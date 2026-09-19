@@ -171,12 +171,42 @@ func (r *Recorder) Handle(ctx context.Context, ev agentturn.Event) error {
 		return r.item(ctx, e.Item, e.ResponseID)
 	case *agentturn.ResponseEnd:
 		return r.response(ctx, e)
+	case *agentturn.RunEnd:
+		return r.runEnd(ctx, e)
 	case *agentturn.ToolEnd:
 		if info, ok := e.Result.Details.(agent.ChildInfo); ok && r.children {
 			return r.child(ctx, e.CallID, info)
 		}
 	}
 	return nil
+}
+
+// runEnd records a failed model call that ended before the adapter emitted a
+// response, and always clears its in-flight request state for recorder reuse.
+func (r *Recorder) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
+	hash, started := r.pending, r.started
+	r.pending = ""
+	r.started = time.Time{}
+	if e.Reason != agentturn.ReasonError || hash == "" {
+		return nil
+	}
+	errorMessage := "model call failed"
+	if e.Err != nil {
+		errorMessage = e.Err.Error()
+	}
+
+	entry := &agentsession.ResponseEntry{
+		Status:      openresponses.ResponseStatusFailed,
+		Error:       &openresponses.ErrorPayload{Code: "model_call_failed", Message: errorMessage},
+		RequestHash: hash,
+	}
+	if !started.IsZero() {
+		if ms := r.now().Sub(started).Milliseconds(); ms > 0 {
+			entry.LatencyMS = ms
+		}
+	}
+	r.responses++
+	return r.append(ctx, entry)
 }
 
 // Canonical returns the request in the form the session format hashes:

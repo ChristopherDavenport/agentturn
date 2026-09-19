@@ -5,6 +5,11 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- The session recorder now records model-call failures that occur before a
+  response stream starts and clears in-flight request state at the end of each run.
+
 ## v0.0.2 - 2026-09-19
 
 - One version per repository. Every nested module's `go.mod` requires

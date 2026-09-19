@@ -363,6 +363,75 @@ func TestStoreErrorEndsRun(t *testing.T) {
 	}
 }
 
+type failingModel struct{ err error }
+
+func (m failingModel) Create(context.Context, openresponses.Request) (*openresponses.Response, error) {
+	return nil, m.err
+}
+
+func (m failingModel) CreateStream(context.Context, openresponses.Request, openresponses.EventSink) error {
+	return m.err
+}
+
+func (m failingModel) Compact(context.Context, openresponses.CompactRequest) (*openresponses.CompactResponse, error) {
+	return nil, m.err
+}
+
+func TestFailedModelCallIsRecordedAndClearedForRecorderReuse(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	boom := errors.New("unknown model")
+	failedAgent := agentturn.New(agentturn.Config{Model: failingModel{err: boom}, ModelName: "missing"})
+	unsubscribe := rec.Attach(failedAgent)
+	if err := failedAgent.Prompt(context.Background(), openresponses.UserText("first")); !errors.Is(err, boom) {
+		t.Fatalf("failed model call error = %v", err)
+	}
+	unsubscribe()
+
+	entries := s.Entries()
+	var failed *agentsession.ResponseEntry
+	for _, entry := range entries {
+		if response, ok := entry.(*agentsession.ResponseEntry); ok {
+			failed = response
+		}
+	}
+	if failed == nil {
+		t.Fatal("failed model call was not recorded")
+	}
+	if failed.Status != openresponses.ResponseStatusFailed || failed.ResponseID != "" || failed.Error == nil {
+		t.Errorf("failed response entry = %+v", failed)
+	} else if !strings.Contains(failed.Error.Message, boom.Error()) {
+		t.Errorf("failed response error = %q, want it to contain %q", failed.Error.Message, boom.Error())
+	}
+	if failed.RequestHash == "" {
+		t.Error("failed response entry has no request hash")
+	}
+	if rec.pending != "" || !rec.started.IsZero() {
+		t.Fatal("failed call left stale request state in the recorder")
+	}
+
+	goodAgent := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "working"}, agentturn.WithTranscript(failedAgent.State().Transcript))
+	defer rec.Attach(goodAgent)()
+	if err := goodAgent.Prompt(context.Background(), openresponses.UserText("second")); err != nil {
+		t.Fatal(err)
+	}
+	var lastResponse *agentsession.ResponseEntry
+	for _, entry := range s.Entries() {
+		if response, ok := entry.(*agentsession.ResponseEntry); ok {
+			lastResponse = response
+		}
+	}
+	if lastResponse == nil || lastResponse.Status != openresponses.ResponseStatusCompleted {
+		t.Fatalf("successful response entry = %+v", lastResponse)
+	}
+	if lastResponse.RequestHash == failed.RequestHash {
+		t.Error("successful call reused the failed call's request hash")
+	}
+}
+
 type failingStore struct {
 	agentsession.Store
 	err error
