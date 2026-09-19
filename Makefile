@@ -63,8 +63,9 @@ NOTES := $(shell mktemp)
 # building from the tree; the changelog's Unreleased section is dated;
 # everything is checked; one commit is made; the root is tagged VERSION
 # and each nested module <dir>/VERSION with the changelog section as the
-# message; and the branch and tags are pushed. TRAILER, when set, is
-# appended to the commit message.
+# message; and the branch and tags are pushed, the tags one at a time
+# because GitHub creates no events for a push of more than three tags.
+# TRAILER, when set, is appended to the commit message.
 release:
 	@test -n "$(VERSION)" || { echo "usage: make release VERSION=vX.Y.Z"; exit 1; }
 	@grep -q '^## Unreleased$$' CHANGELOG.md || { echo "CHANGELOG.md has no Unreleased section"; exit 1; }
@@ -82,7 +83,8 @@ release:
 	git tag -a $(VERSION) -F $(NOTES)
 	@for m in $(SUBMODULES); do git tag -a $$m/$(VERSION) -F $(NOTES) || exit 1; done
 	@rm -f $(NOTES)
-	git push origin HEAD $(VERSION) $(patsubst %,%/$(VERSION),$(SUBMODULES))
+	git push origin HEAD
+	@for t in $(VERSION) $(patsubst %,%/$(VERSION),$(SUBMODULES)); do git push origin $$t || exit 1; done
 
 clean:
 	rm -rf .cache
