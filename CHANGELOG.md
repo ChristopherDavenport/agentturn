@@ -7,11 +7,13 @@ versions may break the API.
 
 ## Unreleased
 
-- The nested modules are tagged as `front/a2a/v0.0.1`,
-  `tools/a2a/v0.0.1` and `session/v0.0.1`. Their `go.mod` files
-  require `agentturn v0.0.1` instead of a local `replace`, so `go get`
-  works, and a committed `go.work` keeps local development building
-  against the checked-out root.
+- One version per repository. Every nested module's `go.mod` requires
+  the released root, and `front/a2a` for `tools/a2a`, next to a
+  `replace` that builds against the tree, so `go get` works for
+  consumers and the checkout needs no workspace. `make release
+  VERSION=` sets the requirements, dates the changelog, and tags the
+  root and every nested module at one commit; the release workflow
+  publishes nested tags too.
 
 ## v0.0.1 - 2026-09-19
 

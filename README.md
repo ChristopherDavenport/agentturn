@@ -140,8 +140,9 @@ agent presents itself in every one of these.
 | `front/a2a`, `tools/a2a` | nested | `github.com/a2aproject/a2a-go` |
 | `session` | nested | `github.com/ChristopherDavenport/agentsession` |
 
-Nested modules are tagged with their directory as the prefix
-(`front/a2a/v0.0.1`) and fetched with `go get` like any module.
+Every module shares the root's version and is tagged at the same
+commit, the nested ones with their directory as the prefix
+(`front/a2a/v0.0.2`); each is fetched with `go get` like any module.
 
 `compact` is the reference `Transform`: when the transcript exceeds a
 token budget it calls the model's `Compact` and splices the returned

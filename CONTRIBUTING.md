@@ -34,11 +34,9 @@ that needs another dependency is a nested module with its own `go.mod`,
 listed under `SUBMODULES` in the Makefile: `front/a2a`, `tools/a2a` and
 `session`. A bare
 `go test ./...` at the root does not cover them; the Makefile targets
-do. The committed `go.work` puts every module in one workspace, so a
-nested module builds against the checked-out root rather than the
-version its `go.mod` requires. `GOFLAGS=-mod=mod` is incompatible with
-workspaces; the Makefile forces `-mod=readonly`, and a plain `go`
-command needs the same.
+do. Each nested `go.mod` requires the released root next to a `replace`
+to the tree: consumers ignore the replace and fetch the version, the
+checkout builds against the working tree.
 
 Tests run offline. The model in a test is the `echo` adapter from
 `openresponses`, and streams are validated with `streamtest`.
@@ -53,21 +51,17 @@ Tests run offline. The model in a test is the `echo` adapter from
 
 ## Releases
 
-Releases are annotated tags. The tag message becomes the GitHub release
-notes, so write it as one:
+Every module in the repository shares one version and is tagged at one
+commit. With the changelog's *Unreleased* section written:
 
 ```sh
-git tag -a v0.1.0 -m "v0.1.0: one line per user-visible change"
-git push origin v0.1.0
+make release VERSION=v0.1.0
 ```
 
-The release workflow publishes the GitHub release, and the Go module
-proxy picks the version up from the tag. Before v1.0.0 the API may
-change between minor versions; the changelog records every break.
-
-Nested modules are tagged with their directory as the prefix, such as
-`front/a2a/v0.1.0`, and their `go.mod` files require a released root
-version, not a `replace`. So a release that touches the root goes in
-order: tag the root, bump the root requirement in each nested module,
-tidy, then tag the nested modules; `tools/a2a` requires `front/a2a` and
-follows it.
+sets the root requirement in each nested module to the version, dates
+the changelog, runs `make check`, commits, tags `v0.1.0` and
+`front/a2a/v0.1.0`, `tools/a2a/v0.1.0`, `session/v0.1.0` with the
+changelog section as the message, and pushes. The release workflow
+publishes a GitHub release per tag, and the Go module proxy picks the
+versions up. Before v1.0.0 the API may change between minor versions;
+the changelog records every break.

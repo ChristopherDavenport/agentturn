@@ -14,3 +14,7 @@ require (
 	golang.org/x/sync v0.22.0 // indirect
 	google.golang.org/grpc v1.84.0 // indirect
 )
+
+// The require names the released root a consumer fetches; the replace
+// builds against the tree.
+replace github.com/ChristopherDavenport/agentturn => ../..

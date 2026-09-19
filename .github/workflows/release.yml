@@ -1,11 +1,12 @@
 name: Release
 
-# Pushing an annotated tag vX.Y.Z publishes a GitHub release whose notes are
-# the tag message. A lightweight tag gets auto-generated notes instead.
+# Pushing an annotated tag vX.Y.Z, or <dir>/vX.Y.Z for a nested module,
+# publishes a GitHub release whose notes are the tag message. A
+# lightweight tag gets auto-generated notes instead.
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "**/v*"]
 
 permissions:
   contents: write
