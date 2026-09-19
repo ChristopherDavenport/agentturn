@@ -39,9 +39,6 @@ do.
 Tests run offline. The model in a test is the `echo` adapter from
 `openresponses`, and streams are validated with `streamtest`.
 
-`agenttool` is pinned by commit until it has a tag; move the pin to
-`v0.0.1` when it exists.
-
 ## Pull requests
 
 - Keep the change focused; unrelated cleanups belong in their own PR.

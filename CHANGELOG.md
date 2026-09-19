@@ -16,8 +16,7 @@ versions may break the API.
   `Config.Tools` is `[]agenttool.Tool`. The self-description helper
   `ServerFor` did not move; build the server with
   `mcpserver.NewServer(cfg.Name, version, cfg.Tools...)`. `make interop`
-  moved with the adapters. `agenttool` is pinned by commit until its
-  first tag.
+  moved with the adapters.
 
 - `Config.Request` is the base of every request the loop sends, so
   `tool_choice`, `parallel_tool_calls`, `max_output_tokens`,
