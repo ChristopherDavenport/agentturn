@@ -8,13 +8,6 @@ on:
 permissions:
   contents: read
 
-# The session module depends on agentsession, which is a private module
-# for now. GOPRIVATE keeps the proxy and checksum database out of the
-# way; the checkout still needs credentials for that repository (a
-# deploy key or a token in the git config) until it is public.
-env:
-  GOPRIVATE: github.com/ChristopherDavenport/agentsession
-
 jobs:
   test:
     name: Test (Go ${{ matrix.go }})

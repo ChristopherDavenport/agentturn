@@ -39,11 +39,8 @@ do.
 Tests run offline. The model in a test is the `echo` adapter from
 `openresponses`, and streams are validated with `streamtest`.
 
-`session` depends on `agentsession`, which is a private module at the
-moment: set `GOPRIVATE=github.com/ChristopherDavenport/agentsession`
-(or the wider `github.com/ChristopherDavenport/*`) and have git access
-to that repository before running the checks. `agenttool` is pinned
-by commit until it has a tag; move the pin to `v0.0.1` when it exists.
+`agenttool` is pinned by commit until it has a tag; move the pin to
+`v0.0.1` when it exists.
 
 ## Pull requests
 
