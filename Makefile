@@ -75,6 +75,7 @@ release:
 	    if grep -q "^[[:space:]]*$(MODULE)/$$s " go.mod; then $(GO) mod edit -require=$(MODULE)/$$s@$(VERSION) || exit 1; fi; \
 	  done && $(GO) mod tidy ) || exit 1; done
 	sed -i 's/^## Unreleased$$/## $(VERSION) - '"$$(date +%F)"'/' CHANGELOG.md
+	$(MAKE) tidy
 	$(MAKE) check
 	git add -A && git commit -q -m "Release $(VERSION)" $(if $(TRAILER),-m "$(TRAILER)")
 	@awk -v v="$(VERSION)" '/^## /{p=($$2==v)} p' CHANGELOG.md | sed '1s/.*/$(VERSION)/' > $(NOTES)
