@@ -1,0 +1,8 @@
+go 1.25.0
+
+use (
+	.
+	./front/a2a
+	./session
+	./tools/a2a
+)

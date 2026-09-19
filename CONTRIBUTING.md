@@ -34,7 +34,11 @@ that needs another dependency is a nested module with its own `go.mod`,
 listed under `SUBMODULES` in the Makefile: `front/a2a`, `tools/a2a` and
 `session`. A bare
 `go test ./...` at the root does not cover them; the Makefile targets
-do.
+do. The committed `go.work` puts every module in one workspace, so a
+nested module builds against the checked-out root rather than the
+version its `go.mod` requires. `GOFLAGS=-mod=mod` is incompatible with
+workspaces; the Makefile forces `-mod=readonly`, and a plain `go`
+command needs the same.
 
 Tests run offline. The model in a test is the `echo` adapter from
 `openresponses`, and streams are validated with `streamtest`.
@@ -60,3 +64,10 @@ git push origin v0.1.0
 The release workflow publishes the GitHub release, and the Go module
 proxy picks the version up from the tag. Before v1.0.0 the API may
 change between minor versions; the changelog records every break.
+
+Nested modules are tagged with their directory as the prefix, such as
+`front/a2a/v0.1.0`, and their `go.mod` files require a released root
+version, not a `replace`. So a release that touches the root goes in
+order: tag the root, bump the root requirement in each nested module,
+tidy, then tag the nested modules; `tools/a2a` requires `front/a2a` and
+follows it.

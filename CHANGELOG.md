@@ -5,6 +5,14 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- The nested modules are tagged as `front/a2a/v0.0.1`,
+  `tools/a2a/v0.0.1` and `session/v0.0.1`. Their `go.mod` files
+  require `agentturn v0.0.1` instead of a local `replace`, so `go get`
+  works, and a committed `go.work` keeps local development building
+  against the checked-out root.
+
 ## v0.0.1 - 2026-09-19
 
 First release. The root module is the loop, `front/responses`,
