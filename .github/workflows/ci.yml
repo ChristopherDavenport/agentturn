@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# The session module depends on agentsession, which is a private module
+# for now. GOPRIVATE keeps the proxy and checksum database out of the
+# way; the checkout still needs credentials for that repository (a
+# deploy key or a token in the git config) until it is public.
+env:
+  GOPRIVATE: github.com/ChristopherDavenport/agentsession
+
+jobs:
+  test:
+    name: Test (Go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.25 is the floor declared in go.mod; stable is the current release.
+        go: ["1.25.x", "stable"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+          # Nested modules have their own go.sum; cache all of them.
+          cache-dependency-path: |
+            go.sum
+            **/go.sum
+      - name: Build
+        run: make build
+      - name: Root module depends on openresponses and the standard library only
+        run: make deps
+      - name: Vet (library and nested modules)
+        run: make vet
+      - name: Test (library and nested modules)
+        run: make test
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: |
+            go.sum
+            **/go.sum
+      - name: Check formatting
+        run: make fmt
+      - name: Check go.mod and go.sum are tidy in every module
+        run: make tidy-check
+      - name: staticcheck
+        run: make lint
+      - name: govulncheck
+        run: make vuln
+
+  # Single required status check for branch protection; it fails if any job
+  # above failed, was cancelled or was skipped.
+  checks:
+    name: Checks
+    if: always()
+    needs: [test, lint]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every job succeeded
+        run: |
+          echo '${{ toJSON(needs) }}'
+          test "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}" = "false"

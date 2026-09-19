@@ -1,0 +1,107 @@
+# Changelog
+
+All user-visible changes to this library. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
+uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
+versions may break the API.
+
+## Unreleased
+
+- `make check` now includes `tidy-check`, which fails when `go mod tidy`
+  would change any module's `go.mod` or `go.sum`; CI uses the same target.
+- **Breaking**: the tool contract moved to its own module,
+  `github.com/ChristopherDavenport/agenttool`, together with the MCP
+  adapters: `agentturn/tool` is now `agenttool`, `front/mcp` is
+  `agenttool/mcpserver` and `tools/mcp` is `agenttool/mcpclient`.
+  `Config.Tools` is `[]agenttool.Tool`. The self-description helper
+  `ServerFor` did not move; build the server with
+  `mcpserver.NewServer(cfg.Name, version, cfg.Tools...)`. `make interop`
+  moved with the adapters. `agenttool` is pinned by commit until its
+  first tag.
+
+- `Config.Request` is the base of every request the loop sends, so
+  `tool_choice`, `parallel_tool_calls`, `max_output_tokens`,
+  `temperature`, `truncation`, `include`, `safety_identifier`,
+  `prompt_cache_key` and the rest reach the model; the loop owns input,
+  tools, store, stream and previous_response_id. `Config.BeforeModelCall`
+  sees the built request before it is sent. `Config.BaseRequest` exposes
+  the starting point, which the session recorder uses for the initial
+  config entry.
+- `front/a2a` builds its input-required boundary on `ToolDecision.Defer`
+  and `RunEnd.Pending` instead of stub tools and a stop hook. In a
+  mixed batch the agent's own tools run and only the caller's calls are
+  handed back. A follow-up that does not answer exactly the pending
+  calls leaves the task input-required with the calls repeated and the
+  rule stated, rather than failing it.
+- `front/responses` expresses a deferred run the way Open Responses can:
+  the response completes with the pending function_call items last in
+  its output, and the caller sends the outputs back with the
+  conversation. `tools/agent` returns an `*agent.InputRequiredError`
+  when the child deferred calls, with the pending calls on `ChildInfo`
+  so a host can continue the child.
+- `tool.New` validates arguments against the reflected schema before
+  decoding: missing required properties, wrong types, values outside an
+  enum, and unexpected properties under a strict schema are returned as
+  a `*tool.ValidationError` the model can retry on. `tool.Reflect`
+  returns the schema tree and `Schema.Validate` / `ValidateJSON` check a
+  value against it; `WithoutValidation` opts out.
+- Pause and resume: `ToolDecision.Defer` hands a call to the caller. The
+  other calls of the batch run, no output is appended for the deferred
+  one, `tool_end` reports `Deferred`, and the run ends with
+  `ReasonInputRequired` and `RunEnd.Pending`. `Agent.Resume` appends the
+  outputs and continues; `Prompt` and `Continue` return
+  `ErrInputRequired` while calls are pending. With the low-level loop,
+  append the outputs and call `Continue`.
+
+- `tool`: the tool contract (`Tool`, `Call`, `Result`, `Sequential`,
+  `Strict`), `tool.New` for typed tools with a standard-library JSON
+  Schema generator and strict mode, `Func` for untyped tools, `Set`,
+  and `Executor` for parallel and sequential batches with progress.
+- Root package: `Run` and `Continue` over any `openresponses.Streamer`,
+  the event stream (`run_start` through `run_end`), request
+  construction with `store: false` and inlined history, `Filter` and
+  `Transform`, and the `BeforeToolCall`, `AfterToolCall` and
+  `ShouldStopAfterTurn` hooks with block, rewrite, override and
+  terminate semantics.
+- `Agent`: queues (`Steer`, `FollowUp`), subscribers with barrier
+  delivery, `Abort`, `WaitForIdle` and `State`.
+- `front/responses`: the loop as an `openresponses.Adapter`. A request
+  with function tools runs one turn and hands the calls back; a request
+  without runs the agent to completion. `WithToolItems` includes the
+  executed calls in the output; `Compact` delegates to the model.
+- `compact`: the reference `Transform`. Over a token budget it calls the
+  model's `Compact`, splices the compaction in front of the recent
+  tail, and caches by prefix so repeated turns cost nothing.
+- `tools/agent`: an agent as a tool. A child run on a fresh or seeded
+  transcript, progress through `Call.OnUpdate`, `ChildInfo` in
+  `Result.Details`, abort through the context, unbounded nesting.
+- `tools/mcp` and `front/mcp` (nested modules on
+  `modelcontextprotocol/go-sdk` v1.8.0): remote MCP tools as `Tool`
+  values with prefixing, content and error mapping, progress and
+  list-changed refresh; and Go tools served over MCP with the inverse
+  mapping.
+- `front/a2a` and `tools/a2a` (nested modules on `a2a-go` v0.3.15): the
+  A2A executor with a conversation store keyed by context ID, coalesced
+  artifact chunks, caller-owned tools through input-required and a
+  cancel registry; and a remote A2A agent as a `Tool`.
+- `front/mcp` validates call arguments against the tool's schema before
+  running it, as the reference servers do, so a missing required
+  property or a wrong type is refused with `isError`. Schemas in drafts
+  the validator does not support are served without validation.
+- `session` (nested module on `agentsession` v0.0.1): a `Recorder`
+  that subscribes an `Agent` to a store. Items are appended on
+  `item_end`, the response entry with its request hash on
+  `response_end`, config entries as the settings change, app-only items
+  as custom entries, and a tools/agent child run as a linked subsession.
+  The module carries its own request hash, tested against
+  agentsession's golden vectors.
+- New `response_end` event: the folded response with usage, delivered
+  after its items and before any tool of the turn runs. `item_start`,
+  `item_update` and `item_end` carry the response ID of a streamed item.
+- `make interop` runs the MCP adapters against the upstream reference
+  server and the MCP Inspector over stdio; `front/mcp/examples/stdio` is
+  the server it drives.
+- `Makefile` and CI mirror `openresponses`: `make check` runs gofmt,
+  vet, the dependency boundary, staticcheck, govulncheck and race tests
+  across every module.
+

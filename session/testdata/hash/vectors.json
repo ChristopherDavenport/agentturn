@@ -1,0 +1,183 @@
+[
+  {
+    "name": "minimal",
+    "request": {
+      "model": "gpt-5",
+      "input": [
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "hi"
+            }
+          ]
+        }
+      ],
+      "store": false
+    },
+    "hash": "sha256:6ace993e374880b1c11c68f9c8a31e630cf0fb43eae1d92aec32a37dd7e72b5f"
+  },
+  {
+    "name": "member order and whitespace do not matter",
+    "request": {
+      "store": false,
+      "input": [
+        {
+          "content": [
+            {
+              "text": "hi",
+              "type": "input_text"
+            }
+          ],
+          "role": "user",
+          "type": "message"
+        }
+      ],
+      "model": "gpt-5"
+    },
+    "hash": "sha256:6ace993e374880b1c11c68f9c8a31e630cf0fb43eae1d92aec32a37dd7e72b5f"
+  },
+  {
+    "name": "settings, tools and passthrough",
+    "request": {
+      "model": "gpt-5",
+      "instructions": "Be brief.",
+      "reasoning": {
+        "effort": "low",
+        "summary": null
+      },
+      "tools": [
+        {
+          "type": "function",
+          "name": "lookup",
+          "description": "Look something up",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "q": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "q"
+            ]
+          }
+        }
+      ],
+      "input": [
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "What is 2+2?"
+            }
+          ]
+        },
+        {
+          "type": "reasoning",
+          "id": "rs_1",
+          "summary": [
+            {
+              "type": "summary_text",
+              "text": "Arithmetic."
+            }
+          ]
+        },
+        {
+          "type": "function_call",
+          "id": "fc_1",
+          "status": "completed",
+          "call_id": "call_1",
+          "name": "lookup",
+          "arguments": "{\"q\":\"2+2\"}"
+        },
+        {
+          "type": "function_call_output",
+          "call_id": "call_1",
+          "output": "4"
+        }
+      ],
+      "store": false,
+      "temperature": 0.2,
+      "acme:region": "eu"
+    },
+    "hash": "sha256:8bb16962eaadff38552061f874116f8afbc25bcdd64b43d4e3901e09b3c94e6e"
+  },
+  {
+    "name": "numbers in ecmascript form",
+    "request": {
+      "model": "m",
+      "input": [
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "n"
+            }
+          ]
+        }
+      ],
+      "store": false,
+      "temperature": 1.0,
+      "top_p": 0.50,
+      "seed": 1e2,
+      "acme:tiny": 0.000001,
+      "acme:huge": 1e21,
+      "acme:neg": -0.0,
+      "acme:frac": 333333333.33333329
+    },
+    "hash": "sha256:ad14c89280c58e08385d065f5af8f27f059edfa1a1f50a8be79c9a8b397192e4"
+  },
+  {
+    "name": "unicode and escapes",
+    "request": {
+      "model": "m",
+      "input": [
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "€ <b>&amp;</b> \"quoted\" \\ back\tslash\n\u0001 😀"
+            }
+          ]
+        }
+      ],
+      "store": false
+    },
+    "hash": "sha256:c40ba7b79fe39f857de0e91c0f05cf1b44b68273f612a46fb9b5380f1d0ec9df"
+  },
+  {
+    "name": "extension item and tool",
+    "request": {
+      "model": "m",
+      "input": [
+        {
+          "type": "acme:search_result",
+          "id": "sr_1",
+          "hits": [
+            3,
+            2,
+            1
+          ]
+        }
+      ],
+      "tools": [
+        {
+          "type": "acme:search",
+          "name": "search",
+          "depth": 2
+        }
+      ],
+      "store": false
+    },
+    "hash": "sha256:5b6bf1de6bd4f690e5e57066c50812f5223fd12f7fa01a694a443756f860333b"
+  }
+]

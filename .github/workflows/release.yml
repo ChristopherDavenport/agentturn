@@ -1,0 +1,29 @@
+name: Release
+
+# Pushing an annotated tag vX.Y.Z publishes a GitHub release whose notes are
+# the tag message. A lightweight tag gets auto-generated notes instead.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Create the release from the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          notes="$(git tag -l --format='%(contents)' "$TAG")"
+          if [ -n "$notes" ]; then
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes "$notes"
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+          fi
