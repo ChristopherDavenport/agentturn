@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/ChristopherDavenport/agenttool v0.0.1
 	github.com/ChristopherDavenport/agentturn v0.0.1
-	github.com/ChristopherDavenport/agentturn/front/a2a v0.0.0-00010101000000-000000000000
+	github.com/ChristopherDavenport/agentturn/front/a2a v0.0.1
 	github.com/ChristopherDavenport/openresponses v0.0.9
 	github.com/a2aproject/a2a-go v0.3.15
 )
@@ -21,5 +21,3 @@ require (
 	google.golang.org/grpc v1.84.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
-
-replace github.com/ChristopherDavenport/agentturn/front/a2a => ../../front/a2a
