@@ -12,9 +12,12 @@
 // start before the assistant items that requested it are durable.
 //
 //	store, _ := jsonl.Open(root)
-//	s, _ := store.Create(ctx, agentsession.Header{CWD: cwd})
-//	rec := session.New(store, s.ID())
+//	rec, s, _ := session.Start(ctx, store, agentsession.Header{CWD: cwd})
 //	defer rec.Attach(agent)()
+//
+// [Start] creates the session and [Resume] reopens one; both return
+// the recorder and the session, and the caller keeps the store, which
+// [Recorder.Store] also returns, for Sync, Release and Close.
 //
 // The package is named session, not agentsession, because a consumer
 // imports both side by side: agentsession to open a store, session to
@@ -36,6 +39,10 @@
 //   - response_end: the response entry with status, usage, error and the
 //     request hash, after the items it produced and before any tool
 //     output of the turn.
+//   - run_end while a call is still in flight, because the model failed
+//     or the run was aborted before the stream produced a response: a
+//     response entry with status failed, the error and the request
+//     hash, so the record shows the call was made and why it ended.
 //   - tool_end with a tools/agent ChildInfo in its details: a new
 //     session holding the child's items, with parent_session set, and a
 //     link entry in this session with rel subsession and the call ID.
@@ -75,12 +82,17 @@ type Recorder struct {
 	now      func() time.Time
 	cfg      *agentturn.Config
 
-	mu        sync.Mutex
-	settings  agentsession.Settings
-	haveCfg   bool
-	pending   string    // request hash of the call in flight
-	started   time.Time // when the call in flight was sent
-	responses int
+	// mu serialises Handle with Attach and Resume. Events of a run
+	// arrive from one goroutine, so holding it across every Append is
+	// not contention; it is what keeps entries in event order when the
+	// recorder is attached to a second agent.
+	mu       sync.Mutex
+	settings agentsession.Settings
+	// wroteConfig is set once a config entry is on the path, written by
+	// this recorder or replayed by Resume, so settle writes deltas.
+	wroteConfig bool
+	pending     string    // request hash of the call in flight
+	started     time.Time // when the call in flight was sent
 }
 
 // Option configures a Recorder.
@@ -113,7 +125,8 @@ func WithoutChildSessions() Option {
 }
 
 // New returns a recorder writing to the session with the given ID in
-// store. The session must exist; see [Start] to create one.
+// store. The session must exist; [Start] creates one and [Resume]
+// reopens one with its settings replayed, which New does not do.
 func New(store agentsession.Store, sessionID string, opts ...Option) *Recorder {
 	r := &Recorder{
 		store:    store,
@@ -128,17 +141,62 @@ func New(store agentsession.Store, sessionID string, opts ...Option) *Recorder {
 	return r
 }
 
-// Start creates a session from h and returns a recorder for it.
+// Start creates a session from h and returns a recorder for it. Child
+// sessions name h.Harness as their writer unless [WithHarness] says
+// otherwise. The caller keeps store for Sync, Release and Close.
 func Start(ctx context.Context, store agentsession.Store, h agentsession.Header, opts ...Option) (*Recorder, *agentsession.Session, error) {
 	s, err := store.Create(ctx, h)
 	if err != nil {
 		return nil, nil, fmt.Errorf("session: create: %w", err)
 	}
-	return New(store, s.ID(), opts...), s, nil
+	r := New(store, s.ID(), opts...)
+	if r.harness == nil {
+		r.harness = s.Header().Harness
+	}
+	return r, s, nil
+}
+
+// Resume opens the session with the given ID and returns a recorder
+// that continues it at its leaf. The recorder starts from the settings
+// in force there, so the first config entry it writes is the delta
+// from them, or nothing when the agent's configuration matches, rather
+// than a full copy on every resume. Child sessions name the header's
+// harness unless [WithHarness] says otherwise.
+func Resume(ctx context.Context, store agentsession.Store, sessionID string, opts ...Option) (*Recorder, *agentsession.Session, error) {
+	s, err := store.Open(ctx, sessionID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("session: open: %w", err)
+	}
+	r := New(store, s.ID(), opts...)
+	if r.harness == nil {
+		r.harness = s.Header().Harness
+	}
+	if s.Leaf() != "" {
+		cx, err := s.Context()
+		if err != nil {
+			return nil, nil, fmt.Errorf("session: context at leaf: %w", err)
+		}
+		r.settings = cx.Settings
+		r.wroteConfig = hasConfig(cx.Entries)
+	}
+	return r, s, nil
+}
+
+// hasConfig reports whether a config entry is on the path.
+func hasConfig(entries []agentsession.Entry) bool {
+	for _, e := range entries {
+		if _, ok := e.(*agentsession.ConfigEntry); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // SessionID returns the ID of the session being written.
 func (r *Recorder) SessionID() string { return r.id }
+
+// Store returns the store the recorder writes to.
+func (r *Recorder) Store() agentsession.Store { return r.store }
 
 // Attach subscribes the recorder to a and returns the unsubscribe
 // function.
@@ -171,6 +229,8 @@ func (r *Recorder) Handle(ctx context.Context, ev agentturn.Event) error {
 		return r.item(ctx, e.Item, e.ResponseID)
 	case *agentturn.ResponseEnd:
 		return r.response(ctx, e)
+	case *agentturn.RunEnd:
+		return r.runEnd(ctx, e)
 	case *agentturn.ToolEnd:
 		if info, ok := e.Result.Details.(agent.ChildInfo); ok && r.children {
 			return r.child(ctx, e.CallID, info)
@@ -198,7 +258,7 @@ func Canonical(req openresponses.Request) openresponses.Request {
 // runStart writes the initial config from the agent's configuration
 // when the recorder has one and nothing has been written yet.
 func (r *Recorder) runStart(ctx context.Context) error {
-	if r.haveCfg || r.cfg == nil {
+	if r.wroteConfig || r.cfg == nil {
 		return nil
 	}
 	req := r.cfg.BaseRequest(ctx)
@@ -227,7 +287,7 @@ func (r *Recorder) settle(ctx context.Context, req openresponses.Request) error 
 		return fmt.Errorf("session: %w", err)
 	}
 	next := agentsession.Settings{}.Apply(full)
-	if !r.haveCfg {
+	if !r.wroteConfig {
 		if err := r.append(ctx, full); err != nil {
 			return err
 		}
@@ -237,7 +297,7 @@ func (r *Recorder) settle(ctx context.Context, req openresponses.Request) error 
 		}
 	}
 	r.settings = next
-	r.haveCfg = true
+	r.wroteConfig = true
 	return nil
 }
 
@@ -268,16 +328,59 @@ func (r *Recorder) response(ctx context.Context, e *agentturn.ResponseEnd) error
 		Incomplete:  resp.IncompleteDetails,
 		Error:       resp.Error,
 		RequestHash: r.pending,
-	}
-	if !r.started.IsZero() {
-		if ms := r.now().Sub(r.started).Milliseconds(); ms > 0 {
-			entry.LatencyMS = ms
-		}
+		LatencyMS:   r.latency(),
 	}
 	r.pending = ""
 	r.started = time.Time{}
-	r.responses++
 	return r.append(ctx, entry)
+}
+
+// runEnd records a call that was sent and never answered: the run
+// ended while a request hash was still in flight, so the model failed
+// before producing a response or the run was aborted mid-stream. The
+// in-flight state is cleared either way, so a recorder reused for a
+// later run cannot attribute its first response to this call.
+func (r *Recorder) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
+	hash := r.pending
+	latency := r.latency()
+	r.pending = ""
+	r.started = time.Time{}
+	if hash == "" {
+		return nil
+	}
+	entry := &agentsession.ResponseEntry{
+		Status:      openresponses.ResponseStatusFailed,
+		Error:       errorPayload(e.Err),
+		RequestHash: hash,
+		LatencyMS:   latency,
+	}
+	return r.append(ctx, entry)
+}
+
+// latency is the time since the call in flight was sent, in
+// milliseconds, or zero when none is.
+func (r *Recorder) latency() int64 {
+	if r.started.IsZero() {
+		return 0
+	}
+	if ms := r.now().Sub(r.started).Milliseconds(); ms > 0 {
+		return ms
+	}
+	return 0
+}
+
+// errorPayload is the wire form of err: the payload of an
+// openresponses error, or a server_error carrying its message.
+func errorPayload(err error) *openresponses.ErrorPayload {
+	if err == nil {
+		return nil
+	}
+	var oe *openresponses.Error
+	if errors.As(err, &oe) {
+		p := oe.Payload()
+		return &p
+	}
+	return &openresponses.ErrorPayload{Type: openresponses.ErrorTypeServerError, Message: err.Error()}
 }
 
 // child writes the items of a tools/agent run as a session of its own
@@ -291,9 +394,6 @@ func (r *Recorder) child(ctx context.Context, callID string, info agent.ChildInf
 	childRec := New(r.store, s.ID(), WithFilter(r.filter))
 	for _, item := range info.Items {
 		responseID := ""
-		if m, ok := item.(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant {
-			responseID = info.RunID
-		}
 		if isModelOutput(item) {
 			responseID = info.RunID
 		}

@@ -300,7 +300,8 @@ Each turn builds an `openresponses.Request` from config plus the filtered,
 transformed transcript. `Store` is false. `PreviousResponseID` is never
 used by the loop; history is always inlined, so the loop works against
 servers without a store and so the session library sees the full input.
-`Metadata` carries run and turn IDs for tracing.
+Run and turn IDs travel on the events, not in request `Metadata`, so
+the settings a session recorder sees change only when config does.
 
 ### Custom items
 

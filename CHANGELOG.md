@@ -16,6 +16,25 @@ versions may break the API.
   them. `WithTranscript` derives the pending calls from the seeded
   transcript, so a session aborted mid-batch resumes through the same
   path. (#1)
+- **Breaking**: the loop no longer stamps `agentturn_run_id` and
+  `agentturn_turn` into request metadata. The IDs are on every event,
+  and the keys made the settings differ on every turn, so a `session`
+  recorder wrote a config delta before every response. A session now
+  holds one config entry until the configuration actually changes.
+  (#2)
+- `session`: a model call that fails before any stream event, or a
+  run aborted mid-stream, is recorded as a response entry with status
+  `failed`, the error and the request hash, so the record shows the
+  call was made. The in-flight hash is cleared on every `run_end`, so
+  a recorder reused for a later run cannot attribute that run's first
+  response to the failed call. (#4)
+- `session.Resume` reopens a session and starts the recorder from the
+  settings at its leaf, so a resumed session gets a delta or nothing
+  rather than a full copy of the instructions and every tool schema.
+  (#3)
+- `session.Start` names child sessions after the header's harness
+  unless `WithHarness` says otherwise, and `Recorder.Store` returns the
+  store so a caller need not hold three values for one session. (#5)
 - Depends on `agenttool` v0.0.2 and `agentsession` v0.0.2.
 
 ## v0.0.2 - 2026-09-19

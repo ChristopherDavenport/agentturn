@@ -115,7 +115,7 @@ func TestRunMessageOnly(t *testing.T) {
 	if req.Model != "m" || req.Instructions != "be brief" || req.Store == nil || *req.Store || !req.Stream {
 		t.Errorf("request = %+v", req)
 	}
-	if req.Metadata["agentturn_run_id"] != end.RunID || req.Metadata["agentturn_turn"] != "1" {
+	if len(req.Metadata) != 0 {
 		t.Errorf("metadata = %v", req.Metadata)
 	}
 	if len(req.Input) != 1 {
@@ -654,7 +654,7 @@ func TestRunRequestTemplateAndBeforeModelCall(t *testing.T) {
 		!req.Includes(openresponses.IncludeReasoningEncryptedContent) || req.SafetyIdentifier != "user-1" || req.PromptCacheKey != "cache-1" || req.Truncation != openresponses.TruncationAuto {
 		t.Errorf("template members lost: %+v", req)
 	}
-	if req.Metadata["app"] != "test" || req.Metadata["hooked"] != "yes" || req.Metadata["agentturn_turn"] != "1" {
+	if req.Metadata["app"] != "test" || req.Metadata["hooked"] != "yes" || len(req.Metadata) != 2 {
 		t.Errorf("metadata = %v", req.Metadata)
 	}
 	if req.Extra["from_template"] != 1 || req.Extra["shared"] != "extra" {

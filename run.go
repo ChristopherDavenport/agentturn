@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"iter"
-	"strconv"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/openresponses"
@@ -174,8 +173,8 @@ func (c Config) validate() error {
 // with the loop-owned transport members set (store false, stream true,
 // no previous_response_id), ModelName, Instructions, Reasoning and Text
 // applied over it, RequestExtra merged over its Extra, and the tool
-// definitions of the moment. Input and the per-turn metadata are added
-// by the loop; a recorder uses this to write the initial settings.
+// definitions of the moment. Only Input is added by the loop; a
+// recorder uses this to write the initial settings.
 func (c Config) BaseRequest(ctx context.Context) openresponses.Request {
 	return c.baseRequest(c.tools(ctx))
 }
@@ -203,9 +202,11 @@ func (c Config) baseRequest(tools agenttool.Set) openresponses.Request {
 	if !c.Text.IsZero() {
 		req.Text = c.Text
 	}
-	req.Metadata = make(map[string]string, len(c.Request.Metadata)+2)
-	for k, v := range c.Request.Metadata {
-		req.Metadata[k] = v
+	if len(c.Request.Metadata) > 0 {
+		req.Metadata = make(map[string]string, len(c.Request.Metadata))
+		for k, v := range c.Request.Metadata {
+			req.Metadata[k] = v
+		}
 	}
 	if len(c.Request.Extra) > 0 || len(c.RequestExtra) > 0 {
 		req.Extra = make(map[string]any, len(c.Request.Extra)+len(c.RequestExtra))
@@ -386,8 +387,6 @@ func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponse
 	}
 	req := r.cfg.baseRequest(tools)
 	req.Input = r.cfg.filter()(input)
-	req.Metadata["agentturn_run_id"] = r.runID
-	req.Metadata["agentturn_turn"] = strconv.Itoa(r.turn)
 	if r.cfg.BeforeModelCall != nil {
 		if err := r.cfg.BeforeModelCall(ctx, &req); err != nil {
 			return openresponses.Request{}, fmt.Errorf("before-model-call hook: %w", err)

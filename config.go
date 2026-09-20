@@ -62,8 +62,9 @@ type Config struct {
 	// every other member are copied from it. The loop owns input, tools,
 	// store, stream and previous_response_id, and ModelName,
 	// Instructions, Reasoning and Text take precedence over the same
-	// members here when set. Metadata is merged with the run and turn
-	// IDs the loop adds.
+	// members here when set. The loop adds nothing else: the run and
+	// turn IDs are on every event, not on the request, so the settings
+	// the model sees change only when this config does.
 	Request openresponses.Request
 
 	// BeforeModelCall runs on the fully built request of each turn, just

@@ -77,16 +77,15 @@ func TestRecordsEveryEventAndVerifies(t *testing.T) {
 	if err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
 		t.Fatal(err)
 	}
-	want := "config item:user config item:function_call* response item:function_call_output config item:assistant* response"
+	want := "config item:user item:function_call* response item:function_call_output item:assistant* response"
 	if got := entryTypes(s); got != want {
 		t.Fatalf("entries = %q\nwant      %q", got, want)
 	}
 	if n := verifyAll(t, s); n != 2 {
 		t.Errorf("responses = %d", n)
 	}
-	// The first config is a full replace from the agent's configuration,
-	// before any item; the later ones are deltas for the per-turn
-	// metadata.
+	// The only config is a full replace from the agent's configuration,
+	// before any item: the settings never change, so no delta follows.
 	entries := s.Entries()
 	first := entries[0].(*agentsession.ConfigEntry)
 	if !first.Replace || first.Model != "m" || first.Instructions == nil || *first.Instructions != "be brief" || len(first.ToolsAdded) != 1 || first.Extra["acme_flag"] == nil || first.Extra["metadata"] != nil {
@@ -97,18 +96,12 @@ func TestRecordsEveryEventAndVerifies(t *testing.T) {
 			t.Errorf("first config lacks request member %q", k)
 		}
 	}
-	for _, i := range []int{2, 6} {
-		delta := entries[i].(*agentsession.ConfigEntry)
-		if delta.Replace || delta.Model != "" || delta.Instructions != nil || len(delta.ToolsAdded) != 0 || len(delta.Extra) != 1 || delta.Extra["metadata"] == nil {
-			t.Errorf("delta config %d = %+v", i, delta)
-		}
-	}
 	// Response entries carry the folded response's fields.
-	resp := entries[4].(*agentsession.ResponseEntry)
+	resp := entries[3].(*agentsession.ResponseEntry)
 	if resp.ResponseID == "" || resp.Status != openresponses.ResponseStatusCompleted || resp.Usage == nil || resp.Usage.TotalTokens == 0 || !strings.HasPrefix(resp.RequestHash, HashPrefix) {
 		t.Errorf("response = %+v", resp)
 	}
-	if entries[3].(*agentsession.ItemEntry).ResponseID != resp.ResponseID {
+	if entries[2].(*agentsession.ItemEntry).ResponseID != resp.ResponseID {
 		t.Error("output item does not name its response")
 	}
 	// The stored context is the transcript the agent holds.
@@ -140,7 +133,7 @@ func TestAppOnlyItemsBecomeCustomEntries(t *testing.T) {
 	if err := a.Prompt(context.Background(), note, openresponses.UserText("hi")); err != nil {
 		t.Fatal(err)
 	}
-	if got := entryTypes(s); got != "config custom item:user config item:assistant* response" {
+	if got := entryTypes(s); got != "config custom item:user item:assistant* response" {
 		t.Fatalf("entries = %q", got)
 	}
 	custom := s.Entries()[1].(*agentsession.CustomEntry)
@@ -157,7 +150,7 @@ func TestAppOnlyItemsBecomeCustomEntries(t *testing.T) {
 	if err := a2.Prompt(context.Background(), note, openresponses.UserText("hi")); err != nil {
 		t.Fatal(err)
 	}
-	if got := entryTypes(s2); got != "config item:agentturn:note item:user config item:assistant* response" {
+	if got := entryTypes(s2); got != "config item:agentturn:note item:user item:assistant* response" {
 		t.Fatalf("entries = %q", got)
 	}
 	verifyAll(t, s2)
@@ -294,15 +287,9 @@ func TestSettingsChangesWriteConfig(t *testing.T) {
 			configs = append(configs, c)
 		}
 	}
-	// Initial full config and a metadata delta for the first run; a
-	// full replace when the second agent's tools differ, then a delta.
-	var replaces int
-	for _, c := range configs {
-		if c.Replace {
-			replaces++
-		}
-	}
-	if len(configs) != 4 || replaces != 2 || configs[2].Model != "two" || !configs[2].Replace || configs[3].Replace {
+	// The initial full config for the first run, then one full replace
+	// when the second agent's tools differ, and nothing per turn.
+	if len(configs) != 2 || !configs[0].Replace || configs[1].Model != "two" || !configs[1].Replace {
 		t.Errorf("configs = %+v", configs)
 	}
 	cx, _ := s.Context()
@@ -412,17 +399,154 @@ func TestDeferredCallsRecordAndResume(t *testing.T) {
 	if err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
 		t.Fatal(err)
 	}
-	if got := entryTypes(s); got != "config item:user config item:function_call* response" {
+	if got := entryTypes(s); got != "config item:user item:function_call* response" {
 		t.Fatalf("entries after defer = %q", got)
 	}
 	call := a.State().Pending[0]
 	if err := a.Resume(context.Background(), openresponses.NewFunctionCallOutput(call.CallID, "ABC")); err != nil {
 		t.Fatal(err)
 	}
-	if got := entryTypes(s); got != "config item:user config item:function_call* response item:function_call_output config item:assistant* response" {
+	if got := entryTypes(s); got != "config item:user item:function_call* response item:function_call_output item:assistant* response" {
 		t.Fatalf("entries after resume = %q", got)
 	}
 	if n := verifyAll(t, s); n != 2 {
 		t.Errorf("responses = %d", n)
+	}
+}
+
+type failingModel struct{}
+
+func (failingModel) CreateStream(context.Context, openresponses.Request, openresponses.EventSink) error {
+	return openresponses.ServerError("down", "model unavailable")
+}
+
+func TestFailedCallIsRecordedAndRecorderReusable(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: failingModel{}, ModelName: "m"})
+	unsub := rec.Attach(a)
+	if err := a.Prompt(context.Background(), openresponses.UserText("x")); err == nil {
+		t.Fatal("prompt should fail")
+	}
+	unsub()
+	// The call that never produced a response is a failed response
+	// entry carrying the error and the hash of the request sent.
+	if got := entryTypes(s); got != "config item:user response" {
+		t.Fatalf("entries after failure = %q", got)
+	}
+	entries := s.Entries()
+	failed := entries[2].(*agentsession.ResponseEntry)
+	if failed.Status != openresponses.ResponseStatusFailed || failed.ResponseID != "" || failed.Error == nil || failed.Error.Code != "down" || !strings.HasPrefix(failed.RequestHash, HashPrefix) {
+		t.Errorf("failed response = %+v error=%+v", failed, failed.Error)
+	}
+	if n := verifyAll(t, s); n != 1 {
+		t.Errorf("responses = %d", n)
+	}
+	// The same recorder on a working agent attributes the next response
+	// to its own request, not to the failed one.
+	b := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"}, agentturn.WithTranscript(a.State().Transcript))
+	defer rec.Attach(b)()
+	if err := b.Prompt(context.Background(), openresponses.UserText("y")); err != nil {
+		t.Fatal(err)
+	}
+	if got := entryTypes(s); got != "config item:user response item:user item:assistant* response" {
+		t.Fatalf("entries after reuse = %q", got)
+	}
+	ok := s.Entries()[5].(*agentsession.ResponseEntry)
+	if ok.Status != openresponses.ResponseStatusCompleted || ok.RequestHash == failed.RequestHash {
+		t.Errorf("reused recorder response = %+v", ok)
+	}
+	if n := verifyAll(t, s); n != 2 {
+		t.Errorf("responses = %d", n)
+	}
+}
+
+func TestResumeContinuesWithoutDuplicateConfig(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{Harness: &agentsession.Harness{Name: "h", Version: "1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.harness == nil || rec.harness.Name != "h" {
+		t.Errorf("Start did not default the child harness: %+v", rec.harness)
+	}
+	if rec.Store() != store {
+		t.Error("Store() is not the store given to Start")
+	}
+	cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Instructions: "be brief"}
+	a := agentturn.New(cfg)
+	unsub := rec.Attach(a)
+	if err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
+		t.Fatal(err)
+	}
+	unsub()
+	before := entryTypes(s)
+
+	// A recorder resumed on the same session with the same configuration
+	// writes no config at all for its run.
+	rec2, s2, err := Resume(context.Background(), store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec2.harness == nil || rec2.harness.Name != "h" {
+		t.Errorf("Resume did not take the header's harness: %+v", rec2.harness)
+	}
+	b := agentturn.New(cfg, agentturn.WithTranscript(a.State().Transcript))
+	unsub = rec2.Attach(b)
+	if err := b.Prompt(context.Background(), openresponses.UserText("y")); err != nil {
+		t.Fatal(err)
+	}
+	unsub()
+	if got := entryTypes(s2); got != before+" item:user item:assistant* response" {
+		t.Fatalf("entries after resume = %q\nbefore = %q", got, before)
+	}
+	if n := verifyAll(t, s2); n != 2 {
+		t.Errorf("responses = %d", n)
+	}
+
+	// Resumed with a changed configuration, it writes the delta, not a
+	// full replace.
+	rec3, s3, err := Resume(context.Background(), store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Instructions = "be thorough"
+	c := agentturn.New(cfg, agentturn.WithTranscript(b.State().Transcript))
+	defer rec3.Attach(c)()
+	if err := c.Prompt(context.Background(), openresponses.UserText("z")); err != nil {
+		t.Fatal(err)
+	}
+	entries := s3.Entries()
+	var configs []*agentsession.ConfigEntry
+	for _, e := range entries {
+		if ce, ok := e.(*agentsession.ConfigEntry); ok {
+			configs = append(configs, ce)
+		}
+	}
+	if len(configs) != 2 || !configs[0].Replace || configs[1].Replace || configs[1].Instructions == nil || *configs[1].Instructions != "be thorough" || configs[1].Model != "" {
+		t.Errorf("configs = %+v", configs)
+	}
+	cx, _ := s3.Context()
+	if cx.Settings.Instructions != "be thorough" || cx.Settings.Model != "m" {
+		t.Errorf("settings = %+v", cx.Settings)
+	}
+	if n := verifyAll(t, s3); n != 3 {
+		t.Errorf("responses = %d", n)
+	}
+
+	// Resume on an empty session behaves like New.
+	empty, err := store.Create(context.Background(), agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec4, _, err := Resume(context.Background(), store, empty.ID())
+	if err != nil || rec4.wroteConfig {
+		t.Errorf("resume on empty session: err=%v wroteConfig=%v", err, rec4.wroteConfig)
+	}
+	if _, _, err := Resume(context.Background(), store, "missing"); err == nil {
+		t.Error("resume of a missing session should fail")
 	}
 }
