@@ -44,8 +44,11 @@ hooks, and queues. Everything else is a front or a subscriber.
 
 ## Non-goals
 
-- Provider catalogs, cost tables, auth resolution, retries against
-  providers. Those belong to an adapter or a gateway.
+- Provider catalogs, cost tables and auth resolution. Those belong to
+  an adapter or a gateway. Retrying a failed model call is the loop's,
+  by amendment (see Retry below): only the loop knows whether the
+  failed attempt already delivered items, which is what decides
+  whether a retry is safe.
 - Persistence. The loop takes a transcript and returns events; the session
   library, `agentsession`, is a subscriber.
 - Any transport. Fronts own transports.
@@ -312,6 +315,22 @@ used by the loop; history is always inlined, so the loop works against
 servers without a store and so the session library sees the full input.
 Run and turn IDs travel on the events, not in request `Metadata`, so
 the settings a session recorder sees change only when config does.
+
+### Retry
+
+Amendment, 2026-09-20 (issue #22). `Config.Retry` is a policy of
+`MaxAttempts`, `Backoff(attempt, err)` and `Retryable(err)`, off by
+default. It applies to the model call only, inside the turn: the same
+request is sent again after the delay, a `model_retry` event carries
+the attempt number, the error and the delay, and the turn's
+`turn_start` and `response_end` are delivered once, so a recorder sees
+one call. An attempt is retried only when nothing of it reached
+subscribers and the server did not answer with a terminal response;
+an attempt that delivered an item is final, because the transcript or
+a recorder may already hold part of it. The defaults retry 408, 409,
+429, 5xx, truncated streams and transport failures, honour
+`Retry-After`, and otherwise double from 500ms to a 30s cap. Abort
+cuts a delay short.
 
 ### Custom items
 

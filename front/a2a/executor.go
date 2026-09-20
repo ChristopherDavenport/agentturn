@@ -57,7 +57,7 @@ func New(cfg agentturn.Config, opts ...Option) *Executor {
 		opt(e)
 	}
 	if e.store == nil {
-		e.store = NewMemoryStore()
+		e.store = &MemoryStore{}
 	}
 	return e
 }

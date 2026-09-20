@@ -3,7 +3,13 @@ package agentturn
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"net"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/openresponses"
@@ -78,6 +84,10 @@ type Config struct {
 	// verification as a Transform.
 	BeforeModelCall func(context.Context, *openresponses.Request) error
 
+	// Retry is the policy for transient model failures. The zero value
+	// retries nothing; see [Retry].
+	Retry Retry
+
 	// ToolExecution selects parallel (default) or sequential batches.
 	ToolExecution ExecutionMode
 	// MaxParallelTools bounds a parallel batch; zero means
@@ -109,6 +119,83 @@ type Config struct {
 
 	// RequestExtra is passed through as Request.Extra on every call.
 	RequestExtra map[string]any
+}
+
+// Retry says when a failed model call is attempted again. A retry
+// happens inside the turn: the same request is sent again after a
+// delay, a [ModelRetry] event tells subscribers, and the turn_start
+// and response_end of the turn are delivered once. Only an attempt
+// that delivered nothing is retried: once an item of the attempt has
+// reached subscribers, or the server has answered with a failed
+// response, the failure is final, because the transcript or a
+// recorder may already hold part of it. Abort cuts a delay short.
+type Retry struct {
+	// MaxAttempts is the number of attempts per turn, the first
+	// included. Zero or one means no retry.
+	MaxAttempts int
+	// Backoff returns how long to wait before the next attempt, given
+	// the number of the attempt that failed and its error. nil means
+	// [DefaultBackoff].
+	Backoff func(attempt int, err error) time.Duration
+	// Retryable reports whether err is worth another attempt. nil means
+	// [DefaultRetryable].
+	Retryable func(error) bool
+}
+
+func (r Retry) retryable(err error) bool {
+	if r.Retryable != nil {
+		return r.Retryable(err)
+	}
+	return DefaultRetryable(err)
+}
+
+func (r Retry) backoff(attempt int, err error) time.Duration {
+	if r.Backoff != nil {
+		return r.Backoff(attempt, err)
+	}
+	return DefaultBackoff(attempt, err)
+}
+
+// DefaultRetryable is the [Retry.Retryable] used when none is set: an
+// openresponses error with status 408, 409, 429 or 5xx, a stream that
+// ended before its terminal event, and transport failures (net.Error,
+// an unexpected EOF, a reset or refused connection). Everything else,
+// a 4xx in particular, is final.
+func DefaultRetryable(err error) bool {
+	var oe *openresponses.Error
+	if errors.As(err, &oe) {
+		switch status := oe.HTTPStatus(); {
+		case status == 408, status == 409, status == 429, status >= 500:
+			return true
+		}
+		return false
+	}
+	if errors.Is(err, openresponses.ErrTruncatedStream) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne)
+}
+
+// DefaultBackoff is the [Retry.Backoff] used when none is set: the
+// Retry-After header of an openresponses error when it names a number
+// of seconds, otherwise 500ms doubled per retry and capped at 30s,
+// without jitter.
+func DefaultBackoff(attempt int, err error) time.Duration {
+	var oe *openresponses.Error
+	if errors.As(err, &oe) {
+		if secs, perr := strconv.Atoi(strings.TrimSpace(oe.Headers.Get("Retry-After"))); perr == nil && secs >= 0 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	d := 500 * time.Millisecond
+	for i := 1; i < attempt && d < 30*time.Second; i++ {
+		d *= 2
+	}
+	return min(d, 30*time.Second)
 }
 
 // ToolCallInfo describes a call before it runs.

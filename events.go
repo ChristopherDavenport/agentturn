@@ -2,15 +2,16 @@ package agentturn
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/openresponses"
 )
 
 // Event is one step of a run. Concrete types are [RunStart], [TurnStart],
-// [ItemStart], [ItemUpdate], [ItemEnd], [ResponseEnd], [ToolStart],
-// [ToolUpdate], [ToolEnd], [TurnEnd] and [RunEnd]. Decoded values are pointers, so
-// switch on *ItemUpdate and so on.
+// [ModelRetry], [ItemStart], [ItemUpdate], [ItemEnd], [ResponseEnd],
+// [ToolStart], [ToolUpdate], [ToolEnd], [TurnEnd] and [RunEnd]. Decoded
+// values are pointers, so switch on *ItemUpdate and so on.
 type Event interface {
 	EventType() string
 }
@@ -19,6 +20,7 @@ type Event interface {
 const (
 	EventRunStart    = "run_start"
 	EventTurnStart   = "turn_start"
+	EventModelRetry  = "model_retry"
 	EventResponseEnd = "response_end"
 	EventItemStart   = "item_start"
 	EventItemUpdate  = "item_update"
@@ -71,6 +73,22 @@ type TurnStart struct {
 
 // EventType returns "turn_start".
 func (*TurnStart) EventType() string { return EventTurnStart }
+
+// ModelRetry reports that a model call failed and will be attempted
+// again after Delay, under [Config.Retry]. It follows the turn_start
+// of the turn; no item of the failed attempt reached subscribers.
+type ModelRetry struct {
+	RunID string
+	Turn  int
+	// Attempt is the number of the attempt that failed, from 1; the
+	// next attempt is Attempt+1.
+	Attempt int
+	Err     error
+	Delay   time.Duration
+}
+
+// EventType returns "model_retry".
+func (*ModelRetry) EventType() string { return EventModelRetry }
 
 // ItemStart announces an item entering the transcript: a prompt or
 // queued message, an assistant item as the stream opens it, or a
@@ -218,6 +236,7 @@ func (*RunEnd) EventType() string { return EventRunEnd }
 var (
 	_ Event = (*RunStart)(nil)
 	_ Event = (*TurnStart)(nil)
+	_ Event = (*ModelRetry)(nil)
 	_ Event = (*ItemStart)(nil)
 	_ Event = (*ItemUpdate)(nil)
 	_ Event = (*ItemEnd)(nil)

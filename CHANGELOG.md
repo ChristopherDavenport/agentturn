@@ -121,8 +121,17 @@ versions may break the API.
   artifact replace no longer aliases the SDK's parts slice, progress
   text grows chunk by chunk instead of re-joining every artifact, data
   part errors say what failed to encode, and the `tools/a2a` argument
-  schema is reflected once at init. `NewMemoryStore` and `Len` are
-  kept. (#18)
+  schema is reflected once at init. **Breaking**: `front/a2a`'s
+  `NewMemoryStore` and `MemoryStore.Len` are removed; the zero
+  `MemoryStore` is ready to use. (#18)
+- `Config.Retry` retries a model call that failed before delivering
+  anything, inside the turn: `MaxAttempts`, `Backoff` and `Retryable`,
+  with defaults that retry 408, 409, 429, 5xx, truncated streams and
+  transport failures, honour `Retry-After`, and double from 500ms to a
+  30s cap. A `model_retry` event reports each retry; `turn_start` and
+  `response_end` are delivered once per turn. An attempt that already
+  delivered an item is final, and `Abort` cuts a delay short. The
+  plan's non-goal on retries is amended. (#22)
 - Depends on `agenttool` v0.0.3 and `agentsession` v0.0.3. A tool
   that panics now ends its call with an `agenttool.PanicError`: the
   model sees one line as the error output and `ToolEnd.Err` carries

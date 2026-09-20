@@ -4,8 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/openresponses"
@@ -776,5 +781,166 @@ func TestRunToolPanicBecomesErrorOutput(t *testing.T) {
 	}
 	if got := itemTypes(end.Items); got != "user function_call function_call_output" {
 		t.Errorf("items = %q", got)
+	}
+}
+
+// flaky fails the first n calls with err, then answers as echo does.
+type flaky struct {
+	echo.Adapter
+	n     int
+	err   error
+	calls int
+}
+
+func (f *flaky) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	f.calls++
+	if f.calls <= f.n {
+		return f.err
+	}
+	return f.Adapter.CreateStream(ctx, req, sink)
+}
+
+// partial emits one complete item and then fails.
+type partial struct{}
+
+func (partial) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("half"); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return openresponses.ServerError("cut", "connection lost")
+}
+
+func TestRunRetriesTransientModelErrors(t *testing.T) {
+	noWait := func(int, error) time.Duration { return 0 }
+	t.Run("retried then answered", func(t *testing.T) {
+		model := &flaky{n: 2, err: openresponses.TooManyRequests("rate", "slow down")}
+		cfg := Config{Model: model, Retry: Retry{MaxAttempts: 3, Backoff: noWait}}
+		events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("hi")}, cfg))
+		if err != nil || end.Reason != ReasonDone || model.calls != 3 {
+			t.Fatalf("err=%v end=%+v calls=%d", err, end, model.calls)
+		}
+		var retries []int
+		var turnStarts, responseEnds int
+		for _, ev := range events {
+			switch e := ev.(type) {
+			case *ModelRetry:
+				retries = append(retries, e.Attempt)
+				if !errors.Is(e.Err, e.Err) || e.Turn != 1 || e.Delay != 0 {
+					t.Errorf("retry event = %+v", e)
+				}
+			case *TurnStart:
+				turnStarts++
+			case *ResponseEnd:
+				responseEnds++
+			}
+		}
+		if len(retries) != 2 || retries[0] != 1 || retries[1] != 2 || turnStarts != 1 || responseEnds != 1 {
+			t.Errorf("retries=%v turn_starts=%d response_ends=%d events=%v", retries, turnStarts, responseEnds, types(events))
+		}
+	})
+	t.Run("attempts exhausted", func(t *testing.T) {
+		model := &flaky{n: 5, err: openresponses.ServerError("down", "unavailable")}
+		cfg := Config{Model: model, Retry: Retry{MaxAttempts: 2, Backoff: noWait}}
+		_, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("hi")}, cfg))
+		var oe *openresponses.Error
+		if end.Reason != ReasonError || !errors.As(err, &oe) || oe.Code != "down" || model.calls != 2 {
+			t.Errorf("err=%v end=%+v calls=%d", err, end, model.calls)
+		}
+	})
+	t.Run("final errors are not retried", func(t *testing.T) {
+		model := &flaky{n: 5, err: openresponses.InvalidRequest("bad", "no such model", "model")}
+		cfg := Config{Model: model, Retry: Retry{MaxAttempts: 3, Backoff: noWait}}
+		_, end, _ := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("hi")}, cfg))
+		if end.Reason != ReasonError || model.calls != 1 {
+			t.Errorf("end=%+v calls=%d", end, model.calls)
+		}
+	})
+	t.Run("no policy means no retry", func(t *testing.T) {
+		model := &flaky{n: 1, err: openresponses.ServerError("down", "unavailable")}
+		_, end, _ := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("hi")}, Config{Model: model}))
+		if end.Reason != ReasonError || model.calls != 1 {
+			t.Errorf("end=%+v calls=%d", end, model.calls)
+		}
+	})
+	t.Run("an attempt that delivered an item is final", func(t *testing.T) {
+		cfg := Config{Model: partial{}, Retry: Retry{MaxAttempts: 3, Backoff: noWait, Retryable: func(error) bool { return true }}}
+		events, end, _ := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("hi")}, cfg))
+		if end.Reason != ReasonError || itemTypes(end.Items) != "user assistant" {
+			t.Errorf("end=%+v items=%s", end, itemTypes(end.Items))
+		}
+		for _, ev := range events {
+			if _, ok := ev.(*ModelRetry); ok {
+				t.Error("retried after an item was delivered")
+			}
+		}
+	})
+	t.Run("abort cuts the backoff short", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		model := &flaky{n: 5, err: openresponses.ServerError("down", "unavailable")}
+		cfg := Config{Model: model, Retry: Retry{MaxAttempts: 5, Backoff: func(int, error) time.Duration { return time.Hour }}}
+		var end *RunEnd
+		start := time.Now()
+		for ev := range Run(ctx, nil, openresponses.Items{openresponses.UserText("hi")}, cfg) {
+			switch e := ev.(type) {
+			case *ModelRetry:
+				cancel()
+			case *RunEnd:
+				end = e
+			}
+		}
+		if end == nil || end.Reason != ReasonAborted || time.Since(start) > 5*time.Second || model.calls != 1 {
+			t.Errorf("end=%+v calls=%d elapsed=%s", end, model.calls, time.Since(start))
+		}
+	})
+}
+
+func TestDefaultRetryPolicy(t *testing.T) {
+	retryable := []error{
+		openresponses.TooManyRequests("r", "m"),
+		openresponses.ServerError("s", "m"),
+		openresponses.NewError(openresponses.ErrorTypeServerError, "c", "m"),
+		&openresponses.Error{StatusCode: 408},
+		&openresponses.Error{StatusCode: 409},
+		fmt.Errorf("wrapped: %w", openresponses.ErrTruncatedStream),
+		io.ErrUnexpectedEOF,
+		&net.OpError{Op: "dial", Err: errors.New("refused")},
+		fmt.Errorf("x: %w", syscall.ECONNRESET),
+	}
+	for _, err := range retryable {
+		if !DefaultRetryable(err) {
+			t.Errorf("%v should be retryable", err)
+		}
+	}
+	final := []error{
+		openresponses.InvalidRequest("c", "m", ""),
+		openresponses.NewError(openresponses.ErrorTypeNotFound, "c", "m"),
+		errors.New("something else"),
+		context.Canceled,
+	}
+	for _, err := range final {
+		if DefaultRetryable(err) {
+			t.Errorf("%v should be final", err)
+		}
+	}
+	if d := DefaultBackoff(1, errors.New("x")); d != 500*time.Millisecond {
+		t.Errorf("backoff(1) = %s", d)
+	}
+	if d := DefaultBackoff(3, errors.New("x")); d != 2*time.Second {
+		t.Errorf("backoff(3) = %s", d)
+	}
+	if d := DefaultBackoff(20, errors.New("x")); d != 30*time.Second {
+		t.Errorf("backoff(20) = %s", d)
+	}
+	if d := DefaultBackoff(1, openresponses.TooManyRequests("r", "m").WithHeader("Retry-After", "7")); d != 7*time.Second {
+		t.Errorf("backoff with Retry-After = %s", d)
 	}
 }

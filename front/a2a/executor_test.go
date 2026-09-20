@@ -35,7 +35,7 @@ func sendTask(t *testing.T, h a2asrv.RequestHandler, msg *a2a.Message) *a2a.Task
 }
 
 func TestSendMessageCompletes(t *testing.T) {
-	store := NewMemoryStore()
+	store := &MemoryStore{}
 	exec := New(agentturn.Config{Name: "echo", Model: &echo.Adapter{}, ModelName: "m"}, WithConversationStore(store))
 	h := a2asrv.NewHandler(exec)
 
@@ -56,8 +56,8 @@ func TestSendMessageCompletes(t *testing.T) {
 	if len(tr) != 2 {
 		t.Errorf("stored transcript has %d items, want 2", len(tr))
 	}
-	if store.Len() != 1 {
-		t.Errorf("stored contexts = %d", store.Len())
+	if len(store.conversations) != 1 {
+		t.Errorf("stored contexts = %d", len(store.conversations))
 	}
 }
 
@@ -106,7 +106,7 @@ func TestStreamingCoalescesArtifactChunks(t *testing.T) {
 }
 
 func TestContextContinuesConversation(t *testing.T) {
-	store := NewMemoryStore()
+	store := &MemoryStore{}
 	var inputs []int
 	model := &recordingModel{Adapter: &echo.Adapter{}, onRequest: func(req openresponses.Request) { inputs = append(inputs, len(req.Input)) }}
 	h := a2asrv.NewHandler(New(agentturn.Config{Model: model}, WithConversationStore(store)))
@@ -208,7 +208,7 @@ func TestCancelMidRun(t *testing.T) {
 }
 
 func TestCallerToolRoundTrip(t *testing.T) {
-	store := NewMemoryStore()
+	store := &MemoryStore{}
 	h := a2asrv.NewHandler(New(agentturn.Config{Model: &echo.Adapter{}}, WithConversationStore(store)))
 
 	msg := userMessage("find it")
@@ -458,7 +458,7 @@ func (callsEveryTool) CreateStream(_ context.Context, req openresponses.Request,
 }
 
 func TestMixedBatchRunsLocalToolsAndDefersCallerTools(t *testing.T) {
-	store := NewMemoryStore()
+	store := &MemoryStore{}
 	local := agenttool.New("local", "runs here", func(context.Context, struct {
 		Q string `json:"q"`
 	}) (string, error) {
@@ -530,7 +530,7 @@ func (q *failingQueue) Write(ctx context.Context, ev a2a.Event) error {
 }
 
 func TestFailedEventWriteIsReturnedNotCanceled(t *testing.T) {
-	store := NewMemoryStore()
+	store := &MemoryStore{}
 	exec := New(agentturn.Config{Model: &echo.Adapter{}}, WithConversationStore(store))
 	inner, err := eventqueue.NewInMemoryManager().GetOrCreate(context.Background(), "t1")
 	if err != nil {

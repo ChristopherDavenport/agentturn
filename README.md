@@ -101,6 +101,7 @@ run, in order:
 |---|---|
 | `run_start` | run ID |
 | `turn_start` | the exact `openresponses.Request` sent |
+| `model_retry` | a transient model failure about to be retried under `Config.Retry`: attempt, error, delay |
 | `item_start`, `item_update`, `item_end` | an item entering the transcript; `item_update` wraps the wire `StreamEvent` verbatim |
 | `response_end` | the folded `Response` with usage, before any tool of the turn runs |
 | `tool_start`, `tool_update`, `tool_end` | one tool call from preflight to result, `tool_end` in completion order |
@@ -150,6 +151,17 @@ Every other request member comes from `Config.Request`, the base the
 loop builds each turn's request on: `tool_choice`, `max_output_tokens`,
 `include: reasoning.encrypted_content` for reasoning models, and so on.
 `BeforeModelCall` sees the finished request before it is sent.
+
+`Config.Retry` retries a model call that failed before delivering
+anything: a 429 or 5xx, a dropped stream, a refused connection. The
+retry happens inside the turn, honours `Retry-After`, reports itself
+as a `model_retry` event, and is cut short by `Abort`. An attempt that
+already delivered an item is never retried, since the transcript may
+hold part of it.
+
+```go
+cfg.Retry = agentturn.Retry{MaxAttempts: 4}
+```
 
 ## Composition
 

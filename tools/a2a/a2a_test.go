@@ -89,7 +89,7 @@ func TestRoundTripThroughFront(t *testing.T) {
 }
 
 func TestSharedContext(t *testing.T) {
-	store := fronta2a.NewMemoryStore()
+	store := &fronta2a.MemoryStore{}
 	remoteCfg := agentturn.Config{Model: &echo.Adapter{}}
 	client, card := serve(t, fronta2a.New(remoteCfg, fronta2a.WithConversationStore(store)), nil)
 	remote := New(client, card, WithContextID("ctx-1"), WithName("remote"))
@@ -103,8 +103,8 @@ func TestSharedContext(t *testing.T) {
 	if len(tr) != 4 {
 		t.Errorf("shared context transcript = %d items, want 4", len(tr))
 	}
-	if store.Len() != 1 {
-		t.Errorf("contexts = %d, want 1", store.Len())
+	if other, _ := store.Load(context.Background(), "ctx-2"); other != nil {
+		t.Errorf("unexpected second context: %v", other)
 	}
 }
 

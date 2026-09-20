@@ -22,9 +22,6 @@ type MemoryStore struct {
 	conversations map[string]agentturn.Transcript
 }
 
-// NewMemoryStore returns an empty store.
-func NewMemoryStore() *MemoryStore { return &MemoryStore{} }
-
 // Load returns a copy of the stored transcript, or nil.
 func (m *MemoryStore) Load(_ context.Context, contextID string) (agentturn.Transcript, error) {
 	m.mu.Lock()
@@ -45,13 +42,6 @@ func (m *MemoryStore) Save(_ context.Context, contextID string, t agentturn.Tran
 	}
 	m.conversations[contextID] = append(agentturn.Transcript(nil), t...)
 	return nil
-}
-
-// Len returns the number of stored contexts.
-func (m *MemoryStore) Len() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return len(m.conversations)
 }
 
 var _ ConversationStore = (*MemoryStore)(nil)

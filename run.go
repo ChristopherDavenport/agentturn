@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/openresponses"
@@ -425,8 +426,9 @@ func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponse
 	return req, nil
 }
 
-// modelTurn streams one response, emitting item events, and appends the
-// completed items to the transcript.
+// modelTurn sends the turn's request, retrying a transient failure
+// under Config.Retry, emitting item events, and appends the completed
+// items to the transcript.
 func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openresponses.Response, error) {
 	req, err := r.request(ctx, tools)
 	if err != nil {
@@ -435,64 +437,101 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 	if err := r.emit(&TurnStart{RunID: r.runID, Turn: r.turn, Request: req}); err != nil {
 		return nil, err
 	}
-	var acc openresponses.Accumulator
-	var resp *openresponses.Response
-	for ev, err := range openresponses.Events(ctx, r.cfg.Model, req) {
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, stop(ReasonAborted, ctx.Err())
-			}
+	for attempt := 1; ; attempt++ {
+		resp, committed, err := r.stream(ctx, req)
+		if err == nil {
+			return resp, nil
+		}
+		if ctx.Err() != nil {
+			return nil, stop(ReasonAborted, ctx.Err())
+		}
+		if committed || attempt >= r.cfg.Retry.MaxAttempts || !r.cfg.Retry.retryable(err) {
 			return nil, fmt.Errorf("agentturn: model: %w", err)
 		}
-		acc.Add(ev)
-		if err := r.streamEvent(ev, &acc); err != nil {
+		delay := r.cfg.Retry.backoff(attempt, err)
+		if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: attempt, Err: err, Delay: delay}); err != nil {
 			return nil, err
+		}
+		if err := sleep(ctx, delay); err != nil {
+			return nil, stop(ReasonAborted, err)
+		}
+	}
+}
+
+// sleep waits for d or until ctx is done.
+func sleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// stream runs one attempt at the request. committed reports that the
+// attempt cannot be retried: an event of it reached subscribers, or
+// the server answered with a terminal response. The error is returned
+// unwrapped so a retry policy sees the transport or wire error itself.
+func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *openresponses.Response, committed bool, err error) {
+	var acc openresponses.Accumulator
+	for ev, err := range openresponses.Events(ctx, r.cfg.Model, req) {
+		if err != nil {
+			return nil, committed, err
+		}
+		acc.Add(ev)
+		emitted, err := r.streamEvent(ev, &acc)
+		committed = committed || emitted
+		if err != nil {
+			return nil, true, err
 		}
 		if final, ok := openresponses.TerminalResponse(ev); ok {
 			resp = final
 		}
 	}
 	if resp == nil {
-		if ctx.Err() != nil {
-			return nil, stop(ReasonAborted, ctx.Err())
-		}
-		return nil, errors.New("agentturn: model: stream ended without a terminal event")
+		return nil, committed, openresponses.ErrTruncatedStream
 	}
 	if err := r.emit(&ResponseEnd{RunID: r.runID, Turn: r.turn, Response: resp}); err != nil {
-		return nil, err
+		return nil, true, err
 	}
 	if resp.Status == openresponses.ResponseStatusFailed {
 		if resp.Error != nil {
-			return nil, fmt.Errorf("agentturn: model: %w", resp.Error.Err(0))
+			return nil, true, resp.Error.Err(0)
 		}
-		return nil, errors.New("agentturn: model: response failed")
+		return nil, true, errors.New("response failed")
 	}
-	return resp, nil
+	return resp, true, nil
 }
 
 // streamEvent turns one wire event, already added to acc, into the item
 // events of the turn: item_start when an output item opens, item_end
 // with the transcript append when it is done, item_update for the
-// events in between. An error event fails the turn.
-func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Accumulator) error {
+// events in between. It reports whether an event was emitted. An error
+// event fails the attempt with the wire error, unwrapped.
+func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Accumulator) (bool, error) {
 	responseID := ""
 	if cur := acc.Response(); cur != nil {
 		responseID = cur.ID
 	}
 	switch e := ev.(type) {
 	case *openresponses.OutputItemAddedEvent:
-		return r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[e.OutputIndex], ResponseID: responseID})
+		return true, r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[e.OutputIndex], ResponseID: responseID})
 	case *openresponses.OutputItemDoneEvent:
 		r.transcript = append(r.transcript, e.Item)
 		r.added = append(r.added, e.Item)
-		return r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: e.Item, ResponseID: responseID})
+		return true, r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: e.Item, ResponseID: responseID})
 	case *openresponses.ErrorEvent:
-		return fmt.Errorf("agentturn: model: %w", e.Err())
+		return false, e.Err()
 	}
 	if idx, ok := outputIndex(ev); ok {
-		return r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[idx], Stream: ev, ResponseID: responseID})
+		return true, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[idx], Stream: ev, ResponseID: responseID})
 	}
-	return nil
+	return false, nil
 }
 
 // outputIndex returns the output index an item-scoped event refers to.
