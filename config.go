@@ -95,11 +95,39 @@ type Config struct {
 	// the model sees change only when this config does.
 	Request openresponses.Request
 
+	// BeforeTurn runs at the start of each turn, before the request is
+	// built, and returns items the loop appends to the transcript with
+	// their item events, as it appends a queued message: the time, a
+	// reminder due, the state of the environment, whatever the model
+	// needs this turn. The items are then facts about the transcript, so
+	// a recorded session rebuilds the request they were part of, which
+	// injection through Transform cannot give. nil or no items appends
+	// nothing. A guard on the request itself belongs in BeforeModelCall.
+	BeforeTurn func(context.Context, TurnStartInfo) (openresponses.Items, error)
+
 	// BeforeModelCall runs on the fully built request of each turn, just
 	// before it is sent and before turn_start reports it. It may change
-	// anything; a change to Input has the same effect on session
-	// verification as a Transform.
+	// anything. A change to Input is one the record cannot describe, so
+	// a session recorder writes that call without a request hash; a
+	// change to a setting is recorded as a config delta. A hook that
+	// refuses the call ends the run with ReasonError after a
+	// [ModelBlocked] event carrying the request as built; a guard that
+	// calls a model is on the critical path of every first token, since
+	// the request is not final until the hook returns.
 	BeforeModelCall func(context.Context, *openresponses.Request) error
+
+	// OutputGuard runs on each assistant message as the stream completes
+	// it, after output_item.done and before the message is appended to
+	// the transcript and delivered as item_end, and may replace it with
+	// another message, a placeholder for one that must not reach the
+	// user, the transcript or the record. nil keeps the message. The
+	// deltas of the original have already been delivered as item_update,
+	// so a front that must not show withheld text renders on item_end.
+	// Function calls, reasoning and every other output item never reach
+	// it, so a replay still has what it needs; a guard that also wants
+	// to end the run returns an error wrapping [ErrGuard] from
+	// ShouldStopAfterTurn, which sees the turn with TurnInfo.Final set.
+	OutputGuard func(context.Context, OutputInfo) (*openresponses.Message, error)
 
 	// Retry is the policy for transient model failures. The zero value
 	// retries nothing; see [Retry].
@@ -128,10 +156,23 @@ type Config struct {
 	// call of the batch executes. A nil decision allows the call.
 	BeforeToolCall func(context.Context, ToolCallInfo) (*ToolDecision, error)
 	// AfterToolCall runs when a call completes and may replace its
-	// result. A nil override keeps the result.
+	// result. A nil override keeps the result. An override replaces the
+	// result before tool_end is delivered and before the output is
+	// appended, so no subscriber and no recorder sees what the tool
+	// returned: bytes cut here exist nowhere afterwards. A cap on tool
+	// output therefore belongs in the tool, the only place the whole
+	// output exists, which can cut the middle so both ends survive and
+	// leave the full bytes where the model can read them, naming that
+	// place in the text it returns; a Transform, which shapes one call
+	// and never replaces the transcript, is the other placement that
+	// keeps the record whole. This hook is for a policy on the result
+	// the model sees, not for saving space.
 	AfterToolCall func(context.Context, ToolResultInfo) (*ToolOverride, error)
 	// ShouldStopAfterTurn ends the run after a turn even when the model
-	// requested tools.
+	// requested tools: true ends it with ReasonStopped and StopHook. An
+	// error wrapping [ErrGuard] ends it with ReasonStopped, StopGuard
+	// and the error on RunEnd.Err, so a policy that stops a run is told
+	// apart from a failure; any other error ends it with ReasonError.
 	ShouldStopAfterTurn func(context.Context, TurnInfo) (bool, error)
 
 	// RequestExtra is passed through as Request.Extra on every call.
@@ -227,6 +268,13 @@ type ToolCallInfo struct {
 	Tool agenttool.Tool
 	// Args are the arguments as raw JSON.
 	Args json.RawMessage
+	// Batch is every call of the turn in the model's order and Index is
+	// this call's position in it. BeforeToolCall runs for each call of
+	// the batch, in order, before any call executes, so a hook that
+	// defers one call can defer the rest of the batch and hold all of
+	// it for the answer.
+	Batch []*openresponses.FunctionCall
+	Index int
 }
 
 // ToolAction is what BeforeToolCall decides for a call.
@@ -262,6 +310,11 @@ type ToolDecision struct {
 	// evaluated on its own and "agent" for another model. Empty is read
 	// as policy. The loop does not use it.
 	By string
+	// Note is text the model sees with the result: it is appended after
+	// the batch's outputs as a developer message, so the model reads the
+	// result and the note together, in that order, in the same turn. It
+	// applies to an allowed call; a blocked call carries its Reason.
+	Note string
 }
 
 // ToolResultInfo describes a completed call.
@@ -289,9 +342,31 @@ type TurnInfo struct {
 	// ToolResults are the results of this turn's calls in the model's
 	// order, empty when the model called no tools.
 	ToolResults []agenttool.Result
+	// Final is set when the model called no tools, so the response is
+	// the run's answer unless a queued follow-up keeps it going.
+	Final bool
 	// Transcript is the working transcript after the turn. It is the
 	// loop's live slice; do not mutate it or keep it past the hook.
 	Transcript Transcript
+}
+
+// TurnStartInfo describes a turn about to start, for [Config.BeforeTurn].
+type TurnStartInfo struct {
+	RunID string
+	Turn  int
+	// Transcript is the working transcript as the turn starts. It is the
+	// loop's live slice; do not mutate it or keep it past the hook.
+	Transcript Transcript
+}
+
+// OutputInfo describes an assistant message the stream has completed,
+// for [Config.OutputGuard].
+type OutputInfo struct {
+	RunID      string
+	Turn       int
+	ResponseID string
+	// Message is the message as the model produced it.
+	Message *openresponses.Message
 }
 
 // DefaultFilter drops every item whose type carries a slug prefix such

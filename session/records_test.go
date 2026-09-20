@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -134,7 +135,12 @@ func TestRunEndReasonsFollowTheCascade(t *testing.T) {
 		}, agentsession.ReasonStopped, ""},
 		{"stopped by a guard on a final turn reads as done", func() agentturn.Config {
 			return agentturn.Config{Model: &echo.Adapter{}, ShouldStopAfterTurn: func(context.Context, agentturn.TurnInfo) (bool, error) { return true, nil }}
-		}, agentsession.ReasonDone, "stopped"},
+		}, agentsession.ReasonDone, "hook"},
+		{"stopped by a guard error reads as done with the guard as ref", func() agentturn.Config {
+			return agentturn.Config{Model: &echo.Adapter{}, ShouldStopAfterTurn: func(context.Context, agentturn.TurnInfo) (bool, error) {
+				return false, fmt.Errorf("%w: phone number", agentturn.ErrGuard)
+			}}
+		}, agentsession.ReasonDone, "guard"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -181,7 +187,7 @@ func TestRunEndReasonsFollowTheCascade(t *testing.T) {
 	}
 	verifyAll(t, s)
 	runs := runsOf(t, s)
-	if last := runs[len(runs)-1]; last.End == nil || last.End.Reason != agentsession.ReasonAborted || last.End.Ref != "stopped" {
+	if last := runs[len(runs)-1]; last.End == nil || last.End.Reason != agentsession.ReasonAborted || last.End.Ref != "terminate" {
 		t.Errorf("terminating resume end = %+v", last.End)
 	}
 }
@@ -655,3 +661,58 @@ func TestJSONLRoundTripVerifies(t *testing.T) {
 		t.Errorf("child responses = %d in %q", n, entryTypes(cs))
 	}
 }
+
+// sideData is a Details value a tool keeps in the session.
+type sideData struct {
+	Path  string `json:"path"`
+	Bytes int    `json:"bytes"`
+}
+
+func (sideData) RecordNS() string { return "acme:tool_output" }
+
+func TestRecordableDetailsBecomeACustomEntry(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keeper := agenttool.New("run", "", func(_ context.Context, _ echoArgs) (agenttool.Result, error) {
+		return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: "first 4 KB ... last 4 KB"}, Details: sideData{Path: "/tmp/out.log", Bytes: 300_000}}, nil
+	})
+	plain := agenttool.New("plain", "", func(_ context.Context, _ echoArgs) (string, error) { return "x", nil })
+	a := agentturn.New(agentturn.Config{Model: allCalls{}, Tools: []agenttool.Tool{keeper, plain}})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
+		t.Fatal(err)
+	}
+	// Only the recordable value is written, between the dispatches and
+	// the outputs; a Details value for subscribers alone is not.
+	if got := entryTypes(s); got != "run config item:user item:function_call* item:function_call* response dispatch dispatch custom item:function_call_output item:function_call_output item:assistant* response run" {
+		t.Errorf("entries = %q", got)
+	}
+	var found *agentsession.CustomEntry
+	for _, e := range s.Entries() {
+		if c, ok := e.(*agentsession.CustomEntry); ok {
+			found = c
+		}
+	}
+	var data sideData
+	if found == nil || found.NS != "acme:tool_output" || json.Unmarshal(found.Data, &data) != nil || data.Path != "/tmp/out.log" || data.Bytes != 300_000 {
+		t.Errorf("custom = %+v", found)
+	}
+	verifyAll(t, s)
+	// A recordable with no namespace fails the run rather than writing
+	// an entry nothing can find.
+	bad := agenttool.New("bad", "", func(_ context.Context, _ echoArgs) (agenttool.Result, error) {
+		return agenttool.Result{Details: noNS{}}, nil
+	})
+	b := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{bad}})
+	defer rec.Attach(b)()
+	if _, err := b.Prompt(context.Background(), openresponses.UserText("x")); err == nil || !strings.Contains(err.Error(), "empty namespace") {
+		t.Errorf("empty namespace: %v", err)
+	}
+}
+
+type noNS struct{}
+
+func (noNS) RecordNS() string { return "" }

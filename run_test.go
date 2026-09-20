@@ -330,22 +330,30 @@ func TestRunStopAfterTurnAndMaxTurns(t *testing.T) {
 	}
 }
 
-func TestRunTerminateNeedsEveryResult(t *testing.T) {
+func TestRunTerminateStopsWithItsCause(t *testing.T) {
 	// twoCalls streams two function calls per turn so the batch has two
 	// results.
 	terminating := agenttool.New("a", "", func(context.Context, echoArgs) (agenttool.Result, error) {
 		return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: "a"}, Terminate: true}, nil
 	})
 	plain := agenttool.New("b", "", func(context.Context, echoArgs) (string, error) { return "b", nil })
+	// A mixed batch ends the run after every call has run, and says the
+	// batch did not agree.
 	cfg := Config{Model: &twoCalls{}, Tools: []agenttool.Tool{terminating, plain}, MaxTurns: 2}
 	_, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
-	if err != nil || end.Reason != ReasonStopped || len(end.Items) != 1+2*4 {
-		t.Errorf("mixed batch should run to MaxTurns: err=%v reason=%s items=%s", err, end.Reason, itemTypes(end.Items))
+	if err != nil || end.Reason != ReasonStopped || end.Cause != StopPartialTerminate || itemTypes(end.Items) != "user function_call function_call function_call_output function_call_output" {
+		t.Errorf("mixed batch: err=%v reason=%s cause=%s items=%s", err, end.Reason, end.Cause, itemTypes(end.Items))
 	}
 	cfg.Tools = []agenttool.Tool{terminating, terminating2()}
 	_, end, err = collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
-	if err != nil || end.Reason != ReasonStopped || len(end.Items) != 1+4 {
-		t.Errorf("terminating batch should stop after one turn: err=%v reason=%s items=%s", err, end.Reason, itemTypes(end.Items))
+	if err != nil || end.Reason != ReasonStopped || end.Cause != StopTerminate || len(end.Items) != 1+4 {
+		t.Errorf("terminating batch should stop after one turn: err=%v reason=%s cause=%s items=%s", err, end.Reason, end.Cause, itemTypes(end.Items))
+	}
+	// Nothing terminating: the turn budget stops the run, and says so.
+	cfg.Tools = []agenttool.Tool{plain, agenttool.New("a", "", func(context.Context, echoArgs) (string, error) { return "a", nil })}
+	_, end, err = collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
+	if err != nil || end.Reason != ReasonStopped || end.Cause != StopMaxTurns {
+		t.Errorf("max turns: err=%v reason=%s cause=%s", err, end.Reason, end.Cause)
 	}
 }
 
