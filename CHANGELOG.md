@@ -5,6 +5,12 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Depends on `agentsession` v0.0.5, the release that implements RFC
+  0001 draft 0.2. The `session` module builds and tests against it
+  unchanged; the entries the draft added follow in this release.
+
 ## v0.0.5 - 2026-09-19
 
 - **Fixed**: an abort delivered every event after it, the `tool_end` of
