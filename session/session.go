@@ -96,6 +96,13 @@
 //   - tool_end with a tools/agent ChildInfo whose run was not observed:
 //     a session holding only the child's items, with no records
 //     promise, and the link; wire Observe to get the full record.
+//   - tool_end whose Result.Details implements agenttool.Recordable: a
+//     custom entry in the namespace the value names, carrying its JSON,
+//     between the call's dispatch and its output. This is how a tool
+//     keeps what its output does not carry, the full bytes of a
+//     truncated result for one, in the session without the recorder
+//     knowing its type. Details for in-process subscribers alone are
+//     not recorded.
 //
 // # Header
 //
@@ -801,11 +808,28 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 	case *agentturn.RunEnd:
 		return w.runEnd(ctx, e)
 	case *agentturn.ToolEnd:
-		if info, ok := e.Result.Details.(agent.ChildInfo); ok && w.rec.children {
-			return w.child(ctx, e.CallID, info)
-		}
+		return w.toolEnd(ctx, e)
 	}
 	return nil
+}
+
+// toolEnd writes what a call's result carries for the record: a child
+// run's link, and the tool's own side data when its Details value is
+// an agenttool.Recordable, as a custom entry in the namespace the value
+// names, between the call's dispatch and its output.
+func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
+	if info, ok := e.Result.Details.(agent.ChildInfo); ok && w.rec.children {
+		return w.child(ctx, e.CallID, info)
+	}
+	rec, err := agenttool.RecordOf(e.Result.Details)
+	if err != nil {
+		return fmt.Errorf("session: call %s: %w", e.CallID, err)
+	}
+	if rec == nil {
+		return nil
+	}
+	_, err = w.append(ctx, &agentsession.CustomEntry{NS: rec.NS, Data: rec.Data})
+	return err
 }
 
 // runStart opens the run on the record: the run entry, the env when

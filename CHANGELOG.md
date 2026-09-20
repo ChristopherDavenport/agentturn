@@ -7,6 +7,12 @@ versions may break the API.
 
 ## Unreleased
 
+- Depends on `agenttool` v0.0.5, and `session` writes a tool's side
+  data: a `Result.Details` value that implements `agenttool.Recordable`
+  is written on `tool_end` as a custom entry in the namespace it names,
+  between the call's dispatch and its output, so a tool keeps what its
+  output does not carry, the full bytes of a truncated result for one,
+  without the recorder knowing its type. (#53, the library half)
 - Depends on `agentsession` v0.0.5, the release that implements RFC
   0001 draft 0.2, and `session` writes the record entries the draft
   added, so a session written by this recorder is resumable from the
