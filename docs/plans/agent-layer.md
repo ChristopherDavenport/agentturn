@@ -517,23 +517,51 @@ should not have to alias one of them.
 
 ## Open questions
 
-- Whether `front/a2a` lives in this repo or its own.
-- Whether `Filter` should be a method on a `Transcript` wrapper type
-  rather than a function in config.
-- Concurrency limit default for parallel tools.
-- Whether steering should also be able to cancel in-flight tools, which pi
-  does not do.
-- Whether the schema generator should be its own package under `tool`
-  so it can be reused for `text.format` JSON schemas on the request side.
-- Whether the MCP adapters ship before or after `front/a2a`.
-- Whether `Config.Tools` should accept a provider function as well as a
-  slice, so a `tools/mcp` server whose tool list changes mid-run is
-  picked up on the next turn without the caller rebuilding config.
-- Whether `tools/mcp` should expose MCP resources and prompts at all, or
-  stay strictly a tool adapter.
-- Whether a child in `tools/agent` should share the parent's `Model` by
-  default or require one in its own `Config`.
-- Whether the child's transcript should be returned in full through
-  `Details` or only summarised, given large sub-runs.
-- Whether `front/a2a` should advertise each `Tool` as an A2A skill or
-  only a single skill from `Config.Description`.
+Revisited 2026-09-20 against the code. Each question is marked
+resolved, with the answer the code gives, or deferred, with what would
+reopen it.
+
+Resolved:
+
+- `front/a2a` lives in this repo, as a nested module with its own
+  `go.mod`, alongside `tools/a2a`. One version per repository, tagged
+  in lockstep with the root.
+- `Filter` stays a function in `Config`, typed `Transcript` to
+  `Transcript`, with `DefaultFilter` and `VisibleFilter` as the
+  ready-made values. No wrapper type; `Transcript` remains an alias of
+  `openresponses.Items` so the transcript and the wire share bytes.
+- The concurrency limit defaults to `agenttool.DefaultMaxParallel`,
+  which is 8; `Config.MaxParallelTools` overrides it.
+- The schema generator lives in the `agenttool` root package
+  (`Reflect`, `SchemaOf`, `SchemaFor`), not in a sub-package, and is
+  importable on its own for `text.format` schemas since the whole
+  contract moved to its own module.
+- The MCP adapters shipped in the first release together with
+  `front/a2a`, and then moved to `agenttool` as `mcpclient` and
+  `mcpserver` because MCP is about tools, not the loop.
+- `Config.ToolProvider` supplies the tools for each turn in place of
+  `Config.Tools`; the loop resolves it once per turn through
+  `ResolveTools`, and `front/a2a` and the responses front use the same
+  resolution.
+- `mcpclient` is strictly a tool adapter: no resources, no prompts. A
+  resource or prompt reaches the model as a tool that returns it, or
+  through the host's `Transform`.
+- A child in `tools/agent` requires its own `Model`; the loop
+  validates `Config.Model` on every run and a nil model refuses to
+  start. Sharing is one assignment at the call site, and requiring it
+  keeps a child's configuration complete on its own.
+- The child's full transcript returns through `ChildInfo.Items`, so
+  the session recorder can write the child as a linked subsession
+  without a second channel. A host that wants less keeps only what it
+  needs; the loop does not summarise.
+- `front/a2a` advertises one default skill from `Config.Description`
+  plus one skill per tool, resolved through `ToolProvider` when set.
+- Retries, formerly a non-goal, are the loop's: see Retry above.
+
+Deferred:
+
+- Whether steering should cancel in-flight tools. Today `Steer` queues
+  items for after the current batch, as pi does; a tool that runs long
+  is cut only by `Abort`. Reopen if a front needs "stop that tool but
+  keep the run", which would need a per-call cancel on `ToolStart` and
+  a defined output for the cut call.
