@@ -261,7 +261,7 @@ func TestAgentAbortAndIdle(t *testing.T) {
 
 	// The cut-off call is pending: Prompt and Continue refuse, Resume
 	// answers it and the run completes.
-	if len(st.Pending) != 1 || st.Pending[0].Name != "upper" {
+	if len(st.Pending) != 1 || st.Pending[0].Call.Name != "upper" {
 		t.Fatalf("pending = %v", st.Pending)
 	}
 	if _, err := a.Prompt(context.Background(), openresponses.UserText("z")); !errors.Is(err, ErrInputRequired) {
@@ -270,7 +270,7 @@ func TestAgentAbortAndIdle(t *testing.T) {
 	if _, err := a.Continue(context.Background()); !errors.Is(err, ErrInputRequired) {
 		t.Errorf("continue after abort err = %v", err)
 	}
-	out := &openresponses.FunctionCallOutput{CallID: st.Pending[0].CallID, Output: openresponses.FunctionCallOutputData{Text: "Error: aborted"}}
+	out := &openresponses.FunctionCallOutput{CallID: st.Pending[0].Call.CallID, Output: openresponses.FunctionCallOutputData{Text: "Error: aborted"}}
 	if _, err := a.Resume(context.Background(), Output(out)); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
@@ -281,7 +281,7 @@ func TestAgentAbortAndIdle(t *testing.T) {
 
 	// A transcript seeded with the same dangling call is pending too.
 	b := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{blocking}}, WithTranscript(st.Transcript[:2]))
-	if p := b.State().Pending; len(p) != 1 || p[0].CallID != out.CallID {
+	if p := b.State().Pending; len(p) != 1 || p[0].Call.CallID != out.CallID {
 		t.Errorf("seeded pending = %v", p)
 	}
 	if _, err := b.Prompt(context.Background(), openresponses.UserText("z")); !errors.Is(err, ErrInputRequired) {
@@ -313,7 +313,7 @@ func TestAgentResume(t *testing.T) {
 	if len(st.Pending) != 1 || itemTypes(st.Transcript) != "user function_call" {
 		t.Fatalf("state = %+v", st)
 	}
-	call := st.Pending[0]
+	call := st.Pending[0].Call
 	if _, err := a.Prompt(context.Background(), openresponses.UserText("more")); !errors.Is(err, ErrInputRequired) {
 		t.Errorf("prompt while pending = %v", err)
 	}
@@ -361,7 +361,7 @@ func TestAgentPromptReturnsRunEnd(t *testing.T) {
 	if err != nil || end == nil || end.Reason != ReasonInputRequired || len(end.Pending) != 1 || itemTypes(end.Items) != "user function_call" {
 		t.Fatalf("paused prompt: err=%v end=%+v", err, end)
 	}
-	end, err = a.Resume(context.Background(), Output(openresponses.NewFunctionCallOutput(end.Pending[0].CallID, "ABC")))
+	end, err = a.Resume(context.Background(), Output(openresponses.NewFunctionCallOutput(end.Pending[0].Call.CallID, "ABC")))
 	if err != nil || end.Reason != ReasonDone || itemTypes(end.Items) != "function_call_output assistant" {
 		t.Fatalf("resumed: err=%v end=%+v", err, end)
 	}
@@ -400,7 +400,7 @@ func TestAgentSetConfigAndSetTranscript(t *testing.T) {
 	if err := a.SetTranscript(branch); err != nil {
 		t.Fatal(err)
 	}
-	if st := a.State(); itemTypes(st.Transcript) != "user function_call" || len(st.Pending) != 1 || st.Pending[0].CallID != "c1" {
+	if st := a.State(); itemTypes(st.Transcript) != "user function_call" || len(st.Pending) != 1 || st.Pending[0].Call.CallID != "c1" {
 		t.Errorf("state after SetTranscript = %+v", st)
 	}
 	if err := a.SetTranscript(Transcript{openresponses.UserText("clean")}); err != nil {
@@ -529,7 +529,7 @@ func TestAgentResumeApproves(t *testing.T) {
 	if _, err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
 		t.Fatal(err)
 	}
-	call := a.State().Pending[0]
+	call := a.State().Pending[0].Call
 	rec := &recorder{}
 	rec.subscribe(a)
 	// The approved call runs inside the loop: its tool events fire with
@@ -568,7 +568,7 @@ func TestAgentResumeApproves(t *testing.T) {
 	if _, err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
 		t.Fatal(err)
 	}
-	pending := a.State().Pending
+	pending := PendingCalls(a.State().Pending)
 	if len(pending) != 2 {
 		t.Fatalf("pending = %v", pending)
 	}
@@ -597,7 +597,7 @@ func TestAgentResumeApproves(t *testing.T) {
 	if _, err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
 		t.Fatal(err)
 	}
-	call = a.State().Pending[0]
+	call = a.State().Pending[0].Call
 	if err := a.SetConfig(Config{Model: &echo.Adapter{}}); err != nil {
 		t.Fatal(err)
 	}
@@ -617,7 +617,7 @@ func TestAgentResumeApproves(t *testing.T) {
 	if _, err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
 		t.Fatal(err)
 	}
-	end, err = a.Resume(context.Background(), Approve(a.State().Pending[0].CallID))
+	end, err = a.Resume(context.Background(), Approve(a.State().Pending[0].Call.CallID))
 	if err != nil || end.Reason != ReasonStopped || itemTypes(end.Items) != "function_call_output" {
 		t.Errorf("terminating resume: err=%v end=%+v", err, end)
 	}
@@ -644,7 +644,7 @@ func TestAgentPromptAnswersPending(t *testing.T) {
 	<-started
 	a.Abort()
 	<-done
-	pending := a.State().Pending
+	pending := PendingCalls(a.State().Pending)
 	if len(pending) != 1 {
 		t.Fatalf("pending = %v", pending)
 	}

@@ -107,6 +107,17 @@ type Fold struct {
 	TokensBefore int
 	// Usage is what the fold's model call reported, when it did.
 	Usage *openresponses.Usage
+	// ResponseID is the ID of the response the fold's model call
+	// produced, from either endpoint, so a recorder can tie the fold to
+	// a call the server made and a replay can recognise the fold's call
+	// among the run's.
+	ResponseID string
+	// Request is the request [NewLocal] sent for the fold: the items
+	// being folded and the summary prompt. Its input is no path's
+	// context, so a hash of it never rebuilds from a stored path; a
+	// recorder that keeps it must mark it as the fold's own call. nil
+	// for [New], whose compaction request is not a Request.
+	Request *openresponses.Request
 	// Err is set when the fold failed; Transform returns it. A fold cut
 	// off by an abort carries the context error.
 	Err error
@@ -170,7 +181,7 @@ func New(c Compactor, opts ...Option) *Transform {
 		if resp == nil || len(resp.Output) == 0 {
 			return folded{}, errors.New("compact: empty compaction response")
 		}
-		f := folded{output: append(openresponses.Items(nil), resp.Output...), usage: resp.Usage}
+		f := folded{output: append(openresponses.Items(nil), resp.Output...), usage: resp.Usage, responseID: resp.ID}
 		for _, item := range f.output {
 			if c, ok := item.(*openresponses.Compaction); ok {
 				f.summary = c
@@ -183,12 +194,14 @@ func New(c Compactor, opts ...Option) *Transform {
 }
 
 // folded is what a fold produced: the items that stand in for the
-// prefix, the one among them a recorder keeps as the summary, and the
-// usage of the call that made them.
+// prefix, the one among them a recorder keeps as the summary, the
+// usage of the call that made them, and the call itself.
 type folded struct {
-	output  openresponses.Items
-	summary openresponses.Item
-	usage   *openresponses.Usage
+	output     openresponses.Items
+	summary    openresponses.Item
+	usage      *openresponses.Usage
+	responseID string
+	request    *openresponses.Request
 }
 
 // NewLocal builds a Transform that folds by asking model for a summary
@@ -222,7 +235,7 @@ func NewLocal(model openresponses.Streamer, opts ...Option) *Transform {
 			return folded{}, errors.New("compact: summary response has no text")
 		}
 		item := t.summaryItem(summary)
-		return folded{output: openresponses.Items{item}, summary: item, usage: resp.Usage}, nil
+		return folded{output: openresponses.Items{item}, summary: item, usage: resp.Usage, responseID: resp.ID, request: &req}, nil
 	}
 	return t
 }
@@ -326,7 +339,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	out := t.join(items, split)
 	t.mu.Unlock()
 	if t.onFold != nil {
-		if err := t.onFold(ctx, Fold{Split: split, Output: f.output, Summary: f.summary, TokensBefore: tokens, Usage: f.usage}); err != nil {
+		if err := t.onFold(ctx, Fold{Split: split, Output: f.output, Summary: f.summary, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, Request: f.request}); err != nil {
 			return nil, fmt.Errorf("compact: on-fold: %w", err)
 		}
 	}

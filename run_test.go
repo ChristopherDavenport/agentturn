@@ -559,7 +559,7 @@ func TestRunAbortMidTool(t *testing.T) {
 		t.Errorf("events = %v", got)
 	}
 	// The cut-off call is the caller's to answer.
-	if len(end.Pending) != 1 || end.Pending[0].Name != "upper" {
+	if len(end.Pending) != 1 || end.Pending[0].Call.Name != "upper" {
 		t.Errorf("pending = %v", end.Pending)
 	}
 	if CanContinue(append(Transcript(nil), end.Items...)) {
@@ -581,7 +581,8 @@ func TestUnansweredCalls(t *testing.T) {
 		{"answered", Transcript{openresponses.UserText("x"), call("a"), out("a")}, nil},
 		{"one unanswered", Transcript{openresponses.UserText("x"), call("a")}, []string{"a"}},
 		{"mixed batch", Transcript{openresponses.UserText("x"), call("a"), call("b"), call("c"), out("b")}, []string{"a", "c"}},
-		{"earlier turn ignored", Transcript{openresponses.UserText("x"), call("a"), openresponses.UserText("y"), call("b"), out("b")}, nil},
+		{"message after a dangling call does not settle it", Transcript{openresponses.UserText("x"), call("a"), openresponses.UserText("y"), call("b"), out("b")}, []string{"a"}},
+		{"answered across a message", Transcript{openresponses.UserText("x"), call("a"), openresponses.UserText("y"), out("a")}, nil},
 		{"answered later in tail", Transcript{openresponses.UserText("x"), call("a"), out("a"), call("b")}, []string{"b"}},
 	}
 	for _, tt := range tests {
@@ -684,7 +685,7 @@ func TestRunDeferredCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if end.Reason != ReasonInputRequired || len(end.Pending) != 1 || end.Pending[0].Name != "upper" {
+	if end.Reason != ReasonInputRequired || len(end.Pending) != 1 || end.Pending[0].Call.Name != "upper" {
 		t.Fatalf("end = %+v", end)
 	}
 	if got := itemTypes(end.Items); got != "user function_call" {
@@ -707,7 +708,7 @@ func TestRunDeferredCall(t *testing.T) {
 	// The caller answers the call and continues; the hook is not
 	// consulted again because the model has nothing left to call.
 	transcript := append(Transcript(nil), end.Items...)
-	transcript = append(transcript, openresponses.NewFunctionCallOutput(end.Pending[0].CallID, "ABC"))
+	transcript = append(transcript, openresponses.NewFunctionCallOutput(end.Pending[0].Call.CallID, "ABC"))
 	_, end, err = collect(t, Continue(context.Background(), transcript, cfg))
 	if err != nil || end.Reason != ReasonDone || end.Items[0].(*openresponses.Message).Text() != "Tool result: ABC" {
 		t.Errorf("resume: err=%v end=%+v", err, end)
@@ -726,7 +727,7 @@ func TestRunDeferredCall(t *testing.T) {
 			return nil, nil
 		}}
 	_, end, err = collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
-	if err != nil || end.Reason != ReasonInputRequired || len(end.Pending) != 1 || end.Pending[0].Name != "a" {
+	if err != nil || end.Reason != ReasonInputRequired || len(end.Pending) != 1 || end.Pending[0].Call.Name != "a" {
 		t.Fatalf("mixed: err=%v end=%+v", err, end)
 	}
 	if got := itemTypes(end.Items); got != "user function_call function_call function_call function_call_output function_call_output" {

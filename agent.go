@@ -58,7 +58,7 @@ type Agent struct {
 	turn       int
 	cancel     context.CancelFunc
 	idle       chan struct{}
-	pending    []*openresponses.FunctionCall
+	pending    []PendingCall
 }
 
 type subscription struct {
@@ -70,14 +70,16 @@ type subscription struct {
 type Option func(*Agent)
 
 // WithTranscript starts the agent from an existing transcript, as when
-// resuming a session. Function calls after the last user message that
-// have no output are pending, as they would be after the run that made
-// them: Prompt and Continue return [ErrInputRequired] until
-// [Agent.Resume] has answered them.
+// resuming a session. Function calls anywhere in it that have no
+// output are pending, with [PendingUnknown] as their reason since the
+// loop cannot say whether they ran, as they would be after the run
+// that made them: Prompt and Continue return [ErrInputRequired] until
+// [Agent.Resume] has answered them, or a Prompt opens with their
+// outputs.
 func WithTranscript(t Transcript) Option {
 	return func(a *Agent) {
 		a.transcript = append(Transcript(nil), t...)
-		a.pending = unansweredCalls(a.transcript)
+		a.pending = pendingCalls(unansweredCalls(a.transcript), PendingUnknown)
 	}
 }
 
@@ -128,7 +130,7 @@ func (a *Agent) SetTranscript(t Transcript) error {
 		return ErrRunning
 	}
 	a.transcript = append(Transcript(nil), t...)
-	a.pending = unansweredCalls(a.transcript)
+	a.pending = pendingCalls(unansweredCalls(a.transcript), PendingUnknown)
 	return nil
 }
 
@@ -142,10 +144,11 @@ type State struct {
 	// Steering and FollowUps count the queued items.
 	Steering  int
 	FollowUps int
-	// Pending lists the calls awaiting outputs, deferred or cut off by
-	// an abort or a failure; Continue refuses until Resume has answered
-	// them, and Prompt unless it opens with their outputs.
-	Pending []*openresponses.FunctionCall
+	// Pending lists the calls awaiting outputs, each with why: deferred,
+	// cut off by an abort or a failure, or found unanswered in a seeded
+	// transcript. Continue refuses until Resume has answered them, and
+	// Prompt unless it opens with their outputs.
+	Pending []PendingCall
 }
 
 // State returns a snapshot.
@@ -159,7 +162,7 @@ func (a *Agent) State() State {
 		Turn:       a.turn,
 		Steering:   len(a.steer),
 		FollowUps:  len(a.followUp),
-		Pending:    append([]*openresponses.FunctionCall(nil), a.pending...),
+		Pending:    append([]PendingCall(nil), a.pending...),
 	}
 }
 
@@ -170,7 +173,8 @@ func (a *Agent) State() State {
 // when the run could not start ([ErrNoPrompt], [ErrRunning],
 // [ErrInputRequired], [ErrNotPending], [ErrNoModel]) or ended with
 // ReasonError, in which case it is RunEnd.Err and the RunEnd is
-// returned alongside.
+// returned alongside. A [Trigger] attached to ctx with
+// [ContextWithTrigger] is carried on the run's RunStart.
 //
 // While calls are pending, a prompt that opens with a
 // function_call_output for each of them is accepted: the outputs are
@@ -252,14 +256,14 @@ func ApproveWith(callID string, args json.RawMessage) Answer {
 // does. With nothing pending, Resume returns [ErrNotPending].
 func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) {
 	a.mu.Lock()
-	pending := append([]*openresponses.FunctionCall(nil), a.pending...)
+	pending := append([]PendingCall(nil), a.pending...)
 	a.mu.Unlock()
 	if len(pending) == 0 {
 		return nil, fmt.Errorf("%w: nothing is pending", ErrNotPending)
 	}
 	byID := make(map[string]*openresponses.FunctionCall, len(pending))
-	for _, call := range pending {
-		byID[call.CallID] = call
+	for _, p := range pending {
+		byID[p.Call.CallID] = p.Call
 	}
 	var outputs openresponses.Items
 	var approved []approval
@@ -285,10 +289,10 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 // pending calls: every pending call must be answered exactly once by a
 // leading function_call_output, and no leading output may name a call
 // that is not pending.
-func answersPending(pending []*openresponses.FunctionCall, prompts openresponses.Items) error {
+func answersPending(pending []PendingCall, prompts openresponses.Items) error {
 	want := make(map[string]bool, len(pending))
-	for _, call := range pending {
-		want[call.CallID] = true
+	for _, p := range pending {
+		want[p.Call.CallID] = true
 	}
 	for _, item := range prompts {
 		out, ok := item.(*openresponses.FunctionCallOutput)

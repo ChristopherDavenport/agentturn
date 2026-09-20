@@ -182,7 +182,7 @@ func (a *Adapter) fullRun(ctx context.Context, req openresponses.Request, transc
 		// emitted here unless the trace already carried them.
 		if !a.toolItems {
 			for _, call := range end.Pending {
-				if err := rl.end(call); err != nil {
+				if err := rl.end(call.Call); err != nil {
 					return err
 				}
 			}

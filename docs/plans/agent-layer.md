@@ -509,6 +509,17 @@ should not have to alias one of them.
 - Returns from the subscriber only after the append is durable under the
   store's sync policy, so the barrier holds: tool preflight for a turn
   waits on the write.
+- Writes the record entries of format 0.2, and promises them in the
+  header: a `run` entry on `run_start` with the loop's source and the
+  trigger the caller put on the context, and on `run_end` with the
+  reason mapped onto the format's cascade and the run's calls left
+  open; a `dispatch` on `tool_start`, durable before the tool runs; a
+  `decision` for a blocked call (reject), a deferred one (hold), and
+  for an approval or a rewrite of the arguments (proceed, carrying what
+  the tool ran with). A call `BeforeModelCall` refused is a failed
+  response from the `model_blocked` event. `WithEnv` supplies the env
+  entry, written on change. Child sessions get derived IDs and
+  `spawned_by`, and their link is written at dispatch.
 
 ## Milestones
 

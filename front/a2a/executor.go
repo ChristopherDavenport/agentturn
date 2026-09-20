@@ -212,7 +212,7 @@ func (e *Executor) persist(ctx context.Context, contextID string, transcript age
 func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue, out outcome) error {
 	switch out.end.Reason {
 	case agentturn.ReasonInputRequired:
-		return e.inputRequired(ctx, reqCtx, q, out.end.Pending, "")
+		return e.inputRequired(ctx, reqCtx, q, agentturn.PendingCalls(out.end.Pending), "")
 	case agentturn.ReasonDone, agentturn.ReasonStopped:
 		var msg *a2a.Message
 		if out.lastText != "" {
