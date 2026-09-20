@@ -102,6 +102,27 @@ versions may break the API.
   takes a `Transcript` to `Transcript` function. The transform no
   longer holds its lock across the model call, and an unhashable
   prefix is no longer remembered as matching everything. (#21)
+- Loop readability: the tool batch is `preflightAll`, `execute` and
+  `collect`, the stream loop body is `streamEvent`, the per-call state
+  is `callState`, and every error the package produces begins with
+  `agentturn:`. `Agent` delivers `run_end` with a context that is not
+  cancelled, even after `Abort`, so a recorder can write on it. The
+  doc no longer claims a panic in a hook produces a `RunEnd`;
+  `Config.Reasoning`, `Config.Text` and `TurnInfo.Transcript` are
+  documented. (#16)
+- `session`: `mu` documents what it guards, the RFC 8785 canonical
+  form is `canonicalJSON` and distinct from `Canonical`, the number
+  formatter is tested against the RFC 8785 Appendix B values and
+  fuzzed for round-tripping, member names are UTF-16 encoded once per
+  object, and the dead response counter is gone. (#17)
+- A2A: `%w` chains are kept through `ErrInvalidParams`, the duplicated
+  part conversions say which counterpart to change with them,
+  `answeredCalls` backs both `unanswered` and `stripUnanswered`, an
+  artifact replace no longer aliases the SDK's parts slice, progress
+  text grows chunk by chunk instead of re-joining every artifact, data
+  part errors say what failed to encode, and the `tools/a2a` argument
+  schema is reflected once at init. `NewMemoryStore` and `Len` are
+  kept. (#18)
 - Depends on `agenttool` v0.0.2 and `agentsession` v0.0.2.
 
 ## v0.0.2 - 2026-09-19

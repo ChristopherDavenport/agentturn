@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf16"
@@ -33,20 +33,23 @@ func RequestHash(req openresponses.Request) (string, error) {
 }
 
 // HashJSON computes the request hash of an already-encoded request.
-// Member order and whitespace do not matter.
+// Member order and whitespace do not matter. Numbers are parsed as
+// float64 on the way, as RFC 8785 requires, so an integer above 2^53
+// hashes as its nearest double.
 func HashJSON(data []byte) (string, error) {
-	canonical, err := canonicalize(data)
+	canonical, err := canonicalJSON(data)
 	if err != nil {
-		return "", fmt.Errorf("session: canonicalise request: %w", err)
+		return "", fmt.Errorf("session: canonicalize request: %w", err)
 	}
 	sum := sha256.Sum256(canonical)
 	return HashPrefix + hex.EncodeToString(sum[:]), nil
 }
 
-// canonicalize returns the RFC 8785 form of a JSON document: members
+// canonicalJSON returns the RFC 8785 form of a JSON document: members
 // sorted by UTF-16 code units, no whitespace, minimal string escapes and
-// numbers as ECMAScript renders them.
-func canonicalize(data []byte) ([]byte, error) {
+// numbers as ECMAScript renders them. It is unrelated to [Canonical],
+// which strips transport members from a request.
+func canonicalJSON(data []byte) ([]byte, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	var v any
@@ -93,11 +96,7 @@ func writeCanonical(buf *bytes.Buffer, v any) error {
 		}
 		buf.WriteByte(']')
 	case map[string]any:
-		keys := make([]string, 0, len(x))
-		for k := range x {
-			keys = append(keys, k)
-		}
-		sort.Slice(keys, func(i, j int) bool { return lessUTF16(keys[i], keys[j]) })
+		keys := sortedKeys(x)
 		buf.WriteByte('{')
 		for i, k := range keys {
 			if i > 0 {
@@ -116,16 +115,23 @@ func writeCanonical(buf *bytes.Buffer, v any) error {
 	return nil
 }
 
-// lessUTF16 orders strings by UTF-16 code units (RFC 8785 section
-// 3.2.3).
-func lessUTF16(a, b string) bool {
-	ua, ub := utf16.Encode([]rune(a)), utf16.Encode([]rune(b))
-	for i := 0; i < len(ua) && i < len(ub); i++ {
-		if ua[i] != ub[i] {
-			return ua[i] < ub[i]
-		}
+// sortedKeys returns the member names ordered by UTF-16 code units
+// (RFC 8785 section 3.2.3), encoding each name once.
+func sortedKeys(m map[string]any) []string {
+	type key struct {
+		s string
+		u []uint16
 	}
-	return len(ua) < len(ub)
+	keys := make([]key, 0, len(m))
+	for k := range m {
+		keys = append(keys, key{s: k, u: utf16.Encode([]rune(k))})
+	}
+	slices.SortFunc(keys, func(a, b key) int { return slices.Compare(a.u, b.u) })
+	out := make([]string, len(keys))
+	for i, k := range keys {
+		out[i] = k.s
+	}
+	return out
 }
 
 // writeCanonicalString applies the escapes of RFC 8785 section 3.2.2.2:

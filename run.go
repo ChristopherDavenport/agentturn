@@ -11,15 +11,16 @@ import (
 	"github.com/ChristopherDavenport/openresponses"
 )
 
-// Errors returned before a run starts.
+// Errors returned before a run starts. Every error the package
+// produces, sentinel or wrapped, begins with "agentturn:".
 var (
-	// ErrNoModel: Config.Model is nil.
+	// ErrNoModel is returned when Config.Model is nil.
 	ErrNoModel = errors.New("agentturn: config has no model")
-	// ErrCannotContinue: the transcript does not end with a user message
-	// or a function call output, so there is nothing for the model to
-	// answer.
+	// ErrCannotContinue is returned when the transcript does not end
+	// with a user message or a function call output, so there is
+	// nothing for the model to answer.
 	ErrCannotContinue = errors.New("agentturn: transcript must end with a user message or a function call output to continue")
-	// ErrNoPrompt: Run was called with no prompt items.
+	// ErrNoPrompt is returned when Run was called with no prompt items.
 	ErrNoPrompt = errors.New("agentturn: no prompt items")
 )
 
@@ -344,7 +345,7 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items) error {
 		if r.cfg.ShouldStopAfterTurn != nil {
 			halt, err := r.cfg.ShouldStopAfterTurn(ctx, TurnInfo{RunID: r.runID, Turn: r.turn, Response: resp, ToolResults: results, Transcript: r.transcript})
 			if err != nil {
-				return fmt.Errorf("should-stop-after-turn hook: %w", err)
+				return fmt.Errorf("agentturn: should-stop-after-turn hook: %w", err)
 			}
 			if halt {
 				return stop(ReasonStopped, nil)
@@ -409,14 +410,14 @@ func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponse
 		var err error
 		input, err = r.cfg.Transform(ctx, input)
 		if err != nil {
-			return openresponses.Request{}, fmt.Errorf("transform: %w", err)
+			return openresponses.Request{}, fmt.Errorf("agentturn: transform: %w", err)
 		}
 	}
 	req := r.cfg.baseRequest(tools)
 	req.Input = r.cfg.filter()(input)
 	if r.cfg.BeforeModelCall != nil {
 		if err := r.cfg.BeforeModelCall(ctx, &req); err != nil {
-			return openresponses.Request{}, fmt.Errorf("before-model-call hook: %w", err)
+			return openresponses.Request{}, fmt.Errorf("agentturn: before-model-call hook: %w", err)
 		}
 	}
 	return req, nil
@@ -439,32 +440,11 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 			if ctx.Err() != nil {
 				return nil, stop(ReasonAborted, ctx.Err())
 			}
-			return nil, fmt.Errorf("model: %w", err)
+			return nil, fmt.Errorf("agentturn: model: %w", err)
 		}
 		acc.Add(ev)
-		responseID := ""
-		if cur := acc.Response(); cur != nil {
-			responseID = cur.ID
-		}
-		switch e := ev.(type) {
-		case *openresponses.OutputItemAddedEvent:
-			if err := r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[e.OutputIndex], ResponseID: responseID}); err != nil {
-				return nil, err
-			}
-		case *openresponses.OutputItemDoneEvent:
-			r.transcript = append(r.transcript, e.Item)
-			r.added = append(r.added, e.Item)
-			if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: e.Item, ResponseID: responseID}); err != nil {
-				return nil, err
-			}
-		case *openresponses.ErrorEvent:
-			return nil, fmt.Errorf("model: %w", e.Err())
-		default:
-			if idx, ok := outputIndex(ev); ok {
-				if err := r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[idx], Stream: ev, ResponseID: responseID}); err != nil {
-					return nil, err
-				}
-			}
+		if err := r.streamEvent(ev, &acc); err != nil {
+			return nil, err
 		}
 		if final, ok := openresponses.TerminalResponse(ev); ok {
 			resp = final
@@ -474,18 +454,43 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 		if ctx.Err() != nil {
 			return nil, stop(ReasonAborted, ctx.Err())
 		}
-		return nil, errors.New("model: stream ended without a terminal event")
+		return nil, errors.New("agentturn: model: stream ended without a terminal event")
 	}
 	if err := r.emit(&ResponseEnd{RunID: r.runID, Turn: r.turn, Response: resp}); err != nil {
 		return nil, err
 	}
 	if resp.Status == openresponses.ResponseStatusFailed {
 		if resp.Error != nil {
-			return nil, fmt.Errorf("model: %w", resp.Error.Err(0))
+			return nil, fmt.Errorf("agentturn: model: %w", resp.Error.Err(0))
 		}
-		return nil, errors.New("model: response failed")
+		return nil, errors.New("agentturn: model: response failed")
 	}
 	return resp, nil
+}
+
+// streamEvent turns one wire event, already added to acc, into the item
+// events of the turn: item_start when an output item opens, item_end
+// with the transcript append when it is done, item_update for the
+// events in between. An error event fails the turn.
+func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Accumulator) error {
+	responseID := ""
+	if cur := acc.Response(); cur != nil {
+		responseID = cur.ID
+	}
+	switch e := ev.(type) {
+	case *openresponses.OutputItemAddedEvent:
+		return r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[e.OutputIndex], ResponseID: responseID})
+	case *openresponses.OutputItemDoneEvent:
+		r.transcript = append(r.transcript, e.Item)
+		r.added = append(r.added, e.Item)
+		return r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: e.Item, ResponseID: responseID})
+	case *openresponses.ErrorEvent:
+		return fmt.Errorf("agentturn: model: %w", e.Err())
+	}
+	if idx, ok := outputIndex(ev); ok {
+		return r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[idx], Stream: ev, ResponseID: responseID})
+	}
+	return nil
 }
 
 // outputIndex returns the output index an item-scoped event refers to.
@@ -550,18 +555,36 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 	}
 	// Hooks and tools see the conversation that produced the calls.
 	ctx = ContextWithTranscript(ctx, append(Transcript(nil), r.transcript...))
+	batch, err := r.preflightAll(ctx, tools, calls)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := r.execute(ctx, batch); err != nil {
+		return nil, nil, err
+	}
+	return r.collect(batch)
+}
+
+// preflightAll runs preflight for every call in the model's order and
+// checks for an abort before anything executes.
+func (r *runner) preflightAll(ctx context.Context, tools agenttool.Set, calls []*openresponses.FunctionCall) ([]*callState, error) {
 	batch := make([]*callState, len(calls))
 	for i, call := range calls {
 		p, err := r.preflight(ctx, tools, call)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		batch[i] = p
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, stop(ReasonAborted, err)
+		return nil, stop(ReasonAborted, err)
 	}
+	return batch, nil
+}
 
+// execute runs the calls preflight did not settle and settles each as
+// it finishes, in completion order.
+func (r *runner) execute(ctx context.Context, batch []*callState) error {
 	var jobs []agenttool.Job
 	var jobIndex []int
 	for i, p := range batch {
@@ -572,27 +595,30 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 		jobIndex = append(jobIndex, i)
 	}
 	exec := agenttool.Executor{MaxParallel: r.cfg.MaxParallelTools, Sequential: r.cfg.ToolExecution == ExecSequential}
-	var emitErr error
 	for ev := range exec.Execute(ctx, jobs) {
 		p := batch[jobIndex[ev.Index]]
-		if !ev.Final {
-			if emitErr = r.emit(&ToolUpdate{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Partial: ev.Result}); emitErr != nil {
-				break
-			}
-			continue
+		var err error
+		if ev.Final {
+			p.result, p.err = ev.Result, ev.Err
+			err = r.settle(ctx, p)
+		} else {
+			err = r.emit(&ToolUpdate{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Partial: ev.Result})
 		}
-		p.result, p.err = ev.Result, ev.Err
-		if emitErr = r.settle(ctx, p); emitErr != nil {
-			break
+		if err != nil {
+			// Leaving the executor's range cancels the batch and waits
+			// for the running tools before this returns.
+			return err
 		}
-	}
-	if emitErr != nil {
-		return nil, nil, emitErr
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, stop(ReasonAborted, err)
+		return stop(ReasonAborted, err)
 	}
+	return nil
+}
 
+// collect appends the outputs in the model's order and returns the
+// results with the deferred calls.
+func (r *runner) collect(batch []*callState) ([]agenttool.Result, []*openresponses.FunctionCall, error) {
 	results := make([]agenttool.Result, len(batch))
 	outputs := make(openresponses.Items, 0, len(batch))
 	var deferred []*openresponses.FunctionCall
@@ -624,7 +650,7 @@ func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openr
 	if r.cfg.BeforeToolCall != nil {
 		decision, err := r.cfg.BeforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: r.turn, Call: call, Tool: p.tool, Args: p.args})
 		if err != nil {
-			return nil, fmt.Errorf("before-tool-call hook: %w", err)
+			return nil, fmt.Errorf("agentturn: before-tool-call hook: %w", err)
 		}
 		if decision != nil {
 			if decision.Args != nil {
@@ -673,7 +699,7 @@ func (r *runner) settle(ctx context.Context, p *callState) error {
 	if r.cfg.AfterToolCall != nil && !p.blocked {
 		override, err := r.cfg.AfterToolCall(ctx, ToolResultInfo{RunID: r.runID, Turn: r.turn, Call: p.call, Tool: p.tool, Args: p.args, Result: p.result, Err: p.err})
 		if err != nil {
-			return fmt.Errorf("after-tool-call hook: %w", err)
+			return fmt.Errorf("agentturn: after-tool-call hook: %w", err)
 		}
 		if override != nil {
 			p.result, p.err = override.Result, override.Err

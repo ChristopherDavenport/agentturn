@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
@@ -97,7 +98,7 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	if err := q.Write(ctx, a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateWorking, nil)); err != nil {
 		return err
 	}
-	cfg := e.runConfig(append(append([]*openresponses.FunctionTool(nil), e.callerTools...), declared...))
+	cfg := e.runConfig(slices.Concat(e.callerTools, declared))
 	out := e.relay(ctx, runCtx, cancel, reqCtx, q, transcript, prompts, cfg)
 	if out.end == nil {
 		return errors.New("run produced no run_end")
@@ -257,7 +258,7 @@ func (e *Executor) runConfig(caller []*openresponses.FunctionTool) agentturn.Con
 		if provider != nil {
 			base = provider(ctx)
 		}
-		return append(append([]agenttool.Tool(nil), base...), stubs...)
+		return slices.Concat(base, stubs)
 	}
 	before := e.cfg.BeforeToolCall
 	cfg.BeforeToolCall = func(ctx context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
@@ -281,15 +282,22 @@ func (e *Executor) runConfig(caller []*openresponses.FunctionTool) agentturn.Con
 	return cfg
 }
 
-// unanswered returns the function calls in t that have no output, in
-// order.
-func unanswered(t agentturn.Transcript) []*openresponses.FunctionCall {
+// answeredCalls returns the IDs of the calls in items that have an
+// output.
+func answeredCalls(items openresponses.Items) map[string]bool {
 	answered := map[string]bool{}
-	for _, item := range t {
+	for _, item := range items {
 		if fco, ok := item.(*openresponses.FunctionCallOutput); ok {
 			answered[fco.CallID] = true
 		}
 	}
+	return answered
+}
+
+// unanswered returns the function calls in t that have no output, in
+// order.
+func unanswered(t agentturn.Transcript) []*openresponses.FunctionCall {
+	answered := answeredCalls(t)
 	var out []*openresponses.FunctionCall
 	for _, item := range t {
 		if fc, ok := item.(*openresponses.FunctionCall); ok && !answered[fc.CallID] {
@@ -332,12 +340,7 @@ func checkAnswers(t agentturn.Transcript, prompts openresponses.Items) error {
 // so the stored conversation stays a valid input after an aborted or
 // failed run.
 func stripUnanswered(items openresponses.Items) openresponses.Items {
-	answered := map[string]bool{}
-	for _, item := range items {
-		if fco, ok := item.(*openresponses.FunctionCallOutput); ok {
-			answered[fco.CallID] = true
-		}
-	}
+	answered := answeredCalls(items)
 	out := make(openresponses.Items, 0, len(items))
 	for _, item := range items {
 		if fc, ok := item.(*openresponses.FunctionCall); ok && !answered[fc.CallID] {
@@ -418,6 +421,7 @@ func taskText(task *a2a.Task) string {
 	return b.String()
 }
 
+// partsText mirrors tools/a2a's partsText; change both together.
 func partsText(parts a2a.ContentParts) string {
 	var b strings.Builder
 	for _, p := range parts {

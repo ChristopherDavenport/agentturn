@@ -102,12 +102,21 @@ func New(client *a2aclient.Client, card *a2a.AgentCard, opts ...Option) agenttoo
 	if r.name == "" {
 		r.name = "agent"
 	}
+	r.schema = argsSchema
+	return r
+}
+
+// argsSchema is reflected once at init; Args is a fixed struct, so a
+// failure is a programming error caught the first time the package
+// loads.
+var argsSchema = mustSchema()
+
+func mustSchema() json.RawMessage {
 	schema, err := agenttool.SchemaFor[Args](false)
 	if err != nil {
-		panic(err) // Args is a fixed struct; this cannot fail.
+		panic("a2a: reflect Args: " + err.Error())
 	}
-	r.schema = schema
-	return r
+	return schema
 }
 
 type remote struct {
@@ -152,7 +161,7 @@ func (r *remote) Execute(ctx context.Context, call agenttool.Call) (agenttool.Re
 				break
 			}
 			if _, ok := ev.(*a2a.TaskArtifactUpdateEvent); ok {
-				call.Update(agenttool.Text(out.text()))
+				call.Update(agenttool.Text(out.progress()))
 			}
 		}
 	}
@@ -167,6 +176,11 @@ type outcome struct {
 	status    *a2a.Message
 	message   *a2a.Message
 	artifacts []*a2a.Artifact
+	// streamed is the artifact text so far, grown chunk by chunk so
+	// progress updates do not re-join every artifact; a replaced
+	// artifact marks it for a rebuild.
+	streamed strings.Builder
+	rebuild  bool
 }
 
 // absorb applies one event and reports whether it was final.
@@ -203,19 +217,37 @@ func (o *outcome) artifact(e *a2a.TaskArtifactUpdateEvent) {
 	if e.Artifact == nil {
 		return
 	}
+	// Parts are always copied: the event's slice belongs to the SDK
+	// and a later append must not write into its backing array.
+	cp := *e.Artifact
+	cp.Parts = append(a2a.ContentParts(nil), e.Artifact.Parts...)
 	for _, a := range o.artifacts {
 		if a.ID == e.Artifact.ID {
 			if e.Append {
-				a.Parts = append(a.Parts, e.Artifact.Parts...)
+				a.Parts = append(a.Parts, cp.Parts...)
+				o.streamed.WriteString(partsText(cp.Parts))
 			} else {
-				*a = *e.Artifact
+				*a = cp
+				o.rebuild = true
 			}
 			return
 		}
 	}
-	cp := *e.Artifact
-	cp.Parts = append(a2a.ContentParts(nil), e.Artifact.Parts...)
 	o.artifacts = append(o.artifacts, &cp)
+	o.streamed.WriteString(partsText(cp.Parts))
+}
+
+// progress returns the artifact text streamed so far, for updates
+// during a task.
+func (o *outcome) progress() string {
+	if o.rebuild {
+		o.streamed.Reset()
+		for _, a := range o.artifacts {
+			o.streamed.WriteString(partsText(a.Parts))
+		}
+		o.rebuild = false
+	}
+	return o.streamed.String()
 }
 
 // text returns the agent's answer: the final message, else the status
@@ -263,6 +295,8 @@ func (o *outcome) result() (agenttool.Result, error) {
 }
 
 // fileParts converts file parts of the artifacts into content parts.
+// The conversion mirrors front/a2a's contentFromFile; change both
+// together.
 func (o *outcome) fileParts() openresponses.Contents {
 	var out openresponses.Contents
 	for _, a := range o.artifacts {
@@ -298,6 +332,7 @@ func output(text string, files openresponses.Contents) openresponses.FunctionCal
 	return openresponses.FunctionCallOutputData{Parts: append(parts, files...)}
 }
 
+// partsText mirrors front/a2a's partsText; change both together.
 func partsText(parts a2a.ContentParts) string {
 	var b strings.Builder
 	for _, p := range parts {

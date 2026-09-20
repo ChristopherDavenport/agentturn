@@ -33,23 +33,25 @@ const (
 // verbatim; other data parts become input_text carrying their JSON.
 func ItemsFromMessage(msg *a2a.Message) (openresponses.Items, error) {
 	var items openresponses.Items
-	var pending openresponses.Contents
+	// buffered holds text and file parts until a data part or the end
+	// closes the user message they form.
+	var buffered openresponses.Contents
 	flush := func() {
-		if len(pending) > 0 {
-			items = append(items, &openresponses.Message{Role: openresponses.RoleUser, Content: pending})
-			pending = nil
+		if len(buffered) > 0 {
+			items = append(items, &openresponses.Message{Role: openresponses.RoleUser, Content: buffered})
+			buffered = nil
 		}
 	}
 	for i, part := range msg.Parts {
 		switch p := part.(type) {
 		case a2a.TextPart:
-			pending = append(pending, &openresponses.InputText{Text: p.Text})
+			buffered = append(buffered, &openresponses.InputText{Text: p.Text})
 		case a2a.FilePart:
 			c, err := contentFromFile(p)
 			if err != nil {
 				return nil, fmt.Errorf("parts[%d]: %w", i, err)
 			}
-			pending = append(pending, c)
+			buffered = append(buffered, c)
 		case a2a.DataPart:
 			raw, err := json.Marshal(p.Data)
 			if err != nil {
@@ -64,7 +66,7 @@ func ItemsFromMessage(msg *a2a.Message) (openresponses.Items, error) {
 				items = append(items, item)
 				continue
 			}
-			pending = append(pending, &openresponses.InputText{Text: string(raw)})
+			buffered = append(buffered, &openresponses.InputText{Text: string(raw)})
 		default:
 			return nil, fmt.Errorf("parts[%d]: unsupported part %T", i, part)
 		}
@@ -73,6 +75,8 @@ func ItemsFromMessage(msg *a2a.Message) (openresponses.Items, error) {
 	return items, nil
 }
 
+// contentFromFile mirrors the file-part conversion in tools/a2a's
+// fileParts; change both together.
 func contentFromFile(p a2a.FilePart) (openresponses.Content, error) {
 	switch f := p.File.(type) {
 	case a2a.FileBytes:
@@ -120,14 +124,15 @@ func PartsFromItem(item openresponses.Item) ([]a2a.Part, error) {
 	return []a2a.Part{dp}, nil
 }
 
+// dataPart encodes v, an item or a content part, as a data part.
 func dataPart(v any) (a2a.DataPart, error) {
 	raw, err := json.Marshal(v)
 	if err != nil {
-		return a2a.DataPart{}, err
+		return a2a.DataPart{}, fmt.Errorf("encode %T as a data part: %w", v, err)
 	}
 	var data map[string]any
 	if err := json.Unmarshal(raw, &data); err != nil {
-		return a2a.DataPart{}, err
+		return a2a.DataPart{}, fmt.Errorf("decode %T as a data part: %w", v, err)
 	}
 	return a2a.DataPart{Data: data}, nil
 }

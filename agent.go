@@ -11,17 +11,18 @@ import (
 
 // Errors returned by [Agent].
 var (
-	// ErrRunning: Prompt, Continue, Resume, SetConfig or SetTranscript
-	// was called while a run is active.
+	// ErrRunning is returned when Prompt, Continue, Resume, SetConfig or
+	// SetTranscript is called while a run is active.
 	ErrRunning = errors.New("agentturn: agent is already running")
-	// ErrInputRequired: the last run left calls unanswered, deferred to
-	// the caller or cut off by an abort or a failure; [Agent.Resume]
-	// with their outputs first. The typed errors of tools/agent and
-	// tools/a2a match it with errors.Is, so a host can ask "does any
-	// sub-agent need input" once.
+	// ErrInputRequired is returned when the last run left calls
+	// unanswered, deferred to the caller or cut off by an abort or a
+	// failure; [Agent.Resume] with their outputs first. The typed
+	// errors of tools/agent and tools/a2a match it with errors.Is, so a
+	// host can ask "does any sub-agent need input" once.
 	ErrInputRequired = errors.New("agentturn: pending tool calls must be resumed before continuing")
-	// ErrNotPending: Resume was given an output for a call that is not
-	// pending, or left a pending call unanswered.
+	// ErrNotPending is returned when Resume was given an output for a
+	// call that is not pending, left a pending call unanswered, or was
+	// called with nothing pending.
 	ErrNotPending = errors.New("agentturn: output does not answer a pending call")
 )
 
@@ -33,7 +34,9 @@ var (
 // Subscribers are called synchronously, in registration order, for every
 // event, so every event is a barrier: the loop does not move to the next
 // phase until each subscriber has returned. A subscriber that returns an
-// error ends the run with ReasonError.
+// error ends the run with ReasonError. The run_end is delivered with a
+// context that is not cancelled, even after [Agent.Abort], so a
+// subscriber that writes durable state on it can.
 type Agent struct {
 	cfg Config
 
@@ -193,24 +196,24 @@ func (a *Agent) Continue(ctx context.Context) (*RunEnd, error) {
 // nothing pending, Resume returns [ErrNotPending].
 func (a *Agent) Resume(ctx context.Context, outputs ...*openresponses.FunctionCallOutput) (*RunEnd, error) {
 	a.mu.Lock()
-	pending := make(map[string]bool, len(a.pending))
+	want := make(map[string]bool, len(a.pending))
 	for _, call := range a.pending {
-		pending[call.CallID] = true
+		want[call.CallID] = true
 	}
 	a.mu.Unlock()
-	if len(pending) == 0 {
+	if len(want) == 0 {
 		return nil, fmt.Errorf("%w: nothing is pending", ErrNotPending)
 	}
 	items := make(openresponses.Items, 0, len(outputs))
 	for _, out := range outputs {
-		if out == nil || !pending[out.CallID] {
+		if out == nil || !want[out.CallID] {
 			return nil, fmt.Errorf("%w: %q", ErrNotPending, callID(out))
 		}
-		delete(pending, out.CallID)
+		delete(want, out.CallID)
 		items = append(items, out)
 	}
-	if len(pending) > 0 {
-		return nil, fmt.Errorf("%w: %d pending call(s) unanswered", ErrNotPending, len(pending))
+	if len(want) > 0 {
+		return nil, fmt.Errorf("%w: %d pending call(s) unanswered", ErrNotPending, len(want))
 	}
 	return a.run(ctx, items, true)
 }
@@ -249,9 +252,16 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, resuming b
 	r := &runner{
 		cfg:        cfg,
 		transcript: transcript,
-		emit:       func(ev Event) error { return a.deliver(ctx, ev) },
-		steer:      a.drainSteer,
-		followUp:   a.drainFollowUp,
+		emit: func(ev Event) error {
+			if _, ok := ev.(*RunEnd); ok {
+				// The run is over; a subscriber writing durable state
+				// on run_end must not see the abort's cancellation.
+				return a.deliver(context.WithoutCancel(ctx), ev)
+			}
+			return a.deliver(ctx, ev)
+		},
+		steer:    a.drainSteer,
+		followUp: a.drainFollowUp,
 	}
 	end := r.run(ctx, prompts)
 	cancel()

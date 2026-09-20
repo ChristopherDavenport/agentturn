@@ -11,6 +11,9 @@ import (
 // writer collects before sending a chunk.
 const DefaultChunkSize = 256
 
+// artifactName names the artifact that carries one assistant message.
+const artifactName = "response"
+
 // artifactWriter streams one assistant message as one artifact,
 // coalescing text deltas into chunks: the first chunk creates the
 // artifact, later ones append, and close sends the remainder with
@@ -60,7 +63,7 @@ func (w *artifactWriter) flush(ctx context.Context, last bool) error {
 	} else {
 		ev = a2a.NewArtifactEvent(w.info, part)
 		ev.Artifact.ID = w.id
-		ev.Artifact.Name = "response"
+		ev.Artifact.Name = artifactName
 		w.started = true
 	}
 	ev.LastChunk = last

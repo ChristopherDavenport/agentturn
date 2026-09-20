@@ -35,21 +35,21 @@ type Reason string
 
 // Run end reasons.
 const (
-	// ReasonDone: the model produced a final answer with no tool calls
-	// and no queued follow-ups.
+	// ReasonDone means the model produced a final answer with no tool
+	// calls and no queued follow-ups.
 	ReasonDone Reason = "done"
-	// ReasonStopped: ShouldStopAfterTurn, a terminating tool batch or
-	// MaxTurns ended the run.
+	// ReasonStopped means ShouldStopAfterTurn, a terminating tool batch
+	// or MaxTurns ended the run.
 	ReasonStopped Reason = "stopped"
-	// ReasonInputRequired: BeforeToolCall deferred one or more calls to
-	// the caller; RunEnd.Pending lists them and the run continues once
-	// their outputs are appended (see Agent.Resume).
+	// ReasonInputRequired means BeforeToolCall deferred one or more
+	// calls to the caller; RunEnd.Pending lists them and the run
+	// continues once their outputs are appended (see Agent.Resume).
 	ReasonInputRequired Reason = "input_required"
-	// ReasonAborted: the context was cancelled. A tool batch cut off
-	// by the abort leaves its calls on RunEnd.Pending.
+	// ReasonAborted means the context was cancelled. A tool batch cut
+	// off by the abort leaves its calls on RunEnd.Pending.
 	ReasonAborted Reason = "aborted"
-	// ReasonError: the model, a hook or a subscriber failed; RunEnd.Err
-	// says which.
+	// ReasonError means the model, a hook or a subscriber failed;
+	// RunEnd.Err says which.
 	ReasonError Reason = "error"
 )
 

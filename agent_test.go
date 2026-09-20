@@ -212,6 +212,15 @@ func TestAgentAbortAndIdle(t *testing.T) {
 		}
 		return nil
 	})
+	// run_end reaches subscribers with a live context even after Abort,
+	// so a recorder can still write on it.
+	var endCtxErr error
+	a.Subscribe(func(ctx context.Context, ev Event) error {
+		if _, ok := ev.(*RunEnd); ok {
+			endCtxErr = ctx.Err()
+		}
+		return nil
+	})
 	done := make(chan *RunEnd, 1)
 	go func() {
 		end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
@@ -235,6 +244,9 @@ func TestAgentAbortAndIdle(t *testing.T) {
 	a.Abort()
 	if end := <-done; end == nil || end.Reason != ReasonAborted || !errors.Is(end.Err, context.Canceled) {
 		t.Errorf("aborted run end = %+v", end)
+	}
+	if endCtxErr != nil {
+		t.Errorf("run_end delivered with a cancelled context: %v", endCtxErr)
 	}
 	if err := a.WaitForIdle(context.Background()); err != nil {
 		t.Error(err)

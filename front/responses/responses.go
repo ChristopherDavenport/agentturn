@@ -96,9 +96,7 @@ func (a *Adapter) Compact(ctx context.Context, req openresponses.CompactRequest)
 	if !ok {
 		return nil, openresponses.InvalidRequest(openresponses.CodeCompactionNotSupported, "the model behind this agent does not compact", "")
 	}
-	if req.Model == "" || a.cfg.ModelName != "" {
-		req.Model = a.model(req.Model)
-	}
+	req.Model = a.model(req.Model)
 	return c.Compact(ctx, req)
 }
 

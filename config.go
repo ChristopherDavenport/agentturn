@@ -54,8 +54,12 @@ type Config struct {
 	// MCP server, is picked up on the next turn.
 	ToolProvider func(ctx context.Context) []agenttool.Tool
 
+	// Reasoning is the reasoning field of every request: effort and
+	// summary. The zero value leaves the request's own.
 	Reasoning openresponses.ReasoningConfig
-	Text      openresponses.TextConfig
+	// Text is the text field of every request: output format and
+	// verbosity. The zero value leaves the request's own.
+	Text openresponses.TextConfig
 
 	// Request is the base of every request the loop sends: tool_choice,
 	// parallel_tool_calls, max_output_tokens, temperature, truncation,
