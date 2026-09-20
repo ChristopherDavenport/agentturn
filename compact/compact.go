@@ -21,7 +21,9 @@
 // only folds again when the kept part outgrows the budget. When it
 // folds again, the previous result is folded with the new prefix, so
 // what an earlier fold kept is summarised again rather than lost. A
-// front that wants to persist the result reads it from [Transform.Last].
+// front that wants to persist the result registers [WithOnFold], which
+// reports every fold, successful or not, with the index at which the
+// transcript was split; [Transform.Last] returns the latest summary.
 package compact
 
 import (
@@ -86,6 +88,42 @@ func WithFilter(fn func(agentturn.Transcript) agentturn.Transcript) Option {
 // items to fold. [New] ignores it.
 func WithSummaryPrompt(prompt string) Option { return func(t *Transform) { t.prompt = prompt } }
 
+// Fold describes one compaction attempt on the transcript passed to
+// [Transform.Transform].
+type Fold struct {
+	// Split is the index into that transcript at which the kept tail
+	// starts: the items before it were folded, and the items from it on
+	// were sent verbatim after Output.
+	Split int
+	// Output stands in for the folded items on the request: the
+	// compaction endpoint's output for [New], the summary message for
+	// [NewLocal]. nil when the fold failed.
+	Output openresponses.Items
+	// Summary is the item a recorder writes as the compaction summary:
+	// the compaction item from [New], the summary message from
+	// [NewLocal]. nil when the fold failed.
+	Summary openresponses.Item
+	// TokensBefore is the estimate that triggered the fold.
+	TokensBefore int
+	// Usage is what the fold's model call reported, when it did.
+	Usage *openresponses.Usage
+	// Err is set when the fold failed; Transform returns it. A fold cut
+	// off by an abort carries the context error.
+	Err error
+}
+
+// WithOnFold sets a function called after every fold attempt, from the
+// goroutine that called Transform and before Transform returns, with
+// the fold that was applied or the failure. An error it returns fails
+// the Transform and so the turn, the way a subscriber's error fails a
+// run, so a recorder that could not write the fold stops the run
+// rather than letting the record drift from the request. A fold
+// discarded because another caller folded the same transcript meanwhile
+// is not reported. A recorder registers here; see agentturn/session.
+func WithOnFold(fn func(context.Context, Fold) error) Option {
+	return func(t *Transform) { t.onFold = fn }
+}
+
 // WithSummaryItem sets how [NewLocal] turns the summary text into the
 // item that stands in for the folded prefix. The default is a user
 // message opening with "Summary of the conversation so far:", which
@@ -100,7 +138,8 @@ func WithSummaryItem(fn func(summary string) openresponses.Item) Option {
 // not hold its lock across the model call, but it remembers one
 // compacted prefix, so share one per conversation.
 type Transform struct {
-	fold        func(ctx context.Context, input openresponses.Items) (openresponses.Items, openresponses.Item, error)
+	fold        func(ctx context.Context, input openresponses.Items) (folded, error)
+	onFold      func(context.Context, Fold) error
 	budget      int
 	keepLast    int
 	model       string
@@ -123,25 +162,33 @@ type Transform struct {
 // server expands on the next call.
 func New(c Compactor, opts ...Option) *Transform {
 	t := newTransform(opts)
-	t.fold = func(ctx context.Context, input openresponses.Items) (openresponses.Items, openresponses.Item, error) {
+	t.fold = func(ctx context.Context, input openresponses.Items) (folded, error) {
 		resp, err := c.Compact(ctx, openresponses.CompactRequest{Model: t.model, Input: input})
 		if err != nil {
-			return nil, nil, fmt.Errorf("compact: %w", err)
+			return folded{}, fmt.Errorf("compact: %w", err)
 		}
 		if resp == nil || len(resp.Output) == 0 {
-			return nil, nil, errors.New("compact: empty compaction response")
+			return folded{}, errors.New("compact: empty compaction response")
 		}
-		out := append(openresponses.Items(nil), resp.Output...)
-		var last openresponses.Item
-		for _, item := range out {
+		f := folded{output: append(openresponses.Items(nil), resp.Output...), usage: resp.Usage}
+		for _, item := range f.output {
 			if c, ok := item.(*openresponses.Compaction); ok {
-				last = c
+				f.summary = c
 				break
 			}
 		}
-		return out, last, nil
+		return f, nil
 	}
 	return t
+}
+
+// folded is what a fold produced: the items that stand in for the
+// prefix, the one among them a recorder keeps as the summary, and the
+// usage of the call that made them.
+type folded struct {
+	output  openresponses.Items
+	summary openresponses.Item
+	usage   *openresponses.Usage
 }
 
 // NewLocal builds a Transform that folds by asking model for a summary
@@ -153,7 +200,7 @@ func New(c Compactor, opts ...Option) *Transform {
 // pick its default.
 func NewLocal(model openresponses.Streamer, opts ...Option) *Transform {
 	t := newTransform(opts)
-	t.fold = func(ctx context.Context, input openresponses.Items) (openresponses.Items, openresponses.Item, error) {
+	t.fold = func(ctx context.Context, input openresponses.Items) (folded, error) {
 		store := false
 		req := openresponses.Request{
 			Model: t.model,
@@ -162,20 +209,20 @@ func NewLocal(model openresponses.Streamer, opts ...Option) *Transform {
 		}
 		resp, err := openresponses.CollectStream(ctx, model, req)
 		if err != nil {
-			return nil, nil, fmt.Errorf("compact: summary: %w", err)
+			return folded{}, fmt.Errorf("compact: summary: %w", err)
 		}
 		if resp.Status == openresponses.ResponseStatusFailed {
 			if resp.Error != nil {
-				return nil, nil, fmt.Errorf("compact: summary: %w", resp.Error.Err(0))
+				return folded{}, fmt.Errorf("compact: summary: %w", resp.Error.Err(0))
 			}
-			return nil, nil, errors.New("compact: summary response failed")
+			return folded{}, errors.New("compact: summary response failed")
 		}
 		summary := strings.TrimSpace(resp.OutputText())
 		if summary == "" {
-			return nil, nil, errors.New("compact: summary response has no text")
+			return folded{}, errors.New("compact: summary response has no text")
 		}
 		item := t.summaryItem(summary)
-		return openresponses.Items{item}, item, nil
+		return folded{output: openresponses.Items{item}, summary: item, usage: resp.Usage}, nil
 	}
 	return t
 }
@@ -214,7 +261,8 @@ func Estimate(items openresponses.Items) int {
 
 // Last returns the item that most recently replaced a folded prefix,
 // or nil: the compaction item from [New], the summary message from
-// [NewLocal]. A recorder writes it as the session's compaction entry.
+// [NewLocal]. [WithOnFold] reports the same item with the split that
+// produced it.
 func (t *Transform) Last() openresponses.Item {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -227,7 +275,8 @@ func (t *Transform) Last() openresponses.Item {
 func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (agentturn.Transcript, error) {
 	t.mu.Lock()
 	view, base := t.view(items)
-	if t.estimate(view) <= t.budget {
+	tokens := t.estimate(view)
+	if tokens <= t.budget {
 		t.mu.Unlock()
 		return view, nil
 	}
@@ -250,26 +299,38 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 
 	// The model call runs unlocked so concurrent callers do not
 	// serialise on the network.
-	output, last, err := t.fold(ctx, input)
+	f, err := t.fold(ctx, input)
 	if err != nil {
+		if t.onFold != nil {
+			if rerr := t.onFold(ctx, Fold{Split: split, TokensBefore: tokens, Err: err}); rerr != nil {
+				return nil, fmt.Errorf("compact: on-fold: %w", rerr)
+			}
+		}
 		return nil, err
 	}
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if t.prefixLen != prevLen || t.prefixHash != prevHash {
 		// Another caller folded meanwhile; its memory stands and this
 		// call is answered from it.
 		view, _ := t.view(items)
+		t.mu.Unlock()
 		return view, nil
 	}
 	t.prefixLen = split
 	t.prefixHash = hash(items[:split])
-	t.output = output
-	if last != nil {
-		t.last = last
+	t.output = f.output
+	if f.summary != nil {
+		t.last = f.summary
 	}
-	return t.join(items, split), nil
+	out := t.join(items, split)
+	t.mu.Unlock()
+	if t.onFold != nil {
+		if err := t.onFold(ctx, Fold{Split: split, Output: f.output, Summary: f.summary, TokensBefore: tokens, Usage: f.usage}); err != nil {
+			return nil, fmt.Errorf("compact: on-fold: %w", err)
+		}
+	}
+	return out, nil
 }
 
 // view returns the transcript with the remembered fold applied, and how

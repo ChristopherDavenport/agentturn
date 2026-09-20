@@ -120,8 +120,11 @@ A batch of calls runs in parallel, bounded, unless the config or a tool
 asks for sequential execution. `Config.BeforeToolCall` is the policy
 seam: block, rewrite arguments, terminate the run, or defer the call to
 the caller. A deferred call ends the run with `input_required` and the
-pending calls listed; `Agent.Resume` takes their outputs and continues,
-which is how a front asks a human before a tool runs:
+pending calls listed; `Agent.Resume` takes an answer per call and
+continues, which is how a front asks a human before a tool runs. An
+answer is an output the front produced, usually a refusal, or an
+approval, which runs the call inside the loop with its tool events,
+hooks and execution mode:
 
 ```go
 cfg.BeforeToolCall = func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
@@ -133,19 +136,26 @@ cfg.BeforeToolCall = func(_ context.Context, info agentturn.ToolCallInfo) (*agen
 end, err := a.Prompt(ctx, openresponses.UserText("Clean up the build directory."))
 if err == nil && end.Reason == agentturn.ReasonInputRequired {
 	// ask the human about end.Pending, then answer every call
-	var outputs []*openresponses.FunctionCallOutput
+	var answers []agentturn.Answer
 	for _, call := range end.Pending {
-		outputs = append(outputs, openresponses.NewFunctionCallOutput(call.CallID, "denied by the user"))
+		if approved(call) {
+			answers = append(answers, agentturn.Approve(call.CallID))
+		} else {
+			answers = append(answers, agentturn.Output(openresponses.NewFunctionCallOutput(call.CallID, "denied by the user")))
+		}
 	}
-	end, err = a.Resume(ctx, outputs...)
+	end, err = a.Resume(ctx, answers...)
 }
 ```
 
 The same path repairs a run that was aborted mid-batch: the cut-off
 calls are on `end.Pending`, and an agent built with
 `agentturn.WithTranscript` from a stored session marks them pending
-again. `AfterToolCall` overrides results; `ShouldStopAfterTurn` ends a
-run early.
+again. A front whose user has moved on answers them on the way to the
+next message instead: a `Prompt` that opens with an output for each
+pending call is accepted, and the model sees the outputs and the
+message in one call. `AfterToolCall` overrides results;
+`ShouldStopAfterTurn` ends a run early.
 
 Every other request member comes from `Config.Request`, the base the
 loop builds each turn's request on: `tool_choice`, `max_output_tokens`,
@@ -219,15 +229,22 @@ l := compact.NewLocal(model, compact.WithBudget(60_000), compact.WithModel("gpt-
 cfg.Transform = l.Transform
 ```
 
+`WithOnFold` reports every fold, applied or failed, with the index at
+which the transcript was split, so a recorder can write it.
+
 `session` subscribes an `Agent` to an `agentsession` store: items on
 `item_end`, the `response` entry with its request hash on
-`response_end`, config entries as settings change, and a `link` entry
-for every child run. Because every event is a barrier, a turn's tool
-preflight waits for the assistant items to be durable.
+`response_end`, config entries as settings change, tool list changes
+as deltas, a compaction entry for every fold the compact transform
+reports, and a session of its own for every child run it observes,
+linked from the parent. Because every event is a barrier, a turn's
+tool preflight waits for the assistant items to be durable.
 
 ```go
 rec, s, err := session.Start(ctx, store, agentsession.Header{CWD: cwd})
 defer rec.Attach(agent)()
+specialist := agent.New(childCfg, agent.WithObserver(rec.Observe))
+c := compact.NewLocal(model, compact.WithOnFold(rec.Fold))
 ```
 
 ## Design
@@ -243,7 +260,10 @@ The plan is `docs/plans/agent-layer.md`. Invariants the tests hold:
 - `item_end` for an assistant item follows `output_item.done`; partial
   items never reach subscribers as `item_end`.
 - Abort cancels the model stream and running tools through the context;
-  the transcript keeps only completed items.
+  the transcript keeps only completed items. Every event the abort
+  leaves behind, the `tool_end` of each cut-off call and the
+  `run_end`, still reaches subscribers, with a context whose
+  cancellation is lifted.
 - Events for one run are delivered from one goroutine.
 
 ## License

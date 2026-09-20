@@ -5,6 +5,58 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- **Fixed**: an abort delivered every event after it, the `tool_end` of
+  the cut-off call included, through the cancelled context, so a
+  session recorder's child session and link were lost and a subscriber
+  error during the abort vanished into `ReasonAborted`. `Agent` now
+  delivers every event with the cancellation lifted, as it did for
+  `run_end` alone; a subscriber that fails for a reason of its own
+  during an abort has its error wrapped with the context error on
+  `RunEnd.Err`; a call cut off during preflight gets its `tool_end`
+  like one cut off while running; the low-level `Run` no longer drops
+  events at random once its context is cancelled; and `tools/agent`
+  calls its observer with the cancellation lifted too. (#23)
+- `tools/agent` + `session`: a child run is recorded as a full session
+  written live. `agent.WithObserver(rec.Observe)` creates the child's
+  session on its `run_start`, with `parent_session` naming the session
+  of the run that called the tool, writes its configuration, items,
+  responses and folds as they happen, and the parent's `tool_end`
+  writes the link. A child of a child is linked from the child's
+  session through the same observer. The loop attaches its run ID to
+  the context of everything a run calls, read with
+  `agentturn.RunIDFromContext`, and `agent.ConfigFromContext` gives the
+  observer the child's configuration. A child whose run was not
+  observed is still written from `ChildInfo.Items`, as before. (#24)
+- **Breaking**: `Agent.Resume` takes `Answer` values, built with
+  `Output`, `Approve` or `ApproveWith`, so an approved deferred call
+  runs inside the loop: `BeforeToolCall` is skipped, the tool events
+  fire with turn 0, `Sequential` and `MaxParallelTools` apply,
+  `AfterToolCall` runs, and the outputs are appended before the model
+  is called. `Resume(ctx, agentturn.Output(out))` is the old call. (#25)
+- `Agent.Prompt` accepts a `function_call_output` for each pending call
+  ahead of the message, appending them through the event stream, so a
+  front whose user has moved on after an abort answers the cut-off
+  calls in the same model call as the next prompt. A leading output for
+  a call that is not pending is `ErrNotPending`. (#26)
+- `compact.WithOnFold` reports every fold, applied or failed, with the
+  index at which the transcript was split, the output, the summary
+  item, the token estimate and the usage; a reporter's error fails the
+  turn. `session.Recorder.Fold` is the reporter: it writes the
+  compaction entry naming the entry of the first kept item, or a custom
+  entry in `agentturn:compaction_failed` for a fold that failed or was
+  aborted, so the record shows the attempt. `session.Resume` seeds the
+  item alignment from the context at the leaf. (#27)
+- `Config.ToolProvider` documents that it is read once per turn, before
+  the model call, that a snapshot provider offers a change still in
+  flight one turn late, and how to wait for it with a bound. (#28)
+- `session`: a tool list change is recorded as `tools_added` and
+  `tools_removed` rather than a full replace, unless the delta would
+  not replay the request's tool order or would be larger than the
+  replacement. (#29)
+- Depends on `agenttool` v0.0.4 and `agentsession` v0.0.4.
+
 ## v0.0.4 - 2026-09-19
 
 - **Fixed**: an abort or a failure during a tool batch left a

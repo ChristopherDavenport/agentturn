@@ -363,7 +363,12 @@ behind the same hook.
   subscribers as `item_end`.
 - Abort cancels the model stream and running tools through the context;
   a run aborted mid-turn ends with `Reason: aborted` and the transcript
-  contains only completed items.
+  contains only completed items. Every event the abort leaves behind,
+  the `tool_end` of each cut-off call and the `run_end`, is delivered,
+  and an `Agent` delivers it with the cancellation lifted, so a
+  subscriber that writes durable state can (issue #23).
+- Every `tool_start` has its `tool_end`, whether the call ran, was
+  blocked, deferred, or cut off before or during execution.
 - Events for one run are delivered from one goroutine.
 
 ## Fronts
@@ -432,7 +437,7 @@ func Tool(cfg agentturn.Config, opts ...Option) tool.Tool
 // Options
 WithArgs[T any]()                 // typed arguments, rendered as the first user message
 WithTranscript(func(parent Transcript) Transcript)   // seed the child from the parent
-WithSession(func(ctx, ChildInfo))  // observe the child run for session linking
+WithObserver(func(ctx, Event))     // every event of the child run, for session recording
 ```
 
 - The child gets its own run, transcript and event stream. Parent hooks
@@ -441,7 +446,15 @@ WithSession(func(ctx, ChildInfo))  // observe the child run for session linking
   the items it added, so a session subscriber on the parent writes a
   `link` entry with `rel: subsession` and the spawning `call_id`, as the
   session format specifies.
-- Abort on the parent cancels the child through the context.
+- The observer sees the child's events from the tool's goroutine, with
+  the parent's tool-call context: the loop attaches its run ID to the
+  context of everything a run calls, so the observer knows which run
+  the child belongs to, and `tools/agent` adds the child's `Config`.
+  That is how one observer serves every level of nesting (amendment,
+  2026-09-20, issue #24).
+- Abort on the parent cancels the child through the context. The
+  observer's context has the cancellation lifted, as an `Agent` lifts
+  it for subscribers, so what the abort leaves behind is still written.
 - Nesting is unbounded and each level is the same code, so a specialist
   that itself delegates needs nothing new.
 
@@ -481,7 +494,18 @@ should not have to alias one of them.
   implementation is a copy of `agentsession.RequestHash` tested against
   the same golden vectors, so the two never drift.
 - On `tool_end` whose `Details` is a `ChildInfo`, writes a `link` entry
-  with `rel: subsession` and the spawning `call_id`.
+  with `rel: subsession` and the spawning `call_id`. The child's own
+  session is written live through `Recorder.Observe`, registered as the
+  child tool's observer: created on the child's `run_start` under the
+  session of the run on the context, filled with the child's config,
+  items, responses and folds as they happen (issue #24). A child that
+  was not observed is written from `ChildInfo.Items`, items only.
+- On a fold reported by `compact.WithOnFold` through `Recorder.Fold`,
+  writes the compaction entry, naming as `first_kept` the entry of the
+  item at the fold's split index; the recorder keeps the entry ID of
+  every item it wrote, aligned with the working transcript, and
+  `Resume` seeds that from the context at the leaf. A failed fold is a
+  custom entry in `agentturn:compaction_failed` (issue #27).
 - Returns from the subscriber only after the append is durable under the
   store's sync policy, so the barrier holds: tool preflight for a turn
   waits on the write.
@@ -541,8 +565,17 @@ Resolved:
   `mcpserver` because MCP is about tools, not the loop.
 - `Config.ToolProvider` supplies the tools for each turn in place of
   `Config.Tools`; the loop resolves it once per turn through
-  `ResolveTools`, and `front/a2a` and the responses front use the same
-  resolution.
+  `ResolveTools`, before the model call, and the same list serves the
+  turn's batch so a call resolves against what the model was offered.
+  A provider that snapshots a remote list lags a change still in
+  flight by one turn; a provider that must not waits inside itself,
+  bounded by its context, as `mcpclient.Remote.Await` allows (issue
+  #28). `front/a2a` and the responses front use the same resolution.
+- A deferred call is answered through `Agent.Resume` with an `Answer`:
+  an output, or an approval that runs the call inside the loop with
+  `BeforeToolCall` skipped and everything else as in a turn (issue
+  #25). A `Prompt` that opens with the outputs of every pending call
+  answers them on the way to the next message (issue #26).
 - `mcpclient` is strictly a tool adapter: no resources, no prompts. A
   resource or prompt reaches the model as a tool that returns it, or
   through the host's `Transform`.
@@ -551,9 +584,11 @@ Resolved:
   start. Sharing is one assignment at the call site, and requiring it
   keeps a child's configuration complete on its own.
 - The child's full transcript returns through `ChildInfo.Items`, so
-  the session recorder can write the child as a linked subsession
-  without a second channel. A host that wants less keeps only what it
-  needs; the loop does not summarise.
+  a session recorder that did not observe the child can still write it
+  as a linked subsession, items only. The full record, config and
+  responses included, comes through the observer written live (issue
+  #24). A host that wants less keeps only what it needs; the loop does
+  not summarise.
 - `front/a2a` advertises one default skill from `Config.Description`
   plus one skill per tool, resolved through `ToolProvider` when set.
 - Retries, formerly a non-goal, are the loop's: see Retry above.

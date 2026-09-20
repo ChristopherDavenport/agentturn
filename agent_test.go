@@ -2,6 +2,7 @@ package agentturn
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -270,7 +271,7 @@ func TestAgentAbortAndIdle(t *testing.T) {
 		t.Errorf("continue after abort err = %v", err)
 	}
 	out := &openresponses.FunctionCallOutput{CallID: st.Pending[0].CallID, Output: openresponses.FunctionCallOutputData{Text: "Error: aborted"}}
-	if _, err := a.Resume(context.Background(), out); err != nil {
+	if _, err := a.Resume(context.Background(), Output(out)); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
 	st = a.State()
@@ -319,7 +320,7 @@ func TestAgentResume(t *testing.T) {
 	if _, err := a.Continue(context.Background()); !errors.Is(err, ErrInputRequired) {
 		t.Errorf("continue while pending = %v", err)
 	}
-	if _, err := a.Resume(context.Background(), openresponses.NewFunctionCallOutput("other", "x")); !errors.Is(err, ErrNotPending) {
+	if _, err := a.Resume(context.Background(), Output(openresponses.NewFunctionCallOutput("other", "x"))); !errors.Is(err, ErrNotPending) {
 		t.Errorf("resume with unknown call = %v", err)
 	}
 	if _, err := a.Resume(context.Background()); !errors.Is(err, ErrNotPending) {
@@ -333,7 +334,7 @@ func TestAgentResume(t *testing.T) {
 	}
 	rec := &recorder{}
 	rec.subscribe(a)
-	if _, err := a.Resume(context.Background(), openresponses.NewFunctionCallOutput(call.CallID, "ABC")); err != nil {
+	if _, err := a.Resume(context.Background(), Output(openresponses.NewFunctionCallOutput(call.CallID, "ABC"))); err != nil {
 		t.Fatal(err)
 	}
 	st = a.State()
@@ -348,7 +349,7 @@ func TestAgentResume(t *testing.T) {
 		t.Errorf("resume events = %v", got[:3])
 	}
 	// Answering twice is refused.
-	if _, err := a.Resume(context.Background(), openresponses.NewFunctionCallOutput(call.CallID, "ABC")); !errors.Is(err, ErrNotPending) {
+	if _, err := a.Resume(context.Background(), Output(openresponses.NewFunctionCallOutput(call.CallID, "ABC"))); !errors.Is(err, ErrNotPending) {
 		t.Errorf("resume after resume = %v", err)
 	}
 }
@@ -360,7 +361,7 @@ func TestAgentPromptReturnsRunEnd(t *testing.T) {
 	if err != nil || end == nil || end.Reason != ReasonInputRequired || len(end.Pending) != 1 || itemTypes(end.Items) != "user function_call" {
 		t.Fatalf("paused prompt: err=%v end=%+v", err, end)
 	}
-	end, err = a.Resume(context.Background(), openresponses.NewFunctionCallOutput(end.Pending[0].CallID, "ABC"))
+	end, err = a.Resume(context.Background(), Output(openresponses.NewFunctionCallOutput(end.Pending[0].CallID, "ABC")))
 	if err != nil || end.Reason != ReasonDone || itemTypes(end.Items) != "function_call_output assistant" {
 		t.Fatalf("resumed: err=%v end=%+v", err, end)
 	}
@@ -437,5 +438,245 @@ func TestAgentSetConfigAndSetTranscript(t *testing.T) {
 	var zero Agent
 	if err := zero.WaitForIdle(context.Background()); err != nil {
 		t.Errorf("zero WaitForIdle = %v", err)
+	}
+}
+
+func TestAgentAbortDeliversEventsWithLiveContext(t *testing.T) {
+	blocking := agenttool.New("upper", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	newAgent := func() (*Agent, chan struct{}) {
+		a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{blocking}})
+		started := make(chan struct{})
+		a.Subscribe(func(_ context.Context, ev Event) error {
+			if _, ok := ev.(*ToolStart); ok {
+				close(started)
+			}
+			return nil
+		})
+		return a, started
+	}
+	abortDuringTool := func(t *testing.T, a *Agent, started chan struct{}) *RunEnd {
+		t.Helper()
+		done := make(chan *RunEnd, 1)
+		go func() {
+			end, _ := a.Prompt(context.Background(), openresponses.UserText("x"))
+			done <- end
+		}()
+		<-started
+		a.Abort()
+		return <-done
+	}
+
+	// Every event after the abort, the tool_end of the cut-off call
+	// included, reaches a subscriber with a context it can still use, and
+	// a later subscriber sees the tool_end too.
+	a, started := newAgent()
+	var ctxErrs []error
+	var seen []string
+	a.Subscribe(func(ctx context.Context, ev Event) error {
+		switch ev.(type) {
+		case *ToolEnd, *TurnEnd, *RunEnd:
+			ctxErrs = append(ctxErrs, ctx.Err())
+		}
+		return nil
+	})
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if e, ok := ev.(*ToolEnd); ok {
+			seen = append(seen, e.Name)
+		}
+		return nil
+	})
+	end := abortDuringTool(t, a, started)
+	if end == nil || end.Reason != ReasonAborted || !errors.Is(end.Err, context.Canceled) {
+		t.Fatalf("end = %+v", end)
+	}
+	for i, err := range ctxErrs {
+		if err != nil {
+			t.Errorf("event %d after abort delivered with a cancelled context: %v", i, err)
+		}
+	}
+	if len(seen) != 1 || seen[0] != "upper" {
+		t.Errorf("second subscriber saw tool_end for %v", seen)
+	}
+
+	// A subscriber that fails for a reason of its own during the abort
+	// ends the run aborted with its error joined to the context error.
+	a, started = newAgent()
+	boom := errors.New("disk full")
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if _, ok := ev.(*ToolEnd); ok {
+			return boom
+		}
+		return nil
+	})
+	end = abortDuringTool(t, a, started)
+	if end == nil || end.Reason != ReasonAborted || !errors.Is(end.Err, context.Canceled) || !errors.Is(end.Err, boom) {
+		t.Errorf("end = %+v", end)
+	}
+}
+
+func TestAgentResumeApproves(t *testing.T) {
+	deferAll := func(context.Context, ToolCallInfo) (*ToolDecision, error) { return &ToolDecision{Action: Defer}, nil }
+	var after []string
+	cfg := Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}, BeforeToolCall: deferAll,
+		AfterToolCall: func(_ context.Context, info ToolResultInfo) (*ToolOverride, error) {
+			after = append(after, info.Call.Name)
+			return nil, nil
+		}}
+	a := New(cfg)
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
+		t.Fatal(err)
+	}
+	call := a.State().Pending[0]
+	rec := &recorder{}
+	rec.subscribe(a)
+	// The approved call runs inside the loop: its tool events fire with
+	// Turn 0, AfterToolCall runs, the output is appended and the model
+	// sees it. BeforeToolCall is not consulted again.
+	end, err := a.Resume(context.Background(), Approve(call.CallID))
+	if err != nil || end.Reason != ReasonDone {
+		t.Fatalf("resume: err=%v end=%+v", err, end)
+	}
+	st := a.State()
+	if itemTypes(st.Transcript) != "user function_call function_call_output assistant" || st.Transcript[3].(*openresponses.Message).Text() != "Tool result: ABC" {
+		t.Errorf("transcript = %q", itemTypes(st.Transcript))
+	}
+	got := rec.types()
+	want := []string{"run_start", "tool_start", "tool_end", "item_start", "item_end", "turn_start"}
+	for i, w := range want {
+		if i >= len(got) || got[i] != w {
+			t.Fatalf("resume events = %v, want prefix %v", got, want)
+		}
+	}
+	for _, ev := range rec.events {
+		if e, ok := ev.(*ToolEnd); ok && (e.Turn != 0 || e.Err != nil || e.Result.Output.Text != "ABC") {
+			t.Errorf("approved tool_end = %+v", e)
+		}
+	}
+	if len(after) != 1 || after[0] != "upper" {
+		t.Errorf("AfterToolCall ran for %v", after)
+	}
+
+	// ApproveWith rewrites the arguments; Output and Approve mix in one
+	// batch and the outputs land in the calls' order.
+	cfg.Model = &twoCalls{}
+	cfg.Tools = []agenttool.Tool{agenttool.New("a", "", upper), agenttool.New("b", "", upper)}
+	cfg.MaxTurns = 1
+	a = New(cfg)
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
+		t.Fatal(err)
+	}
+	pending := a.State().Pending
+	if len(pending) != 2 {
+		t.Fatalf("pending = %v", pending)
+	}
+	end, err = a.Resume(context.Background(), Output(openresponses.NewFunctionCallOutput(pending[1].CallID, "denied")), ApproveWith(pending[0].CallID, json.RawMessage(`{"text":"rewritten"}`)))
+	// The model then calls both tools again and the hook defers them.
+	if err != nil || end.Reason != ReasonInputRequired || len(end.Pending) != 2 {
+		t.Fatalf("mixed resume: err=%v end=%+v", err, end)
+	}
+	outputs := map[string]string{}
+	for _, it := range end.Items {
+		if o, ok := it.(*openresponses.FunctionCallOutput); ok {
+			outputs[o.CallID] = o.Output.Text
+		}
+	}
+	if outputs[pending[0].CallID] != "REWRITTEN" || outputs[pending[1].CallID] != "denied" {
+		t.Errorf("outputs = %v", outputs)
+	}
+	// The output the caller gave comes first, then the approved batch.
+	if got := itemTypes(end.Items); got != "function_call_output function_call_output function_call function_call" {
+		t.Errorf("resume items = %q", got)
+	}
+
+	// An approved call for a tool that no longer exists is answered with
+	// the error output, as it would be in a turn.
+	a = New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}, BeforeToolCall: deferAll})
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
+		t.Fatal(err)
+	}
+	call = a.State().Pending[0]
+	if err := a.SetConfig(Config{Model: &echo.Adapter{}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Resume(context.Background(), Approve(call.CallID)); err != nil {
+		t.Fatal(err)
+	}
+	if out := a.State().Transcript[2].(*openresponses.FunctionCallOutput); out.Output.Text != `Error: unknown tool "upper"` {
+		t.Errorf("unknown approved tool output = %q", out.Output.Text)
+	}
+
+	// A terminating approved batch ends the run stopped, without a model
+	// call.
+	terminating := agenttool.New("done", "", func(context.Context, echoArgs) (agenttool.Result, error) {
+		return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: "bye"}, Terminate: true}, nil
+	})
+	a = New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{terminating}, BeforeToolCall: deferAll})
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
+		t.Fatal(err)
+	}
+	end, err = a.Resume(context.Background(), Approve(a.State().Pending[0].CallID))
+	if err != nil || end.Reason != ReasonStopped || itemTypes(end.Items) != "function_call_output" {
+		t.Errorf("terminating resume: err=%v end=%+v", err, end)
+	}
+}
+
+func TestAgentPromptAnswersPending(t *testing.T) {
+	blocking := agenttool.New("upper", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{blocking}})
+	started := make(chan struct{})
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if _, ok := ev.(*ToolStart); ok {
+			close(started)
+		}
+		return nil
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.Prompt(context.Background(), openresponses.UserText("x"))
+	}()
+	<-started
+	a.Abort()
+	<-done
+	pending := a.State().Pending
+	if len(pending) != 1 {
+		t.Fatalf("pending = %v", pending)
+	}
+	// Without tools the model answers the next message in text.
+	if err := a.SetConfig(Config{Model: &echo.Adapter{}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("next")); !errors.Is(err, ErrInputRequired) {
+		t.Errorf("prompt without the output = %v", err)
+	}
+	if _, err := a.Prompt(context.Background(), openresponses.NewFunctionCallOutput("other", "x"), openresponses.UserText("next")); !errors.Is(err, ErrNotPending) {
+		t.Errorf("prompt with a stray output = %v", err)
+	}
+	if len(a.State().Pending) != 1 {
+		t.Fatal("a refused prompt must leave the call pending")
+	}
+	// The outputs ahead of the message answer the calls through the
+	// event stream, and the next model call sees both.
+	rec := &recorder{}
+	rec.subscribe(a)
+	end, err := a.Prompt(context.Background(), openresponses.NewFunctionCallOutput(pending[0].CallID, "aborted"), openresponses.UserText("next"))
+	if err != nil || end.Reason != ReasonDone {
+		t.Fatalf("prompt with outputs: err=%v end=%+v", err, end)
+	}
+	st := a.State()
+	if len(st.Pending) != 0 || itemTypes(st.Transcript) != "user function_call function_call_output user assistant" {
+		t.Errorf("state = %q pending=%v", itemTypes(st.Transcript), st.Pending)
+	}
+	if got := rec.types(); got[1] != "item_start" || got[2] != "item_end" || got[3] != "item_start" || got[4] != "item_end" {
+		t.Errorf("events = %v", got)
+	}
+	if got := st.Transcript[4].(*openresponses.Message).Text(); !strings.Contains(got, "next") {
+		t.Errorf("model saw %q", got)
 	}
 }

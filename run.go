@@ -123,29 +123,19 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 			r := &runner{
 				cfg:        cfg,
 				transcript: append(Transcript(nil), t...),
+				// Every event is sent, cancelled or not: the consumer
+				// below drains the channel until the run returns, so a
+				// send never blocks for good, and the events an abort
+				// leaves behind, the tool_end of a cut-off call and the
+				// run_end, reach a consumer that is still there. The
+				// loop notices the cancellation through the model, the
+				// tools and its own checks.
 				emit: func(ev Event) error {
-					if _, ok := ev.(*RunEnd); ok {
-						// The run_end is delivered even after the consumer
-						// left, without blocking forever.
-						select {
-						case events <- ev:
-						default:
-							select {
-							case events <- ev:
-							case <-ctx.Done():
-							}
-						}
-						return nil
-					}
-					select {
-					case events <- ev:
-						return nil
-					case <-ctx.Done():
-						return ctx.Err()
-					}
+					events <- ev
+					return nil
 				},
 			}
-			r.run(ctx, prompts)
+			r.run(ctx, prompts, nil)
 		}()
 		// After the consumer breaks out, the loop is drained so the
 		// goroutine can wind down; nothing more is yielded.
@@ -167,6 +157,7 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 }
 
 type transcriptKey struct{}
+type runIDKey struct{}
 
 // ContextWithTranscript attaches a transcript to ctx. The loop does this
 // with its working transcript before running a turn's hooks and tools,
@@ -183,6 +174,21 @@ func ContextWithTranscript(ctx context.Context, t Transcript) context.Context {
 func TranscriptFromContext(ctx context.Context) (Transcript, bool) {
 	t, ok := ctx.Value(transcriptKey{}).(Transcript)
 	return t, ok
+}
+
+// ContextWithRunID attaches a run ID to ctx. The loop does this with
+// its own for everything a run calls, the transform, the hooks, the
+// model and the tools, so a tool that composes another agent, and
+// whatever observes that child, can tell which run it was called from.
+func ContextWithRunID(ctx context.Context, runID string) context.Context {
+	return context.WithValue(ctx, runIDKey{}, runID)
+}
+
+// RunIDFromContext returns the ID of the run whose hook or tool call
+// the context belongs to, or "" outside a loop.
+func RunIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(runIDKey{}).(string)
+	return id
 }
 
 func (c Config) validate() error {
@@ -281,14 +287,25 @@ func (e *errStop) Error() string {
 // stop carries reason and err out of a phase.
 func stop(reason Reason, err error) error { return &errStop{reason: reason, err: err} }
 
+// approval is a pending call the caller approved through Agent.Resume:
+// it runs before the first model call of the run, with args in place of
+// the call's own when set.
+type approval struct {
+	call *openresponses.FunctionCall
+	args json.RawMessage
+}
+
 // run drives the loop and returns the RunEnd. A panic in a tool is
 // recovered by agenttool's executor into a PanicError the model sees as
 // an error output; a panic in a hook or a subscriber is not recovered
 // and unwinds without a RunEnd.
-func (r *runner) run(ctx context.Context, prompts openresponses.Items) *RunEnd {
+func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved []approval) *RunEnd {
 	r.runID = openresponses.NewID("run")
+	// Everything the run calls, transform, hooks, model and tools, can
+	// tell which run it serves.
+	ctx = ContextWithRunID(ctx, r.runID)
 	end := &RunEnd{RunID: r.runID, Reason: ReasonDone}
-	err := r.loop(ctx, prompts)
+	err := r.loop(ctx, prompts, approved)
 	var stop *errStop
 	switch {
 	case err == nil:
@@ -298,6 +315,13 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items) *RunEnd {
 	case ctx.Err() != nil:
 		end.Reason = ReasonAborted
 		end.Err = ctx.Err()
+		if !errors.Is(err, ctx.Err()) {
+			// A subscriber or a hook failed for a reason of its own
+			// while the run was being aborted: the abort is the reason
+			// the run ended, and the failure rides on it rather than
+			// vanishing.
+			end.Err = fmt.Errorf("%w: %w", ctx.Err(), err)
+		}
 	default:
 		end.Reason = ReasonError
 		end.Err = err
@@ -314,12 +338,21 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items) *RunEnd {
 	return end
 }
 
-func (r *runner) loop(ctx context.Context, prompts openresponses.Items) error {
+func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved []approval) error {
 	if err := r.emit(&RunStart{RunID: r.runID}); err != nil {
 		return err
 	}
 	if err := r.appendItems(prompts); err != nil {
 		return err
+	}
+	if len(approved) > 0 {
+		results, err := r.approvedBatch(ctx, approved)
+		if err != nil {
+			return err
+		}
+		if allTerminate(results) {
+			return stop(ReasonStopped, nil)
+		}
 	}
 	for {
 		if r.cfg.MaxTurns > 0 && r.turn >= r.cfg.MaxTurns {
@@ -595,7 +628,7 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 		return nil, nil, nil
 	}
 	// Hooks and tools see the conversation that produced the calls.
-	ctx = ContextWithTranscript(ctx, append(Transcript(nil), r.transcript...))
+	ctx = r.toolContext(ctx)
 	batch, err := r.preflightAll(ctx, tools, calls)
 	if err != nil {
 		return nil, nil, err
@@ -604,6 +637,12 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 		return nil, nil, err
 	}
 	return r.collect(batch)
+}
+
+// toolContext is the context hooks and tools run under: ctx with a
+// snapshot of the working transcript attached.
+func (r *runner) toolContext(ctx context.Context) context.Context {
+	return ContextWithTranscript(ctx, append(Transcript(nil), r.transcript...))
 }
 
 // preflightAll runs preflight for every call in the model's order and
@@ -618,9 +657,27 @@ func (r *runner) preflightAll(ctx context.Context, tools agenttool.Set, calls []
 		batch[i] = p
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, stop(ReasonAborted, err)
+		return nil, r.abortBatch(ctx, batch, err)
 	}
 	return batch, nil
+}
+
+// abortBatch ends a batch cut off before it executed: every call that
+// had its tool_start and is not settled gets its tool_end with the
+// context error, as a call cut off while running does, so the two are
+// always paired. It returns the stop for the aborted run.
+func (r *runner) abortBatch(ctx context.Context, batch []*callState, err error) error {
+	for _, p := range batch {
+		if p.settled {
+			continue
+		}
+		p.settled = true
+		p.err = err
+		if serr := r.settle(ctx, p); serr != nil {
+			return serr
+		}
+	}
+	return stop(ReasonAborted, err)
 }
 
 // execute runs the calls preflight did not settle and settles each as
@@ -677,16 +734,39 @@ func (r *runner) collect(batch []*callState) ([]agenttool.Result, []*openrespons
 	return results, deferred, nil
 }
 
+// approvedBatch runs the calls a caller approved on Resume as one
+// batch, before the first turn: preflight without BeforeToolCall, since
+// the caller has decided, then execute and collect as for any batch.
+// The tool events carry Turn 0.
+func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agenttool.Result, error) {
+	tools := r.cfg.tools(ctx)
+	ctx = r.toolContext(ctx)
+	batch := make([]*callState, len(approved))
+	for i, ap := range approved {
+		p := r.prepare(tools, ap.call, ap.args)
+		if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args}); err != nil {
+			return nil, err
+		}
+		if err := r.check(ctx, p, false); err != nil {
+			return nil, err
+		}
+		batch[i] = p
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, r.abortBatch(ctx, batch, err)
+	}
+	if err := r.execute(ctx, batch); err != nil {
+		return nil, err
+	}
+	results, _, err := r.collect(batch)
+	return results, err
+}
+
 // preflight resolves the tool, checks the arguments and runs
 // BeforeToolCall. It emits tool_start and, for a call that will not
 // execute, tool_end.
 func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openresponses.FunctionCall) (*callState, error) {
-	p := &callState{call: call, args: json.RawMessage(call.Arguments)}
-	if len(p.args) == 0 {
-		p.args = json.RawMessage("{}")
-	}
-	p.tool, _ = tools.Lookup(call.Name)
-
+	p := r.prepare(tools, call, nil)
 	var terminate bool
 	if r.cfg.BeforeToolCall != nil {
 		decision, err := r.cfg.BeforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: r.turn, Call: call, Tool: p.tool, Args: p.args})
@@ -718,20 +798,42 @@ func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openr
 		p.settled = true
 		return p, r.emit(&ToolEnd{RunID: r.runID, Turn: r.turn, CallID: call.CallID, Name: call.Name, Deferred: true})
 	}
+	return p, r.check(ctx, p, terminate)
+}
+
+// prepare starts the state of a call: the tool with its name, if any,
+// and its arguments, args when given and the call's own otherwise, an
+// empty object standing in for none.
+func (r *runner) prepare(tools agenttool.Set, call *openresponses.FunctionCall, args json.RawMessage) *callState {
+	p := &callState{call: call, args: args}
+	if p.args == nil {
+		p.args = json.RawMessage(call.Arguments)
+	}
+	if len(p.args) == 0 {
+		p.args = json.RawMessage("{}")
+	}
+	p.tool, _ = tools.Lookup(call.Name)
+	return p
+}
+
+// check settles a call that will not execute: one a hook blocked, one
+// no tool has the name of, or one whose arguments are not an object.
+// It returns nil, with the call unsettled, when the call may run.
+func (r *runner) check(ctx context.Context, p *callState, terminate bool) error {
 	switch {
 	case p.blocked:
 	case p.tool == nil:
-		p.err = fmt.Errorf("unknown tool %q", call.Name)
+		p.err = fmt.Errorf("unknown tool %q", p.call.Name)
 	case !validObject(p.args):
 		p.err = errors.New("invalid arguments: expected a JSON object")
 	}
-	if p.err != nil {
-		p.settled = true
-		p.result = agenttool.ErrorResult(p.err)
-		p.result.Terminate = terminate
-		return p, r.settle(ctx, p)
+	if p.err == nil {
+		return nil
 	}
-	return p, nil
+	p.settled = true
+	p.result = agenttool.ErrorResult(p.err)
+	p.result.Terminate = terminate
+	return r.settle(ctx, p)
 }
 
 // settle applies AfterToolCall, normalises an error into the output the

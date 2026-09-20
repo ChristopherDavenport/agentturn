@@ -15,9 +15,11 @@
 // The loop never learns a sub-agent concept: to the parent this is a
 // tool, and to the child this is a run. Nesting is unbounded and each
 // level is the same code. The child's events stream out through the
-// call's progress callback and [WithObserver], and its run ID and items
-// come back in Result.Details as a [ChildInfo], so a session subscriber
-// on the parent can write a subsession link keyed by the call ID.
+// call's progress callback and [WithObserver], which is how
+// agentturn/session records the child as a session of its own, and its
+// run ID and items come back in Result.Details as a [ChildInfo], so a
+// session subscriber on the parent can write a subsession link keyed by
+// the call ID.
 //
 // Abort on the parent reaches the child through the context.
 package agent
@@ -143,9 +145,26 @@ func WithTranscript(seed func(parent agentturn.Transcript) agentturn.Transcript)
 }
 
 // WithObserver receives every event of the child run, in order, from the
-// tool's goroutine. It is the seam for linking the child to a session.
+// tool's goroutine. It is the seam for recording the child as a session
+// of its own: agentturn/session's Recorder.Observe is made for it. The
+// context it receives is the call's, so agentturn.RunIDFromContext names
+// the parent run and agentturn.TranscriptFromContext holds the parent's
+// transcript, with the child's configuration added for
+// [ConfigFromContext]; its cancellation is lifted, as an Agent lifts it
+// for subscribers, so an abort that cuts the child does not also cut
+// what the observer writes about it.
 func WithObserver(fn func(context.Context, agentturn.Event)) Option {
 	return func(o *options) { o.observer = fn }
+}
+
+type configKey struct{}
+
+// ConfigFromContext returns the configuration of the child run whose
+// events an observer registered with [WithObserver] is receiving. It
+// reports false on any other context.
+func ConfigFromContext(ctx context.Context) (agentturn.Config, bool) {
+	cfg, ok := ctx.Value(configKey{}).(agentturn.Config)
+	return cfg, ok
 }
 
 // New wraps cfg as a tool named cfg.Name with cfg.Description. Each
@@ -203,9 +222,14 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 
 	var soFar []string
 	var end *agentturn.RunEnd
+	// The observer sees the values of the call's context but never its
+	// cancellation, as an Agent's subscribers do: an abort of the parent
+	// cuts the child through ctx, and the events the cut leaves behind
+	// still have to be written.
+	obsCtx := context.WithValue(context.WithoutCancel(ctx), configKey{}, a.cfg)
 	for ev := range agentturn.Run(ctx, seed, prompts, a.cfg) {
 		if a.opts.observer != nil {
-			a.opts.observer(ctx, ev)
+			a.opts.observer(obsCtx, ev)
 		}
 		switch e := ev.(type) {
 		case *agentturn.ItemEnd:

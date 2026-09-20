@@ -218,7 +218,9 @@ type RunEnd struct {
 	Items  Transcript
 	Reason Reason
 	// Err is set when Reason is ReasonError, and to the context error
-	// when Reason is ReasonAborted.
+	// when Reason is ReasonAborted, wrapping the failure of a subscriber
+	// or a hook when one failed for a reason of its own while the run
+	// was being aborted; errors.Is finds the context error either way.
 	Err error
 	// Pending lists the function calls of the run with no
 	// function_call_output, in transcript order: the calls a deferred

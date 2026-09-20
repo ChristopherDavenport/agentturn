@@ -173,11 +173,20 @@ func TestAbortPropagates(t *testing.T) {
 		<-ctx.Done()
 		return "", ctx.Err()
 	})
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(agentturn.ContextWithRunID(context.Background(), "run_parent"))
+	var afterAbort []string
+	var cfgSeen bool
 	child := New(agentturn.Config{Name: "child", Model: &echo.Adapter{}, Tools: []agenttool.Tool{blocking}},
-		WithObserver(func(_ context.Context, ev agentturn.Event) {
+		WithObserver(func(ctx context.Context, ev agentturn.Event) {
+			if cfg, ok := ConfigFromContext(ctx); ok && cfg.Name == "child" && agentturn.RunIDFromContext(ctx) == "run_parent" {
+				cfgSeen = true
+			}
 			if _, ok := ev.(*agentturn.ToolStart); ok {
 				cancel()
+			}
+			// The observer's context outlives the abort.
+			if ctx.Err() == nil {
+				afterAbort = append(afterAbort, ev.EventType())
 			}
 		}))
 	res, err := child.Execute(ctx, agenttool.Call{Args: json.RawMessage(`{"input":"x"}`)})
@@ -186,6 +195,12 @@ func TestAbortPropagates(t *testing.T) {
 	}
 	if info := res.Details.(ChildInfo); info.Reason != agentturn.ReasonAborted {
 		t.Errorf("details = %+v", info)
+	}
+	if !cfgSeen {
+		t.Error("observer context lacks the child config or the parent run ID")
+	}
+	if n := len(afterAbort); n == 0 || afterAbort[n-1] != "run_end" || afterAbort[n-2] != "tool_end" {
+		t.Errorf("events with a live context = %v", afterAbort)
 	}
 }
 

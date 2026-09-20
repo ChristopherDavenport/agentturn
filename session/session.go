@@ -3,8 +3,9 @@
 // every item the loop appends becomes an item entry as soon as its
 // item_end is delivered, every model call becomes a response entry
 // carrying the hash of the exact request sent, config deltas track the
-// settings between calls, and a child run made through tools/agent
-// becomes a linked subsession.
+// settings between calls, a fold by the compact transform becomes a
+// compaction entry, and a child run made through tools/agent becomes a
+// linked subsession written live.
 //
 // Because the [agentturn.Agent] delivers events as barriers, a
 // [Recorder] returns from each event only after the store's Append has
@@ -31,7 +32,8 @@
 //     format recommends.
 //   - turn_start: a config entry when the settings in force changed
 //     since the last call (a full one first if none was written, deltas
-//     after), so the stored path replays to the request's settings.
+//     after, a tool list change as tools_added and tools_removed), so
+//     the stored path replays to the request's settings.
 //   - item_end: an item entry; an item streamed by the model carries its
 //     response ID. An item the configured filter would hide from the
 //     model, an app-only extension item, is written as a custom entry
@@ -43,17 +45,50 @@
 //     or the run was aborted before the stream produced a response: a
 //     response entry with status failed, the error and the request
 //     hash, so the record shows the call was made and why it ended.
-//   - tool_end with a tools/agent ChildInfo in its details: a new
-//     session holding the child's items, with parent_session set, and a
-//     link entry in this session with rel subsession and the call ID.
+//   - a fold reported through [Recorder.Fold]: a compaction entry whose
+//     first_kept is the entry of the first item the transform kept, with
+//     the summary and the settings in force; a fold that failed is a
+//     custom entry in the agentturn:compaction_failed namespace carrying
+//     the error, so an abort or a failure during the fold leaves a
+//     trace.
+//   - a child run observed through [Recorder.Observe]: a session of its
+//     own, with parent_session set and the child's configuration,
+//     items, responses and folds written as they happen, and a link
+//     entry with rel subsession and the call ID in the parent when the
+//     call's tool_end arrives. A child of a child nests the same way.
+//   - tool_end with a tools/agent ChildInfo whose run was not observed:
+//     a session holding only the child's items, and the link; wire
+//     Observe to get the full record.
 //
-// # Verifiability
+// # Child runs
+//
+// A tools/agent child runs inside a tool call, so its events reach the
+// parent's recorder only through the tool's observer:
+//
+//	specialist := agent.New(childCfg, agent.WithObserver(rec.Observe))
+//
+// Observe finds the parent run through the run ID the loop attaches to
+// every tool call's context, so the same function serves every level of
+// nesting: a child's child is linked from the child's session.
+//
+// # Compaction
 //
 // The hash recorded on a response is computed from the request as sent,
-// in the canonical form [Canonical] defines. When the loop's Transform
-// changes the input for a call, the request differs from the stored
-// path and Session.Verify reports a mismatch for that call; recording a
-// compaction entry for such a change is the caller's job.
+// in the canonical form [Canonical] defines. When a Transform changes
+// the input for a call, the stored path must record the change or
+// Session.Verify reports a mismatch for that call. For the compact
+// transform, [Recorder.Fold] writes the compaction entry:
+//
+//	c := compact.NewLocal(model, compact.WithOnFold(rec.Fold))
+//	cfg.Transform = c.Transform
+//
+// The recorder keeps the entry ID of every item it wrote, aligned with
+// the agent's working transcript, and names the entry at the fold's
+// split as first_kept. [Resume] seeds that alignment from the context
+// at the leaf, so an agent resumed from Context.Items records folds
+// too; an agent seeded with a transcript the recorder did not write and
+// did not resume from cannot, and Fold returns an error, which fails
+// the turn rather than let the record drift.
 package session
 
 import (
@@ -66,33 +101,63 @@ import (
 
 	"github.com/ChristopherDavenport/agentsession"
 	"github.com/ChristopherDavenport/agentturn"
+	"github.com/ChristopherDavenport/agentturn/compact"
 	"github.com/ChristopherDavenport/agentturn/tools/agent"
 	"github.com/ChristopherDavenport/openresponses"
 )
 
-// Recorder is an agentturn subscriber that writes one session. It is
-// safe to attach to one agent at a time; events of a run arrive from
-// one goroutine.
+// FailedFoldNS is the namespace of the custom entry written for a fold
+// that failed. Its data is a [FailedFold].
+const FailedFoldNS = "agentturn:compaction_failed"
+
+// FailedFold is the data of a [FailedFoldNS] custom entry.
+type FailedFold struct {
+	Error        string `json:"error"`
+	TokensBefore int    `json:"tokens_before,omitempty"`
+}
+
+// Recorder is an agentturn subscriber that writes one session, and the
+// sessions of the child runs it observes. It is safe to attach to one
+// agent at a time; events of a run arrive from one goroutine, and
+// Observe may be called from the goroutines of parallel child tools.
 type Recorder struct {
 	store    agentsession.Store
-	id       string
 	filter   func(agentturn.Transcript) agentturn.Transcript
 	harness  *agentsession.Harness
 	children bool
 	now      func() time.Time
-	cfg      *agentturn.Config
 
-	// mu serialises Handle with Attach and Resume. Events of a run
-	// arrive from one goroutine, so holding it across every Append is
-	// not contention; it is what keeps entries in event order when the
-	// recorder is attached to a second agent.
-	mu       sync.Mutex
+	// mu serialises Handle, Observe and Fold with Attach and Resume.
+	// Events of a run arrive from one goroutine, so holding it across
+	// every Append is not contention; it is what keeps entries in event
+	// order when the recorder is attached to a second agent or observes
+	// parallel children.
+	mu sync.Mutex
+	// root is the session this recorder was made for.
+	root *writer
+	// runs maps a run ID to the writer of its session: the root's
+	// current run and every observed child run until its link is
+	// written.
+	runs    map[string]*writer
+	rootRun string
+}
+
+// writer is the state of one session being written.
+type writer struct {
+	rec *Recorder
+	id  string
+	cfg *agentturn.Config
+
 	settings agentsession.Settings
 	// wroteConfig is set once a config entry is on the path, written by
-	// this recorder or replayed by Resume, so settle writes deltas.
+	// this writer or replayed by Resume, so settle writes deltas.
 	wroteConfig bool
 	pending     string    // request hash of the call in flight
 	started     time.Time // when the call in flight was sent
+	// items holds the ID of the entry contributing each item of the
+	// agent's working transcript, in order, so a fold's split index
+	// names the first kept entry.
+	items []string
 }
 
 // Option configures a Recorder.
@@ -115,11 +180,12 @@ func WithHarness(name, version string) Option {
 // entry it writes on a fresh session is a full config, before any item.
 // [Recorder.Attach] sets it from the agent.
 func WithConfig(cfg agentturn.Config) Option {
-	return func(r *Recorder) { r.cfg = &cfg }
+	return func(r *Recorder) { r.root.cfg = &cfg }
 }
 
 // WithoutChildSessions disables recording tools/agent child runs as
-// linked sessions.
+// linked sessions: Observe ignores every event and a ChildInfo on a
+// tool_end writes nothing.
 func WithoutChildSessions() Option {
 	return func(r *Recorder) { r.children = false }
 }
@@ -130,11 +196,12 @@ func WithoutChildSessions() Option {
 func New(store agentsession.Store, sessionID string, opts ...Option) *Recorder {
 	r := &Recorder{
 		store:    store,
-		id:       sessionID,
 		filter:   agentturn.DefaultFilter,
 		children: true,
 		now:      time.Now,
+		runs:     map[string]*writer{},
 	}
+	r.root = &writer{rec: r, id: sessionID}
 	for _, opt := range opts {
 		opt(r)
 	}
@@ -160,8 +227,10 @@ func Start(ctx context.Context, store agentsession.Store, h agentsession.Header,
 // that continues it at its leaf. The recorder starts from the settings
 // in force there, so the first config entry it writes is the delta
 // from them, or nothing when the agent's configuration matches, rather
-// than a full copy on every resume. Child sessions name the header's
-// harness unless [WithHarness] says otherwise.
+// than a full copy on every resume, and from the items of the context
+// there, so an agent seeded with Context.Items can record folds. Child
+// sessions name the header's harness unless [WithHarness] says
+// otherwise.
 func Resume(ctx context.Context, store agentsession.Store, sessionID string, opts ...Option) (*Recorder, *agentsession.Session, error) {
 	s, err := store.Open(ctx, sessionID)
 	if err != nil {
@@ -176,8 +245,12 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 		if err != nil {
 			return nil, nil, fmt.Errorf("session: context at leaf: %w", err)
 		}
-		r.settings = cx.Settings
-		r.wroteConfig = hasConfig(cx.Entries)
+		r.root.settings = cx.Settings
+		r.root.wroteConfig = hasConfig(cx.Entries)
+		r.root.items = make([]string, len(cx.ItemEntries))
+		for i, e := range cx.ItemEntries {
+			r.root.items[i] = e.Base().ID
+		}
 	}
 	return r, s, nil
 }
@@ -193,7 +266,7 @@ func hasConfig(entries []agentsession.Entry) bool {
 }
 
 // SessionID returns the ID of the session being written.
-func (r *Recorder) SessionID() string { return r.id }
+func (r *Recorder) SessionID() string { return r.root.id }
 
 // Store returns the store the recorder writes to.
 func (r *Recorder) Store() agentsession.Store { return r.store }
@@ -202,16 +275,16 @@ func (r *Recorder) Store() agentsession.Store { return r.store }
 // function.
 func (r *Recorder) Attach(a *agentturn.Agent) (unsubscribe func()) {
 	r.mu.Lock()
-	if r.cfg == nil {
+	if r.root.cfg == nil {
 		cfg := a.Config()
-		r.cfg = &cfg
+		r.root.cfg = &cfg
 	}
 	r.mu.Unlock()
 	return a.Subscribe(r.Handle)
 }
 
-// Handle records one event. It is the subscriber function; use it
-// directly with the low-level loop:
+// Handle records one event of the agent's run. It is the subscriber
+// function; use it directly with the low-level loop:
 //
 //	for ev := range agentturn.Run(ctx, t, prompts, cfg) {
 //		if err := rec.Handle(ctx, ev); err != nil { ... }
@@ -219,23 +292,117 @@ func (r *Recorder) Attach(a *agentturn.Agent) (unsubscribe func()) {
 func (r *Recorder) Handle(ctx context.Context, ev agentturn.Event) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if e, ok := ev.(*agentturn.RunStart); ok {
+		if r.rootRun != "" {
+			delete(r.runs, r.rootRun)
+		}
+		r.rootRun = e.RunID
+		r.runs[e.RunID] = r.root
+	}
+	return r.root.handle(ctx, ev)
+}
+
+// Observe records one event of a child run made through tools/agent;
+// register it with agent.WithObserver. On the child's run_start it
+// creates the child's session, with parent_session naming the session
+// of the run that called the tool, the run ID on the context, or this
+// recorder's session when the tool ran outside a loop it records, and
+// writes the child's configuration, which tools/agent puts on the
+// context, as its first entry. Every later event of the run is written
+// to that session as [Recorder.Handle] writes the agent's. The link
+// from the parent is written when the call's tool_end reaches the
+// parent's writer.
+func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.children {
+		return
+	}
+	// An observer cannot fail the child run, so a store failure ends
+	// the record of that child where it is: later events find no writer
+	// and the parent's tool_end falls back to the items.
+	if e, ok := ev.(*agentturn.RunStart); ok {
+		parent := r.root
+		if p, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
+			parent = p
+		}
+		w, err := r.newChild(ctx, parent.id)
+		if err != nil {
+			return
+		}
+		if cfg, ok := agent.ConfigFromContext(ctx); ok {
+			w.cfg = &cfg
+		}
+		r.runs[e.RunID] = w
+	}
+	w, ok := r.runs[runID(ev)]
+	if !ok {
+		return
+	}
+	if err := w.handle(ctx, ev); err != nil {
+		delete(r.runs, runID(ev))
+	}
+}
+
+// Fold records a fold of the compact transform; register it with
+// compact.WithOnFold. A fold that was applied becomes a compaction
+// entry naming the entry of the first kept item as first_kept, with
+// the summary, the settings in force, the token estimate and the
+// usage; a fold that failed becomes a custom entry in [FailedFoldNS].
+// The run ID on the context says which session the fold belongs to, so
+// a child's transform reports into the child's session; without one,
+// the fold is the agent's. An error fails the transform, and so the
+// turn.
+func (r *Recorder) Fold(ctx context.Context, f compact.Fold) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	w := r.root
+	if cw, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
+		w = cw
+	}
+	// The fold may have been cut off by an abort; the record of it is
+	// written regardless.
+	return w.fold(context.WithoutCancel(ctx), f)
+}
+
+// newChild creates a session under parent and returns its writer.
+func (r *Recorder) newChild(ctx context.Context, parent string) (*writer, error) {
+	s, err := r.store.Create(ctx, agentsession.Header{ParentSession: parent, Harness: r.harness})
+	if err != nil {
+		return nil, fmt.Errorf("session: create child session: %w", err)
+	}
+	return &writer{rec: r, id: s.ID()}, nil
+}
+
+// runID returns the run an event belongs to.
+func runID(ev agentturn.Event) string {
 	switch e := ev.(type) {
 	case *agentturn.RunStart:
-		return r.runStart(ctx)
+		return e.RunID
 	case *agentturn.TurnStart:
-		return r.turnStart(ctx, e)
+		return e.RunID
+	case *agentturn.ModelRetry:
+		return e.RunID
+	case *agentturn.ItemStart:
+		return e.RunID
+	case *agentturn.ItemUpdate:
+		return e.RunID
 	case *agentturn.ItemEnd:
-		return r.item(ctx, e.Item, e.ResponseID)
+		return e.RunID
 	case *agentturn.ResponseEnd:
-		return r.response(ctx, e)
-	case *agentturn.RunEnd:
-		return r.runEnd(ctx, e)
+		return e.RunID
+	case *agentturn.ToolStart:
+		return e.RunID
+	case *agentturn.ToolUpdate:
+		return e.RunID
 	case *agentturn.ToolEnd:
-		if info, ok := e.Result.Details.(agent.ChildInfo); ok && r.children {
-			return r.child(ctx, e.CallID, info)
-		}
+		return e.RunID
+	case *agentturn.TurnEnd:
+		return e.RunID
+	case *agentturn.RunEnd:
+		return e.RunID
 	}
-	return nil
+	return ""
 }
 
 // Canonical returns the request in the form the session format hashes:
@@ -254,67 +421,98 @@ func Canonical(req openresponses.Request) openresponses.Request {
 	return out
 }
 
-// runStart writes the initial config from the agent's configuration
-// when the recorder has one and nothing has been written yet.
-func (r *Recorder) runStart(ctx context.Context) error {
-	if r.wroteConfig || r.cfg == nil {
-		return nil
+// handle writes the entry for one event of the writer's run.
+func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
+	switch e := ev.(type) {
+	case *agentturn.RunStart:
+		return w.runStart(ctx)
+	case *agentturn.TurnStart:
+		return w.turnStart(ctx, e)
+	case *agentturn.ItemEnd:
+		return w.item(ctx, e.Item, e.ResponseID)
+	case *agentturn.ResponseEnd:
+		return w.response(ctx, e)
+	case *agentturn.RunEnd:
+		return w.runEnd(ctx, e)
+	case *agentturn.ToolEnd:
+		if info, ok := e.Result.Details.(agent.ChildInfo); ok && w.rec.children {
+			return w.child(ctx, e.CallID, info)
+		}
 	}
-	req := r.cfg.BaseRequest(ctx)
-	return r.settle(ctx, Canonical(req))
+	return nil
 }
 
-func (r *Recorder) turnStart(ctx context.Context, e *agentturn.TurnStart) error {
+// runStart writes the initial config from the agent's configuration
+// when the writer has one and nothing has been written yet.
+func (w *writer) runStart(ctx context.Context) error {
+	if w.wroteConfig || w.cfg == nil {
+		return nil
+	}
+	req := w.cfg.BaseRequest(ctx)
+	return w.settle(ctx, Canonical(req))
+}
+
+func (w *writer) turnStart(ctx context.Context, e *agentturn.TurnStart) error {
 	req := Canonical(e.Request)
 	hash, err := RequestHash(req)
 	if err != nil {
 		return err
 	}
-	if err := r.settle(ctx, req); err != nil {
+	if err := w.settle(ctx, req); err != nil {
 		return err
 	}
-	r.pending = hash
-	r.started = r.now()
+	w.pending = hash
+	w.started = w.rec.now()
 	return nil
 }
 
 // settle brings the recorded settings to those of req, writing a full
 // config first and deltas after.
-func (r *Recorder) settle(ctx context.Context, req openresponses.Request) error {
+func (w *writer) settle(ctx context.Context, req openresponses.Request) error {
 	full, err := agentsession.ConfigFromRequest(req)
 	if err != nil {
 		return fmt.Errorf("session: %w", err)
 	}
 	next := agentsession.Settings{}.Apply(full)
-	if !r.wroteConfig {
-		if err := r.append(ctx, full); err != nil {
+	if !w.wroteConfig {
+		if _, err := w.append(ctx, full); err != nil {
 			return err
 		}
-	} else if delta := configDelta(r.settings, next, full); delta != nil {
-		if err := r.append(ctx, delta); err != nil {
+	} else if delta := configDelta(w.settings, next, full); delta != nil {
+		if _, err := w.append(ctx, delta); err != nil {
 			return err
 		}
 	}
-	r.settings = next
-	r.wroteConfig = true
+	w.settings = next
+	w.wroteConfig = true
 	return nil
 }
 
-func (r *Recorder) item(ctx context.Context, item openresponses.Item, responseID string) error {
+// item writes an item entry, or a custom entry for an item the model
+// did not see, and records its ID against the working transcript.
+func (w *writer) item(ctx context.Context, item openresponses.Item, responseID string) error {
 	if item == nil {
 		return nil
 	}
-	if responseID == "" && len(r.filter(agentturn.Transcript{item})) == 0 {
+	var entry agentsession.Entry
+	if responseID == "" && len(w.rec.filter(agentturn.Transcript{item})) == 0 {
 		raw, err := json.Marshal(item)
 		if err != nil {
 			return fmt.Errorf("session: encode %s item: %w", item.ItemType(), err)
 		}
-		return r.append(ctx, &agentsession.CustomEntry{NS: item.ItemType(), Data: raw})
+		entry = &agentsession.CustomEntry{NS: item.ItemType(), Data: raw}
+	} else {
+		entry = &agentsession.ItemEntry{Item: item, ResponseID: responseID}
 	}
-	return r.append(ctx, &agentsession.ItemEntry{Item: item, ResponseID: responseID})
+	id, err := w.append(ctx, entry)
+	if err != nil {
+		return err
+	}
+	w.items = append(w.items, id)
+	return nil
 }
 
-func (r *Recorder) response(ctx context.Context, e *agentturn.ResponseEnd) error {
+func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 	resp := e.Response
 	if resp == nil {
 		return errors.New("session: response_end without a response")
@@ -326,24 +524,25 @@ func (r *Recorder) response(ctx context.Context, e *agentturn.ResponseEnd) error
 		Usage:       resp.Usage,
 		Incomplete:  resp.IncompleteDetails,
 		Error:       resp.Error,
-		RequestHash: r.pending,
-		LatencyMS:   r.latency(),
+		RequestHash: w.pending,
+		LatencyMS:   w.latency(),
 	}
-	r.pending = ""
-	r.started = time.Time{}
-	return r.append(ctx, entry)
+	w.pending = ""
+	w.started = time.Time{}
+	_, err := w.append(ctx, entry)
+	return err
 }
 
 // runEnd records a call that was sent and never answered: the run
 // ended while a request hash was still in flight, so the model failed
 // before producing a response or the run was aborted mid-stream. The
-// in-flight state is cleared either way, so a recorder reused for a
+// in-flight state is cleared either way, so a writer reused for a
 // later run cannot attribute its first response to this call.
-func (r *Recorder) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
-	hash := r.pending
-	latency := r.latency()
-	r.pending = ""
-	r.started = time.Time{}
+func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
+	hash := w.pending
+	latency := w.latency()
+	w.pending = ""
+	w.started = time.Time{}
 	if hash == "" {
 		return nil
 	}
@@ -353,16 +552,17 @@ func (r *Recorder) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
 		RequestHash: hash,
 		LatencyMS:   latency,
 	}
-	return r.append(ctx, entry)
+	_, err := w.append(ctx, entry)
+	return err
 }
 
 // latency is the time since the call in flight was sent, in
 // milliseconds, or zero when none is.
-func (r *Recorder) latency() int64 {
-	if r.started.IsZero() {
+func (w *writer) latency() int64 {
+	if w.started.IsZero() {
 		return 0
 	}
-	if ms := r.now().Sub(r.started).Milliseconds(); ms > 0 {
+	if ms := w.rec.now().Sub(w.started).Milliseconds(); ms > 0 {
 		return ms
 	}
 	return 0
@@ -382,25 +582,58 @@ func errorPayload(err error) *openresponses.ErrorPayload {
 	return &openresponses.ErrorPayload{Type: openresponses.ErrorTypeServerError, Message: err.Error()}
 }
 
-// child writes the items of a tools/agent run as a session of its own
-// and links it from this one.
-func (r *Recorder) child(ctx context.Context, callID string, info agent.ChildInfo) error {
-	h := agentsession.Header{ParentSession: r.id, Harness: r.harness}
-	s, err := r.store.Create(ctx, h)
-	if err != nil {
-		return fmt.Errorf("session: create child session: %w", err)
+// fold writes the compaction entry for an applied fold, or the failed
+// fold entry for one that failed.
+func (w *writer) fold(ctx context.Context, f compact.Fold) error {
+	if f.Err != nil {
+		raw, err := json.Marshal(FailedFold{Error: f.Err.Error(), TokensBefore: f.TokensBefore})
+		if err != nil {
+			return fmt.Errorf("session: encode failed fold: %w", err)
+		}
+		_, err = w.append(ctx, &agentsession.CustomEntry{NS: FailedFoldNS, Data: raw})
+		return err
 	}
-	childRec := New(r.store, s.ID(), WithFilter(r.filter))
+	if f.Summary == nil {
+		return errors.New("session: fold has no summary item")
+	}
+	if f.Split < 0 || f.Split >= len(w.items) {
+		return fmt.Errorf("session: fold keeps the transcript from item %d, but the recorder wrote %d items", f.Split, len(w.items))
+	}
+	_, err := w.append(ctx, &agentsession.CompactionEntry{
+		FirstKept:    w.items[f.Split],
+		Summary:      f.Summary,
+		Config:       w.settings,
+		TokensBefore: f.TokensBefore,
+		Usage:        f.Usage,
+	})
+	return err
+}
+
+// child links the session of a child run to this one. A run that was
+// observed has its session already; its writer is released. One that
+// was not gets a session holding only its items.
+func (w *writer) child(ctx context.Context, callID string, info agent.ChildInfo) error {
+	r := w.rec
+	if cw, ok := r.runs[info.RunID]; ok {
+		delete(r.runs, info.RunID)
+		_, err := w.append(ctx, agentsession.NewSubsessionLink(cw.id, callID))
+		return err
+	}
+	cw, err := r.newChild(ctx, w.id)
+	if err != nil {
+		return err
+	}
 	for _, item := range info.Items {
 		responseID := ""
 		if isModelOutput(item) {
 			responseID = info.RunID
 		}
-		if err := childRec.item(ctx, item, responseID); err != nil {
+		if err := cw.item(ctx, item, responseID); err != nil {
 			return err
 		}
 	}
-	return r.append(ctx, agentsession.NewSubsessionLink(s.ID(), callID))
+	_, err = w.append(ctx, agentsession.NewSubsessionLink(cw.id, callID))
+	return err
 }
 
 // isModelOutput reports whether an item can only have come from the
@@ -415,25 +648,36 @@ func isModelOutput(item openresponses.Item) bool {
 	return false
 }
 
-func (r *Recorder) append(ctx context.Context, e agentsession.Entry) error {
-	if _, err := r.store.Append(ctx, r.id, e); err != nil {
-		return fmt.Errorf("session: append %s: %w", e.EntryType(), err)
+func (w *writer) append(ctx context.Context, e agentsession.Entry) (string, error) {
+	id, err := w.rec.store.Append(ctx, w.id, e)
+	if err != nil {
+		return "", fmt.Errorf("session: append %s: %w", e.EntryType(), err)
 	}
-	return nil
+	return id, nil
 }
 
 // configDelta returns the config entry that takes prev to next, nil when
 // they are equal, or full (a replace entry) when the change cannot be
-// expressed as a delta, which is a tool list change or a model being
-// cleared.
+// expressed as a delta: a model being cleared, a tool list change that
+// a delta would not replay in the request's order, or a delta that
+// would be larger than the replacement.
 func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntry) *agentsession.ConfigEntry {
 	if equalJSON(prev, next) {
 		return nil
 	}
-	if !equalJSON(prev.Tools, next.Tools) || (next.Model == "" && prev.Model != "") {
+	if next.Model == "" && prev.Model != "" {
 		return full
 	}
 	d := &agentsession.ConfigEntry{}
+	if !equalJSON(prev.Tools, next.Tools) {
+		d.ToolsAdded, d.ToolsRemoved = toolDelta(prev.Tools, next.Tools)
+		// Replay appends added tools after the kept ones, so a delta
+		// stands only when that yields the request's tool order; the
+		// hash of the stored path depends on it.
+		if !equalJSON(prev.Apply(d).Tools, next.Tools) {
+			return full
+		}
+	}
 	if next.Model != prev.Model {
 		d.Model = next.Model
 	}
@@ -463,7 +707,45 @@ func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntr
 			d.ClearExtra(k)
 		}
 	}
+	if jsonLen(d) >= jsonLen(full) {
+		return full
+	}
 	return d
+}
+
+// toolDelta returns the tools of next that prev lacks or defines
+// differently, in next's order, and the names of prev's tools that next
+// lacks, in prev's order. A tool whose definition changed under the
+// same name is in added: replay removes the old definition by name
+// before appending the new one.
+func toolDelta(prev, next openresponses.Tools) (added openresponses.Tools, removed []string) {
+	before := make(map[string]openresponses.Tool, len(prev))
+	for _, t := range prev {
+		before[agentsession.ToolName(t)] = t
+	}
+	after := make(map[string]bool, len(next))
+	for _, t := range next {
+		name := agentsession.ToolName(t)
+		after[name] = true
+		if old, ok := before[name]; !ok || !equalJSON(old, t) {
+			added = append(added, t)
+		}
+	}
+	for _, t := range prev {
+		if name := agentsession.ToolName(t); !after[name] {
+			removed = append(removed, name)
+		}
+	}
+	return added, removed
+}
+
+// jsonLen is the encoded size of v, or zero when it cannot be encoded.
+func jsonLen(v any) int {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return 0
+	}
+	return len(data)
 }
 
 func equalJSON(a, b any) bool {

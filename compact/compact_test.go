@@ -343,3 +343,62 @@ func TestTransformDoesNotHoldLockAcrossFold(t *testing.T) {
 		t.Errorf("out = %v err = %v", out, err)
 	}
 }
+
+func TestOnFoldReportsEveryAttempt(t *testing.T) {
+	s := &summarizer{reply: "the gist"}
+	var folds []Fold
+	tr := NewLocal(s, WithBudget(5), WithKeepLast(1), WithEstimator(count), WithOnFold(func(_ context.Context, f Fold) error {
+		folds = append(folds, f)
+		return nil
+	}))
+	in := items(6)
+	out, err := tr.Transform(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(folds) != 1 {
+		t.Fatalf("folds = %d", len(folds))
+	}
+	f := folds[0]
+	// Five items folded, the last kept; the summary stands in for them.
+	if f.Split != 5 || f.Err != nil || len(f.Output) != 1 || f.Summary != f.Output[0] || f.Summary != tr.Last() || f.TokensBefore != 6 {
+		t.Errorf("fold = %+v", f)
+	}
+	if len(out) != 2 || out[0] != f.Summary || out[1] != in[5] {
+		t.Errorf("transform = %v", out)
+	}
+	// A call answered from memory is not a fold.
+	if _, err := tr.Transform(context.Background(), append(in, openresponses.UserText("more"))); err != nil || len(folds) != 1 {
+		t.Errorf("reused fold reported: err=%v folds=%d", err, len(folds))
+	}
+
+	// A failed fold is reported with the error and no output, and the
+	// error is returned.
+	s.fail = true
+	folds = nil
+	_, err = tr.Transform(context.Background(), append(items(20), openresponses.UserText("x")))
+	if err == nil || len(folds) != 1 || folds[0].Err == nil || folds[0].Output != nil || folds[0].Summary != nil || folds[0].Split != 20 || folds[0].TokensBefore != 17 {
+		t.Errorf("failed fold: err=%v folds=%+v", err, folds)
+	}
+
+	// The reporter's error fails the transform.
+	boom := errors.New("cannot record")
+	s.fail = false
+	tr = NewLocal(s, WithBudget(5), WithKeepLast(1), WithEstimator(count), WithOnFold(func(context.Context, Fold) error { return boom }))
+	if _, err := tr.Transform(context.Background(), items(6)); !errors.Is(err, boom) {
+		t.Errorf("reporter error = %v", err)
+	}
+	// The compaction endpoint's fold reports the compaction item as the
+	// summary.
+	folds = nil
+	tr = New(&echo.Adapter{}, WithBudget(5), WithKeepLast(1), WithEstimator(count), WithOnFold(func(_ context.Context, f Fold) error {
+		folds = append(folds, f)
+		return nil
+	}))
+	if _, err := tr.Transform(context.Background(), items(6)); err != nil {
+		t.Fatal(err)
+	}
+	if len(folds) != 1 || folds[0].Summary == nil || folds[0].Summary.ItemType() != openresponses.ItemTypeCompaction {
+		t.Errorf("endpoint fold = %+v", folds)
+	}
+}

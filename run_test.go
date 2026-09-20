@@ -944,3 +944,35 @@ func TestDefaultRetryPolicy(t *testing.T) {
 		t.Errorf("backoff with Retry-After = %s", d)
 	}
 }
+
+func TestRunIDOnContext(t *testing.T) {
+	var runStart, inTool, inTransform, inHook string
+	tool := agenttool.New("upper", "", func(ctx context.Context, a echoArgs) (string, error) {
+		inTool = RunIDFromContext(ctx)
+		return strings.ToUpper(a.Text), nil
+	})
+	cfg := Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{tool},
+		Transform: func(ctx context.Context, t Transcript) (Transcript, error) {
+			inTransform = RunIDFromContext(ctx)
+			return t, nil
+		},
+		BeforeToolCall: func(ctx context.Context, _ ToolCallInfo) (*ToolDecision, error) {
+			inHook = RunIDFromContext(ctx)
+			return nil, nil
+		}}
+	events, _, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range events {
+		if e, ok := ev.(*RunStart); ok {
+			runStart = e.RunID
+		}
+	}
+	if runStart == "" || inTool != runStart || inTransform != runStart || inHook != runStart {
+		t.Errorf("run %q, tool saw %q, transform saw %q, hook saw %q", runStart, inTool, inTransform, inHook)
+	}
+	if RunIDFromContext(context.Background()) != "" {
+		t.Error("a bare context has a run ID")
+	}
+}

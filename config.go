@@ -57,7 +57,24 @@ type Config struct {
 	Tools []agenttool.Tool
 	// ToolProvider, when set, supplies the tools for each turn in place
 	// of Tools, so a source whose tool list changes, such as a remote
-	// MCP server, is picked up on the next turn.
+	// MCP server, is picked up on the next turn. It is called once per
+	// turn, before the model call, and the same list serves the turn's
+	// tool batch, so a call resolves against the tools the model was
+	// offered.
+	//
+	// A provider that returns a snapshot offers a change one turn late
+	// when the change is still in flight as the turn starts: a tool
+	// whose result announces a new tool returns before the refresh that
+	// fetches it has completed. A provider that must offer the change
+	// on the very next call waits for it here, bounded by ctx, as
+	// mcpclient's Await does:
+	//
+	//	cfg.ToolProvider = func(ctx context.Context) []agenttool.Tool {
+	//		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	//		defer cancel()
+	//		_ = remote.Await(ctx)
+	//		return remote.Tools()
+	//	}
 	ToolProvider func(ctx context.Context) []agenttool.Tool
 
 	// Reasoning is the reasoning field of every request: effort and
@@ -308,9 +325,9 @@ func (c Config) tools(ctx context.Context) agenttool.Set {
 }
 
 // ResolveTools returns the tools of the moment: ToolProvider's answer
-// when it is set, Tools otherwise. The loop consults it once per turn;
-// a front that builds its own request uses it so the provider fallback
-// lives in one place.
+// when it is set, Tools otherwise. The loop consults it once per turn,
+// before the model call; a front that builds its own request uses it
+// so the provider fallback lives in one place.
 func (c Config) ResolveTools(ctx context.Context) []agenttool.Tool {
 	if c.ToolProvider != nil {
 		return c.ToolProvider(ctx)

@@ -12,6 +12,7 @@ import (
 	"github.com/ChristopherDavenport/agentsession"
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
+	"github.com/ChristopherDavenport/agentturn/compact"
 	"github.com/ChristopherDavenport/agentturn/tools/agent"
 	"github.com/ChristopherDavenport/openresponses"
 	"github.com/ChristopherDavenport/openresponses/echo"
@@ -287,9 +288,10 @@ func TestSettingsChangesWriteConfig(t *testing.T) {
 			configs = append(configs, c)
 		}
 	}
-	// The initial full config for the first run, then one full replace
-	// when the second agent's tools differ, and nothing per turn.
-	if len(configs) != 2 || !configs[0].Replace || configs[1].Model != "two" || !configs[1].Replace {
+	// The initial full config for the first run, then one delta when the
+	// second agent differs, the tool it adds as tools_added, and nothing
+	// per turn.
+	if len(configs) != 2 || !configs[0].Replace || configs[1].Model != "two" || configs[1].Replace || len(configs[1].ToolsAdded) != 1 || agentsession.ToolName(configs[1].ToolsAdded[0]) != "upper" {
 		t.Errorf("configs = %+v", configs)
 	}
 	cx, _ := s.Context()
@@ -299,35 +301,74 @@ func TestSettingsChangesWriteConfig(t *testing.T) {
 }
 
 func TestConfigDelta(t *testing.T) {
-	instr := func(s string) *string { return &s }
-	base := agentsession.Settings{Model: "m", Instructions: "i", Extra: map[string]json.RawMessage{"a": json.RawMessage(`1`), "b": json.RawMessage(`2`)}}
-	full := &agentsession.ConfigEntry{Model: "m", Replace: true}
+	tool := func(name, desc string) openresponses.Tool {
+		return openresponses.NewFunctionTool(name, desc, json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}}}`))
+	}
+	a, b, c := tool("a", "first"), tool("b", "second"), tool("c", "third")
+	base := agentsession.Settings{Model: "m", Instructions: strings.Repeat("be helpful ", 20), Tools: openresponses.Tools{a, b},
+		Extra: map[string]json.RawMessage{"a": json.RawMessage(`1`), "b": json.RawMessage(`2`)}}
+	// full is what settle would write: the whole of next as a replace.
+	full := func(next agentsession.Settings) *agentsession.ConfigEntry {
+		req, err := next.Request(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry, err := agentsession.ConfigFromRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return entry
+	}
+	with := func(tools ...openresponses.Tool) agentsession.Settings {
+		next := base
+		next.Tools = tools
+		return next
+	}
+	names := func(tools openresponses.Tools) string {
+		var out []string
+		for _, t := range tools {
+			out = append(out, agentsession.ToolName(t))
+		}
+		return strings.Join(out, " ")
+	}
 	cases := []struct {
 		name string
 		next agentsession.Settings
 		want func(*agentsession.ConfigEntry) bool
 	}{
 		{"equal", base, func(d *agentsession.ConfigEntry) bool { return d == nil }},
-		{"model", agentsession.Settings{Model: "n", Instructions: "i", Extra: base.Extra}, func(d *agentsession.ConfigEntry) bool {
-			return d.Model == "n" && d.Instructions == nil && d.Extra == nil
+		{"model", agentsession.Settings{Model: "n", Instructions: base.Instructions, Tools: base.Tools, Extra: base.Extra}, func(d *agentsession.ConfigEntry) bool {
+			return d.Model == "n" && d.Instructions == nil && d.Extra == nil && !d.Replace
 		}},
-		{"instructions cleared", agentsession.Settings{Model: "m", Extra: base.Extra}, func(d *agentsession.ConfigEntry) bool {
-			return d.Instructions != nil && *d.Instructions == "" && d.Model == ""
+		{"instructions cleared", agentsession.Settings{Model: "m", Tools: base.Tools, Extra: base.Extra}, func(d *agentsession.ConfigEntry) bool {
+			return d.Instructions != nil && *d.Instructions == "" && d.Model == "" && !d.Replace
 		}},
-		{"extra changed and removed", agentsession.Settings{Model: "m", Instructions: "i", Extra: map[string]json.RawMessage{"a": json.RawMessage(`3`)}}, func(d *agentsession.ConfigEntry) bool {
-			return string(d.Extra["a"]) == "3" && string(d.Extra["b"]) == "null" && len(d.Extra) == 2
+		{"extra changed and removed", agentsession.Settings{Model: "m", Instructions: base.Instructions, Tools: base.Tools, Extra: map[string]json.RawMessage{"a": json.RawMessage(`3`)}}, func(d *agentsession.ConfigEntry) bool {
+			return string(d.Extra["a"]) == "3" && string(d.Extra["b"]) == "null" && len(d.Extra) == 2 && !d.Replace
 		}},
-		{"model cleared needs replace", agentsession.Settings{Instructions: "i", Extra: base.Extra}, func(d *agentsession.ConfigEntry) bool { return d == full }},
-		{"tools need replace", agentsession.Settings{Model: "m", Instructions: "i", Extra: base.Extra, Tools: openresponses.Tools{openresponses.NewFunctionTool("t", "", nil)}}, func(d *agentsession.ConfigEntry) bool { return d == full }},
+		{"model cleared needs replace", agentsession.Settings{Instructions: base.Instructions, Tools: base.Tools, Extra: base.Extra}, func(d *agentsession.ConfigEntry) bool { return d.Replace }},
+		{"tool added", with(a, b, c), func(d *agentsession.ConfigEntry) bool {
+			return !d.Replace && names(d.ToolsAdded) == "c" && len(d.ToolsRemoved) == 0 && d.Instructions == nil
+		}},
+		{"tool removed", with(a), func(d *agentsession.ConfigEntry) bool {
+			return !d.Replace && len(d.ToolsAdded) == 0 && strings.Join(d.ToolsRemoved, " ") == "b"
+		}},
+		{"last tool redefined", with(a, tool("b", "changed")), func(d *agentsession.ConfigEntry) bool {
+			return !d.Replace && names(d.ToolsAdded) == "b" && len(d.ToolsRemoved) == 0
+		}},
+		{"first tool redefined needs replace", with(tool("a", "changed"), b), func(d *agentsession.ConfigEntry) bool { return d.Replace }},
+		{"tool inserted first needs replace", with(c, a, b), func(d *agentsession.ConfigEntry) bool { return d.Replace }},
+		{"every tool replaced is still a delta when smaller", with(tool("x", ""), tool("y", "")), func(d *agentsession.ConfigEntry) bool {
+			return !d.Replace && names(d.ToolsAdded) == "x y" && strings.Join(d.ToolsRemoved, " ") == "a b"
+		}},
 	}
-	_ = instr
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			d := configDelta(base, tc.next, full)
+			d := configDelta(base, tc.next, full(tc.next))
 			if !tc.want(d) {
 				t.Errorf("delta = %+v", d)
 			}
-			if d != nil && d != full {
+			if d != nil {
 				if got := base.Apply(d); !equalJSON(got, tc.next) {
 					t.Errorf("applying the delta gives %+v, want %+v", got, tc.next)
 				}
@@ -400,7 +441,7 @@ func TestDeferredCallsRecordAndResume(t *testing.T) {
 		t.Fatalf("entries after defer = %q", got)
 	}
 	call := a.State().Pending[0]
-	if _, err := a.Resume(context.Background(), openresponses.NewFunctionCallOutput(call.CallID, "ABC")); err != nil {
+	if _, err := a.Resume(context.Background(), agentturn.Output(openresponses.NewFunctionCallOutput(call.CallID, "ABC"))); err != nil {
 		t.Fatal(err)
 	}
 	if got := entryTypes(s); got != "config item:user item:function_call* response item:function_call_output item:assistant* response" {
@@ -540,10 +581,351 @@ func TestResumeContinuesWithoutDuplicateConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec4, _, err := Resume(context.Background(), store, empty.ID())
-	if err != nil || rec4.wroteConfig {
-		t.Errorf("resume on empty session: err=%v wroteConfig=%v", err, rec4.wroteConfig)
+	if err != nil || rec4.root.wroteConfig {
+		t.Errorf("resume on empty session: err=%v wroteConfig=%v", err, rec4.root.wroteConfig)
 	}
 	if _, _, err := Resume(context.Background(), store, "missing"); err == nil {
 		t.Error("resume of a missing session should fail")
+	}
+}
+
+// ctxStore fails every write on a cancelled context, as a file store
+// does.
+type ctxStore struct {
+	agentsession.Store
+}
+
+func (s ctxStore) Create(ctx context.Context, h agentsession.Header) (*agentsession.Session, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.Store.Create(ctx, h)
+}
+
+func (s ctxStore) Append(ctx context.Context, id string, e agentsession.Entry) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return s.Store.Append(ctx, id, e)
+}
+
+func links(s *agentsession.Session) []*agentsession.LinkEntry {
+	var out []*agentsession.LinkEntry
+	for _, e := range s.Entries() {
+		if l, ok := e.(*agentsession.LinkEntry); ok {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func TestObservedChildIsWrittenLive(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{}, WithHarness("test", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Three levels: the parent's tool is a child whose tool is a
+	// grandchild whose tool is upper. One observer serves both.
+	grandchild := agent.New(agentturn.Config{Name: "grandchild", Model: &echo.Adapter{}, ModelName: "gc", Instructions: "deepest", Tools: []agenttool.Tool{upper}},
+		agent.WithObserver(rec.Observe))
+	child := agent.New(agentturn.Config{Name: "child", Model: &echo.Adapter{}, ModelName: "c", Instructions: "middle", Tools: []agenttool.Tool{grandchild}},
+		agent.WithObserver(rec.Observe))
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "p", Tools: []agenttool.Tool{child}})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
+		t.Fatal(err)
+	}
+	if got := entryTypes(s); got != "config item:user item:function_call* response link item:function_call_output item:assistant* response" {
+		t.Fatalf("parent entries = %q", got)
+	}
+	verifyAll(t, s)
+	parentLinks := links(s)
+	if len(parentLinks) != 1 || parentLinks[0].CallID != s.Entries()[2].(*agentsession.ItemEntry).Item.(*openresponses.FunctionCall).CallID {
+		t.Fatalf("parent links = %+v", parentLinks)
+	}
+	// The child is a full session: config first, then items and
+	// responses as they happened, its own link to the grandchild, and
+	// every hash verifies.
+	cs, err := store.Open(context.Background(), parentLinks[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := cs.Header(); h.ParentSession != s.ID() || h.Harness == nil || h.Harness.Name != "test" {
+		t.Errorf("child header = %+v", h)
+	}
+	if got := entryTypes(cs); got != "config item:user item:function_call* response link item:function_call_output item:assistant* response" {
+		t.Fatalf("child entries = %q", got)
+	}
+	if n := verifyAll(t, cs); n != 2 {
+		t.Errorf("child responses verified = %d", n)
+	}
+	cx, err := cs.Context()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cx.Settings.Model != "c" || cx.Settings.Instructions != "middle" || len(cx.Settings.Tools) != 1 {
+		t.Errorf("child settings = %+v", cx.Settings)
+	}
+	childLinks := links(cs)
+	if len(childLinks) != 1 {
+		t.Fatalf("child links = %+v", childLinks)
+	}
+	gs, err := store.Open(context.Background(), childLinks[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := gs.Header(); h.ParentSession != cs.ID() {
+		t.Errorf("grandchild header = %+v", h)
+	}
+	if got := entryTypes(gs); got != "config item:user item:function_call* response item:function_call_output item:assistant* response" {
+		t.Fatalf("grandchild entries = %q", got)
+	}
+	if n := verifyAll(t, gs); n != 2 {
+		t.Errorf("grandchild responses verified = %d", n)
+	}
+	gx, _ := gs.Context()
+	if gx.Settings.Model != "gc" || gx.Settings.Instructions != "deepest" {
+		t.Errorf("grandchild settings = %+v", gx.Settings)
+	}
+	// Nothing is left behind once the links are written.
+	if len(rec.runs) != 1 {
+		t.Errorf("writers still registered = %d", len(rec.runs))
+	}
+
+	// A child of a tool run outside any loop is parented to the
+	// recorder's session.
+	res, err := grandchild.Execute(context.Background(), agenttool.Call{ID: "call_x", Args: json.RawMessage(`{"input":"hi"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, ok := rec.runs[res.Details.(agent.ChildInfo).RunID]
+	if !ok {
+		t.Fatal("unlinked child has no writer")
+	}
+	os, _ := store.Open(context.Background(), w.id)
+	if os.Header().ParentSession != s.ID() {
+		t.Errorf("orphan child parent = %q", os.Header().ParentSession)
+	}
+}
+
+func TestAbortDuringChildRunStillLinks(t *testing.T) {
+	store := ctxStore{agentsession.NewMemoryStore()}
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocking := agenttool.New("wait", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	started := make(chan struct{})
+	child := agent.New(agentturn.Config{Name: "child", Model: &echo.Adapter{}, Tools: []agenttool.Tool{blocking}},
+		agent.WithObserver(func(ctx context.Context, ev agentturn.Event) {
+			rec.Observe(ctx, ev)
+			if _, ok := ev.(*agentturn.ToolStart); ok {
+				close(started)
+			}
+		}))
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{child}})
+	defer rec.Attach(a)()
+	// A print front registered after the recorder.
+	var seen []string
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if e, ok := ev.(*agentturn.ToolEnd); ok {
+			seen = append(seen, e.Name)
+		}
+		return nil
+	})
+	done := make(chan *agentturn.RunEnd, 1)
+	go func() {
+		end, _ := a.Prompt(context.Background(), openresponses.UserText("delegate"))
+		done <- end
+	}()
+	<-started
+	a.Abort()
+	end := <-done
+	if end == nil || end.Reason != agentturn.ReasonAborted || len(end.Pending) != 1 {
+		t.Fatalf("end = %+v", end)
+	}
+	if got := entryTypes(s); got != "config item:user item:function_call* response link" {
+		t.Errorf("parent entries = %q", got)
+	}
+	if len(seen) != 1 || seen[0] != "child" {
+		t.Errorf("later subscriber saw tool_end for %v", seen)
+	}
+	l := links(s)
+	if len(l) != 1 {
+		t.Fatal("no link written for the aborted child")
+	}
+	cs, err := store.Open(context.Background(), l[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The child's cut-off call has its tool_end; its run_end wrote
+	// nothing more since no model call was in flight.
+	if got := entryTypes(cs); got != "config item:user item:function_call* response" {
+		t.Errorf("child entries = %q", got)
+	}
+	if verifyAll(t, cs) != 1 {
+		t.Error("child response did not verify")
+	}
+}
+
+// countItems is an estimator in items, so a budget is easy to reason
+// about.
+func countItems(items openresponses.Items) int { return len(items) }
+
+func TestFoldRecordsCompaction(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	summarizer := &echo.Adapter{}
+	tr := compact.NewLocal(summarizer, compact.WithBudget(4), compact.WithKeepLast(2), compact.WithEstimator(countItems), compact.WithOnFold(rec.Fold))
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform})
+	defer rec.Attach(a)()
+	for _, text := range []string{"one", "two", "three", "four", "five"} {
+		if _, err := a.Prompt(context.Background(), openresponses.UserText(text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := entryTypes(s)
+	if !strings.Contains(got, "compaction") {
+		t.Fatalf("no compaction entry in %q", got)
+	}
+	if n := verifyAll(t, s); n != 5 {
+		t.Errorf("responses verified = %d", n)
+	}
+	var folds []*agentsession.CompactionEntry
+	for _, e := range s.Entries() {
+		if c, ok := e.(*agentsession.CompactionEntry); ok {
+			folds = append(folds, c)
+		}
+	}
+	// The third prompt is the first to exceed four items: the summary
+	// keeps the last two, the user message just appended and the
+	// assistant reply before it.
+	first := folds[0]
+	kept, ok := s.Entry(first.FirstKept)
+	if !ok {
+		t.Fatalf("first_kept %s not found", first.FirstKept)
+	}
+	if m, ok := kept.(*agentsession.ItemEntry).Item.(*openresponses.Message); !ok || m.Role != openresponses.RoleAssistant {
+		t.Errorf("first kept = %+v", kept)
+	}
+	if first.Config.Model != "m" || first.TokensBefore != 5 || first.Usage == nil {
+		t.Errorf("compaction = %+v", first)
+	}
+	if sum, ok := first.Summary.(*openresponses.Message); !ok || !strings.HasPrefix(sum.Text(), "Summary of the conversation so far:") {
+		t.Errorf("summary = %+v", first.Summary)
+	}
+	// The context at the leaf is what the transform sent.
+	cx, _ := s.Context()
+	if len(cx.Items) == 0 || cx.Items[0] != folds[len(folds)-1].Summary {
+		t.Errorf("context does not open with the last summary")
+	}
+}
+
+func TestFoldWithAppOnlyItemsAndResume(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := compact.NewLocal(&echo.Adapter{}, compact.WithBudget(4), compact.WithKeepLast(2), compact.WithEstimator(countItems), compact.WithOnFold(rec.Fold))
+	cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform}
+	a := agentturn.New(cfg)
+	unsub := rec.Attach(a)
+	// App-only items sit in the working transcript, so a split index
+	// into it must count them.
+	for _, text := range []string{"one", "two", "three"} {
+		note := &openresponses.UnknownItem{Type: "agentturn:note", Raw: json.RawMessage(`{"type":"agentturn:note","text":"ui marker"}`)}
+		if _, err := a.Prompt(context.Background(), note, openresponses.UserText(text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unsub()
+	if n := verifyAll(t, s); n != 3 {
+		t.Errorf("responses verified = %d", n)
+	}
+	if !strings.Contains(entryTypes(s), "compaction") {
+		t.Fatalf("no compaction in %q", entryTypes(s))
+	}
+
+	// A new process resumes from the context at the leaf with a fresh
+	// transform: the recorder's alignment comes from the context.
+	rec2, s2, err := Resume(context.Background(), store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cx, _ := s2.Context()
+	tr2 := compact.NewLocal(&echo.Adapter{}, compact.WithBudget(4), compact.WithKeepLast(2), compact.WithEstimator(countItems), compact.WithOnFold(rec2.Fold))
+	cfg.Transform = tr2.Transform
+	b := agentturn.New(cfg, agentturn.WithTranscript(cx.Items))
+	defer rec2.Attach(b)()
+	for _, text := range []string{"four", "five"} {
+		if _, err := b.Prompt(context.Background(), openresponses.UserText(text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := verifyAll(t, s2); n != 5 {
+		t.Errorf("responses verified after resume = %d", n)
+	}
+	var folds int
+	for _, e := range s2.Entries() {
+		if _, ok := e.(*agentsession.CompactionEntry); ok {
+			folds++
+		}
+	}
+	if folds < 2 {
+		t.Errorf("folds = %d", folds)
+	}
+
+	// A recorder that did not write the transcript cannot name the
+	// first kept entry, and says so rather than guess.
+	rec3 := New(store, s.ID())
+	if err := rec3.Fold(context.Background(), compact.Fold{Split: 1, Summary: openresponses.UserText("s")}); err == nil {
+		t.Error("fold without alignment should fail")
+	}
+}
+
+type failingFold struct{}
+
+func (failingFold) CreateStream(context.Context, openresponses.Request, openresponses.EventSink) error {
+	return errors.New("summary model down")
+}
+
+func TestFailedFoldLeavesATrace(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := compact.NewLocal(failingFold{}, compact.WithBudget(4), compact.WithKeepLast(2), compact.WithEstimator(countItems), compact.WithOnFold(rec.Fold))
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform})
+	defer rec.Attach(a)()
+	for _, text := range []string{"one", "two"} {
+		if _, err := a.Prompt(context.Background(), openresponses.UserText(text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	end, err := a.Prompt(context.Background(), openresponses.UserText("three"))
+	if err == nil || end.Reason != agentturn.ReasonError {
+		t.Fatalf("third prompt: err=%v end=%+v", err, end)
+	}
+	entries := s.Entries()
+	last, ok := entries[len(entries)-1].(*agentsession.CustomEntry)
+	if !ok || last.NS != FailedFoldNS {
+		t.Fatalf("last entry = %+v, entries %q", entries[len(entries)-1], entryTypes(s))
+	}
+	var data FailedFold
+	if err := json.Unmarshal(last.Data, &data); err != nil || !strings.Contains(data.Error, "summary model down") || data.TokensBefore != 5 {
+		t.Errorf("failed fold = %+v err=%v", data, err)
+	}
+	// The record still verifies: the fold changed nothing.
+	if n := verifyAll(t, s); n != 2 {
+		t.Errorf("responses verified = %d", n)
 	}
 }

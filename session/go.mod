@@ -3,8 +3,8 @@ module github.com/ChristopherDavenport/agentturn/session
 go 1.25.0
 
 require (
-	github.com/ChristopherDavenport/agentsession v0.0.3
-	github.com/ChristopherDavenport/agenttool v0.0.3
+	github.com/ChristopherDavenport/agentsession v0.0.4
+	github.com/ChristopherDavenport/agenttool v0.0.4
 	github.com/ChristopherDavenport/agentturn v0.0.4
 	github.com/ChristopherDavenport/openresponses v0.0.9
 )
