@@ -307,6 +307,9 @@ type runner struct {
 	added Transcript
 	// ctx is the run's context, for the hooks the stream calls.
 	ctx context.Context
+	// mark is the length of the transcript after the previous turn's
+	// response, so the next turn_start can name what was appended since.
+	mark int
 	// deferred holds the IDs of the calls a hook handed to the caller
 	// during this run, so the run end can say why they are pending.
 	deferred map[string]bool
@@ -351,6 +354,7 @@ type approval struct {
 // subscriber is not recovered and unwinds without a RunEnd.
 func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved []approval, terminate bool) *RunEnd {
 	r.runID = openresponses.NewID("run")
+	r.mark = len(r.transcript)
 	// Everything the run calls, transform, hooks, model and tools, can
 	// tell which run it serves.
 	ctx = ContextWithRunID(ctx, r.runID)
@@ -611,12 +615,14 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 	if err != nil {
 		return nil, err
 	}
-	if err := r.emit(&TurnStart{RunID: r.runID, Turn: r.turn, Request: req}); err != nil {
+	inputs := append(openresponses.Items(nil), r.transcript[min(r.mark, len(r.transcript)):]...)
+	if err := r.emit(&TurnStart{RunID: r.runID, Turn: r.turn, Request: req, Inputs: inputs}); err != nil {
 		return nil, err
 	}
 	for attempt := 1; ; attempt++ {
 		resp, committed, err := r.stream(ctx, req)
 		if err == nil {
+			r.mark = len(r.transcript)
 			return resp, nil
 		}
 		if ctx.Err() != nil {

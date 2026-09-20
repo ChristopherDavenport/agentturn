@@ -103,9 +103,10 @@ func (a *Agent) Config() Config { return a.cfg }
 
 // SetConfig replaces the configuration for the next run: model,
 // instructions, reasoning, tools, hooks, all of it. It returns
-// [ErrRunning] while a run is active. Subscribers and queues are kept;
-// a session recorder attached to the agent sees the change as a config
-// delta on the next turn.
+// [ErrRunning] while a run is active. Subscribers and the queues are
+// kept, so anything steered or queued under the old configuration
+// goes to the next run under the new one; a session recorder attached
+// to the agent sees the change as a config delta on the next turn.
 func (a *Agent) SetConfig(cfg Config) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -122,7 +123,8 @@ func (a *Agent) SetConfig(cfg Config) error {
 // [WithTranscript] derives them, so whatever the old transcript was
 // waiting on is forgotten and whatever the new one is waiting on must
 // be answered through [Agent.Resume]. Queued Steer and FollowUp items
-// are kept.
+// are kept and go to the next run on the new transcript; a host that
+// does not want them there reads them from [Agent.State] first.
 func (a *Agent) SetTranscript(t Transcript) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -141,9 +143,13 @@ type State struct {
 	Running    bool
 	RunID      string
 	Turn       int
-	// Steering and FollowUps count the queued items.
+	// Steering and FollowUps count the queued items; Steered and Queued
+	// are the items themselves, copies of the queues, so a host can
+	// persist what it accepted and queue it again after a restart.
 	Steering  int
 	FollowUps int
+	Steered   openresponses.Items
+	Queued    openresponses.Items
 	// Pending lists the calls awaiting outputs, each with why: deferred,
 	// cut off by an abort or a failure, or found unanswered in a seeded
 	// transcript. Continue refuses until Resume has answered them, and
@@ -162,6 +168,8 @@ func (a *Agent) State() State {
 		Turn:       a.turn,
 		Steering:   len(a.steer),
 		FollowUps:  len(a.followUp),
+		Steered:    append(openresponses.Items(nil), a.steer...),
+		Queued:     append(openresponses.Items(nil), a.followUp...),
 		Pending:    append([]PendingCall(nil), a.pending...),
 	}
 }
@@ -448,6 +456,21 @@ func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe fu
 // Steer queues items to be injected after the current tool batch,
 // before the next model call. When the agent is idle they are consumed
 // by the next run at the same point.
+//
+// The queues live in memory: an item accepted here is in no record
+// until a run appends it, and it survives [Agent.Abort], [SetConfig]
+// and [SetTranscript] but not the process. A host that promises the
+// sender it has the item persists it itself, reading the queues back
+// from [Agent.State], and queues it again after a restart.
+//
+// A steered item is appended with its own item events, which reach
+// every subscriber. A subscriber that steers in reaction to an event
+// the steered item itself produces, an item_end during a run for
+// instance, feeds the run forever, and nothing reports it: the loop
+// cannot tell a reaction from a fresh input. Steer from a front, a
+// monitor or another goroutine, or from a subscriber only on events it
+// can tell apart from its own items, such as a tool_end or a specific
+// item type it never steers.
 func (a *Agent) Steer(items ...openresponses.Item) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -455,7 +478,8 @@ func (a *Agent) Steer(items ...openresponses.Item) {
 }
 
 // FollowUp queues items to be injected when the run would otherwise
-// end, so the agent keeps going instead of going idle.
+// end, so the agent keeps going instead of going idle. The queue has
+// the same life and the same caveat about subscribers as [Agent.Steer].
 func (a *Agent) FollowUp(items ...openresponses.Item) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -480,7 +504,8 @@ func (a *Agent) drainFollowUp() openresponses.Items {
 
 // Abort cancels the active run, if any. The model stream and running
 // tools see the cancellation through their context and the run ends
-// with ReasonAborted.
+// with ReasonAborted. The queues are untouched: anything steered or
+// queued and not yet appended goes to the next run.
 func (a *Agent) Abort() {
 	a.mu.Lock()
 	cancel := a.cancel

@@ -142,6 +142,22 @@ versions may break the API.
   hands the child a valid input; the parent's snapshot is unchanged.
   `New` panics on a `Config.Name` a provider rejects as a tool name
   unless `WithToolName` gives one. (#39)
+- `State.Steered` and `State.Queued` are the queued items themselves,
+  copies of the steer and follow-up queues, so a host that promised a
+  sender it has an item can persist it and queue it again after a
+  restart. `Steer`, `FollowUp`, `Abort`, `SetConfig` and
+  `SetTranscript` document that the queues live in memory and survive
+  everything but the process. (#32)
+- `TurnStart.Inputs` names the items appended since the previous turn's
+  response, or since the run started, so a front routes a response to
+  the messages it answers without counting item events between turns.
+  (#33)
+- `AfterToolCall` documents that an override is invisible to every
+  subscriber and recorder, so a cap on tool output belongs in the tool
+  or in a Transform, not there. (#53)
+- `Steer` and `FollowUp` document that a subscriber steering in
+  reaction to an event its own item produces feeds the run forever, and
+  where to steer from instead. (#54)
 - `RunStart` carries `Source`, input or resume, and the `Trigger` a
   caller attached to the context with `ContextWithTrigger`; the loop
   learns nothing from it. (#31)

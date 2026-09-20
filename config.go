@@ -156,7 +156,17 @@ type Config struct {
 	// call of the batch executes. A nil decision allows the call.
 	BeforeToolCall func(context.Context, ToolCallInfo) (*ToolDecision, error)
 	// AfterToolCall runs when a call completes and may replace its
-	// result. A nil override keeps the result.
+	// result. A nil override keeps the result. An override replaces the
+	// result before tool_end is delivered and before the output is
+	// appended, so no subscriber and no recorder sees what the tool
+	// returned: bytes cut here exist nowhere afterwards. A cap on tool
+	// output therefore belongs in the tool, the only place the whole
+	// output exists, which can cut the middle so both ends survive and
+	// leave the full bytes where the model can read them, naming that
+	// place in the text it returns; a Transform, which shapes one call
+	// and never replaces the transcript, is the other placement that
+	// keeps the record whole. This hook is for a policy on the result
+	// the model sees, not for saving space.
 	AfterToolCall func(context.Context, ToolResultInfo) (*ToolOverride, error)
 	// ShouldStopAfterTurn ends the run after a turn even when the model
 	// requested tools: true ends it with ReasonStopped and StopHook. An

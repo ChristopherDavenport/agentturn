@@ -306,3 +306,87 @@ func TestRunRefusesDanglingCalls(t *testing.T) {
 		t.Errorf("continue with a dangling call: err=%v", err)
 	}
 }
+
+func TestStateExposesTheQueues(t *testing.T) {
+	a := New(Config{Model: &echo.Adapter{}})
+	a.Steer(openresponses.UserText("steered"))
+	a.FollowUp(openresponses.UserText("later"), openresponses.UserText("and later"))
+	st := a.State()
+	if st.Steering != 1 || st.FollowUps != 2 || len(st.Steered) != 1 || len(st.Queued) != 2 || st.Queued[1].(*openresponses.Message).Text() != "and later" {
+		t.Errorf("state = %+v", st)
+	}
+	// The copies do not alias the queues.
+	st.Queued[0] = openresponses.UserText("changed")
+	if a.State().Queued[0].(*openresponses.Message).Text() != "later" {
+		t.Error("State returned the queue itself")
+	}
+	// The queues survive SetTranscript and SetConfig and drain into the
+	// next run.
+	if err := a.SetTranscript(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SetConfig(Config{Model: &echo.Adapter{}, ModelName: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	if st := a.State(); st.Steering != 1 || st.FollowUps != 2 {
+		t.Errorf("queues after SetTranscript/SetConfig = %+v", st)
+	}
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
+		t.Fatal(err)
+	}
+	// After the first answer the steered item and both follow-ups are
+	// drained together, and answered by one more turn.
+	if st := a.State(); st.Steering != 0 || st.FollowUps != 0 || itemTypes(st.Transcript) != "user assistant user user user assistant" {
+		t.Errorf("state after run = %q steer=%d followups=%d", itemTypes(st.Transcript), st.Steering, st.FollowUps)
+	}
+}
+
+func TestTurnStartNamesItsInputs(t *testing.T) {
+	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}})
+	rec := &recorder{}
+	rec.subscribe(a)
+	// Steer during the first tool batch, so the second turn answers the
+	// tool output and the steered message; queue a follow-up for a
+	// third. Once only: a subscriber that steers on every tool_start
+	// feeds the run forever, which is the hazard Steer documents.
+	steered := false
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if _, ok := ev.(*ToolStart); ok && !steered {
+			steered = true
+			a.Steer(openresponses.UserText("steered in"))
+			a.FollowUp(openresponses.UserText("follow up"))
+		}
+		return nil
+	})
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
+		t.Fatal(err)
+	}
+	var inputs []string
+	for _, ev := range rec.events {
+		if e, ok := ev.(*TurnStart); ok {
+			inputs = append(inputs, itemTypes(e.Inputs))
+		}
+	}
+	// The echo adapter answers the steered message with another call,
+	// and the follow-up is drained once a turn makes no call.
+	if want := []string{"user", "function_call_output user", "function_call_output", "user", "function_call_output"}; strings.Join(inputs, "|") != strings.Join(want, "|") {
+		t.Errorf("inputs per turn = %v, want %v", inputs, want)
+	}
+	// A resume names the answers and the approved outputs as the first
+	// turn's inputs.
+	deferAll := func(context.Context, ToolCallInfo) (*ToolDecision, error) { return &ToolDecision{Action: Defer}, nil }
+	b := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}, BeforeToolCall: deferAll})
+	if _, err := b.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
+		t.Fatal(err)
+	}
+	rec2 := &recorder{}
+	rec2.subscribe(b)
+	if _, err := b.Resume(context.Background(), Approve(b.State().Pending[0].Call.CallID)); err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range rec2.events {
+		if e, ok := ev.(*TurnStart); ok && itemTypes(e.Inputs) != "function_call_output" {
+			t.Errorf("resume inputs = %q", itemTypes(e.Inputs))
+		}
+	}
+}

@@ -111,11 +111,17 @@ type RunStart struct {
 func (*RunStart) EventType() string { return EventRunStart }
 
 // TurnStart opens a turn and carries the exact request sent to the
-// model.
+// model. Inputs are the items appended to the transcript since the
+// previous turn's response, or since the run started for the first
+// turn: the tool outputs, the steered and queued messages, the items
+// BeforeTurn added. They are what this turn's response answers, so a
+// front that routes replies to the message that caused them reads them
+// here rather than counting item events between turns.
 type TurnStart struct {
 	RunID   string
 	Turn    int
 	Request openresponses.Request
+	Inputs  openresponses.Items
 }
 
 // EventType returns "turn_start".
