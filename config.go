@@ -200,10 +200,18 @@ func VisibleFilter(visible ...string) func(Transcript) openresponses.Items {
 
 // tools resolves the tool list for a turn.
 func (c Config) tools(ctx context.Context) agenttool.Set {
+	return agenttool.Set(c.ResolveTools(ctx))
+}
+
+// ResolveTools returns the tools of the moment: ToolProvider's answer
+// when it is set, Tools otherwise. The loop consults it once per turn;
+// a front that builds its own request uses it so the provider fallback
+// lives in one place.
+func (c Config) ResolveTools(ctx context.Context) []agenttool.Tool {
 	if c.ToolProvider != nil {
-		return agenttool.Set(c.ToolProvider(ctx))
+		return c.ToolProvider(ctx)
 	}
-	return agenttool.Set(c.Tools)
+	return c.Tools
 }
 
 func (c Config) filter() func(Transcript) openresponses.Items {

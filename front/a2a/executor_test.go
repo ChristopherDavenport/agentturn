@@ -14,6 +14,7 @@ import (
 	"github.com/ChristopherDavenport/openresponses/echo"
 	"github.com/a2aproject/a2a-go/a2a"
 	"github.com/a2aproject/a2a-go/a2asrv"
+	"github.com/a2aproject/a2a-go/a2asrv/eventqueue"
 )
 
 func userMessage(text string) *a2a.Message {
@@ -222,12 +223,22 @@ func TestCallerToolRoundTrip(t *testing.T) {
 	if task.Status.Message == nil || len(task.Status.Message.Parts) != 1 {
 		t.Fatalf("status message = %+v", task.Status.Message)
 	}
-	if n, _ := task.Status.Message.Metadata[MetaPendingCalls].(int); n != 1 {
-		t.Errorf("pending calls meta = %v", task.Status.Message.Metadata[MetaPendingCalls])
-	}
 	dp, ok := task.Status.Message.Parts[0].(a2a.DataPart)
 	if !ok || dp.Data["type"] != "function_call" || dp.Data["name"] != "lookup" {
 		t.Fatalf("part = %+v", task.Status.Message.Parts[0])
+	}
+	// The pending call IDs survive the trip a real caller makes: JSON
+	// out and back.
+	raw, err := json.Marshal(task.Status.Message.Metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if ids, _ := meta[MetaPendingCalls].([]any); len(ids) != 1 || ids[0] != dp.Data["call_id"] {
+		t.Errorf("pending calls meta = %v", meta[MetaPendingCalls])
 	}
 	args, _ := dp.Data["arguments"].(string)
 	if args != `{"q":"find it"}` {
@@ -283,8 +294,8 @@ func TestAgentCard(t *testing.T) {
 	cfg := agentturn.Config{Name: "Research Agent", Description: "Finds things.", Tools: []agenttool.Tool{
 		agenttool.New("search", "Search the web", func(context.Context, agenttool.NoArgs) (string, error) { return "", nil }),
 	}}
-	card := AgentCard(cfg, "http://localhost/invoke")
-	if card.Name != "Research Agent" || card.Description != "Finds things." || card.URL != "http://localhost/invoke" {
+	card := AgentCard(context.Background(), cfg, "http://localhost/invoke", "2.0.0")
+	if card.Name != "Research Agent" || card.Description != "Finds things." || card.URL != "http://localhost/invoke" || card.Version != "2.0.0" {
 		t.Errorf("card = %+v", card)
 	}
 	if !card.Capabilities.Streaming || card.PreferredTransport != a2a.TransportProtocolJSONRPC {
@@ -293,8 +304,13 @@ func TestAgentCard(t *testing.T) {
 	if len(card.Skills) != 2 || card.Skills[0].ID != "research_agent" || card.Skills[1].ID != "search" || card.Skills[1].Description != "Search the web" {
 		t.Errorf("skills = %+v", card.Skills)
 	}
-	if AgentCard(agentturn.Config{}, "").Skills[0].ID != "agent" {
+	if AgentCard(context.Background(), agentturn.Config{}, "", "").Skills[0].ID != "agent" {
 		t.Error("unnamed agent should get a default skill")
+	}
+	// A provider-backed tool list is advertised too.
+	provided := agentturn.Config{ToolProvider: func(context.Context) []agenttool.Tool { return cfg.Tools }}
+	if skills := AgentCard(context.Background(), provided, "", "").Skills; len(skills) != 2 || skills[1].ID != "search" {
+		t.Errorf("provider skills = %+v", skills)
 	}
 	if _, err := json.Marshal(card); err != nil {
 		t.Error(err)
@@ -485,7 +501,7 @@ func TestMixedBatchRunsLocalToolsAndDefersCallerTools(t *testing.T) {
 	if note, ok := again.Status.Message.Parts[0].(a2a.TextPart); !ok || !strings.Contains(note.Text, "waiting on 1 tool call") {
 		t.Errorf("note = %+v", again.Status.Message.Parts[0])
 	}
-	if n, _ := again.Status.Message.Metadata[MetaPendingCalls].(int); n != 1 {
+	if ids, _ := again.Status.Message.Metadata[MetaPendingCalls].([]any); len(ids) != 1 || ids[0] != dp.Data["call_id"] {
 		t.Errorf("pending meta = %v", again.Status.Message.Metadata[MetaPendingCalls])
 	}
 	answer := a2a.NewMessageForTask(a2a.MessageRoleUser, task, a2a.DataPart{Data: map[string]any{
@@ -495,4 +511,45 @@ func TestMixedBatchRunsLocalToolsAndDefersCallerTools(t *testing.T) {
 	if done.Status.State != a2a.TaskStateCompleted || Text(done) != "local-ran+remote-ran" {
 		t.Errorf("resumed = %s %q", done.Status.State, Text(done))
 	}
+}
+
+// failingQueue fails every write after the first n.
+type failingQueue struct {
+	eventqueue.Queue
+	n      int
+	writes int
+	err    error
+}
+
+func (q *failingQueue) Write(ctx context.Context, ev a2a.Event) error {
+	q.writes++
+	if q.writes > q.n {
+		return q.err
+	}
+	return q.Queue.Write(ctx, ev)
+}
+
+func TestFailedEventWriteIsReturnedNotCanceled(t *testing.T) {
+	store := NewMemoryStore()
+	exec := New(agentturn.Config{Model: &echo.Adapter{}}, WithConversationStore(store))
+	inner, err := eventqueue.NewInMemoryManager().GetOrCreate(context.Background(), "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken := errors.New("queue broken")
+	// The working status goes through; the first artifact chunk fails.
+	q := &failingQueue{Queue: inner, n: 1, err: broken}
+	reqCtx := &a2asrv.RequestContext{Message: userMessage("hello there"), TaskID: "t1", ContextID: "c1"}
+	if err := exec.Execute(context.Background(), reqCtx, q); !errors.Is(err, broken) {
+		t.Fatalf("Execute err = %v, want the write failure", err)
+	}
+	// The run was aborted by the failure, and the stored conversation
+	// is still a valid input.
+	tr, _ := store.Load(context.Background(), "c1")
+	if len(tr) == 0 || unanswered(tr) != nil {
+		t.Errorf("stored transcript = %d items, unanswered = %v", len(tr), unanswered(tr))
+	}
+	// The zero Executor is usable: track initialises the registry.
+	var zero Executor
+	zero.track("x", func() {})()
 }

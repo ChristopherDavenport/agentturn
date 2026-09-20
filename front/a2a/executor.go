@@ -63,21 +63,22 @@ func New(cfg agentturn.Config, opts ...Option) *Executor {
 
 // Execute runs the loop for one message and translates the run into A2A
 // events. It returns nil after a terminal or input-required status has
-// been written; a returned error makes the SDK fail the task.
+// been written; a returned error, including a failure to write an
+// event, makes the SDK fail the task.
 func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue) error {
 	if reqCtx.Message == nil {
 		return fmt.Errorf("%w: message is required", a2a.ErrInvalidParams)
 	}
 	prompts, err := ItemsFromMessage(reqCtx.Message)
 	if err != nil {
-		return fmt.Errorf("%w: %v", a2a.ErrInvalidParams, err)
+		return fmt.Errorf("%w: %w", a2a.ErrInvalidParams, err)
 	}
 	if len(prompts) == 0 {
 		return fmt.Errorf("%w: message has no usable parts", a2a.ErrInvalidParams)
 	}
 	declared, err := callerTools(reqCtx.Message)
 	if err != nil {
-		return fmt.Errorf("%w: %v", a2a.ErrInvalidParams, err)
+		return fmt.Errorf("%w: %w", a2a.ErrInvalidParams, err)
 	}
 	transcript, err := e.store.Load(ctx, reqCtx.ContextID)
 	if err != nil {
@@ -92,30 +93,72 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	e.mu.Lock()
-	e.cancels[reqCtx.TaskID] = cancel
-	e.mu.Unlock()
-	defer func() {
-		e.mu.Lock()
-		delete(e.cancels, reqCtx.TaskID)
-		e.mu.Unlock()
-	}()
-
+	defer e.track(reqCtx.TaskID, cancel)()
 	if err := q.Write(ctx, a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateWorking, nil)); err != nil {
 		return err
 	}
-
 	cfg := e.runConfig(append(append([]*openresponses.FunctionTool(nil), e.callerTools...), declared...))
-	var (
-		writer   *artifactWriter
-		lastText string
-		end      *agentturn.RunEnd
-		runErr   error
-	)
+	out := e.relay(ctx, runCtx, cancel, reqCtx, q, transcript, prompts, cfg)
+	if out.end == nil {
+		// Run refused to start; nothing was appended.
+		return e.finish(ctx, reqCtx, q, a2a.TaskStateFailed, errorMessage(reqCtx, out.runErr))
+	}
+	if err := e.persist(ctx, reqCtx.ContextID, transcript, out.end); err != nil {
+		return err
+	}
+	if out.writeErr != nil {
+		// The run was cut short because an event could not be written;
+		// the AgentExecutor contract is to return that error, not to
+		// report the task as canceled.
+		return out.writeErr
+	}
+	return e.conclude(ctx, reqCtx, q, out)
+}
+
+// track registers cancel for the task and returns the function that
+// removes it, so a Cancel arriving during the run finds it.
+func (e *Executor) track(id a2a.TaskID, cancel context.CancelFunc) func() {
+	e.mu.Lock()
+	if e.cancels == nil {
+		e.cancels = map[a2a.TaskID]context.CancelFunc{}
+	}
+	e.cancels[id] = cancel
+	e.mu.Unlock()
+	return func() {
+		e.mu.Lock()
+		delete(e.cancels, id)
+		e.mu.Unlock()
+		cancel()
+	}
+}
+
+// outcome is what relay reports about a run.
+type outcome struct {
+	end      *agentturn.RunEnd
+	lastText string
+	// writeErr is the first failure to write an event to the queue; it
+	// aborted the run.
+	writeErr error
+	// runErr is the error Run yielded, which is the RunEnd's error or a
+	// refusal to start.
+	runErr error
+}
+
+// relay drives the loop and streams assistant text into artifacts. A
+// failed write aborts the run through cancel and is reported on the
+// outcome; the run's own end and error are reported alongside.
+func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc, reqCtx *a2asrv.RequestContext, q eventqueue.Queue, transcript agentturn.Transcript, prompts openresponses.Items, cfg agentturn.Config) outcome {
+	var out outcome
+	var writer *artifactWriter
+	fail := func(err error) {
+		if out.writeErr == nil {
+			out.writeErr = err
+		}
+		cancel()
+	}
 	for ev, err := range agentturn.Run(runCtx, transcript, prompts, cfg) {
 		if err != nil {
-			runErr = err
+			out.runErr = err
 		}
 		switch ev := ev.(type) {
 		case *agentturn.ItemStart:
@@ -135,50 +178,51 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 			}
 			if delta != "" {
 				if err := writer.write(ctx, delta); err != nil {
-					cancel()
-					runErr = err
+					fail(err)
 				}
 			}
 		case *agentturn.ItemEnd:
 			if m, ok := ev.Item.(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant && writer != nil {
-				lastText = m.Text()
+				out.lastText = m.Text()
 				if err := writer.close(ctx); err != nil {
-					cancel()
-					runErr = err
+					fail(err)
 				}
 				writer = nil
 			}
 		case *agentturn.RunEnd:
-			end = ev
+			out.end = ev
 		}
 	}
-	if end == nil {
-		// Run refused to start; nothing was appended.
-		return e.finish(ctx, reqCtx, q, a2a.TaskStateFailed, errorMessage(reqCtx, runErr))
-	}
+	return out
+}
 
-	// The conversation is everything the run appended. A deferred call
-	// stays unanswered on purpose: the caller answers it on the next
-	// message. After an abort or a failure, trailing calls that will
-	// never be answered are dropped so the next message is a valid
-	// input.
+// persist stores the conversation after a run: everything the run
+// appended. A deferred call stays unanswered on purpose, since the
+// caller answers it on the next message; after an abort or a failure
+// the calls that will never be answered are dropped so the next message
+// is a valid input.
+func (e *Executor) persist(ctx context.Context, contextID string, transcript agentturn.Transcript, end *agentturn.RunEnd) error {
 	next := append(transcript, end.Items...)
 	switch end.Reason {
 	case agentturn.ReasonDone, agentturn.ReasonStopped, agentturn.ReasonInputRequired:
 	default:
 		next = stripUnanswered(next)
 	}
-	if err := e.store.Save(ctx, reqCtx.ContextID, next); err != nil {
-		return fmt.Errorf("save conversation %q: %w", reqCtx.ContextID, err)
+	if err := e.store.Save(ctx, contextID, next); err != nil {
+		return fmt.Errorf("save conversation %q: %w", contextID, err)
 	}
+	return nil
+}
 
-	switch end.Reason {
+// conclude writes the task's final status from the run's reason.
+func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue, out outcome) error {
+	switch out.end.Reason {
 	case agentturn.ReasonInputRequired:
-		return e.inputRequired(ctx, reqCtx, q, end.Pending, "")
+		return e.inputRequired(ctx, reqCtx, q, out.end.Pending, "")
 	case agentturn.ReasonDone, agentturn.ReasonStopped:
 		var msg *a2a.Message
-		if lastText != "" {
-			msg = a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: lastText})
+		if out.lastText != "" {
+			msg = a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: out.lastText})
 		}
 		return e.finish(ctx, reqCtx, q, a2a.TaskStateCompleted, msg)
 	case agentturn.ReasonAborted:
@@ -187,9 +231,9 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 		_ = e.finish(context.WithoutCancel(ctx), reqCtx, q, a2a.TaskStateCanceled, nil)
 		return nil
 	default:
-		err := end.Err
+		err := out.end.Err
 		if err == nil {
-			err = runErr
+			err = out.runErr
 		}
 		return e.finish(ctx, reqCtx, q, a2a.TaskStateFailed, errorMessage(reqCtx, err))
 	}
@@ -295,9 +339,9 @@ func checkAnswers(t agentturn.Transcript, prompts openresponses.Items) error {
 	return nil
 }
 
-// stripUnanswered drops trailing function_call items that have no
-// output, so the stored conversation stays a valid input after an
-// aborted or failed run.
+// stripUnanswered drops every function_call item that has no output,
+// so the stored conversation stays a valid input after an aborted or
+// failed run.
 func stripUnanswered(items openresponses.Items) openresponses.Items {
 	answered := map[string]bool{}
 	for _, item := range items {
@@ -329,8 +373,14 @@ func (e *Executor) inputRequired(ctx context.Context, reqCtx *a2asrv.RequestCont
 		}
 		parts = append(parts, dp)
 	}
+	// []any, not []string: the SDK's task store accepts only the types a
+	// JSON decode produces, and so does every caller on the wire.
+	ids := make([]any, 0, len(pending))
+	for _, fc := range pending {
+		ids = append(ids, fc.CallID)
+	}
 	msg := a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, parts...)
-	msg.SetMeta(MetaPendingCalls, len(pending))
+	msg.SetMeta(MetaPendingCalls, ids)
 	return e.finish(ctx, reqCtx, q, a2a.TaskStateInputRequired, msg)
 }
 

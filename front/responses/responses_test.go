@@ -335,3 +335,68 @@ func TestFullRunDefersToCaller(t *testing.T) {
 		})
 	}
 }
+
+// capturing records the request it was sent and answers as echo does.
+type capturing struct {
+	echo.Adapter
+	reqs []openresponses.Request
+}
+
+func (c *capturing) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	c.reqs = append(c.reqs, req)
+	return c.Adapter.CreateStream(ctx, req, sink)
+}
+
+func TestRequestMembersReachModelInBothModes(t *testing.T) {
+	maxOut := 321
+	model := &capturing{}
+	cfg := agentturn.Config{Model: model, ModelName: "m", Instructions: "inst", Tools: []agenttool.Tool{upper},
+		RequestExtra: map[string]any{"acme": true},
+		Request: openresponses.Request{
+			MaxOutputTokens:  &maxOut,
+			Include:          []openresponses.Include{openresponses.IncludeReasoningEncryptedContent},
+			SafetyIdentifier: "user-1",
+			PromptCacheKey:   "cache-1",
+			Truncation:       openresponses.TruncationAuto,
+			Metadata:         map[string]string{"app": "test"},
+		},
+		BeforeModelCall: func(_ context.Context, r *openresponses.Request) error {
+			r.Metadata["hooked"] = "yes"
+			return nil
+		},
+	}
+	a := New(cfg)
+	full := request(openresponses.UserText("abc"))
+	if _, err := a.Create(context.Background(), full); err != nil {
+		t.Fatal(err)
+	}
+	one := request(openresponses.UserText("abc"))
+	one.Tools = openresponses.Tools{openresponses.NewFunctionTool("lookup", "caller owned", nil)}
+	one.ToolChoice = openresponses.ToolChoice{Mode: openresponses.ToolChoiceRequired}
+	if _, err := a.Create(context.Background(), one); err != nil {
+		t.Fatal(err)
+	}
+	if len(model.reqs) < 2 {
+		t.Fatalf("model saw %d requests", len(model.reqs))
+	}
+	for i, r := range []openresponses.Request{model.reqs[0], model.reqs[len(model.reqs)-1]} {
+		mode := [...]string{"full run", "one turn"}[i]
+		if r.MaxOutputTokens == nil || *r.MaxOutputTokens != maxOut || !r.Includes(openresponses.IncludeReasoningEncryptedContent) ||
+			r.SafetyIdentifier != "user-1" || r.PromptCacheKey != "cache-1" || r.Truncation != openresponses.TruncationAuto {
+			t.Errorf("%s: request members lost: %+v", mode, r)
+		}
+		if r.Model != "m" || r.Instructions != "inst" || r.Store == nil || *r.Store || !r.Stream {
+			t.Errorf("%s: loop-owned members wrong: model=%q instructions=%q", mode, r.Model, r.Instructions)
+		}
+		if r.Extra["acme"] != true || r.Metadata["app"] != "test" || r.Metadata["hooked"] != "yes" {
+			t.Errorf("%s: extra=%v metadata=%v", mode, r.Extra, r.Metadata)
+		}
+	}
+	last := model.reqs[len(model.reqs)-1]
+	if len(last.Tools) != 2 || last.ToolChoice.Mode != openresponses.ToolChoiceRequired {
+		t.Errorf("one turn: tools=%d tool_choice=%+v", len(last.Tools), last.ToolChoice)
+	}
+	if cfg.Request.Metadata["hooked"] != "" {
+		t.Error("template metadata mutated by the hook")
+	}
+}

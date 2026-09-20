@@ -18,8 +18,11 @@ const (
 	// caller answers with a message whose data parts are the matching
 	// function_call_output items.
 	MetaCallerTools = "agentturn.caller_tools"
-	// MetaPendingCalls, on an input-required status message, counts the
-	// function calls the caller must answer.
+	// MetaPendingCalls, on an input-required status message, lists the
+	// call IDs of the function calls the caller must answer: a JSON
+	// array of strings on the wire, a []any of string values in process,
+	// which is the form a JSON decode yields and the only one the SDK
+	// stores.
 	MetaPendingCalls = "agentturn.pending_calls"
 )
 

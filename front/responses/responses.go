@@ -202,53 +202,53 @@ func (a *Adapter) fullRun(ctx context.Context, req openresponses.Request, transc
 }
 
 // oneTurn calls the model once with the agent's and the caller's tools
-// and re-emits the response; calls are the caller's to run.
+// and re-emits the response; calls are the caller's to run. The request
+// is the same one the loop would send, Config.BaseRequest over the
+// per-request model and instructions, so every Config.Request member
+// reaches the model in both modes.
 func (a *Adapter) oneTurn(ctx context.Context, req openresponses.Request, transcript agentturn.Transcript, callerTools []*openresponses.FunctionTool, rl *relay) error {
-	tools := agenttool.Set(a.cfg.Tools)
-	if a.cfg.ToolProvider != nil {
-		tools = agenttool.Set(a.cfg.ToolProvider(ctx))
+	cfg := a.cfg
+	cfg.ModelName = a.model(req.Model)
+	cfg.Instructions = a.instructions(req.Instructions)
+	if cfg.Reasoning.IsZero() {
+		cfg.Reasoning = req.Reasoning
 	}
-	defs := tools.Definitions()
+	if cfg.Text.IsZero() {
+		cfg.Text = req.Text
+	}
+	// Resolve the tools once: the collision check and the request see
+	// the same list.
+	cfg.Tools = cfg.ResolveTools(ctx)
+	cfg.ToolProvider = nil
+	tools := agenttool.Set(cfg.Tools)
 	for _, ct := range callerTools {
 		if _, ok := tools.Lookup(ct.Name); ok {
 			return openresponses.InvalidRequest(openresponses.CodeInvalidValue, fmt.Sprintf("tool %q is owned by the agent", ct.Name), "tools")
 		}
-		defs = append(defs, ct)
 	}
 	input := transcript
-	if a.cfg.Transform != nil {
+	if cfg.Transform != nil {
 		var err error
-		input, err = a.cfg.Transform(ctx, append(agentturn.Transcript(nil), transcript...))
+		input, err = cfg.Transform(ctx, append(agentturn.Transcript(nil), transcript...))
 		if err != nil {
 			return fmt.Errorf("transform: %w", err)
 		}
 	}
-	filter := a.cfg.Filter
+	filter := cfg.Filter
 	if filter == nil {
 		filter = agentturn.DefaultFilter
 	}
-	store := false
-	upstream := openresponses.Request{
-		Model:        a.model(req.Model),
-		Instructions: a.instructions(req.Instructions),
-		Input:        filter(input),
-		Tools:        defs,
-		ToolChoice:   req.ToolChoice,
-		Reasoning:    a.cfg.Reasoning,
-		Text:         a.cfg.Text,
-		Store:        &store,
-		Stream:       true,
+	upstream := cfg.BaseRequest(ctx)
+	upstream.Input = filter(input)
+	for _, ct := range callerTools {
+		upstream.Tools = append(upstream.Tools, ct)
 	}
-	if upstream.Reasoning.IsZero() {
-		upstream.Reasoning = req.Reasoning
+	if req.ToolChoice != (openresponses.ToolChoice{}) {
+		upstream.ToolChoice = req.ToolChoice
 	}
-	if upstream.Text.IsZero() {
-		upstream.Text = req.Text
-	}
-	if len(a.cfg.RequestExtra) > 0 {
-		upstream.Extra = make(map[string]any, len(a.cfg.RequestExtra))
-		for k, v := range a.cfg.RequestExtra {
-			upstream.Extra[k] = v
+	if cfg.BeforeModelCall != nil {
+		if err := cfg.BeforeModelCall(ctx, &upstream); err != nil {
+			return fmt.Errorf("before-model-call hook: %w", err)
 		}
 	}
 	var acc openresponses.Accumulator

@@ -1,6 +1,7 @@
 package a2a
 
 import (
+	"context"
 	"strings"
 
 	"github.com/ChristopherDavenport/agentturn"
@@ -9,11 +10,12 @@ import (
 
 // AgentCard derives the A2A agent card from the config: Name and
 // Description describe the agent, and the skills are one default skill
-// from the description plus one skill per tool, so a caller sees what
-// the agent can do without a second description. url is the JSON-RPC
-// endpoint. Callers set Version, Provider and security fields as they
-// see fit.
-func AgentCard(cfg agentturn.Config, url string) *a2a.AgentCard {
+// from the description plus one skill per tool, resolved through
+// ToolProvider when the config has one, so a caller sees what the
+// agent can do without a second description. url is the JSON-RPC
+// endpoint and version is the agent's own version string. Callers set
+// Provider and the security fields as they see fit.
+func AgentCard(ctx context.Context, cfg agentturn.Config, url, version string) *a2a.AgentCard {
 	name := cfg.Name
 	if name == "" {
 		name = "agent"
@@ -24,7 +26,7 @@ func AgentCard(cfg agentturn.Config, url string) *a2a.AgentCard {
 		Description: cfg.Description,
 		Tags:        []string{"agent"},
 	}}
-	for _, t := range cfg.Tools {
+	for _, t := range cfg.ResolveTools(ctx) {
 		skills = append(skills, a2a.AgentSkill{
 			ID:          skillID(t.Name()),
 			Name:        t.Name(),
@@ -36,7 +38,7 @@ func AgentCard(cfg agentturn.Config, url string) *a2a.AgentCard {
 		Name:               name,
 		Description:        cfg.Description,
 		URL:                url,
-		Version:            "0.1.0",
+		Version:            version,
 		ProtocolVersion:    string(a2a.Version),
 		PreferredTransport: a2a.TransportProtocolJSONRPC,
 		Capabilities:       a2a.AgentCapabilities{Streaming: true},

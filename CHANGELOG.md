@@ -35,6 +35,23 @@ versions may break the API.
 - `session.Start` names child sessions after the header's harness
   unless `WithHarness` says otherwise, and `Recorder.Store` returns the
   store so a caller need not hold three values for one session. (#5)
+- **Fixed**: `front/responses` single-turn mode built its request by
+  hand and dropped every `Config.Request` member, so an agent with
+  `include: reasoning.encrypted_content` kept its reasoning in full-run
+  mode and lost it when the caller passed tools. Both modes now start
+  from `Config.BaseRequest` and run `BeforeModelCall`. The new
+  `Config.ResolveTools` is the provider fallback the loop uses, for
+  fronts that build their own request. (#8)
+- **Fixed**: `front/a2a` reported a failed event write as a cancelled
+  task. The write error is now returned to the SDK, which fails the
+  task, as the `AgentExecutor` contract requires. `Execute` is split
+  into the relay, the persist step and the final status; the zero
+  `Executor` is usable. (#9)
+- **Breaking**: `front/a2a.MetaPendingCalls` carries the pending call
+  IDs as a JSON array of strings (a `[]any` in process, the only form
+  the SDK stores) instead of an in-process `int` count. `AgentCard`
+  takes a context and a version, and advertises the tools of a
+  `ToolProvider` as skills. (#10)
 - Depends on `agenttool` v0.0.2 and `agentsession` v0.0.2.
 
 ## v0.0.2 - 2026-09-19

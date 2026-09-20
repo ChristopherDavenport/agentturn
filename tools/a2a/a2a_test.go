@@ -40,7 +40,7 @@ func serve(t *testing.T, exec a2asrv.AgentExecutor, card *a2a.AgentCard) (*a2acl
 
 func TestRoundTripThroughFront(t *testing.T) {
 	remoteCfg := agentturn.Config{Name: "Echo Specialist", Description: "Echoes what it is told.", Model: &echo.Adapter{}, ModelName: "remote"}
-	client, card := serve(t, fronta2a.New(remoteCfg), fronta2a.AgentCard(remoteCfg, ""))
+	client, card := serve(t, fronta2a.New(remoteCfg), fronta2a.AgentCard(context.Background(), remoteCfg, "", ""))
 
 	for _, mode := range []string{"streaming", "blocking"} {
 		t.Run(mode, func(t *testing.T) {

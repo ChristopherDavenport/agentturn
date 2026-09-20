@@ -14,7 +14,7 @@
 //	exec := a2a.New(cfg)
 //	handler := a2asrv.NewHandler(exec)
 //	mux.Handle("/invoke", a2asrv.NewJSONRPCHandler(handler))
-//	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(a2a.AgentCard(cfg, url)))
+//	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(a2a.AgentCard(ctx, cfg, url, version)))
 //
 // # Caller-owned tools
 //
