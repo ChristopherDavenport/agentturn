@@ -64,6 +64,34 @@ versions may break the API.
   transcript a strict server rejects. A call with no output anywhere
   later in the transcript is pending, whatever messages intervene.
   (#50)
+- `session`: `Recorder.Rebase` moves the session's leaf and reseeds the
+  recorder from the context there, so a branch with a live recorder
+  records the deltas and the fold alignment of the branch it continues
+  rather than the one it left; it appends nothing and refuses while a
+  run is active with `ErrRunActive`. (#49)
+- `session`: a recorder attached to an agent takes the agent's
+  configuration again at every run, so `Agent.SetConfig` reaches the
+  record as a config delta and as the filter in force; `WithFilter`
+  serves `Handle` without an agent and a configuration whose Filter is
+  nil. (#41)
+- `session`: `Continue` rolls a session over into a successor through
+  `agentsession.Continue` and returns a recorder seeded from it. The
+  package documents that a link is never a context edge: a subsession
+  is self-contained, a change of settings within a conversation is a
+  config entry, and a rollover is a successor. (#40)
+- `session`: `Recorder.Annotate` appends a custom entry at the current
+  leaf of the session of the run on the context, and one made from a
+  subscriber during turn_start lands before that turn's config entry
+  whatever the registration order: the recorder holds the settle it
+  computed on turn_start until the turn's next event. (#51)
+- `session`: a response carries a request hash only when the recorder
+  can stand behind it, when the request's input is what the stored
+  path rebuilds from the items it wrote, the fold it last recorded and
+  the filter in force. A request a Transform or a BeforeModelCall
+  changed in a way the record does not describe, or that carries items
+  the recorder never wrote, is written without a hash, and
+  `Session.Verify` reports it as unverified rather than as a mismatch.
+  (#35, the recorder half)
 - `RunStart` carries `Source`, input or resume, and the `Trigger` a
   caller attached to the context with `ContextWithTrigger`; the loop
   learns nothing from it. (#31)
