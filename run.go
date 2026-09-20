@@ -81,30 +81,37 @@ func CanContinue(t Transcript) bool {
 	return false
 }
 
-// unansweredCalls returns the function calls after the last user
-// message that have no function_call_output, in transcript order. A
-// transcript is a valid input only when this is empty.
+// unansweredCalls returns the function calls anywhere in the transcript
+// that have no function_call_output after them, in transcript order. A
+// transcript is a valid input only when this is empty; a message
+// appended after a dangling call does not settle it, which is the rule
+// a strict server applies.
 func unansweredCalls(t Transcript) []*openresponses.FunctionCall {
-	start := 0
-	for i := len(t) - 1; i >= 0; i-- {
-		if m, ok := t[i].(*openresponses.Message); ok && m.Role != openresponses.RoleAssistant {
-			start = i + 1
-			break
-		}
-	}
 	answered := map[string]bool{}
-	for _, item := range t[start:] {
+	for _, item := range t {
 		if out, ok := item.(*openresponses.FunctionCallOutput); ok {
 			answered[out.CallID] = true
 		}
 	}
 	var calls []*openresponses.FunctionCall
-	for _, item := range t[start:] {
+	for _, item := range t {
 		if call, ok := item.(*openresponses.FunctionCall); ok && !answered[call.CallID] {
 			calls = append(calls, call)
 		}
 	}
 	return calls
+}
+
+// pendingCalls pairs each call with reason.
+func pendingCalls(calls []*openresponses.FunctionCall, reason PendingReason) []PendingCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]PendingCall, len(calls))
+	for i, call := range calls {
+		out[i] = PendingCall{Call: call, Reason: reason}
+	}
+	return out
 }
 
 // observe runs the loop in a goroutine and yields its events from the
@@ -158,6 +165,22 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 
 type transcriptKey struct{}
 type runIDKey struct{}
+type triggerKey struct{}
+
+// ContextWithTrigger attaches a [Trigger] to ctx. A run started with
+// that context, through [Run], [Continue] or an [Agent], carries it on
+// its [RunStart], so a recorder can write what caused the run without
+// the loop learning what a cron job or a channel is.
+func ContextWithTrigger(ctx context.Context, t Trigger) context.Context {
+	return context.WithValue(ctx, triggerKey{}, t)
+}
+
+// TriggerFromContext returns the trigger attached to ctx, or the zero
+// Trigger.
+func TriggerFromContext(ctx context.Context) Trigger {
+	t, _ := ctx.Value(triggerKey{}).(Trigger)
+	return t
+}
 
 // ContextWithTranscript attaches a transcript to ctx. The loop does this
 // with its working transcript before running a turn's hooks and tools,
@@ -269,6 +292,9 @@ type runner struct {
 	runID string
 	turn  int
 	added Transcript
+	// deferred holds the IDs of the calls a hook handed to the caller
+	// during this run, so the run end can say why they are pending.
+	deferred map[string]bool
 }
 
 // errStop carries a run end reason out of a phase.
@@ -331,15 +357,62 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 	// caller's to answer: the deferred ones on input_required, and the
 	// ones an abort or a failure cut off before their outputs were
 	// appended.
-	end.Pending = unansweredCalls(r.transcript)
+	end.Pending = r.pending()
 	// A subscriber that fails on run_end cannot change the outcome; the
 	// run has already ended.
 	_ = r.emit(end)
 	return end
 }
 
+// pending lists the calls of the transcript without an output, each
+// with why: deferred by a hook in this run, cut off in this run, or
+// found in the transcript the run started from.
+func (r *runner) pending() []PendingCall {
+	calls := unansweredCalls(r.transcript)
+	if len(calls) == 0 {
+		return nil
+	}
+	mine := make(map[*openresponses.FunctionCall]bool, len(r.added))
+	for _, item := range r.added {
+		if call, ok := item.(*openresponses.FunctionCall); ok {
+			mine[call] = true
+		}
+	}
+	out := make([]PendingCall, len(calls))
+	for i, call := range calls {
+		reason := PendingUnknown
+		switch {
+		case r.deferred[call.CallID]:
+			reason = PendingDeferred
+		case mine[call]:
+			reason = PendingAborted
+		}
+		out[i] = PendingCall{Call: call, Reason: reason}
+	}
+	return out
+}
+
+// source says what the run begins from: a resume when a prompt answers
+// a call the transcript left unanswered or the caller approved one,
+// an input otherwise.
+func (r *runner) source(prompts openresponses.Items, approved []approval) Source {
+	if len(approved) > 0 {
+		return SourceResume
+	}
+	open := map[string]bool{}
+	for _, call := range unansweredCalls(r.transcript) {
+		open[call.CallID] = true
+	}
+	for _, item := range prompts {
+		if out, ok := item.(*openresponses.FunctionCallOutput); ok && open[out.CallID] {
+			return SourceResume
+		}
+	}
+	return SourceInput
+}
+
 func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved []approval) error {
-	if err := r.emit(&RunStart{RunID: r.runID}); err != nil {
+	if err := r.emit(&RunStart{RunID: r.runID, Source: r.source(prompts, approved), Trigger: TriggerFromContext(ctx)}); err != nil {
 		return err
 	}
 	if err := r.appendItems(prompts); err != nil {
@@ -453,6 +526,11 @@ func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponse
 	req.Input = r.cfg.filter()(input)
 	if r.cfg.BeforeModelCall != nil {
 		if err := r.cfg.BeforeModelCall(ctx, &req); err != nil {
+			// The call was never made; the request as built is the
+			// record of what was refused.
+			if eerr := r.emit(&ModelBlocked{RunID: r.runID, Turn: r.turn, Request: req, Err: err}); eerr != nil {
+				return openresponses.Request{}, eerr
+			}
 			return openresponses.Request{}, fmt.Errorf("agentturn: before-model-call hook: %w", err)
 		}
 	}
@@ -618,6 +696,8 @@ type callState struct {
 	// deferred is set when the caller owns the call; no output is
 	// appended.
 	deferred bool
+	// appended is set once the call's output is in the transcript.
+	appended bool
 }
 
 // toolBatch runs the calls of a turn: preflight in order, execute,
@@ -665,7 +745,8 @@ func (r *runner) preflightAll(ctx context.Context, tools agenttool.Set, calls []
 // abortBatch ends a batch cut off before it executed: every call that
 // had its tool_start and is not settled gets its tool_end with the
 // context error, as a call cut off while running does, so the two are
-// always paired. It returns the stop for the aborted run.
+// always paired, and the outputs of the calls preflight settled are
+// appended. It returns the stop for the aborted run.
 func (r *runner) abortBatch(ctx context.Context, batch []*callState, err error) error {
 	for _, p := range batch {
 		if p.settled {
@@ -677,7 +758,31 @@ func (r *runner) abortBatch(ctx context.Context, batch []*callState, err error) 
 			return serr
 		}
 	}
+	if aerr := r.appendFinished(ctx, batch); aerr != nil {
+		return aerr
+	}
 	return stop(ReasonAborted, err)
+}
+
+// appendFinished appends, in the batch's order, the outputs of the
+// calls that finished in a batch that was cut off: the ones settled
+// with a result of their own rather than the context error. A call that
+// ran to completion before the abort is then answered in the
+// transcript, and only the calls the abort actually cut off are left
+// pending. It is a no-op when nothing finished.
+func (r *runner) appendFinished(ctx context.Context, batch []*callState) error {
+	var outputs openresponses.Items
+	for _, p := range batch {
+		if p == nil || !p.settled || p.deferred || p.appended {
+			continue
+		}
+		if p.err != nil && ctx.Err() != nil && errors.Is(p.err, ctx.Err()) {
+			continue
+		}
+		p.appended = true
+		outputs = append(outputs, &openresponses.FunctionCallOutput{CallID: p.call.CallID, Output: p.result.Output})
+	}
+	return r.appendItems(outputs)
 }
 
 // execute runs the calls preflight did not settle and settles each as
@@ -698,6 +803,7 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 		var err error
 		if ev.Final {
 			p.result, p.err = ev.Result, ev.Err
+			p.settled = true
 			err = r.settle(ctx, p)
 		} else {
 			err = r.emit(&ToolUpdate{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Partial: ev.Result})
@@ -705,10 +811,14 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 		if err != nil {
 			// Leaving the executor's range cancels the batch and waits
 			// for the running tools before this returns.
+			_ = r.appendFinished(ctx, batch)
 			return err
 		}
 	}
 	if err := ctx.Err(); err != nil {
+		if aerr := r.appendFinished(ctx, batch); aerr != nil {
+			return aerr
+		}
 		return stop(ReasonAborted, err)
 	}
 	return nil
@@ -726,6 +836,7 @@ func (r *runner) collect(batch []*callState) ([]agenttool.Result, []*openrespons
 			deferred = append(deferred, p.call)
 			continue
 		}
+		p.appended = true
 		outputs = append(outputs, &openresponses.FunctionCallOutput{CallID: p.call.CallID, Output: p.result.Output})
 	}
 	if err := r.appendItems(outputs); err != nil {
@@ -744,7 +855,7 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 	batch := make([]*callState, len(approved))
 	for i, ap := range approved {
 		p := r.prepare(tools, ap.call, ap.args)
-		if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args}); err != nil {
+		if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args, Decision: &ToolDecision{Args: ap.args}}); err != nil {
 			return nil, err
 		}
 		if err := r.check(ctx, p, false); err != nil {
@@ -768,8 +879,10 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openresponses.FunctionCall) (*callState, error) {
 	p := r.prepare(tools, call, nil)
 	var terminate bool
+	var decision *ToolDecision
 	if r.cfg.BeforeToolCall != nil {
-		decision, err := r.cfg.BeforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: r.turn, Call: call, Tool: p.tool, Args: p.args})
+		var err error
+		decision, err = r.cfg.BeforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: r.turn, Call: call, Tool: p.tool, Args: p.args})
 		if err != nil {
 			return nil, fmt.Errorf("agentturn: before-tool-call hook: %w", err)
 		}
@@ -788,10 +901,14 @@ func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openr
 				p.err = errors.New(reason)
 			case Defer:
 				p.deferred = true
+				if r.deferred == nil {
+					r.deferred = map[string]bool{}
+				}
+				r.deferred[call.CallID] = true
 			}
 		}
 	}
-	if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: call.CallID, Name: call.Name, Args: p.args}); err != nil {
+	if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: call.CallID, Name: call.Name, Args: p.args, Decision: decision}); err != nil {
 		return nil, err
 	}
 	if p.deferred {

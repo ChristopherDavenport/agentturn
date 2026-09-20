@@ -255,7 +255,7 @@ func TestChildInputRequired(t *testing.T) {
 	child := New(childCfg)
 	res, err := child.Execute(context.Background(), agenttool.Call{ID: "c", Args: json.RawMessage(`{"input":"find"}`)})
 	var ire *InputRequiredError
-	if !errors.As(err, &ire) || ire.Agent != "child" || len(ire.Pending) != 1 || ire.Pending[0].Name != "lookup" {
+	if !errors.As(err, &ire) || ire.Agent != "child" || len(ire.Pending) != 1 || ire.Pending[0].Call.Name != "lookup" {
 		t.Fatalf("err = %v", err)
 	}
 	if !strings.Contains(err.Error(), `lookup({"text":"find"})`) {
@@ -267,7 +267,7 @@ func TestChildInputRequired(t *testing.T) {
 	}
 	// The host can answer the child's call and continue it.
 	transcript := append(agentturn.Transcript(nil), info.Items...)
-	transcript = append(transcript, openresponses.NewFunctionCallOutput(info.Pending[0].CallID, "FOUND"))
+	transcript = append(transcript, openresponses.NewFunctionCallOutput(info.Pending[0].Call.CallID, "FOUND"))
 	var final string
 	for ev := range agentturn.Continue(context.Background(), transcript, childCfg) {
 		if e, ok := ev.(*agentturn.RunEnd); ok {

@@ -53,10 +53,10 @@ type ChildInfo struct {
 	// Reason says how the child run ended.
 	Reason agentturn.Reason
 	// Pending lists the calls the child deferred to its caller when
-	// Reason is ReasonInputRequired. A host that wants to answer them
-	// appends their outputs to Items and continues the child with
-	// agentturn.Continue.
-	Pending []*openresponses.FunctionCall
+	// Reason is ReasonInputRequired, and the calls an abort cut off. A
+	// host that wants to answer them appends their outputs to Items and
+	// continues the child with agentturn.Continue.
+	Pending []agentturn.PendingCall
 }
 
 // InputRequiredError is returned when the child run stopped on calls
@@ -67,14 +67,15 @@ type ChildInfo struct {
 type InputRequiredError struct {
 	Agent   string
 	RunID   string
-	Pending []*openresponses.FunctionCall
+	Pending []agentturn.PendingCall
 }
 
 // Error describes the pending calls, arguments abbreviated.
 func (e *InputRequiredError) Error() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "agent %q needs input before it can finish: %d pending tool call(s):", e.Agent, len(e.Pending))
-	for _, fc := range e.Pending {
+	for _, p := range e.Pending {
+		fc := p.Call
 		args := fc.Arguments
 		if len(args) > 200 {
 			args = args[:200] + "..."
@@ -150,9 +151,11 @@ func WithTranscript(seed func(parent agentturn.Transcript) agentturn.Transcript)
 // context it receives is the call's, so agentturn.RunIDFromContext names
 // the parent run and agentturn.TranscriptFromContext holds the parent's
 // transcript, with the child's configuration added for
-// [ConfigFromContext]; its cancellation is lifted, as an Agent lifts it
-// for subscribers, so an abort that cuts the child does not also cut
-// what the observer writes about it.
+// [ConfigFromContext] and the call itself for agenttool.CallFrom, so a
+// recorder can derive the child's session ID from the parent's and the
+// call's; its cancellation is lifted, as an Agent lifts it for
+// subscribers, so an abort that cuts the child does not also cut what
+// the observer writes about it.
 func WithObserver(fn func(context.Context, agentturn.Event)) Option {
 	return func(o *options) { o.observer = fn }
 }
@@ -226,7 +229,7 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	// cancellation, as an Agent's subscribers do: an abort of the parent
 	// cuts the child through ctx, and the events the cut leaves behind
 	// still have to be written.
-	obsCtx := context.WithValue(context.WithoutCancel(ctx), configKey{}, a.cfg)
+	obsCtx := agenttool.WithCall(context.WithValue(context.WithoutCancel(ctx), configKey{}, a.cfg), call)
 	for ev := range agentturn.Run(ctx, seed, prompts, a.cfg) {
 		if a.opts.observer != nil {
 			a.opts.observer(obsCtx, ev)

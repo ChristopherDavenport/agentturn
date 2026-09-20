@@ -8,8 +8,71 @@ versions may break the API.
 ## Unreleased
 
 - Depends on `agentsession` v0.0.5, the release that implements RFC
-  0001 draft 0.2. The `session` module builds and tests against it
-  unchanged; the entries the draft added follow in this release.
+  0001 draft 0.2, and `session` writes the record entries the draft
+  added, so a session written by this recorder is resumable from the
+  file alone: which calls reached their tools, which are held on a
+  decision, why each run started and how it ended. `agentsession
+  verify` passes, record checks included, on every session the test
+  suite writes. (#31, #34, #44, #48, #50, #38, #47, #52)
+- `session`: `Start` promises `run`, `dispatch` and `decision` in the
+  header's `records` unless the caller set them. Every run is
+  bracketed by a `run` entry: the start carries the loop's source,
+  input or resume, and the `Trigger` on the context as `ref`; the end
+  carries the reason in the format's terms and the run's calls left
+  without an output. Every call handed to its tool gets a `dispatch`
+  on `tool_start`, durable before the tool runs under the barrier. A
+  blocked call is a `reject` decision with its reason; a deferred call
+  a `hold`; an approval of a held call, or a hook that rewrote the
+  arguments, a `proceed` carrying the arguments the tool ran with, so
+  the record says what ran while the function_call item stays as the
+  model wrote it; an output the caller wrote for a held call is
+  preceded by the `reject` it is. `Resume` seeds the pending calls
+  from the path so their records anchor after a restart. (#31, #34,
+  #44)
+- `session`: a child session's ID is derived from the parent's and the
+  call's as the format recommends, its header names the call in
+  `spawned_by` and promises the same records, the link from the parent
+  is written when the child starts, at dispatch, and a retry of the
+  same call continues the child session from a new root. tools/agent
+  puts the call on the observer's context for this.
+- `session`: `WithEnv` takes a function the recorder calls once per
+  run for the environment, written as an `env` entry when it differs
+  from the last one written or found on the path by `Resume`. The
+  recorder gathers nothing itself. (#52)
+- `session`: a call `BeforeModelCall` refused is recorded as a failed
+  response carrying the hook's error and the hash of the request that
+  was built, distinct from a call that was made and failed, through
+  the new `ModelBlocked` event. (#38)
+- `session`: a compaction entry carries a `fold` member naming the
+  fold's own model call by response ID, model and request hash, so a
+  replay can recognise the fold's call; `compact.Fold` carries the
+  fold's `Request` and `ResponseID`. The hash is of the fold's request,
+  which no path rebuilds, and is never written as a response. (#47)
+- **Breaking**: `RunEnd.Pending`, `State.Pending` and
+  `agent.ChildInfo.Pending` are `[]PendingCall`, each call with why it
+  has no output: `PendingDeferred`, `PendingAborted` for a call cut off
+  in flight, whose tool may have run, and `PendingUnknown` for a call
+  found unanswered in a seeded transcript. `PendingCalls` returns the
+  calls alone. (#34)
+- **Fixed**: an abort inside a tool batch discarded the outputs of the
+  calls that had finished, so on resume a call that ran was
+  indistinguishable from one that never did. The outputs of the calls
+  that finished are appended, in the batch's order, before the run
+  ends; only the calls the abort cut off are pending. (#48)
+- **Fixed**: a message appended after an unanswered function call hid
+  it from the pending set, so `Continue` and `Prompt` accepted a
+  transcript a strict server rejects. A call with no output anywhere
+  later in the transcript is pending, whatever messages intervene.
+  (#50)
+- `RunStart` carries `Source`, input or resume, and the `Trigger` a
+  caller attached to the context with `ContextWithTrigger`; the loop
+  learns nothing from it. (#31)
+- `ToolStart` carries the `ToolDecision` a hook returned for the call,
+  or the caller's arguments for an approval, and `ToolDecision.By`
+  names who decided, for the record. (#44)
+- `ModelBlocked` is emitted when `BeforeModelCall` refuses a request,
+  with the request as built and the hook's error, in place of the
+  turn_start the call would have had. (#38)
 
 ## v0.0.5 - 2026-09-19
 

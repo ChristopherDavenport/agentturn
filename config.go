@@ -257,6 +257,11 @@ type ToolDecision struct {
 	Terminate bool
 	// Args, when non-nil, replaces the arguments the tool receives.
 	Args json.RawMessage
+	// By names who decided, for the record: the session format knows
+	// "human" for a person the hook waited on, "policy" for a rule it
+	// evaluated on its own and "agent" for another model. Empty is read
+	// as policy. The loop does not use it.
+	By string
 }
 
 // ToolResultInfo describes a completed call.
