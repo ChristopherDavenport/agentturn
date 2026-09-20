@@ -42,8 +42,9 @@ const (
 	// ReasonDone means the model produced a final answer with no tool
 	// calls and no queued follow-ups.
 	ReasonDone Reason = "done"
-	// ReasonStopped means ShouldStopAfterTurn, a terminating tool batch
-	// or MaxTurns ended the run.
+	// ReasonStopped means the loop chose not to call the model again:
+	// ShouldStopAfterTurn, a terminating tool result, MaxTurns or a
+	// refusal on Resume. RunEnd.Cause says which.
 	ReasonStopped Reason = "stopped"
 	// ReasonInputRequired means BeforeToolCall deferred one or more
 	// calls to the caller; RunEnd.Pending lists them and the run
@@ -277,6 +278,32 @@ type TurnEnd struct {
 // EventType returns "turn_end".
 func (*TurnEnd) EventType() string { return EventTurnEnd }
 
+// StopCause says what ended a run with ReasonStopped.
+type StopCause string
+
+// Stop causes.
+const (
+	// StopMaxTurns: Config.MaxTurns was reached with tools still being
+	// called.
+	StopMaxTurns StopCause = "max_turns"
+	// StopHook: ShouldStopAfterTurn returned true.
+	StopHook StopCause = "hook"
+	// StopGuard: ShouldStopAfterTurn returned an error wrapping
+	// [ErrGuard]; the error is on RunEnd.Err.
+	StopGuard StopCause = "guard"
+	// StopTerminate: every result of the batch set Terminate, so the
+	// tools answered on the model's behalf.
+	StopTerminate StopCause = "terminate"
+	// StopPartialTerminate: some results of the batch set Terminate and
+	// others did not. The run ends so the host can act on the call that
+	// asked to end it; the other calls ran and their outputs are in the
+	// transcript.
+	StopPartialTerminate StopCause = "partial_terminate"
+	// StopRefused: an answer built with [Refuse] ended the run instead
+	// of calling the model.
+	StopRefused StopCause = "refused"
+)
+
 // RunEnd closes a run. Exactly one is emitted per run and nothing
 // follows it. Items are the items the run appended to the transcript.
 // A run refused before it started ([ErrNoPrompt], [ErrCannotContinue],
@@ -286,10 +313,15 @@ type RunEnd struct {
 	RunID  string
 	Items  Transcript
 	Reason Reason
-	// Err is set when Reason is ReasonError, and to the context error
-	// when Reason is ReasonAborted, wrapping the failure of a subscriber
-	// or a hook when one failed for a reason of its own while the run
-	// was being aborted; errors.Is finds the context error either way.
+	// Cause says what stopped the run when Reason is ReasonStopped, and
+	// is empty otherwise.
+	Cause StopCause
+	// Err is set when Reason is ReasonError; to the context error when
+	// Reason is ReasonAborted, wrapping the failure of a subscriber or
+	// a hook when one failed for a reason of its own while the run was
+	// being aborted, so errors.Is finds the context error either way;
+	// and to the guard's error when Reason is ReasonStopped with Cause
+	// StopGuard.
 	Err error
 	// Pending lists the function calls in the transcript with no
 	// function_call_output, in transcript order, each with why: the

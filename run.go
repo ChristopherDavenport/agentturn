@@ -23,6 +23,10 @@ var (
 	ErrCannotContinue = errors.New("agentturn: transcript must end with a user message or a function call output to continue")
 	// ErrNoPrompt is returned when Run was called with no prompt items.
 	ErrNoPrompt = errors.New("agentturn: no prompt items")
+	// ErrGuard is what a ShouldStopAfterTurn hook wraps to end the run
+	// as a policy stop rather than a failure: ReasonStopped with
+	// StopGuard, the error on RunEnd.Err.
+	ErrGuard = errors.New("agentturn: guard stopped the run")
 )
 
 // EventBuffer is how many events the loop can run ahead of the consumer
@@ -36,8 +40,10 @@ const EventBuffer = 256
 // run ended and its Err carries the failure when Reason is ReasonError,
 // the context error when Reason is ReasonAborted, and nil otherwise. A
 // misuse before the run starts ([ErrNoPrompt], [ErrCannotContinue],
-// [ErrNoModel], a duplicate tool name) yields one RunEnd with
-// ReasonError and no other event.
+// [ErrNoModel], a duplicate tool name, or [ErrInputRequired] for a
+// transcript with a function call that neither the transcript nor the
+// prompts' leading outputs answer) yields one RunEnd with ReasonError
+// and no other event.
 //
 // The loop runs ahead of the consumer by up to [EventBuffer] events and
 // applies backpressure after that. Breaking out of the loop cancels the
@@ -49,16 +55,23 @@ func Run(ctx context.Context, t Transcript, prompts openresponses.Items, cfg Con
 	if len(prompts) == 0 {
 		return failNow(ErrNoPrompt)
 	}
-	return observe(ctx, t, prompts, cfg)
+	if err := answersPending(pendingCalls(unansweredCalls(t), PendingUnknown), prompts); err != nil {
+		return failNow(err)
+	}
+	return observe(ctx, t, prompts, cfg, false)
 }
 
 // Continue drives the loop from the transcript as it stands, which must
-// satisfy [CanContinue]. Events arrive as for [Run].
+// satisfy [CanContinue] and answer every function call it holds. Events
+// arrive as for [Run].
 func Continue(ctx context.Context, t Transcript, cfg Config) iter.Seq[Event] {
+	if calls := unansweredCalls(t); len(calls) > 0 {
+		return failNow(fmt.Errorf("%w: %d call(s) unanswered", ErrInputRequired, len(calls)))
+	}
 	if !CanContinue(t) {
 		return failNow(ErrCannotContinue)
 	}
-	return observe(ctx, t, nil, cfg)
+	return observe(ctx, t, nil, cfg, false)
 }
 
 // failNow yields the RunEnd of a run that never started.
@@ -116,7 +129,7 @@ func pendingCalls(calls []*openresponses.FunctionCall, reason PendingReason) []P
 
 // observe runs the loop in a goroutine and yields its events from the
 // caller's.
-func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg Config) iter.Seq[Event] {
+func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg Config, terminate bool) iter.Seq[Event] {
 	return func(yield func(Event) bool) {
 		if err := cfg.validate(); err != nil {
 			yield(&RunEnd{Reason: ReasonError, Err: err})
@@ -142,7 +155,7 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 					return nil
 				},
 			}
-			r.run(ctx, prompts, nil)
+			r.run(ctx, prompts, nil, terminate)
 		}()
 		// After the consumer breaks out, the loop is drained so the
 		// goroutine can wind down; nothing more is yielded.
@@ -292,6 +305,8 @@ type runner struct {
 	runID string
 	turn  int
 	added Transcript
+	// ctx is the run's context, for the hooks the stream calls.
+	ctx context.Context
 	// deferred holds the IDs of the calls a hook handed to the caller
 	// during this run, so the run end can say why they are pending.
 	deferred map[string]bool
@@ -300,6 +315,7 @@ type runner struct {
 // errStop carries a run end reason out of a phase.
 type errStop struct {
 	reason Reason
+	cause  StopCause
 	err    error
 }
 
@@ -313,30 +329,40 @@ func (e *errStop) Error() string {
 // stop carries reason and err out of a phase.
 func stop(reason Reason, err error) error { return &errStop{reason: reason, err: err} }
 
+// stopped carries a stop with its cause out of a phase.
+func stopped(cause StopCause, err error) error {
+	return &errStop{reason: ReasonStopped, cause: cause, err: err}
+}
+
 // approval is a pending call the caller approved through Agent.Resume:
 // it runs before the first model call of the run, with args in place of
-// the call's own when set.
+// the call's own when set, and note, when set, appended after the
+// batch's outputs.
 type approval struct {
 	call *openresponses.FunctionCall
 	args json.RawMessage
+	note string
 }
 
-// run drives the loop and returns the RunEnd. A panic in a tool is
-// recovered by agenttool's executor into a PanicError the model sees as
-// an error output; a panic in a hook or a subscriber is not recovered
-// and unwinds without a RunEnd.
-func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved []approval) *RunEnd {
+// run drives the loop and returns the RunEnd. terminate says the caller
+// asked the run to end once the answers are in, without a model call.
+// A panic in a tool is recovered by agenttool's executor into a
+// PanicError the model sees as an error output; a panic in a hook or a
+// subscriber is not recovered and unwinds without a RunEnd.
+func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved []approval, terminate bool) *RunEnd {
 	r.runID = openresponses.NewID("run")
 	// Everything the run calls, transform, hooks, model and tools, can
 	// tell which run it serves.
 	ctx = ContextWithRunID(ctx, r.runID)
+	r.ctx = ctx
 	end := &RunEnd{RunID: r.runID, Reason: ReasonDone}
-	err := r.loop(ctx, prompts, approved)
+	err := r.loop(ctx, prompts, approved, terminate)
 	var stop *errStop
 	switch {
 	case err == nil:
 	case errors.As(err, &stop):
 		end.Reason = stop.reason
+		end.Cause = stop.cause
 		end.Err = stop.err
 	case ctx.Err() != nil:
 		end.Reason = ReasonAborted
@@ -411,7 +437,7 @@ func (r *runner) source(prompts openresponses.Items, approved []approval) Source
 	return SourceInput
 }
 
-func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved []approval) error {
+func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved []approval, terminate bool) error {
 	if err := r.emit(&RunStart{RunID: r.runID, Source: r.source(prompts, approved), Trigger: TriggerFromContext(ctx)}); err != nil {
 		return err
 	}
@@ -423,19 +449,43 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 		if err != nil {
 			return err
 		}
-		if allTerminate(results) {
-			return stop(ReasonStopped, nil)
+		if cause, ok := terminates(results); ok && !terminate {
+			return stopped(cause, nil)
 		}
+		// What was steered in while the caller was deciding goes to the
+		// model with the answers, as after any batch.
+		if err := r.appendItems(r.drain(r.steer)); err != nil {
+			return err
+		}
+	}
+	if terminate {
+		return stopped(StopRefused, nil)
 	}
 	for {
 		if r.cfg.MaxTurns > 0 && r.turn >= r.cfg.MaxTurns {
-			return stop(ReasonStopped, nil)
+			return stopped(StopMaxTurns, nil)
 		}
 		if err := ctx.Err(); err != nil {
 			return stop(ReasonAborted, err)
 		}
 		r.turn++
+		if r.cfg.BeforeTurn != nil {
+			items, err := r.cfg.BeforeTurn(ctx, TurnStartInfo{RunID: r.runID, Turn: r.turn, Transcript: r.transcript})
+			if err != nil {
+				return fmt.Errorf("agentturn: before-turn hook: %w", err)
+			}
+			if err := r.appendItems(items); err != nil {
+				return err
+			}
+		}
 		tools := r.cfg.tools(ctx)
+		if r.cfg.ToolProvider != nil {
+			// A provided list is checked as Config.Tools was before the
+			// run, once per turn, since it may change between turns.
+			if err := tools.Validate(); err != nil {
+				return fmt.Errorf("agentturn: turn %d: tool provider: %w", r.turn, err)
+			}
+		}
 		resp, err := r.modelTurn(ctx, tools)
 		if err != nil {
 			return err
@@ -452,16 +502,19 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 			return stop(ReasonInputRequired, nil)
 		}
 		if r.cfg.ShouldStopAfterTurn != nil {
-			halt, err := r.cfg.ShouldStopAfterTurn(ctx, TurnInfo{RunID: r.runID, Turn: r.turn, Response: resp, ToolResults: results, Transcript: r.transcript})
+			halt, err := r.cfg.ShouldStopAfterTurn(ctx, TurnInfo{RunID: r.runID, Turn: r.turn, Response: resp, ToolResults: results, Final: len(calls) == 0, Transcript: r.transcript})
 			if err != nil {
+				if errors.Is(err, ErrGuard) {
+					return stopped(StopGuard, err)
+				}
 				return fmt.Errorf("agentturn: should-stop-after-turn hook: %w", err)
 			}
 			if halt {
-				return stop(ReasonStopped, nil)
+				return stopped(StopHook, nil)
 			}
 		}
-		if len(calls) > 0 && allTerminate(results) {
-			return stop(ReasonStopped, nil)
+		if cause, ok := terminates(results); ok {
+			return stopped(cause, nil)
 		}
 		queued := r.drain(r.steer)
 		if len(calls) == 0 {
@@ -483,13 +536,26 @@ func (r *runner) drain(q func() openresponses.Items) openresponses.Items {
 	return q()
 }
 
-func allTerminate(results []agenttool.Result) bool {
+// terminates says whether a batch's results end the run, and how: every
+// result set Terminate, or some did. A result's Terminate means the
+// tool answered on the model's behalf; the loop stops either way, and
+// the cause tells a host whether the whole batch agreed.
+func terminates(results []agenttool.Result) (StopCause, bool) {
+	some, all := false, len(results) > 0
 	for _, res := range results {
-		if !res.Terminate {
-			return false
+		if res.Terminate {
+			some = true
+		} else {
+			all = false
 		}
 	}
-	return len(results) > 0
+	switch {
+	case all:
+		return StopTerminate, true
+	case some:
+		return StopPartialTerminate, true
+	}
+	return "", false
 }
 
 // appendItems adds items the loop did not stream (prompts, queued
@@ -633,9 +699,20 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 	case *openresponses.OutputItemAddedEvent:
 		return true, r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[e.OutputIndex], ResponseID: responseID})
 	case *openresponses.OutputItemDoneEvent:
-		r.transcript = append(r.transcript, e.Item)
-		r.added = append(r.added, e.Item)
-		return true, r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: e.Item, ResponseID: responseID})
+		item := e.Item
+		if m, ok := item.(*openresponses.Message); ok && r.cfg.OutputGuard != nil {
+			// The guard sees the message before anything keeps it.
+			replacement, err := r.cfg.OutputGuard(r.ctx, OutputInfo{RunID: r.runID, Turn: r.turn, ResponseID: responseID, Message: m})
+			if err != nil {
+				return true, fmt.Errorf("agentturn: output guard: %w", err)
+			}
+			if replacement != nil {
+				item = replacement
+			}
+		}
+		r.transcript = append(r.transcript, item)
+		r.added = append(r.added, item)
+		return true, r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, ResponseID: responseID})
 	case *openresponses.ErrorEvent:
 		return false, e.Err()
 	}
@@ -698,6 +775,9 @@ type callState struct {
 	deferred bool
 	// appended is set once the call's output is in the transcript.
 	appended bool
+	// note is text appended after the batch's outputs, from the
+	// decision or the approval, as a developer or a user message.
+	note openresponses.Item
 }
 
 // toolBatch runs the calls of a turn: preflight in order, execute,
@@ -730,7 +810,7 @@ func (r *runner) toolContext(ctx context.Context) context.Context {
 func (r *runner) preflightAll(ctx context.Context, tools agenttool.Set, calls []*openresponses.FunctionCall) ([]*callState, error) {
 	batch := make([]*callState, len(calls))
 	for i, call := range calls {
-		p, err := r.preflight(ctx, tools, call)
+		p, err := r.preflight(ctx, tools, call, calls, i)
 		if err != nil {
 			return nil, err
 		}
@@ -824,11 +904,12 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 	return nil
 }
 
-// collect appends the outputs in the model's order and returns the
-// results with the deferred calls.
+// collect appends the outputs in the model's order, then the notes the
+// decisions attached, and returns the results with the deferred calls.
 func (r *runner) collect(batch []*callState) ([]agenttool.Result, []*openresponses.FunctionCall, error) {
 	results := make([]agenttool.Result, len(batch))
 	outputs := make(openresponses.Items, 0, len(batch))
+	var notes openresponses.Items
 	var deferred []*openresponses.FunctionCall
 	for i, p := range batch {
 		results[i] = p.result
@@ -838,8 +919,11 @@ func (r *runner) collect(batch []*callState) ([]agenttool.Result, []*openrespons
 		}
 		p.appended = true
 		outputs = append(outputs, &openresponses.FunctionCallOutput{CallID: p.call.CallID, Output: p.result.Output})
+		if p.note != nil {
+			notes = append(notes, p.note)
+		}
 	}
-	if err := r.appendItems(outputs); err != nil {
+	if err := r.appendItems(append(outputs, notes...)); err != nil {
 		return nil, nil, err
 	}
 	return results, deferred, nil
@@ -855,7 +939,10 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 	batch := make([]*callState, len(approved))
 	for i, ap := range approved {
 		p := r.prepare(tools, ap.call, ap.args)
-		if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args, Decision: &ToolDecision{Args: ap.args}}); err != nil {
+		if ap.note != "" {
+			p.note = openresponses.UserText(ap.note)
+		}
+		if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args, Decision: &ToolDecision{Args: ap.args, Note: ap.note}}); err != nil {
 			return nil, err
 		}
 		if err := r.check(ctx, p, false); err != nil {
@@ -876,19 +963,22 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 // preflight resolves the tool, checks the arguments and runs
 // BeforeToolCall. It emits tool_start and, for a call that will not
 // execute, tool_end.
-func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openresponses.FunctionCall) (*callState, error) {
+func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openresponses.FunctionCall, batch []*openresponses.FunctionCall, index int) (*callState, error) {
 	p := r.prepare(tools, call, nil)
 	var terminate bool
 	var decision *ToolDecision
 	if r.cfg.BeforeToolCall != nil {
 		var err error
-		decision, err = r.cfg.BeforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: r.turn, Call: call, Tool: p.tool, Args: p.args})
+		decision, err = r.cfg.BeforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: r.turn, Call: call, Tool: p.tool, Args: p.args, Batch: batch, Index: index})
 		if err != nil {
 			return nil, fmt.Errorf("agentturn: before-tool-call hook: %w", err)
 		}
 		if decision != nil {
 			if decision.Args != nil {
 				p.args = decision.Args
+			}
+			if decision.Note != "" && decision.Action == Allow {
+				p.note = openresponses.DeveloperText(decision.Note)
 			}
 			terminate = decision.Terminate
 			switch decision.Action {

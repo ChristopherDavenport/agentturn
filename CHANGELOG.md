@@ -92,6 +92,56 @@ versions may break the API.
   the recorder never wrote, is written without a hash, and
   `Session.Verify` reports it as unverified rather than as a mismatch.
   (#35, the recorder half)
+- `RunEnd.Cause` says what stopped a run with `ReasonStopped`:
+  `StopMaxTurns`, `StopHook`, `StopGuard`, `StopTerminate`,
+  `StopPartialTerminate` or `StopRefused`; the recorder writes it as
+  the run end's `ref`. A `ShouldStopAfterTurn` hook that returns an
+  error wrapping `ErrGuard` ends the run as a policy stop, with the
+  error on `RunEnd.Err`, rather than as a failure, and `TurnInfo.Final`
+  says the turn called no tools. (#37)
+- **Breaking**: a batch in which some results set `Terminate` and
+  others do not now ends the run, with `StopPartialTerminate`, instead
+  of continuing as if nothing had asked to stop; the other calls still
+  run and their outputs still land. A batch whose every result
+  terminates stops as before, with `StopTerminate`. (#36)
+- `Config.OutputGuard` runs on each assistant message as the stream
+  completes it, before it is appended, delivered as item_end or
+  recorded, and may replace it with a placeholder; function calls and
+  every other output item never reach it. (#37)
+- `Config.BeforeTurn` returns items the loop appends to the transcript
+  at the start of each turn, with their item events, so per-turn
+  context is a fact about the path and a recorded session rebuilds the
+  request it was part of. (#35, the loop half)
+- `ToolCallInfo` carries `Batch`, every call of the turn in the model's
+  order, and `Index`, so a policy that defers one call can hold the
+  rest of the batch. (#42)
+- `Refuse` answers a pending call and ends the run with `StopRefused`
+  instead of calling the model, for a refusal that should end the turn;
+  `Answer.Terminate` is behind it. The outputs are still appended. (#43)
+- `Answer.Note` and `ToolDecision.Note` carry what the user or the
+  policy said with the result: appended after the batch's outputs as a
+  user or a developer message, so the model reads the result and the
+  note together in the same turn; `Answer.WithNote` attaches one. The
+  steer queue is drained after an approved batch, as after any batch.
+  (#45)
+- **Fixed**: a tool list from `ToolProvider` skipped the duplicate-name
+  check that `Config.Tools` gets before a run. The provided list is
+  validated once per turn and a bad one fails the turn naming it. (#46)
+- **Fixed**: the low-level `Run` and `Continue` accepted a transcript
+  with an unanswered function call, which `Agent.Prompt` refuses; they
+  now fail with `ErrInputRequired` unless the prompts' leading outputs
+  answer it. (#39)
+- `tools/agent`: a child that ends without a final assistant message
+  no longer returns an empty output. By default the parent's model sees
+  an error naming the cause, or the last tool output when a terminating
+  tool answered on the child's behalf; `WithNoAnswer` sets what it sees.
+  `ChildInfo.Cause` carries the child's stop cause. (#30)
+- `tools/agent`: the snapshot a `WithTranscript` seed receives has every
+  in-flight call of the batch answered with a placeholder output, the
+  child's own naming the agent, so a seed that keeps the conversation
+  hands the child a valid input; the parent's snapshot is unchanged.
+  `New` panics on a `Config.Name` a provider rejects as a tool name
+  unless `WithToolName` gives one. (#39)
 - `RunStart` carries `Source`, input or resume, and the `Trigger` a
   caller attached to the context with `ContextWithTrigger`; the loop
   learns nothing from it. (#31)

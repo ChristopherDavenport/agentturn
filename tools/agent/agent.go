@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -50,8 +51,10 @@ type ChildInfo struct {
 	// Items are the items the child run appended to its transcript,
 	// prompts included.
 	Items agentturn.Transcript
-	// Reason says how the child run ended.
+	// Reason says how the child run ended, and Cause what stopped it
+	// when Reason is ReasonStopped.
 	Reason agentturn.Reason
+	Cause  agentturn.StopCause
 	// Pending lists the calls the child deferred to its caller when
 	// Reason is ReasonInputRequired, and the calls an abort cut off. A
 	// host that wants to answer them appends their outputs to Items and
@@ -94,9 +97,36 @@ type Option func(*options)
 type options struct {
 	schema   json.RawMessage
 	strict   bool
+	name     string
 	render   func(json.RawMessage) (openresponses.Items, error)
 	seed     func(parent agentturn.Transcript) agentturn.Transcript
 	observer func(context.Context, agentturn.Event)
+	noAnswer func(ChildInfo) (agenttool.Result, error)
+}
+
+// toolName is the form a provider accepts for a function tool's name.
+var toolName = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// WithToolName offers the child to the model under name rather than
+// under Config.Name, for an agent whose display name is not a valid
+// tool name. It panics on a name a provider rejects, as [New] does.
+func WithToolName(name string) Option {
+	if !toolName.MatchString(name) {
+		panic(fmt.Sprintf("agent.WithToolName: %q is not a tool name: want %s", name, toolName))
+	}
+	return func(o *options) { o.name = name }
+}
+
+// WithNoAnswer sets what the parent's model sees when the child ends
+// without a final assistant message: a run that hit its turn budget
+// or a stop hook still calling tools, or one that finished with an
+// empty message. The default returns an error naming the agent and
+// the cause, so the model knows the child did not answer rather than
+// reading an empty output as one; a child stopped by a terminating
+// tool result is the exception, whose last output stands as the
+// answer, since the tool answered on the model's behalf.
+func WithNoAnswer(fn func(ChildInfo) (agenttool.Result, error)) Option {
+	return func(o *options) { o.noAnswer = fn }
 }
 
 // WithArgs replaces the default {"input": string} arguments with T,
@@ -141,6 +171,14 @@ func withArgs[T any](strict bool, render func(T) openresponses.Items) Option {
 // agentturn.TranscriptFromContext); seed receives nil when the tool is
 // executed outside a loop. The seed goes before the rendered
 // arguments.
+//
+// The snapshot the loop attaches holds the batch's calls, this one
+// among them, with no outputs yet, which is not a valid input. seed
+// receives a copy in which every such call is answered with a
+// placeholder output saying the call is in progress, this one naming
+// the agent, so a seed that keeps the conversation as it is hands the
+// child a transcript a strict server accepts; the parent's snapshot is
+// not changed.
 func WithTranscript(seed func(parent agentturn.Transcript) agentturn.Transcript) Option {
 	return func(o *options) { o.seed = seed }
 }
@@ -173,7 +211,9 @@ func ConfigFromContext(ctx context.Context) (agentturn.Config, bool) {
 // New wraps cfg as a tool named cfg.Name with cfg.Description. Each
 // call runs a child loop with cfg; the child's own hooks apply and the
 // parent's do not. It panics when cfg.Name is empty, since a tool
-// without a name cannot be offered to a model.
+// without a name cannot be offered to a model, and when it is not a
+// name a provider accepts (letters, digits, underscores and hyphens,
+// at most 64) unless [WithToolName] gives one that is.
 func New(cfg agentturn.Config, opts ...Option) agenttool.Tool {
 	if cfg.Name == "" {
 		panic("agent.New: config has no Name")
@@ -181,6 +221,15 @@ func New(cfg agentturn.Config, opts ...Option) agenttool.Tool {
 	o := options{}
 	for _, opt := range opts {
 		opt(&o)
+	}
+	if o.name == "" {
+		if !toolName.MatchString(cfg.Name) {
+			panic(fmt.Sprintf("agent.New: agent %q: name is not a tool name: want %s; use WithToolName", cfg.Name, toolName))
+		}
+		o.name = cfg.Name
+	}
+	if o.noAnswer == nil {
+		o.noAnswer = defaultNoAnswer
 	}
 	if o.render == nil {
 		WithArgs(func(in Input) openresponses.Items {
@@ -195,7 +244,7 @@ type agentTool struct {
 	opts options
 }
 
-func (a *agentTool) Name() string                { return a.cfg.Name }
+func (a *agentTool) Name() string                { return a.opts.name }
 func (a *agentTool) Description() string         { return a.cfg.Description }
 func (a *agentTool) Parameters() json.RawMessage { return a.opts.schema }
 func (a *agentTool) Strict() bool                { return a.opts.strict }
@@ -205,10 +254,12 @@ func (a *agentTool) Strict() bool                { return a.opts.strict }
 // returns its error, one that is aborted returns the context error, and
 // one that stopped on deferred calls returns an [*InputRequiredError],
 // because a pause inside the child cannot become a pause of the parent
-// after the fact. On every error path the Result still carries the
-// ChildInfo: the loop keeps Details when it turns an error into the
-// output the model sees, so a session subscriber can link the child run
-// whether or not it succeeded.
+// after the fact. A child that ends without a final assistant message
+// returns what [WithNoAnswer] says, by default an error naming the
+// cause. On every error path the Result still carries the ChildInfo:
+// the loop keeps Details when it turns an error into the output the
+// model sees, so a session subscriber can link the child run whether
+// or not it succeeded.
 func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool.Result, error) {
 	prompts, err := a.opts.render(call.Args)
 	if err != nil {
@@ -220,7 +271,7 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	var seed agentturn.Transcript
 	if a.opts.seed != nil {
 		parent, _ := agentturn.TranscriptFromContext(ctx)
-		seed = a.opts.seed(parent)
+		seed = a.opts.seed(answered(parent, call.ID, a.cfg.Name))
 	}
 
 	var soFar []string
@@ -250,7 +301,7 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	if end == nil {
 		return agenttool.Result{}, errors.New("agent " + strconv.Quote(a.cfg.Name) + ": child run produced no run_end")
 	}
-	info := ChildInfo{RunID: end.RunID, Items: end.Items, Reason: end.Reason, Pending: end.Pending}
+	info := ChildInfo{RunID: end.RunID, Items: end.Items, Reason: end.Reason, Cause: end.Cause, Pending: end.Pending}
 	switch end.Reason {
 	case agentturn.ReasonInputRequired:
 		return agenttool.Result{Details: info}, &InputRequiredError{Agent: a.cfg.Name, RunID: end.RunID, Pending: end.Pending}
@@ -263,19 +314,81 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		}
 		return agenttool.Result{Details: info}, err
 	}
+	text, ok := lastAssistantText(end.Items)
+	if !ok {
+		res, err := a.opts.noAnswer(info)
+		res.Details = info
+		return res, err
+	}
 	return agenttool.Result{
-		Output:  openresponses.FunctionCallOutputData{Text: lastAssistantText(end.Items)},
+		Output:  openresponses.FunctionCallOutputData{Text: text},
 		Details: info,
 	}, nil
 }
 
-func lastAssistantText(items agentturn.Transcript) string {
-	for i := len(items) - 1; i >= 0; i-- {
-		if m, ok := items[i].(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant {
-			return m.Text()
+// answered returns a copy of parent in which every function call
+// without an output is answered with a placeholder, the call callID
+// naming agent as the one answering it, so a seed that keeps the
+// conversation hands the child a valid input. nil stays nil.
+func answered(parent agentturn.Transcript, callID, agent string) agentturn.Transcript {
+	if parent == nil {
+		return nil
+	}
+	done := map[string]bool{}
+	for _, item := range parent {
+		if out, ok := item.(*openresponses.FunctionCallOutput); ok {
+			done[out.CallID] = true
 		}
 	}
-	return ""
+	out := append(agentturn.Transcript(nil), parent...)
+	for _, item := range parent {
+		fc, ok := item.(*openresponses.FunctionCall)
+		if !ok || done[fc.CallID] {
+			continue
+		}
+		text := "(in progress: this call is running alongside the one being answered)"
+		if fc.CallID == callID {
+			text = "(in progress: the agent " + strconv.Quote(agent) + " is answering this call)"
+		}
+		out = append(out, openresponses.NewFunctionCallOutput(fc.CallID, text))
+	}
+	return out
+}
+
+// defaultNoAnswer is the [WithNoAnswer] used when none is set.
+func defaultNoAnswer(info ChildInfo) (agenttool.Result, error) {
+	if info.Reason == agentturn.ReasonStopped && (info.Cause == agentturn.StopTerminate || info.Cause == agentturn.StopPartialTerminate) {
+		if text, ok := lastOutputText(info.Items); ok {
+			return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: text}}, nil
+		}
+	}
+	name := "the agent"
+	if info.Cause != "" {
+		return agenttool.Result{}, fmt.Errorf("%s stopped (%s) without a final answer", name, info.Cause)
+	}
+	return agenttool.Result{}, errors.New(name + " finished without a final answer")
+}
+
+// lastAssistantText returns the text of the last assistant message,
+// and whether there is one with text.
+func lastAssistantText(items agentturn.Transcript) (string, bool) {
+	for i := len(items) - 1; i >= 0; i-- {
+		if m, ok := items[i].(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant {
+			text := m.Text()
+			return text, text != ""
+		}
+	}
+	return "", false
+}
+
+// lastOutputText returns the text of the last function call output.
+func lastOutputText(items agentturn.Transcript) (string, bool) {
+	for i := len(items) - 1; i >= 0; i-- {
+		if out, ok := items[i].(*openresponses.FunctionCallOutput); ok {
+			return out.Output.Text, true
+		}
+	}
+	return "", false
 }
 
 var (

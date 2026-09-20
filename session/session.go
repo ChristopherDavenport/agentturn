@@ -75,8 +75,8 @@
 //     aborted as interrupted with the context error as ref, since the
 //     host asked for the stop, and stopped as stopped when the last
 //     response requested tools, as done when it did not and as aborted
-//     when the run made no model call, with the loop's own reason as
-//     ref whenever the two differ.
+//     when the run made no model call, with the stop's cause as ref in
+//     every case.
 //   - a fold reported through [Recorder.Fold]: a compaction entry whose
 //     first_kept is the entry of the first item the transform kept, with
 //     the summary and the settings in force, and a fold member naming
@@ -1182,17 +1182,20 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 		// The host asked for the stop, through Abort or its context.
 		return agentsession.ReasonInterrupted, errText(e.Err)
 	case agentturn.ReasonStopped:
+		// The cause is the ref throughout: what stopped the run is what a
+		// reader asks, whichever shape the segment has.
 		switch {
 		case w.responses == 0:
-			// A resume whose approved batch terminated: the segment has
-			// no response, which the format reads as aborted.
-			return agentsession.ReasonAborted, string(e.Reason)
+			// A resume whose approved batch terminated, or a refusal on
+			// Resume: the segment has no response, which the format reads
+			// as aborted.
+			return agentsession.ReasonAborted, string(e.Cause)
 		case w.lastCalls:
-			return agentsession.ReasonStopped, ""
+			return agentsession.ReasonStopped, string(e.Cause)
 		}
 		// A guard or a turn budget stopped a run whose last response
 		// requested nothing, which the format reads as done.
-		return agentsession.ReasonDone, string(e.Reason)
+		return agentsession.ReasonDone, string(e.Cause)
 	}
 	return string(e.Reason), ""
 }

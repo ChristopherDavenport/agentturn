@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -134,7 +135,12 @@ func TestRunEndReasonsFollowTheCascade(t *testing.T) {
 		}, agentsession.ReasonStopped, ""},
 		{"stopped by a guard on a final turn reads as done", func() agentturn.Config {
 			return agentturn.Config{Model: &echo.Adapter{}, ShouldStopAfterTurn: func(context.Context, agentturn.TurnInfo) (bool, error) { return true, nil }}
-		}, agentsession.ReasonDone, "stopped"},
+		}, agentsession.ReasonDone, "hook"},
+		{"stopped by a guard error reads as done with the guard as ref", func() agentturn.Config {
+			return agentturn.Config{Model: &echo.Adapter{}, ShouldStopAfterTurn: func(context.Context, agentturn.TurnInfo) (bool, error) {
+				return false, fmt.Errorf("%w: phone number", agentturn.ErrGuard)
+			}}
+		}, agentsession.ReasonDone, "guard"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -181,7 +187,7 @@ func TestRunEndReasonsFollowTheCascade(t *testing.T) {
 	}
 	verifyAll(t, s)
 	runs := runsOf(t, s)
-	if last := runs[len(runs)-1]; last.End == nil || last.End.Reason != agentsession.ReasonAborted || last.End.Ref != "stopped" {
+	if last := runs[len(runs)-1]; last.End == nil || last.End.Reason != agentsession.ReasonAborted || last.End.Ref != "terminate" {
 		t.Errorf("terminating resume end = %+v", last.End)
 	}
 }

@@ -148,8 +148,15 @@ func TestSeedSeesParentTranscriptUnderALoop(t *testing.T) {
 			t.Fatal(e.Err)
 		}
 	}
-	if itemTypes(seen) != "user function_call" {
-		t.Errorf("seed saw %q, want the parent's user message and the call", itemTypes(seen))
+	// The in-flight call is answered with a placeholder naming the
+	// child, so the seed holds a valid input.
+	if itemTypes(seen) != "user function_call function_call_output" {
+		t.Errorf("seed saw %q, want the parent's user message, the call and a placeholder output", itemTypes(seen))
+	}
+	call := seen[1].(*openresponses.FunctionCall)
+	out := seen[2].(*openresponses.FunctionCallOutput)
+	if out.CallID != call.CallID || !strings.Contains(out.Output.Text, `"child"`) {
+		t.Errorf("placeholder = %+v", out)
 	}
 }
 
@@ -289,5 +296,94 @@ func TestChildInputRequired(t *testing.T) {
 				t.Error("ChildInfo lost on the error path")
 			}
 		}
+	}
+}
+
+func TestChildWithoutAnAnswer(t *testing.T) {
+	// A child that hits its turn budget while still calling tools has no
+	// final message: the parent's model sees an error naming the cause.
+	looping := agenttool.New("lookup", "", func(context.Context, struct {
+		Text string `json:"text"`
+	}) (string, error) {
+		return "found", nil
+	})
+	child := New(agentturn.Config{Name: "explore", Model: &echo.Adapter{}, Tools: []agenttool.Tool{looping}, MaxTurns: 1})
+	res, err := child.Execute(context.Background(), agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"x"}`)})
+	if err == nil || !strings.Contains(err.Error(), "max_turns") || !strings.Contains(err.Error(), "without a final answer") {
+		t.Errorf("err = %v", err)
+	}
+	info, ok := res.Details.(ChildInfo)
+	if !ok || info.Reason != agentturn.ReasonStopped || info.Cause != agentturn.StopMaxTurns {
+		t.Errorf("details = %+v", res.Details)
+	}
+	// A terminating tool answered on the child's behalf: its output is
+	// the answer.
+	final := agenttool.New("final_answer", "", func(context.Context, struct {
+		Text string `json:"text"`
+	}) (agenttool.Result, error) {
+		return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: "42"}, Terminate: true}, nil
+	})
+	child = New(agentturn.Config{Name: "solver", Model: &echo.Adapter{}, Tools: []agenttool.Tool{final}})
+	res, err = child.Execute(context.Background(), agenttool.Call{ID: "c2", Args: json.RawMessage(`{"input":"x"}`)})
+	if err != nil || res.Output.Text != "42" || res.Details.(ChildInfo).Cause != agentturn.StopTerminate {
+		t.Errorf("terminating child: res=%+v err=%v", res, err)
+	}
+	// The host chooses otherwise.
+	child = New(agentturn.Config{Name: "explore", Model: &echo.Adapter{}, Tools: []agenttool.Tool{looping}, MaxTurns: 1},
+		WithNoAnswer(func(info ChildInfo) (agenttool.Result, error) {
+			return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: "ran out of turns after " + string(info.Cause)}}, nil
+		}))
+	res, err = child.Execute(context.Background(), agenttool.Call{ID: "c3", Args: json.RawMessage(`{"input":"x"}`)})
+	if err != nil || res.Output.Text != "ran out of turns after max_turns" || res.Details.(ChildInfo).RunID == "" {
+		t.Errorf("custom no-answer: res=%+v err=%v", res, err)
+	}
+}
+
+func TestToolNameIsValidated(t *testing.T) {
+	mustPanic := func(name string, fn func()) {
+		t.Helper()
+		defer func() {
+			if r := recover(); r == nil || !strings.Contains(fmt.Sprint(r), name) {
+				t.Errorf("expected a panic naming %q, got %v", name, r)
+			}
+		}()
+		fn()
+	}
+	mustPanic("Billing agent", func() { New(agentturn.Config{Name: "Billing agent", Model: &echo.Adapter{}}) })
+	mustPanic("bad name", func() { WithToolName("bad name") })
+	tool := New(agentturn.Config{Name: "Billing agent", Model: &echo.Adapter{}}, WithToolName("billing_agent"))
+	if tool.Name() != "billing_agent" {
+		t.Errorf("tool name = %q", tool.Name())
+	}
+	if New(agentturn.Config{Name: "ok-name_1", Model: &echo.Adapter{}}).Name() != "ok-name_1" {
+		t.Error("a valid name is kept")
+	}
+}
+
+func TestSeedAnswersEverySiblingCall(t *testing.T) {
+	parent := agentturn.Transcript{
+		openresponses.UserText("x"),
+		&openresponses.FunctionCall{CallID: "mine", Name: "child", Arguments: "{}"},
+		&openresponses.FunctionCall{CallID: "sibling", Name: "other", Arguments: "{}"},
+		&openresponses.FunctionCall{CallID: "done", Name: "other", Arguments: "{}"},
+		openresponses.NewFunctionCallOutput("done", "ok"),
+	}
+	got := answered(parent, "mine", "child")
+	if itemTypes(got) != "user function_call function_call function_call function_call_output function_call_output function_call_output" {
+		t.Fatalf("answered = %q", itemTypes(got))
+	}
+	mine := got[5].(*openresponses.FunctionCallOutput)
+	sib := got[6].(*openresponses.FunctionCallOutput)
+	if mine.CallID != "mine" || !strings.Contains(mine.Output.Text, `"child"`) || sib.CallID != "sibling" || !strings.Contains(sib.Output.Text, "alongside") {
+		t.Errorf("placeholders = %+v %+v", mine, sib)
+	}
+	if len(parent) != 5 {
+		t.Error("the parent's snapshot was changed")
+	}
+	if answered(nil, "x", "y") != nil {
+		t.Error("nil seed should stay nil")
+	}
+	if !agentturn.CanContinue(got) {
+		t.Error("the answered snapshot should be a valid input")
 	}
 }
