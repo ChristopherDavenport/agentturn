@@ -67,6 +67,32 @@ func canContinue(t Transcript) bool {
 	return false
 }
 
+// unansweredCalls returns the function calls after the last user
+// message that have no function_call_output, in transcript order. A
+// transcript is a valid input only when this is empty.
+func unansweredCalls(t Transcript) []*openresponses.FunctionCall {
+	start := 0
+	for i := len(t) - 1; i >= 0; i-- {
+		if m, ok := t[i].(*openresponses.Message); ok && m.Role != openresponses.RoleAssistant {
+			start = i + 1
+			break
+		}
+	}
+	answered := map[string]bool{}
+	for _, item := range t[start:] {
+		if out, ok := item.(*openresponses.FunctionCallOutput); ok {
+			answered[out.CallID] = true
+		}
+	}
+	var calls []*openresponses.FunctionCall
+	for _, item := range t[start:] {
+		if call, ok := item.(*openresponses.FunctionCall); ok && !answered[call.CallID] {
+			calls = append(calls, call)
+		}
+	}
+	return calls
+}
+
 type observed struct {
 	ev  Event
 	err error
@@ -205,10 +231,9 @@ type runner struct {
 	steer      func() openresponses.Items
 	followUp   func() openresponses.Items
 
-	runID   string
-	turn    int
-	added   Transcript
-	pending []*openresponses.FunctionCall
+	runID string
+	turn  int
+	added Transcript
 }
 
 // errStop carries a run end reason out of a phase.
@@ -246,7 +271,11 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items) *RunEnd {
 		end.Err = err
 	}
 	end.Items = r.added
-	end.Pending = r.pending
+	// Whatever ended the run, the calls without an output are the
+	// caller's to answer: the deferred ones on input_required, and the
+	// ones an abort or a failure cut off before their outputs were
+	// appended.
+	end.Pending = unansweredCalls(r.transcript)
 	// A subscriber that fails on run_end cannot change the outcome; the
 	// run has already ended.
 	_ = r.emit(end)
@@ -282,7 +311,6 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items) error {
 			return err
 		}
 		if len(pending) > 0 {
-			r.pending = pending
 			return r.stop(ReasonInputRequired, nil)
 		}
 		if r.cfg.ShouldStopAfterTurn != nil {

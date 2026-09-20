@@ -552,6 +552,43 @@ func TestRunAbortMidTool(t *testing.T) {
 	if got := types(events); got[len(got)-1] != "run_end" {
 		t.Errorf("events = %v", got)
 	}
+	// The cut-off call is the caller's to answer.
+	if len(end.Pending) != 1 || end.Pending[0].Name != "upper" {
+		t.Errorf("pending = %v", end.Pending)
+	}
+	if canContinue(append(Transcript(nil), end.Items...)) {
+		t.Error("transcript ending in an unanswered call must not continue")
+	}
+}
+
+func TestUnansweredCalls(t *testing.T) {
+	call := func(id string) *openresponses.FunctionCall { return &openresponses.FunctionCall{CallID: id, Name: "f"} }
+	out := func(id string) *openresponses.FunctionCallOutput {
+		return &openresponses.FunctionCallOutput{CallID: id}
+	}
+	tests := []struct {
+		name string
+		t    Transcript
+		want []string
+	}{
+		{"empty", nil, nil},
+		{"answered", Transcript{openresponses.UserText("x"), call("a"), out("a")}, nil},
+		{"one unanswered", Transcript{openresponses.UserText("x"), call("a")}, []string{"a"}},
+		{"mixed batch", Transcript{openresponses.UserText("x"), call("a"), call("b"), call("c"), out("b")}, []string{"a", "c"}},
+		{"earlier turn ignored", Transcript{openresponses.UserText("x"), call("a"), openresponses.UserText("y"), call("b"), out("b")}, nil},
+		{"answered later in tail", Transcript{openresponses.UserText("x"), call("a"), out("a"), call("b")}, []string{"b"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []string
+			for _, c := range unansweredCalls(tt.t) {
+				got = append(got, c.CallID)
+			}
+			if strings.Join(got, ",") != strings.Join(tt.want, ",") {
+				t.Errorf("got %v want %v", got, tt.want)
+			}
+		})
+	}
 }
 
 func TestRunBreakCancels(t *testing.T) {

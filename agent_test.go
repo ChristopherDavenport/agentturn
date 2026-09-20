@@ -238,6 +238,35 @@ func TestAgentAbortAndIdle(t *testing.T) {
 	}
 	// Abort when idle is a no-op.
 	a.Abort()
+
+	// The cut-off call is pending: Prompt and Continue refuse, Resume
+	// answers it and the run completes.
+	if len(st.Pending) != 1 || st.Pending[0].Name != "upper" {
+		t.Fatalf("pending = %v", st.Pending)
+	}
+	if err := a.Prompt(context.Background(), openresponses.UserText("z")); !errors.Is(err, ErrInputRequired) {
+		t.Errorf("prompt after abort err = %v", err)
+	}
+	if err := a.Continue(context.Background()); !errors.Is(err, ErrInputRequired) {
+		t.Errorf("continue after abort err = %v", err)
+	}
+	out := &openresponses.FunctionCallOutput{CallID: st.Pending[0].CallID, Output: openresponses.FunctionCallOutputData{Text: "Error: aborted"}}
+	if err := a.Resume(context.Background(), out); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	st = a.State()
+	if len(st.Pending) != 0 || itemTypes(st.Transcript) != "user function_call function_call_output assistant" {
+		t.Errorf("state after resume = %q pending=%v", itemTypes(st.Transcript), st.Pending)
+	}
+
+	// A transcript seeded with the same dangling call is pending too.
+	b := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{blocking}}, WithTranscript(st.Transcript[:2]))
+	if p := b.State().Pending; len(p) != 1 || p[0].CallID != out.CallID {
+		t.Errorf("seeded pending = %v", p)
+	}
+	if err := b.Prompt(context.Background(), openresponses.UserText("z")); !errors.Is(err, ErrInputRequired) {
+		t.Errorf("seeded prompt err = %v", err)
+	}
 }
 
 func TestAgentUnsubscribe(t *testing.T) {

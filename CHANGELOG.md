@@ -7,6 +7,15 @@ versions may break the API.
 
 ## Unreleased
 
+- **Fixed**: an abort or a failure during a tool batch left a
+  `function_call` without an output in the transcript, so `Continue`
+  refused it while `Prompt` sent it. `RunEnd.Pending` now lists every
+  call of the run without an output, the deferred ones and the cut-off
+  ones alike, and `Agent` treats them the same: `Prompt` and
+  `Continue` return `ErrInputRequired` until `Resume` has answered
+  them. `WithTranscript` derives the pending calls from the seeded
+  transcript, so a session aborted mid-batch resumes through the same
+  path. (#1)
 - Depends on `agenttool` v0.0.2 and `agentsession` v0.0.2.
 
 ## v0.0.2 - 2026-09-19

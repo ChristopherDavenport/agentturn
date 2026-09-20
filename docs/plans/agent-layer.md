@@ -323,8 +323,10 @@ behind the same hook.
 
 - The transcript after a run is always a valid Open Responses input:
   every `function_call` has exactly one `function_call_output` before the
-  next user message, or the run ended in input-required (a front's
-  concern) with the pending calls recorded.
+  next user message, or the run ended with the unanswered calls on
+  `RunEnd.Pending`: deferred to the caller (input-required, a front's
+  concern) or cut off by an abort or a failure. Either way the caller
+  answers them through `Resume` before the next prompt.
 - Exactly one `run_end` per run, nothing after it.
 - `item_end` for an assistant item is emitted only after
   `output_item.done` from the stream; partial items never reach

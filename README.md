@@ -170,7 +170,9 @@ The plan is `docs/plans/agent-layer.md`. Invariants the tests hold:
 
 - The transcript after a run is a valid Open Responses input: every
   `function_call` is answered before the next user message, or the run
-  ended with the pending calls recorded.
+  ended with the unanswered calls on `RunEnd.Pending`, whether a hook
+  deferred them or an abort or failure cut them off. `Agent.Resume`
+  answers them; `Prompt` and `Continue` refuse until it has.
 - Exactly one `run_end` per run, nothing after it.
 - `item_end` for an assistant item follows `output_item.done`; partial
   items never reach subscribers as `item_end`.

@@ -15,8 +15,9 @@ var (
 	ErrRunning = errors.New("agentturn: agent is already running")
 	// ErrAborted: the run was aborted with [Agent.Abort] or its context.
 	ErrAborted = errors.New("agentturn: run aborted")
-	// ErrInputRequired: the last run deferred calls that are still
-	// unanswered; [Agent.Resume] with their outputs first.
+	// ErrInputRequired: the last run left calls unanswered, deferred to
+	// the caller or cut off by an abort or a failure; [Agent.Resume]
+	// with their outputs first.
 	ErrInputRequired = errors.New("agentturn: pending tool calls must be resumed before continuing")
 	// ErrNotPending: Resume was given an output for a call that is not
 	// pending, or left a pending call unanswered.
@@ -57,9 +58,15 @@ type subscription struct {
 type Option func(*Agent)
 
 // WithTranscript starts the agent from an existing transcript, as when
-// resuming a session.
+// resuming a session. Function calls after the last user message that
+// have no output are pending, as they would be after the run that made
+// them: Prompt and Continue return [ErrInputRequired] until
+// [Agent.Resume] has answered them.
 func WithTranscript(t Transcript) Option {
-	return func(a *Agent) { a.transcript = append(Transcript(nil), t...) }
+	return func(a *Agent) {
+		a.transcript = append(Transcript(nil), t...)
+		a.pending = unansweredCalls(a.transcript)
+	}
 }
 
 // New builds an agent.
@@ -90,8 +97,9 @@ type State struct {
 	// Steering and FollowUps count the queued items.
 	Steering  int
 	FollowUps int
-	// Pending lists the deferred calls awaiting outputs; Prompt and
-	// Continue refuse until Resume has answered them.
+	// Pending lists the calls awaiting outputs, deferred or cut off by
+	// an abort or a failure; Prompt and Continue refuse until Resume has
+	// answered them.
 	Pending []*openresponses.FunctionCall
 }
 
@@ -136,11 +144,13 @@ func (a *Agent) Continue(ctx context.Context) error {
 	return a.run(ctx, nil, false)
 }
 
-// Resume answers the calls the last run deferred and continues. Every
-// pending call must have exactly one output, and no output may answer
-// a call that is not pending; a caller that refuses a call answers it
-// with the refusal as text, which the model then sees. The outputs are
-// appended with their item events before the model is called.
+// Resume answers the calls the last run left pending and continues,
+// whether they were deferred to the caller or cut off by an abort or a
+// failure. Every pending call must have exactly one output, and no
+// output may answer a call that is not pending; a caller that refuses
+// a call answers it with the refusal as text, which the model then
+// sees. The outputs are appended with their item events before the
+// model is called.
 func (a *Agent) Resume(ctx context.Context, outputs ...*openresponses.FunctionCallOutput) error {
 	a.mu.Lock()
 	pending := make(map[string]bool, len(a.pending))

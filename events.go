@@ -45,7 +45,8 @@ const (
 	// the caller; RunEnd.Pending lists them and the run continues once
 	// their outputs are appended (see Agent.Resume).
 	ReasonInputRequired Reason = "input_required"
-	// ReasonAborted: the context was cancelled.
+	// ReasonAborted: the context was cancelled. A tool batch cut off
+	// by the abort leaves its calls on RunEnd.Pending.
 	ReasonAborted Reason = "aborted"
 	// ReasonError: the model, a hook or a subscriber failed; RunEnd.Err
 	// says which.
@@ -160,7 +161,9 @@ func (*ToolUpdate) EventType() string { return EventToolUpdate }
 // Blocked is set when BeforeToolCall refused the call. In both cases
 // Result holds the error output the model sees. Deferred is set when
 // BeforeToolCall handed the call to the caller: nothing ran, Result is
-// empty and no output is appended.
+// empty and no output is appended. A call cancelled by an abort ends
+// with the context error as Err; its output is not appended either, and
+// the call is listed on RunEnd.Pending.
 type ToolEnd struct {
 	RunID    string
 	Turn     int
@@ -196,9 +199,13 @@ type RunEnd struct {
 	// Err is set when Reason is ReasonError, and to the context error
 	// when Reason is ReasonAborted.
 	Err error
-	// Pending lists the function calls a deferred decision left
-	// unanswered when Reason is ReasonInputRequired. The transcript is
-	// a valid input again once each has a function_call_output.
+	// Pending lists the function calls of the run with no
+	// function_call_output, in transcript order: the calls a deferred
+	// decision handed to the caller when Reason is ReasonInputRequired,
+	// and the calls an abort or a failure cut off before their outputs
+	// were appended. It is empty for ReasonDone and ReasonStopped. The
+	// transcript is a valid input again once each has an output, which
+	// Agent.Resume appends.
 	Pending []*openresponses.FunctionCall
 }
 
