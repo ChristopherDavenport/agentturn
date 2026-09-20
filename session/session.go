@@ -46,7 +46,7 @@
 //     the request hash, so a call a BeforeModelCall guard refused is on
 //     the record and distinct from one that was made and failed.
 //   - item_end: an item entry; an item streamed by the model carries its
-//     response ID. An item the configured filter would hide from the
+//     response ID. An item the filter in force would hide from the
 //     model, an app-only extension item, is written as a custom entry
 //     instead so the path rebuilds exactly the input that was sent. A
 //     function_call_output that answers a call still held by a hold
@@ -75,8 +75,8 @@
 //     aborted as interrupted with the context error as ref, since the
 //     host asked for the stop, and stopped as stopped when the last
 //     response requested tools, as done when it did not and as aborted
-//     when the run made no model call, with the loop's own reason as
-//     ref whenever the two differ.
+//     when the run made no model call, with the stop's cause as ref in
+//     every case.
 //   - a fold reported through [Recorder.Fold]: a compaction entry whose
 //     first_kept is the entry of the first item the transform kept, with
 //     the summary and the settings in force, and a fold member naming
@@ -96,6 +96,13 @@
 //   - tool_end with a tools/agent ChildInfo whose run was not observed:
 //     a session holding only the child's items, with no records
 //     promise, and the link; wire Observe to get the full record.
+//   - tool_end whose Result.Details implements agenttool.Recordable: a
+//     custom entry in the namespace the value names, carrying its JSON,
+//     between the call's dispatch and its output. This is how a tool
+//     keeps what its output does not carry, the full bytes of a
+//     truncated result for one, in the session without the recorder
+//     knowing its type. Details for in-process subscribers alone are
+//     not recorded.
 //
 // # Header
 //
@@ -118,24 +125,64 @@
 // so the same function serves every level of nesting: a child's child
 // is linked from the child's session.
 //
-// # Compaction
+// # Request hashes and compaction
 //
 // The hash recorded on a response is computed from the request as sent,
-// in the canonical form [Canonical] defines. When a Transform changes
-// the input for a call, the stored path must record the change or
-// Session.Verify reports a mismatch for that call. For the compact
-// transform, [Recorder.Fold] writes the compaction entry:
+// in the canonical form [Canonical] defines, and is written only when
+// the recorder can stand behind it: when the request's input is what
+// the stored path rebuilds, which the recorder checks against the items
+// it wrote, the fold it last recorded and the filter in force. A
+// request whose input a Transform or a BeforeModelCall changed in a way
+// the record does not describe, or that carries items the recorder
+// never wrote, such as a child's seed transcript, is recorded without
+// a hash, and Session.Verify reports it as unverified rather than as a
+// mismatch. For the compact transform, [Recorder.Fold] writes the
+// compaction entry that describes the change, so its requests keep
+// their hashes:
 //
 //	c := compact.NewLocal(model, compact.WithOnFold(rec.Fold))
 //	cfg.Transform = c.Transform
 //
-// The recorder keeps the entry ID of every item it wrote, aligned with
-// the agent's working transcript, and names the entry at the fold's
-// split as first_kept. [Resume] seeds that alignment from the context
-// at the leaf, so an agent resumed from Context.Items records folds
-// too; an agent seeded with a transcript the recorder did not write and
-// did not resume from cannot, and Fold returns an error, which fails
-// the turn rather than let the record drift.
+// The recorder keeps the entry ID and the value of every item it wrote,
+// aligned with the agent's working transcript, and names the entry at
+// the fold's split as first_kept. [Resume] seeds that alignment from
+// the context at the leaf, so an agent resumed from Context.Items
+// records folds too; an agent seeded with a transcript the recorder did
+// not write and did not resume from cannot, and Fold returns an error,
+// which fails the turn rather than let the record drift.
+//
+// # Following the agent
+//
+// [Recorder.Attach] follows the agent: at every run_start the recorder
+// takes the agent's configuration again, so Agent.SetConfig needs no
+// consumer action, and the filter that decides which items the model
+// saw is the configuration's. [WithFilter] serves [Recorder.Handle]
+// used without an agent, and a configuration whose Filter is nil.
+//
+// # Branching, continuing and annotating
+//
+// A session branches by moving its leaf; a recorder writing it has to
+// be told, or it keeps writing deltas against the branch it left.
+// [Recorder.Rebase] moves the leaf and reseeds the recorder from the
+// context there, as [Resume] seeds it from the leaf at open; it appends
+// nothing and refuses while a run is active. A conversation that
+// outgrows its file rolls over with [Continue], which creates the
+// successor with agentsession.Continue and returns a recorder seeded
+// from it; the successor's context begins with the summary, and the
+// agent that continues it is seeded with that context. A link is never
+// a context edge: a subsession runs on a fresh transcript and its
+// session is self-contained, a conversation continuing under new
+// settings within one session is a config entry, and a rollover is a
+// successor whose first entries carry what it needs.
+//
+// [Recorder.Annotate] appends a custom entry at the current leaf of the
+// session of the run on the context, the recorder's own when none is,
+// so a consumer records its own state, a render manifest or a policy's
+// verdict, next to the turn it describes without reproducing the
+// recorder's parenting. An annotation made from a subscriber during
+// turn_start lands before that turn's config entry, whatever the
+// subscriber's registration order: the recorder holds the settle it
+// computed on turn_start until the next event of the turn.
 package session
 
 import (
@@ -184,6 +231,10 @@ type FoldCall struct {
 	Model string `json:"model,omitempty"`
 }
 
+// ErrRunActive is returned by [Recorder.Rebase] while a run is being
+// written.
+var ErrRunActive = errors.New("session: a run is active")
+
 // Recorder is an agentturn subscriber that writes one session, and the
 // sessions of the child runs it observes. It is safe to attach to one
 // agent at a time; events of a run arrive from one goroutine, and
@@ -195,6 +246,9 @@ type Recorder struct {
 	children bool
 	env      func(context.Context) (*agentsession.EnvEntry, error)
 	now      func() time.Time
+	// agent is the agent Attach subscribed to, whose configuration is
+	// taken again at every run_start.
+	agent *agentturn.Agent
 
 	// mu serialises Handle, Observe and Fold with Attach and Resume.
 	// Events of a run arrive from one goroutine, so holding it across
@@ -221,12 +275,30 @@ type writer struct {
 	// wroteConfig is set once a config entry is on the path, written by
 	// this writer or replayed by Resume, so settle writes deltas.
 	wroteConfig bool
-	pending     string    // request hash of the call in flight
-	started     time.Time // when the call in flight was sent
+	// settleReq is the request whose settings the next entry must
+	// follow: turn_start computes it and the next event of the turn
+	// writes it, so an annotation made during turn_start lands first.
+	settleReq *openresponses.Request
+	// inFlight is set from turn_start to the response; pending is the
+	// hash of the request in flight, empty when the recorder cannot
+	// stand behind it; started is when it was sent.
+	inFlight bool
+	pending  string
+	started  time.Time
 	// items holds the ID of the entry contributing each item of the
 	// agent's working transcript, in order, so a fold's split index
-	// names the first kept entry.
-	items []string
+	// names the first kept entry; values holds the items themselves and
+	// custom says which were written as custom entries, outside the
+	// context, so the input the path rebuilds can be compared with a
+	// request's.
+	items  []string
+	values openresponses.Items
+	custom []bool
+	// foldSet says the last fold recorded replaces the first foldSplit
+	// items with foldSummary in the rebuilt context.
+	foldSet     bool
+	foldSplit   int
+	foldSummary openresponses.Item
 	// calls maps a call ID to what the path holds for it, for the calls
 	// this writer wrote or Resume found pending.
 	calls map[string]*callRecord
@@ -263,10 +335,12 @@ type callRecord struct {
 // Option configures a Recorder.
 type Option func(*Recorder)
 
-// WithFilter sets the filter that decides which items the model saw.
-// Items it drops are written as custom entries rather than item
-// entries. It should match the agent's Config.Filter; the default is
-// agentturn.DefaultFilter.
+// WithFilter sets the filter that decides which items the model saw
+// when the recorder has no configuration to take it from: [Handle]
+// without an agent, or a configuration whose Filter is nil. Items it
+// drops are written as custom entries rather than item entries. The
+// default is agentturn.DefaultFilter. A recorder attached to an agent
+// takes the filter from the agent's configuration at every run.
 func WithFilter(f func(agentturn.Transcript) agentturn.Transcript) Option {
 	return func(r *Recorder) { r.filter = f }
 }
@@ -352,16 +426,38 @@ func Start(ctx context.Context, store agentsession.Store, h agentsession.Header,
 // in force there, so the first config entry it writes is the delta
 // from them, or nothing when the agent's configuration matches, rather
 // than a full copy on every resume; from the items of the context
-// there, so an agent seeded with Context.Items can record folds; from
-// the calls pending there, so their dispatches and decisions anchor to
-// the entries that hold them; and from the last env entry on the path.
-// Child sessions name the header's harness unless [WithHarness] says
-// otherwise.
+// there, so an agent seeded with Context.Items can record folds and
+// its requests carry hashes; from the calls pending there, so their
+// dispatches and decisions anchor to the entries that hold them; and
+// from the last env entry on the path. Child sessions name the
+// header's harness unless [WithHarness] says otherwise.
 func Resume(ctx context.Context, store agentsession.Store, sessionID string, opts ...Option) (*Recorder, *agentsession.Session, error) {
 	s, err := store.Open(ctx, sessionID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("session: open: %w", err)
 	}
+	return resume(s, store, opts)
+}
+
+// Continue rolls the session with the given ID over into a successor
+// through agentsession.Continue: a new session with parent_session
+// naming the old one, a full config carrying the settings in force at
+// the old leaf, summary as its first item when not nil, and a
+// continued_in link on the old session, which lists it as superseded.
+// It returns a recorder seeded from the successor as [Resume] seeds
+// one, and the successor, whose Context().Items is what the agent that
+// continues the conversation should be seeded with. The old session's
+// recorder, if any, should be detached first; a store that holds the
+// old session open may need it released before it can be continued.
+func Continue(ctx context.Context, store agentsession.Store, sessionID string, summary openresponses.Item, opts ...Option) (*Recorder, *agentsession.Session, error) {
+	next, err := agentsession.Continue(ctx, store, sessionID, summary)
+	if err != nil {
+		return nil, nil, fmt.Errorf("session: continue: %w", err)
+	}
+	return resume(next, store, opts)
+}
+
+func resume(s *agentsession.Session, store agentsession.Store, opts []Option) (*Recorder, *agentsession.Session, error) {
 	r := New(store, s.ID(), opts...)
 	if r.harness == nil {
 		r.harness = s.Header().Harness
@@ -370,6 +466,66 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 		return nil, nil, err
 	}
 	return r, s, nil
+}
+
+// Rebase moves the session's leaf to entryID and reseeds the recorder
+// from the context there, as [Resume] seeds it from the leaf at open,
+// so the next run records against the settings, items and pending
+// calls of the branch it continues rather than the one it left. It
+// appends nothing: a rebase is not a change to the record. It refuses
+// with [ErrRunActive] while a run is being written, and s must be the
+// session the recorder writes. The agent's transcript is the caller's
+// to set, with Agent.SetTranscript from s.Context().Items.
+func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s.ID() != r.root.id {
+		return fmt.Errorf("session: rebase: session %s is not the recorder's %s", s.ID(), r.root.id)
+	}
+	if r.root.run != "" {
+		return ErrRunActive
+	}
+	if err := s.Branch(entryID); err != nil {
+		return fmt.Errorf("session: rebase: %w", err)
+	}
+	r.root.reset()
+	return r.root.seed(s)
+}
+
+// Annotate appends a custom entry in namespace ns carrying data,
+// encoded as JSON, at the current leaf of the session of the run on
+// the context, or of the recorder's own session when the context
+// names no run it is writing. It never contributes an item or a
+// setting, so the context and the request hashes are untouched. Made
+// from a subscriber during turn_start, the entry lands before that
+// turn's config entry, whatever the order the subscribers were
+// registered in; made during any later event of the turn, after it.
+func (r *Recorder) Annotate(ctx context.Context, ns string, data any) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	w := r.root
+	if cw, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
+		w = cw
+	}
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("session: encode annotation %s: %w", ns, err)
+	}
+	_, err = w.append(context.WithoutCancel(ctx), &agentsession.CustomEntry{NS: ns, Data: raw})
+	return err
+}
+
+// reset clears what seed sets, keeping the writer's identity and its
+// configuration.
+func (w *writer) reset() {
+	w.settings = agentsession.Settings{}
+	w.wroteConfig = false
+	w.settleReq = nil
+	w.inFlight, w.pending, w.started = false, "", time.Time{}
+	w.items, w.values, w.custom = nil, nil, nil
+	w.foldSet, w.foldSplit, w.foldSummary = false, 0, nil
+	w.calls = map[string]*callRecord{}
+	w.env = nil
 }
 
 // seed sets the writer's state from the session at its leaf.
@@ -387,6 +543,8 @@ func (w *writer) seed(s *agentsession.Session) error {
 	for i, e := range cx.ItemEntries {
 		w.items[i] = e.Base().ID
 	}
+	w.values = append(openresponses.Items(nil), cx.Items...)
+	w.custom = make([]bool, len(w.values))
 	for _, e := range cx.Entries {
 		if env, ok := e.(*agentsession.EnvEntry); ok {
 			w.env = envBody(env)
@@ -419,15 +577,33 @@ func (r *Recorder) SessionID() string { return r.root.id }
 func (r *Recorder) Store() agentsession.Store { return r.store }
 
 // Attach subscribes the recorder to a and returns the unsubscribe
-// function.
+// function. The recorder takes the agent's configuration at every
+// run_start from then on, so a change through Agent.SetConfig reaches
+// the record as a config delta and as the filter in force.
 func (r *Recorder) Attach(a *agentturn.Agent) (unsubscribe func()) {
 	r.mu.Lock()
-	if r.root.cfg == nil {
-		cfg := a.Config()
-		r.root.cfg = &cfg
-	}
+	r.agent = a
+	cfg := a.Config()
+	r.root.cfg = &cfg
 	r.mu.Unlock()
-	return a.Subscribe(r.Handle)
+	unsub := a.Subscribe(r.Handle)
+	return func() {
+		unsub()
+		r.mu.Lock()
+		if r.agent == a {
+			r.agent = nil
+		}
+		r.mu.Unlock()
+	}
+}
+
+// filter returns the filter in force for the writer's session: the
+// configuration's when it has one, the recorder's otherwise.
+func (w *writer) filter() func(agentturn.Transcript) agentturn.Transcript {
+	if w.cfg != nil && w.cfg.Filter != nil {
+		return w.cfg.Filter
+	}
+	return w.rec.filter
 }
 
 // Handle records one event of the agent's run. It is the subscriber
@@ -445,6 +621,10 @@ func (r *Recorder) Handle(ctx context.Context, ev agentturn.Event) error {
 		}
 		r.rootRun = e.RunID
 		r.runs[e.RunID] = r.root
+		if r.agent != nil {
+			cfg := r.agent.Config()
+			r.root.cfg = &cfg
+		}
 	}
 	return r.root.handle(ctx, ev)
 }
@@ -603,8 +783,15 @@ func Canonical(req openresponses.Request) openresponses.Request {
 	return out
 }
 
-// handle writes the entry for one event of the writer's run.
+// handle writes the entry for one event of the writer's run. Any
+// settle held since turn_start is written first, so an annotation made
+// during turn_start precedes it.
 func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
+	if _, ok := ev.(*agentturn.TurnStart); !ok {
+		if err := w.flush(ctx); err != nil {
+			return err
+		}
+	}
 	switch e := ev.(type) {
 	case *agentturn.RunStart:
 		return w.runStart(ctx, e)
@@ -621,11 +808,28 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 	case *agentturn.RunEnd:
 		return w.runEnd(ctx, e)
 	case *agentturn.ToolEnd:
-		if info, ok := e.Result.Details.(agent.ChildInfo); ok && w.rec.children {
-			return w.child(ctx, e.CallID, info)
-		}
+		return w.toolEnd(ctx, e)
 	}
 	return nil
+}
+
+// toolEnd writes what a call's result carries for the record: a child
+// run's link, and the tool's own side data when its Details value is
+// an agenttool.Recordable, as a custom entry in the namespace the value
+// names, between the call's dispatch and its output.
+func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
+	if info, ok := e.Result.Details.(agent.ChildInfo); ok && w.rec.children {
+		return w.child(ctx, e.CallID, info)
+	}
+	rec, err := agenttool.RecordOf(e.Result.Details)
+	if err != nil {
+		return fmt.Errorf("session: call %s: %w", e.CallID, err)
+	}
+	if rec == nil {
+		return nil
+	}
+	_, err = w.append(ctx, &agentsession.CustomEntry{NS: rec.NS, Data: rec.Data})
+	return err
 }
 
 // runStart opens the run on the record: the run entry, the env when
@@ -685,18 +889,63 @@ func envBody(env *agentsession.EnvEntry) []byte {
 	return data
 }
 
+// turnStart holds the settle for the request and takes the hash the
+// response will carry, when the recorder can stand behind it.
 func (w *writer) turnStart(ctx context.Context, e *agentturn.TurnStart) error {
+	if err := w.flush(ctx); err != nil {
+		return err
+	}
 	req := Canonical(e.Request)
-	hash, err := RequestHash(req)
+	hash, err := w.hash(req)
 	if err != nil {
 		return err
 	}
-	if err := w.settle(ctx, req); err != nil {
-		return err
-	}
+	w.settleReq = &req
+	w.inFlight = true
 	w.pending = hash
 	w.started = w.rec.now()
 	return nil
+}
+
+// flush writes the settle held since turn_start, if any.
+func (w *writer) flush(ctx context.Context) error {
+	if w.settleReq == nil {
+		return nil
+	}
+	req := *w.settleReq
+	w.settleReq = nil
+	return w.settle(ctx, req)
+}
+
+// hash returns the request's hash when its input is what the stored
+// path rebuilds, "" otherwise.
+func (w *writer) hash(req openresponses.Request) (string, error) {
+	expected, ok := w.expectedInput()
+	if !ok || !equalJSON(expected, req.Input) {
+		return "", nil
+	}
+	return RequestHash(req)
+}
+
+// expectedInput is the input the stored path rebuilds, as the context
+// algorithm reads it: the summary of the last fold recorded, then the
+// items written as item entries from the fold's first kept one on.
+func (w *writer) expectedInput() (openresponses.Items, bool) {
+	from := 0
+	var out openresponses.Items
+	if w.foldSet {
+		if w.foldSplit > len(w.values) {
+			return nil, false
+		}
+		from = w.foldSplit
+		out = append(out, w.foldSummary)
+	}
+	for i := from; i < len(w.values); i++ {
+		if !w.custom[i] {
+			out = append(out, w.values[i])
+		}
+	}
+	return out, true
 }
 
 // blocked records a call BeforeModelCall refused: the settings the
@@ -705,7 +954,7 @@ func (w *writer) turnStart(ctx context.Context, e *agentturn.TurnStart) error {
 // made.
 func (w *writer) blocked(ctx context.Context, e *agentturn.ModelBlocked) error {
 	req := Canonical(e.Request)
-	hash, err := RequestHash(req)
+	hash, err := w.hash(req)
 	if err != nil {
 		return err
 	}
@@ -764,7 +1013,8 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		}
 	}
 	var entry agentsession.Entry
-	if responseID == "" && len(w.rec.filter(agentturn.Transcript{item})) == 0 {
+	hidden := responseID == "" && len(w.filter()(agentturn.Transcript{item})) == 0
+	if hidden {
 		raw, err := json.Marshal(item)
 		if err != nil {
 			return fmt.Errorf("session: encode %s item: %w", item.ItemType(), err)
@@ -778,6 +1028,8 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		return err
 	}
 	w.items = append(w.items, id)
+	w.values = append(w.values, item)
+	w.custom = append(w.custom, hidden)
 	switch v := item.(type) {
 	case *openresponses.FunctionCall:
 		w.calls[v.CallID] = &callRecord{entry: id, args: v.Arguments}
@@ -897,8 +1149,7 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 		RequestHash: w.pending,
 		LatencyMS:   w.latency(),
 	}
-	w.pending = ""
-	w.started = time.Time{}
+	w.inFlight, w.pending, w.started = false, "", time.Time{}
 	w.responses++
 	w.lastCalls = len(resp.FunctionCalls()) > 0
 	_, err := w.append(ctx, entry)
@@ -914,11 +1165,10 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 // first response to this call. Then the run's end entry, with the
 // reason in the format's terms and the run's calls left open.
 func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
-	hash := w.pending
+	hash, inFlight := w.pending, w.inFlight
 	latency := w.latency()
-	w.pending = ""
-	w.started = time.Time{}
-	if hash != "" {
+	w.inFlight, w.pending, w.started = false, "", time.Time{}
+	if inFlight {
 		w.responses++
 		w.lastCalls = false
 		entry := &agentsession.ResponseEntry{
@@ -956,17 +1206,20 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 		// The host asked for the stop, through Abort or its context.
 		return agentsession.ReasonInterrupted, errText(e.Err)
 	case agentturn.ReasonStopped:
+		// The cause is the ref throughout: what stopped the run is what a
+		// reader asks, whichever shape the segment has.
 		switch {
 		case w.responses == 0:
-			// A resume whose approved batch terminated: the segment has
-			// no response, which the format reads as aborted.
-			return agentsession.ReasonAborted, string(e.Reason)
+			// A resume whose approved batch terminated, or a refusal on
+			// Resume: the segment has no response, which the format reads
+			// as aborted.
+			return agentsession.ReasonAborted, string(e.Cause)
 		case w.lastCalls:
-			return agentsession.ReasonStopped, ""
+			return agentsession.ReasonStopped, string(e.Cause)
 		}
 		// A guard or a turn budget stopped a run whose last response
 		// requested nothing, which the format reads as done.
-		return agentsession.ReasonDone, string(e.Reason)
+		return agentsession.ReasonDone, string(e.Cause)
 	}
 	return string(e.Reason), ""
 }
@@ -1021,6 +1274,7 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 	if f.Split < 0 || f.Split >= len(w.items) {
 		return fmt.Errorf("session: fold keeps the transcript from item %d, but the recorder wrote %d items", f.Split, len(w.items))
 	}
+	w.foldSet, w.foldSplit, w.foldSummary = true, f.Split, f.Summary
 	entry := &agentsession.CompactionEntry{
 		FirstKept:    w.items[f.Split],
 		Summary:      f.Summary,

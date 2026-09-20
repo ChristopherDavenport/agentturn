@@ -7,6 +7,12 @@ versions may break the API.
 
 ## Unreleased
 
+- Depends on `agenttool` v0.0.5, and `session` writes a tool's side
+  data: a `Result.Details` value that implements `agenttool.Recordable`
+  is written on `tool_end` as a custom entry in the namespace it names,
+  between the call's dispatch and its output, so a tool keeps what its
+  output does not carry, the full bytes of a truncated result for one,
+  without the recorder knowing its type. (#53, the library half)
 - Depends on `agentsession` v0.0.5, the release that implements RFC
   0001 draft 0.2, and `session` writes the record entries the draft
   added, so a session written by this recorder is resumable from the
@@ -64,6 +70,100 @@ versions may break the API.
   transcript a strict server rejects. A call with no output anywhere
   later in the transcript is pending, whatever messages intervene.
   (#50)
+- `session`: `Recorder.Rebase` moves the session's leaf and reseeds the
+  recorder from the context there, so a branch with a live recorder
+  records the deltas and the fold alignment of the branch it continues
+  rather than the one it left; it appends nothing and refuses while a
+  run is active with `ErrRunActive`. (#49)
+- `session`: a recorder attached to an agent takes the agent's
+  configuration again at every run, so `Agent.SetConfig` reaches the
+  record as a config delta and as the filter in force; `WithFilter`
+  serves `Handle` without an agent and a configuration whose Filter is
+  nil. (#41)
+- `session`: `Continue` rolls a session over into a successor through
+  `agentsession.Continue` and returns a recorder seeded from it. The
+  package documents that a link is never a context edge: a subsession
+  is self-contained, a change of settings within a conversation is a
+  config entry, and a rollover is a successor. (#40)
+- `session`: `Recorder.Annotate` appends a custom entry at the current
+  leaf of the session of the run on the context, and one made from a
+  subscriber during turn_start lands before that turn's config entry
+  whatever the registration order: the recorder holds the settle it
+  computed on turn_start until the turn's next event. (#51)
+- `session`: a response carries a request hash only when the recorder
+  can stand behind it, when the request's input is what the stored
+  path rebuilds from the items it wrote, the fold it last recorded and
+  the filter in force. A request a Transform or a BeforeModelCall
+  changed in a way the record does not describe, or that carries items
+  the recorder never wrote, is written without a hash, and
+  `Session.Verify` reports it as unverified rather than as a mismatch.
+  (#35, the recorder half)
+- `RunEnd.Cause` says what stopped a run with `ReasonStopped`:
+  `StopMaxTurns`, `StopHook`, `StopGuard`, `StopTerminate`,
+  `StopPartialTerminate` or `StopRefused`; the recorder writes it as
+  the run end's `ref`. A `ShouldStopAfterTurn` hook that returns an
+  error wrapping `ErrGuard` ends the run as a policy stop, with the
+  error on `RunEnd.Err`, rather than as a failure, and `TurnInfo.Final`
+  says the turn called no tools. (#37)
+- **Breaking**: a batch in which some results set `Terminate` and
+  others do not now ends the run, with `StopPartialTerminate`, instead
+  of continuing as if nothing had asked to stop; the other calls still
+  run and their outputs still land. A batch whose every result
+  terminates stops as before, with `StopTerminate`. (#36)
+- `Config.OutputGuard` runs on each assistant message as the stream
+  completes it, before it is appended, delivered as item_end or
+  recorded, and may replace it with a placeholder; function calls and
+  every other output item never reach it. (#37)
+- `Config.BeforeTurn` returns items the loop appends to the transcript
+  at the start of each turn, with their item events, so per-turn
+  context is a fact about the path and a recorded session rebuilds the
+  request it was part of. (#35, the loop half)
+- `ToolCallInfo` carries `Batch`, every call of the turn in the model's
+  order, and `Index`, so a policy that defers one call can hold the
+  rest of the batch. (#42)
+- `Refuse` answers a pending call and ends the run with `StopRefused`
+  instead of calling the model, for a refusal that should end the turn;
+  `Answer.Terminate` is behind it. The outputs are still appended. (#43)
+- `Answer.Note` and `ToolDecision.Note` carry what the user or the
+  policy said with the result: appended after the batch's outputs as a
+  user or a developer message, so the model reads the result and the
+  note together in the same turn; `Answer.WithNote` attaches one. The
+  steer queue is drained after an approved batch, as after any batch.
+  (#45)
+- **Fixed**: a tool list from `ToolProvider` skipped the duplicate-name
+  check that `Config.Tools` gets before a run. The provided list is
+  validated once per turn and a bad one fails the turn naming it. (#46)
+- **Fixed**: the low-level `Run` and `Continue` accepted a transcript
+  with an unanswered function call, which `Agent.Prompt` refuses; they
+  now fail with `ErrInputRequired` unless the prompts' leading outputs
+  answer it. (#39)
+- `tools/agent`: a child that ends without a final assistant message
+  no longer returns an empty output. By default the parent's model sees
+  an error naming the cause, or the last tool output when a terminating
+  tool answered on the child's behalf; `WithNoAnswer` sets what it sees.
+  `ChildInfo.Cause` carries the child's stop cause. (#30)
+- `tools/agent`: the snapshot a `WithTranscript` seed receives has every
+  in-flight call of the batch answered with a placeholder output, the
+  child's own naming the agent, so a seed that keeps the conversation
+  hands the child a valid input; the parent's snapshot is unchanged.
+  `New` panics on a `Config.Name` a provider rejects as a tool name
+  unless `WithToolName` gives one. (#39)
+- `State.Steered` and `State.Queued` are the queued items themselves,
+  copies of the steer and follow-up queues, so a host that promised a
+  sender it has an item can persist it and queue it again after a
+  restart. `Steer`, `FollowUp`, `Abort`, `SetConfig` and
+  `SetTranscript` document that the queues live in memory and survive
+  everything but the process. (#32)
+- `TurnStart.Inputs` names the items appended since the previous turn's
+  response, or since the run started, so a front routes a response to
+  the messages it answers without counting item events between turns.
+  (#33)
+- `AfterToolCall` documents that an override is invisible to every
+  subscriber and recorder, so a cap on tool output belongs in the tool
+  or in a Transform, not there. (#53)
+- `Steer` and `FollowUp` document that a subscriber steering in
+  reaction to an event its own item produces feeds the run forever, and
+  where to steer from instead. (#54)
 - `RunStart` carries `Source`, input or resume, and the `Trigger` a
   caller attached to the context with `ContextWithTrigger`; the loop
   learns nothing from it. (#31)

@@ -103,9 +103,10 @@ func (a *Agent) Config() Config { return a.cfg }
 
 // SetConfig replaces the configuration for the next run: model,
 // instructions, reasoning, tools, hooks, all of it. It returns
-// [ErrRunning] while a run is active. Subscribers and queues are kept;
-// a session recorder attached to the agent sees the change as a config
-// delta on the next turn.
+// [ErrRunning] while a run is active. Subscribers and the queues are
+// kept, so anything steered or queued under the old configuration
+// goes to the next run under the new one; a session recorder attached
+// to the agent sees the change as a config delta on the next turn.
 func (a *Agent) SetConfig(cfg Config) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -122,7 +123,8 @@ func (a *Agent) SetConfig(cfg Config) error {
 // [WithTranscript] derives them, so whatever the old transcript was
 // waiting on is forgotten and whatever the new one is waiting on must
 // be answered through [Agent.Resume]. Queued Steer and FollowUp items
-// are kept.
+// are kept and go to the next run on the new transcript; a host that
+// does not want them there reads them from [Agent.State] first.
 func (a *Agent) SetTranscript(t Transcript) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -141,9 +143,13 @@ type State struct {
 	Running    bool
 	RunID      string
 	Turn       int
-	// Steering and FollowUps count the queued items.
+	// Steering and FollowUps count the queued items; Steered and Queued
+	// are the items themselves, copies of the queues, so a host can
+	// persist what it accepted and queue it again after a restart.
 	Steering  int
 	FollowUps int
+	Steered   openresponses.Items
+	Queued    openresponses.Items
 	// Pending lists the calls awaiting outputs, each with why: deferred,
 	// cut off by an abort or a failure, or found unanswered in a seeded
 	// transcript. Continue refuses until Resume has answered them, and
@@ -162,6 +168,8 @@ func (a *Agent) State() State {
 		Turn:       a.turn,
 		Steering:   len(a.steer),
 		FollowUps:  len(a.followUp),
+		Steered:    append(openresponses.Items(nil), a.steer...),
+		Queued:     append(openresponses.Items(nil), a.followUp...),
 		Pending:    append([]PendingCall(nil), a.pending...),
 	}
 }
@@ -188,7 +196,7 @@ func (a *Agent) Prompt(ctx context.Context, items ...openresponses.Item) (*RunEn
 	if len(items) == 0 {
 		return nil, ErrNoPrompt
 	}
-	return a.run(ctx, items, nil, false)
+	return a.run(ctx, items, nil, false, false)
 }
 
 // Continue runs from the transcript as it stands, which must satisfy
@@ -204,12 +212,13 @@ func (a *Agent) Continue(ctx context.Context) (*RunEnd, error) {
 	if !ok {
 		return nil, ErrCannotContinue
 	}
-	return a.run(ctx, nil, nil, false)
+	return a.run(ctx, nil, nil, false, false)
 }
 
 // Answer resolves one pending call for [Agent.Resume]: an output the
 // caller produced, or an approval that runs the call inside the loop.
-// Build one with [Output], [Approve] or [ApproveWith].
+// Build one with [Output], [Approve], [ApproveWith] or [Refuse], and
+// attach what the user said with [Answer.WithNote].
 type Answer struct {
 	// CallID names the pending call.
 	CallID string
@@ -219,6 +228,16 @@ type Answer struct {
 	// Args, for an approval, replaces the arguments the tool receives,
 	// as ToolDecision.Args does. nil keeps the call's own.
 	Args json.RawMessage
+	// Note is what the user said when answering: it is appended as a
+	// user message after the outputs of every answer of the Resume, so
+	// the model reads the result and the note together, in that order,
+	// in the same turn.
+	Note string
+	// Terminate ends the run with ReasonStopped and StopRefused once
+	// every answer is in, without calling the model, for a refusal that
+	// should end the turn so the user can say what to do instead. The
+	// outputs are still appended, so the transcript stays a valid input.
+	Terminate bool
 }
 
 // Output answers a pending call with out.
@@ -229,12 +248,26 @@ func Output(out *openresponses.FunctionCallOutput) Answer {
 	return Answer{CallID: out.CallID, Output: out}
 }
 
+// Refuse answers a pending call with out and ends the run instead of
+// calling the model: [Output] with Terminate set.
+func Refuse(out *openresponses.FunctionCallOutput) Answer {
+	a := Output(out)
+	a.Terminate = true
+	return a
+}
+
 // Approve runs the pending call with the arguments the model gave.
 func Approve(callID string) Answer { return Answer{CallID: callID} }
 
 // ApproveWith runs the pending call with args in place of the model's.
 func ApproveWith(callID string, args json.RawMessage) Answer {
 	return Answer{CallID: callID, Args: args}
+}
+
+// WithNote returns the answer with note attached.
+func (a Answer) WithNote(note string) Answer {
+	a.Note = note
+	return a
 }
 
 // Resume answers the calls the last run left pending and continues,
@@ -245,15 +278,18 @@ func ApproveWith(callID string, args json.RawMessage) Answer {
 // refusal as text, which the model then sees; a caller that approves a
 // deferred call lets the loop run it.
 //
-// The outputs are appended with their item events first. The approved
+// The outputs are appended with their item events first, then the
+// notes of the answers that carry one, as user messages. The approved
 // calls then run as one batch as the loop runs any batch, with
 // BeforeToolCall skipped because the decision has been made: tool_start,
 // tool_update and tool_end are emitted with Turn 0, Sequential and
-// MaxParallelTools apply, AfterToolCall runs, and the outputs are
-// appended in the calls' transcript order. A batch whose every result
-// sets Terminate ends the run with ReasonStopped without calling the
-// model. The model is then called and the run returns as [Agent.Prompt]
-// does. With nothing pending, Resume returns [ErrNotPending].
+// MaxParallelTools apply, AfterToolCall runs, the outputs are appended
+// in the calls' transcript order and their notes after them, and
+// anything steered in meanwhile follows. A batch whose results set
+// Terminate ends the run with ReasonStopped without calling the model,
+// and so does any answer built with [Refuse]. Otherwise the model is
+// called and the run returns as [Agent.Prompt] does. With nothing
+// pending, Resume returns [ErrNotPending].
 func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) {
 	a.mu.Lock()
 	pending := append([]PendingCall(nil), a.pending...)
@@ -265,24 +301,29 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 	for _, p := range pending {
 		byID[p.Call.CallID] = p.Call
 	}
-	var outputs openresponses.Items
+	var outputs, notes openresponses.Items
 	var approved []approval
+	terminate := false
 	for _, ans := range answers {
 		call, ok := byID[ans.CallID]
 		if !ok {
 			return nil, fmt.Errorf("%w: %q", ErrNotPending, ans.CallID)
 		}
 		delete(byID, ans.CallID)
+		terminate = terminate || ans.Terminate
 		if ans.Output != nil {
 			outputs = append(outputs, ans.Output)
+			if ans.Note != "" {
+				notes = append(notes, openresponses.UserText(ans.Note))
+			}
 			continue
 		}
-		approved = append(approved, approval{call: call, args: ans.Args})
+		approved = append(approved, approval{call: call, args: ans.Args, note: ans.Note})
 	}
 	if len(byID) > 0 {
 		return nil, fmt.Errorf("%w: %d pending call(s) unanswered", ErrNotPending, len(byID))
 	}
-	return a.run(ctx, outputs, approved, true)
+	return a.run(ctx, append(outputs, notes...), approved, true, terminate)
 }
 
 // answersPending checks the outputs that open a prompt against the
@@ -310,7 +351,7 @@ func answersPending(pending []PendingCall, prompts openresponses.Items) error {
 	return nil
 }
 
-func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved []approval, resuming bool) (*RunEnd, error) {
+func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved []approval, resuming, terminate bool) (*RunEnd, error) {
 	a.mu.Lock()
 	if err := a.cfg.validate(); err != nil {
 		a.mu.Unlock()
@@ -349,7 +390,7 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved [
 		steer:      a.drainSteer,
 		followUp:   a.drainFollowUp,
 	}
-	end := r.run(ctx, prompts, approved)
+	end := r.run(ctx, prompts, approved, terminate)
 	cancel()
 
 	a.mu.Lock()
@@ -415,6 +456,21 @@ func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe fu
 // Steer queues items to be injected after the current tool batch,
 // before the next model call. When the agent is idle they are consumed
 // by the next run at the same point.
+//
+// The queues live in memory: an item accepted here is in no record
+// until a run appends it, and it survives [Agent.Abort], [SetConfig]
+// and [SetTranscript] but not the process. A host that promises the
+// sender it has the item persists it itself, reading the queues back
+// from [Agent.State], and queues it again after a restart.
+//
+// A steered item is appended with its own item events, which reach
+// every subscriber. A subscriber that steers in reaction to an event
+// the steered item itself produces, an item_end during a run for
+// instance, feeds the run forever, and nothing reports it: the loop
+// cannot tell a reaction from a fresh input. Steer from a front, a
+// monitor or another goroutine, or from a subscriber only on events it
+// can tell apart from its own items, such as a tool_end or a specific
+// item type it never steers.
 func (a *Agent) Steer(items ...openresponses.Item) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -422,7 +478,8 @@ func (a *Agent) Steer(items ...openresponses.Item) {
 }
 
 // FollowUp queues items to be injected when the run would otherwise
-// end, so the agent keeps going instead of going idle.
+// end, so the agent keeps going instead of going idle. The queue has
+// the same life and the same caveat about subscribers as [Agent.Steer].
 func (a *Agent) FollowUp(items ...openresponses.Item) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -447,7 +504,8 @@ func (a *Agent) drainFollowUp() openresponses.Items {
 
 // Abort cancels the active run, if any. The model stream and running
 // tools see the cancellation through their context and the run ends
-// with ReasonAborted.
+// with ReasonAborted. The queues are untouched: anything steered or
+// queued and not yet appended goes to the next run.
 func (a *Agent) Abort() {
 	a.mu.Lock()
 	cancel := a.cancel
