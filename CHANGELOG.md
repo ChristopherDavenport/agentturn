@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.5 - 2026-09-19
 
 - **Fixed**: an abort delivered every event after it, the `tool_end` of
   the cut-off call included, through the cancelled context, so a
