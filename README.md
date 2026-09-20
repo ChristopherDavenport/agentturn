@@ -193,12 +193,18 @@ commit, the nested ones with their directory as the prefix
 (`front/a2a/v0.0.2`); each is fetched with `go get` like any module.
 
 `compact` is the reference `Transform`: when the transcript exceeds a
-token budget it calls the model's `Compact` and splices the returned
-compaction item in front of the recent tail, caching the result.
+token budget it folds the older part and splices the result in front
+of the recent tail, caching it by prefix so repeated turns cost
+nothing. `New` folds through the model's `Compact` endpoint;
+`NewLocal` asks an ordinary model call for a summary and splices it in
+as a message, for the servers that do not implement compaction.
 
 ```go
 c := compact.New(model, compact.WithBudget(60_000))
 cfg.Transform = c.Transform
+
+l := compact.NewLocal(model, compact.WithBudget(60_000), compact.WithModel("gpt-5-mini"))
+cfg.Transform = l.Transform
 ```
 
 `session` subscribes an `Agent` to an `agentsession` store: items on

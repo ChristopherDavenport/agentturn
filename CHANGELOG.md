@@ -92,6 +92,16 @@ versions may break the API.
 - README: the first-contact example handles the `RunEnd` and
   cancellation, a print front keyed on call ID, and the
   `input_required` round trip through `Defer` and `Resume`. (#6, #19)
+- `compact.NewLocal` folds the transcript through an ordinary model
+  call for servers without a compaction endpoint: the older items and
+  a summary prompt go to the model, the summary comes back as a user
+  message in front of the kept tail, a later fold starts from the
+  previous summary, and the prefix cache and `Last` work as for `New`.
+  `WithSummaryPrompt` and `WithSummaryItem` adjust it. **Breaking**:
+  `Transform.Last` returns an `openresponses.Item`, and `WithFilter`
+  takes a `Transcript` to `Transcript` function. The transform no
+  longer holds its lock across the model call, and an unhashable
+  prefix is no longer remembered as matching everything. (#21)
 - Depends on `agenttool` v0.0.2 and `agentsession` v0.0.2.
 
 ## v0.0.2 - 2026-09-19

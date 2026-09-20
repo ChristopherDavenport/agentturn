@@ -1,20 +1,27 @@
 // Package compact is the reference compaction Transform for agentturn:
 // when a transcript grows past a token budget, the older part is folded
-// into a compaction item by the model's own compaction endpoint and the
-// recent part is kept verbatim.
+// into a shorter form and the recent part is kept verbatim.
+//
+// Two folds are provided behind the same Transform. [New] uses the
+// model's own compaction endpoint and splices the returned compaction
+// item in; [NewLocal] asks an ordinary model call for a summary and
+// splices that in as a message, for the many servers that do not
+// implement compaction.
 //
 //	c := compact.New(model, compact.WithBudget(120_000))
 //	cfg.Transform = c.Transform
 //
+//	l := compact.NewLocal(model, compact.WithBudget(120_000), compact.WithModel("gpt-5-mini"))
+//	cfg.Transform = l.Transform
+//
 // A Transform runs before every model call and shapes that call only;
 // the loop's working transcript is never replaced. The transform
 // therefore remembers what it compacted: as long as the transcript still
-// begins with the prefix it folded, the next call reuses the compaction
-// and only folds again when the kept part outgrows the budget. A front
-// that wants to persist the compaction reads it from [Transform.Last].
-//
-// Local summarisation is a second implementation behind the same hook,
-// not this package.
+// begins with the prefix it folded, the next call reuses the result and
+// only folds again when the kept part outgrows the budget. When it
+// folds again, the previous result is folded with the new prefix, so
+// what an earlier fold kept is summarised again rather than lost. A
+// front that wants to persist the result reads it from [Transform.Last].
 package compact
 
 import (
@@ -22,7 +29,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/ChristopherDavenport/agentturn"
@@ -41,6 +50,10 @@ const DefaultBudget = 100_000
 // none is set.
 const DefaultKeepLast = 4
 
+// DefaultSummaryPrompt is the instruction [NewLocal] sends with the
+// items to fold when [WithSummaryPrompt] is not given.
+const DefaultSummaryPrompt = `Summarize the conversation above so that it can continue without the original messages. Keep every fact, decision, constraint, open question and identifier (file names, IDs, URLs, numbers) that later turns may need, and the outcome of every tool call. If the conversation opens with an earlier summary, fold its content into yours rather than repeating it. Write in the third person, in prose or short lists, with no preamble.`
+
 // Option configures a Transform.
 type Option func(*Transform)
 
@@ -54,52 +67,139 @@ func WithEstimator(fn func(openresponses.Items) int) Option {
 	return func(t *Transform) { t.estimate = fn }
 }
 
-// WithModel sets the model named on compaction requests.
+// WithModel sets the model named on compaction or summary requests.
 func WithModel(name string) Option { return func(t *Transform) { t.model = name } }
 
 // WithKeepLast sets how many recent items are always kept verbatim. The
 // cut never separates a function call from its output.
 func WithKeepLast(n int) Option { return func(t *Transform) { t.keepLast = n } }
 
-// WithFilter sets the filter applied to the items sent for compaction,
+// WithFilter sets the filter applied to the items sent to be folded,
 // so app-only items never reach the server. The default is
 // agentturn.DefaultFilter; pass the same function as Config.Filter.
-func WithFilter(fn func(agentturn.Transcript) openresponses.Items) Option {
+func WithFilter(fn func(agentturn.Transcript) agentturn.Transcript) Option {
 	return func(t *Transform) { t.filter = fn }
 }
 
+// WithSummaryPrompt replaces [DefaultSummaryPrompt] for [NewLocal]. It
+// is sent as the last user message of the summary request, after the
+// items to fold. [New] ignores it.
+func WithSummaryPrompt(prompt string) Option { return func(t *Transform) { t.prompt = prompt } }
+
+// WithSummaryItem sets how [NewLocal] turns the summary text into the
+// item that stands in for the folded prefix. The default is a user
+// message opening with "Summary of the conversation so far:", which
+// every server accepts on input. A server that accepts compaction
+// items on input could be given one here instead. [New] ignores it.
+func WithSummaryItem(fn func(summary string) openresponses.Item) Option {
+	return func(t *Transform) { t.summaryItem = fn }
+}
+
 // Transform compacts transcripts. Its Transform method is the value for
-// agentturn.Config.Transform. It is safe for concurrent use, but it
-// remembers one compacted prefix, so share one per conversation.
+// agentturn.Config.Transform. It is safe for concurrent use and does
+// not hold its lock across the model call, but it remembers one
+// compacted prefix, so share one per conversation.
 type Transform struct {
-	compactor Compactor
-	budget    int
-	keepLast  int
-	model     string
-	estimate  func(openresponses.Items) int
-	filter    func(agentturn.Transcript) openresponses.Items
+	fold        func(ctx context.Context, input openresponses.Items) (openresponses.Items, openresponses.Item, error)
+	budget      int
+	keepLast    int
+	model       string
+	estimate    func(openresponses.Items) int
+	filter      func(agentturn.Transcript) agentturn.Transcript
+	prompt      string
+	summaryItem func(string) openresponses.Item
 
 	mu sync.Mutex
-	// prefixLen items of the transcript are represented by output.
+	// prefixLen items of the transcript are represented by output. An
+	// empty prefixHash means no memory.
 	prefixLen  int
 	prefixHash string
 	output     openresponses.Items
-	last       *openresponses.Compaction
+	last       openresponses.Item
 }
 
-// New builds a Transform over c.
+// New builds a Transform that folds through c's compaction endpoint.
+// The result is the endpoint's output, a compaction item the same
+// server expands on the next call.
 func New(c Compactor, opts ...Option) *Transform {
+	t := newTransform(opts)
+	t.fold = func(ctx context.Context, input openresponses.Items) (openresponses.Items, openresponses.Item, error) {
+		resp, err := c.Compact(ctx, openresponses.CompactRequest{Model: t.model, Input: input})
+		if err != nil {
+			return nil, nil, fmt.Errorf("compact: %w", err)
+		}
+		if resp == nil || len(resp.Output) == 0 {
+			return nil, nil, errors.New("compact: empty compaction response")
+		}
+		out := append(openresponses.Items(nil), resp.Output...)
+		var last openresponses.Item
+		for _, item := range out {
+			if c, ok := item.(*openresponses.Compaction); ok {
+				last = c
+				break
+			}
+		}
+		return out, last, nil
+	}
+	return t
+}
+
+// NewLocal builds a Transform that folds by asking model for a summary
+// with an ordinary call: the items to fold, then the summary prompt as
+// a user message, with no tools. The result is one message carrying
+// the summary (see [WithSummaryItem]). It works against any server,
+// including those that answer 404 to the compaction endpoint. The
+// model is named by [WithModel]; leave it empty to let the server
+// pick its default.
+func NewLocal(model openresponses.Streamer, opts ...Option) *Transform {
+	t := newTransform(opts)
+	t.fold = func(ctx context.Context, input openresponses.Items) (openresponses.Items, openresponses.Item, error) {
+		store := false
+		req := openresponses.Request{
+			Model: t.model,
+			Input: append(append(openresponses.Items(nil), input...), openresponses.UserText(t.prompt)),
+			Store: &store,
+		}
+		resp, err := openresponses.CollectStream(ctx, model, req)
+		if err != nil {
+			return nil, nil, fmt.Errorf("compact: summary: %w", err)
+		}
+		if resp.Status == openresponses.ResponseStatusFailed {
+			if resp.Error != nil {
+				return nil, nil, fmt.Errorf("compact: summary: %w", resp.Error.Err(0))
+			}
+			return nil, nil, errors.New("compact: summary response failed")
+		}
+		summary := strings.TrimSpace(resp.OutputText())
+		if summary == "" {
+			return nil, nil, errors.New("compact: summary response has no text")
+		}
+		item := t.summaryItem(summary)
+		return openresponses.Items{item}, item, nil
+	}
+	return t
+}
+
+func newTransform(opts []Option) *Transform {
 	t := &Transform{
-		compactor: c,
-		budget:    DefaultBudget,
-		keepLast:  DefaultKeepLast,
-		estimate:  Estimate,
-		filter:    agentturn.DefaultFilter,
+		budget:      DefaultBudget,
+		keepLast:    DefaultKeepLast,
+		estimate:    Estimate,
+		filter:      agentturn.DefaultFilter,
+		prompt:      DefaultSummaryPrompt,
+		summaryItem: SummaryMessage,
 	}
 	for _, opt := range opts {
 		opt(t)
 	}
 	return t
+}
+
+// SummaryMessage is the default [WithSummaryItem]: a user message that
+// opens with "Summary of the conversation so far:" and carries the
+// summary.
+func SummaryMessage(summary string) openresponses.Item {
+	return openresponses.UserText("Summary of the conversation so far:\n\n" + summary)
 }
 
 // Estimate is the default token estimator: the JSON size of the items
@@ -112,59 +212,70 @@ func Estimate(items openresponses.Items) int {
 	return len(data) / 4
 }
 
-// Last returns the most recent compaction item produced, or nil.
-func (t *Transform) Last() *openresponses.Compaction {
+// Last returns the item that most recently replaced a folded prefix,
+// or nil: the compaction item from [New], the summary message from
+// [NewLocal]. A recorder writes it as the session's compaction entry.
+func (t *Transform) Last() openresponses.Item {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.last
 }
 
 // Transform returns the transcript to send for this call: unchanged
-// when it fits the budget, otherwise the compaction of its older part
+// when it fits the budget, otherwise the fold of its older part
 // followed by the recent items.
 func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (agentturn.Transcript, error) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	view, base := t.view(items)
 	if t.estimate(view) <= t.budget {
+		t.mu.Unlock()
 		return view, nil
 	}
 	split := t.split(items)
 	if split <= base {
+		t.mu.Unlock()
 		return view, nil
 	}
-	input := append(openresponses.Items(nil), t.output...)
-	if base == 0 {
-		input = nil
+	var input openresponses.Items
+	if base > 0 {
+		input = append(input, t.output...)
 	}
 	input = append(input, t.filter(items[base:split])...)
 	if len(input) == 0 {
+		t.mu.Unlock()
 		return view, nil
 	}
-	resp, err := t.compactor.Compact(ctx, openresponses.CompactRequest{Model: t.model, Input: input})
+	prevLen, prevHash := t.prefixLen, t.prefixHash
+	t.mu.Unlock()
+
+	// The model call runs unlocked so concurrent callers do not
+	// serialise on the network.
+	output, last, err := t.fold(ctx, input)
 	if err != nil {
-		return nil, fmt.Errorf("compact: %w", err)
+		return nil, err
 	}
-	if resp == nil || len(resp.Output) == 0 {
-		return nil, fmt.Errorf("compact: empty compaction response")
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.prefixLen != prevLen || t.prefixHash != prevHash {
+		// Another caller folded meanwhile; its memory stands and this
+		// call is answered from it.
+		view, _ := t.view(items)
+		return view, nil
 	}
 	t.prefixLen = split
 	t.prefixHash = hash(items[:split])
-	t.output = append(openresponses.Items(nil), resp.Output...)
-	for _, item := range resp.Output {
-		if c, ok := item.(*openresponses.Compaction); ok {
-			t.last = c
-			break
-		}
+	t.output = output
+	if last != nil {
+		t.last = last
 	}
 	return t.join(items, split), nil
 }
 
-// view returns the transcript with the remembered compaction applied,
-// and how many items it covers; zero when the memory no longer matches.
+// view returns the transcript with the remembered fold applied, and how
+// many items it covers; zero when the memory no longer matches.
 func (t *Transform) view(items agentturn.Transcript) (agentturn.Transcript, int) {
-	if t.prefixLen > 0 && len(items) >= t.prefixLen && hash(items[:t.prefixLen]) == t.prefixHash {
+	if t.prefixHash != "" && t.prefixLen > 0 && len(items) >= t.prefixLen && hash(items[:t.prefixLen]) == t.prefixHash {
 		return t.join(items, t.prefixLen), t.prefixLen
 	}
 	t.prefixLen, t.prefixHash, t.output = 0, "", nil
@@ -195,6 +306,8 @@ func (t *Transform) split(items agentturn.Transcript) int {
 	return split
 }
 
+// hash identifies a prefix; an empty result means no memory, never a
+// match.
 func hash(items agentturn.Transcript) string {
 	data, err := json.Marshal(items)
 	if err != nil {

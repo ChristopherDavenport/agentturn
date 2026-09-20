@@ -205,3 +205,141 @@ func (p *probeCompactor) Compact(ctx context.Context, req openresponses.CompactR
 	p.fn(req)
 	return (&echo.Adapter{}).Compact(ctx, req)
 }
+
+// summarizer answers every request with a fixed summary and records
+// what it was asked.
+type summarizer struct {
+	reqs  []openresponses.Request
+	reply string
+	fail  bool
+}
+
+func (s *summarizer) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	s.reqs = append(s.reqs, req)
+	if s.fail {
+		return openresponses.ServerError("down", "no summary today")
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text(s.reply); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+func TestLocalSummaryThroughRun(t *testing.T) {
+	s := &summarizer{reply: "They talked about things."}
+	tr := NewLocal(s, WithBudget(5), WithKeepLast(1), WithEstimator(count), WithModel("small"))
+	cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform,
+		Tools: []agenttool.Tool{agenttool.New("upper", "", func(_ context.Context, a echoArgs) (string, error) { return strings.ToUpper(a.Text), nil })}}
+	reqs, end, err := firstRequests(t, agentturn.Run(context.Background(), items(6), openresponses.Items{openresponses.UserText("latest")}, cfg))
+	if err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("err = %v end = %+v", err, end)
+	}
+	// One summary for two turns: the second turn reuses it.
+	if len(s.reqs) != 1 {
+		t.Fatalf("summary calls = %d", len(s.reqs))
+	}
+	sreq := s.reqs[0]
+	if sreq.Model != "small" || len(sreq.Tools) != 0 || sreq.Store == nil || *sreq.Store {
+		t.Errorf("summary request = %+v", sreq)
+	}
+	// The folded items come first, the prompt last.
+	if n := len(sreq.Input); n != 7 || sreq.Input[n-1].(*openresponses.Message).Text() != DefaultSummaryPrompt {
+		t.Errorf("summary input = %d items, last = %v", n, sreq.Input[len(sreq.Input)-1])
+	}
+	// The model saw the summary message in place of the folded prefix.
+	if len(reqs) != 2 {
+		t.Fatalf("turns = %d", len(reqs))
+	}
+	first := reqs[0].Input[0].(*openresponses.Message)
+	if first.Role != openresponses.RoleUser || !strings.HasPrefix(first.Text(), "Summary of the conversation so far:") || !strings.HasSuffix(first.Text(), "They talked about things.") {
+		t.Errorf("first item = %+v", first)
+	}
+	if len(reqs[0].Input) != 2 || len(reqs[1].Input) != 4 {
+		t.Errorf("inputs = %d, %d", len(reqs[0].Input), len(reqs[1].Input))
+	}
+	if last, ok := tr.Last().(*openresponses.Message); !ok || last != first {
+		t.Errorf("Last = %v", tr.Last())
+	}
+	// The model still answers.
+	if final := end.Items[len(end.Items)-1].(*openresponses.Message).Text(); final != "Tool result: LATEST" {
+		t.Errorf("final = %q", final)
+	}
+}
+
+func TestLocalSummaryFoldsThePreviousSummary(t *testing.T) {
+	s := &summarizer{reply: "first summary"}
+	custom := func(summary string) openresponses.Item { return openresponses.DeveloperText("[" + summary + "]") }
+	tr := NewLocal(s, WithBudget(3), WithKeepLast(1), WithEstimator(count), WithSummaryPrompt("condense"), WithSummaryItem(custom))
+	history := items(4)
+	out, err := tr.Transform(context.Background(), history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 2 || out[0].(*openresponses.Message).Role != openresponses.RoleDeveloper || out[0].(*openresponses.Message).Text() != "[first summary]" {
+		t.Errorf("out = %v", out)
+	}
+	if s.reqs[0].Input[len(s.reqs[0].Input)-1].(*openresponses.Message).Text() != "condense" {
+		t.Error("custom prompt not sent")
+	}
+	// The tail outgrows the budget: the next fold starts from the
+	// previous summary, not from the raw history again.
+	s.reply = "second summary"
+	longer := append(append(agentturn.Transcript(nil), history...), items(4)...)
+	out, err = tr.Transform(context.Background(), longer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.reqs) != 2 {
+		t.Fatalf("summary calls = %d", len(s.reqs))
+	}
+	if in := s.reqs[1].Input; in[0].(*openresponses.Message).Text() != "[first summary]" || len(in) != 6 {
+		t.Errorf("second fold input = %d items, first = %v", len(in), in[0])
+	}
+	if out[0].(*openresponses.Message).Text() != "[second summary]" || len(out) != 2 {
+		t.Errorf("out after second fold = %v", out)
+	}
+	// A failing summary call is the transform's error.
+	s.fail = true
+	if _, err := NewLocal(s, WithBudget(1), WithKeepLast(1), WithEstimator(count)).Transform(context.Background(), history); err == nil || !strings.Contains(err.Error(), "no summary today") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestTransformDoesNotHoldLockAcrossFold(t *testing.T) {
+	// Two concurrent transforms over the same conversation: the fold
+	// runs unlocked, and only one memory is installed.
+	release := make(chan struct{})
+	started := make(chan struct{}, 2)
+	slow := &probeCompactor{fn: func(openresponses.CompactRequest) {
+		started <- struct{}{}
+		<-release
+	}}
+	tr := New(slow, WithBudget(3), WithKeepLast(1), WithEstimator(count))
+	history := items(4)
+	results := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			_, err := tr.Transform(context.Background(), history)
+			results <- err
+		}()
+	}
+	// Both callers reach the compactor before either finishes, which a
+	// lock held across the call would prevent.
+	<-started
+	<-started
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := tr.Transform(context.Background(), append(append(agentturn.Transcript(nil), history...), openresponses.UserText("more")))
+	if err != nil || out[0].ItemType() != openresponses.ItemTypeCompaction || len(out) != 3 {
+		t.Errorf("out = %v err = %v", out, err)
+	}
+}
