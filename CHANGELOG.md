@@ -123,7 +123,12 @@ versions may break the API.
   part errors say what failed to encode, and the `tools/a2a` argument
   schema is reflected once at init. `NewMemoryStore` and `Len` are
   kept. (#18)
-- Depends on `agenttool` v0.0.2 and `agentsession` v0.0.2.
+- Depends on `agenttool` v0.0.3 and `agentsession` v0.0.3. A tool
+  that panics now ends its call with an `agenttool.PanicError`: the
+  model sees one line as the error output and `ToolEnd.Err` carries
+  the stack. The A2A front builds its caller-tool stubs with
+  `agenttool.NewFunc`, and the session recorder writes config extras
+  through `ConfigEntry.SetExtra` and `ClearExtra`.
 
 ## v0.0.2 - 2026-09-19
 

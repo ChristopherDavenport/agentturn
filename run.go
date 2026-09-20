@@ -280,8 +280,10 @@ func (e *errStop) Error() string {
 // stop carries reason and err out of a phase.
 func stop(reason Reason, err error) error { return &errStop{reason: reason, err: err} }
 
-// run drives the loop and returns the RunEnd. A panic in a hook, a
-// tool or a subscriber is not recovered; it unwinds without a RunEnd.
+// run drives the loop and returns the RunEnd. A panic in a tool is
+// recovered by agenttool's executor into a PanicError the model sees as
+// an error output; a panic in a hook or a subscriber is not recovered
+// and unwinds without a RunEnd.
 func (r *runner) run(ctx context.Context, prompts openresponses.Items) *RunEnd {
 	r.runID = openresponses.NewID("run")
 	end := &RunEnd{RunID: r.runID, Reason: ReasonDone}

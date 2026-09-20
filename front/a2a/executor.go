@@ -244,12 +244,17 @@ func (e *Executor) runConfig(caller []*openresponses.FunctionTool) agentturn.Con
 	stubs := make([]agenttool.Tool, 0, len(caller))
 	for _, ft := range caller {
 		owned[ft.Name] = true
-		stubs = append(stubs, &agenttool.Func{
-			ToolName:        ft.Name,
-			ToolDescription: ft.Description,
-			Schema:          ft.Parameters,
-			StrictSchema:    ft.Strict != nil && *ft.Strict,
-		})
+		var opts []agenttool.Option
+		if ft.Strict != nil && *ft.Strict {
+			opts = append(opts, agenttool.WithStrict())
+		}
+		// The stub advertises the caller's tool; the hook below defers
+		// every call to it, so its function runs only if that hook was
+		// bypassed, which is a bug worth an error output.
+		name := ft.Name
+		stubs = append(stubs, agenttool.NewFunc(ft.Name, ft.Description, ft.Parameters, func(context.Context, agenttool.Call) (agenttool.Result, error) {
+			return agenttool.Result{}, fmt.Errorf("tool %q is owned by the caller and cannot run here", name)
+		}, opts...))
 	}
 	local, provider := e.cfg.Tools, e.cfg.ToolProvider
 	cfg.Tools = nil

@@ -451,18 +451,16 @@ func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntr
 	}
 	for k, v := range next.Extra {
 		if p, ok := prev.Extra[k]; !ok || string(p) != string(v) {
-			if d.Extra == nil {
-				d.Extra = map[string]json.RawMessage{}
+			if err := d.SetExtra(k, v); err != nil {
+				// v is raw JSON that already decoded once; it cannot fail
+				// to re-encode, so a full replace is the safe fallback.
+				return full
 			}
-			d.Extra[k] = v
 		}
 	}
 	for k := range prev.Extra {
 		if _, ok := next.Extra[k]; !ok {
-			if d.Extra == nil {
-				d.Extra = map[string]json.RawMessage{}
-			}
-			d.Extra[k] = json.RawMessage("null")
+			d.ClearExtra(k)
 		}
 	}
 	return d

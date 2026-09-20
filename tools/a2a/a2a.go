@@ -112,7 +112,7 @@ func New(client *a2aclient.Client, card *a2a.AgentCard, opts ...Option) agenttoo
 var argsSchema = mustSchema()
 
 func mustSchema() json.RawMessage {
-	schema, err := agenttool.SchemaFor[Args](false)
+	schema, err := agenttool.SchemaFor[Args]()
 	if err != nil {
 		panic("a2a: reflect Args: " + err.Error())
 	}

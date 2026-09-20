@@ -112,7 +112,11 @@ func WithStrictArgs[T any](render func(T) openresponses.Items) Option {
 }
 
 func withArgs[T any](strict bool, render func(T) openresponses.Items) Option {
-	schema, err := agenttool.SchemaFor[T](strict)
+	var schemaOpts []agenttool.Option
+	if strict {
+		schemaOpts = append(schemaOpts, agenttool.WithStrict())
+	}
+	schema, err := agenttool.SchemaFor[T](schemaOpts...)
 	if err != nil {
 		panic(fmt.Sprintf("agent.WithArgs: %v", err))
 	}

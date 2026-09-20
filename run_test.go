@@ -752,3 +752,29 @@ func TestRunDeferredCall(t *testing.T) {
 		}
 	}
 }
+
+func TestRunToolPanicBecomesErrorOutput(t *testing.T) {
+	boom := agenttool.New("upper", "", func(context.Context, echoArgs) (string, error) { panic("kaboom") })
+	cfg := Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{boom}, MaxTurns: 1}
+	events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
+	if err != nil || end.Reason != ReasonStopped {
+		t.Fatalf("err = %v end = %+v", err, end)
+	}
+	var te *ToolEnd
+	for _, ev := range events {
+		if e, ok := ev.(*ToolEnd); ok {
+			te = e
+		}
+	}
+	var pe *agenttool.PanicError
+	if te == nil || !errors.As(te.Err, &pe) || pe.Value != "kaboom" || len(pe.Stack) == 0 {
+		t.Fatalf("tool_end = %+v", te)
+	}
+	// The model sees one line, never the stack.
+	if got := te.Result.Output.Text; !strings.Contains(got, "kaboom") || strings.Contains(got, "goroutine") {
+		t.Errorf("output = %q", got)
+	}
+	if got := itemTypes(end.Items); got != "user function_call function_call_output" {
+		t.Errorf("items = %q", got)
+	}
+}
