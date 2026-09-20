@@ -100,8 +100,7 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	cfg := e.runConfig(append(append([]*openresponses.FunctionTool(nil), e.callerTools...), declared...))
 	out := e.relay(ctx, runCtx, cancel, reqCtx, q, transcript, prompts, cfg)
 	if out.end == nil {
-		// Run refused to start; nothing was appended.
-		return e.finish(ctx, reqCtx, q, a2a.TaskStateFailed, errorMessage(reqCtx, out.runErr))
+		return errors.New("run produced no run_end")
 	}
 	if err := e.persist(ctx, reqCtx.ContextID, transcript, out.end); err != nil {
 		return err
@@ -139,9 +138,6 @@ type outcome struct {
 	// writeErr is the first failure to write an event to the queue; it
 	// aborted the run.
 	writeErr error
-	// runErr is the error Run yielded, which is the RunEnd's error or a
-	// refusal to start.
-	runErr error
 }
 
 // relay drives the loop and streams assistant text into artifacts. A
@@ -156,10 +152,7 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 		}
 		cancel()
 	}
-	for ev, err := range agentturn.Run(runCtx, transcript, prompts, cfg) {
-		if err != nil {
-			out.runErr = err
-		}
+	for ev := range agentturn.Run(runCtx, transcript, prompts, cfg) {
 		switch ev := ev.(type) {
 		case *agentturn.ItemStart:
 			if m, ok := ev.Item.(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant {
@@ -231,11 +224,7 @@ func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, 
 		_ = e.finish(context.WithoutCancel(ctx), reqCtx, q, a2a.TaskStateCanceled, nil)
 		return nil
 	default:
-		err := out.end.Err
-		if err == nil {
-			err = out.runErr
-		}
-		return e.finish(ctx, reqCtx, q, a2a.TaskStateFailed, errorMessage(reqCtx, err))
+		return e.finish(ctx, reqCtx, q, a2a.TaskStateFailed, errorMessage(reqCtx, out.end.Err))
 	}
 }
 
@@ -280,13 +269,13 @@ func (e *Executor) runConfig(caller []*openresponses.FunctionTool) agentturn.Con
 				return nil, err
 			}
 		}
-		if !owned[info.Call.Name] || (decision != nil && decision.Block) {
+		if !owned[info.Call.Name] || (decision != nil && decision.Action == agentturn.Block) {
 			return decision, nil
 		}
 		if decision == nil {
 			decision = &agentturn.ToolDecision{}
 		}
-		decision.Defer = true
+		decision.Action = agentturn.Defer
 		return decision, nil
 	}
 	return cfg
@@ -409,9 +398,11 @@ func (e *Executor) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, q 
 	return e.finish(ctx, reqCtx, q, a2a.TaskStateCanceled, nil)
 }
 
-// Text returns the text of a task's final message or, failing that, of
-// its artifacts. It is what a caller reads from a completed task.
-func Text(task *a2a.Task) string {
+// taskText returns the text of a task's final message or, failing that,
+// of its artifacts: what a caller reads from a completed task. The
+// consume side, tools/a2a, has its own reader; this one serves the
+// tests.
+func taskText(task *a2a.Task) string {
 	if task == nil {
 		return ""
 	}

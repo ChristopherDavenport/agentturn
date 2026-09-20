@@ -8,6 +8,16 @@
 > `tools/mcp` as `mcpclient` and `front/mcp` as `mcpserver`. The
 > composition rule is unchanged: the loop knows a `Model` and a list of
 > `agenttool.Tool`.
+>
+> Update, 2026-09-20: the API shapes below were revised after the
+> usability review. `Run` and `Continue` yield `iter.Seq[Event]` with
+> the `RunEnd` as the single terminal; `Prompt`, `Continue` and
+> `Resume` return the `RunEnd` beside the error; `ToolDecision` has an
+> `Action` (`Allow`, `Block`, `Defer`) instead of booleans; the
+> execution modes are `ExecParallel` and `ExecSequential`; `tools/agent`
+> constructs with `New` and reads the parent transcript that the loop
+> attaches to every tool call's context; `Agent.SetConfig` and
+> `SetTranscript` change a live agent between runs.
 
 A generic, designable agent runtime that sits between `openresponses` (the
 model wire) and the fronts that expose an agent (Open Responses endpoint,

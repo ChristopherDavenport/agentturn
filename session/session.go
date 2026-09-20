@@ -76,7 +76,7 @@ import (
 type Recorder struct {
 	store    agentsession.Store
 	id       string
-	filter   func(agentturn.Transcript) openresponses.Items
+	filter   func(agentturn.Transcript) agentturn.Transcript
 	harness  *agentsession.Harness
 	children bool
 	now      func() time.Time
@@ -102,7 +102,7 @@ type Option func(*Recorder)
 // Items it drops are written as custom entries rather than item
 // entries. It should match the agent's Config.Filter; the default is
 // agentturn.DefaultFilter.
-func WithFilter(f func(agentturn.Transcript) openresponses.Items) Option {
+func WithFilter(f func(agentturn.Transcript) agentturn.Transcript) Option {
 	return func(r *Recorder) { r.filter = f }
 }
 
@@ -213,9 +213,8 @@ func (r *Recorder) Attach(a *agentturn.Agent) (unsubscribe func()) {
 // Handle records one event. It is the subscriber function; use it
 // directly with the low-level loop:
 //
-//	for ev, err := range agentturn.Run(ctx, t, prompts, cfg) {
-//		if err == nil { err = rec.Handle(ctx, ev) }
-//		...
+//	for ev := range agentturn.Run(ctx, t, prompts, cfg) {
+//		if err := rec.Handle(ctx, ev); err != nil { ... }
 //	}
 func (r *Recorder) Handle(ctx context.Context, ev agentturn.Event) error {
 	r.mu.Lock()

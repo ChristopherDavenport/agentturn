@@ -74,7 +74,7 @@ func TestRecordsEveryEventAndVerifies(t *testing.T) {
 			SafetyIdentifier: "user-1",
 		}})
 	defer rec.Attach(a)()
-	if err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
 		t.Fatal(err)
 	}
 	want := "config item:user item:function_call* response item:function_call_output item:assistant* response"
@@ -113,7 +113,7 @@ func TestRecordsEveryEventAndVerifies(t *testing.T) {
 		t.Errorf("context has %d items, agent %d", len(cx.Items), len(a.State().Transcript))
 	}
 	// A second run continues the same session and still verifies.
-	if err := a.Prompt(context.Background(), openresponses.UserText("again")); err != nil {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("again")); err != nil {
 		t.Fatal(err)
 	}
 	if n := verifyAll(t, s); n != 4 {
@@ -130,7 +130,7 @@ func TestAppOnlyItemsBecomeCustomEntries(t *testing.T) {
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}})
 	defer rec.Attach(a)()
 	note := &openresponses.UnknownItem{Type: "agentturn:note", Raw: json.RawMessage(`{"type":"agentturn:note","text":"ui marker"}`)}
-	if err := a.Prompt(context.Background(), note, openresponses.UserText("hi")); err != nil {
+	if _, err := a.Prompt(context.Background(), note, openresponses.UserText("hi")); err != nil {
 		t.Fatal(err)
 	}
 	if got := entryTypes(s); got != "config custom item:user item:assistant* response" {
@@ -147,7 +147,7 @@ func TestAppOnlyItemsBecomeCustomEntries(t *testing.T) {
 	rec2, s2, _ := Start(context.Background(), store2, agentsession.Header{}, WithFilter(agentturn.VisibleFilter("agentturn:note")))
 	a2 := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Filter: agentturn.VisibleFilter("agentturn:note")})
 	defer rec2.Attach(a2)()
-	if err := a2.Prompt(context.Background(), note, openresponses.UserText("hi")); err != nil {
+	if _, err := a2.Prompt(context.Background(), note, openresponses.UserText("hi")); err != nil {
 		t.Fatal(err)
 	}
 	if got := entryTypes(s2); got != "config item:agentturn:note item:user item:assistant* response" {
@@ -192,7 +192,7 @@ func TestSlowAppendDelaysToolPreflight(t *testing.T) {
 		}
 		return nil
 	})
-	if err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
 		t.Fatal(err)
 	}
 	store.mu.Lock()
@@ -209,10 +209,10 @@ func TestChildRunProducesLink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	child := agent.Tool(agentturn.Config{Name: "specialist", Description: "a child", Model: &echo.Adapter{}})
+	child := agent.New(agentturn.Config{Name: "specialist", Description: "a child", Model: &echo.Adapter{}})
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{child}})
 	defer rec.Attach(a)()
-	if err := a.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
 		t.Fatal(err)
 	}
 	var link *agentsession.LinkEntry
@@ -246,7 +246,7 @@ func TestChildRunProducesLink(t *testing.T) {
 	rec2, s2, _ := Start(context.Background(), store2, agentsession.Header{}, WithoutChildSessions())
 	a2 := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{child}})
 	defer rec2.Attach(a2)()
-	if err := a2.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
+	if _, err := a2.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(entryTypes(s2), "link") {
@@ -263,7 +263,7 @@ func TestSettingsChangesWriteConfig(t *testing.T) {
 	cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "one", Instructions: "first"}
 	a := agentturn.New(cfg)
 	unsub := rec.Attach(a)
-	if err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
 		t.Fatal(err)
 	}
 	unsub()
@@ -275,7 +275,7 @@ func TestSettingsChangesWriteConfig(t *testing.T) {
 	cfg.Text = openresponses.TextConfig{Verbosity: openresponses.VerbosityLow}
 	b := agentturn.New(cfg, agentturn.WithTranscript(a.State().Transcript))
 	defer rec.Attach(b)()
-	if err := b.Prompt(context.Background(), openresponses.UserText("y")); err != nil {
+	if _, err := b.Prompt(context.Background(), openresponses.UserText("y")); err != nil {
 		t.Fatal(err)
 	}
 	if n := verifyAll(t, s); n != 3 {
@@ -345,7 +345,7 @@ func TestStoreErrorEndsRun(t *testing.T) {
 	}
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}})
 	defer rec.Attach(a)()
-	if err := a.Prompt(context.Background(), openresponses.UserText("x")); !errors.Is(err, boom) {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("x")); !errors.Is(err, boom) {
 		t.Errorf("err = %v", err)
 	}
 }
@@ -369,10 +369,7 @@ func TestLowLevelLoopWithHandle(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	for ev, err := range agentturn.Run(ctx, nil, openresponses.Items{openresponses.UserText("x")}, agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{upper}}) {
-		if err != nil {
-			t.Fatal(err)
-		}
+	for ev := range agentturn.Run(ctx, nil, openresponses.Items{openresponses.UserText("x")}, agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{upper}}) {
 		if err := rec.Handle(ctx, ev); err != nil {
 			t.Fatal(err)
 		}
@@ -393,17 +390,17 @@ func TestDeferredCallsRecordAndResume(t *testing.T) {
 	}
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{upper},
 		BeforeToolCall: func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
-			return &agentturn.ToolDecision{Defer: true}, nil
+			return &agentturn.ToolDecision{Action: agentturn.Defer}, nil
 		}})
 	defer rec.Attach(a)()
-	if err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
 		t.Fatal(err)
 	}
 	if got := entryTypes(s); got != "config item:user item:function_call* response" {
 		t.Fatalf("entries after defer = %q", got)
 	}
 	call := a.State().Pending[0]
-	if err := a.Resume(context.Background(), openresponses.NewFunctionCallOutput(call.CallID, "ABC")); err != nil {
+	if _, err := a.Resume(context.Background(), openresponses.NewFunctionCallOutput(call.CallID, "ABC")); err != nil {
 		t.Fatal(err)
 	}
 	if got := entryTypes(s); got != "config item:user item:function_call* response item:function_call_output item:assistant* response" {
@@ -428,7 +425,7 @@ func TestFailedCallIsRecordedAndRecorderReusable(t *testing.T) {
 	}
 	a := agentturn.New(agentturn.Config{Model: failingModel{}, ModelName: "m"})
 	unsub := rec.Attach(a)
-	if err := a.Prompt(context.Background(), openresponses.UserText("x")); err == nil {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("x")); err == nil {
 		t.Fatal("prompt should fail")
 	}
 	unsub()
@@ -449,7 +446,7 @@ func TestFailedCallIsRecordedAndRecorderReusable(t *testing.T) {
 	// to its own request, not to the failed one.
 	b := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"}, agentturn.WithTranscript(a.State().Transcript))
 	defer rec.Attach(b)()
-	if err := b.Prompt(context.Background(), openresponses.UserText("y")); err != nil {
+	if _, err := b.Prompt(context.Background(), openresponses.UserText("y")); err != nil {
 		t.Fatal(err)
 	}
 	if got := entryTypes(s); got != "config item:user response item:user item:assistant* response" {
@@ -479,7 +476,7 @@ func TestResumeContinuesWithoutDuplicateConfig(t *testing.T) {
 	cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Instructions: "be brief"}
 	a := agentturn.New(cfg)
 	unsub := rec.Attach(a)
-	if err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
 		t.Fatal(err)
 	}
 	unsub()
@@ -496,7 +493,7 @@ func TestResumeContinuesWithoutDuplicateConfig(t *testing.T) {
 	}
 	b := agentturn.New(cfg, agentturn.WithTranscript(a.State().Transcript))
 	unsub = rec2.Attach(b)
-	if err := b.Prompt(context.Background(), openresponses.UserText("y")); err != nil {
+	if _, err := b.Prompt(context.Background(), openresponses.UserText("y")); err != nil {
 		t.Fatal(err)
 	}
 	unsub()
@@ -516,7 +513,7 @@ func TestResumeContinuesWithoutDuplicateConfig(t *testing.T) {
 	cfg.Instructions = "be thorough"
 	c := agentturn.New(cfg, agentturn.WithTranscript(b.State().Transcript))
 	defer rec3.Attach(c)()
-	if err := c.Prompt(context.Background(), openresponses.UserText("z")); err != nil {
+	if _, err := c.Prompt(context.Background(), openresponses.UserText("z")); err != nil {
 		t.Fatal(err)
 	}
 	entries := s3.Entries()

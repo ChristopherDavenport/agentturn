@@ -3,6 +3,7 @@ package agentturn
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -36,7 +37,7 @@ func TestAgentPromptAndState(t *testing.T) {
 	a := New(Config{Model: &echo.Adapter{}, ModelName: "m"})
 	rec := &recorder{}
 	rec.subscribe(a)
-	if err := a.Prompt(context.Background(), openresponses.UserText("hi")); err != nil {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("hi")); err != nil {
 		t.Fatal(err)
 	}
 	st := a.State()
@@ -48,26 +49,26 @@ func TestAgentPromptAndState(t *testing.T) {
 		t.Errorf("events = %v", got)
 	}
 	// A second prompt continues the same transcript.
-	if err := a.Prompt(context.Background(), openresponses.UserText("again")); err != nil {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("again")); err != nil {
 		t.Fatal(err)
 	}
 	if got := itemTypes(a.State().Transcript); got != "user assistant user assistant" {
 		t.Errorf("transcript = %q", got)
 	}
-	if err := a.Prompt(context.Background()); !errors.Is(err, ErrNoPrompt) {
+	if _, err := a.Prompt(context.Background()); !errors.Is(err, ErrNoPrompt) {
 		t.Errorf("empty prompt err = %v", err)
 	}
-	if err := a.Continue(context.Background()); !errors.Is(err, ErrCannotContinue) {
+	if _, err := a.Continue(context.Background()); !errors.Is(err, ErrCannotContinue) {
 		t.Errorf("continue after assistant err = %v", err)
 	}
-	if err := New(Config{}).Prompt(context.Background(), openresponses.UserText("x")); !errors.Is(err, ErrNoModel) {
+	if _, err := New(Config{}).Prompt(context.Background(), openresponses.UserText("x")); !errors.Is(err, ErrNoModel) {
 		t.Errorf("no model err = %v", err)
 	}
 }
 
 func TestAgentContinueAndWithTranscript(t *testing.T) {
 	a := New(Config{Model: &echo.Adapter{}}, WithTranscript(Transcript{openresponses.UserText("resume me")}))
-	if err := a.Continue(context.Background()); err != nil {
+	if _, err := a.Continue(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	tr := a.State().Transcript
@@ -108,7 +109,7 @@ func TestAgentBarrier(t *testing.T) {
 		}
 		return nil
 	})
-	if err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
 		t.Fatal(err)
 	}
 	if toolStarted.Before(itemEndReturned) {
@@ -133,9 +134,9 @@ func TestAgentSubscriberErrorEndsRun(t *testing.T) {
 		}
 		return nil
 	})
-	err := a.Prompt(context.Background(), openresponses.UserText("x"))
-	if !errors.Is(err, boom) {
-		t.Fatalf("err = %v", err)
+	end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+	if !errors.Is(err, boom) || end == nil || end.Reason != ReasonError || !errors.Is(end.Err, boom) {
+		t.Fatalf("err = %v end = %+v", err, end)
 	}
 	got := rec.types()
 	if got[len(got)-1] != "run_end" {
@@ -157,7 +158,7 @@ func TestAgentSteer(t *testing.T) {
 		}
 		return nil
 	})
-	if err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
 		t.Fatal(err)
 	}
 	tr := a.State().Transcript
@@ -177,7 +178,7 @@ func TestAgentFollowUp(t *testing.T) {
 	a.FollowUp(openresponses.UserText("and then"))
 	rec := &recorder{}
 	rec.subscribe(a)
-	if err := a.Prompt(context.Background(), openresponses.UserText("first")); err != nil {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("first")); err != nil {
 		t.Fatal(err)
 	}
 	tr := a.State().Transcript
@@ -211,13 +212,19 @@ func TestAgentAbortAndIdle(t *testing.T) {
 		}
 		return nil
 	})
-	done := make(chan error, 1)
-	go func() { done <- a.Prompt(context.Background(), openresponses.UserText("x")) }()
+	done := make(chan *RunEnd, 1)
+	go func() {
+		end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+		if err != nil {
+			t.Errorf("aborted prompt returned an error: %v", err)
+		}
+		done <- end
+	}()
 	<-started
 	if !a.State().Running {
 		t.Error("agent should be running")
 	}
-	if err := a.Prompt(context.Background(), openresponses.UserText("y")); !errors.Is(err, ErrRunning) {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("y")); !errors.Is(err, ErrRunning) {
 		t.Errorf("concurrent prompt err = %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
@@ -226,8 +233,8 @@ func TestAgentAbortAndIdle(t *testing.T) {
 	}
 	cancel()
 	a.Abort()
-	if err := <-done; !errors.Is(err, ErrAborted) {
-		t.Errorf("prompt err = %v", err)
+	if end := <-done; end == nil || end.Reason != ReasonAborted || !errors.Is(end.Err, context.Canceled) {
+		t.Errorf("aborted run end = %+v", end)
 	}
 	if err := a.WaitForIdle(context.Background()); err != nil {
 		t.Error(err)
@@ -244,14 +251,14 @@ func TestAgentAbortAndIdle(t *testing.T) {
 	if len(st.Pending) != 1 || st.Pending[0].Name != "upper" {
 		t.Fatalf("pending = %v", st.Pending)
 	}
-	if err := a.Prompt(context.Background(), openresponses.UserText("z")); !errors.Is(err, ErrInputRequired) {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("z")); !errors.Is(err, ErrInputRequired) {
 		t.Errorf("prompt after abort err = %v", err)
 	}
-	if err := a.Continue(context.Background()); !errors.Is(err, ErrInputRequired) {
+	if _, err := a.Continue(context.Background()); !errors.Is(err, ErrInputRequired) {
 		t.Errorf("continue after abort err = %v", err)
 	}
 	out := &openresponses.FunctionCallOutput{CallID: st.Pending[0].CallID, Output: openresponses.FunctionCallOutputData{Text: "Error: aborted"}}
-	if err := a.Resume(context.Background(), out); err != nil {
+	if _, err := a.Resume(context.Background(), out); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
 	st = a.State()
@@ -264,7 +271,7 @@ func TestAgentAbortAndIdle(t *testing.T) {
 	if p := b.State().Pending; len(p) != 1 || p[0].CallID != out.CallID {
 		t.Errorf("seeded pending = %v", p)
 	}
-	if err := b.Prompt(context.Background(), openresponses.UserText("z")); !errors.Is(err, ErrInputRequired) {
+	if _, err := b.Prompt(context.Background(), openresponses.UserText("z")); !errors.Is(err, ErrInputRequired) {
 		t.Errorf("seeded prompt err = %v", err)
 	}
 }
@@ -275,7 +282,7 @@ func TestAgentUnsubscribe(t *testing.T) {
 	unsub := a.Subscribe(func(context.Context, Event) error { calls++; return nil })
 	unsub()
 	unsub()
-	if err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 0 {
@@ -285,8 +292,8 @@ func TestAgentUnsubscribe(t *testing.T) {
 
 func TestAgentResume(t *testing.T) {
 	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)},
-		BeforeToolCall: func(context.Context, ToolCallInfo) (*ToolDecision, error) { return &ToolDecision{Defer: true}, nil }})
-	if err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
+		BeforeToolCall: func(context.Context, ToolCallInfo) (*ToolDecision, error) { return &ToolDecision{Action: Defer}, nil }})
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
 		t.Fatal(err)
 	}
 	st := a.State()
@@ -294,24 +301,27 @@ func TestAgentResume(t *testing.T) {
 		t.Fatalf("state = %+v", st)
 	}
 	call := st.Pending[0]
-	if err := a.Prompt(context.Background(), openresponses.UserText("more")); !errors.Is(err, ErrInputRequired) {
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("more")); !errors.Is(err, ErrInputRequired) {
 		t.Errorf("prompt while pending = %v", err)
 	}
-	if err := a.Continue(context.Background()); !errors.Is(err, ErrInputRequired) {
+	if _, err := a.Continue(context.Background()); !errors.Is(err, ErrInputRequired) {
 		t.Errorf("continue while pending = %v", err)
 	}
-	if err := a.Resume(context.Background(), openresponses.NewFunctionCallOutput("other", "x")); !errors.Is(err, ErrNotPending) {
+	if _, err := a.Resume(context.Background(), openresponses.NewFunctionCallOutput("other", "x")); !errors.Is(err, ErrNotPending) {
 		t.Errorf("resume with unknown call = %v", err)
 	}
-	if err := a.Resume(context.Background()); !errors.Is(err, ErrNotPending) {
+	if _, err := a.Resume(context.Background()); !errors.Is(err, ErrNotPending) {
 		t.Errorf("resume with nothing = %v", err)
+	}
+	if _, err := New(Config{Model: &echo.Adapter{}}).Resume(context.Background()); !errors.Is(err, ErrNotPending) {
+		t.Errorf("resume while nothing pending = %v", err)
 	}
 	if len(a.State().Pending) != 1 {
 		t.Fatal("a rejected resume must leave the call pending")
 	}
 	rec := &recorder{}
 	rec.subscribe(a)
-	if err := a.Resume(context.Background(), openresponses.NewFunctionCallOutput(call.CallID, "ABC")); err != nil {
+	if _, err := a.Resume(context.Background(), openresponses.NewFunctionCallOutput(call.CallID, "ABC")); err != nil {
 		t.Fatal(err)
 	}
 	st = a.State()
@@ -326,7 +336,94 @@ func TestAgentResume(t *testing.T) {
 		t.Errorf("resume events = %v", got[:3])
 	}
 	// Answering twice is refused.
-	if err := a.Resume(context.Background(), openresponses.NewFunctionCallOutput(call.CallID, "ABC")); !errors.Is(err, ErrNotPending) {
+	if _, err := a.Resume(context.Background(), openresponses.NewFunctionCallOutput(call.CallID, "ABC")); !errors.Is(err, ErrNotPending) {
 		t.Errorf("resume after resume = %v", err)
+	}
+}
+
+func TestAgentPromptReturnsRunEnd(t *testing.T) {
+	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)},
+		BeforeToolCall: func(context.Context, ToolCallInfo) (*ToolDecision, error) { return &ToolDecision{Action: Defer}, nil }})
+	end, err := a.Prompt(context.Background(), openresponses.UserText("abc"))
+	if err != nil || end == nil || end.Reason != ReasonInputRequired || len(end.Pending) != 1 || itemTypes(end.Items) != "user function_call" {
+		t.Fatalf("paused prompt: err=%v end=%+v", err, end)
+	}
+	end, err = a.Resume(context.Background(), openresponses.NewFunctionCallOutput(end.Pending[0].CallID, "ABC"))
+	if err != nil || end.Reason != ReasonDone || itemTypes(end.Items) != "function_call_output assistant" {
+		t.Fatalf("resumed: err=%v end=%+v", err, end)
+	}
+	b := New(Config{Model: &echo.Adapter{}, MaxTurns: 1})
+	if end, err := b.Prompt(context.Background(), openresponses.UserText("x")); err != nil || end.Reason != ReasonDone {
+		t.Errorf("done: err=%v end=%+v", err, end)
+	}
+}
+
+func TestAgentSetConfigAndSetTranscript(t *testing.T) {
+	a := New(Config{Model: &echo.Adapter{}, ModelName: "one"})
+	var models []string
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if e, ok := ev.(*TurnStart); ok {
+			models = append(models, e.Request.Model)
+		}
+		return nil
+	})
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
+		t.Fatal(err)
+	}
+	cfg := a.Config()
+	cfg.ModelName = "two"
+	if err := a.SetConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	// Subscribers survive the change and see the new model.
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("y")); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(models, ",") != "one,two" {
+		t.Errorf("models = %v", models)
+	}
+	// Switching branch: a transcript with a dangling call is pending.
+	branch := Transcript{openresponses.UserText("b"), &openresponses.FunctionCall{CallID: "c1", Name: "f"}}
+	if err := a.SetTranscript(branch); err != nil {
+		t.Fatal(err)
+	}
+	if st := a.State(); itemTypes(st.Transcript) != "user function_call" || len(st.Pending) != 1 || st.Pending[0].CallID != "c1" {
+		t.Errorf("state after SetTranscript = %+v", st)
+	}
+	if err := a.SetTranscript(Transcript{openresponses.UserText("clean")}); err != nil {
+		t.Fatal(err)
+	}
+	if st := a.State(); len(st.Pending) != 0 {
+		t.Errorf("pending after clean SetTranscript = %v", st.Pending)
+	}
+	// Both refuse during a run.
+	blocking := agenttool.New("wait", "", func(ctx context.Context, _ echoArgs) (string, error) { <-ctx.Done(); return "", ctx.Err() })
+	cfg.Tools = []agenttool.Tool{blocking}
+	if err := a.SetConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if _, ok := ev.(*ToolStart); ok {
+			close(started)
+		}
+		return nil
+	})
+	go func() { _, _ = a.Continue(context.Background()) }()
+	<-started
+	if err := a.SetConfig(cfg); !errors.Is(err, ErrRunning) {
+		t.Errorf("SetConfig while running = %v", err)
+	}
+	if err := a.SetTranscript(nil); !errors.Is(err, ErrRunning) {
+		t.Errorf("SetTranscript while running = %v", err)
+	}
+	a.Abort()
+	if err := a.WaitForIdle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// The zero Agent is idle.
+	var zero Agent
+	if err := zero.WaitForIdle(context.Background()); err != nil {
+		t.Errorf("zero WaitForIdle = %v", err)
 	}
 }

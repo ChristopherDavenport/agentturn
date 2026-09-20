@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -29,7 +30,7 @@ func itemTypes(items openresponses.Items) string {
 func TestToolRunsChild(t *testing.T) {
 	var mu sync.Mutex
 	var observed []string
-	child := Tool(agentturn.Config{Name: "helper", Description: "helps", Model: &echo.Adapter{}, ModelName: "m"},
+	child := New(agentturn.Config{Name: "helper", Description: "helps", Model: &echo.Adapter{}, ModelName: "m"},
 		WithObserver(func(_ context.Context, ev agentturn.Event) {
 			mu.Lock()
 			observed = append(observed, ev.EventType())
@@ -70,10 +71,10 @@ func TestToolErrors(t *testing.T) {
 		args string
 		want string
 	}{
-		{"bad args", Tool(agentturn.Config{Name: "a", Model: &echo.Adapter{}}), `{"input":3}`, "invalid arguments"},
-		{"no model", Tool(agentturn.Config{Name: "a"}), `{"input":"x"}`, "no model"},
-		{"model failure", Tool(agentturn.Config{Name: "a", Model: failing{}}), `{"input":"x"}`, "model unavailable"},
-		{"render nothing", Tool(agentturn.Config{Name: "a", Model: &echo.Adapter{}}, WithArgs(func(Input) openresponses.Items { return nil })), `{}`, "rendered no items"},
+		{"bad args", New(agentturn.Config{Name: "a", Model: &echo.Adapter{}}), `{"input":3}`, "invalid arguments"},
+		{"no model", New(agentturn.Config{Name: "a"}), `{"input":"x"}`, "no model"},
+		{"model failure", New(agentturn.Config{Name: "a", Model: failing{}}), `{"input":"x"}`, "model unavailable"},
+		{"render nothing", New(agentturn.Config{Name: "a", Model: &echo.Adapter{}}, WithArgs(func(Input) openresponses.Items { return nil })), `{}`, "rendered no items"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -89,7 +90,7 @@ func TestToolErrors(t *testing.T) {
 				t.Error("expected panic for empty name")
 			}
 		}()
-		Tool(agentturn.Config{Model: &echo.Adapter{}})
+		New(agentturn.Config{Model: &echo.Adapter{}})
 	}()
 }
 
@@ -105,7 +106,7 @@ func TestTypedArgsAndSeed(t *testing.T) {
 		Focus string `json:"focus,omitempty"`
 	}
 	seedCalled := false
-	child := Tool(agentturn.Config{Name: "reviewer", Model: &echo.Adapter{}},
+	child := New(agentturn.Config{Name: "reviewer", Model: &echo.Adapter{}},
 		WithStrictArgs(func(r review) openresponses.Items {
 			return openresponses.Items{openresponses.UserText("review " + r.File + " for " + r.Focus)}
 		}),
@@ -116,7 +117,7 @@ func TestTypedArgsAndSeed(t *testing.T) {
 	if !agenttool.IsStrict(child) || !strings.Contains(string(child.Parameters()), `"additionalProperties":false`) {
 		t.Errorf("schema = %s", child.Parameters())
 	}
-	ctx := WithParentTranscript(context.Background(), agentturn.Transcript{openresponses.UserText("earlier"), openresponses.AssistantText("ok")})
+	ctx := agentturn.ContextWithTranscript(context.Background(), agentturn.Transcript{openresponses.UserText("earlier"), openresponses.AssistantText("ok")})
 	res, err := child.Execute(ctx, agenttool.Call{Args: json.RawMessage(`{"file":"main.go","focus":"errors"}`)})
 	if err != nil {
 		t.Fatal(err)
@@ -128,9 +129,41 @@ func TestTypedArgsAndSeed(t *testing.T) {
 	if got := itemTypes(res.Details.(ChildInfo).Items); got != "user assistant" {
 		t.Errorf("items = %q", got)
 	}
-	if _, ok := ParentTranscript(context.Background()); ok {
+	if _, ok := agentturn.TranscriptFromContext(context.Background()); ok {
 		t.Error("parent transcript found on a bare context")
 	}
+}
+
+func TestSeedSeesParentTranscriptUnderALoop(t *testing.T) {
+	var seen agentturn.Transcript
+	child := New(agentturn.Config{Name: "child", Model: &echo.Adapter{}},
+		WithTranscript(func(parent agentturn.Transcript) agentturn.Transcript {
+			seen = parent
+			return nil
+		}))
+	parent := agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{child}}
+	// Nothing is attached to the context by hand: the loop does it.
+	for ev := range agentturn.Run(context.Background(), nil, openresponses.Items{openresponses.UserText("delegate")}, parent) {
+		if e, ok := ev.(*agentturn.RunEnd); ok && e.Err != nil {
+			t.Fatal(e.Err)
+		}
+	}
+	if itemTypes(seen) != "user function_call" {
+		t.Errorf("seed saw %q, want the parent's user message and the call", itemTypes(seen))
+	}
+}
+
+func TestInputRequiredErrorMatchesSentinel(t *testing.T) {
+	err := fmt.Errorf("wrapped: %w", &InputRequiredError{Agent: "x"})
+	if !errors.Is(err, agentturn.ErrInputRequired) {
+		t.Error("InputRequiredError should match agentturn.ErrInputRequired")
+	}
+	defer func() {
+		if recover() == nil {
+			t.Error("New without a Name should panic")
+		}
+	}()
+	New(agentturn.Config{Model: &echo.Adapter{}})
 }
 
 func TestAbortPropagates(t *testing.T) {
@@ -141,7 +174,7 @@ func TestAbortPropagates(t *testing.T) {
 		return "", ctx.Err()
 	})
 	ctx, cancel := context.WithCancel(context.Background())
-	child := Tool(agentturn.Config{Name: "child", Model: &echo.Adapter{}, Tools: []agenttool.Tool{blocking}},
+	child := New(agentturn.Config{Name: "child", Model: &echo.Adapter{}, Tools: []agenttool.Tool{blocking}},
 		WithObserver(func(_ context.Context, ev agentturn.Event) {
 			if _, ok := ev.(*agentturn.ToolStart); ok {
 				cancel()
@@ -160,17 +193,14 @@ func TestAbortPropagates(t *testing.T) {
 // tool is an agent whose tool is an agent. Every level is echo, so the
 // answer threads back up through each level's "Tool result:" prefix.
 func TestThreeLevels(t *testing.T) {
-	level3 := Tool(agentturn.Config{Name: "level3", Description: "deepest", Model: &echo.Adapter{}})
-	level2 := Tool(agentturn.Config{Name: "level2", Model: &echo.Adapter{}, Tools: []agenttool.Tool{level3}})
-	level1 := Tool(agentturn.Config{Name: "level1", Model: &echo.Adapter{}, Tools: []agenttool.Tool{level2}})
+	level3 := New(agentturn.Config{Name: "level3", Description: "deepest", Model: &echo.Adapter{}})
+	level2 := New(agentturn.Config{Name: "level2", Model: &echo.Adapter{}, Tools: []agenttool.Tool{level3}})
+	level1 := New(agentturn.Config{Name: "level1", Model: &echo.Adapter{}, Tools: []agenttool.Tool{level2}})
 	parent := agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{level1}}
 
 	var end *agentturn.RunEnd
 	var toolEnd *agentturn.ToolEnd
-	for ev, err := range agentturn.Run(context.Background(), nil, openresponses.Items{openresponses.UserText("ping")}, parent) {
-		if err != nil {
-			t.Fatal(err)
-		}
+	for ev := range agentturn.Run(context.Background(), nil, openresponses.Items{openresponses.UserText("ping")}, parent) {
 		switch e := ev.(type) {
 		case *agentturn.ToolEnd:
 			toolEnd = e
@@ -205,9 +235,9 @@ func TestChildInputRequired(t *testing.T) {
 			return "never", nil
 		})},
 		BeforeToolCall: func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
-			return &agentturn.ToolDecision{Defer: true}, nil
+			return &agentturn.ToolDecision{Action: agentturn.Defer}, nil
 		}}
-	child := Tool(childCfg)
+	child := New(childCfg)
 	res, err := child.Execute(context.Background(), agenttool.Call{ID: "c", Args: json.RawMessage(`{"input":"find"}`)})
 	var ire *InputRequiredError
 	if !errors.As(err, &ire) || ire.Agent != "child" || len(ire.Pending) != 1 || ire.Pending[0].Name != "lookup" {
@@ -224,10 +254,7 @@ func TestChildInputRequired(t *testing.T) {
 	transcript := append(agentturn.Transcript(nil), info.Items...)
 	transcript = append(transcript, openresponses.NewFunctionCallOutput(info.Pending[0].CallID, "FOUND"))
 	var final string
-	for ev, err := range agentturn.Continue(context.Background(), transcript, childCfg) {
-		if err != nil {
-			t.Fatal(err)
-		}
+	for ev := range agentturn.Continue(context.Background(), transcript, childCfg) {
 		if e, ok := ev.(*agentturn.RunEnd); ok {
 			final = e.Items[len(e.Items)-1].(*openresponses.Message).Text()
 		}
@@ -238,10 +265,7 @@ func TestChildInputRequired(t *testing.T) {
 	// Through a parent loop the model sees the pause as a retryable
 	// error output.
 	parent := agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{child}, MaxTurns: 1}
-	for ev, err := range agentturn.Run(context.Background(), nil, openresponses.Items{openresponses.UserText("find")}, parent) {
-		if err != nil {
-			t.Fatal(err)
-		}
+	for ev := range agentturn.Run(context.Background(), nil, openresponses.Items{openresponses.UserText("find")}, parent) {
 		if e, ok := ev.(*agentturn.ToolEnd); ok {
 			if e.Err == nil || !strings.HasPrefix(e.Result.Output.Text, `Error: agent "child" needs input`) {
 				t.Errorf("parent tool_end = %+v", e)

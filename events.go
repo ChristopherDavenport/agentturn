@@ -192,6 +192,9 @@ func (*TurnEnd) EventType() string { return EventTurnEnd }
 
 // RunEnd closes a run. Exactly one is emitted per run and nothing
 // follows it. Items are the items the run appended to the transcript.
+// A run refused before it started ([ErrNoPrompt], [ErrCannotContinue],
+// [ErrNoModel]) is one RunEnd with ReasonError, an empty RunID and no
+// other event.
 type RunEnd struct {
 	RunID  string
 	Items  Transcript

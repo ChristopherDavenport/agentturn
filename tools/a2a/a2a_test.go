@@ -55,10 +55,7 @@ func TestRoundTripThroughFront(t *testing.T) {
 			var updates, ends int
 			var final *agentturn.RunEnd
 			local := agentturn.Config{Model: &echo.Adapter{}, ModelName: "local", Tools: []agenttool.Tool{remote}}
-			for ev, err := range agentturn.Run(context.Background(), nil, openresponses.Items{openresponses.UserText("ping the specialist")}, local) {
-				if err != nil {
-					t.Fatal(err)
-				}
+			for ev := range agentturn.Run(context.Background(), nil, openresponses.Items{openresponses.UserText("ping the specialist")}, local) {
 				switch e := ev.(type) {
 				case *agentturn.ToolUpdate:
 					updates++
@@ -67,7 +64,7 @@ func TestRoundTripThroughFront(t *testing.T) {
 					if e.Err != nil || e.Result.Output.Text != "ping the specialist" {
 						t.Errorf("tool_end = %+v", e)
 					}
-					d, ok := e.Result.Details.(Details)
+					d, ok := e.Result.Details.(TaskInfo)
 					if !ok || d.TaskID == "" || d.ContextID == "" || d.State != a2a.TaskStateCompleted {
 						t.Errorf("details = %+v", e.Result.Details)
 					}
@@ -201,7 +198,7 @@ func TestTaskStates(t *testing.T) {
 				if img, ok := res.Output.Parts[1].(*openresponses.InputImage); !ok || img.ImageURL != "https://x/img.png" {
 					t.Errorf("image part = %+v", res.Output.Parts[1])
 				}
-				if d := res.Details.(Details); d.State != a2a.TaskStateCompleted || d.TaskID == "" {
+				if d := res.Details.(TaskInfo); d.State != a2a.TaskStateCompleted || d.TaskID == "" {
 					t.Errorf("details = %+v", d)
 				}
 			})

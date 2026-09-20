@@ -20,12 +20,13 @@ type Transcript = openresponses.Items
 type ExecutionMode int
 
 const (
-	// Parallel runs the calls of a batch concurrently, bounded by
+	// ExecParallel runs the calls of a batch concurrently, bounded by
 	// [Config.MaxParallelTools], unless a tool in the batch is
 	// agenttool.Sequential.
-	Parallel ExecutionMode = iota
-	// Sequential runs every batch one call at a time in the model's order.
-	Sequential
+	ExecParallel ExecutionMode = iota
+	// ExecSequential runs every batch one call at a time in the model's
+	// order.
+	ExecSequential
 )
 
 // Config describes an agent. The zero value is not usable: Model is
@@ -82,9 +83,9 @@ type Config struct {
 	// zero means no limit.
 	MaxTurns int
 
-	// Filter drops app-only items before each model call. nil means
-	// [DefaultFilter].
-	Filter func(Transcript) openresponses.Items
+	// Filter drops app-only items before each model call and returns
+	// the conversation the model sees. nil means [DefaultFilter].
+	Filter func(Transcript) Transcript
 	// Transform runs before each model call on the whole transcript and
 	// may return a shorter or otherwise edited one for that call only:
 	// prune, compact, inject context. It receives a copy of the slice
@@ -120,20 +121,31 @@ type ToolCallInfo struct {
 	Args json.RawMessage
 }
 
-// ToolDecision is a hook's verdict on a call.
-type ToolDecision struct {
-	// Block refuses the call. The model sees Reason as the error output.
-	Block bool
+// ToolAction is what BeforeToolCall decides for a call.
+type ToolAction int
+
+const (
+	// Allow runs the call. It is the zero value, so a decision that only
+	// rewrites Args or sets Terminate allows the call.
+	Allow ToolAction = iota
+	// Block refuses the call. The model sees ToolDecision.Reason as the
+	// error output.
+	Block
 	// Defer hands the call to the caller instead of running it: the
 	// other calls of the batch proceed, no output is appended for this
 	// one, and the run ends with ReasonInputRequired listing it. The
-	// caller appends the output later and continues. Block wins when
-	// both are set.
-	Defer bool
-	// Reason is the message the model sees when Block is set.
+	// caller appends the output later and continues.
+	Defer
+)
+
+// ToolDecision is a hook's verdict on a call.
+type ToolDecision struct {
+	// Action allows, blocks or defers the call.
+	Action ToolAction
+	// Reason is the message the model sees when Action is Block.
 	Reason string
 	// Terminate hints the loop to stop after the batch, as a tool result
-	// would.
+	// would. It composes with Allow and Block.
 	Terminate bool
 	// Args, when non-nil, replaces the arguments the tool receives.
 	Args json.RawMessage
@@ -164,26 +176,27 @@ type TurnInfo struct {
 	// ToolResults are the results of this turn's calls in the model's
 	// order, empty when the model called no tools.
 	ToolResults []agenttool.Result
-	// Transcript is the working transcript after the turn.
+	// Transcript is the working transcript after the turn. It is the
+	// loop's live slice; do not mutate it or keep it past the hook.
 	Transcript Transcript
 }
 
 // DefaultFilter drops every item whose type carries a slug prefix such
 // as "agentturn:note", which marks an app-only extension item, and nil
 // items. It is the Filter when Config.Filter is nil.
-func DefaultFilter(t Transcript) openresponses.Items {
+func DefaultFilter(t Transcript) Transcript {
 	return VisibleFilter()(t)
 }
 
 // VisibleFilter returns a filter like [DefaultFilter] that keeps the
 // listed extension item types.
-func VisibleFilter(visible ...string) func(Transcript) openresponses.Items {
+func VisibleFilter(visible ...string) func(Transcript) Transcript {
 	keep := make(map[string]bool, len(visible))
 	for _, v := range visible {
 		keep[v] = true
 	}
-	return func(t Transcript) openresponses.Items {
-		out := make(openresponses.Items, 0, len(t))
+	return func(t Transcript) Transcript {
+		out := make(Transcript, 0, len(t))
 		for _, item := range t {
 			if item == nil {
 				continue
@@ -214,7 +227,7 @@ func (c Config) ResolveTools(ctx context.Context) []agenttool.Tool {
 	return c.Tools
 }
 
-func (c Config) filter() func(Transcript) openresponses.Items {
+func (c Config) filter() func(Transcript) Transcript {
 	if c.Filter != nil {
 		return c.Filter
 	}

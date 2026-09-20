@@ -15,18 +15,27 @@
 // until the agent goes idle. A turn is one model call plus the tool
 // executions it requested.
 //
+// [Transcript] and openresponses.Items are one type under two names,
+// and the name says what a value is. A Transcript is a whole
+// conversation: what Run starts from, what Filter and Transform see and
+// return, what a hook or a tool reads from its context. Items is a
+// fragment: the prompts of a run, the outputs of a batch, the items a
+// run added.
+//
 // # Low-level loop
 //
 // [Run] and [Continue] are observational: they yield [Event] values in
 // order and the loop does not wait for the consumer between phases.
+// The [RunEnd] is always the last event and says how the run ended.
 //
-//	for ev, err := range agentturn.Run(ctx, transcript, prompts, cfg) {
-//		if err != nil { ... }
+//	for ev := range agentturn.Run(ctx, transcript, prompts, cfg) {
 //		switch e := ev.(type) {
 //		case *agentturn.ItemUpdate:
 //			if d, ok := e.Stream.(*openresponses.OutputTextDeltaEvent); ok {
 //				fmt.Print(d.Delta)
 //			}
+//		case *agentturn.RunEnd:
+//			if e.Err != nil { ... }
 //		}
 //	}
 //

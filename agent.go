@@ -11,13 +11,14 @@ import (
 
 // Errors returned by [Agent].
 var (
-	// ErrRunning: Prompt or Continue was called while a run is active.
+	// ErrRunning: Prompt, Continue, Resume, SetConfig or SetTranscript
+	// was called while a run is active.
 	ErrRunning = errors.New("agentturn: agent is already running")
-	// ErrAborted: the run was aborted with [Agent.Abort] or its context.
-	ErrAborted = errors.New("agentturn: run aborted")
 	// ErrInputRequired: the last run left calls unanswered, deferred to
 	// the caller or cut off by an abort or a failure; [Agent.Resume]
-	// with their outputs first.
+	// with their outputs first. The typed errors of tools/agent and
+	// tools/a2a match it with errors.Is, so a host can ask "does any
+	// sub-agent need input" once.
 	ErrInputRequired = errors.New("agentturn: pending tool calls must be resumed before continuing")
 	// ErrNotPending: Resume was given an output for a call that is not
 	// pending, or left a pending call unanswered.
@@ -26,7 +27,8 @@ var (
 
 // Agent is the stateful loop: a transcript, queues, subscribers and run
 // control over [Run]. One run at a time; a second Prompt while one is
-// active returns [ErrRunning].
+// active returns [ErrRunning]. The zero Agent has no model and is idle;
+// use [New].
 //
 // Subscribers are called synchronously, in registration order, for every
 // event, so every event is a barrier: the loop does not move to the next
@@ -87,6 +89,39 @@ func closedChan() chan struct{} {
 // Config returns the agent's configuration.
 func (a *Agent) Config() Config { return a.cfg }
 
+// SetConfig replaces the configuration for the next run: model,
+// instructions, reasoning, tools, hooks, all of it. It returns
+// [ErrRunning] while a run is active. Subscribers and queues are kept;
+// a session recorder attached to the agent sees the change as a config
+// delta on the next turn.
+func (a *Agent) SetConfig(cfg Config) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		return ErrRunning
+	}
+	a.cfg = cfg
+	return nil
+}
+
+// SetTranscript replaces the transcript, as when switching to another
+// branch of a session. It returns [ErrRunning] while a run is active.
+// The pending calls are derived from the new transcript as
+// [WithTranscript] derives them, so whatever the old transcript was
+// waiting on is forgotten and whatever the new one is waiting on must
+// be answered through [Agent.Resume]. Queued Steer and FollowUp items
+// are kept.
+func (a *Agent) SetTranscript(t Transcript) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		return ErrRunning
+	}
+	a.transcript = append(Transcript(nil), t...)
+	a.pending = unansweredCalls(a.transcript)
+	return nil
+}
+
 // State is a snapshot of the agent.
 type State struct {
 	// Transcript is a copy of the slice; items are shared.
@@ -119,27 +154,31 @@ func (a *Agent) State() State {
 }
 
 // Prompt appends items and runs until idle. It returns when the run_end
-// subscribers have returned: nil when the run finished or was stopped,
-// [ErrAborted] when it was aborted, and the failure otherwise.
-func (a *Agent) Prompt(ctx context.Context, items ...openresponses.Item) error {
+// subscribers have returned, with the [RunEnd] that says how the run
+// ended: done, stopped, input_required with the pending calls, or
+// aborted with the context error on RunEnd.Err. The error is set only
+// when the run could not start ([ErrNoPrompt], [ErrRunning],
+// [ErrInputRequired], [ErrNoModel]) or ended with ReasonError, in which
+// case it is RunEnd.Err and the RunEnd is returned alongside.
+func (a *Agent) Prompt(ctx context.Context, items ...openresponses.Item) (*RunEnd, error) {
 	if len(items) == 0 {
-		return ErrNoPrompt
+		return nil, ErrNoPrompt
 	}
 	return a.run(ctx, items, false)
 }
 
-// Continue runs from the transcript as it stands, which must end with a
-// user message or a function call output.
-func (a *Agent) Continue(ctx context.Context) error {
+// Continue runs from the transcript as it stands, which must satisfy
+// [CanContinue], and returns as [Agent.Prompt] does.
+func (a *Agent) Continue(ctx context.Context) (*RunEnd, error) {
 	a.mu.Lock()
 	pending := len(a.pending) > 0
-	ok := canContinue(a.transcript)
+	ok := CanContinue(a.transcript)
 	a.mu.Unlock()
 	if pending {
-		return ErrInputRequired
+		return nil, ErrInputRequired
 	}
 	if !ok {
-		return ErrCannotContinue
+		return nil, ErrCannotContinue
 	}
 	return a.run(ctx, nil, false)
 }
@@ -150,27 +189,28 @@ func (a *Agent) Continue(ctx context.Context) error {
 // output may answer a call that is not pending; a caller that refuses
 // a call answers it with the refusal as text, which the model then
 // sees. The outputs are appended with their item events before the
-// model is called.
-func (a *Agent) Resume(ctx context.Context, outputs ...*openresponses.FunctionCallOutput) error {
+// model is called, and the run returns as [Agent.Prompt] does. With
+// nothing pending, Resume returns [ErrNotPending].
+func (a *Agent) Resume(ctx context.Context, outputs ...*openresponses.FunctionCallOutput) (*RunEnd, error) {
 	a.mu.Lock()
 	pending := make(map[string]bool, len(a.pending))
 	for _, call := range a.pending {
 		pending[call.CallID] = true
 	}
 	a.mu.Unlock()
+	if len(pending) == 0 {
+		return nil, fmt.Errorf("%w: nothing is pending", ErrNotPending)
+	}
 	items := make(openresponses.Items, 0, len(outputs))
 	for _, out := range outputs {
 		if out == nil || !pending[out.CallID] {
-			return fmt.Errorf("%w: %q", ErrNotPending, callID(out))
+			return nil, fmt.Errorf("%w: %q", ErrNotPending, callID(out))
 		}
 		delete(pending, out.CallID)
 		items = append(items, out)
 	}
 	if len(pending) > 0 {
-		return fmt.Errorf("%w: %d pending call(s) unanswered", ErrNotPending, len(pending))
-	}
-	if len(items) == 0 {
-		return ErrNoPrompt
+		return nil, fmt.Errorf("%w: %d pending call(s) unanswered", ErrNotPending, len(pending))
 	}
 	return a.run(ctx, items, true)
 }
@@ -182,18 +222,19 @@ func callID(out *openresponses.FunctionCallOutput) string {
 	return out.CallID
 }
 
-func (a *Agent) run(ctx context.Context, prompts openresponses.Items, resuming bool) error {
-	if err := a.cfg.validate(); err != nil {
-		return err
-	}
+func (a *Agent) run(ctx context.Context, prompts openresponses.Items, resuming bool) (*RunEnd, error) {
 	a.mu.Lock()
+	if err := a.cfg.validate(); err != nil {
+		a.mu.Unlock()
+		return nil, err
+	}
 	if a.running {
 		a.mu.Unlock()
-		return ErrRunning
+		return nil, ErrRunning
 	}
 	if len(a.pending) > 0 && !resuming {
 		a.mu.Unlock()
-		return ErrInputRequired
+		return nil, ErrInputRequired
 	}
 	a.pending = nil
 	ctx, cancel := context.WithCancel(ctx)
@@ -202,10 +243,11 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, resuming b
 	a.turn = 0
 	a.idle = make(chan struct{})
 	transcript := append(Transcript(nil), a.transcript...)
+	cfg := a.cfg
 	a.mu.Unlock()
 
 	r := &runner{
-		cfg:        a.cfg,
+		cfg:        cfg,
 		transcript: transcript,
 		emit:       func(ev Event) error { return a.deliver(ctx, ev) },
 		steer:      a.drainSteer,
@@ -220,13 +262,10 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, resuming b
 	close(a.idle)
 	a.mu.Unlock()
 
-	switch end.Reason {
-	case ReasonAborted:
-		return ErrAborted
-	case ReasonError:
-		return end.Err
+	if end.Reason == ReasonError {
+		return end, end.Err
 	}
-	return nil
+	return end, nil
 }
 
 // deliver updates state from the event and calls every subscriber in
@@ -243,6 +282,8 @@ func (a *Agent) deliver(ctx context.Context, ev Event) error {
 	case *RunEnd:
 		a.pending = e.Pending
 	}
+	// Snapshot the subscriber list and release the lock before calling
+	// out: a subscriber may Subscribe, unsubscribe or read State.
 	subs := append([]subscription(nil), a.subs...)
 	a.mu.Unlock()
 	for _, s := range subs {
@@ -266,6 +307,8 @@ func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe fu
 		defer a.mu.Unlock()
 		for i, s := range a.subs {
 			if s.id == id {
+				// The three-index slice forces a fresh array, so a
+				// snapshot taken by deliver is never written through.
 				a.subs = append(a.subs[:i:i], a.subs[i+1:]...)
 				return
 			}
@@ -273,21 +316,21 @@ func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe fu
 	}
 }
 
-// Steer queues an item to be injected after the current tool batch,
-// before the next model call. When the agent is idle it is consumed by
-// the next run at the same point.
-func (a *Agent) Steer(item openresponses.Item) {
+// Steer queues items to be injected after the current tool batch,
+// before the next model call. When the agent is idle they are consumed
+// by the next run at the same point.
+func (a *Agent) Steer(items ...openresponses.Item) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.steer = append(a.steer, item)
+	a.steer = append(a.steer, items...)
 }
 
-// FollowUp queues an item to be injected when the run would otherwise
+// FollowUp queues items to be injected when the run would otherwise
 // end, so the agent keeps going instead of going idle.
-func (a *Agent) FollowUp(item openresponses.Item) {
+func (a *Agent) FollowUp(items ...openresponses.Item) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.followUp = append(a.followUp, item)
+	a.followUp = append(a.followUp, items...)
 }
 
 func (a *Agent) drainSteer() openresponses.Items {
@@ -318,11 +361,15 @@ func (a *Agent) Abort() {
 	}
 }
 
-// WaitForIdle blocks until no run is active or ctx is done.
+// WaitForIdle blocks until no run is active or ctx is done. An agent
+// that has never run is idle.
 func (a *Agent) WaitForIdle(ctx context.Context) error {
 	a.mu.Lock()
 	idle := a.idle
 	a.mu.Unlock()
+	if idle == nil {
+		return nil
+	}
 	select {
 	case <-idle:
 		return nil

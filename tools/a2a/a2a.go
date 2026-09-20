@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"github.com/ChristopherDavenport/agenttool"
+	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/openresponses"
 	"github.com/a2aproject/a2a-go/a2a"
 	"github.com/a2aproject/a2a-go/a2aclient"
@@ -33,9 +34,9 @@ type Args struct {
 	Input string `json:"input" desc:"The request for the agent, in natural language"`
 }
 
-// Details is the app-only detail on every result: which task the call
-// ran as and where it ended.
-type Details struct {
+// TaskInfo is the Result.Details of every call: which task the call ran
+// as and where it ended, the counterpart of tools/agent's ChildInfo.
+type TaskInfo struct {
 	TaskID    a2a.TaskID
 	ContextID string
 	State     a2a.TaskState
@@ -43,7 +44,8 @@ type Details struct {
 
 // InputRequiredError is returned when the remote agent needs more input
 // before it can finish. The model sees the message; a host can resume
-// the task with the IDs.
+// the task with the IDs. It matches agentturn.ErrInputRequired under
+// errors.Is.
 type InputRequiredError struct {
 	TaskID    a2a.TaskID
 	ContextID string
@@ -59,7 +61,11 @@ func (e *InputRequiredError) Error() string {
 	return "the agent needs more input: " + e.Message
 }
 
-// Option configures the tool.
+// Is reports whether target is agentturn.ErrInputRequired.
+func (e *InputRequiredError) Is(target error) bool { return target == agentturn.ErrInputRequired }
+
+// Option configures the tool. The type it configures is unexported, so
+// options come only from this package.
 type Option func(*remote)
 
 // WithName overrides the tool name, which defaults to the card's name
@@ -233,7 +239,7 @@ func (o *outcome) text() string {
 }
 
 func (o *outcome) result() (agenttool.Result, error) {
-	details := Details{TaskID: o.taskID, ContextID: o.contextID, State: o.state}
+	details := TaskInfo{TaskID: o.taskID, ContextID: o.contextID, State: o.state}
 	res := agenttool.Result{Details: details}
 	if o.message != nil && o.state == "" {
 		// A bare message reply, no task.

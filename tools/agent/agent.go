@@ -4,7 +4,7 @@
 // own loop on a fresh transcript with its own hooks and tools, and the
 // child's final answer is the tool output.
 //
-//	specialist := agent.Tool(agentturn.Config{
+//	specialist := agent.New(agentturn.Config{
 //		Name:        "researcher",
 //		Description: "Finds and summarises sources for a question.",
 //		Model:       model,
@@ -25,7 +25,9 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/ChristopherDavenport/agenttool"
@@ -59,6 +61,7 @@ type ChildInfo struct {
 // its BeforeToolCall deferred. The parent's model sees it as the error
 // output and can decide what to do; a host that wants to resume the
 // child finds the run and the pending calls in the result's ChildInfo.
+// It matches agentturn.ErrInputRequired under errors.Is.
 type InputRequiredError struct {
 	Agent   string
 	RunID   string
@@ -79,7 +82,10 @@ func (e *InputRequiredError) Error() string {
 	return b.String()
 }
 
-// Option configures the tool built by [Tool].
+// Is reports whether target is agentturn.ErrInputRequired.
+func (e *InputRequiredError) Is(target error) bool { return target == agentturn.ErrInputRequired }
+
+// Option configures the tool built by [New].
 type Option func(*options)
 
 type options struct {
@@ -93,14 +99,26 @@ type options struct {
 // WithArgs replaces the default {"input": string} arguments with T,
 // whose schema is reflected as in agenttool.New. render turns the decoded
 // value into the items that open the child's transcript, usually one
-// user message.
+// user message. It panics when T has no schema, as agenttool.New does,
+// which a test of the tool's construction catches.
 func WithArgs[T any](render func(T) openresponses.Items) Option {
-	schema, err := agenttool.SchemaFor[T](false)
+	return withArgs(false, render)
+}
+
+// WithStrictArgs is [WithArgs] with a strict schema. It panics when T
+// has no strict schema.
+func WithStrictArgs[T any](render func(T) openresponses.Items) Option {
+	return withArgs(true, render)
+}
+
+func withArgs[T any](strict bool, render func(T) openresponses.Items) Option {
+	schema, err := agenttool.SchemaFor[T](strict)
 	if err != nil {
 		panic(fmt.Sprintf("agent.WithArgs: %v", err))
 	}
 	return func(o *options) {
 		o.schema = schema
+		o.strict = strict
 		o.render = func(raw json.RawMessage) (openresponses.Items, error) {
 			v, err := agenttool.Decode[T](raw)
 			if err != nil {
@@ -111,23 +129,11 @@ func WithArgs[T any](render func(T) openresponses.Items) Option {
 	}
 }
 
-// WithStrictArgs is [WithArgs] with a strict schema.
-func WithStrictArgs[T any](render func(T) openresponses.Items) Option {
-	schema, err := agenttool.SchemaFor[T](true)
-	if err != nil {
-		panic(fmt.Sprintf("agent.WithStrictArgs: %v", err))
-	}
-	return func(o *options) {
-		WithArgs(render)(o)
-		o.schema = schema
-		o.strict = true
-	}
-}
-
-// WithTranscript seeds the child's transcript from the parent's. The
-// parent transcript is whatever the host attached to the context with
-// [WithParentTranscript]; nil when nothing was attached. The seed goes
-// before the rendered arguments.
+// WithTranscript seeds the child's transcript from the parent's, which
+// the loop attaches to every tool call's context (see
+// agentturn.TranscriptFromContext); seed receives nil when the tool is
+// executed outside a loop. The seed goes before the rendered
+// arguments.
 func WithTranscript(seed func(parent agentturn.Transcript) agentturn.Transcript) Option {
 	return func(o *options) { o.seed = seed }
 }
@@ -138,28 +144,13 @@ func WithObserver(fn func(context.Context, agentturn.Event)) Option {
 	return func(o *options) { o.observer = fn }
 }
 
-type parentKey struct{}
-
-// WithParentTranscript attaches the parent's transcript to ctx so a
-// child built with [WithTranscript] can be seeded from it. A host that
-// runs the loop attaches it to the context it passes to Run.
-func WithParentTranscript(ctx context.Context, t agentturn.Transcript) context.Context {
-	return context.WithValue(ctx, parentKey{}, t)
-}
-
-// ParentTranscript returns the transcript attached with
-// [WithParentTranscript].
-func ParentTranscript(ctx context.Context) (agentturn.Transcript, bool) {
-	t, ok := ctx.Value(parentKey{}).(agentturn.Transcript)
-	return t, ok
-}
-
-// Tool wraps cfg as a tool named cfg.Name with cfg.Description. Name is
-// required. Each call runs a child loop with cfg; the child's own hooks
-// apply and the parent's do not.
-func Tool(cfg agentturn.Config, opts ...Option) agenttool.Tool {
+// New wraps cfg as a tool named cfg.Name with cfg.Description. Each
+// call runs a child loop with cfg; the child's own hooks apply and the
+// parent's do not. It panics when cfg.Name is empty, since a tool
+// without a name cannot be offered to a model.
+func New(cfg agentturn.Config, opts ...Option) agenttool.Tool {
 	if cfg.Name == "" {
-		panic("agent.Tool: config has no Name")
+		panic("agent.New: config has no Name")
 	}
 	o := options{}
 	for _, opt := range opts {
@@ -188,7 +179,10 @@ func (a *agentTool) Strict() bool                { return a.opts.strict }
 // returns its error, one that is aborted returns the context error, and
 // one that stopped on deferred calls returns an [*InputRequiredError],
 // because a pause inside the child cannot become a pause of the parent
-// after the fact.
+// after the fact. On every error path the Result still carries the
+// ChildInfo: the loop keeps Details when it turns an error into the
+// output the model sees, so a session subscriber can link the child run
+// whether or not it succeeded.
 func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool.Result, error) {
 	prompts, err := a.opts.render(call.Args)
 	if err != nil {
@@ -199,16 +193,13 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	}
 	var seed agentturn.Transcript
 	if a.opts.seed != nil {
-		parent, _ := ParentTranscript(ctx)
+		parent, _ := agentturn.TranscriptFromContext(ctx)
 		seed = a.opts.seed(parent)
 	}
 
 	var soFar []string
 	var end *agentturn.RunEnd
-	for ev, err := range agentturn.Run(ctx, seed, prompts, a.cfg) {
-		if ev == nil && err != nil {
-			return agenttool.Result{}, fmt.Errorf("agent %q: %w", a.cfg.Name, err)
-		}
+	for ev := range agentturn.Run(ctx, seed, prompts, a.cfg) {
 		if a.opts.observer != nil {
 			a.opts.observer(ctx, ev)
 		}
@@ -226,7 +217,7 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		}
 	}
 	if end == nil {
-		return agenttool.Result{}, fmt.Errorf("agent %q: child run produced no run_end", a.cfg.Name)
+		return agenttool.Result{}, errors.New("agent " + strconv.Quote(a.cfg.Name) + ": child run produced no run_end")
 	}
 	info := ChildInfo{RunID: end.RunID, Items: end.Items, Reason: end.Reason, Pending: end.Pending}
 	switch end.Reason {

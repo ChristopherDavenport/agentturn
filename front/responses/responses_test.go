@@ -223,10 +223,7 @@ func TestAsModelOverHTTP(t *testing.T) {
 	outer := agentturn.Config{Model: client.AsAdapter(), ModelName: "outer"}
 	var end *agentturn.RunEnd
 	var deltas int
-	for ev, err := range agentturn.Run(context.Background(), nil, openresponses.Items{openresponses.UserText("abc")}, outer) {
-		if err != nil {
-			t.Fatal(err)
-		}
+	for ev := range agentturn.Run(context.Background(), nil, openresponses.Items{openresponses.UserText("abc")}, outer) {
 		switch e := ev.(type) {
 		case *agentturn.ItemUpdate:
 			if _, ok := e.Stream.(*openresponses.OutputTextDeltaEvent); ok {
@@ -299,7 +296,7 @@ func (whole) CreateStream(_ context.Context, req openresponses.Request, sink ope
 
 func TestFullRunDefersToCaller(t *testing.T) {
 	deferAll := func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
-		return &agentturn.ToolDecision{Defer: true}, nil
+		return &agentturn.ToolDecision{Action: agentturn.Defer}, nil
 	}
 	cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{upper}, BeforeToolCall: deferAll}
 	for _, withTrace := range []bool{false, true} {

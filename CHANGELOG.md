@@ -52,6 +52,46 @@ versions may break the API.
   the SDK stores) instead of an in-process `int` count. `AgentCard`
   takes a context and a version, and advertises the tools of a
   `ToolProvider` as skills. (#10)
+- **Breaking**: `Agent.Prompt`, `Continue` and `Resume` return the
+  `*RunEnd` beside the error, so a caller can tell done from stopped
+  from paused without a second call. The error is set only when the
+  run could not start or ended with `ReasonError`; an abort comes back
+  as a `RunEnd` with `ReasonAborted` and the context error on it, and
+  `ErrAborted` is gone. `Resume` with nothing pending returns
+  `ErrNotPending`, `Steer` and `FollowUp` take any number of items,
+  and the zero `Agent` is idle for `WaitForIdle`. (#11)
+- **Breaking**: `Run` and `Continue` yield `iter.Seq[Event]`. The
+  `RunEnd` is the single terminal: always the last event, with the
+  failure on `Err` when `Reason` is `ReasonError`. A run refused before
+  it starts is one `RunEnd` with `ReasonError` and no other event. The
+  loop runs ahead of the consumer by up to `EventBuffer` events.
+  `CanContinue` is exported. (#12)
+- **Breaking**: `ToolDecision` has an `Action` of `Allow`, `Block` or
+  `Defer` instead of two booleans that could both be set. `Terminate`
+  and `Args` are unchanged. (#13)
+- **Breaking**: names aligned across sibling packages: `tools/agent`
+  constructs with `New` like every other package; `tools/a2a.Details`
+  is `TaskInfo`, the counterpart of `ChildInfo`; both packages'
+  `InputRequiredError` match `agentturn.ErrInputRequired` under
+  `errors.Is`; the execution modes are `ExecParallel` and
+  `ExecSequential` so `Sequential` no longer collides with
+  `agenttool.Sequential`; `front/a2a.Text` is unexported; `Filter`
+  returns `Transcript` like `Transform`, and `doc.go` states the rule
+  for `Transcript` versus `openresponses.Items`. (#14)
+- **Breaking**: the loop attaches its working transcript to the context
+  of every hook and tool call, and `agentturn.TranscriptFromContext`
+  reads it. `tools/agent.WithTranscript` uses it, so a host no longer
+  has to remember `WithParentTranscript`, which is gone with
+  `ParentTranscript`. `WithArgs`, `WithStrictArgs` and `New` document
+  when they panic; `WithStrictArgs` reflects the schema once; `Execute`
+  states that `ChildInfo` rides on every error path. (#15)
+- `Agent.SetConfig` and `Agent.SetTranscript` change a live agent
+  between runs, refusing with `ErrRunning` during one. `SetTranscript`
+  derives the pending calls from the new transcript, so a branch switch
+  pairs with `agentsession.Session.Branch` on the store side. (#20)
+- README: the first-contact example handles the `RunEnd` and
+  cancellation, a print front keyed on call ID, and the
+  `input_required` round trip through `Defer` and `Resume`. (#6, #19)
 - Depends on `agenttool` v0.0.2 and `agentsession` v0.0.2.
 
 ## v0.0.2 - 2026-09-19

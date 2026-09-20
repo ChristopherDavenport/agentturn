@@ -47,14 +47,20 @@ cfg := agentturn.Config{
 	Tools:        []agenttool.Tool{ReadFile},
 }
 
-// Low-level: an iterator of events. The loop runs ahead of the consumer.
-for ev, err := range agentturn.Run(ctx, nil, openresponses.Items{openresponses.UserText("What is in go.mod?")}, cfg) {
-	if err != nil {
-		log.Fatal(err)
-	}
-	if u, ok := ev.(*agentturn.ItemUpdate); ok {
-		if d, ok := u.Stream.(*openresponses.OutputTextDeltaEvent); ok {
+// Low-level: an iterator of events. The loop runs ahead of the consumer
+// and the run_end is always the last event.
+for ev := range agentturn.Run(ctx, nil, openresponses.Items{openresponses.UserText("What is in go.mod?")}, cfg) {
+	switch e := ev.(type) {
+	case *agentturn.ItemUpdate:
+		if d, ok := e.Stream.(*openresponses.OutputTextDeltaEvent); ok {
 			fmt.Print(d.Delta)
+		}
+	case *agentturn.RunEnd:
+		// e.Reason is done, stopped, input_required, aborted or error;
+		// a cancelled ctx ends the run with aborted and context.Canceled
+		// on e.Err rather than panicking or hanging.
+		if e.Err != nil {
+			log.Fatal(e.Err)
 		}
 	}
 }
@@ -65,7 +71,26 @@ a.Subscribe(func(ctx context.Context, ev agentturn.Event) error {
 	// every event is a barrier: the loop waits for this to return
 	return nil
 })
-err := a.Prompt(ctx, openresponses.UserText("What is in go.mod?"))
+end, err := a.Prompt(ctx, openresponses.UserText("What is in go.mod?"))
+```
+
+`Prompt` returns the `RunEnd`; the error is set only when the run could
+not start or ended with `error`. A print front correlates `tool_end`,
+which arrives in completion order, with `tool_start` by call ID rather
+than by position:
+
+```go
+started := map[string]string{}
+a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+	switch e := ev.(type) {
+	case *agentturn.ToolStart:
+		started[e.CallID] = e.Name + " " + string(e.Args)
+		fmt.Println("▶", started[e.CallID])
+	case *agentturn.ToolEnd:
+		fmt.Printf("  [%s] %s\n", started[e.CallID], e.Result.Output.Text)
+	}
+	return nil
+})
 ```
 
 A run is one `Prompt` or `Continue` until the agent goes idle; a turn is
@@ -95,8 +120,31 @@ asks for sequential execution. `Config.BeforeToolCall` is the policy
 seam: block, rewrite arguments, terminate the run, or defer the call to
 the caller. A deferred call ends the run with `input_required` and the
 pending calls listed; `Agent.Resume` takes their outputs and continues,
-which is how a front asks a human before a tool runs. `AfterToolCall`
-overrides results; `ShouldStopAfterTurn` ends a run early.
+which is how a front asks a human before a tool runs:
+
+```go
+cfg.BeforeToolCall = func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+	if info.Call.Name == "delete_file" {
+		return &agentturn.ToolDecision{Action: agentturn.Defer}, nil
+	}
+	return nil, nil
+}
+end, err := a.Prompt(ctx, openresponses.UserText("Clean up the build directory."))
+if err == nil && end.Reason == agentturn.ReasonInputRequired {
+	// ask the human about end.Pending, then answer every call
+	var outputs []*openresponses.FunctionCallOutput
+	for _, call := range end.Pending {
+		outputs = append(outputs, openresponses.NewFunctionCallOutput(call.CallID, "denied by the user"))
+	}
+	end, err = a.Resume(ctx, outputs...)
+}
+```
+
+The same path repairs a run that was aborted mid-batch: the cut-off
+calls are on `end.Pending`, and an agent built with
+`agentturn.WithTranscript` from a stored session marks them pending
+again. `AfterToolCall` overrides results; `ShouldStopAfterTurn` ends a
+run early.
 
 Every other request member comes from `Config.Request`, the base the
 loop builds each turn's request on: `tool_choice`, `max_output_tokens`,

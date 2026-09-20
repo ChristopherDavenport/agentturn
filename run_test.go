@@ -18,23 +18,22 @@ type echoArgs struct {
 
 func upper(_ context.Context, a echoArgs) (string, error) { return strings.ToUpper(a.Text), nil }
 
-func collect(t *testing.T, seq func(func(Event, error) bool)) ([]Event, *RunEnd, error) {
+// collect drains seq and returns its events, the RunEnd and the
+// RunEnd's error.
+func collect(t *testing.T, seq func(func(Event) bool)) ([]Event, *RunEnd, error) {
 	t.Helper()
 	var events []Event
 	var end *RunEnd
-	var lastErr error
-	for ev, err := range seq {
-		if err != nil {
-			lastErr = err
-		}
-		if ev != nil {
-			events = append(events, ev)
-		}
+	for ev := range seq {
+		events = append(events, ev)
 		if e, ok := ev.(*RunEnd); ok {
 			end = e
 		}
 	}
-	return events, end, lastErr
+	if end == nil {
+		t.Fatal("no run_end")
+	}
+	return events, end, end.Err
 }
 
 func types(events []Event) []string {
@@ -238,9 +237,9 @@ func TestRunHooks(t *testing.T) {
 		wantAfter  int
 	}{
 		{name: "allow", wantOutput: "ABC", wantReason: ReasonDone, wantAfter: 1},
-		{name: "block", before: func(ToolCallInfo) *ToolDecision { return &ToolDecision{Block: true, Reason: "not allowed"} },
+		{name: "block", before: func(ToolCallInfo) *ToolDecision { return &ToolDecision{Action: Block, Reason: "not allowed"} },
 			wantOutput: "Error: not allowed", wantReason: ReasonDone, wantBlock: true, wantErr: true, wantAfter: 0},
-		{name: "block and terminate", before: func(ToolCallInfo) *ToolDecision { return &ToolDecision{Block: true, Terminate: true} },
+		{name: "block and terminate", before: func(ToolCallInfo) *ToolDecision { return &ToolDecision{Action: Block, Terminate: true} },
 			wantOutput: "Error: call blocked", wantReason: ReasonStopped, wantBlock: true, wantErr: true},
 		{name: "rewrite args", before: func(ToolCallInfo) *ToolDecision { return &ToolDecision{Args: json.RawMessage(`{"text":"xyz"}`)} },
 			wantOutput: "XYZ", wantReason: ReasonDone, wantAfter: 1},
@@ -490,7 +489,7 @@ func (failing) CreateStream(context.Context, openresponses.Request, openresponse
 func TestRunPreconditions(t *testing.T) {
 	cases := []struct {
 		name string
-		seq  func(func(Event, error) bool)
+		seq  func(func(Event) bool)
 		want error
 	}{
 		{"no model", Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, Config{}), ErrNoModel},
@@ -501,8 +500,10 @@ func TestRunPreconditions(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			events, _, err := collect(t, tc.seq)
-			if err == nil || (tc.want != nil && !errors.Is(err, tc.want)) || len(events) != 0 {
+			// A refused run is one run_end with ReasonError and nothing
+			// else.
+			events, end, err := collect(t, tc.seq)
+			if err == nil || (tc.want != nil && !errors.Is(err, tc.want)) || len(events) != 1 || end.Reason != ReasonError || end.RunID != "" {
 				t.Errorf("err = %v, events = %v", err, events)
 			}
 		})
@@ -556,7 +557,7 @@ func TestRunAbortMidTool(t *testing.T) {
 	if len(end.Pending) != 1 || end.Pending[0].Name != "upper" {
 		t.Errorf("pending = %v", end.Pending)
 	}
-	if canContinue(append(Transcript(nil), end.Items...)) {
+	if CanContinue(append(Transcript(nil), end.Items...)) {
 		t.Error("transcript ending in an unanswered call must not continue")
 	}
 }
@@ -594,10 +595,7 @@ func TestUnansweredCalls(t *testing.T) {
 func TestRunBreakCancels(t *testing.T) {
 	cfg := Config{Model: &echo.Adapter{}}
 	n := 0
-	for ev, err := range Run(context.Background(), nil, openresponses.Items{openresponses.UserText("a b c d e")}, cfg) {
-		if err != nil {
-			t.Fatal(err)
-		}
+	for ev := range Run(context.Background(), nil, openresponses.Items{openresponses.UserText("a b c d e")}, cfg) {
 		n++
 		if _, ok := ev.(*ItemUpdate); ok {
 			break
@@ -675,7 +673,7 @@ func TestRunRequestTemplateAndBeforeModelCall(t *testing.T) {
 }
 
 func TestRunDeferredCall(t *testing.T) {
-	deferAll := func(context.Context, ToolCallInfo) (*ToolDecision, error) { return &ToolDecision{Defer: true}, nil }
+	deferAll := func(context.Context, ToolCallInfo) (*ToolDecision, error) { return &ToolDecision{Action: Defer}, nil }
 	cfg := Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}, BeforeToolCall: deferAll}
 	events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("abc")}, cfg))
 	if err != nil {
@@ -711,14 +709,14 @@ func TestRunDeferredCall(t *testing.T) {
 	}
 
 	// In a mixed batch the other calls run and only the deferred one is
-	// pending; Block wins over Defer.
+	// pending; a blocked call is answered, not deferred.
 	cfg = Config{Model: &twoCalls{}, Tools: []agenttool.Tool{agenttool.New("a", "", upper), agenttool.New("b", "", upper), agenttool.New("c", "", upper)},
 		BeforeToolCall: func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
 			switch info.Call.Name {
 			case "a":
-				return &ToolDecision{Defer: true}, nil
+				return &ToolDecision{Action: Defer}, nil
 			case "c":
-				return &ToolDecision{Defer: true, Block: true, Reason: "refused"}, nil
+				return &ToolDecision{Action: Block, Reason: "refused"}, nil
 			}
 			return nil, nil
 		}}

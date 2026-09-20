@@ -111,7 +111,7 @@ func (a *Adapter) CreateStream(ctx context.Context, req openresponses.Request, s
 		return openresponses.PreviousResponseNotFound(req.PreviousResponseID)
 	}
 	transcript := agentturn.Transcript(append(openresponses.Items(nil), req.Input...))
-	if !endsWithPrompt(transcript) {
+	if !agentturn.CanContinue(transcript) {
 		return openresponses.InvalidRequest(openresponses.CodeInvalidValue, "input must end with a user message or a function_call_output", "input")
 	}
 	callerTools := functionTools(req.Tools)
@@ -135,14 +135,7 @@ func (a *Adapter) fullRun(ctx context.Context, req openresponses.Request, transc
 	cfg.Instructions = a.instructions(req.Instructions)
 	var usage openresponses.Usage
 	var end *agentturn.RunEnd
-	for ev, err := range agentturn.Continue(ctx, transcript, cfg) {
-		if err != nil && end == nil {
-			// A misuse yields no events; a failed run yields its run_end
-			// alongside the error and is handled below.
-			if ev == nil {
-				return err
-			}
-		}
+	for ev := range agentturn.Continue(ctx, transcript, cfg) {
 		switch e := ev.(type) {
 		case *agentturn.ItemStart:
 			if _, ok := e.Item.(*openresponses.FunctionCallOutput); ok || !a.emits(e.Item) {
@@ -325,19 +318,6 @@ func (a *Adapter) instructions(requested string) string {
 	default:
 		return a.cfg.Instructions + "\n\n" + requested
 	}
-}
-
-func endsWithPrompt(t agentturn.Transcript) bool {
-	if len(t) == 0 {
-		return false
-	}
-	switch v := t[len(t)-1].(type) {
-	case *openresponses.Message:
-		return v.Role != openresponses.RoleAssistant
-	case *openresponses.FunctionCallOutput:
-		return true
-	}
-	return false
 }
 
 func functionTools(tools openresponses.Tools) []*openresponses.FunctionTool {

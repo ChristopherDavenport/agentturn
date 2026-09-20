@@ -45,15 +45,11 @@ type echoArgs struct {
 	Text string `json:"text"`
 }
 
-func firstRequests(t *testing.T, seq func(func(agentturn.Event, error) bool)) ([]openresponses.Request, *agentturn.RunEnd, error) {
+func firstRequests(t *testing.T, seq func(func(agentturn.Event) bool)) ([]openresponses.Request, *agentturn.RunEnd, error) {
 	t.Helper()
 	var reqs []openresponses.Request
 	var end *agentturn.RunEnd
-	var lastErr error
-	for ev, err := range seq {
-		if err != nil {
-			lastErr = err
-		}
+	for ev := range seq {
 		switch e := ev.(type) {
 		case *agentturn.TurnStart:
 			reqs = append(reqs, e.Request)
@@ -61,7 +57,10 @@ func firstRequests(t *testing.T, seq func(func(agentturn.Event, error) bool)) ([
 			end = e
 		}
 	}
-	return reqs, end, lastErr
+	if end == nil {
+		t.Fatal("no run_end")
+	}
+	return reqs, end, end.Err
 }
 
 func TestTransformThroughRun(t *testing.T) {

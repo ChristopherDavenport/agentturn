@@ -43,7 +43,7 @@ func TestSendMessageCompletes(t *testing.T) {
 	if task.Status.State != a2a.TaskStateCompleted {
 		t.Fatalf("state = %s", task.Status.State)
 	}
-	if got := Text(task); got != "hello there" {
+	if got := taskText(task); got != "hello there" {
 		t.Errorf("text = %q", got)
 	}
 	if len(task.Artifacts) != 1 || partsText(task.Artifacts[0].Parts) != "hello there" {
@@ -118,8 +118,8 @@ func TestContextContinuesConversation(t *testing.T) {
 	if task.ContextID != first.ContextID || task.ID == first.ID {
 		t.Fatalf("second task = %+v", task)
 	}
-	if Text(task) != "second" {
-		t.Errorf("text = %q", Text(task))
+	if taskText(task) != "second" {
+		t.Errorf("text = %q", taskText(task))
 	}
 	tr, _ := store.Load(context.Background(), first.ContextID)
 	if len(tr) != 4 {
@@ -218,7 +218,7 @@ func TestCallerToolRoundTrip(t *testing.T) {
 	}})
 	task := sendTask(t, h, msg)
 	if task.Status.State != a2a.TaskStateInputRequired {
-		t.Fatalf("state = %s (%s)", task.Status.State, Text(task))
+		t.Fatalf("state = %s (%s)", task.Status.State, taskText(task))
 	}
 	if task.Status.Message == nil || len(task.Status.Message.Parts) != 1 {
 		t.Fatalf("status message = %+v", task.Status.Message)
@@ -259,8 +259,8 @@ func TestCallerToolRoundTrip(t *testing.T) {
 	if done.ID != task.ID || done.Status.State != a2a.TaskStateCompleted {
 		t.Fatalf("resumed task = %+v", done)
 	}
-	if Text(done) != "Tool result: found" {
-		t.Errorf("text = %q", Text(done))
+	if taskText(done) != "Tool result: found" {
+		t.Errorf("text = %q", taskText(done))
 	}
 	tr, _ = store.Load(context.Background(), task.ContextID)
 	if len(tr) != 4 {
@@ -271,8 +271,8 @@ func TestCallerToolRoundTrip(t *testing.T) {
 func TestFailedRun(t *testing.T) {
 	h := a2asrv.NewHandler(New(agentturn.Config{Model: failing{}}))
 	task := sendTask(t, h, userMessage("x"))
-	if task.Status.State != a2a.TaskStateFailed || !strings.Contains(Text(task), "down") {
-		t.Errorf("task = %s %q", task.Status.State, Text(task))
+	if task.Status.State != a2a.TaskStateFailed || !strings.Contains(taskText(task), "down") {
+		t.Errorf("task = %s %q", task.Status.State, taskText(task))
 	}
 	// Bad metadata is rejected before the run as invalid params, which
 	// the SDK reports to the caller as an error rather than a task.
@@ -470,7 +470,7 @@ func TestMixedBatchRunsLocalToolsAndDefersCallerTools(t *testing.T) {
 
 	task := sendTask(t, h, userMessage("go"))
 	if task.Status.State != a2a.TaskStateInputRequired {
-		t.Fatalf("state = %s (%s)", task.Status.State, Text(task))
+		t.Fatalf("state = %s (%s)", task.Status.State, taskText(task))
 	}
 	if len(task.Status.Message.Parts) != 1 {
 		t.Fatalf("pending parts = %d, want only the caller's call", len(task.Status.Message.Parts))
@@ -508,8 +508,8 @@ func TestMixedBatchRunsLocalToolsAndDefersCallerTools(t *testing.T) {
 		"type": "function_call_output", "call_id": dp.Data["call_id"], "output": "remote-ran",
 	}})
 	done := sendTask(t, h, answer)
-	if done.Status.State != a2a.TaskStateCompleted || Text(done) != "local-ran+remote-ran" {
-		t.Errorf("resumed = %s %q", done.Status.State, Text(done))
+	if done.Status.State != a2a.TaskStateCompleted || taskText(done) != "local-ran+remote-ran" {
+		t.Errorf("resumed = %s %q", done.Status.State, taskText(done))
 	}
 }
 
