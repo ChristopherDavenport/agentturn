@@ -570,11 +570,40 @@ func TestChildSessionIDIsDerivedFromTheCall(t *testing.T) {
 		t.Errorf("replayed child header = %+v", h)
 	}
 
-	// A second run of the same call continues the child session from a
-	// new root rather than minting a second session.
-	call := agenttool.Call{ID: "call_retry", Args: json.RawMessage(`{"input":"hi"}`)}
+	// A second run under the same call continues the child session at
+	// its leaf rather than minting a second session or starting a new
+	// root: a subagent that is messaged again answers from its own
+	// context, so its run belongs after the one before it.
+	call := agenttool.Call{ID: "call_again", Args: json.RawMessage(`{"input":"hi"}`)}
 	for range 2 {
 		if _, err := observed.Execute(context.Background(), call); err != nil {
+			t.Fatal(err)
+		}
+	}
+	again, err := store.Open(context.Background(), agentsession.SubsessionID(s.ID(), "call_again"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := roots(again); n != 1 {
+		t.Errorf("second run under one call opened %d roots in %q", n, entryTypes(again))
+	}
+	if n := len(runsOf(t, again)); n != 2 {
+		t.Errorf("runs on the child session = %d", n)
+	}
+	// Both runs hold a response, and the path to the leaf verifies.
+	if n := verifyAll(t, again); n != 2 {
+		t.Errorf("child responses = %d", n)
+	}
+
+	// A host that means a retry from a clean start says so, and the
+	// leaf is reset as it was before.
+	retryCall := agenttool.Call{ID: "call_retry", Args: json.RawMessage(`{"input":"hi"}`)}
+	for i := range 2 {
+		ctx := context.Background()
+		if i == 1 {
+			ctx = agent.ContextWithRetry(ctx)
+		}
+		if _, err := observed.Execute(ctx, retryCall); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -582,16 +611,9 @@ func TestChildSessionIDIsDerivedFromTheCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	roots := 0
-	for _, e := range retry.Entries() {
-		if e.Base().Parent == "" {
-			roots++
-		}
+	if n := roots(retry); n != 2 {
+		t.Errorf("retried child has %d roots in %q", n, entryTypes(retry))
 	}
-	if roots != 2 {
-		t.Errorf("retried child has %d roots in %q", roots, entryTypes(retry))
-	}
-	// Both roots hold a response, and the path to the leaf verifies.
 	if n := verifyAll(t, retry); n != 2 {
 		t.Errorf("retried child responses = %d", n)
 	}

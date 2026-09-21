@@ -205,7 +205,11 @@ produces them. An agent stands in three places inside another system:
   loop points its `Model` at it through `Client.AsAdapter`.
 - **As a tool.** `tools/agent` wraps a `Config` as a `Tool`: a child run
   on a fresh transcript, progress through `Call.OnUpdate`, the final
-  text as the output and a `ChildInfo` in `Result.Details`.
+  text as the output and a `ChildInfo` in `Result.Details`. The child
+  runs as an `Agent`, and `WithSpawn` hands it to the host before the
+  run, so a hub can steer it, abort it without cutting its siblings, or
+  prompt it again once the tool has returned; `WithRunContext` gives
+  the child run a context of the host's making.
 - **As a peer.** `front/a2a` exposes a loop to A2A callers; `tools/a2a`
   wraps a remote A2A agent as a `Tool`.
 
@@ -253,9 +257,19 @@ tool preflight waits for the assistant items to be durable.
 ```go
 rec, s, err := session.Start(ctx, store, agentsession.Header{CWD: cwd})
 defer rec.Attach(agent)()
-specialist := agent.New(childCfg, agent.WithObserver(rec.Observe))
+specialist := agent.New(childCfg,
+	agent.WithObserver(rec.Observe),
+	agent.WithRunContext(rec.ChildContext))
 c := compact.NewLocal(model, compact.WithOnFold(rec.Fold))
 ```
+
+A child session inherits its parent's working directory, so a store
+that buckets by directory files it with its parent, and `ChildContext`
+puts the child's session ID on the context the child run is given, so a
+layer inside the child that attributes its writes to a session names
+the child's rather than the parent's (`session.SessionIDFromContext`).
+A second run under one call continues the child's session at its leaf;
+`agent.ContextWithRetry` says the other thing.
 
 ## Design
 

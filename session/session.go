@@ -137,7 +137,24 @@
 // Observe finds the parent run through the run ID the loop attaches to
 // every tool call's context, and the call through agenttool.CallFrom,
 // so the same function serves every level of nesting: a child's child
-// is linked from the child's session.
+// is linked from the child's session. The child's session inherits the
+// parent's working directory, so a store that buckets sessions by
+// directory files it with its parent, and a second run under the same
+// call continues it at its leaf rather than starting a new root, since
+// a subagent that is messaged again answers from its own context;
+// agent.ContextWithRetry says the other thing.
+//
+// [Recorder.ChildContext] puts the child's session ID on the context
+// the child run is given, so a layer inside the child that attributes
+// its writes to a session names the child's rather than the parent's:
+//
+//	specialist := agent.New(childCfg,
+//		agent.WithObserver(rec.Observe),
+//		agent.WithRunContext(rec.ChildContext))
+//
+// The host does the same for its own runs with
+// [ContextWithSessionID](ctx, rec.SessionID()); [SessionIDFromContext]
+// reads whichever is in force.
 //
 // # Request hashes and compaction
 //
@@ -288,6 +305,10 @@ type writer struct {
 	rec *Recorder
 	id  string
 	cfg *agentturn.Config
+	// cwd is the working directory the session's header names, which a
+	// child session inherits: a child runs in its parent's process and
+	// its parent's directory, and a store buckets sessions by it.
+	cwd string
 
 	settings agentsession.Settings
 	// wroteConfig is set once a config entry is on the path, written by
@@ -440,6 +461,7 @@ func Start(ctx context.Context, store agentsession.Store, h agentsession.Header,
 	if r.harness == nil {
 		r.harness = s.Header().Harness
 	}
+	r.root.cwd = s.Header().CWD
 	return r, s, nil
 }
 
@@ -484,6 +506,7 @@ func resume(s *agentsession.Session, store agentsession.Store, opts []Option) (*
 	if r.harness == nil {
 		r.harness = s.Header().Harness
 	}
+	r.root.cwd = s.Header().CWD
 	if err := r.root.seed(s); err != nil {
 		return nil, nil, err
 	}
@@ -604,6 +627,57 @@ func hasConfig(entries []agentsession.Entry) bool {
 		}
 	}
 	return false
+}
+
+type sessionIDKey struct{}
+
+// ContextWithSessionID attaches the ID of the session a run is being
+// written to. A host puts its own recorder's on the context it prompts
+// with; [Recorder.ChildContext] puts a child's on the context the child
+// run is given.
+func ContextWithSessionID(ctx context.Context, sessionID string) context.Context {
+	return context.WithValue(ctx, sessionIDKey{}, sessionID)
+}
+
+// SessionIDFromContext returns the ID of the session the run on ctx is
+// written to, or "" when nothing put one there. It is what a layer that
+// attributes its writes to a session reads, beside
+// agentturn.RunIDFromContext: inside a child run it names the child's
+// session, which the recorder creates and the host never otherwise
+// sees.
+func SessionIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(sessionIDKey{}).(string)
+	return id
+}
+
+// ChildContext returns ctx carrying the ID of the session the recorder
+// will write a child run started under callID to, for
+// agent.WithRunContext:
+//
+//	specialist := agent.New(childCfg,
+//		agent.WithObserver(rec.Observe),
+//		agent.WithRunContext(rec.ChildContext))
+//
+// The ID is derived from the session of the run on the context, the
+// parent's, and the call, as the child's own header is, so the child's
+// tools and hooks can attribute what they write to the session that
+// holds the run making the write. A recorder that has to mint an ID
+// instead, because the store could neither create nor reopen the
+// derived one, writes that child elsewhere; the context then names a
+// session the run did not go to, which is the one case this is wrong
+// and the one where nothing was recorded properly anyway.
+func (r *Recorder) ChildContext(ctx context.Context, callID string) context.Context {
+	if callID == "" {
+		return ctx
+	}
+	r.mu.Lock()
+	parent := r.root
+	if p, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
+		parent = p
+	}
+	id := parent.id
+	r.mu.Unlock()
+	return ContextWithSessionID(ctx, agentsession.SubsessionID(id, callID))
 }
 
 // SessionID returns the ID of the session being written.
@@ -738,15 +812,26 @@ func (r *Recorder) Fold(ctx context.Context, f compact.Fold) error {
 	return w.fold(context.WithoutCancel(ctx), f)
 }
 
-// newChild creates a session under parent and returns its writer. With
-// a call ID the session's ID is derived from the parent's and the
-// call's, so a reader can compute it from the parent's link alone, and
-// a second child for the same call, a retry, continues the existing
-// session from a new root. live says the child is written from its
-// events, so the header promises the record entries; a child replayed
-// from its items promises nothing.
+// newChild creates a session under parent and returns its writer. The
+// header names the parent's session, the call and the parent's working
+// directory, which is the child's too: it runs in the same process and
+// the same directory, and a store that buckets sessions by directory
+// would otherwise file every child under none. With a call ID the
+// session's ID is derived from the parent's and the call's, so a
+// reader can compute it from the parent's link alone.
+//
+// A second run under the same call continues the existing session from
+// its leaf: a subagent that is messaged again answers from its own
+// context, so its run belongs after the one before it, with the
+// hashes that follow from that. A host that means a retry from a clean
+// start says so with agent.ContextWithRetry, and the leaf is reset as
+// for a fresh child.
+//
+// live says the child is written from its events, so the header
+// promises the record entries; a child replayed from its items
+// promises nothing.
 func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, live bool) (*writer, error) {
-	h := agentsession.Header{ParentSession: parent.id, Harness: r.harness, SpawnedBy: callID}
+	h := agentsession.Header{ParentSession: parent.id, Harness: r.harness, SpawnedBy: callID, CWD: parent.cwd}
 	if live {
 		h.Records = append([]string(nil), agentsession.AllRecords...)
 	}
@@ -756,18 +841,28 @@ func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, 
 	s, err := r.store.Create(ctx, h)
 	if errors.Is(err, agentsession.ErrSessionExists) {
 		if s, err = r.store.Open(ctx, h.ID); err == nil {
-			s.ResetLeaf()
-			return newWriter(r, s.ID()), nil
+			w := newWriter(r, s.ID())
+			w.cwd = parent.cwd
+			if agent.RetryFromContext(ctx) {
+				s.ResetLeaf()
+				return w, nil
+			}
+			if err := w.seed(s); err != nil {
+				return nil, err
+			}
+			return w, nil
 		}
 		// The store cannot reopen it; a fresh session still records
-		// the retry, under a minted ID.
+		// the run, under a minted ID.
 		h.ID = ""
 		s, err = r.store.Create(ctx, h)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("session: create child session: %w", err)
 	}
-	return newWriter(r, s.ID()), nil
+	w := newWriter(r, s.ID())
+	w.cwd = parent.cwd
+	return w, nil
 }
 
 // runID returns the run an event belongs to.

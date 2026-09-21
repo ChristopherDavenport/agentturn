@@ -7,6 +7,38 @@ versions may break the API.
 
 ## Unreleased
 
+- `tools/agent`: the child runs as an `agentturn.Agent` rather than
+  inside the low-level `Run`, and `WithSpawn(fn)` hands it to the host,
+  keyed by the call, before the run starts: a host can steer a running
+  child, abort one without cutting its siblings or the parent, and
+  prompt it again once the tool has returned, which is what a hub that
+  fans work out to subagents does. Nothing an observer sees changes,
+  except that every event is now a barrier, as it is for the parent, so
+  a child's dispatch is durable before its tool runs. The observer
+  stays subscribed after the call, so a later run the host starts is
+  recorded into the same child session. (#72)
+- `tools/agent`: `WithRunContext(fn)` gives the child run a context of
+  the host's making, derived from the call's; `ContextWithConfig` and
+  `ContextWithRetry` are exported for a host that runs a child agent
+  itself and observes it with the same function. (#72, #73)
+- **Fixed**: a child session was filed under no working directory, so
+  every child landed in a store's `default` bucket and no listing
+  scoped to a directory ever showed one, although the child ran in its
+  parent's process and its parent's directory. The child header
+  inherits the parent's `CWD`. (#66)
+- `session`: `Recorder.ChildContext`, for `agent.WithRunContext`, puts
+  the ID of the session a child run will be written to on the context
+  the child is given, and `SessionIDFromContext` reads it, so a layer
+  that attributes its writes to a session, a memory journal for one,
+  names the child's session rather than the parent's.
+  `ContextWithSessionID` is the same for a host's own runs. (#63)
+- **Fixed**: a second run under one call always reset the child
+  session's leaf, which a revived subagent is not: it answers from its
+  own context, and the new root rebuilt one item of the seven its
+  request carried, with no hash. A second run continues the session at
+  its leaf; a host that means a retry from a clean start says so with
+  `agent.ContextWithRetry`. (#73)
+
 - `Answer.By`, set with `Answer.WithBy`, names who decided an answer to
   a pending call, in the session format's terms: `human` for a person
   at a prompt, `policy` for a rule that answered on its own, `agent`
