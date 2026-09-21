@@ -47,6 +47,13 @@
 // subscriber has returned for the assistant item, and [Agent.Prompt]
 // settles only after the run_end subscribers finish.
 //
+// # Hooks
+//
+// Every hook on [Config] is one field, so two layers that each want one
+// silently lose an assignment to each other. [ChainBeforeModelCall] and
+// its siblings join them in one place, with the order written where a
+// reader can see it.
+//
 // # Composition
 //
 // The loop never learns a sub-agent concept. It knows a [Model] and a
