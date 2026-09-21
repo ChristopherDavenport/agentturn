@@ -161,8 +161,10 @@ versions may break the API.
   no items to strip and read the items the cut call produced as its
   input, and the recorded hash mismatched. Every interrupted run of a
   model that completes an item before the cut, a reasoning model for
-  one, was a `verify` failure. The failed response carries the response
-  ID the writer saw on the items it wrote for that call. (#69)
+  one, was a `verify` failure. The failed response carries the ID of
+  the response the stream named, learned from every item event it
+  raised, so an interrupted turn names the response it was cut out of
+  whether or not the attempt ever appended anything. (#69)
 - `session`: `Recorder.Rebase` with the empty entry ID is the reset a
   product's `/clear` makes: the session's leaf is reset so the next
   append starts a new root, and the recorder forgets the settings, the

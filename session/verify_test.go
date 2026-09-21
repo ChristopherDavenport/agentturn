@@ -288,6 +288,19 @@ func TestInterruptedReasoningRunVerifies(t *testing.T) {
 	if hashed(s) != 1 {
 		t.Errorf("the interrupted call carries no hash: %s", entryTypes(s))
 	}
+	// The attempt never committed, so nothing it produced is on the
+	// path; the failed response still names the response it was cut
+	// out of, which is the only record that the call reached a server
+	// at all.
+	var failed *agentsession.ResponseEntry
+	for _, e := range s.Entries() {
+		if r, ok := e.(*agentsession.ResponseEntry); ok && r.Status == openresponses.ResponseStatusFailed {
+			failed = r
+		}
+	}
+	if failed == nil || failed.ResponseID == "" {
+		t.Errorf("failed response = %+v", failed)
+	}
 	if got := entryTypes(s); strings.Contains(got, "item:reasoning") {
 		t.Errorf("the attempt that never answered left an item: %s", got)
 	}

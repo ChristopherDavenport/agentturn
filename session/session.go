@@ -83,10 +83,10 @@
 //   - run_end: a response entry with status failed, the error, the
 //     request hash and the ID of the response the stream had named,
 //     when a call was still in flight because the model failed or the
-//     run was aborted before the stream produced a response; the ID is
-//     what lets the context algorithm strip the items that call
-//     produced, a reasoning item completed before the cut for one,
-//     rather than read them as its input; then the run entry with
+//     run was aborted before the stream produced a response; the ID
+//     names the response the call was cut out of and lets the context
+//     algorithm strip the items it appended, rather than read them as
+//     its input; then the run entry with
 //     phase end, the reason in the
 //     format's terms and the IDs of the run's calls left without an
 //     output. The loop's reasons map onto the format's cascade: done
@@ -381,10 +381,10 @@ type writer struct {
 	// inFlight is set from turn_start to the response; pending is the
 	// hash of the request in flight, empty when the recorder cannot
 	// stand behind it; started is when it was sent; inFlightID is the
-	// ID of the response streaming it, learned from the items it
-	// produced and appended, so a call that never reached its response
-	// entry can still be written naming the response its items belong
-	// to.
+	// ID of the response streaming it, learned from every item event
+	// the stream raises, an item the attempt held and never committed
+	// included, so a call that never reached its response entry is
+	// still written naming the response it was cut out of.
 	inFlight   bool
 	pending    string
 	started    time.Time
@@ -1005,6 +1005,16 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 			return err
 		}
 	}
+	if w.inFlight {
+		// The stream names its response on every item event, an item
+		// the attempt held and never committed included, so a call cut
+		// off before its response entry is written naming the response
+		// it was cut out of: the interrupted turn of a reasoning
+		// model, which opens its reasoning item before anything else.
+		if id := streamedResponseID(ev); id != "" {
+			w.inFlightID = id
+		}
+	}
 	switch e := ev.(type) {
 	case *agentturn.RunStart:
 		return w.runStart(ctx, e)
@@ -1334,16 +1344,6 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		}
 		entry = e
 	}
-	if w.inFlight && responseID != "" {
-		// The stream named the response before it ended. A call cut off
-		// after this item, a message completed before the cut or a
-		// function call the model finished writing, is written as a
-		// failed response carrying the ID, so the context algorithm
-		// strips the items it produced rather than reading them as its
-		// input. An item the attempt held and never committed is not
-		// written at all, so it needs no stripping.
-		w.inFlightID = responseID
-	}
 	id, err := w.append(ctx, entry)
 	if err != nil {
 		return err
@@ -1359,6 +1359,20 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		w.close(v.CallID)
 	}
 	return nil
+}
+
+// streamedResponseID is the response an item event names, and "" for
+// an event that names none.
+func streamedResponseID(ev agentturn.Event) string {
+	switch e := ev.(type) {
+	case *agentturn.ItemStart:
+		return e.ResponseID
+	case *agentturn.ItemUpdate:
+		return e.ResponseID
+	case *agentturn.ItemEnd:
+		return e.ResponseID
+	}
+	return ""
 }
 
 // close removes a call from the run's open list.
