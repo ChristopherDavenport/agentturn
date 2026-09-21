@@ -6,7 +6,11 @@ type, one tool contract, hooks and queues. Everything else is a front
 that feeds prompts in and consumes events out, or a subscriber.
 
 - The transcript is `openresponses.Items`. What a session stores, what
-  the model receives and what a front renders are the same bytes.
+  the model receives and what a front renders are the same bytes. An
+  item a harness adds for the model and not for the user, an interrupt
+  report or an advisory, is wrapped in `agentturn.Hidden` where it is
+  appended: the model still reads it, and its item events and its
+  session entry say a renderer should not show it.
 - The model is any `openresponses.Streamer`: a remote server through
   `Client.AsAdapter`, a local adapter, or another agent served by
   `front/responses`.
@@ -139,14 +143,20 @@ if err == nil && end.Reason == agentturn.ReasonInputRequired {
 	var answers []agentturn.Answer
 	for _, call := range end.Pending {
 		if approved(call) {
-			answers = append(answers, agentturn.Approve(call.CallID))
+			answers = append(answers, agentturn.Approve(call.CallID).WithBy(agentsession.ByHuman))
 		} else {
-			answers = append(answers, agentturn.Output(openresponses.NewFunctionCallOutput(call.CallID, "denied by the user")))
+			answers = append(answers, agentturn.Output(openresponses.NewFunctionCallOutput(call.CallID, "denied by the user")).WithBy(agentsession.ByHuman))
 		}
 	}
 	end, err = a.Resume(ctx, answers...)
 }
 ```
+
+`Answer.WithBy` says who decided, in the session format's terms
+(`human`, `policy`, `agent`), and `WithNote` what they said; a recorder
+writes both on the decision. There is no default, since a policy engine
+answers through `Resume` as often as a person does, so an answer that
+names nobody is recorded as an anonymous decision.
 
 The same path repairs a run that was aborted mid-batch: the cut-off
 calls are on `end.Pending`, and an agent built with

@@ -46,7 +46,10 @@
 //     the request hash, so a call a BeforeModelCall guard refused is on
 //     the record and distinct from one that was made and failed.
 //   - item_end: an item entry; an item streamed by the model carries its
-//     response ID. An item the filter in force would hide from the
+//     response ID, and an item the caller marked with agentturn.Hidden
+//     carries visible false, the format's word for an item that is part
+//     of the model context and that a renderer should hide. An item the
+//     filter in force would hide from the
 //     model, an app-only extension item, is written as a custom entry
 //     instead so the path rebuilds exactly the input that was sent. A
 //     function_call_output for a call the path holds no dispatch and no
@@ -58,12 +61,17 @@
 //   - tool_start: the call's decision when there is one to record, then
 //     its dispatch. A BeforeToolCall that blocked the call is a reject
 //     decision with its reason and no dispatch; one that deferred it is
-//     a hold and no dispatch; one that rewrote the arguments, or an
-//     approval through Agent.Resume of a held call, is a proceed
-//     decision carrying the arguments the tool ran with when they
-//     differ from the model's. The dispatch follows every decision that
-//     lets the call run, and stands alone for a call nothing decided
-//     about. The decision's by is ToolDecision.By, policy when empty.
+//     a hold carrying the same reason, the rule that raised the prompt,
+//     and no dispatch; one that rewrote the arguments, or an approval
+//     through Agent.Resume of a held call, is a proceed decision
+//     carrying the arguments the tool ran with when they differ from
+//     the model's. The dispatch follows every decision that lets the
+//     call run, and stands alone for a call nothing decided about. The
+//     decision's by is ToolDecision.By, which Answer.By sets for an
+//     approval, and policy for a hook's decision about a call nothing
+//     was holding; an answer that names nobody is written with no by,
+//     since a policy engine answers through Resume as often as a person
+//     does.
 //   - response_end: the response entry with status, usage, error and the
 //     request hash, after the items it produced and before any tool
 //     output of the turn.
@@ -828,7 +836,7 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 	case *agentturn.ModelBlocked:
 		return w.blocked(ctx, e)
 	case *agentturn.ItemEnd:
-		return w.item(ctx, e.Item, e.ResponseID)
+		return w.item(ctx, e.Item, e.ResponseID, e.Hidden)
 	case *agentturn.ResponseEnd:
 		return w.response(ctx, e)
 	case *agentturn.ToolStart:
@@ -1025,8 +1033,10 @@ func (w *writer) settle(ctx context.Context, req openresponses.Request) error {
 // item writes an item entry, or a custom entry for an item the model
 // did not see, and records its ID against the working transcript. A
 // function call is remembered so its records can name the entry; an
-// output answering a held call is preceded by the reject that ends it.
-func (w *writer) item(ctx context.Context, item openresponses.Item, responseID string) error {
+// output the caller wrote for a call nothing dispatched is preceded by
+// the reject that ends it; an item the caller marked with
+// agentturn.Hidden is written with visible false.
+func (w *writer) item(ctx context.Context, item openresponses.Item, responseID string, hidden bool) error {
 	if item == nil {
 		return nil
 	}
@@ -1040,7 +1050,7 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 			// left, is the same thing to a reader and gets the same
 			// decision, which is what the format's record check asks
 			// for.
-			dec := agentsession.NewDecision(out.CallID, c.entry, agentsession.VerdictReject, "").WithReason(outputText(out))
+			dec := agentsession.NewDecision(out.CallID, c.entry, agentsession.VerdictReject, agentturn.DeciderFromContext(ctx, out.CallID)).WithReason(outputText(out))
 			if _, err := w.append(ctx, dec); err != nil {
 				return err
 			}
@@ -1048,15 +1058,23 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		}
 	}
 	var entry agentsession.Entry
-	hidden := responseID == "" && len(w.filter()(agentturn.Transcript{item})) == 0
-	if hidden {
+	// An item the filter in force drops never reached the model, so it
+	// is outside the context and outside the item entries; the hidden
+	// mark is about a renderer and adds nothing to it.
+	appOnly := responseID == "" && len(w.filter()(agentturn.Transcript{item})) == 0
+	if appOnly {
 		raw, err := json.Marshal(item)
 		if err != nil {
 			return fmt.Errorf("session: encode %s item: %w", item.ItemType(), err)
 		}
 		entry = &agentsession.CustomEntry{NS: item.ItemType(), Data: raw}
 	} else {
-		entry = &agentsession.ItemEntry{Item: item, ResponseID: responseID}
+		e := &agentsession.ItemEntry{Item: item, ResponseID: responseID}
+		if hidden {
+			visible := false
+			e.Visible = &visible
+		}
+		entry = e
 	}
 	if w.inFlight && responseID != "" {
 		// The stream named the response before it ended. A call cut off
@@ -1071,7 +1089,7 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 	}
 	w.items = append(w.items, id)
 	w.values = append(w.values, item)
-	w.custom = append(w.custom, hidden)
+	w.custom = append(w.custom, appOnly)
 	switch v := item.(type) {
 	case *openresponses.FunctionCall:
 		w.calls[v.CallID] = &callRecord{entry: id, args: v.Arguments}
@@ -1134,7 +1152,13 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 			c.held, c.rejected = false, true
 			return nil
 		case agentturn.Defer:
-			if _, err := w.append(ctx, agentsession.NewDecision(e.CallID, c.entry, agentsession.VerdictHold, by)); err != nil {
+			// The reason is which rule raised the prompt, which is what
+			// an auditor asks of a hold; the model never sees it.
+			hold := agentsession.NewDecision(e.CallID, c.entry, agentsession.VerdictHold, by)
+			if d.Reason != "" {
+				hold.WithReason(d.Reason)
+			}
+			if _, err := w.append(ctx, hold); err != nil {
 				return err
 			}
 			c.held = true
@@ -1366,7 +1390,7 @@ func (w *writer) child(ctx context.Context, callID string, info agent.ChildInfo)
 		if isModelOutput(item) {
 			responseID = info.RunID
 		}
-		if err := cw.item(ctx, item, responseID); err != nil {
+		if err := cw.item(ctx, item, responseID, false); err != nil {
 			return err
 		}
 	}

@@ -7,6 +7,34 @@ versions may break the API.
 
 ## Unreleased
 
+- `Answer.By`, set with `Answer.WithBy`, names who decided an answer to
+  a pending call, in the session format's terms: `human` for a person
+  at a prompt, `policy` for a rule that answered on its own, `agent`
+  for another model. It rides on the `ToolDecision` the loop
+  synthesises for an approval and, for an output the caller wrote,
+  which raises no tool_start, on the run's context, where the recorder
+  finds it with `agentturn.DeciderFromContext`; `Agent.Resume` attaches
+  it and `ContextWithDeciders` is there for a host driving the
+  low-level `Run`. There is no default: a policy engine answers through
+  Resume as often as a person does, so an answer that names nobody is
+  recorded as an anonymous decision rather than guessed at. (#65)
+- `agentturn.Hidden(item)` marks an item as part of the model's context
+  that a renderer should hide: a stream rule's interrupt report, an
+  advisory, a notice a keyword added. It is a wrapper the loop strips
+  as it appends, so the transcript, the request and every type switch
+  see the item itself; `ItemStart.Hidden` and `ItemEnd.Hidden` carry
+  the mark, and `session` writes the entry with the format's `visible`
+  false. `Unhide` unwraps one. It works wherever the loop appends a
+  caller's item: `Prompt`, `Steer`, `FollowUp`, the prompts of `Run`
+  and what `BeforeTurn` returns. (#75)
+- **Fixed**: `session` recorded a held call without the reason the hook
+  gave, although the reject arm two lines away wrote one, so a session
+  said three calls were held and nothing said which rule raised the
+  prompt. A hold carries the decision's reason; the model still sees
+  nothing for a deferred call. `ToolDecision.Reason` documents that it
+  is the reason of a decision whatever the action, not only the message
+  a block shows the model. (#62)
+
 - **Fixed**: `session` wrote the reject decision that carries an output
   the caller supplied only for a call it was holding, so a call seeded
   from a branch whose dispatch and hold are on the path it left ended

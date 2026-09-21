@@ -298,7 +298,12 @@ const (
 type ToolDecision struct {
 	// Action allows, blocks or defers the call.
 	Action ToolAction
-	// Reason is the message the model sees when Action is Block.
+	// Reason is the message the model sees when Action is Block, and
+	// the reason a session recorder writes on the decision whatever the
+	// action: which rule raised the prompt for a Defer, which one
+	// refused the call for a Block. The model never sees the reason of
+	// a deferred call; it is for the record and for the front that asks
+	// the user.
 	Reason string
 	// Terminate hints the loop to stop after the batch, as a tool result
 	// would. It composes with Allow and Block.
@@ -308,7 +313,9 @@ type ToolDecision struct {
 	// By names who decided, for the record: the session format knows
 	// "human" for a person the hook waited on, "policy" for a rule it
 	// evaluated on its own and "agent" for another model. Empty is read
-	// as policy. The loop does not use it.
+	// as policy for a decision about a call nothing was holding, and as
+	// nobody for the approval of a held call, where [Answer.By] is what
+	// says who answered. The loop does not use it.
 	By string
 	// Note is text the model sees with the result: it is appended after
 	// the batch's outputs as a developer message, so the model reads the

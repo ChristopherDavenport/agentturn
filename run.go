@@ -179,6 +179,7 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 type transcriptKey struct{}
 type runIDKey struct{}
 type triggerKey struct{}
+type decidersKey struct{}
 
 // ContextWithTrigger attaches a [Trigger] to ctx. A run started with
 // that context, through [Run], [Continue] or an [Agent], carries it on
@@ -193,6 +194,32 @@ func ContextWithTrigger(ctx context.Context, t Trigger) context.Context {
 func TriggerFromContext(ctx context.Context) Trigger {
 	t, _ := ctx.Value(triggerKey{}).(Trigger)
 	return t
+}
+
+// ContextWithDeciders attaches who decided the answer to each pending
+// call, by call ID, in the session format's terms ("human", "policy",
+// "agent"). [Agent.Resume] does it from the [Answer.By] of the answers
+// it was given, so a subscriber writing the record of an output the
+// caller supplied, which raises no tool_start to carry a decision, can
+// say who wrote it. A host driving the low-level [Run] with the
+// outputs as prompts attaches it itself. The loop reads nothing from
+// it.
+func ContextWithDeciders(ctx context.Context, by map[string]string) context.Context {
+	if len(by) == 0 {
+		return ctx
+	}
+	out := make(map[string]string, len(by))
+	for k, v := range by {
+		out[k] = v
+	}
+	return context.WithValue(ctx, decidersKey{}, out)
+}
+
+// DeciderFromContext returns who the caller named as the decider of the
+// answer for callID, or "" when nobody was named.
+func DeciderFromContext(ctx context.Context, callID string) string {
+	by, _ := ctx.Value(decidersKey{}).(map[string]string)
+	return by[callID]
 }
 
 // ContextWithTranscript attaches a transcript to ctx. The loop does this
@@ -339,12 +366,13 @@ func stopped(cause StopCause, err error) error {
 
 // approval is a pending call the caller approved through Agent.Resume:
 // it runs before the first model call of the run, with args in place of
-// the call's own when set, and note, when set, appended after the
-// batch's outputs.
+// the call's own when set, note, when set, appended after the batch's
+// outputs, and by naming who approved it, for the record.
 type approval struct {
 	call *openresponses.FunctionCall
 	args json.RawMessage
 	note string
+	by   string
 }
 
 // run drives the loop and returns the RunEnd. terminate says the caller
@@ -563,18 +591,22 @@ func terminates(results []agenttool.Result) (StopCause, bool) {
 }
 
 // appendItems adds items the loop did not stream (prompts, queued
-// messages, tool outputs) to the transcript with their item events.
+// messages, tool outputs) to the transcript with their item events. An
+// item the caller marked with [Hidden] is unwrapped here, so the
+// transcript and the request hold the item itself and only its events
+// say it is hidden.
 func (r *runner) appendItems(items openresponses.Items) error {
 	for _, item := range items {
 		if item == nil {
 			continue
 		}
-		if err := r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item}); err != nil {
+		item, hidden := Unhide(item)
+		if err := r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden}); err != nil {
 			return err
 		}
 		r.transcript = append(r.transcript, item)
 		r.added = append(r.added, item)
-		if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item}); err != nil {
+		if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden}); err != nil {
 			return err
 		}
 	}
@@ -948,7 +980,7 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 		if ap.note != "" {
 			p.note = openresponses.UserText(ap.note)
 		}
-		if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args, Decision: &ToolDecision{Args: ap.args, Note: ap.note}}); err != nil {
+		if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args, Decision: &ToolDecision{Args: ap.args, Note: ap.note, By: ap.by}}); err != nil {
 			return nil, err
 		}
 		if err := r.check(ctx, p, false); err != nil {

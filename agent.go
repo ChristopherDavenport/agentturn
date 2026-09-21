@@ -217,8 +217,9 @@ func (a *Agent) Continue(ctx context.Context) (*RunEnd, error) {
 
 // Answer resolves one pending call for [Agent.Resume]: an output the
 // caller produced, or an approval that runs the call inside the loop.
-// Build one with [Output], [Approve], [ApproveWith] or [Refuse], and
-// attach what the user said with [Answer.WithNote].
+// Build one with [Output], [Approve], [ApproveWith] or [Refuse],
+// attach what the user said with [Answer.WithNote] and who said it
+// with [Answer.WithBy].
 type Answer struct {
 	// CallID names the pending call.
 	CallID string
@@ -238,6 +239,15 @@ type Answer struct {
 	// should end the turn so the user can say what to do instead. The
 	// outputs are still appended, so the transcript stays a valid input.
 	Terminate bool
+	// By names who decided this answer, for the record: the session
+	// format knows "human" for a person at a prompt, "policy" for a
+	// rule that answered on its own and "agent" for another model. It
+	// rides on the ToolDecision the loop synthesises for an approval,
+	// and a session recorder writes it on the decision for an answer of
+	// either kind. There is no default: a policy engine answers through
+	// Resume as often as a person does, so an answer that names nobody
+	// is recorded as an anonymous decision rather than guessed at.
+	By string
 }
 
 // Output answers a pending call with out.
@@ -270,13 +280,21 @@ func (a Answer) WithNote(note string) Answer {
 	return a
 }
 
+// WithBy returns the answer with by attached: who decided it, in the
+// session format's terms ("human", "policy", "agent").
+func (a Answer) WithBy(by string) Answer {
+	a.By = by
+	return a
+}
+
 // Resume answers the calls the last run left pending and continues,
 // whether they were deferred to the caller or cut off by an abort or a
 // failure. Every pending call must have exactly one answer, and no
 // answer may name a call that is not pending. An answer is an output
 // or an approval: a caller that refuses a call answers it with the
 // refusal as text, which the model then sees; a caller that approves a
-// deferred call lets the loop run it.
+// deferred call lets the loop run it. [Answer.By] says who decided,
+// for the record.
 //
 // The outputs are appended with their item events first, then the
 // notes of the answers that carry one, as user messages. The approved
@@ -303,6 +321,7 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 	}
 	var outputs, notes openresponses.Items
 	var approved []approval
+	deciders := map[string]string{}
 	terminate := false
 	for _, ans := range answers {
 		call, ok := byID[ans.CallID]
@@ -311,6 +330,9 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 		}
 		delete(byID, ans.CallID)
 		terminate = terminate || ans.Terminate
+		if ans.By != "" {
+			deciders[ans.CallID] = ans.By
+		}
 		if ans.Output != nil {
 			outputs = append(outputs, ans.Output)
 			if ans.Note != "" {
@@ -318,12 +340,15 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 			}
 			continue
 		}
-		approved = append(approved, approval{call: call, args: ans.Args, note: ans.Note})
+		approved = append(approved, approval{call: call, args: ans.Args, note: ans.Note, by: ans.By})
 	}
 	if len(byID) > 0 {
 		return nil, fmt.Errorf("%w: %d pending call(s) unanswered", ErrNotPending, len(byID))
 	}
-	return a.run(ctx, append(outputs, notes...), approved, true, terminate)
+	// An output the caller wrote raises no tool_start, so the decider
+	// of an answer of that kind rides on the run's context, where a
+	// recorder writing the decision for it finds it.
+	return a.run(ContextWithDeciders(ctx, deciders), append(outputs, notes...), approved, true, terminate)
 }
 
 // answersPending checks the outputs that open a prompt against the
@@ -335,7 +360,7 @@ func answersPending(pending []PendingCall, prompts openresponses.Items) error {
 	for _, p := range pending {
 		want[p.Call.CallID] = true
 	}
-	for _, item := range prompts {
+	for _, item := range unhideAll(prompts) {
 		out, ok := item.(*openresponses.FunctionCallOutput)
 		if !ok {
 			break

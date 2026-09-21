@@ -170,6 +170,10 @@ type ItemStart struct {
 	// ResponseID is the ID of the response streaming the item, and empty
 	// for an item the loop appended itself.
 	ResponseID string
+	// Hidden is set for an item the caller marked with [Hidden]: it is
+	// in the model's context and a renderer should not show it. The
+	// Item is the item itself, unwrapped.
+	Hidden bool
 }
 
 // EventType returns "item_start".
@@ -200,6 +204,10 @@ type ItemEnd struct {
 	// ResponseID is the ID of the response that produced the item, and
 	// empty for an item the loop appended itself.
 	ResponseID string
+	// Hidden is set for an item the caller marked with [Hidden]: it is
+	// in the model's context and a renderer should not show it. A
+	// session recorder writes its entry with visible false.
+	Hidden bool
 }
 
 // EventType returns "item_end".
