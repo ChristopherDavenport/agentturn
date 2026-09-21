@@ -219,7 +219,12 @@ type Config struct {
 // between the reasoning summary and the first token is therefore
 // retried, and leaves nothing in the transcript or the record; the
 // transcript never ends in a bare reasoning item, which no server
-// accepts as input before a user message. Abort cuts a delay short.
+// accepts as input before a user message. A response that completes
+// with no message and no function call leaves nothing either, for the
+// same reason: a model that answers with a reasoning item alone has
+// answered nothing, and the run ends with no assistant message rather
+// than with a transcript the next prompt cannot extend. Abort cuts a
+// delay short.
 type Retry struct {
 	// MaxAttempts is the number of attempts per turn, the first
 	// included. Zero or one means no retry.
