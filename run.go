@@ -902,6 +902,10 @@ type callState struct {
 	// parent is the call whose tool made this one with Invoke, empty
 	// for a call of the model's batch.
 	parent string
+	// turn is the turn the call belongs to, taken when the call was
+	// prepared: a nested call is settled on the goroutine of the tool
+	// that made it, which must not read the loop's own field.
+	turn int
 	// appended is set once the call's output is in the transcript.
 	appended bool
 	// note is text appended after the batch's outputs, from the
@@ -933,8 +937,12 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 // runs another of the turn's tools through the loop.
 func (r *runner) toolContext(ctx context.Context, tools agenttool.Set) context.Context {
 	ctx = ContextWithTranscript(ctx, append(Transcript(nil), r.transcript...))
+	// The turn is taken here, on the loop's goroutine: a tool that
+	// keeps its context past its batch and invokes from a goroutine of
+	// its own must not read a turn the loop is writing.
+	turn := r.turn
 	return context.WithValue(ctx, invokerKey{}, invoker(func(ctx context.Context, name string, args json.RawMessage) (agenttool.Result, error) {
-		return r.invoke(ctx, tools, name, args)
+		return r.invoke(ctx, tools, turn, name, args)
 	}))
 }
 
@@ -1076,7 +1084,7 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 	ctx = r.toolContext(ctx, tools)
 	batch := make([]*callState, len(approved))
 	for i, ap := range approved {
-		p := r.prepare(tools, ap.call, ap.args)
+		p := r.prepare(tools, r.turn, ap.call, ap.args)
 		if ap.note != "" {
 			p.note = openresponses.UserText(ap.note)
 		}
@@ -1102,7 +1110,7 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 // BeforeToolCall. It emits tool_start and, for a call that will not
 // execute, tool_end.
 func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openresponses.FunctionCall, batch []*openresponses.FunctionCall, index int) (*callState, error) {
-	p := r.prepare(tools, call, nil)
+	p := r.prepare(tools, r.turn, call, nil)
 	var terminate bool
 	var decision *ToolDecision
 	if r.cfg.BeforeToolCall != nil {
@@ -1149,8 +1157,8 @@ func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openr
 // prepare starts the state of a call: the tool with its name, if any,
 // and its arguments, args when given and the call's own otherwise, an
 // empty object standing in for none.
-func (r *runner) prepare(tools agenttool.Set, call *openresponses.FunctionCall, args json.RawMessage) *callState {
-	p := &callState{call: call, args: args}
+func (r *runner) prepare(tools agenttool.Set, turn int, call *openresponses.FunctionCall, args json.RawMessage) *callState {
+	p := &callState{call: call, args: args, turn: turn}
 	if p.args == nil {
 		p.args = json.RawMessage(call.Arguments)
 	}
@@ -1185,7 +1193,7 @@ func (r *runner) check(ctx context.Context, p *callState, terminate bool) error 
 // model sees and emits tool_end.
 func (r *runner) settle(ctx context.Context, p *callState) error {
 	if r.cfg.AfterToolCall != nil && !p.blocked {
-		override, err := r.cfg.AfterToolCall(ctx, ToolResultInfo{RunID: r.runID, Turn: r.turn, Call: p.call, Tool: p.tool, Args: p.args, Result: p.result, Err: p.err})
+		override, err := r.cfg.AfterToolCall(ctx, ToolResultInfo{RunID: r.runID, Turn: p.turn, Call: p.call, Tool: p.tool, Args: p.args, Result: p.result, Err: p.err})
 		if err != nil {
 			return fmt.Errorf("agentturn: after-tool-call hook: %w", err)
 		}
@@ -1200,7 +1208,7 @@ func (r *runner) settle(ctx context.Context, p *callState) error {
 		p.result.Terminate = terminate
 		p.result.Details = details
 	}
-	return r.emit(&ToolEnd{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Parent: p.parent})
+	return r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Parent: p.parent})
 }
 
 func validObject(raw json.RawMessage) bool {
@@ -1252,18 +1260,18 @@ func Invoke(ctx context.Context, name string, args json.RawMessage) (agenttool.R
 // invoke runs a nested call through the turn's hooks, events and
 // executor. It never touches the transcript: the call is the work of
 // the call that made it.
-func (r *runner) invoke(ctx context.Context, tools agenttool.Set, name string, args json.RawMessage) (agenttool.Result, error) {
+func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name string, args json.RawMessage) (agenttool.Result, error) {
 	parent := ""
 	if call, ok := agenttool.CallFrom(ctx); ok {
 		parent = call.ID
 	}
 	call := &openresponses.FunctionCall{CallID: openresponses.NewID("call"), Name: name, Arguments: string(args)}
-	p := r.prepare(tools, call, args)
+	p := r.prepare(tools, turn, call, args)
 	p.parent = parent
 	var decision *ToolDecision
 	if r.cfg.BeforeToolCall != nil {
 		var err error
-		decision, err = r.cfg.BeforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: r.turn, Call: call, Tool: p.tool, Args: p.args, Batch: []*openresponses.FunctionCall{call}, Index: 0})
+		decision, err = r.cfg.BeforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: turn, Call: call, Tool: p.tool, Args: p.args, Batch: []*openresponses.FunctionCall{call}, Index: 0})
 		if err != nil {
 			return agenttool.Result{}, fmt.Errorf("agentturn: before-tool-call hook: %w", err)
 		}
@@ -1285,7 +1293,7 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, name string, a
 			}
 		}
 	}
-	if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: call.CallID, Name: name, Args: p.args, Decision: decision, Parent: parent}); err != nil {
+	if err := r.emit(&ToolStart{RunID: r.runID, Turn: turn, CallID: call.CallID, Name: name, Args: p.args, Decision: decision, Parent: parent}); err != nil {
 		return agenttool.Result{}, err
 	}
 	if err := r.check(ctx, p, false); err != nil {
