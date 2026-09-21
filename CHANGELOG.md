@@ -5,6 +5,30 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- **Fixed**: `session` wrote the reject decision that carries an output
+  the caller supplied only for a call it was holding, so a call seeded
+  from a branch whose dispatch and hold are on the path it left ended
+  with an output and no dispatch, which `VerifyRecords` reads as a
+  broken promise. The decision is written for any call the path holds
+  no dispatch and no reject for, which is what a reader takes an output
+  the caller wrote to mean; a held call is unchanged. (#68)
+- **Fixed**: `session` wrote a stream cut after a completed item as a
+  failed response with no response ID, so the context algorithm found
+  no items to strip and read the items the cut call produced as its
+  input, and the recorded hash mismatched. Every interrupted run of a
+  model that completes an item before the cut, a reasoning model for
+  one, was a `verify` failure. The failed response carries the response
+  ID the writer saw on the items it wrote for that call. (#69)
+- `session`: `Recorder.Rebase` with the empty entry ID is the reset a
+  product's `/clear` makes: the session's leaf is reset so the next
+  append starts a new root, and the recorder forgets the settings, the
+  items and the calls of the branch it left, so the new root opens with
+  a full config entry and its responses carry hashes again. Before
+  this, a reset leaf could not be told to the recorder at all, and the
+  root it wrote rebuilt with no model and no instructions. (#74)
+
 ## v0.0.6 - 2026-09-20
 
 - Depends on `agenttool` v0.0.5, and `session` writes a tool's side

@@ -49,10 +49,12 @@
 //     response ID. An item the filter in force would hide from the
 //     model, an app-only extension item, is written as a custom entry
 //     instead so the path rebuilds exactly the input that was sent. A
-//     function_call_output that answers a call still held by a hold
-//     decision, one the caller answered through Agent.Resume with an
+//     function_call_output for a call the path holds no dispatch and no
+//     reject for, one the caller answered through Agent.Resume with an
 //     output of their own, is preceded by a reject decision carrying
-//     the output's text as its reason.
+//     the output's text as its reason: a call held by a hold decision
+//     is the common case, and a call seeded from a branch that left its
+//     dispatch behind is the same thing to a reader.
 //   - tool_start: the call's decision when there is one to record, then
 //     its dispatch. A BeforeToolCall that blocked the call is a reject
 //     decision with its reason and no dispatch; one that deferred it is
@@ -65,10 +67,14 @@
 //   - response_end: the response entry with status, usage, error and the
 //     request hash, after the items it produced and before any tool
 //     output of the turn.
-//   - run_end: a response entry with status failed, the error and the
-//     request hash when a call was still in flight, because the model
-//     failed or the run was aborted before the stream produced a
-//     response; then the run entry with phase end, the reason in the
+//   - run_end: a response entry with status failed, the error, the
+//     request hash and the ID of the response the stream had named,
+//     when a call was still in flight because the model failed or the
+//     run was aborted before the stream produced a response; the ID is
+//     what lets the context algorithm strip the items that call
+//     produced, a reasoning item completed before the cut for one,
+//     rather than read them as its input; then the run entry with
+//     phase end, the reason in the
 //     format's terms and the IDs of the run's calls left without an
 //     output. The loop's reasons map onto the format's cascade: done
 //     and input_required as they are, error with the error as ref,
@@ -165,7 +171,11 @@
 // be told, or it keeps writing deltas against the branch it left.
 // [Recorder.Rebase] moves the leaf and reseeds the recorder from the
 // context there, as [Resume] seeds it from the leaf at open; it appends
-// nothing and refuses while a run is active. A conversation that
+// nothing and refuses while a run is active. Rebase with the empty
+// entry ID is the reset a /clear makes: the next entry starts a new
+// root, and the recorder forgets the items and the settings of the
+// branch it left, so the root opens with a full config and its
+// responses carry hashes. A conversation that
 // outgrows its file rolls over with [Continue], which creates the
 // successor with agentsession.Continue and returns a recorder seeded
 // from it; the successor's context begins with the summary, and the
@@ -281,10 +291,14 @@ type writer struct {
 	settleReq *openresponses.Request
 	// inFlight is set from turn_start to the response; pending is the
 	// hash of the request in flight, empty when the recorder cannot
-	// stand behind it; started is when it was sent.
-	inFlight bool
-	pending  string
-	started  time.Time
+	// stand behind it; started is when it was sent; inFlightID is the
+	// ID of the response streaming it, learned from the items it
+	// produced, so a call that never reached its response entry can
+	// still be written naming the response its items belong to.
+	inFlight   bool
+	pending    string
+	started    time.Time
+	inFlightID string
 	// items holds the ID of the entry contributing each item of the
 	// agent's working transcript, in order, so a fold's split index
 	// names the first kept entry; values holds the items themselves and
@@ -476,6 +490,15 @@ func resume(s *agentsession.Session, store agentsession.Store, opts []Option) (*
 // with [ErrRunActive] while a run is being written, and s must be the
 // session the recorder writes. The agent's transcript is the caller's
 // to set, with Agent.SetTranscript from s.Context().Items.
+//
+// The empty entry ID is the reset a product's /clear makes: the
+// session's leaf is reset so the next append starts a new root
+// (agentsession.Session.ResetLeaf), and the recorder forgets the
+// settings, the items and the calls of the branch it left, so the new
+// root opens with a full config entry and the responses on it carry
+// hashes again. It is the one rebase that changes what the next entry
+// is, which is why it is spelled as the empty ID rather than left to a
+// caller to arrange.
 func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -484,6 +507,11 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 	}
 	if r.root.run != "" {
 		return ErrRunActive
+	}
+	if entryID == "" {
+		s.ResetLeaf()
+		r.root.reset()
+		return nil
 	}
 	if err := s.Branch(entryID); err != nil {
 		return fmt.Errorf("session: rebase: %w", err)
@@ -521,7 +549,7 @@ func (w *writer) reset() {
 	w.settings = agentsession.Settings{}
 	w.wroteConfig = false
 	w.settleReq = nil
-	w.inFlight, w.pending, w.started = false, "", time.Time{}
+	w.inFlight, w.pending, w.started, w.inFlightID = false, "", time.Time{}, ""
 	w.items, w.values, w.custom = nil, nil, nil
 	w.foldSet, w.foldSplit, w.foldSummary = false, 0, nil
 	w.calls = map[string]*callRecord{}
@@ -904,6 +932,7 @@ func (w *writer) turnStart(ctx context.Context, e *agentturn.TurnStart) error {
 	w.inFlight = true
 	w.pending = hash
 	w.started = w.rec.now()
+	w.inFlightID = ""
 	return nil
 }
 
@@ -1002,9 +1031,15 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		return nil
 	}
 	if out, ok := item.(*openresponses.FunctionCallOutput); ok {
-		if c := w.calls[out.CallID]; c != nil && c.held && !c.dispatched {
-			// The caller answered the hold with an output of their own:
-			// the call never ran, and the output is what the model sees.
+		if c := w.calls[out.CallID]; c != nil && !c.dispatched && !c.rejected {
+			// The caller wrote the output themselves: the call never
+			// reached its tool, and the output is what the model sees.
+			// A held call is the common case, but a call seeded from a
+			// path that holds its item and no decision, the shape a
+			// branch leaves when the dispatch is on the branch that was
+			// left, is the same thing to a reader and gets the same
+			// decision, which is what the format's record check asks
+			// for.
 			dec := agentsession.NewDecision(out.CallID, c.entry, agentsession.VerdictReject, "").WithReason(outputText(out))
 			if _, err := w.append(ctx, dec); err != nil {
 				return err
@@ -1022,6 +1057,13 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		entry = &agentsession.CustomEntry{NS: item.ItemType(), Data: raw}
 	} else {
 		entry = &agentsession.ItemEntry{Item: item, ResponseID: responseID}
+	}
+	if w.inFlight && responseID != "" {
+		// The stream named the response before it ended. A call cut off
+		// after this item is written as a failed response carrying the
+		// ID, so the context algorithm strips the items it produced
+		// rather than reading them as its input.
+		w.inFlightID = responseID
 	}
 	id, err := w.append(ctx, entry)
 	if err != nil {
@@ -1149,7 +1191,7 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 		RequestHash: w.pending,
 		LatencyMS:   w.latency(),
 	}
-	w.inFlight, w.pending, w.started = false, "", time.Time{}
+	w.inFlight, w.pending, w.started, w.inFlightID = false, "", time.Time{}, ""
 	w.responses++
 	w.lastCalls = len(resp.FunctionCalls()) > 0
 	_, err := w.append(ctx, entry)
@@ -1159,19 +1201,22 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 // runEnd closes the run on the record. A call that was sent and never
 // answered, because the model failed before producing a response or
 // the run was aborted mid-stream, is written first as a failed
-// response with the error and the request hash, so the record shows
-// the call was made and why it ended; the in-flight state is cleared
+// response with the error, the request hash and the ID of the response
+// the stream had already named, so the record shows the call was made
+// and why it ended and the context algorithm strips the items it
+// produced rather than reading them as its input; the in-flight state is cleared
 // either way, so a writer reused for a later run cannot attribute its
 // first response to this call. Then the run's end entry, with the
 // reason in the format's terms and the run's calls left open.
 func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
-	hash, inFlight := w.pending, w.inFlight
+	hash, inFlight, responseID := w.pending, w.inFlight, w.inFlightID
 	latency := w.latency()
-	w.inFlight, w.pending, w.started = false, "", time.Time{}
+	w.inFlight, w.pending, w.started, w.inFlightID = false, "", time.Time{}, ""
 	if inFlight {
 		w.responses++
 		w.lastCalls = false
 		entry := &agentsession.ResponseEntry{
+			ResponseID:  responseID,
 			Status:      openresponses.ResponseStatusFailed,
 			Error:       errorPayload(e.Err),
 			RequestHash: hash,
