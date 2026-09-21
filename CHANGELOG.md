@@ -7,6 +7,15 @@ versions may break the API.
 
 ## Unreleased
 
+- `Agent.AbortCause(err)` cuts a run with a reason, and the loop reads
+  `context.Cause` wherever it read the bare context error, so a host
+  that cancels the run's context itself with `context.WithCancelCause`
+  is heard too. `RunEnd.Err` carries the cause and a recorder writes it
+  as the run's end, so a harness that cuts a stream for a rule, an
+  advisor, a coordinator or a user pressing Esc can count them apart
+  instead of recording four "context canceled". `Abort` is
+  `AbortCause(nil)` and keeps its meaning. (#70)
+
 - `ChainBeforeModelCall`, `ChainBeforeTurn`, `ChainShouldStopAfterTurn`,
   `ChainBeforeToolCall` and `ChainOutputGuard` join several values for
   one hook into one. Every hook is a plain field, so a product that

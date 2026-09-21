@@ -738,3 +738,41 @@ func TestRecordableDetailsBecomeACustomEntry(t *testing.T) {
 type noNS struct{}
 
 func (noNS) RecordNS() string { return "" }
+
+// TestAbortCauseIsTheRunsRef checks that the reason a host cut a run
+// reaches the record, where "context canceled" stood for seven
+// different things before.
+func TestAbortCauseIsTheRunsRef(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocking := agenttool.New("wait", "waits", func(ctx context.Context, _ echoArgs) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{blocking}})
+	defer rec.Attach(a)()
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if _, ok := ev.(*agentturn.ToolStart); ok {
+			a.AbortCause(errors.New("ttsr: rule box-leak"))
+		}
+		return nil
+	})
+	end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if end == nil || end.Reason != agentturn.ReasonAborted {
+		t.Fatalf("end = %+v", end)
+	}
+	runs := runsOf(t, s)
+	if len(runs) != 1 || runs[0].End == nil {
+		t.Fatalf("runs = %+v", runs)
+	}
+	if runs[0].End.Reason != agentsession.ReasonInterrupted || runs[0].End.Ref != "ttsr: rule box-leak" {
+		t.Errorf("run end = %+v", runs[0].End)
+	}
+	if len(runs[0].End.Pending) != 1 {
+		t.Errorf("the cut call is not pending: %+v", runs[0].End)
+	}
+	verifyAll(t, s)
+}

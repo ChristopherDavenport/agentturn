@@ -309,7 +309,10 @@ The plan is `docs/plans/agent-layer.md`. Invariants the tests hold:
   the transcript keeps only completed items. Every event the abort
   leaves behind, the `tool_end` of each cut-off call and the
   `run_end`, still reaches subscribers, with a context whose
-  cancellation is lifted.
+  cancellation is lifted. `Agent.AbortCause(err)` says why, and the
+  loop reads `context.Cause`, so a rule that matched, an advisor and a
+  user pressing Esc are three things `RunEnd.Err` and the record tell
+  apart rather than three "context canceled".
 - Events for one run are delivered from one goroutine.
 
 ## License

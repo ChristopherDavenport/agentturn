@@ -398,13 +398,13 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 		end.Err = stop.err
 	case ctx.Err() != nil:
 		end.Reason = ReasonAborted
-		end.Err = ctx.Err()
-		if !errors.Is(err, ctx.Err()) {
+		end.Err = context.Cause(ctx)
+		if !errors.Is(err, context.Cause(ctx)) {
 			// A subscriber or a hook failed for a reason of its own
 			// while the run was being aborted: the abort is the reason
 			// the run ended, and the failure rides on it rather than
 			// vanishing.
-			end.Err = fmt.Errorf("%w: %w", ctx.Err(), err)
+			end.Err = fmt.Errorf("%w: %w", context.Cause(ctx), err)
 		}
 	default:
 		end.Reason = ReasonError
@@ -497,8 +497,8 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 		if r.cfg.MaxTurns > 0 && r.turn >= r.cfg.MaxTurns {
 			return stopped(StopMaxTurns, nil)
 		}
-		if err := ctx.Err(); err != nil {
-			return stop(ReasonAborted, err)
+		if ctx.Err() != nil {
+			return stop(ReasonAborted, context.Cause(ctx))
 		}
 		r.turn++
 		if r.cfg.BeforeTurn != nil {
@@ -658,7 +658,7 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 			return resp, nil
 		}
 		if ctx.Err() != nil {
-			return nil, stop(ReasonAborted, ctx.Err())
+			return nil, stop(ReasonAborted, context.Cause(ctx))
 		}
 		if committed || attempt >= r.cfg.Retry.MaxAttempts || !r.cfg.Retry.retryable(err) {
 			return nil, fmt.Errorf("agentturn: model: %w", err)
@@ -668,7 +668,7 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 			return nil, err
 		}
 		if err := sleep(ctx, delay); err != nil {
-			return nil, stop(ReasonAborted, err)
+			return nil, stop(ReasonAborted, context.Cause(ctx))
 		}
 	}
 }
@@ -811,6 +811,9 @@ type callState struct {
 	// deferred is set when the caller owns the call; no output is
 	// appended.
 	deferred bool
+	// cut is set when the abort settled the call rather than the tool,
+	// so no output is appended for it whatever its error says.
+	cut bool
 	// appended is set once the call's output is in the transcript.
 	appended bool
 	// note is text appended after the batch's outputs, from the
@@ -854,8 +857,8 @@ func (r *runner) preflightAll(ctx context.Context, tools agenttool.Set, calls []
 		}
 		batch[i] = p
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, r.abortBatch(ctx, batch, err)
+	if ctx.Err() != nil {
+		return nil, r.abortBatch(ctx, batch, context.Cause(ctx))
 	}
 	return batch, nil
 }
@@ -870,7 +873,7 @@ func (r *runner) abortBatch(ctx context.Context, batch []*callState, err error) 
 		if p.settled {
 			continue
 		}
-		p.settled = true
+		p.settled, p.cut = true, true
 		p.err = err
 		if serr := r.settle(ctx, p); serr != nil {
 			return serr
@@ -894,7 +897,12 @@ func (r *runner) appendFinished(ctx context.Context, batch []*callState) error {
 		if p == nil || !p.settled || p.deferred || p.appended {
 			continue
 		}
-		if p.err != nil && ctx.Err() != nil && errors.Is(p.err, ctx.Err()) {
+		if p.cut {
+			continue
+		}
+		if p.err != nil && ctx.Err() != nil && (errors.Is(p.err, ctx.Err()) || errors.Is(p.err, context.Cause(ctx))) {
+			// The tool was cut off in flight: it returned the
+			// cancellation, or the cause a host gave it.
 			continue
 		}
 		p.appended = true
@@ -933,11 +941,11 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 			return err
 		}
 	}
-	if err := ctx.Err(); err != nil {
+	if ctx.Err() != nil {
 		if aerr := r.appendFinished(ctx, batch); aerr != nil {
 			return aerr
 		}
-		return stop(ReasonAborted, err)
+		return stop(ReasonAborted, context.Cause(ctx))
 	}
 	return nil
 }
@@ -988,8 +996,8 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 		}
 		batch[i] = p
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, r.abortBatch(ctx, batch, err)
+	if ctx.Err() != nil {
+		return nil, r.abortBatch(ctx, batch, context.Cause(ctx))
 	}
 	if err := r.execute(ctx, batch); err != nil {
 		return nil, err

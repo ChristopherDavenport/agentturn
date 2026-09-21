@@ -56,7 +56,7 @@ type Agent struct {
 	running    bool
 	runID      string
 	turn       int
-	cancel     context.CancelFunc
+	cancel     context.CancelCauseFunc
 	idle       chan struct{}
 	pending    []PendingCall
 }
@@ -395,7 +395,7 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved [
 		}
 	}
 	a.pending = nil
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancelCause(ctx)
 	a.running = true
 	a.cancel = cancel
 	a.turn = 0
@@ -416,7 +416,7 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved [
 		followUp:   a.drainFollowUp,
 	}
 	end := r.run(ctx, prompts, approved, terminate)
-	cancel()
+	cancel(nil)
 
 	a.mu.Lock()
 	a.running = false
@@ -529,14 +529,30 @@ func (a *Agent) drainFollowUp() openresponses.Items {
 
 // Abort cancels the active run, if any. The model stream and running
 // tools see the cancellation through their context and the run ends
-// with ReasonAborted. The queues are untouched: anything steered or
-// queued and not yet appended goes to the next run.
-func (a *Agent) Abort() {
+// with ReasonAborted and context.Canceled on RunEnd.Err. The queues are
+// untouched: anything steered or queued and not yet appended goes to
+// the next run.
+func (a *Agent) Abort() { a.AbortCause(nil) }
+
+// AbortCause is [Agent.Abort] with a reason: cause is what
+// context.Cause reports to everything the run called, and what the run
+// ends with on RunEnd.Err, so a recorder writes it as the run's end and
+// a product can count why its runs were cut. A stream rule that
+// matched, an advisor that raised a blocker, a coordinator that
+// cancelled a job and a user pressing Esc are four things a session
+// otherwise records identically as "context canceled". A nil cause is
+// [Agent.Abort].
+//
+// A cause that a caller wants errors.Is(err, context.Canceled) to keep
+// matching should wrap it; the tools of the run see context.Canceled
+// from their own context either way, since that is what ctx.Err
+// reports.
+func (a *Agent) AbortCause(cause error) {
 	a.mu.Lock()
 	cancel := a.cancel
 	a.mu.Unlock()
 	if cancel != nil {
-		cancel()
+		cancel(cause)
 	}
 }
 

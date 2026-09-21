@@ -50,8 +50,10 @@ const (
 	// calls to the caller; RunEnd.Pending lists them and the run
 	// continues once their outputs are appended (see Agent.Resume).
 	ReasonInputRequired Reason = "input_required"
-	// ReasonAborted means the context was cancelled. A tool batch cut
-	// off by the abort leaves its calls on RunEnd.Pending.
+	// ReasonAborted means the context was cancelled. RunEnd.Err is
+	// context.Cause, the reason [Agent.AbortCause] or the host's own
+	// context gave, and context.Canceled when there was none. A tool
+	// batch cut off by the abort leaves its calls on RunEnd.Pending.
 	ReasonAborted Reason = "aborted"
 	// ReasonError means the model, a hook or a subscriber failed;
 	// RunEnd.Err says which.
@@ -330,12 +332,13 @@ type RunEnd struct {
 	// Cause says what stopped the run when Reason is ReasonStopped, and
 	// is empty otherwise.
 	Cause StopCause
-	// Err is set when Reason is ReasonError; to the context error when
-	// Reason is ReasonAborted, wrapping the failure of a subscriber or
-	// a hook when one failed for a reason of its own while the run was
-	// being aborted, so errors.Is finds the context error either way;
-	// and to the guard's error when Reason is ReasonStopped with Cause
-	// StopGuard.
+	// Err is set when Reason is ReasonError; to context.Cause of the
+	// run's context when Reason is ReasonAborted, which is the cause
+	// [Agent.AbortCause] or the host's own context carried and
+	// context.Canceled when there was none, wrapping the failure of a
+	// subscriber or a hook when one failed for a reason of its own
+	// while the run was being aborted; and to the guard's error when
+	// Reason is ReasonStopped with Cause StopGuard.
 	Err error
 	// Pending lists the function calls in the transcript with no
 	// function_call_output, in transcript order, each with why: the
