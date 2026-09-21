@@ -426,22 +426,19 @@ const (
 	QueueFollowUp QueueMode = "follow_up"
 )
 
-// Queued reports an item accepted into a queue, at the moment it was
-// accepted rather than when a run appends it, so a host that answered a
-// sender 202 can make it durable before it says so. It is delivered
-// from the goroutine that called [Agent.Steer] or [Agent.FollowUp],
-// which may be while a run is in flight; a subscriber that returns an
-// error refuses the item, which is then not queued.
+// Queued reports an item [Agent.Steer] or [Agent.FollowUp] accepted
+// into a queue, before any run appends it, so a host writing what it
+// accepted can tell an item it was given from one a run produced. It
+// belongs to no run: the goroutine that owns delivery reports it at its
+// next event, which is why it is not the accept itself and a
+// subscriber's error cannot refuse the item.
 //
-// RunID names the run in flight, and is empty when the agent was idle.
-// Trigger is what the caller attached to the context with
-// [ContextWithTrigger], so the reason an item was accepted is on the
-// event even though the run it joins was started by something else.
+// RunID names the run that was in flight when the item was accepted,
+// and is empty when the agent was idle.
 type Queued struct {
-	RunID   string
-	Item    openresponses.Item
-	Mode    QueueMode
-	Trigger Trigger
+	RunID string
+	Item  openresponses.Item
+	Mode  QueueMode
 	// Hidden is set for an item the caller marked with [Hidden].
 	Hidden bool
 }

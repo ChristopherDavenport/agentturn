@@ -2,7 +2,7 @@ package agentturn
 
 import (
 	"context"
-	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -12,103 +12,145 @@ import (
 )
 
 // TestQueuedReportsWhatWasAccepted is the gateway's case: an item is
-// accepted from a sender that is answered 202 and appended later, and
-// the host has to be able to keep it in between. The event carries what
-// it needs to: the item, which queue, and what the caller said caused
-// it.
+// accepted from a sender that is answered 202 and appended later, and a
+// host writing what it accepted needs to see it as an accept rather
+// than as an item a run produced.
 func TestQueuedReportsWhatWasAccepted(t *testing.T) {
-	blocking := agenttool.New("wait", "", func(ctx context.Context, _ echoArgs) (string, error) {
-		<-ctx.Done()
-		return "", ctx.Err()
-	})
-	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{blocking}})
+	a := New(Config{Model: &echo.Adapter{}, MaxTurns: 1})
 	var queued []*Queued
+	var order []string
 	a.Subscribe(func(_ context.Context, ev Event) error {
 		if e, ok := ev.(*Queued); ok {
 			queued = append(queued, e)
 		}
+		order = append(order, ev.EventType())
 		return nil
 	})
-	// Accepted while the agent is idle.
-	ctx := ContextWithTrigger(context.Background(), Trigger{Kind: "slack", Ref: "C123"})
-	if err := a.FollowUp(ctx, openresponses.UserText("and then this")); err != nil {
+	// Accepted while the agent is idle: the report follows at the
+	// start of the next run, before anything that run does.
+	a.FollowUp(openresponses.UserText("and then this"))
+	if len(queued) != 0 {
+		t.Fatalf("an idle agent delivered %d events with no goroutine to deliver them", len(queued))
+	}
+	if st := a.State(); len(st.Queued) != 1 {
+		t.Fatalf("the item was not queued: %+v", st.Queued)
+	}
+	end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if err != nil {
 		t.Fatal(err)
 	}
 	if len(queued) != 1 {
 		t.Fatalf("queued events = %d", len(queued))
 	}
-	if e := queued[0]; e.Mode != QueueFollowUp || e.RunID != "" || e.Trigger.String() != "slack:C123" {
+	if e := queued[0]; e.Mode != QueueFollowUp || e.RunID != "" || e.Hidden {
 		t.Errorf("event = %+v", e)
 	}
 	if m, ok := queued[0].Item.(*openresponses.Message); !ok || m.Text() != "and then this" {
 		t.Errorf("item = %v", queued[0].Item)
 	}
-	// Accepted while a run is in flight: the event names the run.
-	started := make(chan struct{})
-	a.Subscribe(func(_ context.Context, ev Event) error {
-		if _, ok := ev.(*ToolStart); ok {
-			close(started)
+	if len(order) == 0 || order[0] != EventQueued {
+		t.Errorf("the accept was reported after the run began: %v", order)
+	}
+	if end.Reason == ReasonError {
+		t.Fatalf("end = %+v", end)
+	}
+
+	// Accepted while a run is in flight: the event names that run, and
+	// the item it carries is the item itself.
+	notice := openresponses.DeveloperText("<notice>be brief</notice>")
+	b := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}, MaxTurns: 1})
+	var inFlight []*Queued
+	b.Subscribe(func(_ context.Context, ev Event) error {
+		switch e := ev.(type) {
+		case *ToolStart:
+			b.Steer(Hidden(notice))
+		case *Queued:
+			inFlight = append(inFlight, e)
 		}
 		return nil
 	})
-	go func() {
-		<-started
-		_ = a.Steer(context.Background(), Hidden(openresponses.DeveloperText("<notice>be brief</notice>")))
-		a.Abort()
-	}()
-	end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
-	if end == nil || end.Reason != ReasonAborted {
-		t.Fatalf("end = %+v", end)
+	end, err = b.Prompt(context.Background(), openresponses.UserText("go"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(queued) != 2 {
-		t.Fatalf("queued events = %d", len(queued))
+	if len(inFlight) != 1 {
+		t.Fatalf("queued events = %d", len(inFlight))
 	}
-	if e := queued[1]; e.Mode != QueueSteer || e.RunID != end.RunID || !e.Hidden {
+	if e := inFlight[0]; e.Mode != QueueSteer || e.RunID != end.RunID || !e.Hidden {
 		t.Errorf("event = %+v, run %q", e, end.RunID)
 	}
-	// The queues still hold what was accepted, for a host that persists
-	// them itself.
-	st := a.State()
-	if len(st.Steered) != 1 || len(st.Queued) != 1 {
-		t.Errorf("state = %d steered, %d queued", len(st.Steered), len(st.Queued))
+	if m, ok := inFlight[0].Item.(*openresponses.Message); !ok || m.Text() != notice.Text() {
+		t.Errorf("item = %v", inFlight[0].Item)
 	}
 }
 
-// TestQueuedSubscriberRefusesTheItem checks that a host that cannot
-// make an accepted item durable can refuse the accept.
-func TestQueuedSubscriberRefusesTheItem(t *testing.T) {
-	full := errors.New("inbox full")
-	a := New(Config{Model: &echo.Adapter{}})
+// TestSteerFromASubscriberDoesNotBlock is the pattern the docs allow
+// with care: a subscriber that steers on an event it can tell apart
+// from its own items. Accepting an item never waits on delivery, so it
+// returns and the report follows on the next event.
+func TestSteerFromASubscriberDoesNotBlock(t *testing.T) {
+	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}, MaxTurns: 2})
+	steered := false
+	var order []string
 	a.Subscribe(func(_ context.Context, ev Event) error {
-		if _, ok := ev.(*Queued); ok {
-			return full
+		order = append(order, ev.EventType())
+		if _, ok := ev.(*ToolEnd); ok && !steered {
+			steered = true
+			a.Steer(openresponses.UserText("and the duplicates"))
+			// The item is queued by the time this returns, and the
+			// report has not been delivered yet.
+			if n := a.State().Steering; n != 1 {
+				t.Errorf("steering = %d", n)
+			}
 		}
 		return nil
 	})
-	err := a.Steer(context.Background(), openresponses.UserText("one"), openresponses.UserText("two"))
-	if !errors.Is(err, full) {
-		t.Fatalf("err = %v", err)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
+			t.Error(err)
+		}
+	}()
+	<-done
+	if !steered {
+		t.Fatal("the subscriber never steered")
 	}
-	if st := a.State(); len(st.Steered) != 0 || st.Steering != 0 {
-		t.Errorf("a refused item was queued: %+v", st.Steered)
+	// The accept was reported before the item reached the transcript.
+	queued, item := -1, -1
+	for i, typ := range order {
+		if typ == EventQueued && queued < 0 {
+			queued = i
+		}
+	}
+	for _, it := range a.State().Transcript {
+		if m, ok := it.(*openresponses.Message); ok && m.Text() == "and the duplicates" {
+			item = 1
+		}
+	}
+	if queued < 0 || item < 0 {
+		t.Errorf("queued at %d, steered item in the transcript: %v (%v)", queued, item >= 0, order)
 	}
 }
 
 // TestQueuedIsDeliveredUnderTheSameBarrier steers a running agent from
-// another goroutine while its tool reports progress, so the queued
-// events and the run's own events reach the subscribers at the same
-// moment. A subscriber is documented as never being entered twice at
-// once, so a front may keep state without a lock of its own; the slice
-// here is unguarded on purpose, and under -race it is the assertion.
+// another goroutine while its tool reports progress. A subscriber is
+// documented as never being entered twice at once, so a front may keep
+// state without a lock of its own; the slice here is unguarded on
+// purpose, and under -race it is the assertion.
 func TestQueuedIsDeliveredUnderTheSameBarrier(t *testing.T) {
 	const steps = 40
 	started := make(chan struct{})
+	accepted := make(chan struct{})
 	var once sync.Once
 	reporting := agenttool.New("work", "works", func(ctx context.Context, _ echoArgs) (string, error) {
 		once.Do(func() { close(started) })
 		for i := 0; i < steps; i++ {
 			agenttool.Progress(ctx, agenttool.Text("working"))
 		}
+		// The call ends once everything has been accepted, so the run
+		// is still there to report all of it.
+		<-accepted
 		return "done", nil
 	})
 	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{reporting}, MaxTurns: 1})
@@ -117,21 +159,16 @@ func TestQueuedIsDeliveredUnderTheSameBarrier(t *testing.T) {
 		seen = append(seen, ev.EventType())
 		return nil
 	})
-	done := make(chan struct{})
 	go func() {
-		defer close(done)
+		defer close(accepted)
 		<-started
 		for i := 0; i < steps; i++ {
-			if err := a.Steer(context.Background(), openresponses.UserText("more")); err != nil {
-				t.Error(err)
-				return
-			}
+			a.Steer(openresponses.UserText("more"))
 		}
 	}()
 	if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
 		t.Fatal(err)
 	}
-	<-done
 	queued := 0
 	for _, typ := range seen {
 		if typ == EventQueued {
@@ -139,9 +176,6 @@ func TestQueuedIsDeliveredUnderTheSameBarrier(t *testing.T) {
 		}
 	}
 	if queued != steps {
-		t.Errorf("queued events = %d, want %d", queued, steps)
-	}
-	if st := a.State(); len(st.Steered)+len(st.Transcript) == 0 {
-		t.Error("nothing was queued or appended")
+		t.Errorf("queued events = %d, want %d in %s", queued, steps, strings.Join(seen[:min(len(seen), 8)], " "))
 	}
 }

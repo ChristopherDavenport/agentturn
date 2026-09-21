@@ -7,20 +7,17 @@ versions may break the API.
 
 ## Unreleased
 
-- **Breaking**: `Agent.Steer` and `Agent.FollowUp` take a context and
-  return an error. Each item they accept is delivered to the
-  subscribers first as the new `Queued` event, carrying the item, which
-  queue it went into, the run in flight if there is one and the
-  `Trigger` on the context; a subscriber that returns an error refuses
-  the item, which is then not queued. The event goes through the same
-  delivery as a run's own, so a subscriber is never entered from two
-  goroutines at once; a subscriber that steers from inside an event
-  passes on the context it was handed, which carries the delivery it
-  already holds. A gateway that answers a sender
-  202 can make what it accepted durable at the moment it accepts it,
-  rather than writing the same sixty lines of custom entries to keep an
-  inbox nobody else keeps. The queues themselves are unchanged, and so
-  are `State.Steered` and `State.Queued`. (#67)
+- `Queued` reports an item `Agent.Steer` or `Agent.FollowUp` accepted
+  into a queue, with which queue it went into and the run that was in
+  flight, so a host writing what it accepted can tell an item it was
+  handed from one a run produced, where before the two were the same
+  user message with nothing to separate them. The report is not the
+  accept: the item is queued when the call returns, and the goroutine
+  that owns delivery reports it at its next event, before anything that
+  item produces. Steer and FollowUp keep their signatures and never
+  wait on delivery, so steering from inside a subscriber is safe, and a
+  host that must not lose an input writes it before it accepts it. The
+  queues, `State.Steered` and `State.Queued` are unchanged. (#67)
 
 - `compact.WithPin(fn)` keeps the items fn reports through a fold:
   whatever part of the folded prefix they were in, they follow the

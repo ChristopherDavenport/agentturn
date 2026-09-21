@@ -122,7 +122,7 @@ func TestNotesFollowTheOutputs(t *testing.T) {
 		t.Fatal(err)
 	}
 	pending := a.State().Pending
-	_ = a.Steer(context.Background(), openresponses.UserText("steered while deciding"))
+	a.Steer(openresponses.UserText("steered while deciding"))
 	end, err = a.Resume(context.Background(),
 		Output(openresponses.NewFunctionCallOutput(pending[1].Call.CallID, "did it myself")).WithNote("that one I handled"),
 		Approve(pending[0].Call.CallID).WithNote("but never delete build/ again"))
@@ -309,8 +309,8 @@ func TestRunRefusesDanglingCalls(t *testing.T) {
 
 func TestStateExposesTheQueues(t *testing.T) {
 	a := New(Config{Model: &echo.Adapter{}})
-	_ = a.Steer(context.Background(), openresponses.UserText("steered"))
-	_ = a.FollowUp(context.Background(), openresponses.UserText("later"), openresponses.UserText("and later"))
+	a.Steer(openresponses.UserText("steered"))
+	a.FollowUp(openresponses.UserText("later"), openresponses.UserText("and later"))
 	st := a.State()
 	if st.Steering != 1 || st.FollowUps != 2 || len(st.Steered) != 1 || len(st.Queued) != 2 || st.Queued[1].(*openresponses.Message).Text() != "and later" {
 		t.Errorf("state = %+v", st)
@@ -350,11 +350,11 @@ func TestTurnStartNamesItsInputs(t *testing.T) {
 	// third. Once only: a subscriber that steers on every tool_start
 	// feeds the run forever, which is the hazard Steer documents.
 	steered := false
-	a.Subscribe(func(ctx context.Context, ev Event) error {
+	a.Subscribe(func(_ context.Context, ev Event) error {
 		if _, ok := ev.(*ToolStart); ok && !steered {
 			steered = true
-			_ = a.Steer(ctx, openresponses.UserText("steered in"))
-			_ = a.FollowUp(ctx, openresponses.UserText("follow up"))
+			a.Steer(openresponses.UserText("steered in"))
+			a.FollowUp(openresponses.UserText("follow up"))
 		}
 		return nil
 	})

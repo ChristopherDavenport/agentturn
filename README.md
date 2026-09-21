@@ -112,11 +112,12 @@ run, in order:
 | `turn_end` | the folded `Response` with usage, and the tool results |
 | `run_end` | the items added this run and the reason: done, stopped, input_required, aborted, error |
 
-`queued` belongs to no run: `Steer` and `FollowUp` deliver it as they accept an
-item, with the queue it went into and the `Trigger` on the context, so
-a gateway that answers a sender 202 can make the item durable before it
-says so. It waits for the event in flight, as every event does, and a
-subscriber that returns an error refuses the item.
+`queued` belongs to no run. `Steer` and `FollowUp` accept an item and
+return; the goroutine that owns delivery reports it at its next event,
+before anything that item produces, so a host writing what it accepted
+tells an item it was handed from one a run made. A run in flight
+reports it at once, an idle agent at the start of the next run, so a
+gateway that must not lose an input writes it before it accepts it.
 
 ## Tools
 
@@ -360,13 +361,12 @@ The plan is `docs/plans/agent-layer.md`. Invariants the tests hold:
   loop reads `context.Cause`, so a rule that matched, an advisor and a
   user pressing Esc are three things `RunEnd.Err` and the record tell
   apart rather than three "context canceled".
-- An `Agent` delivers one event at a time, whichever goroutine raised
-  it: the run's own events, the events a nested call raises from a
-  tool's goroutine, and the `queued` events of `Steer` and `FollowUp`,
-  which belong to no run. A subscriber is never entered from two
-  goroutines at once, and a subscriber that steers or prompts from
-  inside an event passes on the context it was handed. The low-level
-  `Run` yields to one consumer, which is the same guarantee.
+- Events for one run are delivered from one goroutine, the events a
+  nested call raises from a tool's goroutine serialised with them, so a
+  subscriber is never entered from two goroutines at once. Nothing
+  outside a run delivers: `Steer` and `FollowUp` queue an item and
+  return, and their `queued` event is reported by the run at its next
+  event, so steering from inside a subscriber is safe.
 
 ## License
 
