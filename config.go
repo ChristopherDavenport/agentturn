@@ -171,6 +171,11 @@ type Config struct {
 	// Several policies are joined with [ChainBeforeToolCall], which
 	// folds their decisions deny over ask over allow; assigning the
 	// field twice keeps only the second policy.
+	//
+	// One call at a time reaches it, a nested call made with [Invoke]
+	// from a tool's own goroutine included, so a policy may keep state
+	// without a lock of its own. Calling Invoke from inside the hook
+	// waits for the hook to return, which it cannot do.
 	BeforeToolCall func(context.Context, ToolCallInfo) (*ToolDecision, error)
 	// AfterToolCall runs when a call completes and may replace its
 	// result. A nil override keeps the result. An override replaces the
@@ -183,7 +188,9 @@ type Config struct {
 	// place in the text it returns; a Transform, which shapes one call
 	// and never replaces the transcript, is the other placement that
 	// keeps the record whole. This hook is for a policy on the result
-	// the model sees, not for saving space.
+	// the model sees, not for saving space. One result at a time
+	// reaches it, whichever goroutine finished the call, as for
+	// BeforeToolCall.
 	AfterToolCall func(context.Context, ToolResultInfo) (*ToolOverride, error)
 	// ShouldStopAfterTurn ends the run after a turn even when the model
 	// requested tools: true ends it with ReasonStopped and StopHook. An

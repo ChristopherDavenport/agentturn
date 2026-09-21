@@ -1272,10 +1272,10 @@ var ErrNoInvoker = errors.New("agentturn: no loop on the context to invoke a too
 // implements the interface itself and wants the parent named passes
 // agenttool.WithCall. Outside a loop, Invoke returns [ErrNoInvoker].
 //
-// Call it from a tool, with the context the tool was given. A
-// subscriber is called while the agent holds delivery, and a tool's
-// context does not carry that, so invoking from a subscriber waits for
-// a barrier the subscriber is itself holding.
+// Call it from a tool, with the context the tool was given, and not
+// from a hook or a subscriber: BeforeToolCall and AfterToolCall take
+// one call at a time, and a subscriber is called while the agent holds
+// delivery, so either would wait for something it is itself holding.
 func Invoke(ctx context.Context, name string, args json.RawMessage) (agenttool.Result, error) {
 	fn, _ := ctx.Value(invokerKey{}).(invoker)
 	if fn == nil {
