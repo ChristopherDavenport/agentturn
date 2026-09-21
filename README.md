@@ -227,6 +227,18 @@ first token is retried and leaves no orphan behind.
 cfg.Retry = agentturn.Retry{MaxAttempts: 4}
 ```
 
+`Retry.Revise` may change the request the next attempt sends, which is
+how a fallback chain lives in the loop rather than under it: the
+switch is on the `model_retry` event and a recorder writes it as a
+config delta, so the path names the model that answered.
+
+```go
+cfg.Retry = agentturn.Retry{MaxAttempts: 4, Revise: func(attempt int, req *openresponses.Request, err error) *openresponses.Request {
+	req.Model = fallback[min(attempt, len(fallback)-1)]
+	return nil
+}}
+```
+
 ## Composition
 
 The loop never learns a sub-agent concept. It knows a `Model` and a list

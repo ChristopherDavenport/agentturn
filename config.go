@@ -231,6 +231,22 @@ type Retry struct {
 	// Retryable reports whether err is worth another attempt. nil means
 	// [DefaultRetryable].
 	Retryable func(error) bool
+	// Revise, when set, may change the request the next attempt sends:
+	// another model, a lower effort, a smaller max_output_tokens. It is
+	// called after the attempt numbered attempt failed with err, with a
+	// copy of the request that failed; it may edit that copy in place
+	// and return nil, or return a request of its own. The copy shares
+	// the slices and maps of the original, so a hook that changes the
+	// input or the tools builds a new one rather than appending to
+	// what it was given.
+	//
+	// The revised request is on the [ModelRetry] event, and a session
+	// recorder takes its settings, so a fallback to another model is a
+	// config delta on the path and the record names the model that
+	// answered rather than the one that did not. A fallback chain
+	// written as a Streamer under the loop still works and still says
+	// nothing.
+	Revise func(attempt int, req *openresponses.Request, err error) *openresponses.Request
 }
 
 func (r Retry) retryable(err error) bool {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ChristopherDavenport/agentsession"
 	"github.com/ChristopherDavenport/agentsession/jsonl"
@@ -850,4 +851,73 @@ func TestNestedCallsAreRecorded(t *testing.T) {
 	// The entries land between the call's dispatch and its output, and
 	// the record still verifies.
 	verifyAll(t, s)
+}
+
+// switching answers 429 while the request names the primary model and
+// answers as itself once it names another.
+type switching struct{ primary string }
+
+func (m switching) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	if req.Model == m.primary {
+		return openresponses.TooManyRequests("rate", "rate limited")
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	msg, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := msg.Text("answered by " + req.Model); err != nil {
+		return err
+	}
+	if err := msg.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestRevisedRetryIsAConfigDelta checks that a turn that moved to a
+// fallback model records the model that answered: the settings in force
+// at the response are the revised request's, and the path still
+// rebuilds the request it hashed.
+func TestRevisedRetryIsAConfigDelta(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: switching{primary: "a"}, ModelName: "a", Retry: agentturn.Retry{
+		MaxAttempts: 3,
+		Backoff:     func(int, error) time.Duration { return 0 },
+		Revise: func(_ int, req *openresponses.Request, _ error) *openresponses.Request {
+			req.Model = "b"
+			return nil
+		},
+	}})
+	defer rec.Attach(a)()
+	end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("err=%v end=%+v", err, end)
+	}
+	if n := verifyAll(t, s); n != 1 || hashed(s) != 1 {
+		t.Errorf("responses = %d hashed = %d", n, hashed(s))
+	}
+	cx, err := s.Context()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cx.Settings.Model != "b" {
+		t.Errorf("settings name %q, the model that did not answer", cx.Settings.Model)
+	}
+	for _, e := range s.Entries() {
+		if r, ok := e.(*agentsession.ResponseEntry); ok && r.Model != "b" {
+			t.Errorf("response entry model = %q", r.Model)
+		}
+	}
+	// The run opened with the agent's configuration and the switch is
+	// one delta on top of it: not one config per attempt, since the
+	// attempt that failed answered nothing and wrote nothing.
+	cfgs := configs(s)
+	if len(cfgs) != 2 || cfgs[0].Model != "a" || cfgs[1].Model != "b" {
+		t.Errorf("config entries = %d in %q", len(cfgs), entryTypes(s))
+	}
 }

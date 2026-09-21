@@ -7,6 +7,15 @@ versions may break the API.
 
 ## Unreleased
 
+- `Retry.Revise` may change the request the next attempt sends: another
+  model, a lower effort. `ModelRetry` carries that request, and
+  `session` settles on it, so a fallback chain lives in the loop rather
+  than under it as a `Streamer` over its legs, where no event described
+  the switch and the config on the path named the model that did not
+  answer. The retry's settings replace the failed attempt's rather than
+  adding to them, since an attempt that never answered wrote nothing.
+  (#77)
+
 - `agentturn.Invoke(ctx, name, args)` runs one of the turn's tools from
   inside another as if the model had asked for it under the call in
   flight: `BeforeToolCall` decides, `tool_start` and `tool_end` carry

@@ -131,7 +131,8 @@ func (*TurnStart) EventType() string { return EventTurnStart }
 
 // ModelRetry reports that a model call failed and will be attempted
 // again after Delay, under [Config.Retry]. It follows the turn_start
-// of the turn; no item of the failed attempt reached subscribers.
+// of the turn; the failed attempt never began an answer, and anything
+// it completed on the way was dropped with it.
 type ModelRetry struct {
 	RunID string
 	Turn  int
@@ -140,6 +141,11 @@ type ModelRetry struct {
 	Attempt int
 	Err     error
 	Delay   time.Duration
+	// Request is what the next attempt will send: the turn's request,
+	// or what [Retry.Revise] made of it. A recorder settles on it as it
+	// does on turn_start, so a fallback to another model reaches the
+	// path as a config delta.
+	Request openresponses.Request
 }
 
 // EventType returns "model_retry".

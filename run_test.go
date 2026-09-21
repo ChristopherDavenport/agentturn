@@ -1091,3 +1091,80 @@ func TestReasoningOnlyPartialIsRetried(t *testing.T) {
 		}
 	})
 }
+
+// switching answers 429 while the request names the primary model, and
+// answers as itself once the request names the fallback.
+type switching struct {
+	primary  string
+	calls    int
+	answered []string
+}
+
+func (m *switching) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.calls++
+	if req.Model == m.primary {
+		return openresponses.TooManyRequests("rate", "rate limited")
+	}
+	m.answered = append(m.answered, req.Model)
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	msg, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := msg.Text("answered by " + req.Model); err != nil {
+		return err
+	}
+	if err := msg.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestRetryReviseMovesTheTurn covers the fallback chain: a rate-limited
+// turn moves to another model, and the loop says so rather than leaving
+// the switch under a Streamer where no event describes it.
+func TestRetryReviseMovesTheTurn(t *testing.T) {
+	model := &switching{primary: "a"}
+	cfg := Config{Model: model, ModelName: "a", Retry: Retry{
+		MaxAttempts: 3,
+		Backoff:     func(int, error) time.Duration { return 0 },
+		Revise: func(attempt int, req *openresponses.Request, err error) *openresponses.Request {
+			req.Model = "b"
+			return nil
+		},
+	}}
+	events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("go")}, cfg))
+	if err != nil || end.Reason != ReasonDone || model.calls != 2 {
+		t.Fatalf("err=%v end=%+v calls=%d", err, end, model.calls)
+	}
+	var retries []*ModelRetry
+	var starts []string
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case *ModelRetry:
+			retries = append(retries, e)
+		case *TurnStart:
+			starts = append(starts, e.Request.Model)
+		}
+	}
+	if len(retries) != 1 || retries[0].Request.Model != "b" {
+		t.Fatalf("model_retry = %+v", retries)
+	}
+	if len(starts) != 1 || starts[0] != "a" {
+		t.Errorf("turn_start models = %v", starts)
+	}
+	if strings.Join(model.answered, ",") != "b" {
+		t.Errorf("answered by %v", model.answered)
+	}
+	// A revision that returns a request of its own is taken too.
+	model = &switching{primary: "a"}
+	cfg.Model = model
+	cfg.Retry.Revise = func(_ int, req *openresponses.Request, _ error) *openresponses.Request {
+		next := *req
+		next.Model = "c"
+		return &next
+	}
+	if _, _, err = collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("go")}, cfg)); err != nil || strings.Join(model.answered, ",") != "c" {
+		t.Errorf("err=%v answered by %v", err, model.answered)
+	}
+}

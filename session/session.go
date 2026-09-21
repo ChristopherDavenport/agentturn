@@ -41,6 +41,11 @@
 //     since the last call (a full one first if none was written, deltas
 //     after, a tool list change as tools_added and tools_removed), so
 //     the stored path replays to the request's settings.
+//   - model_retry: the settings of the request the next attempt will
+//     send, in place of the ones the attempt that failed carried, since
+//     that attempt answered nothing and wrote nothing. A Retry.Revise
+//     that moves the turn to another model is then a config delta, and
+//     the path names the model that answered.
 //   - model_blocked: the config settle for the request that was built,
 //     then a response entry with status failed, the hook's error and
 //     the request hash, so a call a BeforeModelCall guard refused is on
@@ -962,7 +967,12 @@ func Canonical(req openresponses.Request) openresponses.Request {
 // settle held since turn_start is written first, so an annotation made
 // during turn_start precedes it.
 func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
-	if _, ok := ev.(*agentturn.TurnStart); !ok {
+	switch ev.(type) {
+	case *agentturn.TurnStart, *agentturn.ModelRetry:
+		// Both hold a settle for the call they are about to make; the
+		// retry's replaces the one the turn started with, since the
+		// attempt it described never answered and wrote nothing.
+	default:
 		if err := w.flush(ctx); err != nil {
 			return err
 		}
@@ -972,6 +982,8 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 		return w.runStart(ctx, e)
 	case *agentturn.TurnStart:
 		return w.turnStart(ctx, e)
+	case *agentturn.ModelRetry:
+		return w.retry(ctx, e)
 	case *agentturn.ModelBlocked:
 		return w.blocked(ctx, e)
 	case *agentturn.ItemEnd:
@@ -1109,6 +1121,25 @@ func (w *writer) turnStart(ctx context.Context, e *agentturn.TurnStart) error {
 	if err := w.flush(ctx); err != nil {
 		return err
 	}
+	req := Canonical(e.Request)
+	hash, err := w.hash(req)
+	if err != nil {
+		return err
+	}
+	w.settleReq = &req
+	w.inFlight = true
+	w.pending = hash
+	w.started = w.rec.now()
+	w.inFlightID = ""
+	return nil
+}
+
+// retry takes the settings and the hash of the request the next
+// attempt will send, in place of the ones the attempt that failed was
+// built with: a fallback that moved the turn to another model is a
+// config delta on the path, so the settings in force name the model
+// that answered.
+func (w *writer) retry(ctx context.Context, e *agentturn.ModelRetry) error {
 	req := Canonical(e.Request)
 	hash, err := w.hash(req)
 	if err != nil {

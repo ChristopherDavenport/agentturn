@@ -690,7 +690,16 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 			return nil, fmt.Errorf("agentturn: model: %w", err)
 		}
 		delay := r.cfg.Retry.backoff(attempt, err)
-		if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: attempt, Err: err, Delay: delay}); err != nil {
+		if revise := r.cfg.Retry.Revise; revise != nil {
+			// The policy may move the turn to another model or another
+			// setting; the record follows the event.
+			next := req
+			if out := revise(attempt, &next, err); out != nil {
+				next = *out
+			}
+			req = next
+		}
+		if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: attempt, Err: err, Delay: delay, Request: req}); err != nil {
 			return nil, err
 		}
 		if err := sleep(ctx, delay); err != nil {
