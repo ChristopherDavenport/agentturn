@@ -172,6 +172,28 @@ loop builds each turn's request on: `tool_choice`, `max_output_tokens`,
 `include: reasoning.encrypted_content` for reasoning models, and so on.
 `BeforeModelCall` sees the finished request before it is sent.
 
+Every hook is one field, so two layers that want the same one silently
+lose an assignment to each other: a memory that re-renders its block
+into the instructions and a guard that inspects the request both want
+`BeforeModelCall`. The chain helpers join them in one place, with the
+order where a reader can see it, since a hook that edits the request
+belongs before one that inspects it:
+
+```go
+cfg.BeforeModelCall = agentturn.ChainBeforeModelCall(
+	memory.BeforeModelCall(), // edits the request
+	guard.BeforeModelCall(),  // inspects what will be sent
+)
+cfg.ShouldStopAfterTurn = agentturn.ChainShouldStopAfterTurn(
+	guard.ShouldStopAfterTurn(),
+	budget.ShouldStopAfterTurn(),
+)
+```
+
+`ChainBeforeTurn` concatenates what each layer returns,
+`ChainBeforeToolCall` folds the decisions deny over ask over allow, and
+`ChainOutputGuard` hands each guard's replacement to the next.
+
 `Config.Retry` retries a model call that failed before delivering
 anything: a 429 or 5xx, a dropped stream, a refused connection. The
 retry happens inside the turn, honours `Retry-After`, reports itself

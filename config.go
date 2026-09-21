@@ -103,6 +103,11 @@ type Config struct {
 	// a recorded session rebuilds the request they were part of, which
 	// injection through Transform cannot give. nil or no items appends
 	// nothing. A guard on the request itself belongs in BeforeModelCall.
+	//
+	// It is one field and several layers want it. Assigning it twice
+	// keeps the second assignment and loses the first with no error and
+	// no sign, so a product with more than one layer joins them with
+	// [ChainBeforeTurn], which appends what each returns in order.
 	BeforeTurn func(context.Context, TurnStartInfo) (openresponses.Items, error)
 
 	// BeforeModelCall runs on the fully built request of each turn, just
@@ -114,6 +119,13 @@ type Config struct {
 	// [ModelBlocked] event carrying the request as built; a guard that
 	// calls a model is on the critical path of every first token, since
 	// the request is not final until the hook returns.
+	//
+	// This is the most contested field in the package: a memory that
+	// re-renders its block into the instructions and a guard that
+	// inspects what is about to be sent both want it, and assigning it
+	// twice keeps the second assignment silently. Join them with
+	// [ChainBeforeModelCall], in the order they must run: a hook that
+	// edits the request before one that inspects it.
 	BeforeModelCall func(context.Context, *openresponses.Request) error
 
 	// OutputGuard runs on each assistant message as the stream completes
@@ -127,6 +139,8 @@ type Config struct {
 	// it, so a replay still has what it needs; a guard that also wants
 	// to end the run returns an error wrapping [ErrGuard] from
 	// ShouldStopAfterTurn, which sees the turn with TurnInfo.Final set.
+	// Several guards are joined with [ChainOutputGuard], each seeing
+	// what the one before it left.
 	OutputGuard func(context.Context, OutputInfo) (*openresponses.Message, error)
 
 	// Retry is the policy for transient model failures. The zero value
@@ -154,6 +168,9 @@ type Config struct {
 
 	// BeforeToolCall runs once per call, in the model's order, before any
 	// call of the batch executes. A nil decision allows the call.
+	// Several policies are joined with [ChainBeforeToolCall], which
+	// folds their decisions deny over ask over allow; assigning the
+	// field twice keeps only the second policy.
 	BeforeToolCall func(context.Context, ToolCallInfo) (*ToolDecision, error)
 	// AfterToolCall runs when a call completes and may replace its
 	// result. A nil override keeps the result. An override replaces the
@@ -173,6 +190,11 @@ type Config struct {
 	// error wrapping [ErrGuard] ends it with ReasonStopped, StopGuard
 	// and the error on RunEnd.Err, so a policy that stops a run is told
 	// apart from a failure; any other error ends it with ReasonError.
+	//
+	// A guard chain and a token budget both want this field. Join them
+	// with [ChainShouldStopAfterTurn], which stops at the first hook
+	// that stops the run, so the error on RunEnd.Err is that hook's and
+	// says which one fired.
 	ShouldStopAfterTurn func(context.Context, TurnInfo) (bool, error)
 
 	// RequestExtra is passed through as Request.Extra on every call.

@@ -7,6 +7,18 @@ versions may break the API.
 
 ## Unreleased
 
+- `ChainBeforeModelCall`, `ChainBeforeTurn`, `ChainShouldStopAfterTurn`,
+  `ChainBeforeToolCall` and `ChainOutputGuard` join several values for
+  one hook into one. Every hook is a plain field, so a product that
+  follows two layers' READMEs in turn keeps the second assignment and
+  loses the first with no error and no sign, which is how a memory
+  block silently freezes at the value it had when the process started.
+  The semantics are stated: in order, the first error stops the chain,
+  the first stop ends the run, BeforeTurn concatenates, BeforeToolCall
+  folds deny over ask over allow with the first reason of an action
+  kept, and each output guard sees what the one before it left.
+  `Config`'s doc comments name the layers that contest each field. (#64)
+
 - `tools/agent`: the child runs as an `agentturn.Agent` rather than
   inside the low-level `Run`, and `WithSpawn(fn)` hands it to the host,
   keyed by the call, before the run starts: a host can steer a running
