@@ -1237,6 +1237,10 @@ var ErrNoInvoker = errors.New("agentturn: no loop on the context to invoke a too
 // agenttool.New puts on every typed tool's context; a tool that
 // implements the interface itself and wants the parent named passes
 // agenttool.WithCall. Outside a loop, Invoke returns [ErrNoInvoker].
+//
+// Call it from a tool, with the context the tool was given. A
+// subscriber is called while the loop holds delivery, so invoking from
+// one, with a context it kept from elsewhere, blocks the run.
 func Invoke(ctx context.Context, name string, args json.RawMessage) (agenttool.Result, error) {
 	fn, _ := ctx.Value(invokerKey{}).(invoker)
 	if fn == nil {

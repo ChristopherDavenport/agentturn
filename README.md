@@ -360,9 +360,12 @@ The plan is `docs/plans/agent-layer.md`. Invariants the tests hold:
   loop reads `context.Cause`, so a rule that matched, an advisor and a
   user pressing Esc are three things `RunEnd.Err` and the record tell
   apart rather than three "context canceled".
-- Events for one run are delivered from one goroutine, and a nested
-  call's from the goroutine of the tool that made it, one event at a
-  time: a subscriber is never called from two goroutines at once.
+- Events for one run are delivered from one goroutine, and the events
+  a nested call raises from a tool's goroutine are serialised with
+  them, so a run's events never interleave. The `queued` event of
+  `Steer` and `FollowUp` belongs to no run and is delivered from the
+  goroutine that accepted the item, which may be while a run's event is
+  in flight.
 
 ## License
 
