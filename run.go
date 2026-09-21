@@ -340,6 +340,18 @@ type runner struct {
 	// deferred holds the IDs of the calls a hook handed to the caller
 	// during this run, so the run end can say why they are pending.
 	deferred map[string]bool
+	// held are the completed items of the attempt in flight that the
+	// transcript does not have yet, because nothing has committed the
+	// attempt: a reasoning item a model opens before its answer. They
+	// are appended when the attempt commits and dropped when it ends
+	// without committing.
+	held []heldItem
+}
+
+// heldItem is a completed item waiting for its attempt to commit.
+type heldItem struct {
+	item       openresponses.Item
+	responseID string
 }
 
 // errStop carries a run end reason out of a phase.
@@ -689,18 +701,24 @@ func sleep(ctx context.Context, d time.Duration) error {
 }
 
 // stream runs one attempt at the request. committed reports that the
-// attempt cannot be retried: an event of it reached subscribers, or
-// the server answered with a terminal response. The error is returned
-// unwrapped so a retry policy sees the transport or wire error itself.
+// attempt cannot be retried: a message or a function call opened, a
+// subscriber failed, or the server answered with a terminal response.
+// An attempt that ends before it commits leaves nothing behind: the
+// items it completed, a reasoning summary before the first token for
+// one, are dropped with it, so the transcript never ends in an item the
+// model produced on the way to an answer that never came. The error is
+// returned unwrapped so a retry policy sees the transport or wire error
+// itself.
 func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *openresponses.Response, committed bool, err error) {
 	var acc openresponses.Accumulator
+	r.held = nil
 	for ev, err := range openresponses.Events(ctx, r.cfg.Model, req) {
 		if err != nil {
 			return nil, committed, err
 		}
 		acc.Add(ev)
-		emitted, err := r.streamEvent(ev, &acc)
-		committed = committed || emitted
+		commits, err := r.streamEvent(ev, &acc, committed)
+		committed = committed || commits
 		if err != nil {
 			return nil, true, err
 		}
@@ -726,16 +744,28 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 // streamEvent turns one wire event, already added to acc, into the item
 // events of the turn: item_start when an output item opens, item_end
 // with the transcript append when it is done, item_update for the
-// events in between. It reports whether an event was emitted. An error
-// event fails the attempt with the wire error, unwrapped.
-func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Accumulator) (bool, error) {
+// events in between. committed says whether the attempt has committed;
+// while it has not, a completed item is held rather than appended, and
+// the return reports whether this event commits the attempt, which a
+// message or a function call opening does. An error event fails the
+// attempt with the wire error, unwrapped.
+func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Accumulator, committed bool) (bool, error) {
 	responseID := ""
 	if cur := acc.Response(); cur != nil {
 		responseID = cur.ID
 	}
 	switch e := ev.(type) {
 	case *openresponses.OutputItemAddedEvent:
-		return true, r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[e.OutputIndex], ResponseID: responseID})
+		item := acc.Response().Output[e.OutputIndex]
+		commits := !committed && commitsAttempt(item)
+		if commits {
+			// The answer has started: what the attempt produced on the
+			// way to it belongs in the transcript, before it.
+			if err := r.flushHeld(); err != nil {
+				return true, err
+			}
+		}
+		return commits, r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, ResponseID: responseID})
 	case *openresponses.OutputItemDoneEvent:
 		item := e.Item
 		if m, ok := item.(*openresponses.Message); ok && r.cfg.OutputGuard != nil {
@@ -748,16 +778,48 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 				item = replacement
 			}
 		}
+		if !committed {
+			// Nothing commits the attempt yet, so the item waits: a
+			// failure now is retried and leaves no trace.
+			r.held = append(r.held, heldItem{item: item, responseID: responseID})
+			return false, nil
+		}
 		r.transcript = append(r.transcript, item)
 		r.added = append(r.added, item)
-		return true, r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, ResponseID: responseID})
+		return false, r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, ResponseID: responseID})
 	case *openresponses.ErrorEvent:
 		return false, e.Err()
 	}
 	if idx, ok := outputIndex(ev); ok {
-		return true, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[idx], Stream: ev, ResponseID: responseID})
+		return false, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[idx], Stream: ev, ResponseID: responseID})
 	}
 	return false, nil
+}
+
+// commitsAttempt reports whether an item opening commits the attempt:
+// the model has begun its answer, so a failure after it cannot be
+// retried without sending part of the answer twice.
+func commitsAttempt(item openresponses.Item) bool {
+	switch item.(type) {
+	case *openresponses.Message, *openresponses.FunctionCall:
+		return true
+	}
+	return false
+}
+
+// flushHeld appends the items the attempt held, in order, with their
+// item_end events.
+func (r *runner) flushHeld() error {
+	held := r.held
+	r.held = nil
+	for _, h := range held {
+		r.transcript = append(r.transcript, h.item)
+		r.added = append(r.added, h.item)
+		if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: h.item, ResponseID: h.responseID}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // outputIndex returns the output index an item-scoped event refers to.

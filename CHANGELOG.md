@@ -7,6 +7,17 @@ versions may break the API.
 
 ## Unreleased
 
+- **Fixed**: `Retry` committed an attempt as soon as any output item
+  opened, and a reasoning model opens its reasoning item before its
+  text, so a 503 between the summary and the first token was final and
+  left a transcript ending in a reasoning item, which `Continue`
+  refuses and a strict server rejects. An attempt commits when a
+  message or a function call opens; an item completed before that is
+  held, reaching subscribers as item_start and item_update so a front
+  still renders thinking live, and is appended when the attempt commits
+  or dropped when it ends without committing. The transcript never ends
+  in a bare reasoning item. (#71)
+
 - `Agent.AbortCause(err)` cuts a run with a reason, and the loop reads
   `context.Cause` wherever it read the bare context error, so a host
   that cancels the run's context itself with `context.WithCancelCause`

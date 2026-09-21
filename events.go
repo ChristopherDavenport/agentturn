@@ -165,6 +165,12 @@ func (*ModelBlocked) EventType() string { return EventModelBlocked }
 // queued message, an assistant item as the stream opens it, or a
 // function call output. For an assistant item the Item is the live
 // accumulated value and fills in as updates arrive.
+//
+// An item the model completes before its attempt commits, a reasoning
+// summary before the first token, is announced here and reaches the
+// transcript only if the attempt commits (see [Retry]): a front that
+// renders from item_start drops what it was rendering when a
+// [ModelRetry] or a failing run_end follows with no item_end for it.
 type ItemStart struct {
 	RunID string
 	Turn  int

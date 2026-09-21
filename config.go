@@ -204,11 +204,22 @@ type Config struct {
 // Retry says when a failed model call is attempted again. A retry
 // happens inside the turn: the same request is sent again after a
 // delay, a [ModelRetry] event tells subscribers, and the turn_start
-// and response_end of the turn are delivered once. Only an attempt
-// that delivered nothing is retried: once an item of the attempt has
-// reached subscribers, or the server has answered with a failed
-// response, the failure is final, because the transcript or a
-// recorder may already hold part of it. Abort cuts a delay short.
+// and response_end of the turn are delivered once.
+//
+// Only an attempt that has not committed is retried. An attempt
+// commits when the model begins its answer, which is a message or a
+// function call item opening, or when the server answers with a failed
+// response; after that a failure is final, because the transcript or a
+// recorder may already hold part of the answer. An item the model
+// completed before that point, the reasoning summary a reasoning model
+// writes before its first token, is held rather than appended: it
+// reaches subscribers as item_start and item_update, so a front renders
+// thinking live, and it is appended with its item_end when the attempt
+// commits and dropped when the attempt ends without committing. A 503
+// between the reasoning summary and the first token is therefore
+// retried, and leaves nothing in the transcript or the record; the
+// transcript never ends in a bare reasoning item, which no server
+// accepts as input before a user message. Abort cuts a delay short.
 type Retry struct {
 	// MaxAttempts is the number of attempts per turn, the first
 	// included. Zero or one means no retry.

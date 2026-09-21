@@ -194,12 +194,16 @@ cfg.ShouldStopAfterTurn = agentturn.ChainShouldStopAfterTurn(
 `ChainBeforeToolCall` folds the decisions deny over ask over allow, and
 `ChainOutputGuard` hands each guard's replacement to the next.
 
-`Config.Retry` retries a model call that failed before delivering
-anything: a 429 or 5xx, a dropped stream, a refused connection. The
+`Config.Retry` retries a model call that failed before the model began
+its answer: a 429 or 5xx, a dropped stream, a refused connection. The
 retry happens inside the turn, honours `Retry-After`, reports itself
-as a `model_retry` event, and is cut short by `Abort`. An attempt that
-already delivered an item is never retried, since the transcript may
-hold part of it.
+as a `model_retry` event, and is cut short by `Abort`. An attempt
+commits when a message or a function call opens, and is never retried
+after that, since the transcript may hold part of the answer. An item
+the model completed before that point, a reasoning summary, streams to
+subscribers but waits: it is appended when the attempt commits and
+dropped when the attempt fails, so a 503 between the thinking and the
+first token is retried and leaves no orphan behind.
 
 ```go
 cfg.Retry = agentturn.Retry{MaxAttempts: 4}

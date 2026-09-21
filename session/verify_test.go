@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -232,5 +233,66 @@ func TestRebaseToTheEmptyIDResets(t *testing.T) {
 	}
 	if got := entryTypes(s); !strings.Contains(got, "config") {
 		t.Errorf("entries = %s", got)
+	}
+}
+
+// reasoningThenCut completes a reasoning item and then blocks until the
+// stream is cut, as a reasoning model does when a rule or a user stops
+// the run before the first token.
+type reasoningThenCut struct{}
+
+func (reasoningThenCut) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Reasoning()
+	if err != nil {
+		return err
+	}
+	if err := w.Summary("weighing the options"); err != nil {
+		return err
+	}
+	if err := w.EndSummary(); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestInterruptedReasoningRunVerifies is the live turn the study hit on
+// its first run: a reasoning model cut before its answer. Nothing the
+// attempt produced is on the path, so the failed response rebuilds the
+// request that was sent.
+func TestInterruptedReasoningRunVerifies(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: reasoningThenCut{}, ModelName: "qwen"})
+	defer rec.Attach(a)()
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if e, ok := ev.(*agentturn.ItemStart); ok && e.Item.ItemType() == "reasoning" {
+			a.AbortCause(errors.New("ttsr: rule box-leak"))
+		}
+		return nil
+	})
+	end, _ := a.Prompt(context.Background(), openresponses.UserText("how do I leak a String?"))
+	if end == nil || end.Reason != agentturn.ReasonAborted {
+		t.Fatalf("end = %+v", end)
+	}
+	if n := verifyAll(t, s); n != 1 {
+		t.Errorf("responses = %d", n)
+	}
+	if hashed(s) != 1 {
+		t.Errorf("the interrupted call carries no hash: %s", entryTypes(s))
+	}
+	if got := entryTypes(s); strings.Contains(got, "item:reasoning") {
+		t.Errorf("the attempt that never answered left an item: %s", got)
+	}
+	runs := runsOf(t, s)
+	if len(runs) != 1 || runs[0].End == nil || runs[0].End.Ref != "ttsr: rule box-leak" {
+		t.Errorf("run end = %+v", runs[0].End)
 	}
 }

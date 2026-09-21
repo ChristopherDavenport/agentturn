@@ -985,3 +985,109 @@ func TestRunIDOnContext(t *testing.T) {
 		t.Error("a bare context has a run ID")
 	}
 }
+
+// reasoningThenFail completes a reasoning item and then fails, for the
+// first n calls; after that it reasons and answers, as a reasoning
+// model whose provider was briefly overloaded does.
+type reasoningThenFail struct {
+	n     int
+	calls int
+}
+
+func (m *reasoningThenFail) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.calls++
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Reasoning()
+	if err != nil {
+		return err
+	}
+	if err := w.Summary("weighing the options"); err != nil {
+		return err
+	}
+	if err := w.EndSummary(); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	if m.calls <= m.n {
+		return openresponses.ServerError("overloaded", "overloaded")
+	}
+	msg, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := msg.Text("use Box::leak"); err != nil {
+		return err
+	}
+	if err := msg.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestReasoningOnlyPartialIsRetried covers the turn a reasoning model
+// loses between its summary and its first token: the attempt has not
+// begun its answer, so it is retried, and what it completed on the way
+// is not left in the transcript.
+func TestReasoningOnlyPartialIsRetried(t *testing.T) {
+	noWait := func(int, error) time.Duration { return 0 }
+	t.Run("retried, and the reasoning of the attempt that answered is kept", func(t *testing.T) {
+		model := &reasoningThenFail{n: 1}
+		cfg := Config{Model: model, Retry: Retry{MaxAttempts: 3, Backoff: noWait}}
+		events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("go")}, cfg))
+		if err != nil || end.Reason != ReasonDone || model.calls != 2 {
+			t.Fatalf("err=%v end=%+v calls=%d", err, end, model.calls)
+		}
+		if got := itemTypes(end.Items); got != "user reasoning assistant" {
+			t.Errorf("items = %q", got)
+		}
+		retries, starts, ends := 0, 0, 0
+		for _, ev := range events {
+			switch e := ev.(type) {
+			case *ModelRetry:
+				retries++
+			case *ItemStart:
+				if e.Item.ItemType() == "reasoning" {
+					starts++
+				}
+			case *ItemEnd:
+				if e.Item.ItemType() == "reasoning" {
+					ends++
+				}
+			}
+		}
+		// Both attempts rendered their thinking live; only the one that
+		// committed is in the transcript.
+		if retries != 1 || starts != 2 || ends != 1 {
+			t.Errorf("retries=%d reasoning item_start=%d item_end=%d", retries, starts, ends)
+		}
+	})
+	t.Run("the failure leaves a transcript the loop can continue", func(t *testing.T) {
+		model := &reasoningThenFail{n: 5}
+		cfg := Config{Model: model, Retry: Retry{MaxAttempts: 2, Backoff: noWait}}
+		_, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("go")}, cfg))
+		if end.Reason != ReasonError || err == nil || model.calls != 2 {
+			t.Fatalf("err=%v end=%+v calls=%d", err, end, model.calls)
+		}
+		if got := itemTypes(end.Items); got != "user" {
+			t.Errorf("items = %q, want nothing of the attempts that never answered", got)
+		}
+		transcript := Transcript{openresponses.UserText("go")}
+		if !CanContinue(transcript) {
+			t.Error("the transcript after the failure cannot be continued")
+		}
+	})
+	t.Run("an attempt that opened a message is final", func(t *testing.T) {
+		cfg := Config{Model: partial{}, Retry: Retry{MaxAttempts: 3, Backoff: noWait, Retryable: func(error) bool { return true }}}
+		events, end, _ := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("hi")}, cfg))
+		if end.Reason != ReasonError || itemTypes(end.Items) != "user assistant" {
+			t.Errorf("end=%+v items=%s", end, itemTypes(end.Items))
+		}
+		for _, ev := range events {
+			if _, ok := ev.(*ModelRetry); ok {
+				t.Error("retried after the answer had begun")
+			}
+		}
+	})
+}
