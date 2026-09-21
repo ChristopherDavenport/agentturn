@@ -110,6 +110,13 @@
 //   - tool_end with a tools/agent ChildInfo whose run was not observed:
 //     a session holding only the child's items, with no records
 //     promise, and the link; wire Observe to get the full record.
+//   - tool_start and tool_end of a call a tool made through
+//     agentturn.Invoke: a custom entry in the [NestedCallNS] namespace
+//     for each, carrying the parent call, the name, the arguments and
+//     what a hook decided, then the outcome. A nested call has no
+//     function_call item for a dispatch or a decision to name, so until
+//     the format has a word for one these carry what a reader needs to
+//     count the calls a turn ran.
 //   - tool_end whose Result.Details implements agenttool.Recordable: a
 //     custom entry in the namespace the value names, carrying its JSON,
 //     between the call's dispatch and its output. This is how a tool
@@ -264,6 +271,43 @@ type FoldCall struct {
 	ResponseID string `json:"response_id,omitempty"`
 	// Model is the model the request named.
 	Model string `json:"model,omitempty"`
+}
+
+// NestedCallNS is the namespace of the custom entries written for a
+// call a tool made through [agentturn.Invoke]. Its data is a
+// [NestedCall]: one entry with phase start before the call runs,
+// carrying the name, the arguments and what a hook decided, and one
+// with phase end carrying the outcome.
+//
+// A nested call has no function_call item in the transcript, because it
+// is the work of the call that made it, and the format's dispatch and
+// decision entries name the entry holding the call. These entries carry
+// what the format has no word for yet, so a reader that counts the
+// calls a turn ran, or an auditor asking what a code-execution tool did
+// with the agent's other tools, has the same facts the model's own
+// calls leave behind.
+const NestedCallNS = "agentturn:nested_call"
+
+// NestedCall is the data of a [NestedCallNS] custom entry.
+type NestedCall struct {
+	// Phase is start before the call runs and end after it.
+	Phase string `json:"phase"`
+	// CallID is the ID the loop minted for the nested call and Parent
+	// the call whose tool made it.
+	CallID string `json:"call_id"`
+	Parent string `json:"parent"`
+	Name   string `json:"name"`
+	// Args are the arguments the tool ran with, on the start entry.
+	Args json.RawMessage `json:"args,omitempty"`
+	// Verdict, Reason and By are what a hook decided about the call,
+	// in the format's terms, on the start entry.
+	Verdict string `json:"verdict,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	By      string `json:"by,omitempty"`
+	// Output is the text the caller received and Error the failure, on
+	// the end entry.
+	Output string `json:"output,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 // ErrRunActive is returned by [Recorder.Rebase] while a run is being
@@ -949,6 +993,18 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 // an agenttool.Recordable, as a custom entry in the namespace the value
 // names, between the call's dispatch and its output.
 func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
+	if e.Parent != "" {
+		if err := w.nested(ctx, NestedCall{
+			Phase:  agentsession.RunEnd,
+			CallID: e.CallID,
+			Parent: e.Parent,
+			Name:   e.Name,
+			Output: e.Result.Output.Text,
+			Error:  errText(e.Err),
+		}); err != nil {
+			return err
+		}
+	}
 	if info, ok := e.Result.Details.(agent.ChildInfo); ok && w.rec.children {
 		return w.child(ctx, e.CallID, info)
 	}
@@ -961,6 +1017,33 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 	}
 	_, err = w.append(ctx, &agentsession.CustomEntry{NS: rec.NS, Data: rec.Data})
 	return err
+}
+
+// nested writes one custom entry for a call a tool made through
+// agentturn.Invoke.
+func (w *writer) nested(ctx context.Context, n NestedCall) error {
+	raw, err := json.Marshal(n)
+	if err != nil {
+		return fmt.Errorf("session: encode nested call %s: %w", n.CallID, err)
+	}
+	_, err = w.append(ctx, &agentsession.CustomEntry{NS: NestedCallNS, Data: raw})
+	return err
+}
+
+// decisionReason is a decision's reason, or "" when there is none.
+func decisionReason(d *agentturn.ToolDecision) string {
+	if d == nil {
+		return ""
+	}
+	return d.Reason
+}
+
+// decisionBy is who a decision names, or "" when there is none.
+func decisionBy(d *agentturn.ToolDecision) string {
+	if d == nil {
+		return ""
+	}
+	return d.By
 }
 
 // runStart opens the run on the record: the run entry, the env when
@@ -1220,6 +1303,28 @@ func outputText(out *openresponses.FunctionCallOutput) string {
 // toolStart writes what was decided about the call, when something
 // was, and its dispatch when it goes to its tool.
 func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
+	if e.Parent != "" {
+		return w.nested(ctx, NestedCall{
+			Phase:  agentsession.RunStart,
+			CallID: e.CallID,
+			Parent: e.Parent,
+			Name:   e.Name,
+			Args:   json.RawMessage(e.Args),
+			Verdict: func() string {
+				switch {
+				case e.Decision == nil:
+					return ""
+				case e.Decision.Action != agentturn.Allow:
+					return agentsession.VerdictReject
+				case e.Decision.Args != nil:
+					return agentsession.VerdictProceed
+				}
+				return ""
+			}(),
+			Reason: decisionReason(e.Decision),
+			By:     decisionBy(e.Decision),
+		})
+	}
 	c := w.calls[e.CallID]
 	if c == nil {
 		// A call this recorder did not write and did not find pending:

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"sync"
 	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
@@ -150,7 +151,7 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 				// run_end, reach a consumer that is still there. The
 				// loop notices the cancellation through the model, the
 				// tools and its own checks.
-				emit: func(ev Event) error {
+				send: func(ev Event) error {
 					events <- ev
 					return nil
 				},
@@ -320,14 +321,20 @@ func (c Config) baseRequest(tools agenttool.Set) openresponses.Request {
 	return req
 }
 
-// runner is one run of the loop. emit delivers an event and returns an
+// runner is one run of the loop. send delivers an event and returns an
 // error to abort the run; steer and followUp drain the queues when set.
 type runner struct {
 	cfg        Config
 	transcript Transcript
-	emit       func(Event) error
+	send       func(Event) error
 	steer      func() openresponses.Items
 	followUp   func() openresponses.Items
+
+	// emitMu serialises delivery, so the events a nested call raises
+	// from a tool's goroutine do not interleave with the run's own or
+	// with another tool's. A subscriber is never called from two
+	// goroutines at once, and the run's own events keep their order.
+	emitMu sync.Mutex
 
 	runID string
 	turn  int
@@ -352,6 +359,13 @@ type runner struct {
 type heldItem struct {
 	item       openresponses.Item
 	responseID string
+}
+
+// emit delivers one event to the consumer, one at a time.
+func (r *runner) emit(ev Event) error {
+	r.emitMu.Lock()
+	defer r.emitMu.Unlock()
+	return r.send(ev)
 }
 
 // errStop carries a run end reason out of a phase.
@@ -876,6 +890,9 @@ type callState struct {
 	// cut is set when the abort settled the call rather than the tool,
 	// so no output is appended for it whatever its error says.
 	cut bool
+	// parent is the call whose tool made this one with Invoke, empty
+	// for a call of the model's batch.
+	parent string
 	// appended is set once the call's output is in the transcript.
 	appended bool
 	// note is text appended after the batch's outputs, from the
@@ -891,7 +908,7 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 		return nil, nil, nil
 	}
 	// Hooks and tools see the conversation that produced the calls.
-	ctx = r.toolContext(ctx)
+	ctx = r.toolContext(ctx, tools)
 	batch, err := r.preflightAll(ctx, tools, calls)
 	if err != nil {
 		return nil, nil, err
@@ -903,9 +920,13 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 }
 
 // toolContext is the context hooks and tools run under: ctx with a
-// snapshot of the working transcript attached.
-func (r *runner) toolContext(ctx context.Context) context.Context {
-	return ContextWithTranscript(ctx, append(Transcript(nil), r.transcript...))
+// snapshot of the working transcript attached, and the invoker that
+// runs another of the turn's tools through the loop.
+func (r *runner) toolContext(ctx context.Context, tools agenttool.Set) context.Context {
+	ctx = ContextWithTranscript(ctx, append(Transcript(nil), r.transcript...))
+	return context.WithValue(ctx, invokerKey{}, invoker(func(ctx context.Context, name string, args json.RawMessage) (agenttool.Result, error) {
+		return r.invoke(ctx, tools, name, args)
+	}))
 }
 
 // preflightAll runs preflight for every call in the model's order and
@@ -1043,7 +1064,7 @@ func (r *runner) collect(batch []*callState) ([]agenttool.Result, []*openrespons
 // The tool events carry Turn 0.
 func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agenttool.Result, error) {
 	tools := r.cfg.tools(ctx)
-	ctx = r.toolContext(ctx)
+	ctx = r.toolContext(ctx, tools)
 	batch := make([]*callState, len(approved))
 	for i, ap := range approved {
 		p := r.prepare(tools, ap.call, ap.args)
@@ -1170,10 +1191,102 @@ func (r *runner) settle(ctx context.Context, p *callState) error {
 		p.result.Terminate = terminate
 		p.result.Details = details
 	}
-	return r.emit(&ToolEnd{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked})
+	return r.emit(&ToolEnd{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Parent: p.parent})
 }
 
 func validObject(raw json.RawMessage) bool {
 	var v map[string]json.RawMessage
 	return json.Unmarshal(raw, &v) == nil && v != nil
+}
+
+type invokerKey struct{}
+
+// invoker runs one nested call under the turn that attached it.
+type invoker func(ctx context.Context, name string, args json.RawMessage) (agenttool.Result, error)
+
+// ErrNoInvoker is returned by [Invoke] outside a tool call of a loop.
+var ErrNoInvoker = errors.New("agentturn: no loop on the context to invoke a tool through")
+
+// Invoke runs one of the turn's tools as if the model had asked for it
+// under the call in flight: [Config.BeforeToolCall] decides, tool_start
+// and tool_end are emitted with Parent naming the call that made it,
+// [Config.AfterToolCall] may override the result, and a session
+// recorder writes it. It is what a tool that lets its code reach the
+// agent's other tools, a code-execution kernel over a loopback bridge,
+// calls instead of holding an agenttool.Set of its own, where the
+// policy, the events and the record would all be absent.
+//
+// The result is the one the model would have seen, with the error
+// beside it: a tool that failed, a name no tool has, arguments that are
+// not an object, or a call the hook refused, whose Reason is the error.
+// A hook that defers the call refuses it instead, since a nested call
+// cannot be handed to the caller: it belongs to a tool that is running.
+// Nothing is appended to the transcript, so a nested call costs no
+// items and a Terminate on its result means nothing to the loop.
+//
+// The call it is made under comes from agenttool.CallFrom, which
+// agenttool.New puts on every typed tool's context; a tool that
+// implements the interface itself and wants the parent named passes
+// agenttool.WithCall. Outside a loop, Invoke returns [ErrNoInvoker].
+func Invoke(ctx context.Context, name string, args json.RawMessage) (agenttool.Result, error) {
+	fn, _ := ctx.Value(invokerKey{}).(invoker)
+	if fn == nil {
+		return agenttool.Result{}, ErrNoInvoker
+	}
+	return fn(ctx, name, args)
+}
+
+// invoke runs a nested call through the turn's hooks, events and
+// executor. It never touches the transcript: the call is the work of
+// the call that made it.
+func (r *runner) invoke(ctx context.Context, tools agenttool.Set, name string, args json.RawMessage) (agenttool.Result, error) {
+	parent := ""
+	if call, ok := agenttool.CallFrom(ctx); ok {
+		parent = call.ID
+	}
+	call := &openresponses.FunctionCall{CallID: openresponses.NewID("call"), Name: name, Arguments: string(args)}
+	p := r.prepare(tools, call, args)
+	p.parent = parent
+	var decision *ToolDecision
+	if r.cfg.BeforeToolCall != nil {
+		var err error
+		decision, err = r.cfg.BeforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: r.turn, Call: call, Tool: p.tool, Args: p.args, Batch: []*openresponses.FunctionCall{call}, Index: 0})
+		if err != nil {
+			return agenttool.Result{}, fmt.Errorf("agentturn: before-tool-call hook: %w", err)
+		}
+		if decision != nil {
+			if decision.Args != nil {
+				p.args = decision.Args
+			}
+			switch decision.Action {
+			case Block, Defer:
+				reason := decision.Reason
+				if reason == "" {
+					reason = "call blocked"
+				}
+				if decision.Action == Defer {
+					reason = "a nested call cannot be deferred to the caller: " + reason
+				}
+				p.blocked = true
+				p.err = errors.New(reason)
+			}
+		}
+	}
+	if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: call.CallID, Name: name, Args: p.args, Decision: decision, Parent: parent}); err != nil {
+		return agenttool.Result{}, err
+	}
+	if err := r.check(ctx, p, false); err != nil {
+		return agenttool.Result{}, err
+	}
+	if p.settled {
+		return p.result, p.err
+	}
+	job := agenttool.Job{Tool: p.tool, Call: agenttool.Call{ID: call.CallID, Args: p.args}}
+	results, errs := agenttool.Executor{}.Results(ctx, []agenttool.Job{job})
+	p.result, p.err = results[0], errs[0]
+	p.settled = true
+	if err := r.settle(ctx, p); err != nil {
+		return agenttool.Result{}, err
+	}
+	return p.result, p.err
 }

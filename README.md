@@ -167,6 +167,24 @@ pending call is accepted, and the model sees the outputs and the
 message in one call. `AfterToolCall` overrides results;
 `ShouldStopAfterTurn` ends a run early.
 
+A tool whose own work is to call other tools, a code-execution kernel
+with a loopback bridge, uses `agentturn.Invoke` rather than holding a
+tool set of its own, so the nested call goes through `BeforeToolCall`,
+raises `tool_start` and `tool_end` with `Parent` naming the call that
+made it, and reaches the recorder:
+
+```go
+var Eval = agenttool.New("eval", "Run code that may call the agent's tools",
+	func(ctx context.Context, a EvalArgs) (string, error) {
+		res, err := agentturn.Invoke(ctx, "read", json.RawMessage(`{"path":"go.mod"}`))
+		...
+	})
+```
+
+A nested call appends nothing to the transcript: it is the work of the
+call that made it. A hook that defers one refuses it instead, since
+there is nobody to ask while a tool is running.
+
 Every other request member comes from `Config.Request`, the base the
 loop builds each turn's request on: `tool_choice`, `max_output_tokens`,
 `include: reasoning.encrypted_content` for reasoning models, and so on.
@@ -317,7 +335,9 @@ The plan is `docs/plans/agent-layer.md`. Invariants the tests hold:
   loop reads `context.Cause`, so a rule that matched, an advisor and a
   user pressing Esc are three things `RunEnd.Err` and the record tell
   apart rather than three "context canceled".
-- Events for one run are delivered from one goroutine.
+- Events for one run are delivered from one goroutine, and a nested
+  call's from the goroutine of the tool that made it, one event at a
+  time: a subscriber is never called from two goroutines at once.
 
 ## License
 

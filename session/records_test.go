@@ -776,3 +776,78 @@ func TestAbortCauseIsTheRunsRef(t *testing.T) {
 	}
 	verifyAll(t, s)
 }
+
+// TestNestedCallsAreRecorded checks that the calls a tool makes through
+// agentturn.Invoke leave the same facts on the record as the model's
+// own: one entry before each runs and one after, so a reader counting
+// the calls of a turn counts three rather than one.
+func TestNestedCallsAreRecorded(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := agenttool.New("read", "reads", func(context.Context, echoArgs) (string, error) { return "the contents", nil })
+	eval := agenttool.New("eval", "runs code", func(ctx context.Context, _ echoArgs) (string, error) {
+		if _, err := agentturn.Invoke(ctx, "read", json.RawMessage(`{"text":"go.mod"}`)); err != nil {
+			return "", err
+		}
+		_, err := agentturn.Invoke(ctx, "bash", json.RawMessage(`{"text":"rm -rf /tmp/build"}`))
+		if err == nil {
+			t.Error("the blocked nested call returned no error")
+		}
+		return "ran two calls", nil
+	})
+	bash := agenttool.New("bash", "runs a command", func(context.Context, echoArgs) (string, error) { return "done", nil })
+	policy := func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+		if info.Call.Name == "bash" {
+			return &agentturn.ToolDecision{Action: agentturn.Block, Reason: "denied by bash(rm:*)", By: agentsession.ByPolicy}, nil
+		}
+		return nil, nil
+	}
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m",
+		Tools: []agenttool.Tool{eval, read, bash}, BeforeToolCall: policy, MaxTurns: 1})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
+		t.Fatal(err)
+	}
+	var nested []NestedCall
+	for _, e := range s.Entries() {
+		c, ok := e.(*agentsession.CustomEntry)
+		if !ok || c.NS != NestedCallNS {
+			continue
+		}
+		var n NestedCall
+		if err := json.Unmarshal(c.Data, &n); err != nil {
+			t.Fatal(err)
+		}
+		nested = append(nested, n)
+	}
+	if len(nested) != 4 {
+		t.Fatalf("nested call entries = %d", len(nested))
+	}
+	parent := callsOf(t, s)["eval"]
+	if parent == nil || parent.Dispatch == nil {
+		t.Fatalf("the call that made them = %+v", parent)
+	}
+	for _, n := range nested {
+		if n.Parent != parent.ID() {
+			t.Errorf("entry %+v does not name the call that made it (%s)", n, parent.ID())
+		}
+	}
+	if nested[0].Name != "read" || nested[0].Phase != agentsession.RunStart || string(nested[0].Args) != `{"text":"go.mod"}` {
+		t.Errorf("first entry = %+v", nested[0])
+	}
+	if nested[1].Phase != agentsession.RunEnd || nested[1].Output != "the contents" {
+		t.Errorf("second entry = %+v", nested[1])
+	}
+	if nested[2].Name != "bash" || nested[2].Verdict != agentsession.VerdictReject || nested[2].Reason != "denied by bash(rm:*)" || nested[2].By != agentsession.ByPolicy {
+		t.Errorf("third entry = %+v", nested[2])
+	}
+	if nested[3].Phase != agentsession.RunEnd || nested[3].Error == "" {
+		t.Errorf("fourth entry = %+v", nested[3])
+	}
+	// The entries land between the call's dispatch and its output, and
+	// the record still verifies.
+	verifyAll(t, s)
+}

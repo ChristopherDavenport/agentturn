@@ -249,6 +249,11 @@ type ToolStart struct {
 	Name     string
 	Args     json.RawMessage
 	Decision *ToolDecision
+	// Parent is the ID of the call whose tool made this one with
+	// [Invoke], and empty for a call the model made. A nested call has
+	// no function_call item in the transcript: it is the work of the
+	// call that made it.
+	Parent string
 }
 
 // EventType returns "tool_start".
@@ -283,6 +288,9 @@ type ToolEnd struct {
 	Err      error
 	Blocked  bool
 	Deferred bool
+	// Parent is the ID of the call whose tool made this one with
+	// [Invoke], and empty for a call the model made.
+	Parent string
 }
 
 // EventType returns "tool_end".

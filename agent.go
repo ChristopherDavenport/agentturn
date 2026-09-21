@@ -411,7 +411,7 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved [
 	r := &runner{
 		cfg:        cfg,
 		transcript: transcript,
-		emit:       func(ev Event) error { return a.deliver(subCtx, ev) },
+		send:       func(ev Event) error { return a.deliver(subCtx, ev) },
 		steer:      a.drainSteer,
 		followUp:   a.drainFollowUp,
 	}

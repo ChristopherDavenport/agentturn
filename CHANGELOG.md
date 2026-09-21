@@ -7,6 +7,20 @@ versions may break the API.
 
 ## Unreleased
 
+- `agentturn.Invoke(ctx, name, args)` runs one of the turn's tools from
+  inside another as if the model had asked for it under the call in
+  flight: `BeforeToolCall` decides, `tool_start` and `tool_end` carry
+  the new `Parent` naming the call that made it, `AfterToolCall`
+  applies, and `session` writes a custom entry in the
+  `agentturn:nested_call` namespace before and after, since a nested
+  call has no function_call item for a dispatch to name. A tool that
+  let its code reach the agent's other tools through an `agenttool.Set`
+  of its own ran them past the policy, the events and the record
+  alike. A nested call appends nothing to the transcript, and a hook
+  that defers one refuses it, since there is nobody to ask while a tool
+  is running. Delivery is serialised, so a subscriber is never called
+  from two goroutines at once. (#76)
+
 - **Fixed**: `Retry` committed an attempt as soon as any output item
   opened, and a reasoning model opens its reasoning item before its
   text, so a 503 between the summary and the first token was final and
