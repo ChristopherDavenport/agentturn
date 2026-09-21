@@ -411,7 +411,7 @@ func TestSpawnHandsOutTheChild(t *testing.T) {
 		}),
 		WithSpawn(func(callID string, a *agentturn.Agent) {
 			spawnedFor, handle = callID, a
-			a.Steer(openresponses.UserText("and the duplicates"))
+			_ = a.Steer(context.Background(), openresponses.UserText("and the duplicates"))
 		}))
 	res, err := child.Execute(context.Background(), agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"list the exports"}`)})
 	if err != nil {

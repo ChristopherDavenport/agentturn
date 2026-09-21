@@ -482,11 +482,21 @@ func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe fu
 // before the next model call. When the agent is idle they are consumed
 // by the next run at the same point.
 //
+// Each item is delivered to the subscribers as a [Queued] event before
+// it is queued, carrying the mode and the [Trigger] on ctx, so a host
+// that answers a sender 202 can make the item durable at the moment it
+// accepts it rather than when a run appends it. A subscriber that
+// returns an error refuses the item: it is not queued, the items after
+// it are not either, and the error is returned. The event is delivered
+// from the calling goroutine, so a subscriber may see it while a run's
+// own event is being delivered; a run's own events still come from one
+// goroutine.
+//
 // The queues live in memory: an item accepted here is in no record
-// until a run appends it, and it survives [Agent.Abort], [SetConfig]
-// and [SetTranscript] but not the process. A host that promises the
-// sender it has the item persists it itself, reading the queues back
-// from [Agent.State], and queues it again after a restart.
+// until a run appends it or a subscriber writes it, and it survives
+// [Agent.Abort], [SetConfig] and [SetTranscript] but not the process. A
+// host reads the queues back from [Agent.State] and queues them again
+// after a restart.
 //
 // A steered item is appended with its own item events, which reach
 // every subscriber. A subscriber that steers in reaction to an event
@@ -496,19 +506,44 @@ func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe fu
 // monitor or another goroutine, or from a subscriber only on events it
 // can tell apart from its own items, such as a tool_end or a specific
 // item type it never steers.
-func (a *Agent) Steer(items ...openresponses.Item) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.steer = append(a.steer, items...)
+func (a *Agent) Steer(ctx context.Context, items ...openresponses.Item) error {
+	return a.queue(ctx, QueueSteer, items)
 }
 
 // FollowUp queues items to be injected when the run would otherwise
 // end, so the agent keeps going instead of going idle. The queue has
-// the same life and the same caveat about subscribers as [Agent.Steer].
-func (a *Agent) FollowUp(items ...openresponses.Item) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.followUp = append(a.followUp, items...)
+// the same life, the same [Queued] event and the same caveat about
+// subscribers as [Agent.Steer].
+func (a *Agent) FollowUp(ctx context.Context, items ...openresponses.Item) error {
+	return a.queue(ctx, QueueFollowUp, items)
+}
+
+// queue reports each item as accepted and then queues it.
+func (a *Agent) queue(ctx context.Context, mode QueueMode, items openresponses.Items) error {
+	trigger := TriggerFromContext(ctx)
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		base, hidden := Unhide(item)
+		a.mu.Lock()
+		runID := ""
+		if a.running {
+			runID = a.runID
+		}
+		a.mu.Unlock()
+		if err := a.deliver(ctx, &Queued{RunID: runID, Item: base, Mode: mode, Trigger: trigger, Hidden: hidden}); err != nil {
+			return err
+		}
+		a.mu.Lock()
+		if mode == QueueSteer {
+			a.steer = append(a.steer, item)
+		} else {
+			a.followUp = append(a.followUp, item)
+		}
+		a.mu.Unlock()
+	}
+	return nil
 }
 
 func (a *Agent) drainSteer() openresponses.Items {

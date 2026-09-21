@@ -112,6 +112,12 @@ run, in order:
 | `turn_end` | the folded `Response` with usage, and the tool results |
 | `run_end` | the items added this run and the reason: done, stopped, input_required, aborted, error |
 
+`queued` belongs to no run: `Steer` and `FollowUp` deliver it from the
+calling goroutine as they accept an item, with the queue it went into
+and the `Trigger` on the context, so a gateway that answers a sender
+202 can make the item durable before it says so. A subscriber that
+returns an error refuses the item.
+
 ## Tools
 
 Tools come from `agenttool`: `agenttool.New[Args, Out]` turns a typed

@@ -83,7 +83,7 @@ func TestSpawnedChildIsSteerableAndRevivable(t *testing.T) {
 			children = append(children, child)
 			// Reaching a child that has not finished: the steered
 			// message joins the run before it ends.
-			child.Steer(openresponses.UserText("also note duplicates"))
+			_ = child.Steer(context.Background(), openresponses.UserText("also note duplicates"))
 		}))
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{specialist}})
 	defer rec.Attach(a)()

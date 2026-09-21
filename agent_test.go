@@ -152,7 +152,7 @@ func TestAgentSteer(t *testing.T) {
 	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}, MaxTurns: 3})
 	a.Subscribe(func(_ context.Context, ev Event) error {
 		if e, ok := ev.(*ToolStart); ok && e.Turn == 1 {
-			a.Steer(openresponses.UserText("steered"))
+			_ = a.Steer(context.Background(), openresponses.UserText("steered"))
 			if a.State().Steering != 1 {
 				t.Error("steer not queued")
 			}
@@ -176,7 +176,7 @@ func TestAgentSteer(t *testing.T) {
 
 func TestAgentFollowUp(t *testing.T) {
 	a := New(Config{Model: &echo.Adapter{}})
-	a.FollowUp(openresponses.UserText("and then"))
+	_ = a.FollowUp(context.Background(), openresponses.UserText("and then"))
 	rec := &recorder{}
 	rec.subscribe(a)
 	if _, err := a.Prompt(context.Background(), openresponses.UserText("first")); err != nil {

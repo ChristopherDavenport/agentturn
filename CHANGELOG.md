@@ -7,6 +7,17 @@ versions may break the API.
 
 ## Unreleased
 
+- **Breaking**: `Agent.Steer` and `Agent.FollowUp` take a context and
+  return an error. Each item they accept is delivered to the
+  subscribers first as the new `Queued` event, carrying the item, which
+  queue it went into, the run in flight if there is one and the
+  `Trigger` on the context; a subscriber that returns an error refuses
+  the item, which is then not queued. A gateway that answers a sender
+  202 can make what it accepted durable at the moment it accepts it,
+  rather than writing the same sixty lines of custom entries to keep an
+  inbox nobody else keeps. The queues themselves are unchanged, and so
+  are `State.Steered` and `State.Queued`. (#67)
+
 - `compact.WithPin(fn)` keeps the items fn reports through a fold:
   whatever part of the folded prefix they were in, they follow the
   summary in the request, in their order, so a stream rule's reminder

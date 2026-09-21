@@ -11,8 +11,8 @@ import (
 // Event is one step of a run. Concrete types are [RunStart], [TurnStart],
 // [ModelRetry], [ModelBlocked], [ItemStart], [ItemUpdate], [ItemEnd],
 // [ResponseEnd], [ToolStart], [ToolUpdate], [ToolEnd], [TurnEnd] and
-// [RunEnd]. Decoded values are pointers, so switch on *ItemUpdate and so
-// on.
+// [RunEnd], and [Queued], which belongs to no run. Decoded values are
+// pointers, so switch on *ItemUpdate and so on.
 type Event interface {
 	EventType() string
 }
@@ -32,6 +32,7 @@ const (
 	EventToolEnd      = "tool_end"
 	EventTurnEnd      = "turn_end"
 	EventRunEnd       = "run_end"
+	EventQueued       = "queued"
 )
 
 // Reason says why a run ended.
@@ -410,7 +411,44 @@ func PendingCalls(pending []PendingCall) []*openresponses.FunctionCall {
 	return out
 }
 
+// QueueMode says which queue an item was accepted into.
+type QueueMode string
+
+// Queue modes.
+const (
+	// QueueSteer is [Agent.Steer]: the item joins the run after the
+	// current tool batch, before the next model call.
+	QueueSteer QueueMode = "steer"
+	// QueueFollowUp is [Agent.FollowUp]: the item joins the run when it
+	// would otherwise end.
+	QueueFollowUp QueueMode = "follow_up"
+)
+
+// Queued reports an item accepted into a queue, at the moment it was
+// accepted rather than when a run appends it, so a host that answered a
+// sender 202 can make it durable before it says so. It is delivered
+// from the goroutine that called [Agent.Steer] or [Agent.FollowUp],
+// which may be while a run is in flight; a subscriber that returns an
+// error refuses the item, which is then not queued.
+//
+// RunID names the run in flight, and is empty when the agent was idle.
+// Trigger is what the caller attached to the context with
+// [ContextWithTrigger], so the reason an item was accepted is on the
+// event even though the run it joins was started by something else.
+type Queued struct {
+	RunID   string
+	Item    openresponses.Item
+	Mode    QueueMode
+	Trigger Trigger
+	// Hidden is set for an item the caller marked with [Hidden].
+	Hidden bool
+}
+
+// EventType returns "queued".
+func (*Queued) EventType() string { return EventQueued }
+
 var (
+	_ Event = (*Queued)(nil)
 	_ Event = (*RunStart)(nil)
 	_ Event = (*TurnStart)(nil)
 	_ Event = (*ModelRetry)(nil)
