@@ -36,7 +36,13 @@ var (
 //
 // Subscribers are called synchronously, in registration order, for every
 // event, so every event is a barrier: the loop does not move to the next
-// phase until each subscriber has returned. A subscriber that returns an
+// phase until each subscriber has returned, a tool that raises an event
+// with [Invoke] waits for them, and so does a caller queueing an item
+// with [Agent.Steer]. One event is delivered at a time, whichever
+// goroutine raised it, so a subscriber is never entered from two
+// goroutines at once. A subscriber that steers or prompts the agent
+// from inside an event does so with the context it was handed, which
+// carries the delivery it already holds, or from another goroutine. A subscriber that returns an
 // error ends the run with ReasonError. Every event is delivered with a
 // context whose cancellation is lifted: [Agent.Abort] reaches the model
 // stream and the running tools, and the events that follow it, the
@@ -47,6 +53,10 @@ var (
 type Agent struct {
 	cfg Config
 
+	// emitMu is the delivery barrier: one event reaches the subscribers
+	// at a time, whichever goroutine raised it.
+	emitMu sync.Mutex
+
 	mu         sync.Mutex
 	transcript Transcript
 	subs       []subscription
@@ -54,11 +64,15 @@ type Agent struct {
 	steer      openresponses.Items
 	followUp   openresponses.Items
 	running    bool
-	runID      string
-	turn       int
-	cancel     context.CancelFunc
-	idle       chan struct{}
-	pending    []PendingCall
+	// queued holds the accepts not yet reported: Steer and FollowUp
+	// append, and the goroutine that owns delivery reports them at its
+	// next event.
+	queued  []*Queued
+	runID   string
+	turn    int
+	cancel  context.CancelCauseFunc
+	idle    chan struct{}
+	pending []PendingCall
 }
 
 type subscription struct {
@@ -217,8 +231,9 @@ func (a *Agent) Continue(ctx context.Context) (*RunEnd, error) {
 
 // Answer resolves one pending call for [Agent.Resume]: an output the
 // caller produced, or an approval that runs the call inside the loop.
-// Build one with [Output], [Approve], [ApproveWith] or [Refuse], and
-// attach what the user said with [Answer.WithNote].
+// Build one with [Output], [Approve], [ApproveWith] or [Refuse],
+// attach what the user said with [Answer.WithNote] and who said it
+// with [Answer.WithBy].
 type Answer struct {
 	// CallID names the pending call.
 	CallID string
@@ -238,6 +253,15 @@ type Answer struct {
 	// should end the turn so the user can say what to do instead. The
 	// outputs are still appended, so the transcript stays a valid input.
 	Terminate bool
+	// By names who decided this answer, for the record: the session
+	// format knows "human" for a person at a prompt, "policy" for a
+	// rule that answered on its own and "agent" for another model. It
+	// rides on the ToolDecision the loop synthesises for an approval,
+	// and a session recorder writes it on the decision for an answer of
+	// either kind. There is no default: a policy engine answers through
+	// Resume as often as a person does, so an answer that names nobody
+	// is recorded as an anonymous decision rather than guessed at.
+	By string
 }
 
 // Output answers a pending call with out.
@@ -270,13 +294,21 @@ func (a Answer) WithNote(note string) Answer {
 	return a
 }
 
+// WithBy returns the answer with by attached: who decided it, in the
+// session format's terms ("human", "policy", "agent").
+func (a Answer) WithBy(by string) Answer {
+	a.By = by
+	return a
+}
+
 // Resume answers the calls the last run left pending and continues,
 // whether they were deferred to the caller or cut off by an abort or a
 // failure. Every pending call must have exactly one answer, and no
 // answer may name a call that is not pending. An answer is an output
 // or an approval: a caller that refuses a call answers it with the
 // refusal as text, which the model then sees; a caller that approves a
-// deferred call lets the loop run it.
+// deferred call lets the loop run it. [Answer.By] says who decided,
+// for the record.
 //
 // The outputs are appended with their item events first, then the
 // notes of the answers that carry one, as user messages. The approved
@@ -303,6 +335,7 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 	}
 	var outputs, notes openresponses.Items
 	var approved []approval
+	deciders := map[string]string{}
 	terminate := false
 	for _, ans := range answers {
 		call, ok := byID[ans.CallID]
@@ -311,6 +344,9 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 		}
 		delete(byID, ans.CallID)
 		terminate = terminate || ans.Terminate
+		if ans.By != "" {
+			deciders[ans.CallID] = ans.By
+		}
 		if ans.Output != nil {
 			outputs = append(outputs, ans.Output)
 			if ans.Note != "" {
@@ -318,12 +354,15 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 			}
 			continue
 		}
-		approved = append(approved, approval{call: call, args: ans.Args, note: ans.Note})
+		approved = append(approved, approval{call: call, args: ans.Args, note: ans.Note, by: ans.By})
 	}
 	if len(byID) > 0 {
 		return nil, fmt.Errorf("%w: %d pending call(s) unanswered", ErrNotPending, len(byID))
 	}
-	return a.run(ctx, append(outputs, notes...), approved, true, terminate)
+	// An output the caller wrote raises no tool_start, so the decider
+	// of an answer of that kind rides on the run's context, where a
+	// recorder writing the decision for it finds it.
+	return a.run(ContextWithDeciders(ctx, deciders), append(outputs, notes...), approved, true, terminate)
 }
 
 // answersPending checks the outputs that open a prompt against the
@@ -335,7 +374,7 @@ func answersPending(pending []PendingCall, prompts openresponses.Items) error {
 	for _, p := range pending {
 		want[p.Call.CallID] = true
 	}
-	for _, item := range prompts {
+	for _, item := range unhideAll(prompts) {
 		out, ok := item.(*openresponses.FunctionCallOutput)
 		if !ok {
 			break
@@ -370,7 +409,7 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved [
 		}
 	}
 	a.pending = nil
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancelCause(ctx)
 	a.running = true
 	a.cancel = cancel
 	a.turn = 0
@@ -386,12 +425,12 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved [
 	r := &runner{
 		cfg:        cfg,
 		transcript: transcript,
-		emit:       func(ev Event) error { return a.deliver(subCtx, ev) },
+		send:       func(ev Event) error { return a.deliver(subCtx, ev) },
 		steer:      a.drainSteer,
 		followUp:   a.drainFollowUp,
 	}
 	end := r.run(ctx, prompts, approved, terminate)
-	cancel()
+	cancel(nil)
 
 	a.mu.Lock()
 	a.running = false
@@ -405,9 +444,55 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved [
 	return end, nil
 }
 
-// deliver updates state from the event and calls every subscriber in
-// registration order.
+// deliver calls every subscriber for one event, one event at a time.
+// Delivery is the barrier: the run's events and the events a nested
+// call raises from a tool's goroutine pass through it, so a subscriber
+// is never entered from two goroutines at once. The items [Agent.Steer]
+// and [Agent.FollowUp] accepted since the last event are reported
+// first, so an item is always announced before anything it produces.
+//
+// Nothing outside a run delivers, so a subscriber never waits on a
+// barrier it is itself holding: steering from inside an event queues
+// the item and returns.
 func (a *Agent) deliver(ctx context.Context, ev Event) error {
+	a.emitMu.Lock()
+	defer a.emitMu.Unlock()
+	if err := a.drainQueued(ctx); err != nil {
+		return err
+	}
+	if err := a.dispatch(ctx, ev); err != nil {
+		return err
+	}
+	if _, last := ev.(*RunEnd); last {
+		// Nothing follows the run's end, so what a subscriber accepted
+		// while it was being delivered is reported now rather than
+		// waiting for a run that may never come.
+		return a.drainQueued(ctx)
+	}
+	return nil
+}
+
+// drainQueued reports the items accepted since the last event, in the
+// order they were accepted. It is one pass: an item a subscriber
+// accepts while these are being delivered waits for the next event,
+// which is what keeps a subscriber that steers on every queued event
+// from spinning here.
+func (a *Agent) drainQueued(ctx context.Context) error {
+	a.mu.Lock()
+	evs := a.queued
+	a.queued = nil
+	a.mu.Unlock()
+	for _, ev := range evs {
+		if err := a.dispatch(ctx, ev); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// dispatch updates state from the event and calls every subscriber in
+// registration order.
+func (a *Agent) dispatch(ctx context.Context, ev Event) error {
 	a.mu.Lock()
 	switch e := ev.(type) {
 	case *RunStart:
@@ -457,11 +542,25 @@ func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe fu
 // before the next model call. When the agent is idle they are consumed
 // by the next run at the same point.
 //
+// Each item is reported to the subscribers as a [Queued] event, so a
+// host writing what it accepted has it before the run appends it and
+// can tell an item it accepted from one a run produced. The report is
+// not the accept: the item is queued when this returns, and the event
+// is delivered by whichever goroutine owns delivery, at its next event.
+// A run in flight reports it before its next event; an idle agent
+// reports it at the start of the next run, so a host that must not
+// lose an input writes it before calling here rather than from the
+// event.
+//
+// It never blocks on the delivery barrier, so steering from inside a
+// subscriber is safe: the item is queued and the event follows on the
+// next one.
+//
 // The queues live in memory: an item accepted here is in no record
-// until a run appends it, and it survives [Agent.Abort], [SetConfig]
-// and [SetTranscript] but not the process. A host that promises the
-// sender it has the item persists it itself, reading the queues back
-// from [Agent.State], and queues it again after a restart.
+// until a run appends it or a subscriber writes it, and it survives
+// [Agent.Abort], [SetConfig] and [SetTranscript] but not the process. A
+// host reads the queues back from [Agent.State] and queues them again
+// after a restart.
 //
 // A steered item is appended with its own item events, which reach
 // every subscriber. A subscriber that steers in reaction to an event
@@ -472,18 +571,37 @@ func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe fu
 // can tell apart from its own items, such as a tool_end or a specific
 // item type it never steers.
 func (a *Agent) Steer(items ...openresponses.Item) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.steer = append(a.steer, items...)
+	a.queue(QueueSteer, items)
 }
 
 // FollowUp queues items to be injected when the run would otherwise
 // end, so the agent keeps going instead of going idle. The queue has
-// the same life and the same caveat about subscribers as [Agent.Steer].
+// the same life, the same [Queued] event and the same caveat about
+// subscribers as [Agent.Steer].
 func (a *Agent) FollowUp(items ...openresponses.Item) {
+	a.queue(QueueFollowUp, items)
+}
+
+// queue accepts items and records the report the next event delivers.
+func (a *Agent) queue(mode QueueMode, items openresponses.Items) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.followUp = append(a.followUp, items...)
+	runID := ""
+	if a.running {
+		runID = a.runID
+	}
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		base, hidden := Unhide(item)
+		if mode == QueueSteer {
+			a.steer = append(a.steer, item)
+		} else {
+			a.followUp = append(a.followUp, item)
+		}
+		a.queued = append(a.queued, &Queued{RunID: runID, Item: base, Mode: mode, Hidden: hidden})
+	}
 }
 
 func (a *Agent) drainSteer() openresponses.Items {
@@ -504,14 +622,30 @@ func (a *Agent) drainFollowUp() openresponses.Items {
 
 // Abort cancels the active run, if any. The model stream and running
 // tools see the cancellation through their context and the run ends
-// with ReasonAborted. The queues are untouched: anything steered or
-// queued and not yet appended goes to the next run.
-func (a *Agent) Abort() {
+// with ReasonAborted and context.Canceled on RunEnd.Err. The queues are
+// untouched: anything steered or queued and not yet appended goes to
+// the next run.
+func (a *Agent) Abort() { a.AbortCause(nil) }
+
+// AbortCause is [Agent.Abort] with a reason: cause is what
+// context.Cause reports to everything the run called, and what the run
+// ends with on RunEnd.Err, so a recorder writes it as the run's end and
+// a product can count why its runs were cut. A stream rule that
+// matched, an advisor that raised a blocker, a coordinator that
+// cancelled a job and a user pressing Esc are four things a session
+// otherwise records identically as "context canceled". A nil cause is
+// [Agent.Abort].
+//
+// A cause that a caller wants errors.Is(err, context.Canceled) to keep
+// matching should wrap it; the tools of the run see context.Canceled
+// from their own context either way, since that is what ctx.Err
+// reports.
+func (a *Agent) AbortCause(cause error) {
 	a.mu.Lock()
 	cancel := a.cancel
 	a.mu.Unlock()
 	if cancel != nil {
-		cancel()
+		cancel(cause)
 	}
 }
 

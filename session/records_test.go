@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ChristopherDavenport/agentsession"
 	"github.com/ChristopherDavenport/agentsession/jsonl"
@@ -570,11 +571,40 @@ func TestChildSessionIDIsDerivedFromTheCall(t *testing.T) {
 		t.Errorf("replayed child header = %+v", h)
 	}
 
-	// A second run of the same call continues the child session from a
-	// new root rather than minting a second session.
-	call := agenttool.Call{ID: "call_retry", Args: json.RawMessage(`{"input":"hi"}`)}
+	// A second run under the same call continues the child session at
+	// its leaf rather than minting a second session or starting a new
+	// root: a subagent that is messaged again answers from its own
+	// context, so its run belongs after the one before it.
+	call := agenttool.Call{ID: "call_again", Args: json.RawMessage(`{"input":"hi"}`)}
 	for range 2 {
 		if _, err := observed.Execute(context.Background(), call); err != nil {
+			t.Fatal(err)
+		}
+	}
+	again, err := store.Open(context.Background(), agentsession.SubsessionID(s.ID(), "call_again"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := roots(again); n != 1 {
+		t.Errorf("second run under one call opened %d roots in %q", n, entryTypes(again))
+	}
+	if n := len(runsOf(t, again)); n != 2 {
+		t.Errorf("runs on the child session = %d", n)
+	}
+	// Both runs hold a response, and the path to the leaf verifies.
+	if n := verifyAll(t, again); n != 2 {
+		t.Errorf("child responses = %d", n)
+	}
+
+	// A host that means a retry from a clean start says so, and the
+	// leaf is reset as it was before.
+	retryCall := agenttool.Call{ID: "call_retry", Args: json.RawMessage(`{"input":"hi"}`)}
+	for i := range 2 {
+		ctx := context.Background()
+		if i == 1 {
+			ctx = agent.ContextWithRetry(ctx)
+		}
+		if _, err := observed.Execute(ctx, retryCall); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -582,16 +612,9 @@ func TestChildSessionIDIsDerivedFromTheCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	roots := 0
-	for _, e := range retry.Entries() {
-		if e.Base().Parent == "" {
-			roots++
-		}
+	if n := roots(retry); n != 2 {
+		t.Errorf("retried child has %d roots in %q", n, entryTypes(retry))
 	}
-	if roots != 2 {
-		t.Errorf("retried child has %d roots in %q", roots, entryTypes(retry))
-	}
-	// Both roots hold a response, and the path to the leaf verifies.
 	if n := verifyAll(t, retry); n != 2 {
 		t.Errorf("retried child responses = %d", n)
 	}
@@ -716,3 +739,266 @@ func TestRecordableDetailsBecomeACustomEntry(t *testing.T) {
 type noNS struct{}
 
 func (noNS) RecordNS() string { return "" }
+
+// TestAbortCauseIsTheRunsRef checks that the reason a host cut a run
+// reaches the record, where "context canceled" stood for seven
+// different things before.
+func TestAbortCauseIsTheRunsRef(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocking := agenttool.New("wait", "waits", func(ctx context.Context, _ echoArgs) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{blocking}})
+	defer rec.Attach(a)()
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if _, ok := ev.(*agentturn.ToolStart); ok {
+			a.AbortCause(errors.New("ttsr: rule box-leak"))
+		}
+		return nil
+	})
+	end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if end == nil || end.Reason != agentturn.ReasonAborted {
+		t.Fatalf("end = %+v", end)
+	}
+	runs := runsOf(t, s)
+	if len(runs) != 1 || runs[0].End == nil {
+		t.Fatalf("runs = %+v", runs)
+	}
+	if runs[0].End.Reason != agentsession.ReasonInterrupted || runs[0].End.Ref != "ttsr: rule box-leak" {
+		t.Errorf("run end = %+v", runs[0].End)
+	}
+	if len(runs[0].End.Pending) != 1 {
+		t.Errorf("the cut call is not pending: %+v", runs[0].End)
+	}
+	verifyAll(t, s)
+}
+
+// TestNestedCallsAreRecorded checks that the calls a tool makes through
+// agentturn.Invoke leave the same facts on the record as the model's
+// own: one entry before each runs and one after, so a reader counting
+// the calls of a turn counts three rather than one.
+func TestNestedCallsAreRecorded(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := agenttool.New("read", "reads", func(context.Context, echoArgs) (string, error) { return "the contents", nil })
+	eval := agenttool.New("eval", "runs code", func(ctx context.Context, _ echoArgs) (string, error) {
+		if _, err := agentturn.Invoke(ctx, "read", json.RawMessage(`{"text":"go.mod"}`)); err != nil {
+			return "", err
+		}
+		_, err := agentturn.Invoke(ctx, "bash", json.RawMessage(`{"text":"rm -rf /tmp/build"}`))
+		if err == nil {
+			t.Error("the blocked nested call returned no error")
+		}
+		return "ran two calls", nil
+	})
+	bash := agenttool.New("bash", "runs a command", func(context.Context, echoArgs) (string, error) { return "done", nil })
+	policy := func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+		if info.Call.Name == "bash" {
+			return &agentturn.ToolDecision{Action: agentturn.Block, Reason: "denied by bash(rm:*)", By: agentsession.ByPolicy}, nil
+		}
+		return nil, nil
+	}
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m",
+		Tools: []agenttool.Tool{eval, read, bash}, BeforeToolCall: policy, MaxTurns: 1})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
+		t.Fatal(err)
+	}
+	var nested []NestedCall
+	for _, e := range s.Entries() {
+		c, ok := e.(*agentsession.CustomEntry)
+		if !ok || c.NS != NestedCallNS {
+			continue
+		}
+		var n NestedCall
+		if err := json.Unmarshal(c.Data, &n); err != nil {
+			t.Fatal(err)
+		}
+		nested = append(nested, n)
+	}
+	if len(nested) != 4 {
+		t.Fatalf("nested call entries = %d", len(nested))
+	}
+	parent := callsOf(t, s)["eval"]
+	if parent == nil || parent.Dispatch == nil {
+		t.Fatalf("the call that made them = %+v", parent)
+	}
+	for _, n := range nested {
+		if n.Parent != parent.ID() {
+			t.Errorf("entry %+v does not name the call that made it (%s)", n, parent.ID())
+		}
+	}
+	if nested[0].Name != "read" || nested[0].Phase != agentsession.RunStart || string(nested[0].Args) != `{"text":"go.mod"}` {
+		t.Errorf("first entry = %+v", nested[0])
+	}
+	if nested[1].Phase != agentsession.RunEnd || nested[1].Output != "the contents" {
+		t.Errorf("second entry = %+v", nested[1])
+	}
+	if nested[2].Name != "bash" || nested[2].Verdict != agentsession.VerdictReject || nested[2].Reason != "denied by bash(rm:*)" || nested[2].By != agentsession.ByPolicy {
+		t.Errorf("third entry = %+v", nested[2])
+	}
+	if nested[3].Phase != agentsession.RunEnd || nested[3].Error == "" {
+		t.Errorf("fourth entry = %+v", nested[3])
+	}
+	// The entries land between the call's dispatch and its output, and
+	// the record still verifies.
+	verifyAll(t, s)
+}
+
+// switching answers 429 while the request names the primary model and
+// answers as itself once it names another.
+type switching struct{ primary string }
+
+func (m switching) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	if req.Model == m.primary {
+		return openresponses.TooManyRequests("rate", "rate limited")
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	msg, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := msg.Text("answered by " + req.Model); err != nil {
+		return err
+	}
+	if err := msg.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestRevisedRetryIsAConfigDelta checks that a turn that moved to a
+// fallback model records the model that answered: the settings in force
+// at the response are the revised request's, and the path still
+// rebuilds the request it hashed.
+func TestRevisedRetryIsAConfigDelta(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: switching{primary: "a"}, ModelName: "a", Retry: agentturn.Retry{
+		MaxAttempts: 3,
+		Backoff:     func(int, error) time.Duration { return 0 },
+		Revise: func(_ int, req *openresponses.Request, _ error) *openresponses.Request {
+			req.Model = "b"
+			return nil
+		},
+	}})
+	defer rec.Attach(a)()
+	end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("err=%v end=%+v", err, end)
+	}
+	if n := verifyAll(t, s); n != 1 || hashed(s) != 1 {
+		t.Errorf("responses = %d hashed = %d", n, hashed(s))
+	}
+	cx, err := s.Context()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cx.Settings.Model != "b" {
+		t.Errorf("settings name %q, the model that did not answer", cx.Settings.Model)
+	}
+	for _, e := range s.Entries() {
+		if r, ok := e.(*agentsession.ResponseEntry); ok && r.Model != "b" {
+			t.Errorf("response entry model = %q", r.Model)
+		}
+	}
+	// The run opened with the agent's configuration and the switch is
+	// one delta on top of it: not one config per attempt, since the
+	// attempt that failed answered nothing and wrote nothing.
+	cfgs := configs(s)
+	if len(cfgs) != 2 || cfgs[0].Model != "a" || cfgs[1].Model != "b" {
+		t.Errorf("config entries = %d in %q", len(cfgs), entryTypes(s))
+	}
+}
+
+// chainLeg streams a reasoning item and then fails, unless the request
+// names the last leg of the chain, in which case it answers: a
+// provider under load behind a fallback chain.
+type chainLeg struct{ last string }
+
+func (m chainLeg) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Reasoning()
+	if err != nil {
+		return err
+	}
+	if err := w.Summary("weighing the options"); err != nil {
+		return err
+	}
+	if err := w.EndSummary(); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	if req.Model != m.last {
+		return openresponses.ServerError("overloaded", "overloaded")
+	}
+	msg, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := msg.Text("answered by " + req.Model); err != nil {
+		return err
+	}
+	if err := msg.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestOnlyTheAttemptThatAnsweredIsConfigured checks that an attempt
+// which streamed and then failed leaves no settings on the path: it
+// answered nothing, so a config entry describing it would tell a reader
+// the conversation ran under a model it never got an answer from.
+func TestOnlyTheAttemptThatAnsweredIsConfigured(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := map[int]string{1: "b", 2: "c"}
+	a := agentturn.New(agentturn.Config{Model: chainLeg{last: "c"}, ModelName: "a", Retry: agentturn.Retry{
+		MaxAttempts: 3,
+		Backoff:     func(int, error) time.Duration { return 0 },
+		Revise: func(attempt int, req *openresponses.Request, _ error) *openresponses.Request {
+			req.Model = next[attempt]
+			return nil
+		},
+	}})
+	defer rec.Attach(a)()
+	end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("err=%v end=%+v", err, end)
+	}
+	cfgs := configs(s)
+	if len(cfgs) != 2 || cfgs[0].Model != "a" || cfgs[1].Model != "c" {
+		var models []string
+		for _, c := range cfgs {
+			models = append(models, c.Model)
+		}
+		t.Errorf("config entries name %v in %q", models, entryTypes(s))
+	}
+	// The attempts that failed left nothing else either.
+	if n := verifyAll(t, s); n != 1 || hashed(s) != 1 {
+		t.Errorf("responses = %d hashed = %d", n, hashed(s))
+	}
+	cx, err := s.Context()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cx.Settings.Model != "c" || len(cx.Items) != 3 {
+		t.Errorf("context = %+v, %d items", cx.Settings, len(cx.Items))
+	}
+}

@@ -6,7 +6,11 @@ type, one tool contract, hooks and queues. Everything else is a front
 that feeds prompts in and consumes events out, or a subscriber.
 
 - The transcript is `openresponses.Items`. What a session stores, what
-  the model receives and what a front renders are the same bytes.
+  the model receives and what a front renders are the same bytes. An
+  item a harness adds for the model and not for the user, an interrupt
+  report or an advisory, is wrapped in `agentturn.Hidden` where it is
+  appended: the model still reads it, and its item events and its
+  session entry say a renderer should not show it.
 - The model is any `openresponses.Streamer`: a remote server through
   `Client.AsAdapter`, a local adapter, or another agent served by
   `front/responses`.
@@ -108,6 +112,13 @@ run, in order:
 | `turn_end` | the folded `Response` with usage, and the tool results |
 | `run_end` | the items added this run and the reason: done, stopped, input_required, aborted, error |
 
+`queued` belongs to no run. `Steer` and `FollowUp` accept an item and
+return; the goroutine that owns delivery reports it at its next event,
+before anything that item produces, so a host writing what it accepted
+tells an item it was handed from one a run made. A run in flight
+reports it at once, an idle agent at the start of the next run, so a
+gateway that must not lose an input writes it before it accepts it.
+
 ## Tools
 
 Tools come from `agenttool`: `agenttool.New[Args, Out]` turns a typed
@@ -139,14 +150,20 @@ if err == nil && end.Reason == agentturn.ReasonInputRequired {
 	var answers []agentturn.Answer
 	for _, call := range end.Pending {
 		if approved(call) {
-			answers = append(answers, agentturn.Approve(call.CallID))
+			answers = append(answers, agentturn.Approve(call.CallID).WithBy(agentsession.ByHuman))
 		} else {
-			answers = append(answers, agentturn.Output(openresponses.NewFunctionCallOutput(call.CallID, "denied by the user")))
+			answers = append(answers, agentturn.Output(openresponses.NewFunctionCallOutput(call.CallID, "denied by the user")).WithBy(agentsession.ByHuman))
 		}
 	}
 	end, err = a.Resume(ctx, answers...)
 }
 ```
+
+`Answer.WithBy` says who decided, in the session format's terms
+(`human`, `policy`, `agent`), and `WithNote` what they said; a recorder
+writes both on the decision. There is no default, since a policy engine
+answers through `Resume` as often as a person does, so an answer that
+names nobody is recorded as an anonymous decision.
 
 The same path repairs a run that was aborted mid-batch: the cut-off
 calls are on `end.Pending`, and an agent built with
@@ -157,20 +174,76 @@ pending call is accepted, and the model sees the outputs and the
 message in one call. `AfterToolCall` overrides results;
 `ShouldStopAfterTurn` ends a run early.
 
+A tool whose own work is to call other tools, a code-execution kernel
+with a loopback bridge, uses `agentturn.Invoke` rather than holding a
+tool set of its own, so the nested call goes through `BeforeToolCall`,
+raises `tool_start` and `tool_end` with `Parent` naming the call that
+made it, and reaches the recorder:
+
+```go
+var Eval = agenttool.New("eval", "Run code that may call the agent's tools",
+	func(ctx context.Context, a EvalArgs) (string, error) {
+		res, err := agentturn.Invoke(ctx, "read", json.RawMessage(`{"path":"go.mod"}`))
+		...
+	})
+```
+
+A nested call appends nothing to the transcript: it is the work of the
+call that made it. A hook that defers one refuses it instead, since
+there is nobody to ask while a tool is running.
+
 Every other request member comes from `Config.Request`, the base the
 loop builds each turn's request on: `tool_choice`, `max_output_tokens`,
 `include: reasoning.encrypted_content` for reasoning models, and so on.
 `BeforeModelCall` sees the finished request before it is sent.
 
-`Config.Retry` retries a model call that failed before delivering
-anything: a 429 or 5xx, a dropped stream, a refused connection. The
+Every hook is one field, so two layers that want the same one silently
+lose an assignment to each other: a memory that re-renders its block
+into the instructions and a guard that inspects the request both want
+`BeforeModelCall`. The chain helpers join them in one place, with the
+order where a reader can see it, since a hook that edits the request
+belongs before one that inspects it:
+
+```go
+cfg.BeforeModelCall = agentturn.ChainBeforeModelCall(
+	memory.BeforeModelCall(), // edits the request
+	guard.BeforeModelCall(),  // inspects what will be sent
+)
+cfg.ShouldStopAfterTurn = agentturn.ChainShouldStopAfterTurn(
+	guard.ShouldStopAfterTurn(),
+	budget.ShouldStopAfterTurn(),
+)
+```
+
+`ChainBeforeTurn` concatenates what each layer returns,
+`ChainBeforeToolCall` folds the decisions deny over ask over allow, and
+`ChainOutputGuard` hands each guard's replacement to the next.
+
+`Config.Retry` retries a model call that failed before the model began
+its answer: a 429 or 5xx, a dropped stream, a refused connection. The
 retry happens inside the turn, honours `Retry-After`, reports itself
-as a `model_retry` event, and is cut short by `Abort`. An attempt that
-already delivered an item is never retried, since the transcript may
-hold part of it.
+as a `model_retry` event, and is cut short by `Abort`. An attempt
+commits when a message or a function call opens, and is never retried
+after that, since the transcript may hold part of the answer. An item
+the model completed before that point, a reasoning summary, streams to
+subscribers but waits: it is appended when the attempt commits and
+dropped when the attempt fails, so a 503 between the thinking and the
+first token is retried and leaves no orphan behind.
 
 ```go
 cfg.Retry = agentturn.Retry{MaxAttempts: 4}
+```
+
+`Retry.Revise` may change the request the next attempt sends, which is
+how a fallback chain lives in the loop rather than under it: the
+switch is on the `model_retry` event and a recorder writes it as a
+config delta, so the path names the model that answered.
+
+```go
+cfg.Retry = agentturn.Retry{MaxAttempts: 4, Revise: func(attempt int, req *openresponses.Request, err error) *openresponses.Request {
+	req.Model = fallback[min(attempt, len(fallback)-1)]
+	return nil
+}}
 ```
 
 ## Composition
@@ -195,7 +268,11 @@ produces them. An agent stands in three places inside another system:
   loop points its `Model` at it through `Client.AsAdapter`.
 - **As a tool.** `tools/agent` wraps a `Config` as a `Tool`: a child run
   on a fresh transcript, progress through `Call.OnUpdate`, the final
-  text as the output and a `ChildInfo` in `Result.Details`.
+  text as the output and a `ChildInfo` in `Result.Details`. The child
+  runs as an `Agent`, and `WithSpawn` hands it to the host before the
+  run, so a hub can steer it, abort it without cutting its siblings, or
+  prompt it again once the tool has returned; `WithRunContext` gives
+  the child run a context of the host's making.
 - **As a peer.** `front/a2a` exposes a loop to A2A callers; `tools/a2a`
   wraps a remote A2A agent as a `Tool`.
 
@@ -231,6 +308,13 @@ cfg.Transform = l.Transform
 
 `WithOnFold` reports every fold, applied or failed, with the index at
 which the transcript was split, so a recorder can write it.
+`WithPin(fn)` keeps the items `fn` reports through a fold: whatever
+part of the folded prefix they were in, they follow the summary in the
+request, so an injected reminder stays the reminder instead of
+becoming a clause of a summary. The fold summarises them too, so
+nothing is lost if the pin is later dropped; until the session format
+can describe a pinned item, the calls after such a fold are recorded
+without a request hash and the compaction entry names what was kept.
 
 `session` subscribes an `Agent` to an `agentsession` store: items on
 `item_end`, the `response` entry with its request hash on
@@ -243,9 +327,19 @@ tool preflight waits for the assistant items to be durable.
 ```go
 rec, s, err := session.Start(ctx, store, agentsession.Header{CWD: cwd})
 defer rec.Attach(agent)()
-specialist := agent.New(childCfg, agent.WithObserver(rec.Observe))
+specialist := agent.New(childCfg,
+	agent.WithObserver(rec.Observe),
+	agent.WithRunContext(rec.ChildContext))
 c := compact.NewLocal(model, compact.WithOnFold(rec.Fold))
 ```
+
+A child session inherits its parent's working directory, so a store
+that buckets by directory files it with its parent, and `ChildContext`
+puts the child's session ID on the context the child run is given, so a
+layer inside the child that attributes its writes to a session names
+the child's rather than the parent's (`session.SessionIDFromContext`).
+A second run under one call continues the child's session at its leaf;
+`agent.ContextWithRetry` says the other thing.
 
 ## Design
 
@@ -263,8 +357,16 @@ The plan is `docs/plans/agent-layer.md`. Invariants the tests hold:
   the transcript keeps only completed items. Every event the abort
   leaves behind, the `tool_end` of each cut-off call and the
   `run_end`, still reaches subscribers, with a context whose
-  cancellation is lifted.
-- Events for one run are delivered from one goroutine.
+  cancellation is lifted. `Agent.AbortCause(err)` says why, and the
+  loop reads `context.Cause`, so a rule that matched, an advisor and a
+  user pressing Esc are three things `RunEnd.Err` and the record tell
+  apart rather than three "context canceled".
+- Events for one run are delivered from one goroutine, the events a
+  nested call raises from a tool's goroutine serialised with them, so a
+  subscriber is never entered from two goroutines at once. Nothing
+  outside a run delivers: `Steer` and `FollowUp` queue an item and
+  return, and their `queued` event is reported by the run at its next
+  event, so steering from inside a subscriber is safe.
 
 ## License
 

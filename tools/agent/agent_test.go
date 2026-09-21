@@ -387,3 +387,100 @@ func TestSeedAnswersEverySiblingCall(t *testing.T) {
 		t.Error("the answered snapshot should be a valid input")
 	}
 }
+
+// hostKey is a value a host puts on the child's run context.
+type hostKey struct{}
+
+// TestSpawnHandsOutTheChild covers the three things a host could not do
+// with a child running inside the low-level loop: talk to it while it
+// runs, abort it on its own, and prompt it again once the tool has
+// returned. It also checks that WithRunContext reaches the child's
+// tools.
+func TestSpawnHandsOutTheChild(t *testing.T) {
+	var seen []string
+	note := agenttool.New("note", "note something", func(ctx context.Context, _ struct{}) (string, error) {
+		v, _ := ctx.Value(hostKey{}).(string)
+		seen = append(seen, v)
+		return "noted", nil
+	})
+	var handle *agentturn.Agent
+	var spawnedFor string
+	child := New(agentturn.Config{Name: "helper", Model: &echo.Adapter{}, Tools: []agenttool.Tool{note}},
+		WithRunContext(func(ctx context.Context, callID string) context.Context {
+			return context.WithValue(ctx, hostKey{}, "session-of-"+callID)
+		}),
+		WithSpawn(func(callID string, a *agentturn.Agent) {
+			spawnedFor, handle = callID, a
+			a.Steer(openresponses.UserText("and the duplicates"))
+		}))
+	res, err := child.Execute(context.Background(), agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"list the exports"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spawnedFor != "c1" || handle == nil {
+		t.Fatalf("spawn saw %q, handle %v", spawnedFor, handle)
+	}
+	if len(seen) == 0 {
+		t.Fatal("the child's tool never ran")
+	}
+	for _, v := range seen {
+		if v != "session-of-c1" {
+			t.Errorf("the child's tool saw %v", seen)
+			break
+		}
+	}
+	info := res.Details.(ChildInfo)
+	if handle.State().RunID != info.RunID {
+		t.Errorf("handle run %q, child run %q", handle.State().RunID, info.RunID)
+	}
+	// The steered message joined the run before it ended.
+	if got := itemTypes(handle.State().Transcript); !strings.Contains(got, "function_call_output user") {
+		t.Errorf("child transcript = %q", got)
+	}
+	// The handle outlives the call: a second prompt continues the
+	// child's own conversation.
+	before := len(handle.State().Transcript)
+	if _, err := handle.Prompt(context.Background(), openresponses.UserText("which file was it?")); err != nil {
+		t.Fatal(err)
+	}
+	if after := len(handle.State().Transcript); after <= before {
+		t.Errorf("transcript did not grow: %d then %d", before, after)
+	}
+}
+
+// TestSpawnedChildAbortsAlone checks that a host can cut one child
+// without cutting the call that made it or its siblings.
+func TestSpawnedChildAbortsAlone(t *testing.T) {
+	blocking := agenttool.New("wait", "waits", func(ctx context.Context, _ struct{}) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	started := make(chan struct{})
+	var handle *agentturn.Agent
+	child := New(agentturn.Config{Name: "helper", Model: &echo.Adapter{}, Tools: []agenttool.Tool{blocking}},
+		WithSpawn(func(_ string, a *agentturn.Agent) {
+			handle = a
+			a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+				if _, ok := ev.(*agentturn.ToolStart); ok {
+					close(started)
+				}
+				return nil
+			})
+		}))
+	go func() {
+		<-started
+		handle.Abort()
+	}()
+	ctx := context.Background()
+	res, err := child.Execute(ctx, agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"go"}`)})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v", err)
+	}
+	if info, ok := res.Details.(ChildInfo); !ok || info.Reason != agentturn.ReasonAborted {
+		t.Errorf("details = %+v", res.Details)
+	}
+	// The parent's context was never cancelled: only the child was cut.
+	if ctx.Err() != nil {
+		t.Errorf("the call's context was cancelled: %v", ctx.Err())
+	}
+}

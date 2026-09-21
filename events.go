@@ -11,8 +11,8 @@ import (
 // Event is one step of a run. Concrete types are [RunStart], [TurnStart],
 // [ModelRetry], [ModelBlocked], [ItemStart], [ItemUpdate], [ItemEnd],
 // [ResponseEnd], [ToolStart], [ToolUpdate], [ToolEnd], [TurnEnd] and
-// [RunEnd]. Decoded values are pointers, so switch on *ItemUpdate and so
-// on.
+// [RunEnd], and [Queued], which belongs to no run. Decoded values are
+// pointers, so switch on *ItemUpdate and so on.
 type Event interface {
 	EventType() string
 }
@@ -32,6 +32,7 @@ const (
 	EventToolEnd      = "tool_end"
 	EventTurnEnd      = "turn_end"
 	EventRunEnd       = "run_end"
+	EventQueued       = "queued"
 )
 
 // Reason says why a run ended.
@@ -50,8 +51,10 @@ const (
 	// calls to the caller; RunEnd.Pending lists them and the run
 	// continues once their outputs are appended (see Agent.Resume).
 	ReasonInputRequired Reason = "input_required"
-	// ReasonAborted means the context was cancelled. A tool batch cut
-	// off by the abort leaves its calls on RunEnd.Pending.
+	// ReasonAborted means the context was cancelled. RunEnd.Err is
+	// context.Cause, the reason [Agent.AbortCause] or the host's own
+	// context gave, and context.Canceled when there was none. A tool
+	// batch cut off by the abort leaves its calls on RunEnd.Pending.
 	ReasonAborted Reason = "aborted"
 	// ReasonError means the model, a hook or a subscriber failed;
 	// RunEnd.Err says which.
@@ -129,7 +132,8 @@ func (*TurnStart) EventType() string { return EventTurnStart }
 
 // ModelRetry reports that a model call failed and will be attempted
 // again after Delay, under [Config.Retry]. It follows the turn_start
-// of the turn; no item of the failed attempt reached subscribers.
+// of the turn; the failed attempt never began an answer, and anything
+// it completed on the way was dropped with it.
 type ModelRetry struct {
 	RunID string
 	Turn  int
@@ -138,6 +142,11 @@ type ModelRetry struct {
 	Attempt int
 	Err     error
 	Delay   time.Duration
+	// Request is what the next attempt will send: the turn's request,
+	// or what [Retry.Revise] made of it. A recorder settles on it as it
+	// does on turn_start, so a fallback to another model reaches the
+	// path as a config delta.
+	Request openresponses.Request
 }
 
 // EventType returns "model_retry".
@@ -163,6 +172,14 @@ func (*ModelBlocked) EventType() string { return EventModelBlocked }
 // queued message, an assistant item as the stream opens it, or a
 // function call output. For an assistant item the Item is the live
 // accumulated value and fills in as updates arrive.
+//
+// An item the model completes before its attempt commits, a reasoning
+// summary before the first token, is announced here and reaches the
+// transcript when the answer begins or the response arrives (see
+// [Retry]). An attempt that ends without its response drops what it
+// held, so a front that renders from item_start drops what it was
+// rendering when a [ModelRetry], or a run_end with an error or an
+// abort, follows with no item_end for it.
 type ItemStart struct {
 	RunID string
 	Turn  int
@@ -170,6 +187,10 @@ type ItemStart struct {
 	// ResponseID is the ID of the response streaming the item, and empty
 	// for an item the loop appended itself.
 	ResponseID string
+	// Hidden is set for an item the caller marked with [Hidden]: it is
+	// in the model's context and a renderer should not show it. The
+	// Item is the item itself, unwrapped.
+	Hidden bool
 }
 
 // EventType returns "item_start".
@@ -200,6 +221,10 @@ type ItemEnd struct {
 	// ResponseID is the ID of the response that produced the item, and
 	// empty for an item the loop appended itself.
 	ResponseID string
+	// Hidden is set for an item the caller marked with [Hidden]: it is
+	// in the model's context and a renderer should not show it. A
+	// session recorder writes its entry with visible false.
+	Hidden bool
 }
 
 // EventType returns "item_end".
@@ -233,6 +258,11 @@ type ToolStart struct {
 	Name     string
 	Args     json.RawMessage
 	Decision *ToolDecision
+	// Parent is the ID of the call whose tool made this one with
+	// [Invoke], and empty for a call the model made. A nested call has
+	// no function_call item in the transcript: it is the work of the
+	// call that made it.
+	Parent string
 }
 
 // EventType returns "tool_start".
@@ -267,6 +297,9 @@ type ToolEnd struct {
 	Err      error
 	Blocked  bool
 	Deferred bool
+	// Parent is the ID of the call whose tool made this one with
+	// [Invoke], and empty for a call the model made.
+	Parent string
 }
 
 // EventType returns "tool_end".
@@ -322,12 +355,13 @@ type RunEnd struct {
 	// Cause says what stopped the run when Reason is ReasonStopped, and
 	// is empty otherwise.
 	Cause StopCause
-	// Err is set when Reason is ReasonError; to the context error when
-	// Reason is ReasonAborted, wrapping the failure of a subscriber or
-	// a hook when one failed for a reason of its own while the run was
-	// being aborted, so errors.Is finds the context error either way;
-	// and to the guard's error when Reason is ReasonStopped with Cause
-	// StopGuard.
+	// Err is set when Reason is ReasonError; to context.Cause of the
+	// run's context when Reason is ReasonAborted, which is the cause
+	// [Agent.AbortCause] or the host's own context carried and
+	// context.Canceled when there was none, wrapping the failure of a
+	// subscriber or a hook when one failed for a reason of its own
+	// while the run was being aborted; and to the guard's error when
+	// Reason is ReasonStopped with Cause StopGuard.
 	Err error
 	// Pending lists the function calls in the transcript with no
 	// function_call_output, in transcript order, each with why: the
@@ -379,7 +413,41 @@ func PendingCalls(pending []PendingCall) []*openresponses.FunctionCall {
 	return out
 }
 
+// QueueMode says which queue an item was accepted into.
+type QueueMode string
+
+// Queue modes.
+const (
+	// QueueSteer is [Agent.Steer]: the item joins the run after the
+	// current tool batch, before the next model call.
+	QueueSteer QueueMode = "steer"
+	// QueueFollowUp is [Agent.FollowUp]: the item joins the run when it
+	// would otherwise end.
+	QueueFollowUp QueueMode = "follow_up"
+)
+
+// Queued reports an item [Agent.Steer] or [Agent.FollowUp] accepted
+// into a queue, before any run appends it, so a host writing what it
+// accepted can tell an item it was given from one a run produced. It
+// belongs to no run: the goroutine that owns delivery reports it at its
+// next event, which is why it is not the accept itself and a
+// subscriber's error cannot refuse the item.
+//
+// RunID names the run that was in flight when the item was accepted,
+// and is empty when the agent was idle.
+type Queued struct {
+	RunID string
+	Item  openresponses.Item
+	Mode  QueueMode
+	// Hidden is set for an item the caller marked with [Hidden].
+	Hidden bool
+}
+
+// EventType returns "queued".
+func (*Queued) EventType() string { return EventQueued }
+
 var (
+	_ Event = (*Queued)(nil)
 	_ Event = (*RunStart)(nil)
 	_ Event = (*TurnStart)(nil)
 	_ Event = (*ModelRetry)(nil)

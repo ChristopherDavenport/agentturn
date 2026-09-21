@@ -32,6 +32,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
@@ -102,6 +103,8 @@ type options struct {
 	seed     func(parent agentturn.Transcript) agentturn.Transcript
 	observer func(context.Context, agentturn.Event)
 	noAnswer func(ChildInfo) (agenttool.Result, error)
+	spawn    func(callID string, child *agentturn.Agent)
+	runCtx   func(ctx context.Context, callID string) context.Context
 }
 
 // toolName is the form a provider accepts for a function tool's name.
@@ -183,9 +186,12 @@ func WithTranscript(seed func(parent agentturn.Transcript) agentturn.Transcript)
 	return func(o *options) { o.seed = seed }
 }
 
-// WithObserver receives every event of the child run, in order, from the
-// tool's goroutine. It is the seam for recording the child as a session
-// of its own: agentturn/session's Recorder.Observe is made for it. The
+// WithObserver receives every event of the child run, in order, as a
+// subscriber of the child's agent, so every event is a barrier: the
+// child does not move to its next phase until the observer has
+// returned, which is what makes a dispatch durable before its tool
+// runs. It is the seam for recording the child as a session of its
+// own: agentturn/session's Recorder.Observe is made for it. The
 // context it receives is the call's, so agentturn.RunIDFromContext names
 // the parent run and agentturn.TranscriptFromContext holds the parent's
 // transcript, with the child's configuration added for
@@ -198,7 +204,37 @@ func WithObserver(fn func(context.Context, agentturn.Event)) Option {
 	return func(o *options) { o.observer = fn }
 }
 
+// WithSpawn is called with the child's agent, keyed by the call, after
+// the observer is subscribed and before the run starts, so a host can
+// steer it, abort it on its own without cutting its siblings, and
+// prompt it again once the tool has returned: what a hub that messages
+// a running subagent, cancels one job and revives a parked one needs,
+// and what a child running inside [agentturn.Run] could not give.
+// Nothing an observer sees changes, and the agent is the tool's: a
+// host that prompts it again gets a second run on the child's own
+// transcript.
+//
+// The observer stays subscribed after Execute returns, so a later run
+// the host starts is recorded into the same child session; the call's
+// progress updates stop, since the call is over.
+func WithSpawn(fn func(callID string, child *agentturn.Agent)) Option {
+	return func(o *options) { o.spawn = fn }
+}
+
+// WithRunContext gives the child run a context of the host's making,
+// derived from the call's: what only the host knows and the child
+// should run under. A session recorder's ChildContext is the case it
+// was added for, putting the child's session ID on the context so a
+// layer that attributes its writes to a session, a memory journal for
+// one, names the child's rather than the parent's. It runs once per
+// call, before the run starts, and the context it returns is the one
+// the child's hooks and tools see.
+func WithRunContext(fn func(ctx context.Context, callID string) context.Context) Option {
+	return func(o *options) { o.runCtx = fn }
+}
+
 type configKey struct{}
+type retryKey struct{}
 
 // ConfigFromContext returns the configuration of the child run whose
 // events an observer registered with [WithObserver] is receiving. It
@@ -206,6 +242,32 @@ type configKey struct{}
 func ConfigFromContext(ctx context.Context) (agentturn.Config, bool) {
 	cfg, ok := ctx.Value(configKey{}).(agentturn.Config)
 	return cfg, ok
+}
+
+// ContextWithConfig attaches a child's configuration to ctx, as this
+// package does for the observer of a child it runs. A host that runs a
+// child agent itself and observes it with the same function puts the
+// configuration on the context it prompts with, so the observer can
+// write it before the child's first item.
+func ContextWithConfig(ctx context.Context, cfg agentturn.Config) context.Context {
+	return context.WithValue(ctx, configKey{}, cfg)
+}
+
+// ContextWithRetry marks the runs under ctx as retries of the call they
+// belong to rather than continuations of it. An observer that keeps a
+// session per call, agentturn/session's does, continues the existing
+// session at its leaf for a second run under one call, because a
+// subagent that is messaged again answers from its own context; a host
+// that means the other thing, a retry from a clean start, says so here.
+func ContextWithRetry(ctx context.Context) context.Context {
+	return context.WithValue(ctx, retryKey{}, true)
+}
+
+// RetryFromContext reports whether the host marked the run a retry with
+// [ContextWithRetry].
+func RetryFromContext(ctx context.Context) bool {
+	retry, _ := ctx.Value(retryKey{}).(bool)
+	return retry
 }
 
 // New wraps cfg as a tool named cfg.Name with cfg.Description. Each
@@ -249,17 +311,19 @@ func (a *agentTool) Description() string         { return a.cfg.Description }
 func (a *agentTool) Parameters() json.RawMessage { return a.opts.schema }
 func (a *agentTool) Strict() bool                { return a.opts.strict }
 
-// Execute runs the child. The output is the text of the child's last
-// assistant message; Details is a [ChildInfo]. A child that fails
-// returns its error, one that is aborted returns the context error, and
-// one that stopped on deferred calls returns an [*InputRequiredError],
-// because a pause inside the child cannot become a pause of the parent
-// after the fact. A child that ends without a final assistant message
-// returns what [WithNoAnswer] says, by default an error naming the
-// cause. On every error path the Result still carries the ChildInfo:
-// the loop keeps Details when it turns an error into the output the
-// model sees, so a session subscriber can link the child run whether
-// or not it succeeded.
+// Execute runs the child as an [agentturn.Agent], so every event is a
+// barrier and a host given the agent by [WithSpawn] can reach it while
+// it runs. The output is the text of the child's last assistant
+// message; Details is a [ChildInfo]. A child that fails returns its
+// error, one that is aborted returns the context error, and one that
+// stopped on deferred calls returns an [*InputRequiredError], because a
+// pause inside the child cannot become a pause of the parent after the
+// fact. A child that ends without a final assistant message returns
+// what [WithNoAnswer] says, by default an error naming the cause. On
+// every error path the Result still carries the ChildInfo: the loop
+// keeps Details when it turns an error into the output the model sees,
+// so a session subscriber can link the child run whether or not it
+// succeeded.
 func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool.Result, error) {
 	prompts, err := a.opts.render(call.Args)
 	if err != nil {
@@ -274,32 +338,60 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		seed = a.opts.seed(answered(parent, call.ID, a.cfg.Name))
 	}
 
-	var soFar []string
-	var end *agentturn.RunEnd
 	// The observer sees the values of the call's context but never its
 	// cancellation, as an Agent's subscribers do: an abort of the parent
 	// cuts the child through ctx, and the events the cut leaves behind
 	// still have to be written.
 	obsCtx := agenttool.WithCall(context.WithValue(context.WithoutCancel(ctx), configKey{}, a.cfg), call)
-	for ev := range agentturn.Run(ctx, seed, prompts, a.cfg) {
+	var opts []agentturn.Option
+	if seed != nil {
+		opts = append(opts, agentturn.WithTranscript(seed))
+	}
+	child := agentturn.New(a.cfg, opts...)
+	var mu sync.Mutex
+	var soFar []string
+	done := false
+	child.Subscribe(func(_ context.Context, ev agentturn.Event) error {
 		if a.opts.observer != nil {
 			a.opts.observer(obsCtx, ev)
 		}
-		switch e := ev.(type) {
-		case *agentturn.ItemEnd:
-			if m, ok := e.Item.(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant {
-				soFar = append(soFar, m.Text())
-				call.Update(agenttool.Result{
-					Output:  openresponses.FunctionCallOutputData{Text: strings.Join(soFar, "\n\n")},
-					Details: ChildInfo{RunID: e.RunID},
-				})
-			}
-		case *agentturn.RunEnd:
-			end = e
+		e, ok := ev.(*agentturn.ItemEnd)
+		if !ok {
+			return nil
 		}
+		m, ok := e.Item.(*openresponses.Message)
+		if !ok || m.Role != openresponses.RoleAssistant {
+			return nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if done {
+			// The call is over; a later run is the host's and has
+			// nowhere to report progress to.
+			return nil
+		}
+		soFar = append(soFar, m.Text())
+		call.Update(agenttool.Result{
+			Output:  openresponses.FunctionCallOutputData{Text: strings.Join(soFar, "\n\n")},
+			Details: ChildInfo{RunID: e.RunID},
+		})
+		return nil
+	})
+	if a.opts.spawn != nil {
+		a.opts.spawn(call.ID, child)
 	}
+	if a.opts.runCtx != nil {
+		ctx = a.opts.runCtx(ctx, call.ID)
+	}
+	end, err := child.Prompt(ctx, prompts...)
+	mu.Lock()
+	done = true
+	mu.Unlock()
 	if end == nil {
-		return agenttool.Result{}, errors.New("agent " + strconv.Quote(a.cfg.Name) + ": child run produced no run_end")
+		if err == nil {
+			err = errors.New("child run produced no run_end")
+		}
+		return agenttool.Result{}, fmt.Errorf("agent %s: %w", strconv.Quote(a.cfg.Name), err)
 	}
 	info := ChildInfo{RunID: end.RunID, Items: end.Items, Reason: end.Reason, Cause: end.Cause, Pending: end.Pending}
 	switch end.Reason {

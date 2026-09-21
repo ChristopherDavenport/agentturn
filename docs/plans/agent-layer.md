@@ -9,6 +9,19 @@
 > composition rule is unchanged: the loop knows a `Model` and a list of
 > `agenttool.Tool`.
 >
+> Update, 2026-09-21: round 2 of the design studies added, without
+> changing the composition rule: `Agent.AbortCause` with the loop
+> reading `context.Cause`; a retry that commits only when a message or
+> a function call opens, holding an earlier item until it does;
+> `Retry.Revise` for a fallback chain inside the loop; `Invoke` on a
+> tool's context for a nested call, with `Parent` on the tool events;
+> the `Chain*` helpers for a hook two layers want; `Hidden` for an item
+> the model reads and a renderer hides; `Answer.By` for who answered a
+> held call; `Queued` for an item accepted into a queue, with `Steer`
+> and `FollowUp` taking a context; `compact.WithPin`; and, in
+> `tools/agent`, a child that runs as an `Agent` with `WithSpawn` and
+> `WithRunContext`.
+>
 > Update, 2026-09-20: the API shapes below were revised after the
 > usability review. `Run` and `Continue` yield `iter.Seq[Event]` with
 > the `RunEnd` as the single terminal; `Prompt`, `Continue` and

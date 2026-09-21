@@ -242,3 +242,56 @@ func TestToolStartCarriesDecision(t *testing.T) {
 		t.Errorf("approved tool_start = %+v", approved)
 	}
 }
+
+// TestAbortCause checks that a host's reason for cutting a run reaches
+// RunEnd.Err, whether it aborted the agent or cancelled the context it
+// prompted with, and that a bare abort still reads as a cancellation.
+func TestAbortCause(t *testing.T) {
+	rule := errors.New("ttsr: rule box-leak")
+	blocking := agenttool.New("wait", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	newAgent := func(cut func(a *Agent, cancel context.CancelCauseFunc)) (*RunEnd, context.CancelCauseFunc) {
+		cfg := Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{blocking}}
+		a := New(cfg)
+		ctx, cancel := context.WithCancelCause(context.Background())
+		a.Subscribe(func(_ context.Context, ev Event) error {
+			if _, ok := ev.(*ToolStart); ok {
+				cut(a, cancel)
+			}
+			return nil
+		})
+		end, _ := a.Prompt(ctx, openresponses.UserText("go"))
+		return end, cancel
+	}
+	t.Run("AbortCause names the rule that fired", func(t *testing.T) {
+		end, cancel := newAgent(func(a *Agent, _ context.CancelCauseFunc) { a.AbortCause(rule) })
+		defer cancel(nil)
+		if end.Reason != ReasonAborted || !errors.Is(end.Err, rule) {
+			t.Errorf("end = %+v", end)
+		}
+		// The cut-off call is the caller's to answer, as after any
+		// abort: its output was not appended.
+		if len(end.Pending) != 1 || end.Pending[0].Reason != PendingAborted {
+			t.Errorf("pending = %+v", end.Pending)
+		}
+		if got := itemTypes(end.Items); got != "user function_call" {
+			t.Errorf("items = %q", got)
+		}
+	})
+	t.Run("a cause on the host's own context reaches the end", func(t *testing.T) {
+		end, cancel := newAgent(func(_ *Agent, cancel context.CancelCauseFunc) { cancel(rule) })
+		defer cancel(nil)
+		if end.Reason != ReasonAborted || !errors.Is(end.Err, rule) {
+			t.Errorf("end = %+v", end)
+		}
+	})
+	t.Run("a bare abort is a cancellation", func(t *testing.T) {
+		end, cancel := newAgent(func(a *Agent, _ context.CancelCauseFunc) { a.Abort() })
+		defer cancel(nil)
+		if end.Reason != ReasonAborted || !errors.Is(end.Err, context.Canceled) {
+			t.Errorf("end = %+v", end)
+		}
+	})
+}

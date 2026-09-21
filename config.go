@@ -103,6 +103,11 @@ type Config struct {
 	// a recorded session rebuilds the request they were part of, which
 	// injection through Transform cannot give. nil or no items appends
 	// nothing. A guard on the request itself belongs in BeforeModelCall.
+	//
+	// It is one field and several layers want it. Assigning it twice
+	// keeps the second assignment and loses the first with no error and
+	// no sign, so a product with more than one layer joins them with
+	// [ChainBeforeTurn], which appends what each returns in order.
 	BeforeTurn func(context.Context, TurnStartInfo) (openresponses.Items, error)
 
 	// BeforeModelCall runs on the fully built request of each turn, just
@@ -114,6 +119,13 @@ type Config struct {
 	// [ModelBlocked] event carrying the request as built; a guard that
 	// calls a model is on the critical path of every first token, since
 	// the request is not final until the hook returns.
+	//
+	// This is the most contested field in the package: a memory that
+	// re-renders its block into the instructions and a guard that
+	// inspects what is about to be sent both want it, and assigning it
+	// twice keeps the second assignment silently. Join them with
+	// [ChainBeforeModelCall], in the order they must run: a hook that
+	// edits the request before one that inspects it.
 	BeforeModelCall func(context.Context, *openresponses.Request) error
 
 	// OutputGuard runs on each assistant message as the stream completes
@@ -127,6 +139,8 @@ type Config struct {
 	// it, so a replay still has what it needs; a guard that also wants
 	// to end the run returns an error wrapping [ErrGuard] from
 	// ShouldStopAfterTurn, which sees the turn with TurnInfo.Final set.
+	// Several guards are joined with [ChainOutputGuard], each seeing
+	// what the one before it left.
 	OutputGuard func(context.Context, OutputInfo) (*openresponses.Message, error)
 
 	// Retry is the policy for transient model failures. The zero value
@@ -154,6 +168,14 @@ type Config struct {
 
 	// BeforeToolCall runs once per call, in the model's order, before any
 	// call of the batch executes. A nil decision allows the call.
+	// Several policies are joined with [ChainBeforeToolCall], which
+	// folds their decisions deny over ask over allow; assigning the
+	// field twice keeps only the second policy.
+	//
+	// One call at a time reaches it, a nested call made with [Invoke]
+	// from a tool's own goroutine included, so a policy may keep state
+	// without a lock of its own. Calling Invoke from inside the hook
+	// waits for the hook to return, which it cannot do.
 	BeforeToolCall func(context.Context, ToolCallInfo) (*ToolDecision, error)
 	// AfterToolCall runs when a call completes and may replace its
 	// result. A nil override keeps the result. An override replaces the
@@ -166,13 +188,20 @@ type Config struct {
 	// place in the text it returns; a Transform, which shapes one call
 	// and never replaces the transcript, is the other placement that
 	// keeps the record whole. This hook is for a policy on the result
-	// the model sees, not for saving space.
+	// the model sees, not for saving space. One result at a time
+	// reaches it, whichever goroutine finished the call, as for
+	// BeforeToolCall.
 	AfterToolCall func(context.Context, ToolResultInfo) (*ToolOverride, error)
 	// ShouldStopAfterTurn ends the run after a turn even when the model
 	// requested tools: true ends it with ReasonStopped and StopHook. An
 	// error wrapping [ErrGuard] ends it with ReasonStopped, StopGuard
 	// and the error on RunEnd.Err, so a policy that stops a run is told
 	// apart from a failure; any other error ends it with ReasonError.
+	//
+	// A guard chain and a token budget both want this field. Join them
+	// with [ChainShouldStopAfterTurn], which stops at the first hook
+	// that stops the run, so the error on RunEnd.Err is that hook's and
+	// says which one fired.
 	ShouldStopAfterTurn func(context.Context, TurnInfo) (bool, error)
 
 	// RequestExtra is passed through as Request.Extra on every call.
@@ -182,11 +211,24 @@ type Config struct {
 // Retry says when a failed model call is attempted again. A retry
 // happens inside the turn: the same request is sent again after a
 // delay, a [ModelRetry] event tells subscribers, and the turn_start
-// and response_end of the turn are delivered once. Only an attempt
-// that delivered nothing is retried: once an item of the attempt has
-// reached subscribers, or the server has answered with a failed
-// response, the failure is final, because the transcript or a
-// recorder may already hold part of it. Abort cuts a delay short.
+// and response_end of the turn are delivered once.
+//
+// Only an attempt that has not committed is retried. An attempt
+// commits when the model begins its answer, which is a message or a
+// function call item opening, or when the server answers with a failed
+// response; after that a failure is final, because the transcript or a
+// recorder may already hold part of the answer. An item the model
+// completed before that point, the reasoning summary a reasoning model
+// writes before its first token, is held rather than appended: it
+// reaches subscribers as item_start and item_update, so a front renders
+// thinking live, and it is appended with its item_end when the answer
+// begins or when the response arrives. Only an attempt that ends
+// without its response, a transport failure, a cut stream or a failed
+// response, drops what it held. A 503 between the reasoning summary
+// and the first token is therefore retried and leaves nothing in the
+// transcript or the record, where before it was final and left a
+// transcript ending in a reasoning item that no server accepts as
+// input before a user message. Abort cuts a delay short.
 type Retry struct {
 	// MaxAttempts is the number of attempts per turn, the first
 	// included. Zero or one means no retry.
@@ -198,6 +240,22 @@ type Retry struct {
 	// Retryable reports whether err is worth another attempt. nil means
 	// [DefaultRetryable].
 	Retryable func(error) bool
+	// Revise, when set, may change the request the next attempt sends:
+	// another model, a lower effort, a smaller max_output_tokens. It is
+	// called after the attempt numbered attempt failed with err, with a
+	// copy of the request that failed; it may edit that copy in place
+	// and return nil, or return a request of its own. The copy shares
+	// the slices and maps of the original, so a hook that changes the
+	// input or the tools builds a new one rather than appending to
+	// what it was given.
+	//
+	// The revised request is on the [ModelRetry] event, and a session
+	// recorder takes its settings, so a fallback to another model is a
+	// config delta on the path and the record names the model that
+	// answered rather than the one that did not. A fallback chain
+	// written as a Streamer under the loop still works and still says
+	// nothing.
+	Revise func(attempt int, req *openresponses.Request, err error) *openresponses.Request
 }
 
 func (r Retry) retryable(err error) bool {
@@ -298,7 +356,12 @@ const (
 type ToolDecision struct {
 	// Action allows, blocks or defers the call.
 	Action ToolAction
-	// Reason is the message the model sees when Action is Block.
+	// Reason is the message the model sees when Action is Block, and
+	// the reason a session recorder writes on the decision whatever the
+	// action: which rule raised the prompt for a Defer, which one
+	// refused the call for a Block. The model never sees the reason of
+	// a deferred call; it is for the record and for the front that asks
+	// the user.
 	Reason string
 	// Terminate hints the loop to stop after the batch, as a tool result
 	// would. It composes with Allow and Block.
@@ -308,7 +371,9 @@ type ToolDecision struct {
 	// By names who decided, for the record: the session format knows
 	// "human" for a person the hook waited on, "policy" for a rule it
 	// evaluated on its own and "agent" for another model. Empty is read
-	// as policy. The loop does not use it.
+	// as policy for a decision about a call nothing was holding, and as
+	// nobody for the approval of a held call, where [Answer.By] is what
+	// says who answered. The loop does not use it.
 	By string
 	// Note is text the model sees with the result: it is appended after
 	// the batch's outputs as a developer message, so the model reads the

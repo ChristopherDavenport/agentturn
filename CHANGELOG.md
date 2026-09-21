@@ -5,6 +5,171 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- `Queued` reports an item `Agent.Steer` or `Agent.FollowUp` accepted
+  into a queue, with which queue it went into and the run that was in
+  flight, so a host writing what it accepted can tell an item it was
+  handed from one a run produced, where before the two were the same
+  user message with nothing to separate them. The report is not the
+  accept: the item is queued when the call returns, and the goroutine
+  that owns delivery reports it at its next event, before anything that
+  item produces. Steer and FollowUp keep their signatures and never
+  wait on delivery, so steering from inside a subscriber is safe, and a
+  host that must not lose an input writes it before it accepts it. The
+  queues, `State.Steered` and `State.Queued` are unchanged. (#67)
+
+- `compact.WithPin(fn)` keeps the items fn reports through a fold:
+  whatever part of the folded prefix they were in, they follow the
+  summary in the request, in their order, so a stream rule's reminder
+  or a policy notice survives compaction as itself rather than as
+  whatever the summary model made of it. `WithKeepLast` keeps a window
+  at the end and nothing kept a member of the part that is folded.
+  `Fold.Pinned` reports them and `session` names them in the
+  compaction entry's `fold` member; because a compaction entry says
+  only where the kept tail starts, the calls after a fold that pinned
+  anything are recorded without a request hash rather than with one
+  that would not verify. (#78)
+
+- `Retry.Revise` may change the request the next attempt sends: another
+  model, a lower effort. `ModelRetry` carries that request, and
+  `session` settles on it, so a fallback chain lives in the loop rather
+  than under it as a `Streamer` over its legs, where no event described
+  the switch and the config on the path named the model that did not
+  answer. The retry's settings replace the failed attempt's rather than
+  adding to them, since an attempt that never answered wrote nothing.
+  (#77)
+
+- `agentturn.Invoke(ctx, name, args)` runs one of the turn's tools from
+  inside another as if the model had asked for it under the call in
+  flight: `BeforeToolCall` decides, `tool_start` and `tool_end` carry
+  the new `Parent` naming the call that made it, `AfterToolCall`
+  applies, and `session` writes a custom entry in the
+  `agentturn:nested_call` namespace before and after, since a nested
+  call has no function_call item for a dispatch to name. A tool that
+  let its code reach the agent's other tools through an `agenttool.Set`
+  of its own ran them past the policy, the events and the record
+  alike. A nested call appends nothing to the transcript, and a hook
+  that defers one refuses it, since there is nobody to ask while a tool
+  is running. Delivery is serialised, so a subscriber is never called
+  from two goroutines at once. (#76)
+
+- **Fixed**: `Retry` committed an attempt as soon as any output item
+  opened, and a reasoning model opens its reasoning item before its
+  text, so a 503 between the summary and the first token was final and
+  left a transcript ending in a reasoning item, which `Continue`
+  refuses and a strict server rejects. An attempt commits when a
+  message or a function call opens; an item completed before that is
+  held, reaching subscribers as item_start and item_update so a front
+  still renders thinking live, and is appended when the attempt commits
+  or dropped when it ends without committing. The transcript never ends
+  in a bare reasoning item. (#71)
+
+- `Agent.AbortCause(err)` cuts a run with a reason, and the loop reads
+  `context.Cause` wherever it read the bare context error, so a host
+  that cancels the run's context itself with `context.WithCancelCause`
+  is heard too. `RunEnd.Err` carries the cause and a recorder writes it
+  as the run's end, so a harness that cuts a stream for a rule, an
+  advisor, a coordinator or a user pressing Esc can count them apart
+  instead of recording four "context canceled". `Abort` is
+  `AbortCause(nil)` and keeps its meaning. (#70)
+
+- `ChainBeforeModelCall`, `ChainBeforeTurn`, `ChainShouldStopAfterTurn`,
+  `ChainBeforeToolCall` and `ChainOutputGuard` join several values for
+  one hook into one. Every hook is a plain field, so a product that
+  follows two layers' READMEs in turn keeps the second assignment and
+  loses the first with no error and no sign, which is how a memory
+  block silently freezes at the value it had when the process started.
+  The semantics are stated: in order, the first error stops the chain,
+  the first stop ends the run, BeforeTurn concatenates, BeforeToolCall
+  folds deny over ask over allow with the first reason of an action
+  kept, and each output guard sees what the one before it left.
+  `Config`'s doc comments name the layers that contest each field. (#64)
+
+- `tools/agent`: the child runs as an `agentturn.Agent` rather than
+  inside the low-level `Run`, and `WithSpawn(fn)` hands it to the host,
+  keyed by the call, before the run starts: a host can steer a running
+  child, abort one without cutting its siblings or the parent, and
+  prompt it again once the tool has returned, which is what a hub that
+  fans work out to subagents does. Nothing an observer sees changes,
+  except that every event is now a barrier, as it is for the parent, so
+  a child's dispatch is durable before its tool runs. The observer
+  stays subscribed after the call, so a later run the host starts is
+  recorded into the same child session. (#72)
+- `tools/agent`: `WithRunContext(fn)` gives the child run a context of
+  the host's making, derived from the call's; `ContextWithConfig` and
+  `ContextWithRetry` are exported for a host that runs a child agent
+  itself and observes it with the same function. (#72, #73)
+- **Fixed**: a child session was filed under no working directory, so
+  every child landed in a store's `default` bucket and no listing
+  scoped to a directory ever showed one, although the child ran in its
+  parent's process and its parent's directory. The child header
+  inherits the parent's `CWD`. (#66)
+- `session`: `Recorder.ChildContext`, for `agent.WithRunContext`, puts
+  the ID of the session a child run will be written to on the context
+  the child is given, and `SessionIDFromContext` reads it, so a layer
+  that attributes its writes to a session, a memory journal for one,
+  names the child's session rather than the parent's.
+  `ContextWithSessionID` is the same for a host's own runs. (#63)
+- **Fixed**: a second run under one call always reset the child
+  session's leaf, which a revived subagent is not: it answers from its
+  own context, and the new root rebuilt one item of the seven its
+  request carried, with no hash. A second run continues the session at
+  its leaf; a host that means a retry from a clean start says so with
+  `agent.ContextWithRetry`. (#73)
+
+- `Answer.By`, set with `Answer.WithBy`, names who decided an answer to
+  a pending call, in the session format's terms: `human` for a person
+  at a prompt, `policy` for a rule that answered on its own, `agent`
+  for another model. It rides on the `ToolDecision` the loop
+  synthesises for an approval and, for an output the caller wrote,
+  which raises no tool_start, on the run's context, where the recorder
+  finds it with `agentturn.DeciderFromContext`; `Agent.Resume` attaches
+  it and `ContextWithDeciders` is there for a host driving the
+  low-level `Run`. There is no default: a policy engine answers through
+  Resume as often as a person does, so an answer that names nobody is
+  recorded as an anonymous decision rather than guessed at. (#65)
+- `agentturn.Hidden(item)` marks an item as part of the model's context
+  that a renderer should hide: a stream rule's interrupt report, an
+  advisory, a notice a keyword added. It is a wrapper the loop strips
+  as it appends, so the transcript, the request and every type switch
+  see the item itself; `ItemStart.Hidden` and `ItemEnd.Hidden` carry
+  the mark, and `session` writes the entry with the format's `visible`
+  false. `Unhide` unwraps one. It works wherever the loop appends a
+  caller's item: `Prompt`, `Steer`, `FollowUp`, the prompts of `Run`
+  and what `BeforeTurn` returns. (#75)
+- **Fixed**: `session` recorded a held call without the reason the hook
+  gave, although the reject arm two lines away wrote one, so a session
+  said three calls were held and nothing said which rule raised the
+  prompt. A hold carries the decision's reason; the model still sees
+  nothing for a deferred call. `ToolDecision.Reason` documents that it
+  is the reason of a decision whatever the action, not only the message
+  a block shows the model. (#62)
+
+- **Fixed**: `session` wrote the reject decision that carries an output
+  the caller supplied only for a call it was holding, so a call seeded
+  from a branch whose dispatch and hold are on the path it left ended
+  with an output and no dispatch, which `VerifyRecords` reads as a
+  broken promise. The decision is written for any call the path holds
+  no dispatch and no reject for, which is what a reader takes an output
+  the caller wrote to mean; a held call is unchanged. (#68)
+- **Fixed**: `session` wrote a stream cut after a completed item as a
+  failed response with no response ID, so the context algorithm found
+  no items to strip and read the items the cut call produced as its
+  input, and the recorded hash mismatched. Every interrupted run of a
+  model that completes an item before the cut, a reasoning model for
+  one, was a `verify` failure. The failed response carries the ID of
+  the response the stream named, learned from every item event it
+  raised, so an interrupted turn names the response it was cut out of
+  whether or not the attempt ever appended anything. (#69)
+- `session`: `Recorder.Rebase` with the empty entry ID is the reset a
+  product's `/clear` makes: the session's leaf is reset so the next
+  append starts a new root, and the recorder forgets the settings, the
+  items and the calls of the branch it left, so the new root opens with
+  a full config entry and its responses carry hashes again. Before
+  this, a reset leaf could not be told to the recorder at all, and the
+  root it wrote rebuilt with no model and no instructions. (#74)
+
 ## v0.0.6 - 2026-09-20
 
 - Depends on `agenttool` v0.0.5, and `session` writes a tool's side

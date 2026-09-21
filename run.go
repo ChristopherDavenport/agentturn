@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"sync"
 	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
@@ -150,7 +151,7 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 				// run_end, reach a consumer that is still there. The
 				// loop notices the cancellation through the model, the
 				// tools and its own checks.
-				emit: func(ev Event) error {
+				send: func(ev Event) error {
 					events <- ev
 					return nil
 				},
@@ -179,6 +180,7 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 type transcriptKey struct{}
 type runIDKey struct{}
 type triggerKey struct{}
+type decidersKey struct{}
 
 // ContextWithTrigger attaches a [Trigger] to ctx. A run started with
 // that context, through [Run], [Continue] or an [Agent], carries it on
@@ -193,6 +195,32 @@ func ContextWithTrigger(ctx context.Context, t Trigger) context.Context {
 func TriggerFromContext(ctx context.Context) Trigger {
 	t, _ := ctx.Value(triggerKey{}).(Trigger)
 	return t
+}
+
+// ContextWithDeciders attaches who decided the answer to each pending
+// call, by call ID, in the session format's terms ("human", "policy",
+// "agent"). [Agent.Resume] does it from the [Answer.By] of the answers
+// it was given, so a subscriber writing the record of an output the
+// caller supplied, which raises no tool_start to carry a decision, can
+// say who wrote it. A host driving the low-level [Run] with the
+// outputs as prompts attaches it itself. The loop reads nothing from
+// it.
+func ContextWithDeciders(ctx context.Context, by map[string]string) context.Context {
+	if len(by) == 0 {
+		return ctx
+	}
+	out := make(map[string]string, len(by))
+	for k, v := range by {
+		out[k] = v
+	}
+	return context.WithValue(ctx, decidersKey{}, out)
+}
+
+// DeciderFromContext returns who the caller named as the decider of the
+// answer for callID, or "" when nobody was named.
+func DeciderFromContext(ctx context.Context, callID string) string {
+	by, _ := ctx.Value(decidersKey{}).(map[string]string)
+	return by[callID]
 }
 
 // ContextWithTranscript attaches a transcript to ctx. The loop does this
@@ -293,14 +321,22 @@ func (c Config) baseRequest(tools agenttool.Set) openresponses.Request {
 	return req
 }
 
-// runner is one run of the loop. emit delivers an event and returns an
+// runner is one run of the loop. send delivers an event and returns an
 // error to abort the run; steer and followUp drain the queues when set.
 type runner struct {
 	cfg        Config
 	transcript Transcript
-	emit       func(Event) error
+	send       func(Event) error
 	steer      func() openresponses.Items
 	followUp   func() openresponses.Items
+
+	// hookMu serialises the tool hooks. A nested call runs on the
+	// goroutine of the tool that made it, so without it two tools of
+	// one batch would enter BeforeToolCall at once, and a nested
+	// call's AfterToolCall would run beside the batch's. It is held
+	// across the hook alone, never across an emit or a tool, so the
+	// only way to block on it is to call Invoke from inside a hook.
+	hookMu sync.Mutex
 
 	runID string
 	turn  int
@@ -313,6 +349,37 @@ type runner struct {
 	// deferred holds the IDs of the calls a hook handed to the caller
 	// during this run, so the run end can say why they are pending.
 	deferred map[string]bool
+	// held are the completed items of the attempt in flight that the
+	// transcript does not have yet, because nothing has committed the
+	// attempt: a reasoning item a model opens before its answer. They
+	// are appended when the attempt commits and dropped when it ends
+	// without committing.
+	held []heldItem
+}
+
+// heldItem is a completed item waiting for its attempt to commit.
+type heldItem struct {
+	item       openresponses.Item
+	responseID string
+}
+
+// emit delivers one event to the consumer. An Agent serialises them
+// behind its own barrier, whichever goroutine raised them; the
+// low-level loop's channel takes one send at a time.
+func (r *runner) emit(ev Event) error { return r.send(ev) }
+
+// beforeToolCall runs the hook for one call, one goroutine at a time.
+func (r *runner) beforeToolCall(ctx context.Context, info ToolCallInfo) (*ToolDecision, error) {
+	r.hookMu.Lock()
+	defer r.hookMu.Unlock()
+	return r.cfg.BeforeToolCall(ctx, info)
+}
+
+// afterToolCall runs the hook for one result, one goroutine at a time.
+func (r *runner) afterToolCall(ctx context.Context, info ToolResultInfo) (*ToolOverride, error) {
+	r.hookMu.Lock()
+	defer r.hookMu.Unlock()
+	return r.cfg.AfterToolCall(ctx, info)
 }
 
 // errStop carries a run end reason out of a phase.
@@ -339,12 +406,13 @@ func stopped(cause StopCause, err error) error {
 
 // approval is a pending call the caller approved through Agent.Resume:
 // it runs before the first model call of the run, with args in place of
-// the call's own when set, and note, when set, appended after the
-// batch's outputs.
+// the call's own when set, note, when set, appended after the batch's
+// outputs, and by naming who approved it, for the record.
 type approval struct {
 	call *openresponses.FunctionCall
 	args json.RawMessage
 	note string
+	by   string
 }
 
 // run drives the loop and returns the RunEnd. terminate says the caller
@@ -370,13 +438,13 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 		end.Err = stop.err
 	case ctx.Err() != nil:
 		end.Reason = ReasonAborted
-		end.Err = ctx.Err()
-		if !errors.Is(err, ctx.Err()) {
+		end.Err = context.Cause(ctx)
+		if !errors.Is(err, context.Cause(ctx)) {
 			// A subscriber or a hook failed for a reason of its own
 			// while the run was being aborted: the abort is the reason
 			// the run ended, and the failure rides on it rather than
 			// vanishing.
-			end.Err = fmt.Errorf("%w: %w", ctx.Err(), err)
+			end.Err = fmt.Errorf("%w: %w", context.Cause(ctx), err)
 		}
 	default:
 		end.Reason = ReasonError
@@ -433,7 +501,7 @@ func (r *runner) source(prompts openresponses.Items, approved []approval) Source
 	for _, call := range unansweredCalls(r.transcript) {
 		open[call.CallID] = true
 	}
-	for _, item := range prompts {
+	for _, item := range unhideAll(prompts) {
 		if out, ok := item.(*openresponses.FunctionCallOutput); ok && open[out.CallID] {
 			return SourceResume
 		}
@@ -469,8 +537,8 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 		if r.cfg.MaxTurns > 0 && r.turn >= r.cfg.MaxTurns {
 			return stopped(StopMaxTurns, nil)
 		}
-		if err := ctx.Err(); err != nil {
-			return stop(ReasonAborted, err)
+		if ctx.Err() != nil {
+			return stop(ReasonAborted, context.Cause(ctx))
 		}
 		r.turn++
 		if r.cfg.BeforeTurn != nil {
@@ -563,18 +631,22 @@ func terminates(results []agenttool.Result) (StopCause, bool) {
 }
 
 // appendItems adds items the loop did not stream (prompts, queued
-// messages, tool outputs) to the transcript with their item events.
+// messages, tool outputs) to the transcript with their item events. An
+// item the caller marked with [Hidden] is unwrapped here, so the
+// transcript and the request hold the item itself and only its events
+// say it is hidden.
 func (r *runner) appendItems(items openresponses.Items) error {
 	for _, item := range items {
 		if item == nil {
 			continue
 		}
-		if err := r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item}); err != nil {
+		item, hidden := Unhide(item)
+		if err := r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden}); err != nil {
 			return err
 		}
 		r.transcript = append(r.transcript, item)
 		r.added = append(r.added, item)
-		if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item}); err != nil {
+		if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden}); err != nil {
 			return err
 		}
 	}
@@ -626,17 +698,26 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 			return resp, nil
 		}
 		if ctx.Err() != nil {
-			return nil, stop(ReasonAborted, ctx.Err())
+			return nil, stop(ReasonAborted, context.Cause(ctx))
 		}
 		if committed || attempt >= r.cfg.Retry.MaxAttempts || !r.cfg.Retry.retryable(err) {
 			return nil, fmt.Errorf("agentturn: model: %w", err)
 		}
 		delay := r.cfg.Retry.backoff(attempt, err)
-		if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: attempt, Err: err, Delay: delay}); err != nil {
+		if revise := r.cfg.Retry.Revise; revise != nil {
+			// The policy may move the turn to another model or another
+			// setting; the record follows the event.
+			next := req
+			if out := revise(attempt, &next, err); out != nil {
+				next = *out
+			}
+			req = next
+		}
+		if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: attempt, Err: err, Delay: delay, Request: req}); err != nil {
 			return nil, err
 		}
 		if err := sleep(ctx, delay); err != nil {
-			return nil, stop(ReasonAborted, err)
+			return nil, stop(ReasonAborted, context.Cause(ctx))
 		}
 	}
 }
@@ -657,18 +738,24 @@ func sleep(ctx context.Context, d time.Duration) error {
 }
 
 // stream runs one attempt at the request. committed reports that the
-// attempt cannot be retried: an event of it reached subscribers, or
-// the server answered with a terminal response. The error is returned
-// unwrapped so a retry policy sees the transport or wire error itself.
+// attempt cannot be retried: a message or a function call opened, a
+// subscriber failed, or the server answered with a terminal response.
+// An item the attempt completed before it committed is held until the
+// answer begins or the response arrives, and dropped when the attempt
+// ends without one, so a failure between a reasoning summary and the
+// first token leaves nothing behind and a response that arrives keeps
+// everything it carried. The error is returned unwrapped so a retry
+// policy sees the transport or wire error itself.
 func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *openresponses.Response, committed bool, err error) {
 	var acc openresponses.Accumulator
+	r.held = nil
 	for ev, err := range openresponses.Events(ctx, r.cfg.Model, req) {
 		if err != nil {
 			return nil, committed, err
 		}
 		acc.Add(ev)
-		emitted, err := r.streamEvent(ev, &acc)
-		committed = committed || emitted
+		commits, err := r.streamEvent(ev, &acc, committed)
+		committed = committed || commits
 		if err != nil {
 			return nil, true, err
 		}
@@ -678,6 +765,18 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 	}
 	if resp == nil {
 		return nil, committed, openresponses.ErrTruncatedStream
+	}
+	if resp.Status != openresponses.ResponseStatusFailed {
+		// The response arrived, so what the attempt completed on the
+		// way to it is the model's output and belongs in the
+		// transcript, whether or not a message or a function call ever
+		// opened: a reasoning item the model answered with alone, an
+		// item cut short by the token limit, an item type this loop
+		// does not know. Only an attempt that ended without its
+		// response drops what it held.
+		if err := r.flushHeld(); err != nil {
+			return nil, true, err
+		}
 	}
 	if err := r.emit(&ResponseEnd{RunID: r.runID, Turn: r.turn, Response: resp}); err != nil {
 		return nil, true, err
@@ -694,16 +793,28 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 // streamEvent turns one wire event, already added to acc, into the item
 // events of the turn: item_start when an output item opens, item_end
 // with the transcript append when it is done, item_update for the
-// events in between. It reports whether an event was emitted. An error
-// event fails the attempt with the wire error, unwrapped.
-func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Accumulator) (bool, error) {
+// events in between. committed says whether the attempt has committed;
+// while it has not, a completed item is held rather than appended, and
+// the return reports whether this event commits the attempt, which a
+// message or a function call opening does. An error event fails the
+// attempt with the wire error, unwrapped.
+func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Accumulator, committed bool) (bool, error) {
 	responseID := ""
 	if cur := acc.Response(); cur != nil {
 		responseID = cur.ID
 	}
 	switch e := ev.(type) {
 	case *openresponses.OutputItemAddedEvent:
-		return true, r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[e.OutputIndex], ResponseID: responseID})
+		item := acc.Response().Output[e.OutputIndex]
+		commits := !committed && commitsAttempt(item)
+		if commits {
+			// The answer has started: what the attempt produced on the
+			// way to it belongs in the transcript, before it.
+			if err := r.flushHeld(); err != nil {
+				return true, err
+			}
+		}
+		return commits, r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, ResponseID: responseID})
 	case *openresponses.OutputItemDoneEvent:
 		item := e.Item
 		if m, ok := item.(*openresponses.Message); ok && r.cfg.OutputGuard != nil {
@@ -716,16 +827,48 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 				item = replacement
 			}
 		}
+		if !committed {
+			// Nothing commits the attempt yet, so the item waits: a
+			// failure now is retried and leaves no trace.
+			r.held = append(r.held, heldItem{item: item, responseID: responseID})
+			return false, nil
+		}
 		r.transcript = append(r.transcript, item)
 		r.added = append(r.added, item)
-		return true, r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, ResponseID: responseID})
+		return false, r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, ResponseID: responseID})
 	case *openresponses.ErrorEvent:
 		return false, e.Err()
 	}
 	if idx, ok := outputIndex(ev); ok {
-		return true, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[idx], Stream: ev, ResponseID: responseID})
+		return false, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[idx], Stream: ev, ResponseID: responseID})
 	}
 	return false, nil
+}
+
+// commitsAttempt reports whether an item opening commits the attempt:
+// the model has begun its answer, so a failure after it cannot be
+// retried without sending part of the answer twice.
+func commitsAttempt(item openresponses.Item) bool {
+	switch item.(type) {
+	case *openresponses.Message, *openresponses.FunctionCall:
+		return true
+	}
+	return false
+}
+
+// flushHeld appends the items the attempt held, in order, with their
+// item_end events.
+func (r *runner) flushHeld() error {
+	held := r.held
+	r.held = nil
+	for _, h := range held {
+		r.transcript = append(r.transcript, h.item)
+		r.added = append(r.added, h.item)
+		if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: h.item, ResponseID: h.responseID}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // outputIndex returns the output index an item-scoped event refers to.
@@ -779,6 +922,16 @@ type callState struct {
 	// deferred is set when the caller owns the call; no output is
 	// appended.
 	deferred bool
+	// cut is set when the abort settled the call rather than the tool,
+	// so no output is appended for it whatever its error says.
+	cut bool
+	// parent is the call whose tool made this one with Invoke, empty
+	// for a call of the model's batch.
+	parent string
+	// turn is the turn the call belongs to, taken when the call was
+	// prepared: a nested call is settled on the goroutine of the tool
+	// that made it, which must not read the loop's own field.
+	turn int
 	// appended is set once the call's output is in the transcript.
 	appended bool
 	// note is text appended after the batch's outputs, from the
@@ -794,7 +947,7 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 		return nil, nil, nil
 	}
 	// Hooks and tools see the conversation that produced the calls.
-	ctx = r.toolContext(ctx)
+	ctx = r.toolContext(ctx, tools)
 	batch, err := r.preflightAll(ctx, tools, calls)
 	if err != nil {
 		return nil, nil, err
@@ -806,9 +959,17 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 }
 
 // toolContext is the context hooks and tools run under: ctx with a
-// snapshot of the working transcript attached.
-func (r *runner) toolContext(ctx context.Context) context.Context {
-	return ContextWithTranscript(ctx, append(Transcript(nil), r.transcript...))
+// snapshot of the working transcript attached, and the invoker that
+// runs another of the turn's tools through the loop.
+func (r *runner) toolContext(ctx context.Context, tools agenttool.Set) context.Context {
+	ctx = ContextWithTranscript(ctx, append(Transcript(nil), r.transcript...))
+	// The turn is taken here, on the loop's goroutine: a tool that
+	// keeps its context past its batch and invokes from a goroutine of
+	// its own must not read a turn the loop is writing.
+	turn := r.turn
+	return context.WithValue(ctx, invokerKey{}, invoker(func(ctx context.Context, name string, args json.RawMessage) (agenttool.Result, error) {
+		return r.invoke(ctx, tools, turn, name, args)
+	}))
 }
 
 // preflightAll runs preflight for every call in the model's order and
@@ -822,8 +983,8 @@ func (r *runner) preflightAll(ctx context.Context, tools agenttool.Set, calls []
 		}
 		batch[i] = p
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, r.abortBatch(ctx, batch, err)
+	if ctx.Err() != nil {
+		return nil, r.abortBatch(ctx, batch, context.Cause(ctx))
 	}
 	return batch, nil
 }
@@ -838,7 +999,7 @@ func (r *runner) abortBatch(ctx context.Context, batch []*callState, err error) 
 		if p.settled {
 			continue
 		}
-		p.settled = true
+		p.settled, p.cut = true, true
 		p.err = err
 		if serr := r.settle(ctx, p); serr != nil {
 			return serr
@@ -862,7 +1023,12 @@ func (r *runner) appendFinished(ctx context.Context, batch []*callState) error {
 		if p == nil || !p.settled || p.deferred || p.appended {
 			continue
 		}
-		if p.err != nil && ctx.Err() != nil && errors.Is(p.err, ctx.Err()) {
+		if p.cut {
+			continue
+		}
+		if p.err != nil && ctx.Err() != nil && (errors.Is(p.err, ctx.Err()) || errors.Is(p.err, context.Cause(ctx))) {
+			// The tool was cut off in flight: it returned the
+			// cancellation, or the cause a host gave it.
 			continue
 		}
 		p.appended = true
@@ -901,11 +1067,11 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 			return err
 		}
 	}
-	if err := ctx.Err(); err != nil {
+	if ctx.Err() != nil {
 		if aerr := r.appendFinished(ctx, batch); aerr != nil {
 			return aerr
 		}
-		return stop(ReasonAborted, err)
+		return stop(ReasonAborted, context.Cause(ctx))
 	}
 	return nil
 }
@@ -941,14 +1107,14 @@ func (r *runner) collect(batch []*callState) ([]agenttool.Result, []*openrespons
 // The tool events carry Turn 0.
 func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agenttool.Result, error) {
 	tools := r.cfg.tools(ctx)
-	ctx = r.toolContext(ctx)
+	ctx = r.toolContext(ctx, tools)
 	batch := make([]*callState, len(approved))
 	for i, ap := range approved {
-		p := r.prepare(tools, ap.call, ap.args)
+		p := r.prepare(tools, r.turn, ap.call, ap.args)
 		if ap.note != "" {
 			p.note = openresponses.UserText(ap.note)
 		}
-		if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args, Decision: &ToolDecision{Args: ap.args, Note: ap.note}}); err != nil {
+		if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args, Decision: &ToolDecision{Args: ap.args, Note: ap.note, By: ap.by}}); err != nil {
 			return nil, err
 		}
 		if err := r.check(ctx, p, false); err != nil {
@@ -956,8 +1122,8 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 		}
 		batch[i] = p
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, r.abortBatch(ctx, batch, err)
+	if ctx.Err() != nil {
+		return nil, r.abortBatch(ctx, batch, context.Cause(ctx))
 	}
 	if err := r.execute(ctx, batch); err != nil {
 		return nil, err
@@ -970,12 +1136,12 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 // BeforeToolCall. It emits tool_start and, for a call that will not
 // execute, tool_end.
 func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openresponses.FunctionCall, batch []*openresponses.FunctionCall, index int) (*callState, error) {
-	p := r.prepare(tools, call, nil)
+	p := r.prepare(tools, r.turn, call, nil)
 	var terminate bool
 	var decision *ToolDecision
 	if r.cfg.BeforeToolCall != nil {
 		var err error
-		decision, err = r.cfg.BeforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: r.turn, Call: call, Tool: p.tool, Args: p.args, Batch: batch, Index: index})
+		decision, err = r.beforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: r.turn, Call: call, Tool: p.tool, Args: p.args, Batch: batch, Index: index})
 		if err != nil {
 			return nil, fmt.Errorf("agentturn: before-tool-call hook: %w", err)
 		}
@@ -1017,8 +1183,8 @@ func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openr
 // prepare starts the state of a call: the tool with its name, if any,
 // and its arguments, args when given and the call's own otherwise, an
 // empty object standing in for none.
-func (r *runner) prepare(tools agenttool.Set, call *openresponses.FunctionCall, args json.RawMessage) *callState {
-	p := &callState{call: call, args: args}
+func (r *runner) prepare(tools agenttool.Set, turn int, call *openresponses.FunctionCall, args json.RawMessage) *callState {
+	p := &callState{call: call, args: args, turn: turn}
 	if p.args == nil {
 		p.args = json.RawMessage(call.Arguments)
 	}
@@ -1053,7 +1219,7 @@ func (r *runner) check(ctx context.Context, p *callState, terminate bool) error 
 // model sees and emits tool_end.
 func (r *runner) settle(ctx context.Context, p *callState) error {
 	if r.cfg.AfterToolCall != nil && !p.blocked {
-		override, err := r.cfg.AfterToolCall(ctx, ToolResultInfo{RunID: r.runID, Turn: r.turn, Call: p.call, Tool: p.tool, Args: p.args, Result: p.result, Err: p.err})
+		override, err := r.afterToolCall(ctx, ToolResultInfo{RunID: r.runID, Turn: p.turn, Call: p.call, Tool: p.tool, Args: p.args, Result: p.result, Err: p.err})
 		if err != nil {
 			return fmt.Errorf("agentturn: after-tool-call hook: %w", err)
 		}
@@ -1068,10 +1234,107 @@ func (r *runner) settle(ctx context.Context, p *callState) error {
 		p.result.Terminate = terminate
 		p.result.Details = details
 	}
-	return r.emit(&ToolEnd{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked})
+	return r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Parent: p.parent})
 }
 
 func validObject(raw json.RawMessage) bool {
 	var v map[string]json.RawMessage
 	return json.Unmarshal(raw, &v) == nil && v != nil
+}
+
+type invokerKey struct{}
+
+// invoker runs one nested call under the turn that attached it.
+type invoker func(ctx context.Context, name string, args json.RawMessage) (agenttool.Result, error)
+
+// ErrNoInvoker is returned by [Invoke] outside a tool call of a loop.
+var ErrNoInvoker = errors.New("agentturn: no loop on the context to invoke a tool through")
+
+// Invoke runs one of the turn's tools as if the model had asked for it
+// under the call in flight: [Config.BeforeToolCall] decides, tool_start
+// and tool_end are emitted with Parent naming the call that made it,
+// [Config.AfterToolCall] may override the result, and a session
+// recorder writes it. It is what a tool that lets its code reach the
+// agent's other tools, a code-execution kernel over a loopback bridge,
+// calls instead of holding an agenttool.Set of its own, where the
+// policy, the events and the record would all be absent.
+//
+// The result is the one the model would have seen, with the error
+// beside it: a tool that failed, a name no tool has, arguments that are
+// not an object, or a call the hook refused, whose Reason is the error.
+// A hook that defers the call refuses it instead, since a nested call
+// cannot be handed to the caller: it belongs to a tool that is running.
+// Nothing is appended to the transcript, so a nested call costs no
+// items and a Terminate on its result means nothing to the loop.
+//
+// The call it is made under comes from agenttool.CallFrom, which
+// agenttool.New puts on every typed tool's context; a tool that
+// implements the interface itself and wants the parent named passes
+// agenttool.WithCall. Outside a loop, Invoke returns [ErrNoInvoker].
+//
+// Call it from a tool, with the context the tool was given, and not
+// from a hook or a subscriber: BeforeToolCall and AfterToolCall take
+// one call at a time, and a subscriber is called while the agent holds
+// delivery, so either would wait for something it is itself holding.
+func Invoke(ctx context.Context, name string, args json.RawMessage) (agenttool.Result, error) {
+	fn, _ := ctx.Value(invokerKey{}).(invoker)
+	if fn == nil {
+		return agenttool.Result{}, ErrNoInvoker
+	}
+	return fn(ctx, name, args)
+}
+
+// invoke runs a nested call through the turn's hooks, events and
+// executor. It never touches the transcript: the call is the work of
+// the call that made it.
+func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name string, args json.RawMessage) (agenttool.Result, error) {
+	parent := ""
+	if call, ok := agenttool.CallFrom(ctx); ok {
+		parent = call.ID
+	}
+	call := &openresponses.FunctionCall{CallID: openresponses.NewID("call"), Name: name, Arguments: string(args)}
+	p := r.prepare(tools, turn, call, args)
+	p.parent = parent
+	var decision *ToolDecision
+	if r.cfg.BeforeToolCall != nil {
+		var err error
+		decision, err = r.beforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: turn, Call: call, Tool: p.tool, Args: p.args, Batch: []*openresponses.FunctionCall{call}, Index: 0})
+		if err != nil {
+			return agenttool.Result{}, fmt.Errorf("agentturn: before-tool-call hook: %w", err)
+		}
+		if decision != nil {
+			if decision.Args != nil {
+				p.args = decision.Args
+			}
+			switch decision.Action {
+			case Block, Defer:
+				reason := decision.Reason
+				if reason == "" {
+					reason = "call blocked"
+				}
+				if decision.Action == Defer {
+					reason = "a nested call cannot be deferred to the caller: " + reason
+				}
+				p.blocked = true
+				p.err = errors.New(reason)
+			}
+		}
+	}
+	if err := r.emit(&ToolStart{RunID: r.runID, Turn: turn, CallID: call.CallID, Name: name, Args: p.args, Decision: decision, Parent: parent}); err != nil {
+		return agenttool.Result{}, err
+	}
+	if err := r.check(ctx, p, false); err != nil {
+		return agenttool.Result{}, err
+	}
+	if p.settled {
+		return p.result, p.err
+	}
+	job := agenttool.Job{Tool: p.tool, Call: agenttool.Call{ID: call.CallID, Args: p.args}}
+	results, errs := agenttool.Executor{}.Results(ctx, []agenttool.Job{job})
+	p.result, p.err = results[0], errs[0]
+	p.settled = true
+	if err := r.settle(ctx, p); err != nil {
+		return agenttool.Result{}, err
+	}
+	return p.result, p.err
 }

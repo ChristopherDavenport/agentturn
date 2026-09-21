@@ -985,3 +985,269 @@ func TestRunIDOnContext(t *testing.T) {
 		t.Error("a bare context has a run ID")
 	}
 }
+
+// reasoningThenFail completes a reasoning item and then fails, for the
+// first n calls; after that it reasons and answers, as a reasoning
+// model whose provider was briefly overloaded does.
+type reasoningThenFail struct {
+	n     int
+	calls int
+}
+
+func (m *reasoningThenFail) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.calls++
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Reasoning()
+	if err != nil {
+		return err
+	}
+	if err := w.Summary("weighing the options"); err != nil {
+		return err
+	}
+	if err := w.EndSummary(); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	if m.calls <= m.n {
+		return openresponses.ServerError("overloaded", "overloaded")
+	}
+	msg, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := msg.Text("use Box::leak"); err != nil {
+		return err
+	}
+	if err := msg.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestReasoningOnlyPartialIsRetried covers the turn a reasoning model
+// loses between its summary and its first token: the attempt has not
+// begun its answer, so it is retried, and what it completed on the way
+// is not left in the transcript.
+func TestReasoningOnlyPartialIsRetried(t *testing.T) {
+	noWait := func(int, error) time.Duration { return 0 }
+	t.Run("retried, and the reasoning of the attempt that answered is kept", func(t *testing.T) {
+		model := &reasoningThenFail{n: 1}
+		cfg := Config{Model: model, Retry: Retry{MaxAttempts: 3, Backoff: noWait}}
+		events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("go")}, cfg))
+		if err != nil || end.Reason != ReasonDone || model.calls != 2 {
+			t.Fatalf("err=%v end=%+v calls=%d", err, end, model.calls)
+		}
+		if got := itemTypes(end.Items); got != "user reasoning assistant" {
+			t.Errorf("items = %q", got)
+		}
+		retries, starts, ends := 0, 0, 0
+		for _, ev := range events {
+			switch e := ev.(type) {
+			case *ModelRetry:
+				retries++
+			case *ItemStart:
+				if e.Item.ItemType() == "reasoning" {
+					starts++
+				}
+			case *ItemEnd:
+				if e.Item.ItemType() == "reasoning" {
+					ends++
+				}
+			}
+		}
+		// Both attempts rendered their thinking live; only the one that
+		// committed is in the transcript.
+		if retries != 1 || starts != 2 || ends != 1 {
+			t.Errorf("retries=%d reasoning item_start=%d item_end=%d", retries, starts, ends)
+		}
+	})
+	t.Run("the failure leaves a transcript the loop can continue", func(t *testing.T) {
+		model := &reasoningThenFail{n: 5}
+		cfg := Config{Model: model, Retry: Retry{MaxAttempts: 2, Backoff: noWait}}
+		_, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("go")}, cfg))
+		if end.Reason != ReasonError || err == nil || model.calls != 2 {
+			t.Fatalf("err=%v end=%+v calls=%d", err, end, model.calls)
+		}
+		if got := itemTypes(end.Items); got != "user" {
+			t.Errorf("items = %q, want nothing of the attempts that never answered", got)
+		}
+		transcript := Transcript{openresponses.UserText("go")}
+		if !CanContinue(transcript) {
+			t.Error("the transcript after the failure cannot be continued")
+		}
+	})
+	t.Run("an attempt that opened a message is final", func(t *testing.T) {
+		cfg := Config{Model: partial{}, Retry: Retry{MaxAttempts: 3, Backoff: noWait, Retryable: func(error) bool { return true }}}
+		events, end, _ := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("hi")}, cfg))
+		if end.Reason != ReasonError || itemTypes(end.Items) != "user assistant" {
+			t.Errorf("end=%+v items=%s", end, itemTypes(end.Items))
+		}
+		for _, ev := range events {
+			if _, ok := ev.(*ModelRetry); ok {
+				t.Error("retried after the answer had begun")
+			}
+		}
+	})
+}
+
+// switching answers 429 while the request names the primary model, and
+// answers as itself once the request names the fallback.
+type switching struct {
+	primary  string
+	calls    int
+	answered []string
+}
+
+func (m *switching) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.calls++
+	if req.Model == m.primary {
+		return openresponses.TooManyRequests("rate", "rate limited")
+	}
+	m.answered = append(m.answered, req.Model)
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	msg, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := msg.Text("answered by " + req.Model); err != nil {
+		return err
+	}
+	if err := msg.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestRetryReviseMovesTheTurn covers the fallback chain: a rate-limited
+// turn moves to another model, and the loop says so rather than leaving
+// the switch under a Streamer where no event describes it.
+func TestRetryReviseMovesTheTurn(t *testing.T) {
+	model := &switching{primary: "a"}
+	cfg := Config{Model: model, ModelName: "a", Retry: Retry{
+		MaxAttempts: 3,
+		Backoff:     func(int, error) time.Duration { return 0 },
+		Revise: func(attempt int, req *openresponses.Request, err error) *openresponses.Request {
+			req.Model = "b"
+			return nil
+		},
+	}}
+	events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("go")}, cfg))
+	if err != nil || end.Reason != ReasonDone || model.calls != 2 {
+		t.Fatalf("err=%v end=%+v calls=%d", err, end, model.calls)
+	}
+	var retries []*ModelRetry
+	var starts []string
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case *ModelRetry:
+			retries = append(retries, e)
+		case *TurnStart:
+			starts = append(starts, e.Request.Model)
+		}
+	}
+	if len(retries) != 1 || retries[0].Request.Model != "b" {
+		t.Fatalf("model_retry = %+v", retries)
+	}
+	if len(starts) != 1 || starts[0] != "a" {
+		t.Errorf("turn_start models = %v", starts)
+	}
+	if strings.Join(model.answered, ",") != "b" {
+		t.Errorf("answered by %v", model.answered)
+	}
+	// A revision that returns a request of its own is taken too.
+	model = &switching{primary: "a"}
+	cfg.Model = model
+	cfg.Retry.Revise = func(_ int, req *openresponses.Request, _ error) *openresponses.Request {
+		next := *req
+		next.Model = "c"
+		return &next
+	}
+	if _, _, err = collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("go")}, cfg)); err != nil || strings.Join(model.answered, ",") != "c" {
+		t.Errorf("err=%v answered by %v", err, model.answered)
+	}
+}
+
+// answersWithReasoning completes a reasoning item and then ends the
+// response without a message, as a small model sometimes does, and as a
+// turn cut short by the token limit does.
+type answersWithReasoning struct{ incomplete bool }
+
+func (m answersWithReasoning) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Reasoning()
+	if err != nil {
+		return err
+	}
+	if err := w.Summary("weighing the options"); err != nil {
+		return err
+	}
+	if err := w.EndSummary(); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	if m.incomplete {
+		return em.Incomplete(openresponses.IncompleteReasonMaxOutputTokens)
+	}
+	return em.Complete()
+}
+
+// TestAResponseKeepsWhatTheAttemptHeld checks the other side of the
+// commit rule: an attempt is held, not discarded. A response that
+// arrives without ever opening a message is still the model's output,
+// so what it carried reaches the transcript with its item_end rather
+// than leaving an item_start no one closes.
+func TestAResponseKeepsWhatTheAttemptHeld(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		model Model
+	}{
+		{name: "completed", model: answersWithReasoning{}},
+		{name: "incomplete", model: answersWithReasoning{incomplete: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{Model: tc.model, MaxTurns: 1}
+			events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("go")}, cfg))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := itemTypes(end.Items); got != "user reasoning" {
+				t.Errorf("items = %q", got)
+			}
+			starts, ends := 0, 0
+			for _, ev := range events {
+				switch e := ev.(type) {
+				case *ItemStart:
+					if e.Item.ItemType() == "reasoning" {
+						starts++
+					}
+				case *ItemEnd:
+					if e.Item.ItemType() == "reasoning" {
+						ends++
+					}
+				}
+			}
+			if starts != 1 || ends != 1 {
+				t.Errorf("reasoning item_start=%d item_end=%d, want one of each", starts, ends)
+			}
+			// The held item is in place before the response that
+			// carried it.
+			order := types(events)
+			itemEnd, responseEnd := -1, -1
+			for i, typ := range order {
+				switch typ {
+				case EventItemEnd:
+					itemEnd = i
+				case EventResponseEnd:
+					responseEnd = i
+				}
+			}
+			if itemEnd < 0 || responseEnd < 0 || itemEnd > responseEnd {
+				t.Errorf("events = %v", order)
+			}
+		})
+	}
+}
