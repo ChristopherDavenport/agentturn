@@ -382,8 +382,9 @@ type writer struct {
 	// hash of the request in flight, empty when the recorder cannot
 	// stand behind it; started is when it was sent; inFlightID is the
 	// ID of the response streaming it, learned from the items it
-	// produced, so a call that never reached its response entry can
-	// still be written naming the response its items belong to.
+	// produced and appended, so a call that never reached its response
+	// entry can still be written naming the response its items belong
+	// to.
 	inFlight   bool
 	pending    string
 	started    time.Time
@@ -411,6 +412,11 @@ type writer struct {
 	calls map[string]*callRecord
 	// linked marks the calls whose subsession link is written.
 	linked map[string]bool
+	// replay is set while a transcript is being copied into a session
+	// rather than written from a live run, so the outputs in it answer
+	// calls that ran inside that run and no decision is written for
+	// them.
+	replay bool
 	// env is the last env entry written, encoded, so the next is
 	// written only when it differs.
 	env []byte
@@ -433,10 +439,13 @@ type callRecord struct {
 	args string
 	// held is set while the latest decision is a hold that nothing has
 	// answered; dispatched once a dispatch is written; rejected once a
-	// reject is.
-	held       bool
-	dispatched bool
-	rejected   bool
+	// reject is. dispatchRun is the run the dispatch was written in, so
+	// an output arriving in a later run is the caller's answer to a
+	// call an abort cut off rather than the tool's own.
+	held        bool
+	dispatched  bool
+	rejected    bool
+	dispatchRun string
 }
 
 // Option configures a Recorder.
@@ -983,11 +992,15 @@ func Canonical(req openresponses.Request) openresponses.Request {
 // during turn_start precedes it.
 func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 	switch ev.(type) {
-	case *agentturn.TurnStart, *agentturn.ModelRetry:
-		// Both hold a settle for the call they are about to make; the
-		// retry's replaces the one the turn started with, since the
-		// attempt it described never answered and wrote nothing.
-	default:
+	case *agentturn.RunStart, *agentturn.ModelBlocked, *agentturn.ItemEnd, *agentturn.ResponseEnd,
+		*agentturn.ToolStart, *agentturn.ToolEnd, *agentturn.RunEnd:
+		// The events that write an entry flush the settle held for the
+		// call in flight, so the settings are on the path before what
+		// they describe. The others, item_start and item_update among
+		// them, write nothing and leave it held: an attempt that
+		// streamed and then failed is replaced by the settle of the
+		// attempt that follows it, so a turn that answered once
+		// records one config.
 		if err := w.flush(ctx); err != nil {
 			return err
 		}
@@ -1271,8 +1284,11 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 	if item == nil {
 		return nil
 	}
-	if out, ok := item.(*openresponses.FunctionCallOutput); ok {
-		if c := w.calls[out.CallID]; c != nil && !c.dispatched && !c.rejected {
+	if out, ok := item.(*openresponses.FunctionCallOutput); ok && !w.replay {
+		c := w.calls[out.CallID]
+		switch {
+		case c == nil:
+		case !c.dispatched && !c.rejected:
 			// The caller wrote the output themselves: the call never
 			// reached its tool, and the output is what the model sees.
 			// A held call is the common case, but a call seeded from a
@@ -1286,6 +1302,17 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 				return err
 			}
 			c.held, c.rejected = false, true
+		case c.dispatchRun != w.run:
+			// The call reached its tool in an earlier run, which an
+			// abort cut off, and the caller has now written its
+			// output. The dispatch already says the tool ran, so the
+			// decision is a proceed and says who answered; an answer
+			// that names nobody adds nothing the path does not show.
+			if by := agentturn.DeciderFromContext(ctx, out.CallID); by != "" {
+				if _, err := w.append(ctx, agentsession.NewDecision(out.CallID, c.entry, agentsession.VerdictProceed, by)); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	var entry agentsession.Entry
@@ -1309,9 +1336,12 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 	}
 	if w.inFlight && responseID != "" {
 		// The stream named the response before it ended. A call cut off
-		// after this item is written as a failed response carrying the
-		// ID, so the context algorithm strips the items it produced
-		// rather than reading them as its input.
+		// after this item, a message completed before the cut or a
+		// function call the model finished writing, is written as a
+		// failed response carrying the ID, so the context algorithm
+		// strips the items it produced rather than reading them as its
+		// input. An item the attempt held and never committed is not
+		// written at all, so it needs no stripping.
 		w.inFlightID = responseID
 	}
 	id, err := w.append(ctx, entry)
@@ -1433,7 +1463,7 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 	if _, err := w.append(ctx, agentsession.NewDispatch(e.CallID, c.entry)); err != nil {
 		return err
 	}
-	c.held, c.dispatched = false, true
+	c.held, c.dispatched, c.dispatchRun = false, true, w.run
 	return nil
 }
 
@@ -1638,6 +1668,9 @@ func (w *writer) child(ctx context.Context, callID string, info agent.ChildInfo)
 	if err != nil {
 		return err
 	}
+	// The items are a transcript being copied, not a run being
+	// watched: its outputs came from the child's own tools.
+	cw.replay = true
 	for _, item := range info.Items {
 		responseID := ""
 		if isModelOutput(item) {

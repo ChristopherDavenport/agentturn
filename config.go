@@ -214,17 +214,14 @@ type Config struct {
 // completed before that point, the reasoning summary a reasoning model
 // writes before its first token, is held rather than appended: it
 // reaches subscribers as item_start and item_update, so a front renders
-// thinking live, and it is appended with its item_end when the attempt
-// commits and dropped when the attempt ends without committing. A 503
-// between the reasoning summary and the first token is therefore
-// retried, and leaves nothing in the transcript or the record; the
-// transcript never ends in a bare reasoning item, which no server
-// accepts as input before a user message. A response that completes
-// with no message and no function call leaves nothing either, for the
-// same reason: a model that answers with a reasoning item alone has
-// answered nothing, and the run ends with no assistant message rather
-// than with a transcript the next prompt cannot extend. Abort cuts a
-// delay short.
+// thinking live, and it is appended with its item_end when the answer
+// begins or when the response arrives. Only an attempt that ends
+// without its response, a transport failure, a cut stream or a failed
+// response, drops what it held. A 503 between the reasoning summary
+// and the first token is therefore retried and leaves nothing in the
+// transcript or the record, where before it was final and left a
+// transcript ending in a reasoning item that no server accepts as
+// input before a user message. Abort cuts a delay short.
 type Retry struct {
 	// MaxAttempts is the number of attempts per turn, the first
 	// included. Zero or one means no retry.

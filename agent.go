@@ -36,7 +36,13 @@ var (
 //
 // Subscribers are called synchronously, in registration order, for every
 // event, so every event is a barrier: the loop does not move to the next
-// phase until each subscriber has returned. A subscriber that returns an
+// phase until each subscriber has returned, a tool that raises an event
+// with [Invoke] waits for them, and so does a caller queueing an item
+// with [Agent.Steer]. One event is delivered at a time, whichever
+// goroutine raised it, so a subscriber is never entered from two
+// goroutines at once. A subscriber that steers or prompts the agent
+// from inside an event does so with the context it was handed, which
+// carries the delivery it already holds, or from another goroutine. A subscriber that returns an
 // error ends the run with ReasonError. Every event is delivered with a
 // context whose cancellation is lifted: [Agent.Abort] reaches the model
 // stream and the running tools, and the events that follow it, the
@@ -46,6 +52,10 @@ var (
 // ReasonAborted and its error joined to the context error on RunEnd.Err.
 type Agent struct {
 	cfg Config
+
+	// emitMu is the delivery barrier: one event reaches the subscribers
+	// at a time, whichever goroutine raised it.
+	emitMu sync.Mutex
 
 	mu         sync.Mutex
 	transcript Transcript
@@ -430,9 +440,33 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved [
 	return end, nil
 }
 
-// deliver updates state from the event and calls every subscriber in
-// registration order.
+// deliver calls every subscriber for one event, one event at a time.
+// Delivery is the barrier: the run's events, the events a nested call
+// raises from a tool's goroutine and the queued events of Steer and
+// FollowUp all pass through it, so a subscriber is never entered from
+// two goroutines at once.
+//
+// The goroutine that holds delivery may deliver again without
+// deadlocking, which is what a subscriber that steers the agent from
+// inside an event does; it is recognised by the context the subscriber
+// was handed, so a subscriber that starts or steers a run passes that
+// context on, or does it from another goroutine.
 func (a *Agent) deliver(ctx context.Context, ev Event) error {
+	if _, held := ctx.Value(deliveringKey{}).(struct{}); held {
+		return a.dispatch(ctx, ev)
+	}
+	a.emitMu.Lock()
+	defer a.emitMu.Unlock()
+	return a.dispatch(context.WithValue(ctx, deliveringKey{}, struct{}{}), ev)
+}
+
+// deliveringKey marks the context of a subscriber being called, so the
+// goroutine delivering an event is not blocked by its own barrier.
+type deliveringKey struct{}
+
+// dispatch updates state from the event and calls every subscriber in
+// registration order.
+func (a *Agent) dispatch(ctx context.Context, ev Event) error {
 	a.mu.Lock()
 	switch e := ev.(type) {
 	case *RunStart:
@@ -487,10 +521,14 @@ func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe fu
 // that answers a sender 202 can make the item durable at the moment it
 // accepts it rather than when a run appends it. A subscriber that
 // returns an error refuses the item: it is not queued, the items after
-// it are not either, and the error is returned. The event is delivered
-// from the calling goroutine, so a subscriber may see it while a run's
-// own event is being delivered; a run's own events still come from one
-// goroutine.
+// it are not either, and the error is returned.
+//
+// The event goes through the same delivery barrier as a run's own, so
+// it waits for the event in flight and a subscriber is never entered
+// twice at once. A subscriber that steers from inside an event passes
+// the context it was handed, which carries the delivery it already
+// holds; steering with a context of its own would wait for a barrier
+// it is itself holding.
 //
 // The queues live in memory: an item accepted here is in no record
 // until a run appends it or a subscriber writes it, and it survives
@@ -512,8 +550,8 @@ func (a *Agent) Steer(ctx context.Context, items ...openresponses.Item) error {
 
 // FollowUp queues items to be injected when the run would otherwise
 // end, so the agent keeps going instead of going idle. The queue has
-// the same life, the same [Queued] event and the same caveat about
-// subscribers as [Agent.Steer].
+// the same life, the same [Queued] event, the same context rule and the
+// same caveat about subscribers as [Agent.Steer].
 func (a *Agent) FollowUp(ctx context.Context, items ...openresponses.Item) error {
 	return a.queue(ctx, QueueFollowUp, items)
 }

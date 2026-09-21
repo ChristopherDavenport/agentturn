@@ -103,9 +103,21 @@ func TestHiddenOutputAnswersAPendingCall(t *testing.T) {
 	}
 	callID := end.Pending[0].Call.CallID
 	out := openresponses.NewFunctionCallOutput(callID, "did it myself")
+	var source Source
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if e, ok := ev.(*RunStart); ok {
+			source = e.Source
+		}
+		return nil
+	})
 	end, err = a.Prompt(context.Background(), Hidden(out), openresponses.UserText("carry on"))
 	if err != nil || end.Reason == ReasonError {
 		t.Fatalf("prompt with a hidden output: err=%v end=%+v", err, end)
+	}
+	// The run answers a pending call, whatever the output is wrapped
+	// in, so the record says resume rather than input.
+	if source != SourceResume {
+		t.Errorf("run source = %q", source)
 	}
 	if got := itemTypes(a.State().Transcript[:4]); got != "user function_call function_call_output user" {
 		t.Errorf("transcript = %q", got)

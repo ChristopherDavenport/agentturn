@@ -119,7 +119,10 @@ type Fold struct {
 	Split int
 	// Output stands in for the folded items on the request: the
 	// compaction endpoint's output for [New], the summary message for
-	// [NewLocal]. nil when the fold failed.
+	// [NewLocal]. nil when the fold failed. The request the transform
+	// returns is Output, then Pinned, then the items from Split on, so
+	// the two members name different things and a reader that wants
+	// what was sent joins them in that order.
 	Output openresponses.Items
 	// Summary is the item a recorder writes as the compaction summary:
 	// the compaction item from [New], the summary message from
@@ -134,8 +137,9 @@ type Fold struct {
 	// a call the server made and a replay can recognise the fold's call
 	// among the run's.
 	ResponseID string
-	// Pinned are the items of the folded prefix that [WithPin] kept: on
-	// the request they follow Output, in this order.
+	// Pinned are the items of the folded prefix that [WithPin] kept, in
+	// their order. They follow Output on the request and are not part
+	// of it.
 	Pinned openresponses.Items
 	// Request is the request [NewLocal] sent for the fold: the items
 	// being folded and the summary prompt. Its input is no path's
@@ -366,7 +370,10 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	out := t.join(items, split)
 	t.mu.Unlock()
 	if t.onFold != nil {
-		if err := t.onFold(ctx, Fold{Split: split, Output: t.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, Request: f.request}); err != nil {
+		// The fold's own output and the pinned items, as locals: the
+		// memory they were written to belongs to the lock that was just
+		// released.
+		if err := t.onFold(ctx, Fold{Split: split, Output: f.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, Request: f.request}); err != nil {
 			return nil, fmt.Errorf("compact: on-fold: %w", err)
 		}
 	}

@@ -330,11 +330,13 @@ type runner struct {
 	steer      func() openresponses.Items
 	followUp   func() openresponses.Items
 
-	// emitMu serialises delivery, so the events a nested call raises
-	// from a tool's goroutine do not interleave with the run's own or
-	// with another tool's. A subscriber is never called from two
-	// goroutines at once, and the run's own events keep their order.
-	emitMu sync.Mutex
+	// hookMu serialises the tool hooks. A nested call runs on the
+	// goroutine of the tool that made it, so without it two tools of
+	// one batch would enter BeforeToolCall at once, and a nested
+	// call's AfterToolCall would run beside the batch's. It is held
+	// across the hook alone, never across an emit or a tool, so the
+	// only way to block on it is to call Invoke from inside a hook.
+	hookMu sync.Mutex
 
 	runID string
 	turn  int
@@ -361,11 +363,23 @@ type heldItem struct {
 	responseID string
 }
 
-// emit delivers one event to the consumer, one at a time.
-func (r *runner) emit(ev Event) error {
-	r.emitMu.Lock()
-	defer r.emitMu.Unlock()
-	return r.send(ev)
+// emit delivers one event to the consumer. An Agent serialises them
+// behind its own barrier, whichever goroutine raised them; the
+// low-level loop's channel takes one send at a time.
+func (r *runner) emit(ev Event) error { return r.send(ev) }
+
+// beforeToolCall runs the hook for one call, one goroutine at a time.
+func (r *runner) beforeToolCall(ctx context.Context, info ToolCallInfo) (*ToolDecision, error) {
+	r.hookMu.Lock()
+	defer r.hookMu.Unlock()
+	return r.cfg.BeforeToolCall(ctx, info)
+}
+
+// afterToolCall runs the hook for one result, one goroutine at a time.
+func (r *runner) afterToolCall(ctx context.Context, info ToolResultInfo) (*ToolOverride, error) {
+	r.hookMu.Lock()
+	defer r.hookMu.Unlock()
+	return r.cfg.AfterToolCall(ctx, info)
 }
 
 // errStop carries a run end reason out of a phase.
@@ -487,7 +501,7 @@ func (r *runner) source(prompts openresponses.Items, approved []approval) Source
 	for _, call := range unansweredCalls(r.transcript) {
 		open[call.CallID] = true
 	}
-	for _, item := range prompts {
+	for _, item := range unhideAll(prompts) {
 		if out, ok := item.(*openresponses.FunctionCallOutput); ok && open[out.CallID] {
 			return SourceResume
 		}
@@ -726,12 +740,12 @@ func sleep(ctx context.Context, d time.Duration) error {
 // stream runs one attempt at the request. committed reports that the
 // attempt cannot be retried: a message or a function call opened, a
 // subscriber failed, or the server answered with a terminal response.
-// An attempt that ends before it commits leaves nothing behind: the
-// items it completed, a reasoning summary before the first token for
-// one, are dropped with it, so the transcript never ends in an item the
-// model produced on the way to an answer that never came. The error is
-// returned unwrapped so a retry policy sees the transport or wire error
-// itself.
+// An item the attempt completed before it committed is held until the
+// answer begins or the response arrives, and dropped when the attempt
+// ends without one, so a failure between a reasoning summary and the
+// first token leaves nothing behind and a response that arrives keeps
+// everything it carried. The error is returned unwrapped so a retry
+// policy sees the transport or wire error itself.
 func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *openresponses.Response, committed bool, err error) {
 	var acc openresponses.Accumulator
 	r.held = nil
@@ -751,6 +765,18 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 	}
 	if resp == nil {
 		return nil, committed, openresponses.ErrTruncatedStream
+	}
+	if resp.Status != openresponses.ResponseStatusFailed {
+		// The response arrived, so what the attempt completed on the
+		// way to it is the model's output and belongs in the
+		// transcript, whether or not a message or a function call ever
+		// opened: a reasoning item the model answered with alone, an
+		// item cut short by the token limit, an item type this loop
+		// does not know. Only an attempt that ended without its
+		// response drops what it held.
+		if err := r.flushHeld(); err != nil {
+			return nil, true, err
+		}
 	}
 	if err := r.emit(&ResponseEnd{RunID: r.runID, Turn: r.turn, Response: resp}); err != nil {
 		return nil, true, err
@@ -1115,7 +1141,7 @@ func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openr
 	var decision *ToolDecision
 	if r.cfg.BeforeToolCall != nil {
 		var err error
-		decision, err = r.cfg.BeforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: r.turn, Call: call, Tool: p.tool, Args: p.args, Batch: batch, Index: index})
+		decision, err = r.beforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: r.turn, Call: call, Tool: p.tool, Args: p.args, Batch: batch, Index: index})
 		if err != nil {
 			return nil, fmt.Errorf("agentturn: before-tool-call hook: %w", err)
 		}
@@ -1193,7 +1219,7 @@ func (r *runner) check(ctx context.Context, p *callState, terminate bool) error 
 // model sees and emits tool_end.
 func (r *runner) settle(ctx context.Context, p *callState) error {
 	if r.cfg.AfterToolCall != nil && !p.blocked {
-		override, err := r.cfg.AfterToolCall(ctx, ToolResultInfo{RunID: r.runID, Turn: p.turn, Call: p.call, Tool: p.tool, Args: p.args, Result: p.result, Err: p.err})
+		override, err := r.afterToolCall(ctx, ToolResultInfo{RunID: r.runID, Turn: p.turn, Call: p.call, Tool: p.tool, Args: p.args, Result: p.result, Err: p.err})
 		if err != nil {
 			return fmt.Errorf("agentturn: after-tool-call hook: %w", err)
 		}
@@ -1247,8 +1273,9 @@ var ErrNoInvoker = errors.New("agentturn: no loop on the context to invoke a too
 // agenttool.WithCall. Outside a loop, Invoke returns [ErrNoInvoker].
 //
 // Call it from a tool, with the context the tool was given. A
-// subscriber is called while the loop holds delivery, so invoking from
-// one, with a context it kept from elsewhere, blocks the run.
+// subscriber is called while the agent holds delivery, and a tool's
+// context does not carry that, so invoking from a subscriber waits for
+// a barrier the subscriber is itself holding.
 func Invoke(ctx context.Context, name string, args json.RawMessage) (agenttool.Result, error) {
 	fn, _ := ctx.Value(invokerKey{}).(invoker)
 	if fn == nil {
@@ -1271,7 +1298,7 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 	var decision *ToolDecision
 	if r.cfg.BeforeToolCall != nil {
 		var err error
-		decision, err = r.cfg.BeforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: turn, Call: call, Tool: p.tool, Args: p.args, Batch: []*openresponses.FunctionCall{call}, Index: 0})
+		decision, err = r.beforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: turn, Call: call, Tool: p.tool, Args: p.args, Batch: []*openresponses.FunctionCall{call}, Index: 0})
 		if err != nil {
 			return agenttool.Result{}, fmt.Errorf("agentturn: before-tool-call hook: %w", err)
 		}

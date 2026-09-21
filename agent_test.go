@@ -150,9 +150,11 @@ func TestAgentSubscriberErrorEndsRun(t *testing.T) {
 
 func TestAgentSteer(t *testing.T) {
 	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}, MaxTurns: 3})
-	a.Subscribe(func(_ context.Context, ev Event) error {
+	// A subscriber steers with the context it was handed, which carries
+	// the delivery it already holds.
+	a.Subscribe(func(ctx context.Context, ev Event) error {
 		if e, ok := ev.(*ToolStart); ok && e.Turn == 1 {
-			_ = a.Steer(context.Background(), openresponses.UserText("steered"))
+			_ = a.Steer(ctx, openresponses.UserText("steered"))
 			if a.State().Steering != 1 {
 				t.Error("steer not queued")
 			}

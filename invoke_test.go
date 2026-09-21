@@ -140,3 +140,69 @@ func TestInvokeRefusesADeferredCall(t *testing.T) {
 		t.Errorf("a nested call was handed to the caller: %+v", end.Pending)
 	}
 }
+
+// callsNamed emits one function call per name, in one response.
+type callsNamed struct{ names []string }
+
+func (m callsNamed) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	for _, name := range m.names {
+		w, err := em.FunctionCall("", name)
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(`{"text":"t"}`); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+	}
+	return em.Complete()
+}
+
+// TestNestedCallsEnterTheHooksOneAtATime runs two tools of one batch in
+// parallel and has both call Invoke at the same moment. The hooks are
+// documented as running once per call, and a policy is entitled to keep
+// state without a lock of its own, so the loop must not enter them from
+// two goroutines at once. The maps here are unguarded on purpose: under
+// -race they are the assertion.
+func TestNestedCallsEnterTheHooksOneAtATime(t *testing.T) {
+	before := map[string]int{}
+	after := map[string]int{}
+	var bar sync.WaitGroup
+	bar.Add(2)
+	read := agenttool.New("read", "reads", func(context.Context, echoArgs) (string, error) { return "contents", nil })
+	evalTool := func(name string) agenttool.Tool {
+		return agenttool.New(name, "runs code", func(ctx context.Context, _ echoArgs) (string, error) {
+			// Both tools reach here before either invokes, so the two
+			// nested calls overlap.
+			bar.Done()
+			bar.Wait()
+			_, err := Invoke(ctx, "read", json.RawMessage(`{"text":"go.mod"}`))
+			return "ran", err
+		})
+	}
+	cfg := Config{
+		Model:    callsNamed{names: []string{"eval_a", "eval_b"}},
+		Tools:    []agenttool.Tool{evalTool("eval_a"), evalTool("eval_b"), read},
+		MaxTurns: 1,
+		BeforeToolCall: func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
+			before[info.Call.Name]++
+			return nil, nil
+		},
+		AfterToolCall: func(_ context.Context, info ToolResultInfo) (*ToolOverride, error) {
+			after[info.Call.Name]++
+			return nil, nil
+		},
+	}
+	if _, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg)); err != nil {
+		t.Fatalf("err=%v end=%+v", err, end)
+	}
+	if before["eval_a"] != 1 || before["eval_b"] != 1 || before["read"] != 2 {
+		t.Errorf("before-tool-call saw %v", before)
+	}
+	if after["read"] != 2 {
+		t.Errorf("after-tool-call saw %v", after)
+	}
+}

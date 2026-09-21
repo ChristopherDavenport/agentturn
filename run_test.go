@@ -1168,3 +1168,86 @@ func TestRetryReviseMovesTheTurn(t *testing.T) {
 		t.Errorf("err=%v answered by %v", err, model.answered)
 	}
 }
+
+// answersWithReasoning completes a reasoning item and then ends the
+// response without a message, as a small model sometimes does, and as a
+// turn cut short by the token limit does.
+type answersWithReasoning struct{ incomplete bool }
+
+func (m answersWithReasoning) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Reasoning()
+	if err != nil {
+		return err
+	}
+	if err := w.Summary("weighing the options"); err != nil {
+		return err
+	}
+	if err := w.EndSummary(); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	if m.incomplete {
+		return em.Incomplete(openresponses.IncompleteReasonMaxOutputTokens)
+	}
+	return em.Complete()
+}
+
+// TestAResponseKeepsWhatTheAttemptHeld checks the other side of the
+// commit rule: an attempt is held, not discarded. A response that
+// arrives without ever opening a message is still the model's output,
+// so what it carried reaches the transcript with its item_end rather
+// than leaving an item_start no one closes.
+func TestAResponseKeepsWhatTheAttemptHeld(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		model Model
+	}{
+		{name: "completed", model: answersWithReasoning{}},
+		{name: "incomplete", model: answersWithReasoning{incomplete: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{Model: tc.model, MaxTurns: 1}
+			events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("go")}, cfg))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := itemTypes(end.Items); got != "user reasoning" {
+				t.Errorf("items = %q", got)
+			}
+			starts, ends := 0, 0
+			for _, ev := range events {
+				switch e := ev.(type) {
+				case *ItemStart:
+					if e.Item.ItemType() == "reasoning" {
+						starts++
+					}
+				case *ItemEnd:
+					if e.Item.ItemType() == "reasoning" {
+						ends++
+					}
+				}
+			}
+			if starts != 1 || ends != 1 {
+				t.Errorf("reasoning item_start=%d item_end=%d, want one of each", starts, ends)
+			}
+			// The held item is in place before the response that
+			// carried it.
+			order := types(events)
+			itemEnd, responseEnd := -1, -1
+			for i, typ := range order {
+				switch typ {
+				case EventItemEnd:
+					itemEnd = i
+				case EventResponseEnd:
+					responseEnd = i
+				}
+			}
+			if itemEnd < 0 || responseEnd < 0 || itemEnd > responseEnd {
+				t.Errorf("events = %v", order)
+			}
+		})
+	}
+}

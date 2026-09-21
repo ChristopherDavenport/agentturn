@@ -112,11 +112,11 @@ run, in order:
 | `turn_end` | the folded `Response` with usage, and the tool results |
 | `run_end` | the items added this run and the reason: done, stopped, input_required, aborted, error |
 
-`queued` belongs to no run: `Steer` and `FollowUp` deliver it from the
-calling goroutine as they accept an item, with the queue it went into
-and the `Trigger` on the context, so a gateway that answers a sender
-202 can make the item durable before it says so. A subscriber that
-returns an error refuses the item.
+`queued` belongs to no run: `Steer` and `FollowUp` deliver it as they accept an
+item, with the queue it went into and the `Trigger` on the context, so
+a gateway that answers a sender 202 can make the item durable before it
+says so. It waits for the event in flight, as every event does, and a
+subscriber that returns an error refuses the item.
 
 ## Tools
 
@@ -360,12 +360,13 @@ The plan is `docs/plans/agent-layer.md`. Invariants the tests hold:
   loop reads `context.Cause`, so a rule that matched, an advisor and a
   user pressing Esc are three things `RunEnd.Err` and the record tell
   apart rather than three "context canceled".
-- Events for one run are delivered from one goroutine, and the events
-  a nested call raises from a tool's goroutine are serialised with
-  them, so a run's events never interleave. The `queued` event of
-  `Steer` and `FollowUp` belongs to no run and is delivered from the
-  goroutine that accepted the item, which may be while a run's event is
-  in flight.
+- An `Agent` delivers one event at a time, whichever goroutine raised
+  it: the run's own events, the events a nested call raises from a
+  tool's goroutine, and the `queued` events of `Steer` and `FollowUp`,
+  which belong to no run. A subscriber is never entered from two
+  goroutines at once, and a subscriber that steers or prompts from
+  inside an event passes on the context it was handed. The low-level
+  `Run` yields to one consumer, which is the same guarantee.
 
 ## License
 

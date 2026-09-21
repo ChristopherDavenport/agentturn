@@ -7,6 +7,7 @@ import (
 	"github.com/ChristopherDavenport/agentsession"
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
+	"github.com/ChristopherDavenport/agentturn/tools/agent"
 	"github.com/ChristopherDavenport/openresponses"
 	"github.com/ChristopherDavenport/openresponses/echo"
 )
@@ -154,4 +155,100 @@ func TestHiddenItemsAreRecordedAsNotVisible(t *testing.T) {
 	if len(cx.Items) != 3 {
 		t.Errorf("context = %d items, want the hidden one among them", len(cx.Items))
 	}
+}
+
+// TestReplayedChildWritesNoDecisions checks that copying a child's
+// transcript into a session is not mistaken for a caller answering its
+// calls: the outputs in it came from the child's own tools, and a
+// decision saying otherwise would tell a reader the calls were
+// refused.
+func TestReplayedChildWritesNoDecisions(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No observer, so the child is written from its items when the
+	// call ends.
+	plain := agent.New(agentturn.Config{Name: "plain", Model: &echo.Adapter{}, Tools: []agenttool.Tool{upper}})
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{plain}})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
+		t.Fatal(err)
+	}
+	l := links(s)
+	if len(l) != 1 {
+		t.Fatalf("links = %+v", l)
+	}
+	child, err := store.Open(context.Background(), l[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls, err := child.Calls(child.Leaf())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || calls[0].Output == nil {
+		t.Fatalf("child calls = %+v", calls)
+	}
+	for _, e := range child.Entries() {
+		if d, ok := e.(*agentsession.DecisionEntry); ok {
+			t.Errorf("the replayed child holds a decision: %+v", d)
+		}
+	}
+	verifyAll(t, s)
+	verifyAll(t, child)
+}
+
+// TestAnswerToAnAbortedCallNamesWhoAnswered covers the call an abort
+// cut off in flight: its dispatch is on the path, so the caller's
+// output is not a reject, and who wrote it is still worth recording.
+func TestAnswerToAnAbortedCallNamesWhoAnswered(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocking := agenttool.New("wait", "waits", func(ctx context.Context, _ echoArgs) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{blocking}}
+	a := agentturn.New(cfg)
+	defer rec.Attach(a)()
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if _, ok := ev.(*agentturn.ToolStart); ok {
+			a.Abort()
+		}
+		return nil
+	})
+	end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if end == nil || end.Reason != agentturn.ReasonAborted || len(end.Pending) != 1 {
+		t.Fatalf("end = %+v", end)
+	}
+	callID := end.Pending[0].Call.CallID
+	// The user answers the cut-off call themselves; the tools are put
+	// away so the next turn is an answer.
+	cfg.Tools = nil
+	if err := a.SetConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	answer := agentturn.Output(openresponses.NewFunctionCallOutput(callID, "I ran it myself")).WithBy(agentsession.ByHuman)
+	if _, err := a.Resume(context.Background(), answer); err != nil {
+		t.Fatal(err)
+	}
+	c := callsOf(t, s)["wait"]
+	if c == nil || c.Dispatch == nil || c.Output == nil {
+		t.Fatalf("call = %+v", c)
+	}
+	if len(c.Decisions) != 1 {
+		t.Fatalf("decisions = %+v", c.Decisions)
+	}
+	if d := c.Decisions[0]; d.Verdict != agentsession.VerdictProceed || d.By != agentsession.ByHuman {
+		t.Errorf("decision = %+v, want a proceed by a human", d)
+	}
+	if c.Rejected() {
+		t.Error("a call that reached its tool is recorded as rejected")
+	}
+	verifyAll(t, s)
 }

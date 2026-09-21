@@ -481,3 +481,84 @@ func TestPinKeepsAnInjectedItemThroughAFold(t *testing.T) {
 		}
 	}
 }
+
+// TestOnFoldReadsNoSharedState holds one fold inside its reporter
+// while another conversation is transformed on the same Transform,
+// which forgets the memory that no longer matches. The Fold is the
+// transform's report to its caller, so what it carries is the
+// caller's: built from the fold's own result, never read out of state
+// the lock was just released on. Under -race that is the assertion.
+func TestOnFoldReadsNoSharedState(t *testing.T) {
+	inFold := make(chan struct{})
+	release := make(chan struct{})
+	var seen int
+	tr := New(&counting{Compactor: &echo.Adapter{}}, WithBudget(3), WithKeepLast(1), WithEstimator(count),
+		WithOnFold(func(_ context.Context, f Fold) error {
+			seen = len(f.Output)
+			close(inFold)
+			<-release
+			return nil
+		}))
+	history := items(4)
+	done := make(chan error, 1)
+	go func() {
+		_, err := tr.Transform(context.Background(), history)
+		done <- err
+	}()
+	<-inFold
+	// A conversation that does not begin with the folded prefix and
+	// fits the budget, so the transform forgets what it remembered
+	// without folding again: the write that races a reporter reading
+	// the memory instead of its own fold.
+	other := agentturn.Transcript{openresponses.UserText("elsewhere")}
+	if _, err := tr.Transform(context.Background(), other); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if seen == 0 {
+		t.Error("the fold reported no output")
+	}
+}
+
+// TestFoldOutputAndPinnedAreDisjoint checks the two members name
+// different things, so a consumer that joins them to see what was sent
+// does not send anything twice.
+func TestFoldOutputAndPinnedAreDisjoint(t *testing.T) {
+	interrupt := openresponses.DeveloperText("<system-interrupt>never use Box::leak</system-interrupt>")
+	s := &summarizer{reply: "They talked about things."}
+	var fold Fold
+	tr := NewLocal(s, WithBudget(5), WithKeepLast(1), WithEstimator(count),
+		WithPin(func(item openresponses.Item) bool { return item == openresponses.Item(interrupt) }),
+		WithOnFold(func(_ context.Context, f Fold) error {
+			fold = f
+			return nil
+		}))
+	history := append(agentturn.Transcript{interrupt}, items(6)...)
+	out, err := tr.Transform(context.Background(), history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range fold.Output {
+		if item == openresponses.Item(interrupt) {
+			t.Error("Output carries a pinned item, so Output plus Pinned sends it twice")
+		}
+	}
+	if len(fold.Pinned) != 1 || fold.Pinned[0] != openresponses.Item(interrupt) {
+		t.Fatalf("Pinned = %v", fold.Pinned)
+	}
+	// Output, then Pinned, then the items from Split on is what was
+	// sent.
+	want := append(append(openresponses.Items(nil), fold.Output...), fold.Pinned...)
+	want = append(want, history[fold.Split:]...)
+	if len(want) != len(out) {
+		t.Fatalf("rebuilt %d items, sent %d", len(want), len(out))
+	}
+	for i := range want {
+		if want[i] != out[i] {
+			t.Errorf("item %d: rebuilt %v, sent %v", i, want[i], out[i])
+		}
+	}
+}

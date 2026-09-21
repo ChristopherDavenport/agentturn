@@ -175,9 +175,11 @@ func (*ModelBlocked) EventType() string { return EventModelBlocked }
 //
 // An item the model completes before its attempt commits, a reasoning
 // summary before the first token, is announced here and reaches the
-// transcript only if the attempt commits (see [Retry]): a front that
-// renders from item_start drops what it was rendering when a
-// [ModelRetry] or a failing run_end follows with no item_end for it.
+// transcript when the answer begins or the response arrives (see
+// [Retry]). An attempt that ends without its response drops what it
+// held, so a front that renders from item_start drops what it was
+// rendering when a [ModelRetry], or a run_end with an error or an
+// abort, follows with no item_end for it.
 type ItemStart struct {
 	RunID string
 	Turn  int

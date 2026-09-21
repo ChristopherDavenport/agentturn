@@ -3,6 +3,7 @@ package agentturn
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/ChristopherDavenport/agenttool"
@@ -90,5 +91,57 @@ func TestQueuedSubscriberRefusesTheItem(t *testing.T) {
 	}
 	if st := a.State(); len(st.Steered) != 0 || st.Steering != 0 {
 		t.Errorf("a refused item was queued: %+v", st.Steered)
+	}
+}
+
+// TestQueuedIsDeliveredUnderTheSameBarrier steers a running agent from
+// another goroutine while its tool reports progress, so the queued
+// events and the run's own events reach the subscribers at the same
+// moment. A subscriber is documented as never being entered twice at
+// once, so a front may keep state without a lock of its own; the slice
+// here is unguarded on purpose, and under -race it is the assertion.
+func TestQueuedIsDeliveredUnderTheSameBarrier(t *testing.T) {
+	const steps = 40
+	started := make(chan struct{})
+	var once sync.Once
+	reporting := agenttool.New("work", "works", func(ctx context.Context, _ echoArgs) (string, error) {
+		once.Do(func() { close(started) })
+		for i := 0; i < steps; i++ {
+			agenttool.Progress(ctx, agenttool.Text("working"))
+		}
+		return "done", nil
+	})
+	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{reporting}, MaxTurns: 1})
+	var seen []string
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		seen = append(seen, ev.EventType())
+		return nil
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-started
+		for i := 0; i < steps; i++ {
+			if err := a.Steer(context.Background(), openresponses.UserText("more")); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	queued := 0
+	for _, typ := range seen {
+		if typ == EventQueued {
+			queued++
+		}
+	}
+	if queued != steps {
+		t.Errorf("queued events = %d, want %d", queued, steps)
+	}
+	if st := a.State(); len(st.Steered)+len(st.Transcript) == 0 {
+		t.Error("nothing was queued or appended")
 	}
 }

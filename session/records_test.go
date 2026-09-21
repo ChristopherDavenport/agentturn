@@ -921,3 +921,84 @@ func TestRevisedRetryIsAConfigDelta(t *testing.T) {
 		t.Errorf("config entries = %d in %q", len(cfgs), entryTypes(s))
 	}
 }
+
+// chainLeg streams a reasoning item and then fails, unless the request
+// names the last leg of the chain, in which case it answers: a
+// provider under load behind a fallback chain.
+type chainLeg struct{ last string }
+
+func (m chainLeg) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Reasoning()
+	if err != nil {
+		return err
+	}
+	if err := w.Summary("weighing the options"); err != nil {
+		return err
+	}
+	if err := w.EndSummary(); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	if req.Model != m.last {
+		return openresponses.ServerError("overloaded", "overloaded")
+	}
+	msg, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := msg.Text("answered by " + req.Model); err != nil {
+		return err
+	}
+	if err := msg.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestOnlyTheAttemptThatAnsweredIsConfigured checks that an attempt
+// which streamed and then failed leaves no settings on the path: it
+// answered nothing, so a config entry describing it would tell a reader
+// the conversation ran under a model it never got an answer from.
+func TestOnlyTheAttemptThatAnsweredIsConfigured(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := map[int]string{1: "b", 2: "c"}
+	a := agentturn.New(agentturn.Config{Model: chainLeg{last: "c"}, ModelName: "a", Retry: agentturn.Retry{
+		MaxAttempts: 3,
+		Backoff:     func(int, error) time.Duration { return 0 },
+		Revise: func(attempt int, req *openresponses.Request, _ error) *openresponses.Request {
+			req.Model = next[attempt]
+			return nil
+		},
+	}})
+	defer rec.Attach(a)()
+	end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("err=%v end=%+v", err, end)
+	}
+	cfgs := configs(s)
+	if len(cfgs) != 2 || cfgs[0].Model != "a" || cfgs[1].Model != "c" {
+		var models []string
+		for _, c := range cfgs {
+			models = append(models, c.Model)
+		}
+		t.Errorf("config entries name %v in %q", models, entryTypes(s))
+	}
+	// The attempts that failed left nothing else either.
+	if n := verifyAll(t, s); n != 1 || hashed(s) != 1 {
+		t.Errorf("responses = %d hashed = %d", n, hashed(s))
+	}
+	cx, err := s.Context()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cx.Settings.Model != "c" || len(cx.Items) != 3 {
+		t.Errorf("context = %+v, %d items", cx.Settings, len(cx.Items))
+	}
+}

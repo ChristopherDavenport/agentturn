@@ -12,7 +12,11 @@ versions may break the API.
   subscribers first as the new `Queued` event, carrying the item, which
   queue it went into, the run in flight if there is one and the
   `Trigger` on the context; a subscriber that returns an error refuses
-  the item, which is then not queued. A gateway that answers a sender
+  the item, which is then not queued. The event goes through the same
+  delivery as a run's own, so a subscriber is never entered from two
+  goroutines at once; a subscriber that steers from inside an event
+  passes on the context it was handed, which carries the delivery it
+  already holds. A gateway that answers a sender
   202 can make what it accepted durable at the moment it accepts it,
   rather than writing the same sixty lines of custom entries to keep an
   inbox nobody else keeps. The queues themselves are unchanged, and so
