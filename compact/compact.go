@@ -24,6 +24,9 @@
 // front that wants to persist the result registers [WithOnFold], which
 // reports every fold, successful or not, with the index at which the
 // transcript was split; [Transform.Last] returns the latest summary.
+// [WithPin] keeps chosen items of the folded prefix verbatim after the
+// summary, for context a harness injected that must not become
+// whatever the summary made of it.
 package compact
 
 import (
@@ -76,6 +79,25 @@ func WithModel(name string) Option { return func(t *Transform) { t.model = name 
 // cut never separates a function call from its output.
 func WithKeepLast(n int) Option { return func(t *Transform) { t.keepLast = n } }
 
+// WithPin keeps the items fn reports through a fold: whatever part of
+// the folded prefix they were in, they follow the summary in the
+// request, in their order, and the fold that summarised them
+// summarised them too, so nothing is lost if the pin is later dropped.
+// It is for context a harness injected and must not lose to a summary:
+// a stream rule's reminder, a policy notice, an instruction the user
+// gave once. [WithKeepLast] keeps a window at the end; this keeps a
+// member of the part that is folded.
+//
+// A pinned item is one the request carries that the stored path does
+// not rebuild, because a compaction entry names where the kept tail
+// starts and nothing else. A session recorder therefore records the
+// calls after such a fold without a request hash, naming the pinned
+// items in the compaction entry, rather than recording a hash that
+// would not verify.
+func WithPin(fn func(openresponses.Item) bool) Option {
+	return func(t *Transform) { t.pin = fn }
+}
+
 // WithFilter sets the filter applied to the items sent to be folded,
 // so app-only items never reach the server. The default is
 // agentturn.DefaultFilter; pass the same function as Config.Filter.
@@ -112,6 +134,9 @@ type Fold struct {
 	// a call the server made and a replay can recognise the fold's call
 	// among the run's.
 	ResponseID string
+	// Pinned are the items of the folded prefix that [WithPin] kept: on
+	// the request they follow Output, in this order.
+	Pinned openresponses.Items
 	// Request is the request [NewLocal] sent for the fold: the items
 	// being folded and the summary prompt. Its input is no path's
 	// context, so a hash of it never rebuilds from a stored path; a
@@ -158,6 +183,7 @@ type Transform struct {
 	filter      func(agentturn.Transcript) agentturn.Transcript
 	prompt      string
 	summaryItem func(string) openresponses.Item
+	pin         func(openresponses.Item) bool
 
 	mu sync.Mutex
 	// prefixLen items of the transcript are represented by output. An
@@ -330,20 +356,37 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 		t.mu.Unlock()
 		return view, nil
 	}
+	pinned := t.pinned(items[:split])
 	t.prefixLen = split
 	t.prefixHash = hash(items[:split])
-	t.output = f.output
+	t.output = append(append(openresponses.Items(nil), f.output...), pinned...)
 	if f.summary != nil {
 		t.last = f.summary
 	}
 	out := t.join(items, split)
 	t.mu.Unlock()
 	if t.onFold != nil {
-		if err := t.onFold(ctx, Fold{Split: split, Output: f.output, Summary: f.summary, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, Request: f.request}); err != nil {
+		if err := t.onFold(ctx, Fold{Split: split, Output: t.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, Request: f.request}); err != nil {
 			return nil, fmt.Errorf("compact: on-fold: %w", err)
 		}
 	}
 	return out, nil
+}
+
+// pinned returns the items of the folded prefix that the pin keeps, in
+// their order, filtered as the request is so an app-only item never
+// reaches the server.
+func (t *Transform) pinned(prefix agentturn.Transcript) openresponses.Items {
+	if t.pin == nil {
+		return nil
+	}
+	var out openresponses.Items
+	for _, item := range t.filter(prefix) {
+		if t.pin(item) {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 // view returns the transcript with the remembered fold applied, and how

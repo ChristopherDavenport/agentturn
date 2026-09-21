@@ -934,3 +934,84 @@ func TestFailedFoldLeavesATrace(t *testing.T) {
 		t.Errorf("responses verified = %d", n)
 	}
 }
+
+// TestPinnedFoldNamesWhatItKept checks what the record says about a
+// fold that kept items of the folded prefix verbatim: the compaction
+// entry names them, and the calls after it carry no request hash,
+// because the path rebuilds the summary and the kept tail and knows
+// nothing of an item the transform put between them. Verify reports
+// them as unverified rather than mismatched.
+func TestPinnedFoldNamesWhatItKept(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notice := openresponses.DeveloperText("<system-interrupt>never use Box::leak</system-interrupt>")
+	pin := func(item openresponses.Item) bool { return item == openresponses.Item(notice) }
+	tr := compact.NewLocal(&echo.Adapter{}, compact.WithBudget(4), compact.WithKeepLast(2),
+		compact.WithEstimator(countItems), compact.WithOnFold(rec.Fold), compact.WithPin(pin))
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("one"), notice); err != nil {
+		t.Fatal(err)
+	}
+	var sent []openresponses.Items
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if e, ok := ev.(*agentturn.TurnStart); ok {
+			sent = append(sent, e.Request.Input)
+		}
+		return nil
+	})
+	for _, text := range []string{"two", "three", "four"} {
+		if _, err := a.Prompt(context.Background(), openresponses.UserText(text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var folds []*agentsession.CompactionEntry
+	for _, e := range s.Entries() {
+		if c, ok := e.(*agentsession.CompactionEntry); ok {
+			folds = append(folds, c)
+		}
+	}
+	if len(folds) == 0 {
+		t.Fatalf("no compaction entry in %q", entryTypes(s))
+	}
+	raw, ok := folds[0].Unknown[FoldMember]
+	if !ok {
+		t.Fatalf("the compaction entry names no fold call: %+v", folds[0])
+	}
+	var call FoldCall
+	if err := json.Unmarshal(raw, &call); err != nil {
+		t.Fatal(err)
+	}
+	if len(call.Pinned) != 1 {
+		t.Fatalf("the fold names %d pinned items", len(call.Pinned))
+	}
+	if m, ok := call.Pinned[0].(*openresponses.Message); !ok || m.Text() != notice.Text() {
+		t.Errorf("pinned = %+v", call.Pinned[0])
+	}
+	// The model kept reading the notice after the fold.
+	last := sent[len(sent)-1]
+	found := false
+	for _, item := range last {
+		if m, ok := item.(*openresponses.Message); ok && m.Text() == notice.Text() {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the last request lost the pinned item: %v", last)
+	}
+	// Nothing mismatches; the calls after the fold are simply not
+	// verifiable until the format can describe a pinned item.
+	verifyAll(t, s)
+	responses := 0
+	for _, e := range s.Entries() {
+		if r, ok := e.(*agentsession.ResponseEntry); ok && r.RequestHash == "" {
+			responses++
+		}
+	}
+	if responses == 0 {
+		t.Error("a call after the pinned fold carries a hash the path cannot rebuild")
+	}
+}

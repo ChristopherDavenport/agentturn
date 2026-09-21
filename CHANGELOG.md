@@ -7,6 +7,18 @@ versions may break the API.
 
 ## Unreleased
 
+- `compact.WithPin(fn)` keeps the items fn reports through a fold:
+  whatever part of the folded prefix they were in, they follow the
+  summary in the request, in their order, so a stream rule's reminder
+  or a policy notice survives compaction as itself rather than as
+  whatever the summary model made of it. `WithKeepLast` keeps a window
+  at the end and nothing kept a member of the part that is folded.
+  `Fold.Pinned` reports them and `session` names them in the
+  compaction entry's `fold` member; because a compaction entry says
+  only where the kept tail starts, the calls after a fold that pinned
+  anything are recorded without a request hash rather than with one
+  that would not verify. (#78)
+
 - `Retry.Revise` may change the request the next attempt sends: another
   model, a lower effort. `ModelRetry` carries that request, and
   `session` settles on it, so a fallback chain lives in the loop rather

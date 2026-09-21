@@ -402,3 +402,82 @@ func TestOnFoldReportsEveryAttempt(t *testing.T) {
 		t.Errorf("endpoint fold = %+v", folds)
 	}
 }
+
+// TestPinKeepsAnInjectedItemThroughAFold is the stream rule's case: a
+// reminder injected once, then a fold, and the rule suppressed
+// afterwards. What the model has of it must be the reminder, not what
+// the summary made of it.
+func TestPinKeepsAnInjectedItemThroughAFold(t *testing.T) {
+	interrupt := openresponses.DeveloperText("<system-interrupt>never use Box::leak</system-interrupt>")
+	isInterrupt := func(item openresponses.Item) bool {
+		m, ok := item.(*openresponses.Message)
+		return ok && strings.HasPrefix(m.Text(), "<system-interrupt>")
+	}
+	s := &summarizer{reply: "They talked about things."}
+	tr := NewLocal(s, WithBudget(5), WithKeepLast(1), WithEstimator(count), WithPin(isInterrupt))
+	var folds []Fold
+	WithOnFold(func(_ context.Context, f Fold) error {
+		folds = append(folds, f)
+		return nil
+	})(tr)
+
+	history := append(agentturn.Transcript{interrupt}, items(6)...)
+	out, err := tr.Transform(context.Background(), history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The summary stands in for the folded prefix and the pinned item
+	// follows it, before the kept tail.
+	if len(out) != 3 {
+		t.Fatalf("request = %d items: %v", len(out), out)
+	}
+	if m, ok := out[0].(*openresponses.Message); !ok || !strings.HasPrefix(m.Text(), "Summary of the conversation so far:") {
+		t.Errorf("first item = %v", out[0])
+	}
+	if out[1] != openresponses.Item(interrupt) {
+		t.Errorf("second item = %v, want the pinned interrupt", out[1])
+	}
+	if len(folds) != 1 || len(folds[0].Pinned) != 1 || folds[0].Pinned[0] != openresponses.Item(interrupt) {
+		t.Fatalf("fold = %+v", folds)
+	}
+	// It survives the next fold too, which summarises it again so
+	// nothing is lost if the pin is later dropped.
+	longer := append(append(agentturn.Transcript(nil), history...), items(6)...)
+	out, err = tr.Transform(context.Background(), longer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, item := range out {
+		if item == openresponses.Item(interrupt) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the pinned item is gone after the second fold: %v", out)
+	}
+	if len(folds) != 2 || len(folds[1].Pinned) != 1 {
+		t.Errorf("second fold = %+v", folds[1])
+	}
+	var summarised bool
+	for _, item := range s.reqs[1].Input {
+		if item == openresponses.Item(interrupt) {
+			summarised = true
+		}
+	}
+	if !summarised {
+		t.Error("the pinned item was not part of the fold that summarised its prefix")
+	}
+	// Without a pin the injected item is whatever the summary made of
+	// it, which is what the option exists to change.
+	plain := NewLocal(&summarizer{reply: "They talked about things."}, WithBudget(5), WithKeepLast(1), WithEstimator(count))
+	out, err = plain.Transform(context.Background(), history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range out {
+		if item == openresponses.Item(interrupt) {
+			t.Error("an unpinned item survived the fold verbatim")
+		}
+	}
+}

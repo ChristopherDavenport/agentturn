@@ -101,7 +101,12 @@
 //     the summary and the settings in force, and a fold member naming
 //     the fold's own model call by response ID, model and request hash;
 //     that hash is of the fold's request, which no path rebuilds, and
-//     is kept so a replay can recognise the call. A fold that failed is
+//     is kept so a replay can recognise the call. A fold that pinned
+//     items, compact.WithPin, names them there too, and the calls after
+//     it are recorded without a request hash: the pinned items follow
+//     the summary on every request and the context algorithm, which
+//     knows only where the kept tail starts, does not rebuild them. A
+//     fold that failed is
 //     a custom entry in the agentturn:compaction_failed namespace
 //     carrying the error, so an abort or a failure during the fold
 //     leaves a trace.
@@ -276,6 +281,12 @@ type FoldCall struct {
 	ResponseID string `json:"response_id,omitempty"`
 	// Model is the model the request named.
 	Model string `json:"model,omitempty"`
+	// Pinned are the items compact.WithPin kept verbatim after the
+	// summary on the requests that follow the fold. They are on the
+	// request and not on the path the context algorithm rebuilds, which
+	// is why those requests are recorded without a hash; naming them
+	// here is what lets a reader see the shape of what was sent.
+	Pinned openresponses.Items `json:"pinned,omitempty"`
 }
 
 // NestedCallNS is the namespace of the custom entries written for a
@@ -387,10 +398,14 @@ type writer struct {
 	values openresponses.Items
 	custom []bool
 	// foldSet says the last fold recorded replaces the first foldSplit
-	// items with foldSummary in the rebuilt context.
+	// items with foldSummary in the rebuilt context; foldPinned says
+	// that fold also kept items of the folded prefix verbatim, which
+	// the rebuilt context does not hold, so no request after it can
+	// carry a hash.
 	foldSet     bool
 	foldSplit   int
 	foldSummary openresponses.Item
+	foldPinned  bool
 	// calls maps a call ID to what the path holds for it, for the calls
 	// this writer wrote or Resume found pending.
 	calls map[string]*callRecord
@@ -631,7 +646,7 @@ func (w *writer) reset() {
 	w.settleReq = nil
 	w.inFlight, w.pending, w.started, w.inFlightID = false, "", time.Time{}, ""
 	w.items, w.values, w.custom = nil, nil, nil
-	w.foldSet, w.foldSplit, w.foldSummary = false, 0, nil
+	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = false, 0, nil, false
 	w.calls = map[string]*callRecord{}
 	w.env = nil
 }
@@ -1180,6 +1195,13 @@ func (w *writer) expectedInput() (openresponses.Items, bool) {
 	from := 0
 	var out openresponses.Items
 	if w.foldSet {
+		if w.foldPinned {
+			// The fold kept items of the folded prefix verbatim after
+			// the summary. They are on every request until the next
+			// fold and on no path the context algorithm rebuilds, so
+			// the recorder cannot stand behind a hash for them.
+			return nil, false
+		}
 		if w.foldSplit > len(w.values) {
 			return nil, false
 		}
@@ -1574,7 +1596,7 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 	if f.Split < 0 || f.Split >= len(w.items) {
 		return fmt.Errorf("session: fold keeps the transcript from item %d, but the recorder wrote %d items", f.Split, len(w.items))
 	}
-	w.foldSet, w.foldSplit, w.foldSummary = true, f.Split, f.Summary
+	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = true, f.Split, f.Summary, len(f.Pinned) > 0
 	entry := &agentsession.CompactionEntry{
 		FirstKept:    w.items[f.Split],
 		Summary:      f.Summary,
@@ -1582,8 +1604,8 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 		TokensBefore: f.TokensBefore,
 		Usage:        f.Usage,
 	}
-	if f.Request != nil || f.ResponseID != "" {
-		call := FoldCall{ResponseID: f.ResponseID}
+	if f.Request != nil || f.ResponseID != "" || len(f.Pinned) > 0 {
+		call := FoldCall{ResponseID: f.ResponseID, Pinned: f.Pinned}
 		if f.Request != nil {
 			hash, err := RequestHash(Canonical(*f.Request))
 			if err != nil {
