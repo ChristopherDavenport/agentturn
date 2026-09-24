@@ -51,7 +51,7 @@ func verifyAll(t *testing.T, s *agentsession.Session) int {
 	for _, e := range s.Entries() {
 		if _, ok := e.(*agentsession.ResponseEntry); ok {
 			n++
-			if err := s.Verify(e.Base().ID); err != nil {
+			if err := s.Verify(e.Base().ID); err != nil && !errors.Is(err, agentsession.ErrNoHash) {
 				t.Errorf("verify %s: %v", e.Base().ID, err)
 			}
 		}

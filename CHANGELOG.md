@@ -7,6 +7,21 @@ versions may break the API.
 
 ## Unreleased
 
+- Requires `agentsession` v0.0.7, `agenttool` v0.0.7 and `openresponses`
+  v0.0.12, up from v0.0.5, v0.0.5 and v0.0.9.
+- **Breaking, in what is recorded.** `session` writes `stopped` rather
+  than `aborted` for a run whose segment has no response of its own — a
+  resume whose approved batch terminated, or a refusal on Resume.
+  agentsession v0.0.6 took those shapes out of the cascade's `aborted`
+  step, so `stopped` is now what the segment reads and what
+  `Run.Verify` accepts; writing `aborted` was the accommodation the old
+  cascade forced, and it now fails verification.
+- The `session` tests accept `agentsession.ErrNoHash` from `Verify`,
+  which agentsession v0.0.6 added for a response that recorded no
+  request hash. The recorder legitimately writes none whenever a layer
+  edits the request outside the transcript, which is the case several
+  of those tests construct.
+
 - `Queued` reports an item `Agent.Steer` or `Agent.FollowUp` accepted
   into a queue, with which queue it went into and the run that was in
   flight, so a host writing what it accepted can tell an item it was

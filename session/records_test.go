@@ -188,7 +188,7 @@ func TestRunEndReasonsFollowTheCascade(t *testing.T) {
 	}
 	verifyAll(t, s)
 	runs := runsOf(t, s)
-	if last := runs[len(runs)-1]; last.End == nil || last.End.Reason != agentsession.ReasonAborted || last.End.Ref != "terminate" {
+	if last := runs[len(runs)-1]; last.End == nil || last.End.Reason != agentsession.ReasonStopped || last.End.Ref != "terminate" {
 		t.Errorf("terminating resume end = %+v", last.End)
 	}
 }

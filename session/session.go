@@ -1577,9 +1577,13 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 		switch {
 		case w.responses == 0:
 			// A resume whose approved batch terminated, or a refusal on
-			// Resume: the segment has no response, which the format reads
-			// as aborted.
-			return agentsession.ReasonAborted, string(e.Cause)
+			// Resume: the segment answers a call an earlier run's model
+			// call made and ends without calling the model again, which
+			// the format reads as stopped. It read as aborted until
+			// agentsession v0.0.6, where the cascade's aborted step
+			// stopped catching a segment with no response of its own,
+			// and writing what happened stopped failing Run.Verify.
+			return agentsession.ReasonStopped, string(e.Cause)
 		case w.lastCalls:
 			return agentsession.ReasonStopped, string(e.Cause)
 		}
