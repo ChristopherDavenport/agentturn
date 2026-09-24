@@ -9,7 +9,7 @@ GOVULNCHECK ?= $(GO) run golang.org/x/vuln/cmd/govulncheck@latest
 SUBMODULES = front/a2a tools/a2a session
 
 .PHONY: build deps replaces test vet fmt tidy tidy-check lint vuln check \
-	release-guard release clean
+	extracted release-guard release clean
 
 build:
 	$(GO) build ./...
@@ -69,8 +69,31 @@ vuln:
 	$(GOVULNCHECK) ./...
 	@for m in $(SUBMODULES); do (cd $$m && $(GOVULNCHECK) ./...) || exit 1; done
 
-# Everything CI runs.
+# Everything CI runs, bar extracted below.
 check: fmt tidy-check vet deps replaces lint vuln test
+
+# Builds, vets and tests each nested module the way a consumer gets it:
+# extracted to
+# a directory with no parent go.mod, with the in-tree replaces dropped,
+# so the require lines are answered by the proxy. replaces above checks
+# that a require is present and release-guard checks that it names the
+# version being tagged; both are claims about a version string, and
+# neither compiles anything against it. Point agenttool's mcpclient at
+# agenttool v0.0.1 and both stay silent while this fails with
+# "undefined: agenttool.WithResource".
+#
+# release-guard.sh had this once, at openresponses v0.0.11: "build it the
+# way a consumer does", running build, vet and test. Introducing the
+# replace at v0.0.12 turned that line into a build against the tree,
+# because GOWORK=off stopped meaning "no local root", and it went on
+# printing ok. release-guard.sh now calls this script in its place.
+#
+# Needs the network, so it is not part of check. It could not be anyway:
+# release points every require at the version being released, and the
+# proxy cannot serve that until the tag is pushed. CI runs it on pull
+# requests and on main.
+extracted:
+	@scripts/check-extracted.sh $(SUBMODULES)
 
 # The module path of the root, which every first-party require and
 # replace is written against.
