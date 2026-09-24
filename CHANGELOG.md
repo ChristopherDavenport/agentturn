@@ -50,6 +50,20 @@ versions may break the API.
   step, so `stopped` is now what the segment reads and what
   `Run.Verify` accepts; writing `aborted` was the accommodation the old
   cascade forced, and it now fails verification.
+
+  **Sessions written before v0.0.7 are affected, and they are not
+  corrupt.** One of them that holds a terminating resume or a refusal
+  on resume carries `"reason": "aborted"` on that run entry, which was
+  the right value under RFC 0001 draft 0.2. Draft 0.3 moved the answer,
+  so reading the same file with `agentsession` v0.0.6 or later fails
+  `Run.Verify`, `VerifyRecords` and the `agentsession verify` CLI with
+  *run end disagrees with its segment: … wrote aborted, segment reads
+  stopped*. Nothing else about the file changed and no item, response
+  or hash is wrong; it is the reader's rule that moved under it.
+  Sessions written from v0.0.7 on carry `stopped` and verify. There is
+  no migration for the old ones: rewriting the run entry's reason in
+  place is the only fix, and whether that is worth doing is a judgement
+  about the archive, not about the file. (#78)
 - The `session` tests accept `agentsession.ErrNoHash` from `Verify`,
   which agentsession v0.0.6 added for a response that recorded no
   request hash. The recorder legitimately writes none whenever a layer

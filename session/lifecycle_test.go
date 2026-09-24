@@ -220,7 +220,7 @@ func TestFilterFollowsSetConfig(t *testing.T) {
 	// The second request carries the first note too, which the path
 	// holds only as a custom entry, so that response is honestly
 	// written without a hash rather than with one that mismatches.
-	if n := verifyAll(t, s); n != 2 || hashed(s) != 1 {
+	if n := verifyAllUnhashed(t, s, 1); n != 2 || hashed(s) != 1 {
 		t.Errorf("responses = %d hashed = %d", n, hashed(s))
 	}
 	// Detached, the recorder stops following the agent.
@@ -428,7 +428,7 @@ func TestUnrecordedTransformOmitsHash(t *testing.T) {
 	if _, err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
 		t.Fatal(err)
 	}
-	if n := verifyAll(t, s); n != 1 || hashed(s) != 0 {
+	if n := verifyAllUnhashed(t, s, 1); n != 1 || hashed(s) != 0 {
 		t.Errorf("responses = %d hashed = %d", n, hashed(s))
 	}
 	// So does a BeforeModelCall that edits the input, and a seeded
@@ -470,7 +470,7 @@ func TestUnrecordedTransformOmitsHash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := verifyAll(t, cs); n != 1 || hashed(cs) != 0 {
+	if n := verifyAllUnhashed(t, cs, 1); n != 1 || hashed(cs) != 0 {
 		t.Errorf("seeded child responses = %d hashed = %d", n, hashed(cs))
 	}
 	// A blocked call under an unrecorded transform is likewise
@@ -480,7 +480,7 @@ func TestUnrecordedTransformOmitsHash(t *testing.T) {
 	d := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Transform: inject, BeforeModelCall: func(context.Context, *openresponses.Request) error { return errors.New("no") }})
 	defer rec4.Attach(d)()
 	_, _ = d.Prompt(context.Background(), openresponses.UserText("x"))
-	if n := verifyAll(t, s4); n != 1 || hashed(s4) != 0 {
+	if n := verifyAllUnhashed(t, s4, 1); n != 1 || hashed(s4) != 0 {
 		t.Errorf("blocked responses = %d hashed = %d", n, hashed(s4))
 	}
 }

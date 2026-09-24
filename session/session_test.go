@@ -42,22 +42,39 @@ func entryTypes(s *agentsession.Session) string {
 	return strings.Join(parts, " ")
 }
 
-// verifyAll checks every response entry's hash against the rebuilt
-// request, checks the record entries on the path to the leaf, and
-// returns how many responses there were. A response the recorder wrote
-// no hash for is not a failure here: it is the honest outcome for a
-// request the record cannot rebuild, and the tests that expect one
-// count it with hashed.
+// verifyAll checks that every response entry's hash is the one the
+// rebuilt request hashes to, checks the record entries on the path to
+// the leaf, and returns how many responses there were. Every response
+// must carry a hash: agentsession.Verify reports one that does not with
+// ErrNoHash, and this reports that as a failure, so a change that
+// silently stopped hashing is caught wherever this is called.
 func verifyAll(t *testing.T, s *agentsession.Session) int {
 	t.Helper()
-	n := 0
+	return verifyAllUnhashed(t, s, 0)
+}
+
+// verifyAllUnhashed is verifyAll for a session that is meant to hold
+// responses the record cannot rebuild — a transform that injects, a
+// hook that edits the input, a child seeded with a transcript the
+// recorder never wrote. The caller says how many, so the expectation is
+// on the test rather than on the helper.
+func verifyAllUnhashed(t *testing.T, s *agentsession.Session, want int) int {
+	t.Helper()
+	n, unhashed := 0, 0
 	for _, e := range s.Entries() {
 		if _, ok := e.(*agentsession.ResponseEntry); ok {
 			n++
-			if err := s.Verify(e.Base().ID); err != nil && !errors.Is(err, agentsession.ErrNoHash) {
+			switch err := s.Verify(e.Base().ID); {
+			case err == nil:
+			case errors.Is(err, agentsession.ErrNoHash):
+				unhashed++
+			default:
 				t.Errorf("verify %s: %v", e.Base().ID, err)
 			}
 		}
+	}
+	if unhashed != want {
+		t.Errorf("responses the record cannot rebuild = %d, want %d", unhashed, want)
 	}
 	if err := s.VerifyRecords(s.Leaf()); err != nil {
 		t.Errorf("verify records: %v", err)

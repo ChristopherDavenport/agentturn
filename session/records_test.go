@@ -195,6 +195,119 @@ func TestRunEndReasonsFollowTheCascade(t *testing.T) {
 	}
 }
 
+// twoCallModel calls every offered tool once per turn, so a run can
+// leave more than one call pending.
+type twoCallModel struct{}
+
+func (twoCallModel) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	for _, tl := range req.Tools {
+		ft, ok := tl.(*openresponses.FunctionTool)
+		if !ok {
+			continue
+		}
+		w, err := em.FunctionCall("", ft.Name)
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(`{"text":"t"}`); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+	}
+	return em.Complete()
+}
+
+// TestResponselessRunReadsAsStoppedOnlyWhenItAnsweredACall drives the
+// three shapes a run with no model call of its own can have. It goes
+// through Handle rather than through a loop because the loop produces
+// only the third: Resume refuses a partial answer, and every path it
+// has to ReasonStopped without a model call has answered every pending
+// call first. Handle is public for a host driving agentturn.Run itself,
+// and the format's stopped step asks for both of the things the
+// recorder checks — the segment answered a call, and no call on the
+// path is left without an output — so each run is written and then
+// checked against ComputeReason, the reader it has to agree with.
+func TestResponselessRunReadsAsStoppedOnlyWhenItAnsweredACall(t *testing.T) {
+	// Two calls, both deferred, so the path holds a response that made
+	// them and two calls with no output.
+	lower := agenttool.New("lower", "", func(_ context.Context, x echoArgs) (string, error) { return strings.ToLower(x.Text), nil })
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: twoCallModel{}, Tools: []agenttool.Tool{upper, lower},
+		BeforeToolCall: func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+			return &agentturn.ToolDecision{Action: agentturn.Defer}, nil
+		}})
+	unsub := rec.Attach(a)
+	end, err := a.Prompt(context.Background(), openresponses.UserText("abc"))
+	if err != nil || len(end.Pending) != 2 {
+		t.Fatalf("prompt: err=%v pending=%d", err, len(end.Pending))
+	}
+	unsub()
+	first, second := end.Pending[0].Call.CallID, end.Pending[1].Call.CallID
+
+	// Each run below is a stop with no model call; they differ only in
+	// what the segment holds.
+	host := func(runID string, items ...openresponses.Item) {
+		t.Helper()
+		ctx := context.Background()
+		if err := rec.Handle(ctx, &agentturn.RunStart{RunID: runID, Source: agentturn.SourceResume}); err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range items {
+			if err := rec.Handle(ctx, &agentturn.ItemEnd{RunID: runID, Item: item}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := rec.Handle(ctx, &agentturn.RunEnd{RunID: runID, Reason: agentturn.ReasonStopped, Cause: agentturn.StopRefused}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 1. Answers nothing. The stopped step wants a segment holding an
+	//    output or a decision, and this holds neither.
+	host("run_nothing")
+	// 2. Answers one of the two. A call on the path is still without an
+	//    output, which keeps a later run from reading as stopped.
+	host("run_partial", openresponses.NewFunctionCallOutput(first, "one"))
+	// 3. Answers the last one. Now the segment answered a call the
+	//    response before it made and nothing on the path is pending.
+	host("run_rest", openresponses.NewFunctionCallOutput(second, "two"))
+	// 4. Answers nothing again, after a run that answered. Nothing is
+	//    pending now, so this one reads as stopped unless the record of
+	//    what the previous run answered was cleared with the run.
+	host("run_after")
+
+	want := []string{
+		agentsession.ReasonInputRequired,
+		agentsession.ReasonAborted,
+		agentsession.ReasonAborted,
+		agentsession.ReasonStopped,
+		agentsession.ReasonAborted,
+	}
+	runs := runsOf(t, s)
+	if len(runs) != len(want) {
+		t.Fatalf("runs = %d, want %d, in %q", len(runs), len(want), entryTypes(s))
+	}
+	for i, r := range runs {
+		if r.End == nil {
+			t.Fatalf("run %d has no end", i)
+		}
+		if r.End.Reason != want[i] {
+			t.Errorf("run %d wrote %s, want %s", i, r.End.Reason, want[i])
+		}
+		// The reader has to agree, which is the point of writing it.
+		if got := agentsession.ComputeReason(r.Path, r.Segment); got != r.End.Reason {
+			t.Errorf("run %d wrote %s, the format computes %s", i, r.End.Reason, got)
+		}
+	}
+	verifyAll(t, s)
+}
+
 // terminatingTool wraps a tool so its result terminates the batch.
 type terminatingTool struct{ agenttool.Tool }
 
@@ -593,9 +706,18 @@ func TestChildSessionIDIsDerivedFromTheCall(t *testing.T) {
 	if n := len(runsOf(t, again)); n != 2 {
 		t.Errorf("runs on the child session = %d", n)
 	}
-	// Both runs hold a response, and the path to the leaf verifies.
-	if n := verifyAll(t, again); n != 2 {
-		t.Errorf("child responses = %d", n)
+	// Both runs hold a response. Only the first carries a hash: the
+	// child session accumulates both runs, so the path rebuilds a
+	// context of every item under this call, while tools/agent builds a
+	// fresh agent for each Execute whose request is the new input
+	// alone. The record and the request disagree and the recorder
+	// declines a hash it cannot stand behind, which is the honest
+	// outcome of a gap that is not the recorder's: whether a second
+	// execution under one call ID should seed the child from its own
+	// recorded context, or open a new root, is open. Pinned here so a
+	// change to it is seen.
+	if n := verifyAllUnhashed(t, again, 1); n != 2 || hashed(again) != 1 {
+		t.Errorf("child responses = %d hashed = %d", n, hashed(again))
 	}
 
 	// A host that means a retry from a clean start says so, and the

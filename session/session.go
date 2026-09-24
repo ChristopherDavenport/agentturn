@@ -184,8 +184,11 @@
 // request whose input a Transform or a BeforeModelCall changed in a way
 // the record does not describe, or that carries items the recorder
 // never wrote, such as a child's seed transcript, is recorded without
-// a hash, and Session.Verify reports it as unverified rather than as a
-// mismatch. For the compact transform, [Recorder.Fold] writes the
+// a hash, and Session.Verify reports it with agentsession.ErrNoHash
+// rather than as a mismatch. A host that gates on the record therefore
+// tells "nothing was checked" from "checked and correct" with
+// errors.Is and not with err == nil. For the compact transform,
+// [Recorder.Fold] writes the
 // compaction entry that describes the change, so its requests keep
 // their hashes:
 //
@@ -1581,6 +1584,17 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 			// reads it as stopped when it answered a call an earlier
 			// run's model call made and left nothing on the path
 			// pending, and as aborted otherwise.
+			//
+			// The loop reaches only the stopped side. Resume refuses a
+			// partial answer, so a run of its that stops without calling
+			// the model has answered every call that was pending. The
+			// aborted side is for a host driving agentturn.Run itself
+			// through Handle, which ends a run where it likes. The
+			// format's stopped step asks one further thing that is not
+			// checked here, that the path's last response is the one
+			// whose calls are being answered; no arrangement of the
+			// loop's events can break that, since a call without an
+			// output keeps the model from being called again.
 			if w.answeredCall && !w.pendingOnPath() {
 				return agentsession.ReasonStopped, string(e.Cause)
 			}
