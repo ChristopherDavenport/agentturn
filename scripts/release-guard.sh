@@ -33,15 +33,49 @@ echo "release-guard: $TAG"
 [ -z "$(git status --porcelain)" ] || die "working tree is dirty; commit or stash first"
 ok "working tree clean"
 
+# --- What origin has published ----------------------------------------
+# The version floor has to come from what is published, not from what
+# this checkout happens to know. A clone that has not fetched recently
+# carries a stale floor, and a version that sorts below one already on
+# the proxy is the one mistake with no remedy: proxy.golang.org and
+# sum.golang.org serve both forever and nobody can supersede the older
+# content. Reading only local tags made this script approve exactly that.
+#
+# git ls-remote is read-only, so unlike a git fetch --tags at the top of
+# a check it does not mutate the caller's tag state as a side effect.
+#
+# It fails closed. If origin cannot be reached then the push could not
+# have succeeded either, so refusing costs a release nothing, while a
+# silent fallback to local tags would reinstate the stale floor on
+# precisely the day the network is unreliable.
+REMOTE_LS="$(git ls-remote --tags origin 2>&1)" \
+  || die "cannot read the published tags from origin:
+            $REMOTE_LS
+            The floor is what origin has published, so there is no safe answer
+            without it, and a push could not have succeeded either."
+
+# ls-remote returns the peeled ^{} refs alongside the tags; drop them.
+REMOTE_TAGS="$(printf '%s\n' "$REMOTE_LS" | sed -e 's|.*refs/tags/||' -e '/\^{}$/d')"
+
+# The floor is the union of local and remote. Remote alone would break
+# make release: it writes the root tag locally and does not push until
+# the end, so the checks below still have to see local tags.
+ALL_TAGS="$( { git tag -l; printf '%s\n' "$REMOTE_TAGS"; } | sort -u )"
+
+# Tags matching a pattern, from that union. grep exits 1 on no match,
+# which errexit would take as a failure, so the empty case is explicit.
+matching() { printf '%s\n' "$ALL_TAGS" | grep -E "$1" || true; }
+ok "read the published tags from origin"
+
 git rev-parse -q --verify "refs/tags/$TAG" >/dev/null \
   && die "tag $TAG already exists locally"
-[ -z "$(git ls-remote --tags origin "refs/tags/$TAG")" ] \
-  || die "tag $TAG already exists on origin"
+printf '%s\n' "$REMOTE_TAGS" | grep -qxF -- "$TAG" \
+  && die "tag $TAG already exists on origin"
 ok "tag is new"
 
 # --- Root version already released ------------------------------------
 # Nested tags are <dir>/vX.Y.Z, so 'v*' matches root tags only.
-ROOT_LATEST="$(git tag -l 'v*' | newest)"
+ROOT_LATEST="$(matching '^v' | newest)"
 [ -n "$ROOT_LATEST" ] || die "no root tag found; cannot establish the version floor"
 
 case "$TAG" in
@@ -69,7 +103,7 @@ case "$TAG" in
 
     # And it has to move that module forward too, or the proxy keeps
     # serving the older content under a version nobody can supersede.
-    DIR_LATEST="$(git tag -l "$DIR/v*" | sed "s|^$DIR/||" | newest)"
+    DIR_LATEST="$(matching "^$DIR/v" | sed "s|^$DIR/||" | newest)"
     if [ -n "$DIR_LATEST" ]; then
       [ "$(printf '%s\n%s\n' "$DIR_LATEST" "$VERSION" | newest)" = "$VERSION" ] \
         || die "$VERSION does not sort above $DIR's current release $DIR_LATEST"
@@ -100,13 +134,41 @@ case "$TAG" in
             $DIR would claim to be built against a root it was not built against"
     ok "root $VERSION is this commit"
 
-    # Cheap proof the replace resolves and the module is buildable as
-    # published. The heavy vet and test already ran under make check,
-    # against this same code.
-    echo "  ..  building $DIR outside the workspace"
-    (cd "$DIR" && GOWORK=off go build ./...) \
-      || die "$DIR does not build outside the workspace"
-    ok "builds outside the workspace"
+    # Build, vet and test it the way a consumer gets it: extracted, with
+    # the replace dropped, so the require line above is resolved from the
+    # proxy rather than from the directory next door.
+    #
+    # This line used to read (cd "$DIR" && GOWORK=off go build ./...),
+    # described as proof the module "is buildable as published". It was
+    # that, once. A nested go.mod carrying replace <root> => .. makes
+    # GOWORK=off resolve the root from the tree, so it became a build of
+    # the tree against itself — make build, run twice — while still
+    # printing ok. check-extracted.sh restores what the line claimed.
+    #
+    # It can only run once the root version is on the proxy, and during
+    # make release it is not: the root tag is written locally and pushed
+    # on the last line. Nothing is lost by skipping it there. The two
+    # checks immediately above have already established that every
+    # first-party require names $VERSION and that root $VERSION is this
+    # commit, so root $VERSION *is* this tree, and make check compiled
+    # $DIR against this tree before the release commit was written. The
+    # extracted build would re-derive that through the proxy. Where it
+    # earns its keep is on a require naming an earlier release, which is
+    # every run outside make release: CI on pull requests and on main,
+    # and make release-guard on a tag whose root is already published.
+    # go list -m reports every module in the workspace, so the root has
+    # to be asked for outside it.
+    MODULE="$(GOWORK=off go list -m)"
+    if [ -z "$(GOWORK=off go list -m -e -f '{{with .Error}}{{.Err}}{{end}}' \
+                 "$MODULE@$VERSION")" ]; then
+      scripts/check-extracted.sh "$DIR" \
+        || die "$DIR does not build against $MODULE@$VERSION as a consumer gets it"
+    else
+      echo "  --  $MODULE@$VERSION is not on the proxy yet, so $DIR cannot be"
+      echo "      built the way a consumer gets it. Root $VERSION is this commit"
+      echo "      and make check compiled $DIR against it, so nothing is unproven;"
+      echo "      the extracted build runs in CI once the tags are pushed."
+    fi
     ;;
 
   *)
