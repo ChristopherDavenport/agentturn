@@ -164,9 +164,11 @@ func TestRunEndReasonsFollowTheCascade(t *testing.T) {
 		})
 	}
 
-	// A resume whose approved batch terminates makes no model call, and
-	// the format reads such a segment as aborted; the loop's reason
-	// rides as ref.
+	// A resume whose approved batch terminates makes no model call: the
+	// segment holds no response of its own, and the format reads a
+	// segment that answers a call an earlier model call made, and
+	// leaves nothing pending, as stopped. The loop's reason rides as
+	// ref.
 	store := agentsession.NewMemoryStore()
 	rec, s, err := Start(context.Background(), store, agentsession.Header{})
 	if err != nil {

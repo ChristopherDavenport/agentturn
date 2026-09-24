@@ -5,6 +5,40 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- **Fixed**: a fold that pinned items, `compact.WithPin`, is written to
+  the compaction entry's `pinned` member, which the context algorithm
+  places after the summary as the request carries it. The recorder put
+  them in the `fold` extension member instead, which `BuildContext`
+  never reads, so the context rebuilt from the record was missing them
+  and the recorder declined a request hash it could not stand behind.
+  The calls after such a fold now keep their hashes,
+  `Session.RequestContext` rebuilds the input that was sent, and the
+  pinned items are in the context `Resume` and `Continue` seed from, so
+  the pin predicate still has something to match after a restart. The
+  v0.0.7 entry below says those calls are recorded without a hash; that
+  was the behaviour until this release. (#78)
+
+  **Breaking, in the fold member.** `session.FoldCall.Pinned` is gone:
+  the pinned items are the format's now, and the member names the
+  fold's own model call and nothing else. A session written by v0.0.7
+  with a pinned fold still carries them under `fold.pinned`, still has
+  no request hashes on the calls after the fold, and is not repaired by
+  reading it with this release — nothing about that file is wrong, it
+  is short the member the context algorithm reads.
+
+- **Breaking, in what is recorded.** A run whose segment holds no
+  response of its own is written as `stopped` only when it answered a
+  call an earlier run's model call made and left no call on the path
+  without an output, and as `aborted` otherwise. v0.0.7 wrote `stopped`
+  for every responseless segment, which disagrees with
+  `agentsession.ComputeReason` for a run that answered nothing or that
+  answered only part of what was pending, and so failed `Run.Verify`.
+  The loop cannot produce either of those shapes — `Resume` refuses a
+  partial answer — so this reaches a host driving `agentturn.Run`
+  itself through the public `Recorder.Handle`. (#78)
+
 ## v0.0.7 - 2026-09-23
 
 - Requires `agentsession` v0.0.7, `agenttool` v0.0.7 and `openresponses`

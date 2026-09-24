@@ -44,7 +44,10 @@ func entryTypes(s *agentsession.Session) string {
 
 // verifyAll checks every response entry's hash against the rebuilt
 // request, checks the record entries on the path to the leaf, and
-// returns how many responses there were.
+// returns how many responses there were. A response the recorder wrote
+// no hash for is not a failure here: it is the honest outcome for a
+// request the record cannot rebuild, and the tests that expect one
+// count it with hashed.
 func verifyAll(t *testing.T, s *agentsession.Session) int {
 	t.Helper()
 	n := 0
@@ -935,13 +938,15 @@ func TestFailedFoldLeavesATrace(t *testing.T) {
 	}
 }
 
-// TestPinnedFoldNamesWhatItKept checks what the record says about a
-// fold that kept items of the folded prefix verbatim: the compaction
-// entry names them, and the calls after it carry no request hash,
-// because the path rebuilds the summary and the kept tail and knows
-// nothing of an item the transform put between them. Verify reports
-// them as unverified rather than mismatched.
-func TestPinnedFoldNamesWhatItKept(t *testing.T) {
+// TestPinnedFoldRebuildsWhatWasSent checks what the record says about
+// a fold that kept items of the folded prefix verbatim. The compaction
+// entry carries them in its pinned member, the context algorithm puts
+// them back between the summary and the kept tail, and so every call
+// after the fold keeps its request hash, RequestContext rebuilds the
+// input that was sent, and the context a resume seeds from still holds
+// the pinned item. Without the member the recorder declines the hash,
+// because the rebuild would be missing the item.
+func TestPinnedFoldRebuildsWhatWasSent(t *testing.T) {
 	store := agentsession.NewMemoryStore()
 	rec, s, err := Start(context.Background(), store, agentsession.Header{})
 	if err != nil {
@@ -953,16 +958,16 @@ func TestPinnedFoldNamesWhatItKept(t *testing.T) {
 		compact.WithEstimator(countItems), compact.WithOnFold(rec.Fold), compact.WithPin(pin))
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform})
 	defer rec.Attach(a)()
-	if _, err := a.Prompt(context.Background(), openresponses.UserText("one"), notice); err != nil {
-		t.Fatal(err)
-	}
 	var sent []openresponses.Items
 	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
 		if e, ok := ev.(*agentturn.TurnStart); ok {
-			sent = append(sent, e.Request.Input)
+			sent = append(sent, Canonical(e.Request).Input)
 		}
 		return nil
 	})
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("one"), notice); err != nil {
+		t.Fatal(err)
+	}
 	for _, text := range []string{"two", "three", "four"} {
 		if _, err := a.Prompt(context.Background(), openresponses.UserText(text)); err != nil {
 			t.Fatal(err)
@@ -977,41 +982,96 @@ func TestPinnedFoldNamesWhatItKept(t *testing.T) {
 	if len(folds) == 0 {
 		t.Fatalf("no compaction entry in %q", entryTypes(s))
 	}
+	for _, f := range folds {
+		if len(f.Pinned) != 1 {
+			t.Fatalf("the compaction entry names %d pinned items", len(f.Pinned))
+		}
+		if m, ok := f.Pinned[0].(*openresponses.Message); !ok || m.Text() != notice.Text() {
+			t.Errorf("pinned = %+v", f.Pinned[0])
+		}
+	}
+	// The pinned items are the format's now, not the fold member's: the
+	// member names the fold's own call and nothing else.
 	raw, ok := folds[0].Unknown[FoldMember]
 	if !ok {
 		t.Fatalf("the compaction entry names no fold call: %+v", folds[0])
 	}
-	var call FoldCall
-	if err := json.Unmarshal(raw, &call); err != nil {
+	var member map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &member); err != nil {
 		t.Fatal(err)
 	}
-	if len(call.Pinned) != 1 {
-		t.Fatalf("the fold names %d pinned items", len(call.Pinned))
+	if _, ok := member["pinned"]; ok {
+		t.Errorf("the fold member still carries the pinned items: %s", raw)
 	}
-	if m, ok := call.Pinned[0].(*openresponses.Message); !ok || m.Text() != notice.Text() {
-		t.Errorf("pinned = %+v", call.Pinned[0])
+	// Every call kept its hash, and every one of them rebuilds, from
+	// the record alone, the input that was sent.
+	var responses []*agentsession.ResponseEntry
+	for _, e := range s.Entries() {
+		if r, ok := e.(*agentsession.ResponseEntry); ok {
+			responses = append(responses, r)
+			if r.RequestHash == "" {
+				t.Errorf("response %s carries no request hash", r.ID)
+			}
+		}
 	}
-	// The model kept reading the notice after the fold.
-	last := sent[len(sent)-1]
+	if n := verifyAll(t, s); n != len(sent) {
+		t.Errorf("responses verified = %d, turns sent = %d", n, len(sent))
+	}
+	for i, r := range responses {
+		cx, err := s.RequestContext(r.ID)
+		if err != nil {
+			t.Fatalf("request context of %s: %v", r.ID, err)
+		}
+		if !equalJSON(cx.Items, sent[i]) {
+			t.Errorf("rebuilt request %d = %v, sent %v", i, cx.Items, sent[i])
+		}
+	}
+	// And the context a Resume or a Continue seeds from still holds it,
+	// so the pin predicate has something to match after a restart.
+	cx, err := s.Context()
+	if err != nil {
+		t.Fatal(err)
+	}
 	found := false
-	for _, item := range last {
+	for _, item := range cx.Items {
 		if m, ok := item.(*openresponses.Message); ok && m.Text() == notice.Text() {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("the last request lost the pinned item: %v", last)
+		t.Errorf("the context at the leaf lost the pinned item: %v", cx.Items)
 	}
-	// Nothing mismatches; the calls after the fold are simply not
-	// verifiable until the format can describe a pinned item.
-	verifyAll(t, s)
-	responses := 0
-	for _, e := range s.Entries() {
-		if r, ok := e.(*agentsession.ResponseEntry); ok && r.RequestHash == "" {
-			responses++
+	// So a run resumed from that context carries the notice, the pin
+	// predicate finds it again, and the resumed run's calls hash too.
+	rec2, s2, err := Resume(context.Background(), store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr2 := compact.NewLocal(&echo.Adapter{}, compact.WithBudget(4), compact.WithKeepLast(2),
+		compact.WithEstimator(countItems), compact.WithOnFold(rec2.Fold), compact.WithPin(pin))
+	b := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr2.Transform},
+		agentturn.WithTranscript(agentturn.Transcript(cx.Items)))
+	var resumed openresponses.Items
+	b.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if e, ok := ev.(*agentturn.TurnStart); ok {
+			resumed = e.Request.Input
+		}
+		return nil
+	})
+	defer rec2.Attach(b)()
+	if _, err := b.Prompt(context.Background(), openresponses.UserText("six")); err != nil {
+		t.Fatal(err)
+	}
+	found = false
+	for _, item := range resumed {
+		if m, ok := item.(*openresponses.Message); ok && m.Text() == notice.Text() {
+			found = true
 		}
 	}
-	if responses == 0 {
-		t.Error("a call after the pinned fold carries a hash the path cannot rebuild")
+	if !found {
+		t.Errorf("the resumed run's request lost the pinned item: %v", resumed)
+	}
+	if n := verifyAll(t, s2); n != hashed(s2) {
+		t.Errorf("responses after the resume = %d, hashed = %d", n, hashed(s2))
 	}
 }

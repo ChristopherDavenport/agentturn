@@ -93,20 +93,21 @@
 //     and input_required as they are, error with the error as ref,
 //     aborted as interrupted with the context error as ref, since the
 //     host asked for the stop, and stopped as stopped when the last
-//     response requested tools, as done when it did not and as aborted
-//     when the run made no model call, with the stop's cause as ref in
-//     every case.
+//     response requested tools, as done when it did not, and, when the
+//     run made no model call of its own, as stopped when it answered a
+//     call an earlier one made and left nothing pending and as aborted
+//     otherwise, with the stop's cause as ref in every case.
 //   - a fold reported through [Recorder.Fold]: a compaction entry whose
 //     first_kept is the entry of the first item the transform kept, with
 //     the summary and the settings in force, and a fold member naming
 //     the fold's own model call by response ID, model and request hash;
 //     that hash is of the fold's request, which no path rebuilds, and
 //     is kept so a replay can recognise the call. A fold that pinned
-//     items, compact.WithPin, names them there too, and the calls after
-//     it are recorded without a request hash: the pinned items follow
-//     the summary on every request and the context algorithm, which
-//     knows only where the kept tail starts, does not rebuild them. A
-//     fold that failed is
+//     items, compact.WithPin, writes them to the entry's pinned member,
+//     where the context algorithm places them after the summary as the
+//     request carries them, so the calls after such a fold keep their
+//     hashes and the pinned items are in the context a resume seeds
+//     from. A fold that failed is
 //     a custom entry in the agentturn:compaction_failed namespace
 //     carrying the error, so an abort or a failure during the fold
 //     leaves a trace.
@@ -281,12 +282,6 @@ type FoldCall struct {
 	ResponseID string `json:"response_id,omitempty"`
 	// Model is the model the request named.
 	Model string `json:"model,omitempty"`
-	// Pinned are the items compact.WithPin kept verbatim after the
-	// summary on the requests that follow the fold. They are on the
-	// request and not on the path the context algorithm rebuilds, which
-	// is why those requests are recorded without a hash; naming them
-	// here is what lets a reader see the shape of what was sent.
-	Pinned openresponses.Items `json:"pinned,omitempty"`
 }
 
 // NestedCallNS is the namespace of the custom entries written for a
@@ -399,14 +394,13 @@ type writer struct {
 	values openresponses.Items
 	custom []bool
 	// foldSet says the last fold recorded replaces the first foldSplit
-	// items with foldSummary in the rebuilt context; foldPinned says
-	// that fold also kept items of the folded prefix verbatim, which
-	// the rebuilt context does not hold, so no request after it can
-	// carry a hash.
+	// items with foldSummary in the rebuilt context; foldPinned are the
+	// items of the folded prefix that fold kept verbatim, which follow
+	// the summary there as they do on the request.
 	foldSet     bool
 	foldSplit   int
 	foldSummary openresponses.Item
-	foldPinned  bool
+	foldPinned  openresponses.Items
 	// calls maps a call ID to what the path holds for it, for the calls
 	// this writer wrote or Resume found pending.
 	calls map[string]*callRecord
@@ -424,11 +418,15 @@ type writer struct {
 	// run is the ID of the run being written, "" between runs; open
 	// lists, in order, the calls of that run with no output yet;
 	// responses counts its model calls and lastCalls says whether the
-	// last one requested tools, which is what the end reason turns on.
-	run       string
-	open      []string
-	responses int
-	lastCalls bool
+	// last one requested tools, which is what the end reason turns on;
+	// answeredCall says the run wrote an output or a decision, which is
+	// how the format reads a run that answered a call an earlier one's
+	// model call made.
+	run          string
+	open         []string
+	responses    int
+	lastCalls    bool
+	answeredCall bool
 }
 
 // callRecord is what the path holds for one function call.
@@ -439,12 +437,15 @@ type callRecord struct {
 	args string
 	// held is set while the latest decision is a hold that nothing has
 	// answered; dispatched once a dispatch is written; rejected once a
-	// reject is. dispatchRun is the run the dispatch was written in, so
-	// an output arriving in a later run is the caller's answer to a
-	// call an abort cut off rather than the tool's own.
+	// reject is; answered once an output for it is on the path, which
+	// is what the format reads as a call that is no longer pending.
+	// dispatchRun is the run the dispatch was written in, so an output
+	// arriving in a later run is the caller's answer to a call an abort
+	// cut off rather than the tool's own.
 	held        bool
 	dispatched  bool
 	rejected    bool
+	answered    bool
 	dispatchRun string
 }
 
@@ -655,7 +656,7 @@ func (w *writer) reset() {
 	w.settleReq = nil
 	w.inFlight, w.pending, w.started, w.inFlightID = false, "", time.Time{}, ""
 	w.items, w.values, w.custom = nil, nil, nil
-	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = false, 0, nil, false
+	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = false, 0, nil, nil
 	w.calls = map[string]*callRecord{}
 	w.env = nil
 }
@@ -1105,6 +1106,7 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 	w.open = nil
 	w.responses = 0
 	w.lastCalls = false
+	w.answeredCall = false
 	if _, err := w.append(ctx, agentsession.NewRunStart(e.RunID, string(e.Source), e.Trigger.String())); err != nil {
 		return err
 	}
@@ -1213,23 +1215,18 @@ func (w *writer) hash(req openresponses.Request) (string, error) {
 
 // expectedInput is the input the stored path rebuilds, as the context
 // algorithm reads it: the summary of the last fold recorded, then the
-// items written as item entries from the fold's first kept one on.
+// items that fold pinned, then the items written as item entries from
+// the fold's first kept one on.
 func (w *writer) expectedInput() (openresponses.Items, bool) {
 	from := 0
 	var out openresponses.Items
 	if w.foldSet {
-		if w.foldPinned {
-			// The fold kept items of the folded prefix verbatim after
-			// the summary. They are on every request until the next
-			// fold and on no path the context algorithm rebuilds, so
-			// the recorder cannot stand behind a hash for them.
-			return nil, false
-		}
 		if w.foldSplit > len(w.values) {
 			return nil, false
 		}
 		from = w.foldSplit
 		out = append(out, w.foldSummary)
+		out = append(out, w.foldPinned...)
 	}
 	for i := from; i < len(w.values); i++ {
 		if !w.custom[i] {
@@ -1375,8 +1372,11 @@ func streamedResponseID(ev agentturn.Event) string {
 	return ""
 }
 
-// close removes a call from the run's open list.
+// close marks a call answered and removes it from the run's open list.
 func (w *writer) close(callID string) {
+	if c, ok := w.calls[callID]; ok {
+		c.answered = true
+	}
 	for i, id := range w.open {
 		if id == callID {
 			w.open = append(w.open[:i:i], w.open[i+1:]...)
@@ -1577,13 +1577,14 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 		switch {
 		case w.responses == 0:
 			// A resume whose approved batch terminated, or a refusal on
-			// Resume: the segment answers a call an earlier run's model
-			// call made and ends without calling the model again, which
-			// the format reads as stopped. It read as aborted until
-			// agentsession v0.0.6, where the cascade's aborted step
-			// stopped catching a segment with no response of its own,
-			// and writing what happened stopped failing Run.Verify.
-			return agentsession.ReasonStopped, string(e.Cause)
+			// Resume: the segment has no response of its own. The format
+			// reads it as stopped when it answered a call an earlier
+			// run's model call made and left nothing on the path
+			// pending, and as aborted otherwise.
+			if w.answeredCall && !w.pendingOnPath() {
+				return agentsession.ReasonStopped, string(e.Cause)
+			}
+			return agentsession.ReasonAborted, string(e.Cause)
 		case w.lastCalls:
 			return agentsession.ReasonStopped, string(e.Cause)
 		}
@@ -1592,6 +1593,19 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 		return agentsession.ReasonDone, string(e.Cause)
 	}
 	return string(e.Reason), ""
+}
+
+// pendingOnPath reports whether any call the writer knows of is still
+// without an output. The format's stopped step reads every call on the
+// path, not only the run's own, so a call an earlier run left
+// unanswered keeps this one from reading as stopped.
+func (w *writer) pendingOnPath() bool {
+	for _, c := range w.calls {
+		if !c.answered {
+			return true
+		}
+	}
+	return false
 }
 
 func errText(err error) string {
@@ -1644,16 +1658,17 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 	if f.Split < 0 || f.Split >= len(w.items) {
 		return fmt.Errorf("session: fold keeps the transcript from item %d, but the recorder wrote %d items", f.Split, len(w.items))
 	}
-	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = true, f.Split, f.Summary, len(f.Pinned) > 0
+	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = true, f.Split, f.Summary, f.Pinned
 	entry := &agentsession.CompactionEntry{
 		FirstKept:    w.items[f.Split],
 		Summary:      f.Summary,
+		Pinned:       f.Pinned,
 		Config:       w.settings,
 		TokensBefore: f.TokensBefore,
 		Usage:        f.Usage,
 	}
-	if f.Request != nil || f.ResponseID != "" || len(f.Pinned) > 0 {
-		call := FoldCall{ResponseID: f.ResponseID, Pinned: f.Pinned}
+	if f.Request != nil || f.ResponseID != "" {
+		call := FoldCall{ResponseID: f.ResponseID}
 		if f.Request != nil {
 			hash, err := RequestHash(Canonical(*f.Request))
 			if err != nil {
@@ -1729,6 +1744,18 @@ func (w *writer) append(ctx context.Context, e agentsession.Entry) (string, erro
 	id, err := w.rec.store.Append(ctx, w.id, e)
 	if err != nil {
 		return "", fmt.Errorf("session: append %s: %w", e.EntryType(), err)
+	}
+	// The format reads a segment holding a function call output or a
+	// decision as one that answered a call, which is the shape its
+	// stopped step asks for; this is that test, taken as the entries
+	// are written rather than by reading the segment back.
+	switch v := e.(type) {
+	case *agentsession.DecisionEntry:
+		w.answeredCall = true
+	case *agentsession.ItemEntry:
+		if _, ok := v.Item.(*openresponses.FunctionCallOutput); ok {
+			w.answeredCall = true
+		}
 	}
 	return id, nil
 }
