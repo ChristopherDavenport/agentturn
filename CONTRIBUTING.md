@@ -18,7 +18,7 @@ the change can be discussed before you spend time on it.
 Go 1.25 or later is required. The full local check is:
 
 ```sh
-make check        # gofmt, tidy, vet, deps, staticcheck, govulncheck, race tests, every module
+make check        # gofmt, tidy, vet, deps, replaces, staticcheck, govulncheck, race tests, every module
 ```
 
 The individual targets are `fmt`, `tidy-check`, `vet`, `deps`, `lint`,
@@ -65,3 +65,23 @@ changelog section as the message, and pushes. The release workflow
 publishes a GitHub release per tag, and the Go module proxy picks the
 versions up. Before v1.0.0 the API may change between minor versions;
 the changelog records every break.
+
+
+`make release-guard TAG=<tag>` is what stands between a mistake and a
+permanent one, and `make release` runs it for every tag it writes. It
+refuses a dirty tree, a tag that already exists locally or on origin, a
+version that sorts below the current root release or does not move its
+module forward, a first-party require that does not name that version, a
+root tag that is not this commit, and a module that will not build with
+`GOWORK=off`. The root is guarded and tagged first, because a nested
+module's guard needs the root tag to exist. Nothing is public until the
+push, so a refusal costs a `git reset --hard HEAD~1` and a `git tag -d`.
+
+`make replaces`, part of `check`, refuses a first-party require that
+lacks a matching `replace`. There is no `go.work` here, so the replaces
+are the only thing building the tree against itself — and losing one
+would make the next release resolve that module from the proxy, where
+the version being released does not exist yet.
+
+`go mod tidy` can move a requirement that the release just set, so the
+requires are read back and asserted before anything is tagged.

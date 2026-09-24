@@ -8,7 +8,8 @@ GOVULNCHECK ?= $(GO) run golang.org/x/vuln/cmd/govulncheck@latest
 # target loops over them.
 SUBMODULES = front/a2a tools/a2a session
 
-.PHONY: build deps test vet fmt tidy tidy-check lint vuln check release clean
+.PHONY: build deps replaces test vet fmt tidy tidy-check lint vuln check \
+	release-guard release clean
 
 build:
 	$(GO) build ./...
@@ -20,6 +21,23 @@ build:
 deps:
 	@deps=$$($(GO) list -deps -f '{{if not .Standard}}{{.ImportPath}}{{end}}' ./... | grep -v '^github.com/ChristopherDavenport/agentturn' | grep -v '^github.com/ChristopherDavenport/agenttool' | grep -v '^github.com/ChristopherDavenport/openresponses' || true); \
 	  test -z "$$deps" || { echo "root module depends on: $$deps"; exit 1; }
+
+# Every first-party module a nested module requires must also be
+# replaced, at a path that exists. There is no go.work in this
+# repository: the replace is the only thing that builds the tree against
+# itself, and it is load-bearing at release time too.
+#
+# Every module is released at one version, from one commit, and requires
+# its siblings at exactly that version — a version the proxy cannot serve
+# until the tag is pushed. The replace is what lets the release commit
+# resolve, tidy and build. Lose one and the next release fails at make
+# tidy, or silently pins that module to the previous release.
+#
+# A replace is a property of the main module, so consumers ignore it and
+# get the require. That is safe only because the require names the commit
+# the module is tagged from; release-guard is what proves it.
+replaces:
+	@scripts/check-replaces.sh $(SUBMODULES)
 
 test:
 	$(GO) test -race ./...
@@ -52,39 +70,81 @@ vuln:
 	@for m in $(SUBMODULES); do (cd $$m && $(GOVULNCHECK) ./...) || exit 1; done
 
 # Everything CI runs.
-check: fmt tidy-check vet deps lint vuln test
+check: fmt tidy-check vet deps replaces lint vuln test
 
+# The module path of the root, which every first-party require and
+# replace is written against.
 MODULE := $(shell $(GO) list -m)
-NOTES := $(shell mktemp)
 
-# Cut a release. Every module in the repository shares one version and
-# one commit: each nested module's requirement on the root, and on any
-# sibling module, is set to VERSION next to the replace that keeps it
-# building from the tree; the changelog's Unreleased section is dated;
-# everything is checked; one commit is made; the root is tagged VERSION
-# and each nested module <dir>/VERSION with the changelog section as the
-# message; and the branch and tags are pushed, the tags one at a time
-# because GitHub creates no events for a push of more than three tags.
+# Checks one tag is safe to push, before it is pushed. A pushed tag is
+# permanent — the proxy and the checksum database keep the version
+# forever — so this is the last point at which a mistake is free:
+#   make release-guard TAG=front/a2a/v0.1.0
+release-guard:
+	@test -n "$(TAG)" || { echo "usage: make release-guard TAG=<tag>"; exit 1; }
+	@scripts/release-guard.sh "$(TAG)"
+
+# Every tag a release writes: the root and one per nested module, all at
+# the same version, all from the one commit below.
+RELEASE_TAGS = $(VERSION) $(patsubst %,%/$(VERSION),$(SUBMODULES))
+
+# Cut a release:
+#
+#   make release VERSION=v0.1.0
+#
+# Every module is released at one version, from one commit, and requires
+# its first-party siblings at exactly that version. So the first thing
+# this does is point every nested module at VERSION — a version that does
+# not exist yet. That resolves because each nested go.mod replaces its
+# first-party requirements with the tree (see replaces above); tidy,
+# build and test all see the code being tagged.
+#
+# The tags go one at a time rather than in one --atomic push, because
+# GitHub creates no events for a push of more than three tags and there
+# are four here: an atomic push would land every tag and then silently
+# never run the release workflow. The window this opens is benign under
+# the one-version rule — each tag is already correct and self-consistent
+# when it lands, so a consumer inside the window gets "no matching
+# version" for a module not yet pushed, which is a clean failure rather
+# than a wrong resolution. Moving to --atomic means creating the GitHub
+# releases from here with gh instead of relying on the push event.
+#
+# The root is guarded and tagged first, then each nested module, because
+# a nested module's guard proves the root tag of that version names this
+# commit — which it cannot do before that tag exists. Every tag is local
+# until the push; if a guard refuses, undo with git reset --hard HEAD~1
+# and git tag -d the tags written.
+#
 # TRAILER, when set, is appended to the commit message.
+#
+# The changelog is dated through a temp file rather than sed -i, which is
+# a GNU-ism: BSD sed reads the argument after -i as a backup suffix, so
+# the GNU spelling fails outright on macOS, where these releases are cut.
+# The temp file is removed if sed dies, so a failed run leaves nothing
+# untracked behind for the clean-tree gate to trip over next time.
 release:
 	@test -n "$(VERSION)" || { echo "usage: make release VERSION=vX.Y.Z"; exit 1; }
+	@test "$(origin SUBMODULES)" = file || { echo "do not override SUBMODULES here: a command-line override propagates into the bump, tidy and check below, so a module would be tagged having checked a subset."; exit 1; }
 	@grep -q '^## Unreleased$$' CHANGELOG.md || { echo "CHANGELOG.md has no Unreleased section"; exit 1; }
 	@test -z "$$(git status --porcelain)" || { echo "working tree is not clean"; exit 1; }
-	@for m in $(SUBMODULES); do ( \
-	  cd $$m && $(GO) mod edit -require=$(MODULE)@$(VERSION) && \
-	  for s in $(SUBMODULES); do \
-	    if grep -q "^[[:space:]]*$(MODULE)/$$s " go.mod; then $(GO) mod edit -require=$(MODULE)/$$s@$(VERSION) || exit 1; fi; \
-	  done && $(GO) mod tidy ) || exit 1; done
-	sed -i 's/^## Unreleased$$/## $(VERSION) - '"$$(date +%F)"'/' CHANGELOG.md
+	@scripts/versions.sh set $(VERSION) $(SUBMODULES)
+	sed 's/^## Unreleased$$/## $(VERSION) - '"$$(date +%F)"'/' CHANGELOG.md > CHANGELOG.md.tmp \
+	  && mv CHANGELOG.md.tmp CHANGELOG.md \
+	  || { rm -f CHANGELOG.md.tmp; exit 1; }
 	$(MAKE) tidy
 	$(MAKE) check
+	@scripts/versions.sh check $(VERSION) $(SUBMODULES)
 	git add -A && git commit -q -m "Release $(VERSION)" $(if $(TRAILER),-m "$(TRAILER)")
-	@awk -v v="$(VERSION)" '/^## /{p=($$2==v)} p' CHANGELOG.md | sed '1s/.*/$(VERSION)/' > $(NOTES)
-	git tag -a $(VERSION) -F $(NOTES)
-	@for m in $(SUBMODULES); do git tag -a $$m/$(VERSION) -F $(NOTES) || exit 1; done
-	@rm -f $(NOTES)
+	@scripts/release-guard.sh "$(VERSION)"
+	@notes="$$(scripts/release-notes.sh $(VERSION))" || exit 1; \
+	 git tag -a $(VERSION) -m "$$notes"
+	@set -e; notes="$$(scripts/release-notes.sh $(VERSION))"; \
+	for m in $(SUBMODULES); do \
+	  scripts/release-guard.sh "$$m/$(VERSION)"; \
+	  git tag -a $$m/$(VERSION) -m "$$notes"; \
+	done
 	git push origin HEAD
-	@for t in $(VERSION) $(patsubst %,%/$(VERSION),$(SUBMODULES)); do git push origin $$t || exit 1; done
+	@for t in $(RELEASE_TAGS); do git push origin $$t || exit 1; done
 
 clean:
 	rm -rf .cache
