@@ -33,15 +33,49 @@ echo "release-guard: $TAG"
 [ -z "$(git status --porcelain)" ] || die "working tree is dirty; commit or stash first"
 ok "working tree clean"
 
+# --- What origin has published ----------------------------------------
+# The version floor has to come from what is published, not from what
+# this checkout happens to know. A clone that has not fetched recently
+# carries a stale floor, and a version that sorts below one already on
+# the proxy is the one mistake with no remedy: proxy.golang.org and
+# sum.golang.org serve both forever and nobody can supersede the older
+# content. Reading only local tags made this script approve exactly that.
+#
+# git ls-remote is read-only, so unlike a git fetch --tags at the top of
+# a check it does not mutate the caller's tag state as a side effect.
+#
+# It fails closed. If origin cannot be reached then the push could not
+# have succeeded either, so refusing costs a release nothing, while a
+# silent fallback to local tags would reinstate the stale floor on
+# precisely the day the network is unreliable.
+REMOTE_LS="$(git ls-remote --tags origin 2>&1)" \
+  || die "cannot read the published tags from origin:
+            $REMOTE_LS
+            The floor is what origin has published, so there is no safe answer
+            without it, and a push could not have succeeded either."
+
+# ls-remote returns the peeled ^{} refs alongside the tags; drop them.
+REMOTE_TAGS="$(printf '%s\n' "$REMOTE_LS" | sed -e 's|.*refs/tags/||' -e '/\^{}$/d')"
+
+# The floor is the union of local and remote. Remote alone would break
+# make release: it writes the root tag locally and does not push until
+# the end, so the checks below still have to see local tags.
+ALL_TAGS="$( { git tag -l; printf '%s\n' "$REMOTE_TAGS"; } | sort -u )"
+
+# Tags matching a pattern, from that union. grep exits 1 on no match,
+# which errexit would take as a failure, so the empty case is explicit.
+matching() { printf '%s\n' "$ALL_TAGS" | grep -E "$1" || true; }
+ok "read the published tags from origin"
+
 git rev-parse -q --verify "refs/tags/$TAG" >/dev/null \
   && die "tag $TAG already exists locally"
-[ -z "$(git ls-remote --tags origin "refs/tags/$TAG")" ] \
-  || die "tag $TAG already exists on origin"
+printf '%s\n' "$REMOTE_TAGS" | grep -qxF -- "$TAG" \
+  && die "tag $TAG already exists on origin"
 ok "tag is new"
 
 # --- Root version already released ------------------------------------
 # Nested tags are <dir>/vX.Y.Z, so 'v*' matches root tags only.
-ROOT_LATEST="$(git tag -l 'v*' | newest)"
+ROOT_LATEST="$(matching '^v' | newest)"
 [ -n "$ROOT_LATEST" ] || die "no root tag found; cannot establish the version floor"
 
 case "$TAG" in
@@ -69,7 +103,7 @@ case "$TAG" in
 
     # And it has to move that module forward too, or the proxy keeps
     # serving the older content under a version nobody can supersede.
-    DIR_LATEST="$(git tag -l "$DIR/v*" | sed "s|^$DIR/||" | newest)"
+    DIR_LATEST="$(matching "^$DIR/v" | sed "s|^$DIR/||" | newest)"
     if [ -n "$DIR_LATEST" ]; then
       [ "$(printf '%s\n%s\n' "$DIR_LATEST" "$VERSION" | newest)" = "$VERSION" ] \
         || die "$VERSION does not sort above $DIR's current release $DIR_LATEST"
