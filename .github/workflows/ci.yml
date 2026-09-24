@@ -57,12 +57,30 @@ jobs:
       - name: govulncheck
         run: make vuln
 
+  # The one job that resolves a nested module's require lines. Every
+  # other job builds inside the tree, where the replace answers first and
+  # those lines are never read; a consumer reads nothing else. A version
+  # string is all the other guards check; this one compiles against it.
+  extracted:
+    name: Nested modules build extracted
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            **/go.sum
+      - name: Every nested module builds against the versions it requires
+        run: make extracted
+
   # Single required status check for branch protection; it fails if any job
   # above failed, was cancelled or was skipped.
   checks:
     name: Checks
     if: always()
-    needs: [test, lint]
+    needs: [test, lint, extracted]
     runs-on: ubuntu-latest
     steps:
       - name: Verify every job succeeded

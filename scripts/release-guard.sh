@@ -134,13 +134,41 @@ case "$TAG" in
             $DIR would claim to be built against a root it was not built against"
     ok "root $VERSION is this commit"
 
-    # Cheap proof the replace resolves and the module is buildable as
-    # published. The heavy vet and test already ran under make check,
-    # against this same code.
-    echo "  ..  building $DIR outside the workspace"
-    (cd "$DIR" && GOWORK=off go build ./...) \
-      || die "$DIR does not build outside the workspace"
-    ok "builds outside the workspace"
+    # Build, vet and test it the way a consumer gets it: extracted, with
+    # the replace dropped, so the require line above is resolved from the
+    # proxy rather than from the directory next door.
+    #
+    # This line used to read (cd "$DIR" && GOWORK=off go build ./...),
+    # described as proof the module "is buildable as published". It was
+    # that, once. A nested go.mod carrying replace <root> => .. makes
+    # GOWORK=off resolve the root from the tree, so it became a build of
+    # the tree against itself — make build, run twice — while still
+    # printing ok. check-extracted.sh restores what the line claimed.
+    #
+    # It can only run once the root version is on the proxy, and during
+    # make release it is not: the root tag is written locally and pushed
+    # on the last line. Nothing is lost by skipping it there. The two
+    # checks immediately above have already established that every
+    # first-party require names $VERSION and that root $VERSION is this
+    # commit, so root $VERSION *is* this tree, and make check compiled
+    # $DIR against this tree before the release commit was written. The
+    # extracted build would re-derive that through the proxy. Where it
+    # earns its keep is on a require naming an earlier release, which is
+    # every run outside make release: CI on pull requests and on main,
+    # and make release-guard on a tag whose root is already published.
+    # go list -m reports every module in the workspace, so the root has
+    # to be asked for outside it.
+    MODULE="$(GOWORK=off go list -m)"
+    if [ -z "$(GOWORK=off go list -m -e -f '{{with .Error}}{{.Err}}{{end}}' \
+                 "$MODULE@$VERSION")" ]; then
+      scripts/check-extracted.sh "$DIR" \
+        || die "$DIR does not build against $MODULE@$VERSION as a consumer gets it"
+    else
+      echo "  --  $MODULE@$VERSION is not on the proxy yet, so $DIR cannot be"
+      echo "      built the way a consumer gets it. Root $VERSION is this commit"
+      echo "      and make check compiled $DIR against it, so nothing is unproven;"
+      echo "      the extracted build runs in CI once the tags are pushed."
+    fi
     ;;
 
   *)
