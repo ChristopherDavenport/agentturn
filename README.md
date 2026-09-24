@@ -312,9 +312,10 @@ which the transcript was split, so a recorder can write it.
 part of the folded prefix they were in, they follow the summary in the
 request, so an injected reminder stays the reminder instead of
 becoming a clause of a summary. The fold summarises them too, so
-nothing is lost if the pin is later dropped; until the session format
-can describe a pinned item, the calls after such a fold are recorded
-without a request hash and the compaction entry names what was kept.
+nothing is lost if the pin is later dropped. The compaction entry names
+what was kept in its `pinned` member, which the context algorithm
+places after the summary, so the calls after such a fold keep their
+request hashes and a resumed session still carries the pinned items.
 
 `session` subscribes an `Agent` to an `agentsession` store: items on
 `item_end`, the `response` entry with its request hash on

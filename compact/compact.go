@@ -88,12 +88,11 @@ func WithKeepLast(n int) Option { return func(t *Transform) { t.keepLast = n } }
 // gave once. [WithKeepLast] keeps a window at the end; this keeps a
 // member of the part that is folded.
 //
-// A pinned item is one the request carries that the stored path does
-// not rebuild, because a compaction entry names where the kept tail
-// starts and nothing else. A session recorder therefore records the
-// calls after such a fold without a request hash, naming the pinned
-// items in the compaction entry, rather than recording a hash that
-// would not verify.
+// A pinned item is on the request and not in the transcript, so a
+// session recorder names it in the compaction entry, whose pinned
+// member the context algorithm places after the summary. The calls
+// after such a fold therefore keep their request hashes, and a session
+// resumed from the record still carries the pinned items.
 func WithPin(fn func(openresponses.Item) bool) Option {
 	return func(t *Transform) { t.pin = fn }
 }

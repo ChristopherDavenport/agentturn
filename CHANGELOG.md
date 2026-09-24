@@ -5,6 +5,40 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- **Fixed**: a fold that pinned items, `compact.WithPin`, is written to
+  the compaction entry's `pinned` member, which the context algorithm
+  places after the summary as the request carries it. The recorder put
+  them in the `fold` extension member instead, which `BuildContext`
+  never reads, so the context rebuilt from the record was missing them
+  and the recorder declined a request hash it could not stand behind.
+  The calls after such a fold now keep their hashes,
+  `Session.RequestContext` rebuilds the input that was sent, and the
+  pinned items are in the context `Resume` and `Continue` seed from, so
+  the pin predicate still has something to match after a restart. The
+  v0.0.7 entry below says those calls are recorded without a hash; that
+  was the behaviour until this release. (#78)
+
+  **Breaking, in the fold member.** `session.FoldCall.Pinned` is gone:
+  the pinned items are the format's now, and the member names the
+  fold's own model call and nothing else. A session written by v0.0.7
+  with a pinned fold still carries them under `fold.pinned`, still has
+  no request hashes on the calls after the fold, and is not repaired by
+  reading it with this release — nothing about that file is wrong, it
+  is short the member the context algorithm reads.
+
+- **Breaking, in what is recorded.** A run whose segment holds no
+  response of its own is written as `stopped` only when it answered a
+  call an earlier run's model call made and left no call on the path
+  without an output, and as `aborted` otherwise. v0.0.7 wrote `stopped`
+  for every responseless segment, which disagrees with
+  `agentsession.ComputeReason` for a run that answered nothing or that
+  answered only part of what was pending, and so failed `Run.Verify`.
+  The loop cannot produce either of those shapes — `Resume` refuses a
+  partial answer — so this reaches a host driving `agentturn.Run`
+  itself through the public `Recorder.Handle`. (#78)
+
 ## v0.0.7 - 2026-09-23
 
 - Requires `agentsession` v0.0.7, `agenttool` v0.0.7 and `openresponses`
@@ -16,6 +50,20 @@ versions may break the API.
   step, so `stopped` is now what the segment reads and what
   `Run.Verify` accepts; writing `aborted` was the accommodation the old
   cascade forced, and it now fails verification.
+
+  **Sessions written before v0.0.7 are affected, and they are not
+  corrupt.** One of them that holds a terminating resume or a refusal
+  on resume carries `"reason": "aborted"` on that run entry, which was
+  the right value under RFC 0001 draft 0.2. Draft 0.3 moved the answer,
+  so reading the same file with `agentsession` v0.0.6 or later fails
+  `Run.Verify`, `VerifyRecords` and the `agentsession verify` CLI with
+  *run end disagrees with its segment: … wrote aborted, segment reads
+  stopped*. Nothing else about the file changed and no item, response
+  or hash is wrong; it is the reader's rule that moved under it.
+  Sessions written from v0.0.7 on carry `stopped` and verify. There is
+  no migration for the old ones: rewriting the run entry's reason in
+  place is the only fix, and whether that is worth doing is a judgement
+  about the archive, not about the file. (#78)
 - The `session` tests accept `agentsession.ErrNoHash` from `Verify`,
   which agentsession v0.0.6 added for a response that recorded no
   request hash. The recorder legitimately writes none whenever a layer
