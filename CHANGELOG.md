@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.7 - 2026-09-23
 
 - Requires `agentsession` v0.0.7, `agenttool` v0.0.7 and `openresponses`
   v0.0.12, up from v0.0.5, v0.0.5 and v0.0.9.
