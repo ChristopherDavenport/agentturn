@@ -5,6 +5,19 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- `docs/rfcs/0001-agent-loop.md` states the loop's contract as draft
+  0.1, structured as agentsession's and agenttool's RFC 0001: the
+  transcript, the request procedure, the phases of a turn, the batch
+  and its decisions, the run end with its reasons and causes, pending
+  calls and the resume, cancellation, the event catalogue with its
+  order and invariants, delivery, the queues, the hooks and their
+  chains, nested calls, composition, what each event gives the
+  record, the Go binding as a table, and conformance. The open
+  questions name the issues that track each gap. No behaviour
+  changes. (#81)
+
 ## v0.0.8 - 2026-09-23
 
 - **Fixed**: a fold that pinned items, `compact.WithPin`, is written to

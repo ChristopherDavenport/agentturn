@@ -344,7 +344,8 @@ A second run under one call continues the child's session at its leaf;
 
 ## Design
 
-The plan is `docs/plans/agent-layer.md`. Invariants the tests hold:
+The contract is `docs/rfcs/0001-agent-loop.md`, the plan behind it
+`docs/plans/agent-layer.md`. Invariants the tests hold:
 
 - The transcript after a run is a valid Open Responses input: every
   `function_call` is answered before the next user message, or the run
