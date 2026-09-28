@@ -57,9 +57,18 @@ pr_field() {
 }
 
 # checks_ok <pr>: every CI job succeeded, or only the extracted job and
-# its aggregate failed and that was allowed.
+# its aggregate failed and that was allowed. A job still running is
+# waited for, up to twenty minutes, since a PR pushed moments ago has
+# its CI in flight and that is not a failure.
 checks_ok() {
-  local bad rest
+  local bad rest pending
+  for _ in $(seq 1 80); do
+    pending=$(pr_field "$1" '[.statusCheckRollup[]? | select((.status // "COMPLETED") != "COMPLETED") | (.name // .context)] | join(",")')
+    [ -n "$pending" ] || break
+    say "  waiting for CI on #$1: $pending"
+    sleep 15
+  done
+  [ -z "$pending" ] || { echo "  !!  CI still running on #$1 after twenty minutes: $pending" >&2; return 1; }
   bad=$(pr_field "$1" '[.statusCheckRollup[]? | select((.conclusion // .state) != "SUCCESS") | (.name // .context)] | join(",")')
   [ -z "$bad" ] && return 0
   if [ "$ALLOW_EXTRACTED" = 1 ]; then
