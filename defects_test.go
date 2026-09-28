@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -361,12 +362,13 @@ func TestAbortWithFailingAfterCallHookPairsEveryCall(t *testing.T) {
 // failure stops the tools and the executor is drained before the batch
 // is settled, so a tool's tool_end follows its return, the nested
 // events it raises on the way out precede it, and a result it returns
-// of its own is finished and appended rather than cut.
+// of its own is settled and appended rather than cut. The failure is a
+// consumer's, so the hook still stands to judge the drained results.
 func TestFailureMidBatchDrainsTheExecutor(t *testing.T) {
-	boom := errors.New("hook boom")
-	// The hook fails on a only once b and c have started, so the
-	// failure cuts a running batch rather than one the executor has
-	// not spawned yet.
+	boom := errors.New("consumer boom")
+	// The consumer fails on a's tool_end only once b and c have
+	// started, so the failure cuts a running batch rather than one the
+	// executor has not spawned yet.
 	bStarted, cStarted := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	fast := agenttool.New("a", "", func(context.Context, echoArgs) (string, error) { return "a", nil })
@@ -384,18 +386,21 @@ func TestFailureMidBatchDrainsTheExecutor(t *testing.T) {
 		_, _ = Invoke(ctx, "c", json.RawMessage(`{"text":"t"}`))
 		return "b done", nil
 	})
-	cfg := Config{Model: twoCalls{}, Tools: []agenttool.Tool{fast, slow, inner},
-		AfterToolCall: func(_ context.Context, info ToolResultInfo) (*ToolOverride, error) {
-			if info.Call.Name == "a" {
-				<-bStarted
-				<-cStarted
-				return nil, boom
-			}
-			return nil, nil
-		}}
+	cfg := Config{Model: twoCalls{}, Tools: []agenttool.Tool{fast, slow, inner}}
 	// twoCalls calls every offered tool, c included, so c also runs as
 	// a call of the batch; that one is plain and finishes on its own.
-	events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
+	a := New(cfg)
+	var events []Event
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		events = append(events, ev)
+		if e, ok := ev.(*ToolEnd); ok && e.Name == "a" {
+			<-bStarted
+			<-cStarted
+			return boom
+		}
+		return nil
+	})
+	end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
 	if !errors.Is(err, boom) || end.Reason != ReasonError {
 		t.Fatalf("run: err=%v reason=%s", err, end.Reason)
 	}
@@ -421,19 +426,21 @@ func TestFailureMidBatchDrainsTheExecutor(t *testing.T) {
 	if len(seq) != 3 || seq[0] != "nested_start" || seq[1] != "nested_end" || seq[2] != "end_b" {
 		t.Errorf("order: %v", seq)
 	}
-	// b returned a result of its own after the cut, so it is finished
-	// and its output appended; a's hook failed, so a is cut and pending.
+	// Every call finished with a result of its own: a's tool_end was
+	// raised before the consumer refused it, and b and c returned
+	// their own results during the drain; all three are appended and
+	// nothing is pending, though the run failed.
 	var outputs []string
 	for _, it := range end.Items {
 		if out, ok := it.(*openresponses.FunctionCallOutput); ok {
 			outputs = append(outputs, out.Output.Text)
 		}
 	}
-	if len(outputs) != 2 || outputs[0] != "b done" && outputs[1] != "b done" {
-		t.Errorf("outputs: %v, want b's and c's", outputs)
+	if len(outputs) != 3 || !slices.Contains(outputs, "b done") {
+		t.Errorf("outputs: %v, want a's, b's and c's", outputs)
 	}
-	if len(end.Pending) != 1 || end.Pending[0].Call.Name != "a" || end.Pending[0].Reason != PendingAborted {
-		t.Errorf("pending: %v", pendingReasons(end))
+	if len(end.Pending) != 0 {
+		t.Errorf("pending: %v, want none", pendingReasons(end))
 	}
 }
 
@@ -564,6 +571,83 @@ func TestApprovedBatchFailuresPair(t *testing.T) {
 			starts, ends, unpaired := pairing(events)
 			if starts == 0 || starts != ends || len(unpaired) != 0 {
 				t.Errorf("pairing: starts=%d ends=%d unpaired=%v", starts, ends, unpaired)
+			}
+		})
+	}
+}
+
+// TestDrainedResultsSeeTheHook pins the redaction rule of a failed
+// batch: a result that arrives while the executor is drained goes
+// through the after-call hook when a consumer caused the failure, and
+// is cut when the hook itself did, so nothing the hook would have
+// replaced reaches tool_end, a recorder or the transcript.
+func TestDrainedResultsSeeTheHook(t *testing.T) {
+	boom := errors.New("boom")
+	for _, hookFails := range []bool{false, true} {
+		name := "subscriber fails"
+		if hookFails {
+			name = "hook fails"
+		}
+		t.Run(name, func(t *testing.T) {
+			bStarted := make(chan struct{})
+			fast := agenttool.New("a", "", func(context.Context, echoArgs) (string, error) { return "a", nil })
+			slow := agenttool.New("b", "", func(ctx context.Context, _ echoArgs) (string, error) {
+				close(bStarted)
+				<-ctx.Done()
+				if !errors.Is(context.Cause(ctx), boom) {
+					t.Errorf("b sees cause %v, want the failure", context.Cause(ctx))
+				}
+				return "SECRET-TOKEN", nil
+			})
+			cfg := Config{Model: twoCalls{}, Tools: []agenttool.Tool{fast, slow},
+				AfterToolCall: func(_ context.Context, info ToolResultInfo) (*ToolOverride, error) {
+					if info.Call.Name == "a" {
+						<-bStarted
+						if hookFails {
+							return nil, boom
+						}
+						return nil, nil
+					}
+					return &ToolOverride{Result: agenttool.Text("[redacted]")}, nil
+				}}
+			a := New(cfg)
+			var events []Event
+			a.Subscribe(func(_ context.Context, ev Event) error {
+				events = append(events, ev)
+				if e, ok := ev.(*ToolEnd); ok && e.Name == "a" && !hookFails {
+					return boom
+				}
+				return nil
+			})
+			end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+			if !errors.Is(err, boom) || end.Reason != ReasonError {
+				t.Fatalf("run: err=%v reason=%s", err, end.Reason)
+			}
+			if starts, ends, unpaired := pairing(events); starts != 2 || ends != 2 || len(unpaired) != 0 {
+				t.Errorf("pairing: starts=%d ends=%d unpaired=%v", starts, ends, unpaired)
+			}
+			for _, ev := range events {
+				if e, ok := ev.(*ToolEnd); ok && strings.Contains(e.Result.Output.Text, "SECRET") {
+					t.Errorf("tool_end for %s carries the unredacted output", e.Name)
+				}
+			}
+			var bOut string
+			for _, it := range end.Items {
+				if out, ok := it.(*openresponses.FunctionCallOutput); ok {
+					bOut = out.Output.Text
+				}
+			}
+			if strings.Contains(bOut, "SECRET") {
+				t.Errorf("transcript carries the unredacted output: %q", bOut)
+			}
+			if hookFails {
+				if bOut != "" || len(end.Pending) != 2 {
+					t.Errorf("hook failed: output %q pending %v, want b cut", bOut, pendingReasons(end))
+				}
+			} else if bOut != "[redacted]" || len(end.Pending) != 0 {
+				// a's tool_end was raised before the consumer refused
+				// it, so a is finished too, and nothing is pending.
+				t.Errorf("subscriber failed: output %q pending %v, want b redacted and appended", bOut, pendingReasons(end))
 			}
 		})
 	}

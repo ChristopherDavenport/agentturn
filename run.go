@@ -1115,23 +1115,35 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 	}
 	exec := agenttool.Executor{MaxParallel: r.cfg.MaxParallelTools, Sequential: r.cfg.ToolExecution == ExecSequential}
 	// The batch has a context of its own, so a failure can stop the
-	// tools and the executor still be drained: every result it holds
-	// is received, as an abort receives them, before the batch is
-	// settled. Leaving the range would cancel and wait too, but would
-	// lose the results that arrive while it waits.
-	bctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// tools, with the failure as the cause a tool reads, and the
+	// executor still be drained: every result it holds is received,
+	// as an abort receives them, before the batch is settled. Leaving
+	// the range would cancel and wait too, but would lose the results
+	// that arrive while it waits.
+	bctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	var failed error
+	// hookFailed says the failure was the after-call hook's own, so a
+	// result arriving during the drain has nowhere to be judged and is
+	// cut; a consumer's failure leaves the hook standing, and such a
+	// result goes through it as any other, since the hook is the point
+	// past which nobody sees what a tool returned.
+	hookFailed := false
 	for ev := range exec.Execute(bctx, jobs) {
 		p := batch[jobIndex[ev.Index]]
 		if failed != nil {
-			// The batch is being drained: a call that returns a
-			// result of its own before the cancellation reaches it
-			// is finished and ended without the hook; one that
-			// returns the cancellation is left for failBatch to cut.
-			if ev.Final && !isCancellation(ev.Err, bctx) {
-				p.result, p.err = ev.Result, ev.Err
-				p.settled = true
+			if !ev.Final || isCancellation(ev.Err, bctx) || hookFailed {
+				// Cut, or nothing to end yet: failBatch ends what
+				// has not ended once the drain is over.
+				continue
+			}
+			// A result of the call's own, before the cancellation
+			// reached it: settled through the hook, and cut if the
+			// hook refuses it too.
+			p.result, p.err = ev.Result, ev.Err
+			p.settled = true
+			if serr := r.settle(ctx, p); serr != nil && !p.ended {
+				p.cut, p.err, p.result = true, serr, agenttool.Result{}
 				_ = r.finish(p)
 			}
 			continue
@@ -1141,12 +1153,15 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 			p.result, p.err = ev.Result, ev.Err
 			p.settled = true
 			err = r.settle(ctx, p)
+			// settle ends the call before it delivers, so a call left
+			// unended is one the hook refused.
+			hookFailed = err != nil && !p.ended
 		} else {
 			err = r.emit(&ToolUpdate{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Partial: ev.Result})
 		}
 		if err != nil {
 			failed = err
-			cancel()
+			cancel(err)
 		}
 	}
 	if failed != nil {
@@ -1329,9 +1344,12 @@ func (r *runner) settle(ctx context.Context, p *callState) error {
 
 // finish ends a call whose result and error are decided: the error
 // becomes the output the model sees, the decision's hint is composed
-// in, and tool_end is raised. It is the one place a call is ended, so
-// a call is never ended twice, and it runs no hook: settle runs the
-// after-call hook and then this; a cut call comes here directly.
+// in, and tool_end is raised. Every call that ran or was cut ends
+// here, so none is ended twice, and it runs no hook: settle runs the
+// after-call hook and then this; a cut call comes here directly. A
+// deferred call is the one exception, ended in preflight with an
+// empty result, since nothing ran and nothing was decided about a
+// result.
 func (r *runner) finish(p *callState) error {
 	if p.err != nil {
 		terminate := p.result.Terminate

@@ -14,10 +14,12 @@ versions may break the API.
   outputs of the calls that finished with a result of their own are
   appended, and the rest are pending as `aborted`; a call whose
   after-call hook failed has no result and is cut. The failure stops
-  the batch's tools through their context and the executor is drained
-  before anything is ended, as under an abort, so a call that returns
-  its own result on the way out is finished and appended, and a tool's
-  `tool_end` follows its return. An abort that a subscriber or the
+  the batch's tools through their context, with the failure as the
+  cause, and the executor is drained before anything is ended, as
+  under an abort, so a call that returns its own result on the way out
+  is settled through the after-call hook and appended, or cut when the
+  hook itself was what failed, and a tool's `tool_end` follows its
+  return. An abort that a subscriber or the
   after-call hook fails inside now ends every cut call before the
   failure is reported, the remaining cut calls skipping the hook, and
   a nested call whose hook or delivery failed gets its `tool_end`

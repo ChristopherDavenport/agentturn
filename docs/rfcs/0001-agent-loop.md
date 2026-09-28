@@ -533,13 +533,18 @@ failure cuts appends the outputs of the calls that finished and drops
 their notes. A call is **finished** when it settled with a result of
 its own, from its tool or the after-call hook, and its `tool_end` was
 raised; a call whose after-call hook failed has no result and is cut.
-A failure stops the batch's tools through their context and the loop
-still receives every result the executor holds, as it does under a
-cancellation: a call that returns a result of its own before the
-cancellation reaches it is finished, ended without the hook, and its
-output appended; one that returns the cancellation is cut. A tool's
-`tool_end` therefore follows the tool's return, and the events of a
-nested call the tool makes on its way out precede it.
+A failure stops the batch's tools through their context, with the
+failure as the cancellation's cause, and the loop still receives every
+result the executor holds, as it does under a cancellation. A call
+that returns a result of its own before the cancellation reaches it is
+settled through the after-call hook as any other, since the hook is
+the point past which nobody sees what a tool returned, and is then
+finished and its output appended, or cut if the hook refuses it too.
+When the failure was the hook's own, no such result can be judged, and
+every call that returns one is cut. One that returns the cancellation
+is cut either way. A tool's `tool_end` therefore follows the tool's
+return, and the events of a nested call the tool makes on its way out
+precede it.
 
 The executor is given the configuration's execution mode and bound.
 The loop SHOULD also install the harness's tool recorder on it, so a
