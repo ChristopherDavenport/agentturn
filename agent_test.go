@@ -544,7 +544,7 @@ func TestAgentResumeApproves(t *testing.T) {
 		t.Errorf("transcript = %q", itemTypes(st.Transcript))
 	}
 	got := rec.types()
-	want := []string{"run_start", "tool_start", "tool_end", "item_start", "item_end", "turn_start"}
+	want := []string{"run_start", "tool_start", "tool_dispatch", "tool_end", "item_start", "item_end", "turn_start"}
 	for i, w := range want {
 		if i >= len(got) || got[i] != w {
 			t.Fatalf("resume events = %v, want prefix %v", got, want)

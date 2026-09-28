@@ -827,7 +827,10 @@ func TestRecordableDetailsBecomeACustomEntry(t *testing.T) {
 		return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: "first 4 KB ... last 4 KB"}, Details: sideData{Path: "/tmp/out.log", Bytes: 300_000}}, nil
 	})
 	plain := agenttool.New("plain", "", func(_ context.Context, _ echoArgs) (string, error) { return "x", nil })
-	a := agentturn.New(agentturn.Config{Model: allCalls{}, Tools: []agenttool.Tool{keeper, plain}})
+	// A serial batch, so the dispatches fall in one order: the executor
+	// hands the second call over as soon as the first returns, before
+	// the loop has settled the first, so its record follows both.
+	a := agentturn.New(agentturn.Config{Model: allCalls{}, Tools: []agenttool.Tool{keeper, plain}, ToolExecution: agentturn.ExecSequential})
 	defer rec.Attach(a)()
 	if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
 		t.Fatal(err)

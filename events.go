@@ -10,8 +10,8 @@ import (
 
 // Event is one step of a run. Concrete types are [RunStart], [TurnStart],
 // [ModelRetry], [ModelBlocked], [ItemStart], [ItemUpdate], [ItemEnd],
-// [ResponseEnd], [ToolStart], [ToolUpdate], [ToolEnd], [TurnEnd] and
-// [RunEnd], and [Queued], which belongs to no run. Decoded values are
+// [ResponseEnd], [ToolStart], [ToolDispatch], [ToolUpdate], [ToolEnd],
+// [TurnEnd] and [RunEnd], and [Queued], which belongs to no run. Decoded values are
 // pointers, so switch on *ItemUpdate and so on.
 type Event interface {
 	EventType() string
@@ -28,6 +28,7 @@ const (
 	EventItemUpdate   = "item_update"
 	EventItemEnd      = "item_end"
 	EventToolStart    = "tool_start"
+	EventToolDispatch = "tool_dispatch"
 	EventToolUpdate   = "tool_update"
 	EventToolEnd      = "tool_end"
 	EventTurnEnd      = "turn_end"
@@ -267,6 +268,29 @@ type ToolStart struct {
 
 // EventType returns "tool_start".
 func (*ToolStart) EventType() string { return EventToolStart }
+
+// ToolDispatch reports that a call has been handed to its tool: it has
+// taken a slot in the batch's bound and its turn in its chain, and the
+// tool is about to run. tool_start says the call was decided; this
+// says it started, which for a batch wider than the bound or serial
+// by a tool's request is later, and for a call cut off in between
+// never. It is where a session recorder writes the dispatch entry, so
+// a call cut off before it reads as never started and one cut off
+// after as possibly run. It is raised on the call's own goroutine,
+// serialised with the run's events, and a subscriber that fails on it
+// stops the call: it ends with that error and the tool does not run,
+// so a dispatch that could not be made durable is never followed by a
+// side effect the record cannot see. Parent is set for a nested call.
+type ToolDispatch struct {
+	RunID  string
+	Turn   int
+	CallID string
+	Name   string
+	Parent string
+}
+
+// EventType returns "tool_dispatch".
+func (*ToolDispatch) EventType() string { return EventToolDispatch }
 
 // ToolUpdate carries progress from a running tool.
 type ToolUpdate struct {

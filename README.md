@@ -108,7 +108,7 @@ run, in order:
 | `model_retry` | a transient model failure about to be retried under `Config.Retry`: attempt, error, delay |
 | `item_start`, `item_update`, `item_end` | an item entering the transcript; `item_update` wraps the wire `StreamEvent` verbatim |
 | `response_end` | the folded `Response` with usage, before any tool of the turn runs |
-| `tool_start`, `tool_update`, `tool_end` | one tool call from preflight to result, `tool_end` in completion order |
+| `tool_start`, `tool_dispatch`, `tool_update`, `tool_end` | one tool call from preflight to result: `tool_start` when it is decided, in the model's order; `tool_dispatch` when it is handed to its tool; `tool_end` in completion order |
 | `turn_end` | the folded `Response` with usage, and the tool results |
 | `run_end` | the items added this run and the reason: done, stopped, input_required, aborted, error |
 

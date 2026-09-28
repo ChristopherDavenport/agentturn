@@ -366,12 +366,18 @@ func TestAbortWithFailingAfterCallHookPairsEveryCall(t *testing.T) {
 // consumer's, so the hook still stands to judge the drained results.
 func TestFailureMidBatchDrainsTheExecutor(t *testing.T) {
 	boom := errors.New("consumer boom")
-	// The consumer fails on a's tool_end only once b and c have
-	// started, so the failure cuts a running batch rather than one the
-	// executor has not spawned yet.
+	// a returns only once b and c have started, so the consumer's
+	// failure on a's tool_end cuts a running batch rather than one the
+	// executor has not spawned yet. The wait is in the tool, not in the
+	// subscriber: a subscriber holds the delivery barrier, which b's
+	// and c's tool_dispatch need before their tools run.
 	bStarted, cStarted := make(chan struct{}), make(chan struct{})
 	var once sync.Once
-	fast := agenttool.New("a", "", func(context.Context, echoArgs) (string, error) { return "a", nil })
+	fast := agenttool.New("a", "", func(context.Context, echoArgs) (string, error) {
+		<-bStarted
+		<-cStarted
+		return "a", nil
+	})
 	inner := agenttool.New("c", "", func(context.Context, echoArgs) (string, error) {
 		once.Do(func() { close(cStarted) })
 		return "c", nil
@@ -394,8 +400,6 @@ func TestFailureMidBatchDrainsTheExecutor(t *testing.T) {
 	a.Subscribe(func(_ context.Context, ev Event) error {
 		events = append(events, ev)
 		if e, ok := ev.(*ToolEnd); ok && e.Name == "a" {
-			<-bStarted
-			<-cStarted
 			return boom
 		}
 		return nil
@@ -590,7 +594,13 @@ func TestDrainedResultsSeeTheHook(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			bStarted := make(chan struct{})
-			fast := agenttool.New("a", "", func(context.Context, echoArgs) (string, error) { return "a", nil })
+			// a returns once b has started; the wait is in the tool so
+			// that no subscriber holds the delivery barrier b's
+			// tool_dispatch needs.
+			fast := agenttool.New("a", "", func(context.Context, echoArgs) (string, error) {
+				<-bStarted
+				return "a", nil
+			})
 			slow := agenttool.New("b", "", func(ctx context.Context, _ echoArgs) (string, error) {
 				close(bStarted)
 				<-ctx.Done()
@@ -602,7 +612,6 @@ func TestDrainedResultsSeeTheHook(t *testing.T) {
 			cfg := Config{Model: twoCalls{}, Tools: []agenttool.Tool{fast, slow},
 				AfterToolCall: func(_ context.Context, info ToolResultInfo) (*ToolOverride, error) {
 					if info.Call.Name == "a" {
-						<-bStarted
 						if hookFails {
 							return nil, boom
 						}

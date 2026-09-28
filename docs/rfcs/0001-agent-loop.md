@@ -506,9 +506,17 @@ batch, with the configuration's execution mode and bound and each
 call's arguments as decided. The executor's rules are agenttool RFC
 0001's: results matched by call, completion order free, one sequential
 tool serialising the batch, a shared resource serialising its calls,
-cancellation waited for. A `tool_update` is raised for each progress
-update a tool sends, and each call is settled as it completes, in
-completion order:
+cancellation waited for. A `tool_dispatch` is raised as each call is
+handed to its tool, after it has taken a slot in the bound and its turn
+in a serial batch or a resource chain, and before the tool runs; a call
+the cut reaches first never reached a tool and raises none. It is
+raised on the call's own goroutine, serialised with the run's events,
+and the executor waits on it, so a recorder has the dispatch durable
+before the side effect. A consumer that fails on it stops the call
+before its tool runs and fails the run as any delivery failure does,
+with the call pending as `aborted` and no side effect behind it. A
+`tool_update` is raised for each progress update a tool sends, and
+each call is settled as it completes, in completion order:
 
 1. The **after-call hook** sees the call, its result and its error,
    and MAY replace either. An override replaces the result before
@@ -546,10 +554,11 @@ is cut either way. A tool's `tool_end` therefore follows the tool's
 return, and the events of a nested call the tool makes on its way out
 precede it.
 
-The executor is given the configuration's execution mode and bound.
-The loop SHOULD also install the harness's tool recorder on it, so a
-tool that writes a record while it runs, as agenttool RFC 0001 lets
-it, reaches the host; the reference installs none at draft 0.1 (#97).
+The executor is given the configuration's execution mode and bound,
+the harness's tool recorder when it has one, so a tool that writes a
+record while it runs, as agenttool RFC 0001 lets it, reaches the host
+with the call on the context, and the start callback that raises
+`tool_dispatch`.
 
 The context every hook and tool of the batch runs under carries the run
 ID, a snapshot of the working transcript as it stood when the batch
@@ -732,6 +741,7 @@ turn number. The catalogue, with the members beyond those two:
 | `item_end` | `item`, `response_id`, `hidden` | the item is complete and in the transcript |
 | `response_end` | `response` | the stream ended; before any tool of the turn runs |
 | `tool_start` | `call_id`, `name`, `args`, `decision`, `parent` | after preflight, in the model's order |
+| `tool_dispatch` | `call_id`, `name`, `parent` | the call has been handed to its tool, before the tool runs; after its `tool_start` and before its `tool_end` |
 | `tool_update` | `call_id`, `name`, `partial` | a progress update from a running tool |
 | `tool_end` | `call_id`, `name`, `result`, `error`, `blocked`, `deferred`, `parent` | the call settled, in completion order |
 | `turn_end` | `response`, `tool_results` | after the batch's outputs are appended |
@@ -773,10 +783,11 @@ queued*
 batch:
   (tool_start tool_end?)+               preflight, in order; tool_end here only for a
                                         call that will not run
-  (tool_update | tool_end | nested)*    completion order
+  (tool_dispatch | tool_update | tool_end | nested)*   completion order; a call's
+                                        tool_dispatch precedes its tool_end
   (item_start item_end)*                outputs, in order; then notes
 nested:
-  tool_start (tool_update | nested)* tool_end   a call a tool made, parent set
+  tool_start (tool_dispatch | tool_update | nested)* tool_end   a call a tool made, parent set
 ```
 
 ### Invariants
@@ -847,7 +858,9 @@ implementation would otherwise choose differently:
 - an error on `run_end` is ignored, since the run has already ended;
 - an error on a `queued` report delivered ahead of a run's event ends
   the run before that event is delivered to anyone;
-- an error on `model_blocked` replaces the hook's error as the run's.
+- an error on `model_blocked` replaces the hook's error as the run's;
+- an error on `tool_dispatch` stops that call before its tool runs, and
+  the run ends as for any delivery failure, with the call pending.
 
 A subscriber MUST NOT start a run from inside a delivery: a prompt, a
 continue or a resume made there is refused as one made during a run,
@@ -949,10 +962,12 @@ as if the model had asked for it under the call in flight:
   tool has, arguments that are not an object, or a refusal whose reason
   is the error;
 - a failure of the loop's own around the call — the decision hook
-  returning an error, a consumer failing on its `tool_start`, the
-  after-call hook or a consumer failing as it settles — is returned to
-  the invoking tool as the error and does not end the run; the tool
-  decides what its own result is. A call whose `tool_start` was raised
+  returning an error, a consumer failing on its `tool_start` or its
+  `tool_dispatch`, the after-call hook or a consumer failing as it
+  settles — is returned to the invoking tool as the error and does not
+  end the run; the tool decides what its own result is. A refused
+  `tool_dispatch` stops the nested tool as it stops any, and the
+  failure is the invoking tool's to answer rather than the run's. A call whose `tool_start` was raised
   gets its `tool_end` carrying the failure, so the pair holds for a
   nested call too. A decision hook error is returned before
   `tool_start`, so that call raises no events at all.
@@ -1045,9 +1060,10 @@ of the events.
 | `turn_start` | a `config` delta when the request's settings differ from the path's; the request hash is computed here and written on the response |
 | `model_retry` | a `config` delta when the revised request's settings differ |
 | `model_blocked` | a failed `response` carrying the hook's error and the request hash, so the call that was refused is told from one that was made and failed |
-| `item_end` | an `item`, with the display flag off for a hidden item. Before a caller-supplied output for a call that was neither dispatched nor rejected, a `reject` decision with the output's text as its reason and the decider the caller named; before one for a call dispatched in an earlier run, a `proceed` with the decider when one was named |
+| `item_end` | an `item`, with the display flag off for a hidden item. Before a caller-supplied output for a call that was neither dispatched nor rejected, a `reject` decision with the output's text as its reason and the decider the caller named, and `policy` as the decider when the loop refused the call itself in this run, for a name no tool has or arguments that are not an object; before one for a call dispatched in an earlier run, a `proceed` with the decider when one was named |
 | `response_end` | the `response`, with `request_hash` when the input the loop sent is the input the recorded path rebuilds, and none otherwise |
-| `tool_start` | a `decision`: `reject` with the reason for a block, `call blocked` when it gave none; `hold` for a defer, with the reason when given; `proceed` for a call that was held or whose arguments were rewritten, with the arguments. The decider is the decision's, and `policy` for a call nothing was holding whose decision names nobody. Then a `dispatch` for every call not blocked or deferred, durable before the tool runs. A nested call is a record entry instead |
+| `tool_start` | a `decision`: `reject` with the reason for a block, `call blocked` when it gave none; `hold` for a defer, with the reason when given; `proceed` for a call that was held or whose arguments were rewritten, with the arguments. The decider is the decision's, and `policy` for a call nothing was holding whose decision names nobody. A nested call is a record entry instead |
+| `tool_dispatch` | a `dispatch`, durable before the event returns, so the tool runs after it or not at all; nothing for a nested call |
 | `tool_end` | a recordable details value as a record entry in its namespace; a nested call's record; for a child run that was not observed, its session written from the items it added and its `link`; an observed child's `link` and session are written by the observer from the child's own events, starting at its `run_start` |
 | `turn_end` | nothing of its own |
 | `run_end` | first, when a `turn_start` had no `response_end`, a failed `response` carrying the run's error; then `run` end with the reason mapped onto the format's cascade: `done`, `input_required` and `error` as themselves, the error's text as `ref`; `aborted` as `interrupted` with the error's text, since the host asked; `stopped` as `stopped` when the last response made calls, as `done` when it made none, and for a run with no response of its own as `stopped` when it answered a pending call and left none, `aborted` otherwise, with the cause as `ref` |
@@ -1057,20 +1073,13 @@ of the events.
 Three rules follow from the writing discipline of that format and are
 met by the delivery rules here. An item is durable before the tool that
 reads it runs, because every event is a barrier. A `dispatch` is
-durable before the tool runs, because `tool_start` precedes execution.
-And every entry a cancellation leaves to write is written, because
-every event after a cancellation is delivered with a usable context.
-
-The `dispatch` row departs from the format in two ways this document
-intends to close. agenttool RFC 0001 says a call starts when it is
-handed to its tool and a harness that records a dispatch records it at
-that moment; the loop raises no event at that moment, so the reference
-writes it from `tool_start`, before the whole batch executes, and a
-call that never reached a tool reads as in flight (#93). And a
-`dispatch` is written for a call naming no tool or carrying bad
-arguments, which the format defines as a call handed to its tool. A
-loop SHOULD raise a per-call signal at hand-off, and a recorder SHOULD
-write the `dispatch` there and only for a call that is handed over.
+durable before the tool runs, because `tool_dispatch` is raised at
+hand-off and the executor waits on it; and it is written only for a
+call handed to its tool, as agenttool RFC 0001 requires of a harness
+that records one, so a call the cut reached first, or one the loop
+refused itself, has none and reads as never started. And every entry a
+cancellation leaves to write is written, because every event after a
+cancellation is delivered with a usable context.
 
 Two facts the record needs are supplied by the caller and carried by
 the loop unread: the trigger of a run, and who decided an answer. The
@@ -1099,7 +1108,8 @@ maps onto it as follows:
 | refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning` |
 | run ID, trigger, transcript on the context | `ContextWithRunID`/`RunIDFromContext`, `ContextWithTrigger`/`TriggerFromContext`, `ContextWithTranscript`/`TranscriptFromContext` |
 | source | `Source`: `SourceInput`, `SourceResume` |
-| events | `Event` with `EventType()`; `RunStart`, `TurnStart`, `ModelRetry`, `ModelBlocked`, `ItemStart`, `ItemUpdate`, `ItemEnd`, `ResponseEnd`, `ToolStart`, `ToolUpdate`, `ToolEnd`, `TurnEnd`, `RunEnd`, `Queued`; the `Event*` name constants |
+| events | `Event` with `EventType()`; `RunStart`, `TurnStart`, `ModelRetry`, `ModelBlocked`, `ItemStart`, `ItemUpdate`, `ItemEnd`, `ResponseEnd`, `ToolStart`, `ToolDispatch`, `ToolUpdate`, `ToolEnd`, `TurnEnd`, `RunEnd`, `Queued`; the `Event*` name constants |
+| tool recorder | `Config.ToolRecorder`, the executor's recorder for every batch; `session.Recorder.RecordFunc` is the value a session recorder offers |
 | reason, cause | `Reason` (`ReasonDone`, `ReasonStopped`, `ReasonInputRequired`, `ReasonAborted`, `ReasonError`); `StopCause` (`StopMaxTurns`, `StopHook`, `StopGuard`, `StopTerminate`, `StopPartialTerminate`, `StopRefused`) |
 | pending call | `PendingCall{Call, Reason}`; `PendingReason` (`PendingDeferred`, `PendingAborted`, `PendingUnknown`); `PendingCalls` |
 | decision | `ToolDecision{Action, Reason, Terminate, Args, By, Note}`; `ToolAction` (`Allow`, `Block`, `Defer`) |
@@ -1112,7 +1122,7 @@ maps onto it as follows:
 | the loop as a model | `front/responses.New(cfg)` → `openresponses.Adapter` |
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`; `tools/a2a.New(client, card)` |
-| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`; `session.RequestHash` |
+| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `RecordFunc`; `session.RequestHash` |
 
 Every error the package returns to its caller, sentinel or wrapped,
 begins with `agentturn:`; the error texts a call's output carries,
@@ -1122,9 +1132,6 @@ agenttool's executor
 into an error the model sees; a panic in a hook or a subscriber is not
 recovered and unwinds without a `run_end`.
 
-Where the binding does not yet do what this document says, the rule
-above says so in place and names the issue: the executor's recorder
-(#97) and the moment a `dispatch` is written (#93).
 
 ## Conformance
 
@@ -1156,7 +1163,8 @@ consumes events out, and nothing else; correlates `tool_end` with
 from deltas; and answers pending calls through the resume.
 
 **A conforming recorder** writes the entries the record table gives
-from the events it names, and declines a request hash for an input the
+from the events it names, writes the `dispatch` from `tool_dispatch`
+and from nothing earlier, and declines a request hash for an input the
 path cannot rebuild.
 
 ### The scenario corpus
@@ -1218,20 +1226,15 @@ module and is listed in the changelog as one.
 
 ## Open questions
 
-- **Dispatch per call, not per batch** (#93). The loop decides every
-  call before any executes, and `tool_start` is where a recorder
-  writes the `dispatch`, so every call of a batch is dispatched on disk
-  before the first tool runs; a call that provably never reached a
-  tool reads as in flight. agenttool now tells the harness when each
-  call is handed to its tool. Whether the loop raises a second signal
-  at that moment — a member on `tool_update`, a new event, or the
-  executor's callback exposed on the configuration — and whether
-  `tool_start` keeps its place before the batch, is open.
-- **The tool recorder** (#97). agenttool lets a tool write a record
-  while it runs, through a recorder the harness installs; the loop
-  installs none, so under it the write is a no-op and a tool killed
-  mid-call leaves nothing behind. Mirroring the executor's third field
-  on the configuration is the smallest fix.
+- **A `proceed` with no `dispatch` after it** (agentsession #78). With
+  the `dispatch` written at hand-off, an approval or a rewrite that a
+  cut or the loop's own refusal overtakes leaves a `proceed` decision
+  that no `dispatch` follows, which agentsession RFC 0001's `decision`
+  section does not admit and its verifier does not check. Whether the
+  format admits the shape, with a `reject` or the run's end saying the
+  call did not go, or a writer holds the `proceed` until the dispatch
+  and loses what the overtaken approval said, is agentsession's to
+  rule; the recorder writes the first shape until it does.
 - **Who closes a provided tool** (#95). The host closes what it built,
   and under a tool provider the host never holds the value. Documenting
   that a provider caches per session, or a release hook called after

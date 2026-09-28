@@ -201,8 +201,9 @@ func TestReplayedChildWritesNoDecisions(t *testing.T) {
 }
 
 // TestAnswerToAnAbortedCallNamesWhoAnswered covers the call an abort
-// cut off in flight: its dispatch is on the path, so the caller's
-// output is not a reject, and who wrote it is still worth recording.
+// cut off in flight: it was handed to its tool, so its dispatch is on
+// the path, the caller's output is not a reject, and who wrote it is
+// still worth recording.
 func TestAnswerToAnAbortedCallNamesWhoAnswered(t *testing.T) {
 	store := agentsession.NewMemoryStore()
 	rec, s, err := Start(context.Background(), store, agentsession.Header{})
@@ -217,7 +218,7 @@ func TestAnswerToAnAbortedCallNamesWhoAnswered(t *testing.T) {
 	a := agentturn.New(cfg)
 	defer rec.Attach(a)()
 	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
-		if _, ok := ev.(*agentturn.ToolStart); ok {
+		if _, ok := ev.(*agentturn.ToolDispatch); ok {
 			a.Abort()
 		}
 		return nil
