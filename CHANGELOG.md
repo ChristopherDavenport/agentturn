@@ -7,6 +7,36 @@ versions may break the API.
 
 ## Unreleased
 
+- Requires `agenttool` v0.0.8 and `agentsession` v0.0.8, up from
+  v0.0.7. The session recorder writes `agentsession/0.5`, whose entry
+  IDs are envelope hashes; sessions written under 0.4 read by
+  migrating in memory, as that library says.
+- **`tool_dispatch`** reports the moment a call is handed to its tool:
+  after it has taken a slot in the bound and its turn in a serial
+  batch or a resource chain, and before the tool runs. `tool_start`
+  keeps its place, when the call is decided, in the model's order for
+  the whole batch. The event is raised from the executor's `OnStart`
+  on the call's own goroutine, serialised with the run's events, and a
+  subscriber that fails on it stops the call before its tool runs and
+  ends the run with reason `error`, as any delivery failure does; the
+  call is then pending as `aborted` with no side effect behind it.
+  (#93)
+- **Breaking, in what is recorded.** `session` writes the `dispatch`
+  entry from `tool_dispatch`, per call, rather than from `tool_start`,
+  per batch. A call cut off before it reached its tool, waiting for a
+  slot or its turn, now has no dispatch and reads as never started; it
+  read as in flight before, so a resume after a kill treated every
+  call of the batch as possibly run. A call the loop refused itself, a
+  name no tool has or arguments that are not an object, is recorded
+  as a `reject` decision by `policy` carrying the error the model saw,
+  where it was written with a dispatch it never earned. (#93)
+- `Config.ToolRecorder` is `agenttool.Executor.Recorder` for every
+  batch, so a tool that writes a record while it runs with
+  `agenttool.WriteRecord` reaches the host under the loop; it was a
+  no-op, since the loop installed nothing. `session.Recorder.RecordFunc`
+  is the value to set it to: each record lands as a custom entry in
+  the record's namespace, at the leaf of the run on the context,
+  durably before the tool goes on. (#97)
 - **Fixed**: a hook or a subscriber that fails while a tool batch is
   in flight no longer leaves the running calls without their
   `tool_end`. The batch is settled as an abort settles it: every call

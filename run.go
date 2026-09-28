@@ -349,6 +349,7 @@ type runner struct {
 	// deferred holds the IDs of the calls a hook handed to the caller
 	// during this run, so the run end can say why they are pending.
 	deferred map[string]bool
+
 	// held are the completed items of the attempt in flight that the
 	// transcript does not have yet, because nothing has committed the
 	// attempt: a reasoning item a model opens before its answer. They
@@ -949,6 +950,10 @@ type callState struct {
 	// terminate is the decision's hint, which rides on the result
 	// whether the call is settled in preflight or runs.
 	terminate bool
+	// dispatchErr is the failure to deliver the call's tool_dispatch,
+	// when a consumer refused it: the tool did not run, and the call
+	// is cut rather than settled with the failure as its result.
+	dispatchErr error
 	// parent is the call whose tool made this one with Invoke, empty
 	// for a call of the model's batch.
 	parent string
@@ -1106,14 +1111,16 @@ func (r *runner) appendFinished(ctx context.Context, batch []*callState) error {
 func (r *runner) execute(ctx context.Context, batch []*callState) error {
 	var jobs []agenttool.Job
 	var jobIndex []int
+	byID := make(map[string]*callState, len(batch))
 	for i, p := range batch {
 		if p.settled {
 			continue
 		}
 		jobs = append(jobs, agenttool.Job{Tool: p.tool, Call: agenttool.Call{ID: p.call.CallID, Args: p.args}})
 		jobIndex = append(jobIndex, i)
+		byID[p.call.CallID] = p
 	}
-	exec := agenttool.Executor{MaxParallel: r.cfg.MaxParallelTools, Sequential: r.cfg.ToolExecution == ExecSequential}
+	exec := r.executor(func(job agenttool.Job) *callState { return byID[job.Call.ID] })
 	// The batch has a context of its own, so a failure can stop the
 	// tools, with the failure as the cause a tool reads, and the
 	// executor still be drained: every result it holds is received,
@@ -1132,7 +1139,7 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 	for ev := range exec.Execute(bctx, jobs) {
 		p := batch[jobIndex[ev.Index]]
 		if failed != nil {
-			if !ev.Final || isCancellation(ev.Err, bctx) || hookFailed {
+			if !ev.Final || isCancellation(ev.Err, bctx) || hookFailed || p.dispatchErr != nil {
 				// Cut, or nothing to end yet: failBatch ends what
 				// has not ended once the drain is over.
 				continue
@@ -1150,6 +1157,15 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 		}
 		var err error
 		if ev.Final {
+			if p.dispatchErr != nil {
+				// The consumer refused the call's dispatch, so the tool
+				// did not run; that is the run's failure, not the
+				// call's result, and the batch is drained and cut as
+				// for any delivery failure.
+				failed = p.dispatchErr
+				cancel(failed)
+				continue
+			}
 			p.result, p.err = ev.Result, ev.Err
 			p.settled = true
 			err = r.settle(ctx, p)
@@ -1186,6 +1202,35 @@ func isCancellation(err error, ctx context.Context) bool {
 		return false
 	}
 	return errors.Is(err, ctx.Err()) || errors.Is(err, context.Cause(ctx))
+}
+
+// executor builds the batch executor: the configuration's mode, bound
+// and recorder, and a start callback that raises tool_dispatch for the
+// call a job belongs to, found by find. The callback runs on the job's
+// goroutine; emit serialises it with the run's events. A consumer that
+// fails on the event stops the job, which the executor completes with
+// that error, so the tool does not run after a dispatch nobody could
+// record.
+func (r *runner) executor(find func(agenttool.Job) *callState) agenttool.Executor {
+	return agenttool.Executor{
+		MaxParallel: r.cfg.MaxParallelTools,
+		Sequential:  r.cfg.ToolExecution == ExecSequential,
+		Recorder:    r.cfg.ToolRecorder,
+		OnStart: func(_ context.Context, job agenttool.Job) error {
+			p := find(job)
+			if p == nil {
+				return nil
+			}
+			err := r.emit(&ToolDispatch{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Parent: p.parent})
+			// Remembered on the call itself: the executor hands the
+			// failure back as the job's error, and the loop reads
+			// the state, not the error, to tell a refused dispatch
+			// from a tool's own failure. The final event crosses a
+			// channel, so the loop goroutine reads it after this.
+			p.dispatchErr = err
+			return err
+		},
+	}
 }
 
 // collect appends the outputs in the model's order, then the notes the
@@ -1462,7 +1507,13 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 		return p.result, p.err
 	}
 	job := agenttool.Job{Tool: p.tool, Call: agenttool.Call{ID: call.CallID, Args: p.args}}
-	results, errs := agenttool.Executor{}.Results(ctx, []agenttool.Job{job})
+	results, errs := r.executor(func(agenttool.Job) *callState { return p }).Results(ctx, []agenttool.Job{job})
+	if p.dispatchErr != nil {
+		// The consumer refused the nested call's dispatch, so its tool
+		// did not run; the tool that made it decides, as for any
+		// failure of the loop's own around a nested call.
+		return agenttool.Result{}, r.endNested(p, p.dispatchErr)
+	}
 	p.result, p.err = results[0], errs[0]
 	p.settled = true
 	if err := r.settle(ctx, p); err != nil {

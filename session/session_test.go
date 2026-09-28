@@ -747,7 +747,9 @@ func TestAbortDuringChildRunStillLinks(t *testing.T) {
 	child := agent.New(agentturn.Config{Name: "child", Model: &echo.Adapter{}, Tools: []agenttool.Tool{blocking}},
 		agent.WithObserver(func(ctx context.Context, ev agentturn.Event) {
 			rec.Observe(ctx, ev)
-			if _, ok := ev.(*agentturn.ToolStart); ok {
+			// The child's call is in flight once it is handed to its
+			// tool, which is when its dispatch is on the child's path.
+			if _, ok := ev.(*agentturn.ToolDispatch); ok {
 				close(started)
 			}
 		}))

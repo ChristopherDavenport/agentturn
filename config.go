@@ -152,6 +152,14 @@ type Config struct {
 	// MaxParallelTools bounds a parallel batch; zero means
 	// agenttool.DefaultMaxParallel.
 	MaxParallelTools int
+	// ToolRecorder, when set, is agenttool.Executor.Recorder for every
+	// batch: installed on each call's context, so a tool that writes a
+	// record while it runs with agenttool.WriteRecord reaches the host
+	// without the host threading a context through Prompt. A session
+	// recorder offers one as session.Recorder.RecordFunc. nil leaves a
+	// recorder already on the run's context in place and installs
+	// nothing else, so under nil a tool's WriteRecord is a no-op.
+	ToolRecorder agenttool.RecordFunc
 	// MaxTurns stops a run after this many turns with ReasonStopped;
 	// zero means no limit.
 	MaxTurns int

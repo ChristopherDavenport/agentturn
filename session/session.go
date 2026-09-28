@@ -62,21 +62,27 @@
 //     output of their own, is preceded by a reject decision carrying
 //     the output's text as its reason: a call held by a hold decision
 //     is the common case, and a call seeded from a branch that left its
-//     dispatch behind is the same thing to a reader.
-//   - tool_start: the call's decision when there is one to record, then
-//     its dispatch. A BeforeToolCall that blocked the call is a reject
-//     decision with its reason and no dispatch; one that deferred it is
-//     a hold carrying the same reason, the rule that raised the prompt,
-//     and no dispatch; one that rewrote the arguments, or an approval
-//     through Agent.Resume of a held call, is a proceed decision
-//     carrying the arguments the tool ran with when they differ from
-//     the model's. The dispatch follows every decision that lets the
-//     call run, and stands alone for a call nothing decided about. The
-//     decision's by is ToolDecision.By, which Answer.By sets for an
-//     approval, and policy for a hook's decision about a call nothing
-//     was holding; an answer that names nobody is written with no by,
-//     since a policy engine answers through Resume as often as a person
-//     does.
+//     dispatch behind is the same thing to a reader. A call the loop
+//     refused itself, for a name no tool has or arguments that are not
+//     an object, is the same shape with policy as the decider.
+//   - tool_start: the call's decision when there is one to record. A
+//     BeforeToolCall that blocked the call is a reject decision with
+//     its reason; one that deferred it is a hold carrying the same
+//     reason, the rule that raised the prompt; one that rewrote the
+//     arguments, or an approval through Agent.Resume of a held call,
+//     is a proceed decision carrying the arguments the tool ran with
+//     when they differ from the model's. The decision's by is
+//     ToolDecision.By, which Answer.By sets for an approval, and policy
+//     for a hook's decision about a call nothing was holding; an answer
+//     that names nobody is written with no by, since a policy engine
+//     answers through Resume as often as a person does.
+//   - tool_dispatch: the call's dispatch, written as the loop hands the
+//     call to its tool and not before, so a call the cut reached first,
+//     one waiting for a slot in the bound or its turn in a serial batch,
+//     has none and reads as never started. The loop raises it on the
+//     call's own goroutine and the barrier holds it there, so the
+//     dispatch is durable before the tool runs, and a write that fails
+//     stops the call.
 //   - response_end: the response entry with status, usage, error and the
 //     request hash, after the items it produced and before any tool
 //     output of the turn.
@@ -142,8 +148,8 @@
 // header unless the caller set Records, so a reader takes a call with
 // no dispatch as never started and a run with no end entry as cut off.
 // The promise is kept by the barrier: the recorder returns from
-// tool_start only after the dispatch is appended, and the loop does
-// not hand the call to its tool before then.
+// tool_dispatch only after the dispatch is appended, and the executor
+// does not run the tool before then.
 //
 // # Child runs
 //
@@ -450,6 +456,12 @@ type callRecord struct {
 	rejected    bool
 	answered    bool
 	dispatchRun string
+	// settledRun is the run whose tool_end ended the call without a
+	// dispatch: the loop refused it itself, for a name no tool has or
+	// arguments that are not an object, or a cut ended it before it
+	// was handed over. An output arriving in that run is then the
+	// loop's own refusal rather than a caller's answer.
+	settledRun string
 }
 
 // Option configures a Recorder.
@@ -649,6 +661,18 @@ func (r *Recorder) Annotate(ctx context.Context, ns string, data any) error {
 	}
 	_, err = w.append(context.WithoutCancel(ctx), &agentsession.CustomEntry{NS: ns, Data: raw})
 	return err
+}
+
+// RecordFunc returns the recorder a tool's agenttool.WriteRecord
+// reaches: each record is written as a custom entry in the record's
+// namespace, at the leaf of the run on the context, durably before it
+// returns, as [Recorder.Annotate] writes one. Set it as
+// agentturn.Config.ToolRecorder, or install it with
+// agenttool.ContextWithRecorder on the context a run is prompted with.
+func (r *Recorder) RecordFunc() agenttool.RecordFunc {
+	return func(ctx context.Context, rec *agenttool.Record) error {
+		return r.Annotate(ctx, rec.NS, json.RawMessage(rec.Data))
+	}
 }
 
 // reset clears what seed sets, keeping the writer's identity and its
@@ -963,6 +987,8 @@ func runID(ev agentturn.Event) string {
 		return e.RunID
 	case *agentturn.ToolStart:
 		return e.RunID
+	case *agentturn.ToolDispatch:
+		return e.RunID
 	case *agentturn.ToolUpdate:
 		return e.RunID
 	case *agentturn.ToolEnd:
@@ -997,7 +1023,7 @@ func Canonical(req openresponses.Request) openresponses.Request {
 func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 	switch ev.(type) {
 	case *agentturn.RunStart, *agentturn.ModelBlocked, *agentturn.ItemEnd, *agentturn.ResponseEnd,
-		*agentturn.ToolStart, *agentturn.ToolEnd, *agentturn.RunEnd:
+		*agentturn.ToolStart, *agentturn.ToolDispatch, *agentturn.ToolEnd, *agentturn.RunEnd:
 		// The events that write an entry flush the settle held for the
 		// call in flight, so the settings are on the path before what
 		// they describe. The others, item_start and item_update among
@@ -1034,6 +1060,8 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 		return w.response(ctx, e)
 	case *agentturn.ToolStart:
 		return w.toolStart(ctx, e)
+	case *agentturn.ToolDispatch:
+		return w.toolDispatch(ctx, e)
 	case *agentturn.RunEnd:
 		return w.runEnd(ctx, e)
 	case *agentturn.ToolEnd:
@@ -1047,6 +1075,9 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 // an agenttool.Recordable, as a custom entry in the namespace the value
 // names, between the call's dispatch and its output.
 func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
+	if c := w.calls[e.CallID]; c != nil && e.Parent == "" && !e.Deferred && !c.dispatched && !c.rejected {
+		c.settledRun = w.run
+	}
 	if e.Parent != "" {
 		if err := w.nested(ctx, NestedCall{
 			Phase:  agentsession.RunEnd,
@@ -1307,7 +1338,19 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 			// left, is the same thing to a reader and gets the same
 			// decision, which is what the format's record check asks
 			// for.
-			dec := agentsession.NewDecision(out.CallID, c.entry, agentsession.VerdictReject, agentturn.DeciderFromContext(ctx, out.CallID)).WithReason(outputText(out))
+			//
+			// A call the loop settled itself in this run, for a name
+			// no tool has or arguments that are not an object, has the
+			// same shape with the loop as the decider: it refused the
+			// call before any tool, which is a policy's refusal.
+			by := agentturn.DeciderFromContext(ctx, out.CallID)
+			if c.settledRun != "" && c.settledRun == w.run {
+				// The loop refused it, whoever approved it: a call
+				// the caller approved on resume and the loop then
+				// found no tool for is the loop's reject.
+				by = agentsession.ByPolicy
+			}
+			dec := agentsession.NewDecision(out.CallID, c.entry, agentsession.VerdictReject, by).WithReason(outputText(out))
 			if _, err := w.append(ctx, dec); err != nil {
 				return err
 			}
@@ -1401,7 +1444,8 @@ func outputText(out *openresponses.FunctionCallOutput) string {
 }
 
 // toolStart writes what was decided about the call, when something
-// was, and its dispatch when it goes to its tool.
+// was. The dispatch is written when the call is handed to its tool,
+// which tool_dispatch reports.
 func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 	if e.Parent != "" {
 		return w.nested(ctx, NestedCall{
@@ -1477,10 +1521,28 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 			return err
 		}
 	}
+	c.held = false
+	return nil
+}
+
+// toolDispatch writes the call's dispatch: the loop has handed it to
+// its tool, so from here its side effect may have happened. It is
+// durable before this returns, and a failure here stops the call, so
+// no tool runs after a dispatch the record does not hold. A nested
+// call has no function_call item to anchor one to and its record is
+// the custom entries tool_start and tool_end write.
+func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) error {
+	if e.Parent != "" {
+		return nil
+	}
+	c := w.calls[e.CallID]
+	if c == nil || c.rejected || c.dispatched {
+		return nil
+	}
 	if _, err := w.append(ctx, agentsession.NewDispatch(e.CallID, c.entry)); err != nil {
 		return err
 	}
-	c.held, c.dispatched, c.dispatchRun = false, true, w.run
+	c.dispatched, c.dispatchRun = true, w.run
 	return nil
 }
 
