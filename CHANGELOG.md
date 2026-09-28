@@ -13,12 +13,17 @@ versions may break the API.
   that has not ended gets a `tool_end` carrying the failure, the
   outputs of the calls that finished with a result of their own are
   appended, and the rest are pending as `aborted`; a call whose
-  after-call hook failed has no result and is cut. An abort that a
-  subscriber fails inside now ends every cut call before the failure
-  is reported, and a nested call whose hook or delivery failed gets
-  its `tool_end` before the error returns to the tool. A `tool_end`
-  counts as raised when the loop delivers it, so a subscriber that
-  fails on one never sees the call ended twice. (#101)
+  after-call hook failed has no result and is cut. The failure stops
+  the batch's tools through their context and the executor is drained
+  before anything is ended, as under an abort, so a call that returns
+  its own result on the way out is finished and appended, and a tool's
+  `tool_end` follows its return. An abort that a subscriber or the
+  after-call hook fails inside now ends every cut call before the
+  failure is reported, the remaining cut calls skipping the hook, and
+  a nested call whose hook or delivery failed gets its `tool_end`
+  before the error returns to the tool. A `tool_end` counts as raised
+  when the loop delivers it, so a subscriber that fails on one never
+  sees the call ended twice. (#101)
 - **Fixed**: `ToolDecision.Terminate` on an allowed call that runs
   now ends the run with `StopTerminate`, or `StopPartialTerminate`
   when the rest of the batch did not agree, as the doc comment

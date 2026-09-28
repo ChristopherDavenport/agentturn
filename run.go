@@ -804,7 +804,9 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 // while it has not, a completed item is held rather than appended, and
 // the return reports whether this event commits the attempt, which a
 // message or a function call opening does. An error event fails the
-// attempt with the wire error, unwrapped.
+// attempt with the wire error, wrapped as a wireError so stream can
+// tell it from a delivery failure and hand the policy the error
+// itself.
 func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Accumulator, committed bool) (bool, error) {
 	responseID := ""
 	if cur := acc.Response(); cur != nil {
@@ -1024,10 +1026,10 @@ func (r *runner) failBatch(ctx context.Context, batch []*callState, cause error)
 		if p == nil || p.ended {
 			continue
 		}
-		p.settled, p.cut, p.ended = true, true, true
+		p.settled, p.cut = true, true
 		p.err = cause
-		p.result = agenttool.ErrorResult(cause)
-		_ = r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Parent: p.parent})
+		p.result = agenttool.Result{}
+		_ = r.finish(p)
 	}
 	_ = r.appendFinished(ctx, batch)
 	return cause
@@ -1046,11 +1048,22 @@ func (r *runner) abortBatch(ctx context.Context, batch []*callState, err error) 
 		}
 		p.settled, p.cut = true, true
 		p.err = err
-		if serr := r.settle(ctx, p); serr != nil && first == nil {
+		if first != nil {
+			// A hook or a consumer has already failed on this abort;
+			// the rest are ended without the hook, so every call has
+			// its tool_end and the failure is reported once.
+			_ = r.finish(p)
+			continue
+		}
+		if serr := r.settle(ctx, p); serr != nil {
 			// The failure is reported once every call has its
 			// tool_end, so a consumer that fails on one of them does
-			// not leave the others without theirs.
+			// not leave the others without theirs; a hook that
+			// failed before the call was ended leaves it to end here.
 			first = serr
+			if !p.ended {
+				_ = r.finish(p)
+			}
 		}
 	}
 	if aerr := r.appendFinished(ctx, batch); aerr != nil && first == nil {
@@ -1101,8 +1114,28 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 		jobIndex = append(jobIndex, i)
 	}
 	exec := agenttool.Executor{MaxParallel: r.cfg.MaxParallelTools, Sequential: r.cfg.ToolExecution == ExecSequential}
-	for ev := range exec.Execute(ctx, jobs) {
+	// The batch has a context of its own, so a failure can stop the
+	// tools and the executor still be drained: every result it holds
+	// is received, as an abort receives them, before the batch is
+	// settled. Leaving the range would cancel and wait too, but would
+	// lose the results that arrive while it waits.
+	bctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var failed error
+	for ev := range exec.Execute(bctx, jobs) {
 		p := batch[jobIndex[ev.Index]]
+		if failed != nil {
+			// The batch is being drained: a call that returns a
+			// result of its own before the cancellation reaches it
+			// is finished and ended without the hook; one that
+			// returns the cancellation is left for failBatch to cut.
+			if ev.Final && !isCancellation(ev.Err, bctx) {
+				p.result, p.err = ev.Result, ev.Err
+				p.settled = true
+				_ = r.finish(p)
+			}
+			continue
+		}
 		var err error
 		if ev.Final {
 			p.result, p.err = ev.Result, ev.Err
@@ -1112,11 +1145,14 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 			err = r.emit(&ToolUpdate{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Partial: ev.Result})
 		}
 		if err != nil {
-			// Leaving the executor's range cancels the batch and waits
-			// for the running tools before this returns; they are then
-			// ended with the failure, as an abort ends them.
-			return r.failBatch(ctx, batch, err)
+			failed = err
+			cancel()
 		}
+	}
+	if failed != nil {
+		// The tools have returned; the calls that did not finish are
+		// ended with the failure, as an abort ends them.
+		return r.failBatch(ctx, batch, failed)
 	}
 	if ctx.Err() != nil {
 		if aerr := r.appendFinished(ctx, batch); aerr != nil {
@@ -1125,6 +1161,16 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 		return stop(ReasonAborted, context.Cause(ctx))
 	}
 	return nil
+}
+
+// isCancellation reports whether err is the cancellation of ctx, or its
+// cause: what a tool returns when it was cut off rather than a result
+// of its own.
+func isCancellation(err error, ctx context.Context) bool {
+	if err == nil || ctx.Err() == nil {
+		return false
+	}
+	return errors.Is(err, ctx.Err()) || errors.Is(err, context.Cause(ctx))
 }
 
 // collect appends the outputs in the model's order, then the notes the
@@ -1278,6 +1324,15 @@ func (r *runner) settle(ctx context.Context, p *callState) error {
 			p.result, p.err = override.Result, override.Err
 		}
 	}
+	return r.finish(p)
+}
+
+// finish ends a call whose result and error are decided: the error
+// becomes the output the model sees, the decision's hint is composed
+// in, and tool_end is raised. It is the one place a call is ended, so
+// a call is never ended twice, and it runs no hook: settle runs the
+// after-call hook and then this; a cut call comes here directly.
+func (r *runner) finish(p *callState) error {
 	if p.err != nil {
 		terminate := p.result.Terminate
 		details := p.result.Details
@@ -1404,10 +1459,10 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 // goes on: the failure is the tool's to answer.
 func (r *runner) endNested(p *callState, cause error) error {
 	if !p.ended {
-		p.settled, p.cut, p.ended = true, true, true
+		p.settled, p.cut = true, true
 		p.err = cause
-		p.result = agenttool.ErrorResult(cause)
-		_ = r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Parent: p.parent})
+		p.result = agenttool.Result{}
+		_ = r.finish(p)
 	}
 	return cause
 }

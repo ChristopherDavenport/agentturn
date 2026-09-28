@@ -533,6 +533,13 @@ failure cuts appends the outputs of the calls that finished and drops
 their notes. A call is **finished** when it settled with a result of
 its own, from its tool or the after-call hook, and its `tool_end` was
 raised; a call whose after-call hook failed has no result and is cut.
+A failure stops the batch's tools through their context and the loop
+still receives every result the executor holds, as it does under a
+cancellation: a call that returns a result of its own before the
+cancellation reaches it is finished, ended without the hook, and its
+output appended; one that returns the cancellation is cut. A tool's
+`tool_end` therefore follows the tool's return, and the events of a
+nested call the tool makes on its way out precede it.
 
 The executor is given the configuration's execution mode and bound.
 The loop SHOULD also install the harness's tool recorder on it, so a
@@ -587,7 +594,7 @@ in transcript order, each with a reason:
 | pending reason | meaning |
 | --- | --- |
 | `deferred` | the decision hook handed the call to the caller in this run and nothing has answered it. The tool did not run |
-| `aborted` | the call was appended by this run and the run was cancelled or failed while it was in flight, after its `tool_start`. The tool may have run to completion, so its side effect may have happened |
+| `aborted` | the call was appended by this run and the run was cancelled or failed before its output was appended: while it was in flight, after its `tool_start`, or before it was reached, when the failure came earlier in the batch. The tool may have run to completion, so its side effect may have happened |
 | `unknown` | the call was in the transcript the run was given, so the loop cannot say whether it ran. A session recorded with dispatch entries can. A call approved on resume and then cut off reads `unknown` too, since the run did not append it, although the run knows it started |
 
 The pending list is empty for `done` and `stopped`. Whatever ended the
@@ -675,8 +682,10 @@ stream and the running tools through their contexts, as agenttool RFC
   motivation's first misreading breaks. Every call that had its
   `tool_start` and has not ended gets its `tool_end` with the
   cancellation as its error, so the two are always paired, and a
-  consumer that fails on one of those does not deprive the others of
-  theirs: the failure is reported once every call has ended. The outputs
+  consumer or a hook that fails on one of those does not deprive the
+  others of theirs: the call it failed on is ended without the hook,
+  the remaining cut calls skip the hook, and the failure is reported
+  once every call has ended. The outputs
   of the calls that **finished** before the cut — settled with a result
   of their own rather than the cancellation — are appended in the
   batch's order, so a call that ran to completion is answered in the

@@ -2,6 +2,7 @@ package agentturn
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -217,7 +218,7 @@ func TestDecisionTerminateOnAnAllowedCall(t *testing.T) {
 	}
 	// One decision of a two-call batch terminates: the batch did not
 	// agree, and the run says so.
-	some := Config{Model: twoCalls{}, Tools: []agenttool.Tool{agenttool.New("a", "", plain), agenttool.New("b", "", plain)},
+	some := Config{Model: twoCalls{}, Tools: []agenttool.Tool{agenttool.New("a", "", plain), agenttool.New("b", "", plain)}, MaxTurns: 2,
 		BeforeToolCall: func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
 			return &ToolDecision{Terminate: info.Call.Name == "a"}, nil
 		}}
@@ -312,5 +313,258 @@ func TestRetryAfterAWireErrorEvent(t *testing.T) {
 	_, end, _ = collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, Config{Model: m}))
 	if end.Reason != ReasonError || m.calls != 1 {
 		t.Errorf("no policy: reason=%s calls=%d", end.Reason, m.calls)
+	}
+}
+
+// TestAbortWithFailingAfterCallHookPairsEveryCall pins the first
+// blocker of the #104 review: an after-call hook that fails on a cut
+// call, as one doing I/O on the cancelled context does, does not leave
+// that call or the ones after it without a tool_end.
+func TestAbortWithFailingAfterCallHookPairsEveryCall(t *testing.T) {
+	boom := errors.New("hook boom")
+	plain := func(context.Context, echoArgs) (string, error) { return "x", nil }
+	hookCalls := 0
+	a := New(Config{Model: twoCalls{}, Tools: []agenttool.Tool{agenttool.New("a", "", plain), agenttool.New("b", "", plain)},
+		BeforeToolCall: func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
+			return nil, nil
+		},
+		AfterToolCall: func(context.Context, ToolResultInfo) (*ToolOverride, error) {
+			hookCalls++
+			return nil, boom
+		}})
+	var events []Event
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		events = append(events, ev)
+		// Abort while the batch is being decided, so every call is
+		// cut before it runs and settled by abortBatch.
+		if e, ok := ev.(*ToolStart); ok && e.Name == "b" {
+			a.Abort()
+		}
+		return nil
+	})
+	end, _ := a.Prompt(context.Background(), openresponses.UserText("x"))
+	if end.Reason != ReasonAborted || !errors.Is(end.Err, boom) {
+		t.Fatalf("run: reason=%s err=%v", end.Reason, end.Err)
+	}
+	if starts, ends, unpaired := pairing(events); starts != 2 || ends != 2 || len(unpaired) != 0 {
+		t.Errorf("pairing: starts=%d ends=%d unpaired=%v", starts, ends, unpaired)
+	}
+	if hookCalls != 1 {
+		t.Errorf("after-call hook ran %d times; once it has failed the remaining cut calls skip it", hookCalls)
+	}
+	if len(end.Pending) != 2 {
+		t.Errorf("pending: %v", pendingReasons(end))
+	}
+}
+
+// TestFailureMidBatchDrainsTheExecutor pins the second blocker: a
+// failure stops the tools and the executor is drained before the batch
+// is settled, so a tool's tool_end follows its return, the nested
+// events it raises on the way out precede it, and a result it returns
+// of its own is finished and appended rather than cut.
+func TestFailureMidBatchDrainsTheExecutor(t *testing.T) {
+	boom := errors.New("hook boom")
+	// The hook fails on a only once b and c have started, so the
+	// failure cuts a running batch rather than one the executor has
+	// not spawned yet.
+	bStarted, cStarted := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	fast := agenttool.New("a", "", func(context.Context, echoArgs) (string, error) { return "a", nil })
+	inner := agenttool.New("c", "", func(context.Context, echoArgs) (string, error) {
+		once.Do(func() { close(cStarted) })
+		return "c", nil
+	})
+	// b waits to be cut, then makes a nested call and returns a result
+	// of its own: it handled the cancellation, as a tool may.
+	slow := agenttool.New("b", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		close(bStarted)
+		<-ctx.Done()
+		// The nested call is refused under the cancelled context and
+		// still raises its events as b's; b then answers on its own.
+		_, _ = Invoke(ctx, "c", json.RawMessage(`{"text":"t"}`))
+		return "b done", nil
+	})
+	cfg := Config{Model: twoCalls{}, Tools: []agenttool.Tool{fast, slow, inner},
+		AfterToolCall: func(_ context.Context, info ToolResultInfo) (*ToolOverride, error) {
+			if info.Call.Name == "a" {
+				<-bStarted
+				<-cStarted
+				return nil, boom
+			}
+			return nil, nil
+		}}
+	// twoCalls calls every offered tool, c included, so c also runs as
+	// a call of the batch; that one is plain and finishes on its own.
+	events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
+	if !errors.Is(err, boom) || end.Reason != ReasonError {
+		t.Fatalf("run: err=%v reason=%s", err, end.Reason)
+	}
+	if starts, ends, unpaired := pairing(events); starts != 4 || ends != 4 || len(unpaired) != 0 {
+		t.Errorf("pairing: starts=%d ends=%d unpaired=%v", starts, ends, unpaired)
+	}
+	// The nested call's events precede b's tool_end.
+	var seq []string
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case *ToolStart:
+			if e.Parent != "" {
+				seq = append(seq, "nested_start")
+			}
+		case *ToolEnd:
+			if e.Parent != "" {
+				seq = append(seq, "nested_end")
+			} else if e.Name == "b" {
+				seq = append(seq, "end_b")
+			}
+		}
+	}
+	if len(seq) != 3 || seq[0] != "nested_start" || seq[1] != "nested_end" || seq[2] != "end_b" {
+		t.Errorf("order: %v", seq)
+	}
+	// b returned a result of its own after the cut, so it is finished
+	// and its output appended; a's hook failed, so a is cut and pending.
+	var outputs []string
+	for _, it := range end.Items {
+		if out, ok := it.(*openresponses.FunctionCallOutput); ok {
+			outputs = append(outputs, out.Output.Text)
+		}
+	}
+	if len(outputs) != 2 || outputs[0] != "b done" && outputs[1] != "b done" {
+		t.Errorf("outputs: %v, want b's and c's", outputs)
+	}
+	if len(end.Pending) != 1 || end.Pending[0].Call.Name != "a" || end.Pending[0].Reason != PendingAborted {
+		t.Errorf("pending: %v", pendingReasons(end))
+	}
+}
+
+// TestNestedCallFailuresPair pins the nested site of #101: a failure
+// of the loop's own around a nested call gives it its tool_end and
+// returns to the tool, which decides its own result; the run goes on.
+func TestNestedCallFailuresPair(t *testing.T) {
+	boom := errors.New("boom")
+	inner := agenttool.New("c", "", func(context.Context, echoArgs) (string, error) { return "c", nil })
+	outer := agenttool.New("b", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		_, err := Invoke(ctx, "c", json.RawMessage(`{"text":"t"}`))
+		if err != nil {
+			return "b: " + err.Error(), nil
+		}
+		return "b ok", nil
+	})
+	cases := []struct {
+		name   string
+		cfg    func(*Config)
+		failOn func(Event) bool
+	}{
+		{name: "after-call hook fails on the nested call", cfg: func(c *Config) {
+			c.AfterToolCall = func(_ context.Context, info ToolResultInfo) (*ToolOverride, error) {
+				if info.Call.Name == "c" {
+					return nil, boom
+				}
+				return nil, nil
+			}
+		}},
+		{name: "subscriber fails on the nested tool_start", failOn: func(ev Event) bool {
+			e, ok := ev.(*ToolStart)
+			return ok && e.Parent != ""
+		}},
+		{name: "subscriber fails on the nested tool_end", failOn: func(ev Event) bool {
+			e, ok := ev.(*ToolEnd)
+			return ok && e.Parent != ""
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The model calls b alone; c is offered so Invoke finds it.
+			cfg := Config{Model: callsNamed{names: []string{"b"}}, Tools: []agenttool.Tool{outer, inner}, MaxTurns: 1}
+			if tc.cfg != nil {
+				tc.cfg(&cfg)
+			}
+			a := New(cfg)
+			var events []Event
+			a.Subscribe(func(_ context.Context, ev Event) error {
+				events = append(events, ev)
+				if tc.failOn != nil && tc.failOn(ev) {
+					return boom
+				}
+				return nil
+			})
+			end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+			if err != nil || end.Reason != ReasonStopped {
+				t.Fatalf("run: err=%v reason=%s", err, end.Reason)
+			}
+			if starts, ends, unpaired := pairing(events); starts != 2 || ends != 2 || len(unpaired) != 0 {
+				t.Errorf("pairing: starts=%d ends=%d unpaired=%v", starts, ends, unpaired)
+			}
+			var bOut string
+			for _, it := range end.Items {
+				if out, ok := it.(*openresponses.FunctionCallOutput); ok && strings.HasPrefix(out.Output.Text, "b") {
+					bOut = out.Output.Text
+				}
+			}
+			if !strings.Contains(bOut, "boom") {
+				t.Errorf("b did not see the failure: %q", bOut)
+			}
+		})
+	}
+}
+
+// TestApprovedBatchFailuresPair pins the resume site of #101: a hook
+// or a consumer that fails in the approved batch leaves no tool_start
+// without its tool_end.
+func TestApprovedBatchFailuresPair(t *testing.T) {
+	boom := errors.New("boom")
+	plain := func(context.Context, echoArgs) (string, error) { return "x", nil }
+	cases := []struct {
+		name   string
+		cfg    func(*Config)
+		failOn string
+	}{
+		{name: "after-call hook fails", cfg: func(c *Config) {
+			c.AfterToolCall = func(context.Context, ToolResultInfo) (*ToolOverride, error) { return nil, boom }
+		}},
+		{name: "subscriber fails on tool_start", failOn: EventToolStart},
+		{name: "subscriber fails on tool_end", failOn: EventToolEnd},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{Model: twoCalls{}, Tools: []agenttool.Tool{agenttool.New("a", "", plain), agenttool.New("b", "", plain)},
+				BeforeToolCall: func(context.Context, ToolCallInfo) (*ToolDecision, error) {
+					return &ToolDecision{Action: Defer}, nil
+				}}
+			a := New(cfg)
+			end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+			if err != nil || end.Reason != ReasonInputRequired || len(end.Pending) != 2 {
+				t.Fatalf("first run: err=%v reason=%s", err, end.Reason)
+			}
+			if tc.cfg != nil {
+				tc.cfg(&cfg)
+				if err := a.SetConfig(cfg); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var events []Event
+			resumed := false
+			a.Subscribe(func(_ context.Context, ev Event) error {
+				if _, ok := ev.(*RunStart); ok {
+					resumed = true
+				}
+				if !resumed {
+					return nil
+				}
+				events = append(events, ev)
+				if ev.EventType() == tc.failOn {
+					return boom
+				}
+				return nil
+			})
+			end, err = a.Resume(context.Background(), Approve(end.Pending[0].Call.CallID), Approve(end.Pending[1].Call.CallID))
+			if !errors.Is(err, boom) || end.Reason != ReasonError {
+				t.Fatalf("resume: err=%v reason=%s", err, end.Reason)
+			}
+			starts, ends, unpaired := pairing(events)
+			if starts == 0 || starts != ends || len(unpaired) != 0 {
+				t.Errorf("pairing: starts=%d ends=%d unpaired=%v", starts, ends, unpaired)
+			}
+		})
 	}
 }
