@@ -129,7 +129,15 @@ for PR in "${PRS[@]}"; do
   PREV_BRANCH="$HEAD"
 done
 
-say "every PR landed; deleting the stack's branches"
+say "every PR landed"
+if [ "$DRY" = 0 ]; then
+  # Leave the working tree on main before any of the stack's branches
+  # is deleted: the one checked out cannot be, and it usually is.
+  git checkout --quiet "$DEFAULT"
+  git pull --quiet --ff-only origin "$DEFAULT"
+fi
+
+say "deleting the stack's branches"
 for b in "${MERGED_BRANCHES[@]}"; do
   run git push --quiet origin --delete "$b"
   if git show-ref --verify --quiet "refs/heads/$b"; then
@@ -138,8 +146,6 @@ for b in "${MERGED_BRANCHES[@]}"; do
 done
 
 if [ "$DRY" = 0 ]; then
-  git checkout --quiet "$DEFAULT"
-  git pull --quiet --ff-only origin "$DEFAULT"
   say "$DEFAULT is at $(git rev-parse --short HEAD); running make check"
   make check
 fi
