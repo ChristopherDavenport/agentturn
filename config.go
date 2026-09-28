@@ -217,7 +217,9 @@ type Config struct {
 // commits when the model begins its answer, which is a message or a
 // function call item opening, or when the server answers with a failed
 // response; after that a failure is final, because the transcript or a
-// recorder may already hold part of the answer. An item the model
+// recorder may already hold part of the answer. An error event the
+// server sends before the answer opens is a failed attempt like a cut
+// stream, and is retried as one. An item the model
 // completed before that point, the reasoning summary a reasoning model
 // writes before its first token, is held rather than appended: it
 // reaches subscribers as item_start and item_update, so a front renders
