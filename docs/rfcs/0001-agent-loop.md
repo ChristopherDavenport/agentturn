@@ -25,7 +25,8 @@ session recorder, a parent agent — it owes an event sequence with fixed
 order and fixed invariants: one terminal per run, every `tool_start`
 paired with a `tool_end`, an item announced complete only when it is,
 and every event after a cancellation still delivered, so what the
-record holds is what happened.
+record holds is what happened. Where the reference falls short of an
+invariant, this draft says so and names the issue.
 
 The transcript is Open Responses items and nothing else. The loop knows
 a model and a list of tools and never learns a sub-agent concept; every
@@ -34,8 +35,9 @@ model, a tool, a peer over a protocol, or itself under new settings.
 
 ## Motivation
 
-The rules below exist and are, as far as anyone has measured, correct.
-They live in doc comments on exported Go identifiers (#81). A second
+The rules below exist in doc comments on exported Go identifiers
+(#81). Most of them held when this draft was checked against the code;
+the ones that did not are named as open questions, each with an issue. A second
 implementation, in Go or elsewhere, has nothing to conform to and is
 reverse-engineered from comments, and two of them diverge exactly where
 the comments are load-bearing: one delivers `run_end` as soon as the
@@ -129,8 +131,10 @@ in RFC 2119.
   loop stops calling the model. A run has an ID, a source, a sequence
   of turns and exactly one end.
 - **Turn**: one model call and the tool executions it requested. Turns
-  are numbered from 1 within a run; a batch the caller approved on
-  resume runs before the first turn and is numbered 0.
+  are numbered from 1 within a run. Everything before the first turn —
+  the prompts, a resume's outputs and notes, and a batch the caller
+  approved on resume — carries turn 0; an item appended after a turn's
+  batch carries that turn's number.
 - **Batch**: the function calls of one response, in the model's order,
   or the calls a caller approved on resume.
 - **Call**: one function call item and everything that happens to it:
@@ -168,7 +172,9 @@ from it; a session recorder writes it.
   is the transform's, and the transform's result is the request's
   input and never the transcript.
 - A transcript is **valid input** when every function call in it has
-  exactly one function call output after it. A run MUST leave the
+  a function call output naming it. The loop checks that one exists
+  anywhere in the transcript and does not check that there is only
+  one, or that it follows the call. A run MUST leave the
   transcript valid, or end with the unanswered calls listed on its end
   event, and a loop MUST refuse to start a run over a transcript that
   holds an unanswered call unless the run's own input answers it.
@@ -199,7 +205,7 @@ A configuration is what a run reads and nothing else is. It carries:
 | name, description | how the agent presents itself when composed: the tool name and description as a tool, the card as a peer, the server info over a protocol. The loop itself reads neither |
 | model | required; a run over a configuration with no model is refused |
 | model name, instructions, reasoning, text | the corresponding request members, set on every request when set |
-| request base | every other request member — tool choice, parallel tool calls, max output tokens, temperature, truncation, include, cache key, service tier, passthrough extras — copied onto every request. The loop owns input, tools, store, stream and previous response ID and overwrites them |
+| request base | every other request member — tool choice, parallel tool calls, max output tokens, temperature, truncation, include, cache key, service tier, passthrough extras — copied onto every request. The loop owns input, tools, store, stream, stream options and previous response ID and overwrites them |
 | tools, or a tool provider | the tools of the moment, resolved once per turn |
 | execution mode, parallel bound | the batch rules of agenttool RFC 0001: sequential, or parallel up to the bound |
 | max turns | a limit after which the run stops |
@@ -214,7 +220,7 @@ a remote list offers a change one turn late when the change is still in
 flight as the turn starts; a provider that must not waits inside
 itself, bounded by its context. A set of tools MUST have distinct
 names; a fixed list is checked once before the run and a provided list
-once per turn, and a duplicate refuses the run or fails the turn. The
+once per turn, and a duplicate refuses the run or fails the run. The
 loop never closes a tool: close belongs to the host, as agenttool RFC
 0001 says, and a provider that builds tools per turn is responsible for
 what it built (#95).
@@ -239,13 +245,16 @@ A run begins in one of two ways, and its **source** says which:
   or supplied its output. A prompt that opens with the outputs of the
   pending calls is a resume that also carries a message.
 
-Before a run starts, the loop checks what it can and refuses with one
-`run_end` carrying reason `error` and no other event when: there are no
-prompt items; the transcript cannot be continued; the configuration
-has no model; two tools share a name; the transcript holds an
-unanswered call that neither it nor the leading outputs of the prompts
-answer; or an answer names a call that is not pending. Such a `run_end`
-has no run ID, since no run was started.
+Before a run starts, the loop checks what it can and refuses when:
+there are no prompt items; the transcript cannot be continued; the
+configuration has no model; two tools share a name; the transcript
+holds an unanswered call that neither it nor the leading outputs of the
+prompts answer; an answer names a call that is not pending; or, for an
+agent, a run is already active. The two forms refuse differently. The
+low-level loop yields one `run_end` carrying reason `error`, the
+refusal as its error and no run ID, and no other event. The agent
+returns the refusal to the caller and delivers nothing to its
+subscribers, since no run started and there is nothing to record.
 
 A run has an ID the loop mints, carried on every event of the run and
 attached to the context of everything the run calls — the transform,
@@ -262,9 +271,10 @@ A turn proceeds in these phases, in this order. Each names the events
 it raises and the hooks it calls; the events are defined
 [below](#events).
 
-1. **Limits.** If the run has reached its turn limit, it ends with
-   reason `stopped` and cause `max_turns`. If the run's context is
-   cancelled, it ends with reason `aborted`.
+1. **Limits.** If the run has taken its turn limit's worth of turns,
+   it ends with reason `stopped` and cause `max_turns`, whatever would
+   have started the next one: a tool batch to answer or a steered item.
+   If the run's context is cancelled, it ends with reason `aborted`.
 2. **Before the turn.** The before-turn hook MAY return items, which
    the loop appends to the transcript with their item events as it
    appends any input. They are then facts about the transcript: a
@@ -272,7 +282,8 @@ it raises and the hooks it calls; the events are defined
    injection through the transform cannot give. A hook error ends the
    run with reason `error`.
 3. **Tools of the moment** are resolved and, for a provided list,
-   validated.
+   validated. A resume's approved batch resolves them the same way and
+   skips the validation.
 4. **The request** is built as the [next section](#the-request) says.
    The before-model-call hook runs on it last. A hook that refuses
    raises `model_blocked` carrying the request as built and ends the
@@ -306,8 +317,9 @@ it raises and the hooks it calls; the events are defined
     the run ends with reason `stopped` and cause `terminate`. If some
     did, it ends with cause `partial_terminate`: the other calls ran
     and their outputs are in the transcript, and the host acts on the
-    call that asked to end the run. This is the batch rule of agenttool
-    RFC 0001 with the partial case given a name.
+    call that asked to end the run. agenttool RFC 0001 requires a
+    harness to report a partial batch as partial and leaves the policy
+    to it; this loop's policy is to stop and say so.
 12. **Queues.** Items steered in while the turn ran are appended, with
     their item events. If the model called no tools, the follow-up
     queue is drained after them; if nothing was queued, the run ends
@@ -330,7 +342,8 @@ that a recorder holding the transcript and the settings rebuilds it:
 3. Apply the **filter** to the result, which removes what the model
    must not see.
 4. Take the request base, set the loop-owned transport members — store
-   false, stream true, no previous response ID — and apply the model
+   false, stream true, no stream options, no previous response ID — and
+   apply the model
    name, instructions, reasoning and text over it, the passthrough
    extras merged over its own, and the definitions of the tools of the
    moment.
@@ -377,7 +390,11 @@ the transcript.
   delivered as `item_update`, so a front that must not show withheld
   text renders on `item_end`. Function calls, reasoning and every other
   output item never reach the guard, so a replay still has what it
-  needs. A guard error fails the turn.
+  needs. A guard error fails the run. The replacement reaches the transcript and `item_end` only: the
+  response carried by `response_end`, `turn_end` and the stop hook is
+  the wire response as the model produced it, with the original
+  message, so a front that must not show withheld text renders from
+  the item events and never from the response.
 - `response_end` carries the folded response, usage included, as soon
   as the stream ends and before any tool of the turn runs. A response
   that arrived with a failed status is delivered here too, before the
@@ -395,7 +412,11 @@ turn's `turn_start` and `response_end` are delivered once.
 
 An attempt **commits** when the model begins its answer, which is a
 message or a function call item opening; when the server answers with
-a failed response; or when a consumer fails while it is delivered. A
+a failed response; or when a consumer fails while it is delivered. At
+draft 0.1 the reference also commits an attempt on a wire error event,
+so a retryable failure the server reports that way is never retried;
+that is a defect (#103), and the rule this document intends is that an
+error event before the answer opens is retried as a cut stream is. A
 committed attempt MUST NOT be retried, because the transcript or a
 recorder may already hold part of it. An item the model completes
 before the attempt commits — the reasoning summary a reasoning model
@@ -409,11 +430,13 @@ and leaves nothing behind. A front that renders from `item_start` drops
 what it was rendering when a `model_retry`, or a `run_end` with an
 error or an abort, follows with no `item_end` for it.
 
-The defaults retry the transient statuses (408, 409, 429 and 5xx), a
-stream that ended before its terminal event and transport failures,
-honour a Retry-After header, and otherwise double from 500ms to a 30s
-cap. Everything else, a 4xx in particular, is final. Cancellation cuts
-a delay short and ends the run with reason `aborted`.
+Retry is off unless the policy names more than one attempt. The
+default predicate retries the transient statuses (408, 409, 429 and
+5xx), a stream that ended before its terminal event and transport
+failures, and calls everything else, a 4xx in particular, final. The
+default backoff honours a Retry-After header, uncapped, and otherwise
+doubles from 500ms to a 30s cap. Cancellation cuts a delay short and
+ends the run with reason `aborted`.
 
 The revision MAY move the next attempt to another model or another
 setting, which is how a fallback chain lives in the loop rather than
@@ -443,7 +466,7 @@ For each call, in the model's order:
    replacement arguments, a note, a terminate hint and who decided.
    Replacement arguments are what the tool receives; the function call
    item in the transcript keeps the model's. A hook error fails the
-   turn.
+   run.
 3. `tool_start` is raised with the arguments the tool will receive and
    the decision, in the model's order.
 4. A call that will not execute is **settled** at once, with its
@@ -460,9 +483,12 @@ For each call, in the model's order:
 
    A settled call's error output is rendered as agenttool RFC 0001
    renders a returned error, `Error: ` and the message, once. A
-   decision's terminate hint rides on the result of a blocked call as
-   on any other, so a policy can refuse a call and end the run in one
-   decision.
+   decision's terminate hint rides on the result of a call settled
+   here, so a policy can refuse a call and end the run in one decision.
+   The rule this document intends is that it rides on the result of an
+   allowed call the same way, as the hint composes with allow; at
+   draft 0.1 the reference drops it for a call that executes and reads
+   the terminate cause from the tool's result alone (#102).
 
 A hook that defers one call can defer the rest of the batch and hold
 all of it for the answer, since it sees the whole batch and runs
@@ -490,8 +516,11 @@ completion order:
    and MAY replace either. An override replaces the result before
    `tool_end` is delivered and before the output is appended, so no
    consumer and no recorder sees what the tool returned: bytes cut
-   here exist nowhere afterwards. It does not run for a blocked call.
-   A hook error fails the turn.
+   here exist nowhere afterwards. It runs for every call but a blocked
+   one: a call that settled in preflight with no tool or with bad
+   arguments, an executed call, and a call a cancellation cut off,
+   which it sees with the cancellation as the error. A hook error fails
+   the run.
 2. An error, from the tool or the override, becomes the error output
    the model sees, with the result's details and terminate hint kept.
 3. `tool_end` is raised with the result as the model will see it, the
@@ -500,7 +529,14 @@ completion order:
 Once every call has settled, the outputs are appended to the transcript
 in the **model's order**, whatever order they completed in, each with
 its item events, and then the notes of the decisions, in the same
-order. A deferred call has no output.
+order. A deferred call has no output. A batch that a cancellation or a
+failure cuts appends the outputs of the calls that finished and drops
+their notes.
+
+The executor is given the configuration's execution mode and bound.
+The loop SHOULD also install the harness's tool recorder on it, so a
+tool that writes a record while it runs, as agenttool RFC 0001 lets
+it, reaches the host; the reference installs none at draft 0.1 (#97).
 
 The context every hook and tool of the batch runs under carries the run
 ID, a snapshot of the working transcript as it stood when the batch
@@ -525,20 +561,24 @@ calls** with why each is pending.
 
 | cause | meaning |
 | --- | --- |
-| `max_turns` | the turn limit was reached with the model still calling tools |
+| `max_turns` | the turn limit was reached before another model call |
 | `hook` | the stop hook ended the run |
 | `guard` | the stop hook ended the run with an error marked as a guard's; the error is on the end event |
 | `terminate` | every result of the batch set the terminate hint |
 | `partial_terminate` | some results of the batch set it and others did not |
 | `refused` | an answer on resume asked the run to end without calling the model |
 
-The reasons are tested in the order the turn's phases state them:
-a failure or a cancellation at any phase ends the run there; a
-deferred call ends it before the stop hook is asked; the stop hook is
-asked before the terminate hint is read; the turn limit is read at the
-top of the next turn. A cancellation observed while a failure is being
-handled wins: the reason is `aborted` and the failure rides on its
-error.
+The reason is decided as follows. A phase that ends the run on its own
+terms — the turn limit, a deferred call, the stop hook, the terminate
+hint, a refusal on resume, the cancellation check at the top of a turn
+or inside a retry delay — names its reason and cause, and that stands.
+Otherwise, if the run's context is cancelled when the run winds down,
+the reason is `aborted`, with the cancellation's cause as the error
+and, when the failure that ended the run was not that cancellation, the
+failure joined to it. Otherwise the reason is `error` with the failure.
+Within a turn the phases run in order, so a deferred call is found
+before the stop hook is asked and the stop hook before the terminate
+hint is read.
 
 A **pending call** is a function call in the transcript with no output,
 in transcript order, each with a reason:
@@ -546,8 +586,8 @@ in transcript order, each with a reason:
 | pending reason | meaning |
 | --- | --- |
 | `deferred` | the decision hook handed the call to the caller in this run and nothing has answered it. The tool did not run |
-| `aborted` | the run was cancelled or failed while the call was in flight, after its `tool_start`. The tool may have run to completion, so its side effect may have happened |
-| `unknown` | the call was found without an output in a transcript the run was given, so the loop cannot say whether it ran. A session recorded with dispatch entries can |
+| `aborted` | the call was appended by this run and the run was cancelled or failed while it was in flight, after its `tool_start`. The tool may have run to completion, so its side effect may have happened |
+| `unknown` | the call was in the transcript the run was given, so the loop cannot say whether it ran. A session recorded with dispatch entries can. A call approved on resume and then cut off reads `unknown` too, since the run did not append it, although the run knows it started (#101 tracks the pairing rule this touches) |
 
 The pending list is empty for `done` and `stopped`. Whatever ended the
 run, the calls without an output are the caller's to answer, and the
@@ -586,19 +626,22 @@ a call that is not pending. It then runs as follows, and its source is
 2. The outputs of the answers that carry one are appended with their
    item events, then the notes of those answers as user messages.
 3. The approved calls run as **one batch before the first turn**, with
-   the decision hook skipped because the decision has been made: their
-   `tool_start` carries a decision holding the caller's arguments, note
-   and decider and nothing else, the tool events carry turn 0, the
-   execution mode and bound apply, the after-call hook runs, the
-   outputs are appended in the calls' transcript order and their notes
-   after them as user messages.
-4. If every result of the approved batch set terminate, the run ends
-   with reason `stopped` and cause `terminate`, or `partial_terminate`
-   when some did.
-5. Items steered in while the caller was deciding are appended, as
-   after any batch.
+   the decision hook skipped because the decision has been made: every
+   `tool_start` is raised first, in the order the answers name the
+   calls, each carrying a decision holding the caller's arguments, note
+   and decider and nothing else; the tool events carry turn 0; the
+   execution mode and bound apply; the after-call hook runs; the
+   outputs are appended in the order the answers name the calls, not
+   in transcript order, and their notes after them as user messages.
+4. If no answer asked the run to terminate and every result of the
+   approved batch set terminate, the run ends with reason `stopped` and
+   cause `terminate`, or `partial_terminate` when some did.
+5. When there was an approved batch, items steered in while the caller
+   was deciding are appended, as after any batch. A resume with outputs
+   alone leaves them for the first turn's batch.
 6. If any answer asked the run to terminate, it ends with reason
-   `stopped` and cause `refused`.
+   `stopped` and cause `refused`, whatever the approved batch's results
+   said.
 7. Otherwise the first turn begins.
 
 A prompt that opens with a function call output for each pending call
@@ -693,33 +736,46 @@ The events of a run appear in this order; `*` is zero or more, `?` at
 most one, and `queued` MAY appear between any two events:
 
 ```
+queued*
 run_start
 (item_start item_end)*                  prompts; or a resume's outputs and notes
-(tool_start tool_update* tool_end)*     a resume's approved batch, turn 0
+batch?                                  a resume's approved batch, turn 0
 (item_start item_end)*                  its outputs and notes, then steered items
 turn*:
   (item_start item_end)*                before-turn items
   turn_start | model_blocked            the latter ends the run
-  (item_start item_update* model_retry)*  attempts that failed before committing
+  ((item_start item_update*)* model_retry)*  attempts that failed before committing
   (item_start item_update* item_end)*   output items; item_end after the item is done
   response_end
-  (tool_start tool_end?)*               preflight, model order; tool_end here only for a
-                                        call that will not run
-  (tool_update | tool_end)*             completion order
-  (item_start item_end)*                outputs, model order; then notes
+  batch
   turn_end
   (item_start item_end)*                steered items; then follow-ups when no calls
 run_end
+queued*
+
+batch:
+  (tool_start tool_end?)+               preflight, in order; tool_end here only for a
+                                        call that will not run
+  (tool_update | tool_end | nested)*    completion order
+  (item_start item_end)*                outputs, in order; then notes
+nested:
+  tool_start (tool_update | nested)* tool_end   a call a tool made, parent set
 ```
 
 ### Invariants
 
 A conforming loop holds these over every run, however it ends:
 
-- Exactly one `run_end` per run, always last.
+- Exactly one `run_end` per run, and no event of the run follows it.
+  A `queued` report belongs to no run and MAY precede `run_start` or
+  follow `run_end`.
 - Every `tool_start` has exactly one `tool_end` with the same call ID,
   whether the call ran, was blocked, was deferred, or was cut off
-  before or during execution.
+  before or during execution by a cancellation. At draft 0.1 the
+  reference breaks this when a hook or a consumer fails mid-batch: the
+  calls still running get no `tool_end`, and the outputs of the calls
+  that finished are appended without one (#101). The rule stands and
+  the reference is to be fixed.
 - `item_end` for an output item follows the wire event that completed
   it; a partial item is never announced as complete. The item is in the
   transcript when `item_end` is delivered.
@@ -728,13 +784,18 @@ A conforming loop holds these over every run, however it ends:
   position.
 - `response_end` precedes every `tool_start` of its turn, and every
   output item of the response has had its `item_end` before it.
-- `turn_start` and `response_end` are delivered once per turn, however
-  many attempts the turn took.
+- `turn_start` is delivered once per turn and `response_end` at most
+  once, however many attempts the turn took: a turn whose last attempt
+  ended without a response has none.
 - Every event after a cancellation that the rules above say is raised
   is delivered.
-- The events of one run are delivered from one goroutine or thread,
-  the events a nested call raises from a tool's own serialised with
-  them, so a consumer is never entered twice at once.
+- Events are delivered serially, never concurrently: the events of
+  the run and the events a nested call raises from a tool's own
+  goroutine pass through one delivery, so a consumer is never entered
+  twice at once. Which goroutine delivers an event is not specified.
+- A failure truncates the sequence at its phase; the events the
+  cancellation section says are raised for a cut batch follow, and then
+  `run_end`.
 
 ## Delivery
 
@@ -757,11 +818,22 @@ has returned for the response's items, and a prompt settles only after
 the `run_end` subscribers finish, which is what lets a session recorder
 have an item durable before the tool that reads it runs. One event is
 delivered at a time, whichever goroutine raised it. A subscriber that
-returns an error ends the run with reason `error`. A subscriber that
-subscribes during a run takes effect from the next event. A subscriber
-MUST NOT call into the agent in a way that waits for the delivery it is
-inside: it steers with the context it was handed, or from another
-goroutine.
+subscribes during a run takes effect from the next event.
+
+A subscriber that returns an error ends the run with reason `error`,
+and the failure has these consequences, stated because a second
+implementation would otherwise choose differently:
+
+- the event does not reach the subscribers after the one that failed;
+- an error on `run_end` is ignored, since the run has already ended;
+- an error on a `queued` report delivered ahead of a run's event ends
+  the run before that event is delivered to anyone;
+- an error on `model_blocked` replaces the hook's error as the run's.
+
+A subscriber MUST NOT start a run from inside a delivery: a prompt, a
+continue or a resume made there is refused as one made during a run,
+`run_end` included, since the run is active until its delivery
+returns. Queueing an item never blocks and is safe from a subscriber.
 
 An agent runs **one run at a time**: a prompt, a continue, a resume, a
 configuration change or a transcript change while a run is active is
@@ -818,11 +890,11 @@ provide a way to chain each, with the fold rule the table gives.
 | --- | --- | --- | --- | --- | --- |
 | before turn | turn phase 2 | the working transcript | items to append as facts | fails the run | items appended in order; the first error drops them all |
 | before model call | turn phase 4, last | the finished request | edits it in place | `model_blocked`, then the run fails | in order, each seeing what the last left; the first error stops |
-| output guard | as the stream completes an assistant message | the message | a replacement or none | fails the turn | in order, each seeing the last's replacement; the last stands |
-| decision (before tool call) | preflight, per call, model order | the call, the tool, the arguments, the batch and index | a decision or none | fails the turn | the strictest action wins, block over defer over allow; a block ends the chain, a defer does not; rewritten arguments pass to the hooks after; the first reason and decider of the standing action, the first note; terminate if any set it |
-| after tool call | as each call completes | the call, the result, the error | an override or none | fails the turn | — |
+| output guard | as the stream completes an assistant message | the message | a replacement or none | fails the run | in order, each seeing the last's replacement; the last stands |
+| decision (before tool call) | preflight, per call, model order; a nested call as a batch of one | the call, the tool, the arguments, the batch and index | a decision or none | fails the run; returned to the tool for a nested call | the strictest action wins, block over defer over allow; a block ends the chain, a defer does not; rewritten arguments pass to the hooks after; the first reason and decider of the standing action, the first note; terminate if any set it |
+| after tool call | as each call settles, blocked calls excepted | the call, the result, the error | an override or none | fails the run; returned to the tool for a nested call | — |
 | should stop after turn | turn phase 10 | the response, the results, whether the turn was final, the transcript | stop or not; a guard error stops with cause `guard` | fails the run unless marked as a guard's | in order until one stops; the first error stops |
-| transform | request step 2 | a copy of the transcript | the input for this call | fails the turn | — |
+| transform | request step 2 | a copy of the transcript | the input for this call | fails the run | — |
 | filter | request step 3 | the transformed list | what the model sees | — | — |
 
 The stop hook tells a policy stop from a failure by marking its error
@@ -845,16 +917,24 @@ the loop rather than holding a tool set of its own, where the policy,
 the events and the record would all be absent. The loop runs the call
 as if the model had asked for it under the call in flight:
 
-- the decision hook decides it; a hook that defers it refuses it
-  instead, since a nested call cannot be handed to the caller: it
-  belongs to a tool that is running;
+- the decision hook decides it, seeing a batch of one at index 0; a
+  hook that defers it refuses it instead, since a nested call cannot be
+  handed to the caller: it belongs to a tool that is running, and the
+  error reads `a nested call cannot be deferred to the caller: ` and
+  the reason. The decision's note and terminate hint are ignored;
 - `tool_start` and `tool_end` are raised with **parent** naming the
   call that made it, serialised with the run's own events;
 - the after-call hook MAY override the result;
 - the result returned to the invoking tool is the one the model would
   have seen, with the error beside it: a tool that failed, a name no
   tool has, arguments that are not an object, or a refusal whose reason
-  is the error.
+  is the error;
+- a failure of the loop's own around the call — the decision hook
+  returning an error, a consumer failing on its `tool_start`, the
+  after-call hook or a consumer failing as it settles — is returned to
+  the invoking tool as the error and does not end the run; the tool
+  decides what its own result is. A decision hook error is returned
+  before `tool_start`, so that call raises no events at all.
 
 Nothing is appended to the transcript: a nested call is the work of the
 call that made it, costs no items, and its terminate hint means nothing
@@ -885,10 +965,20 @@ An agent stands in four places inside another system:
   loop keeps no store.
 - **As a tool.** A configuration wrapped as a tool. Each call runs a
   **child run** on a fresh transcript, or one seeded from the parent's
-  by a function the host supplies; the child's events stream out
-  through the call's progress channel; the final assistant text is the
-  output; the child's run ID and the items it added are the result's
-  details, so a recorder on the parent links the child session. The
+  by a function the host supplies. The seed the function sees is the
+  batch's snapshot with every unanswered call answered by a
+  placeholder output — the call being served says the child is
+  answering it, its siblings say they are running alongside — so the
+  child starts from valid input. The child's accumulated assistant
+  text streams out through the call's progress channel, with the
+  child's run ID as details; its events reach the observer alone. The
+  final assistant text is the output; when there is none, the last
+  output of a run that terminated is, and otherwise the call fails
+  with an error naming the cause. A child that failed returns its
+  error; one that was cancelled returns the cancellation. The child's
+  run ID, the items it added, its reason, cause and pending calls are
+  the result's details, so a recorder on the parent links the child
+  session. The
   child runs with its own configuration and its own hooks; the
   parent's do not run inside it. A child that ends with calls its own
   hook deferred returns an error that says so and names them, so the
@@ -930,27 +1020,36 @@ of the events.
 
 | event | entry |
 | --- | --- |
-| `run_start` | `run` start, with the loop's source as the format's and the trigger as `ref` |
+| `run_start` | `run` start, with the loop's source as the format's and the trigger joined as `kind:ref`, or whichever is set, as `ref`; an `env` entry when the host supplies one and it changed; the full initial `config` from the configuration's base request when nothing has been written yet |
 | `turn_start` | a `config` delta when the request's settings differ from the path's; the request hash is computed here and written on the response |
 | `model_retry` | a `config` delta when the revised request's settings differ |
-| `model_blocked` | a `response` carrying the hook's error, so the call that was refused is told from one that was made and failed |
-| `item_end` | an `item`, with the display flag off for a hidden item |
+| `model_blocked` | a failed `response` carrying the hook's error and the request hash, so the call that was refused is told from one that was made and failed |
+| `item_end` | an `item`, with the display flag off for a hidden item. Before a caller-supplied output for a call that was neither dispatched nor rejected, a `reject` decision with the output's text as its reason and the decider the caller named; before one for a call dispatched in an earlier run, a `proceed` with the decider when one was named |
 | `response_end` | the `response`, with `request_hash` when the input the loop sent is the input the recorded path rebuilds, and none otherwise |
-| `tool_start` | a `dispatch` for a call that will run, durable before the tool runs; a `decision`: `reject` with the reason for a block, `hold` for a defer, `proceed` with the arguments for an approval or a rewrite, with the decider the decision or the answer named |
-| `tool_end` | a recordable details value as a record entry in its namespace; a child run's `link` and its session; a nested call's record |
+| `tool_start` | a `decision`: `reject` with the reason for a block, `call blocked` when it gave none; `hold` for a defer, with the reason when given; `proceed` for a call that was held or whose arguments were rewritten, with the arguments. The decider is the decision's, and `policy` for a call nothing was holding whose decision names nobody. Then a `dispatch` for every call not blocked or deferred, durable before the tool runs. A nested call is a record entry instead |
+| `tool_end` | a recordable details value as a record entry in its namespace; a nested call's record; for a child run that was not observed, its session written from the items it added and its `link`; an observed child's `link` and session are written by the observer from the child's own events, starting at its `run_start` |
 | `turn_end` | nothing of its own |
-| `run_end` | `run` end, with the reason mapped onto the format's cascade: `done`, `input_required` and `error` as themselves; `aborted` as `interrupted`, since the host asked; `stopped` as `stopped`, or as the value the segment reads when the run answered nothing of its own |
+| `run_end` | first, when a `turn_start` had no `response_end`, a failed `response` carrying the run's error; then `run` end with the reason mapped onto the format's cascade: `done`, `input_required` and `error` as themselves, the error's text as `ref`; `aborted` as `interrupted` with the error's text, since the host asked; `stopped` as `stopped` when the last response made calls, as `done` when it made none, and for a run with no response of its own as `stopped` when it answered a pending call and left none, `aborted` otherwise, with the cause as `ref` |
 | a fold the transform reports | a `compaction` naming what was kept and what was pinned, or a record entry for a fold that failed |
-| `queued` | nothing today; the format has `queued`, and writing it is open (#67) |
+| `queued` | nothing today; the format has `queued`, and writing it is open (#67). The loop's follow-up mode is spelled `follow_up` and the format's `followup`; a writer maps the one onto the other |
 
 Three rules follow from the writing discipline of that format and are
 met by the delivery rules here. An item is durable before the tool that
 reads it runs, because every event is a barrier. A `dispatch` is
-durable before the tool runs, because `tool_start` precedes execution;
-that it precedes the whole batch's execution rather than each call's is
-open (#93). And every entry a cancellation leaves to write is written,
-because every event after a cancellation is delivered with a usable
-context.
+durable before the tool runs, because `tool_start` precedes execution.
+And every entry a cancellation leaves to write is written, because
+every event after a cancellation is delivered with a usable context.
+
+The `dispatch` row departs from the format in two ways this document
+intends to close. agenttool RFC 0001 says a call starts when it is
+handed to its tool and a harness that records a dispatch records it at
+that moment; the loop raises no event at that moment, so the reference
+writes it from `tool_start`, before the whole batch executes, and a
+call that never reached a tool reads as in flight (#93). And a
+`dispatch` is written for a call naming no tool or carrying bad
+arguments, which the format defines as a call handed to its tool. A
+loop SHOULD raise a per-call signal at hand-off, and a recorder SHOULD
+write the `dispatch` there and only for a call that is handed over.
 
 Two facts the record needs are supplied by the caller and carried by
 the loop unread: the trigger of a run, and who decided an answer. The
@@ -994,15 +1093,20 @@ maps onto it as follows:
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`; `tools/a2a.New(client, card)` |
 | the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`; `session.RequestHash` |
 
-Every error the package produces, sentinel or wrapped, begins with
-`agentturn:`. A panic in a tool is recovered by agenttool's executor
+Every error the package returns to its caller, sentinel or wrapped,
+begins with `agentturn:`; the error texts a call's output carries,
+`unknown tool "<name>"` and the others the batch section gives, are
+the model's and are not prefixed. A panic in a tool is recovered by
+agenttool's executor
 into an error the model sees; a panic in a hook or a subscriber is not
 recovered and unwinds without a `run_end`.
 
-Two places where the binding does not do what this document says are
-listed under open questions: the executor's recorder is not installed
-by the loop (#97), and a `dispatch` written from `tool_start` precedes
-the batch rather than the call (#93).
+Where the binding does not yet do what this document says, the rule
+above says so in place and names the issue: the pairing of `tool_start`
+and `tool_end` under a failure (#101), a decision's terminate hint on
+an executed call (#102), a wire error event and the retry (#103), the
+executor's recorder (#97) and the moment a `dispatch` is written
+(#93).
 
 ## Conformance
 
@@ -1018,9 +1122,9 @@ uncommitted attempt and drops what it held; raises exactly one
 error and the pending calls with their reasons; refuses to run over a
 transcript with an unanswered call unless the run's input answers it;
 answers pending calls only through a resume that answers all of them;
-settles a cut-off batch with a `tool_end` per call and the outputs of
-the calls that finished; and delivers every event a cancellation leaves
-behind.
+settles a batch cut off by a cancellation or a failure with a
+`tool_end` per call and the outputs of the calls that finished; and
+delivers every event a cancellation leaves behind.
 
 **A conforming agent** delivers events synchronously as barriers, one
 at a time, in registration order; refuses a second run while one is
@@ -1090,6 +1194,21 @@ module and is listed in the changelog as one.
 
 ## Open questions
 
+Three of these were found by checking this draft against the code and
+are defects in the reference rather than choices; the rule this
+document intends is stated in place and the issue holds the probe.
+
+- **`tool_start` without `tool_end` under a failure** (#101). A hook
+  or a consumer that fails while calls of the batch are running leaves
+  them without a `tool_end`, and appends the outputs of the ones that
+  finished without one. The cancellation path settles every call; the
+  failure path should go through the same settlement.
+- **A decision's terminate hint on an executed call** (#102). The hint
+  is honoured only for a call settled in preflight; for an allowed
+  call that runs it is dropped and the run ends `done`.
+- **A wire error event commits the attempt** (#103). An error event
+  before the answer opens is treated as final, so a retryable failure
+  reported that way is never retried and a fallback chain never asked.
 - **Dispatch per call, not per batch** (#93). The loop decides every
   call before any executes, and `tool_start` is where a recorder
   writes the `dispatch`, so every call of a batch is dispatched on disk

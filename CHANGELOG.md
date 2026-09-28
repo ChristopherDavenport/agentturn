@@ -15,8 +15,10 @@ versions may break the API.
   order and invariants, delivery, the queues, the hooks and their
   chains, nested calls, composition, what each event gives the
   record, the Go binding as a table, and conformance. The open
-  questions name the issues that track each gap. No behaviour
-  changes. (#81)
+  questions name the issues that track each gap. Checking the draft
+  against the code found three defects in the loop, filed as #101,
+  #102 and #103 and stated in the text as departures from the rule it
+  intends. No behaviour changes. (#81)
 
 ## v0.0.8 - 2026-09-23
 
