@@ -25,8 +25,7 @@ session recorder, a parent agent — it owes an event sequence with fixed
 order and fixed invariants: one terminal per run, every `tool_start`
 paired with a `tool_end`, an item announced complete only when it is,
 and every event after a cancellation still delivered, so what the
-record holds is what happened. Where the reference falls short of an
-invariant, this draft says so and names the issue.
+record holds is what happened.
 
 The transcript is Open Responses items and nothing else. The loop knows
 a model and a list of tools and never learns a sub-agent concept; every
@@ -36,8 +35,9 @@ model, a tool, a peer over a protocol, or itself under new settings.
 ## Motivation
 
 The rules below exist in doc comments on exported Go identifiers
-(#81). Most of them held when this draft was checked against the code;
-the ones that did not are named as open questions, each with an issue. A second
+(#81). Checking this draft against the code found three that the code
+did not keep (#101, #102, #103); they are fixed, and the rules here
+are the ones the tests now hold. A second
 implementation, in Go or elsewhere, has nothing to conform to and is
 reverse-engineered from comments, and two of them diverge exactly where
 the comments are load-bearing: one delivers `run_end` as soon as the
@@ -412,11 +412,10 @@ turn's `turn_start` and `response_end` are delivered once.
 
 An attempt **commits** when the model begins its answer, which is a
 message or a function call item opening; when the server answers with
-a failed response; or when a consumer fails while it is delivered. At
-draft 0.1 the reference also commits an attempt on a wire error event,
-so a retryable failure the server reports that way is never retried;
-that is a defect (#103), and the rule this document intends is that an
-error event before the answer opens is retried as a cut stream is. A
+a failed response; or when a consumer fails while it is delivered. An
+error event the server sends before the answer opens does not commit:
+it is a failed attempt like a cut stream, and the retry policy sees
+the wire error itself; one sent after the answer opened is final. A
 committed attempt MUST NOT be retried, because the transcript or a
 recorder may already hold part of it. An item the model completes
 before the attempt commits — the reasoning summary a reasoning model
@@ -484,11 +483,10 @@ For each call, in the model's order:
    A settled call's error output is rendered as agenttool RFC 0001
    renders a returned error, `Error: ` and the message, once. A
    decision's terminate hint rides on the result of a call settled
-   here, so a policy can refuse a call and end the run in one decision.
-   The rule this document intends is that it rides on the result of an
-   allowed call the same way, as the hint composes with allow; at
-   draft 0.1 the reference drops it for a call that executes and reads
-   the terminate cause from the tool's result alone (#102).
+   here, so a policy can refuse a call and end the run in one decision;
+   it rides on the result of an allowed call the same way, once the
+   tool has run, and an override by the after-call hook does not clear
+   it.
 
 A hook that defers one call can defer the rest of the batch and hold
 all of it for the answer, since it sees the whole batch and runs
@@ -519,8 +517,9 @@ completion order:
    here exist nowhere afterwards. It runs for every call but a blocked
    one: a call that settled in preflight with no tool or with bad
    arguments, an executed call, and a call a cancellation cut off,
-   which it sees with the cancellation as the error. A hook error fails
-   the run.
+   which it sees with the cancellation as the error. It does not run
+   for a call a failure cut off, since the run has already failed. A
+   hook error fails the run.
 2. An error, from the tool or the override, becomes the error output
    the model sees, with the result's details and terminate hint kept.
 3. `tool_end` is raised with the result as the model will see it, the
@@ -531,7 +530,9 @@ in the **model's order**, whatever order they completed in, each with
 its item events, and then the notes of the decisions, in the same
 order. A deferred call has no output. A batch that a cancellation or a
 failure cuts appends the outputs of the calls that finished and drops
-their notes.
+their notes. A call is **finished** when it settled with a result of
+its own, from its tool or the after-call hook, and its `tool_end` was
+raised; a call whose after-call hook failed has no result and is cut.
 
 The executor is given the configuration's execution mode and bound.
 The loop SHOULD also install the harness's tool recorder on it, so a
@@ -587,7 +588,7 @@ in transcript order, each with a reason:
 | --- | --- |
 | `deferred` | the decision hook handed the call to the caller in this run and nothing has answered it. The tool did not run |
 | `aborted` | the call was appended by this run and the run was cancelled or failed while it was in flight, after its `tool_start`. The tool may have run to completion, so its side effect may have happened |
-| `unknown` | the call was in the transcript the run was given, so the loop cannot say whether it ran. A session recorded with dispatch entries can. A call approved on resume and then cut off reads `unknown` too, since the run did not append it, although the run knows it started (#101 tracks the pairing rule this touches) |
+| `unknown` | the call was in the transcript the run was given, so the loop cannot say whether it ran. A session recorded with dispatch entries can. A call approved on resume and then cut off reads `unknown` too, since the run did not append it, although the run knows it started |
 
 The pending list is empty for `done` and `stopped`. Whatever ended the
 run, the calls without an output are the caller's to answer, and the
@@ -672,8 +673,10 @@ stream and the running tools through their contexts, as agenttool RFC
   from their own context either way.
 - A batch cut off is settled as follows, and this is the rule the
   motivation's first misreading breaks. Every call that had its
-  `tool_start` and is not settled gets its `tool_end` with the
-  cancellation as its error, so the two are always paired. The outputs
+  `tool_start` and has not ended gets its `tool_end` with the
+  cancellation as its error, so the two are always paired, and a
+  consumer that fails on one of those does not deprive the others of
+  theirs: the failure is reported once every call has ended. The outputs
   of the calls that **finished** before the cut — settled with a result
   of their own rather than the cancellation — are appended in the
   batch's order, so a call that ran to completion is answered in the
@@ -771,11 +774,13 @@ A conforming loop holds these over every run, however it ends:
   follow `run_end`.
 - Every `tool_start` has exactly one `tool_end` with the same call ID,
   whether the call ran, was blocked, was deferred, or was cut off
-  before or during execution by a cancellation. At draft 0.1 the
-  reference breaks this when a hook or a consumer fails mid-batch: the
-  calls still running get no `tool_end`, and the outputs of the calls
-  that finished are appended without one (#101). The rule stands and
-  the reference is to be fixed.
+  before or during execution by a cancellation or by a failure. A
+  batch a hook or a consumer fails inside is settled as a cancelled
+  one is: every call that has not ended gets its `tool_end` carrying
+  the failure, the outputs of the calls that finished are appended,
+  and the rest are pending as `aborted`. A `tool_end` counts as raised
+  when the loop delivers it, whether or not every consumer took it, so
+  a consumer that fails on one never earns the call a second.
 - `item_end` for an output item follows the wire event that completed
   it; a partial item is never announced as complete. The item is in the
   transcript when `item_end` is delivered.
@@ -933,8 +938,10 @@ as if the model had asked for it under the call in flight:
   returning an error, a consumer failing on its `tool_start`, the
   after-call hook or a consumer failing as it settles — is returned to
   the invoking tool as the error and does not end the run; the tool
-  decides what its own result is. A decision hook error is returned
-  before `tool_start`, so that call raises no events at all.
+  decides what its own result is. A call whose `tool_start` was raised
+  gets its `tool_end` carrying the failure, so the pair holds for a
+  nested call too. A decision hook error is returned before
+  `tool_start`, so that call raises no events at all.
 
 Nothing is appended to the transcript: a nested call is the work of the
 call that made it, costs no items, and its terminate hint means nothing
@@ -1102,11 +1109,8 @@ into an error the model sees; a panic in a hook or a subscriber is not
 recovered and unwinds without a `run_end`.
 
 Where the binding does not yet do what this document says, the rule
-above says so in place and names the issue: the pairing of `tool_start`
-and `tool_end` under a failure (#101), a decision's terminate hint on
-an executed call (#102), a wire error event and the retry (#103), the
-executor's recorder (#97) and the moment a `dispatch` is written
-(#93).
+above says so in place and names the issue: the executor's recorder
+(#97) and the moment a `dispatch` is written (#93).
 
 ## Conformance
 
@@ -1142,6 +1146,12 @@ from the events it names, and declines a request hash for an input the
 path cannot rebuild.
 
 ### The scenario corpus
+
+The reference's own tests hold the rules three defects found on the
+way to this draft broke: a batch a hook or a consumer fails inside
+pairs every call, a decision's terminate hint on an allowed call, and
+a wire error event before the answer as a retried attempt (#101,
+#102, #103).
 
 Draft 0.2 will add `testdata/loop/`, a directory of scenarios driven by
 a scripted model with no network, each holding the configuration in
@@ -1194,21 +1204,6 @@ module and is listed in the changelog as one.
 
 ## Open questions
 
-Three of these were found by checking this draft against the code and
-are defects in the reference rather than choices; the rule this
-document intends is stated in place and the issue holds the probe.
-
-- **`tool_start` without `tool_end` under a failure** (#101). A hook
-  or a consumer that fails while calls of the batch are running leaves
-  them without a `tool_end`, and appends the outputs of the ones that
-  finished without one. The cancellation path settles every call; the
-  failure path should go through the same settlement.
-- **A decision's terminate hint on an executed call** (#102). The hint
-  is honoured only for a call settled in preflight; for an allowed
-  call that runs it is dropped and the run ends `done`.
-- **A wire error event commits the attempt** (#103). An error event
-  before the answer opens is treated as final, so a retryable failure
-  reported that way is never retried and a fallback chain never asked.
 - **Dispatch per call, not per batch** (#93). The loop decides every
   call before any executes, and `tool_start` is where a recorder
   writes the `dispatch`, so every call of a batch is dispatched on disk

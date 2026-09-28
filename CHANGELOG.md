@@ -7,6 +7,29 @@ versions may break the API.
 
 ## Unreleased
 
+- **Fixed**: a hook or a subscriber that fails while a tool batch is
+  in flight no longer leaves the running calls without their
+  `tool_end`. The batch is settled as an abort settles it: every call
+  that has not ended gets a `tool_end` carrying the failure, the
+  outputs of the calls that finished with a result of their own are
+  appended, and the rest are pending as `aborted`; a call whose
+  after-call hook failed has no result and is cut. An abort that a
+  subscriber fails inside now ends every cut call before the failure
+  is reported, and a nested call whose hook or delivery failed gets
+  its `tool_end` before the error returns to the tool. A `tool_end`
+  counts as raised when the loop delivers it, so a subscriber that
+  fails on one never sees the call ended twice. (#101)
+- **Fixed**: `ToolDecision.Terminate` on an allowed call that runs
+  now ends the run with `StopTerminate`, or `StopPartialTerminate`
+  when the rest of the batch did not agree, as the doc comment
+  promised; it was honoured only for a call settled in preflight. An
+  `AfterToolCall` override does not clear the hint. (#102)
+- **Fixed**: a wire `error` event the model sends before its answer
+  opens is a failed attempt like a cut stream, retried under
+  `Config.Retry` with the wire error itself offered to the policy. It
+  was treated as a committed attempt and never retried, so a 503
+  reported that way defeated the retry and the fallback chain. An
+  error event after the answer opened is still final. (#103)
 - `docs/rfcs/0001-agent-loop.md` states the loop's contract as draft
   0.1, structured as agentsession's and agenttool's RFC 0001: the
   transcript, the request procedure, the phases of a turn, the batch
@@ -16,9 +39,7 @@ versions may break the API.
   chains, nested calls, composition, what each event gives the
   record, the Go binding as a table, and conformance. The open
   questions name the issues that track each gap. Checking the draft
-  against the code found three defects in the loop, filed as #101,
-  #102 and #103 and stated in the text as departures from the rule it
-  intends. No behaviour changes. (#81)
+  against the code found the three defects fixed above. (#81)
 
 ## v0.0.8 - 2026-09-23
 

@@ -757,6 +757,13 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 		commits, err := r.streamEvent(ev, &acc, committed)
 		committed = committed || commits
 		if err != nil {
+			var wire *wireError
+			if errors.As(err, &wire) {
+				// The server reported the failure as an event. Before
+				// the answer opened it is a failed attempt like a cut
+				// stream, and retried as one; after, it is final.
+				return nil, committed, wire.err
+			}
 			return nil, true, err
 		}
 		if final, ok := openresponses.TerminalResponse(ev); ok {
@@ -837,13 +844,21 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		r.added = append(r.added, item)
 		return false, r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, ResponseID: responseID})
 	case *openresponses.ErrorEvent:
-		return false, e.Err()
+		return false, &wireError{err: e.Err()}
 	}
 	if idx, ok := outputIndex(ev); ok {
 		return false, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[idx], Stream: ev, ResponseID: responseID})
 	}
 	return false, nil
 }
+
+// wireError carries an error event off the stream, so the attempt can
+// tell a failure the server reported from one raised while an event
+// was delivered, which commits the attempt.
+type wireError struct{ err error }
+
+func (e *wireError) Error() string { return e.err.Error() }
+func (e *wireError) Unwrap() error { return e.err }
 
 // commitsAttempt reports whether an item opening commits the attempt:
 // the model has begun its answer, so a failure after it cannot be
@@ -922,9 +937,16 @@ type callState struct {
 	// deferred is set when the caller owns the call; no output is
 	// appended.
 	deferred bool
-	// cut is set when the abort settled the call rather than the tool,
-	// so no output is appended for it whatever its error says.
+	// cut is set when an abort or a failure settled the call rather
+	// than the tool, so no output is appended for it whatever its error
+	// says.
 	cut bool
+	// ended is set once the call's tool_end has been delivered, so a
+	// batch that ends early can give one to every call that lacks it.
+	ended bool
+	// terminate is the decision's hint, which rides on the result
+	// whether the call is settled in preflight or runs.
+	terminate bool
 	// parent is the call whose tool made this one with Invoke, empty
 	// for a call of the model's batch.
 	parent string
@@ -978,15 +1000,37 @@ func (r *runner) preflightAll(ctx context.Context, tools agenttool.Set, calls []
 	batch := make([]*callState, len(calls))
 	for i, call := range calls {
 		p, err := r.preflight(ctx, tools, call, calls, i)
-		if err != nil {
-			return nil, err
-		}
 		batch[i] = p
+		if err != nil {
+			return nil, r.failBatch(ctx, batch, err)
+		}
 	}
 	if ctx.Err() != nil {
 		return nil, r.abortBatch(ctx, batch, context.Cause(ctx))
 	}
 	return batch, nil
+}
+
+// failBatch ends a batch a hook or a consumer failed inside, so the
+// run ends with the failure and no tool_start is left without its
+// tool_end: every call that has not ended gets one carrying the
+// failure, the calls that finished before it have their outputs
+// appended, and the rest are pending. The after-call hook does not
+// run for the cut calls, since the run has already failed; a delivery
+// that fails here is not reported over the failure that ended the run.
+// It returns cause.
+func (r *runner) failBatch(ctx context.Context, batch []*callState, cause error) error {
+	for _, p := range batch {
+		if p == nil || p.ended {
+			continue
+		}
+		p.settled, p.cut, p.ended = true, true, true
+		p.err = cause
+		p.result = agenttool.ErrorResult(cause)
+		_ = r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Parent: p.parent})
+	}
+	_ = r.appendFinished(ctx, batch)
+	return cause
 }
 
 // abortBatch ends a batch cut off before it executed: every call that
@@ -995,18 +1039,25 @@ func (r *runner) preflightAll(ctx context.Context, tools agenttool.Set, calls []
 // always paired, and the outputs of the calls preflight settled are
 // appended. It returns the stop for the aborted run.
 func (r *runner) abortBatch(ctx context.Context, batch []*callState, err error) error {
+	var first error
 	for _, p := range batch {
-		if p.settled {
+		if p == nil || p.ended {
 			continue
 		}
 		p.settled, p.cut = true, true
 		p.err = err
-		if serr := r.settle(ctx, p); serr != nil {
-			return serr
+		if serr := r.settle(ctx, p); serr != nil && first == nil {
+			// The failure is reported once every call has its
+			// tool_end, so a consumer that fails on one of them does
+			// not leave the others without theirs.
+			first = serr
 		}
 	}
-	if aerr := r.appendFinished(ctx, batch); aerr != nil {
-		return aerr
+	if aerr := r.appendFinished(ctx, batch); aerr != nil && first == nil {
+		first = aerr
+	}
+	if first != nil {
+		return first
 	}
 	return stop(ReasonAborted, err)
 }
@@ -1062,9 +1113,9 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 		}
 		if err != nil {
 			// Leaving the executor's range cancels the batch and waits
-			// for the running tools before this returns.
-			_ = r.appendFinished(ctx, batch)
-			return err
+			// for the running tools before this returns; they are then
+			// ended with the failure, as an abort ends them.
+			return r.failBatch(ctx, batch, err)
 		}
 	}
 	if ctx.Err() != nil {
@@ -1114,13 +1165,13 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 		if ap.note != "" {
 			p.note = openresponses.UserText(ap.note)
 		}
-		if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args, Decision: &ToolDecision{Args: ap.args, Note: ap.note, By: ap.by}}); err != nil {
-			return nil, err
-		}
-		if err := r.check(ctx, p, false); err != nil {
-			return nil, err
-		}
 		batch[i] = p
+		if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args, Decision: &ToolDecision{Args: ap.args, Note: ap.note, By: ap.by}}); err != nil {
+			return nil, r.failBatch(ctx, batch, err)
+		}
+		if err := r.check(ctx, p); err != nil {
+			return nil, r.failBatch(ctx, batch, err)
+		}
 	}
 	if ctx.Err() != nil {
 		return nil, r.abortBatch(ctx, batch, context.Cause(ctx))
@@ -1134,10 +1185,11 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 
 // preflight resolves the tool, checks the arguments and runs
 // BeforeToolCall. It emits tool_start and, for a call that will not
-// execute, tool_end.
+// execute, tool_end. The state is returned beside an error once
+// tool_start has been raised, so the batch can give the call its
+// tool_end; before that there is nothing to end and the state is nil.
 func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openresponses.FunctionCall, batch []*openresponses.FunctionCall, index int) (*callState, error) {
 	p := r.prepare(tools, r.turn, call, nil)
-	var terminate bool
 	var decision *ToolDecision
 	if r.cfg.BeforeToolCall != nil {
 		var err error
@@ -1152,7 +1204,7 @@ func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openr
 			if decision.Note != "" && decision.Action == Allow {
 				p.note = openresponses.DeveloperText(decision.Note)
 			}
-			terminate = decision.Terminate
+			p.terminate = decision.Terminate
 			switch decision.Action {
 			case Block:
 				reason := decision.Reason
@@ -1171,13 +1223,13 @@ func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openr
 		}
 	}
 	if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: call.CallID, Name: call.Name, Args: p.args, Decision: decision}); err != nil {
-		return nil, err
+		return p, err
 	}
 	if p.deferred {
-		p.settled = true
+		p.settled, p.ended = true, true
 		return p, r.emit(&ToolEnd{RunID: r.runID, Turn: r.turn, CallID: call.CallID, Name: call.Name, Deferred: true})
 	}
-	return p, r.check(ctx, p, terminate)
+	return p, r.check(ctx, p)
 }
 
 // prepare starts the state of a call: the tool with its name, if any,
@@ -1198,7 +1250,7 @@ func (r *runner) prepare(tools agenttool.Set, turn int, call *openresponses.Func
 // check settles a call that will not execute: one a hook blocked, one
 // no tool has the name of, or one whose arguments are not an object.
 // It returns nil, with the call unsettled, when the call may run.
-func (r *runner) check(ctx context.Context, p *callState, terminate bool) error {
+func (r *runner) check(ctx context.Context, p *callState) error {
 	switch {
 	case p.blocked:
 	case p.tool == nil:
@@ -1211,7 +1263,6 @@ func (r *runner) check(ctx context.Context, p *callState, terminate bool) error 
 	}
 	p.settled = true
 	p.result = agenttool.ErrorResult(p.err)
-	p.result.Terminate = terminate
 	return r.settle(ctx, p)
 }
 
@@ -1234,6 +1285,14 @@ func (r *runner) settle(ctx context.Context, p *callState) error {
 		p.result.Terminate = terminate
 		p.result.Details = details
 	}
+	// The decision's hint composes with the tool's own, whether the
+	// call ran or was settled in preflight, and an override does not
+	// clear it: the policy asked the loop to stop after this batch.
+	p.result.Terminate = p.result.Terminate || p.terminate
+	// The event is raised whether or not every consumer takes it: a
+	// delivery that fails is the consumer's failure, and the call is
+	// not ended a second time for it.
+	p.ended = true
 	return r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Parent: p.parent})
 }
 
@@ -1321,10 +1380,10 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 		}
 	}
 	if err := r.emit(&ToolStart{RunID: r.runID, Turn: turn, CallID: call.CallID, Name: name, Args: p.args, Decision: decision, Parent: parent}); err != nil {
-		return agenttool.Result{}, err
+		return agenttool.Result{}, r.endNested(p, err)
 	}
-	if err := r.check(ctx, p, false); err != nil {
-		return agenttool.Result{}, err
+	if err := r.check(ctx, p); err != nil {
+		return agenttool.Result{}, r.endNested(p, err)
 	}
 	if p.settled {
 		return p.result, p.err
@@ -1334,7 +1393,21 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 	p.result, p.err = results[0], errs[0]
 	p.settled = true
 	if err := r.settle(ctx, p); err != nil {
-		return agenttool.Result{}, err
+		return agenttool.Result{}, r.endNested(p, err)
 	}
 	return p.result, p.err
+}
+
+// endNested gives a nested call whose loop-side handling failed, a
+// hook or a consumer, the tool_end its tool_start promised, carrying
+// the failure, and returns the failure to the invoking tool. The run
+// goes on: the failure is the tool's to answer.
+func (r *runner) endNested(p *callState, cause error) error {
+	if !p.ended {
+		p.settled, p.cut, p.ended = true, true, true
+		p.err = cause
+		p.result = agenttool.ErrorResult(cause)
+		_ = r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Parent: p.parent})
+	}
+	return cause
 }
