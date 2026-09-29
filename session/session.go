@@ -57,8 +57,11 @@
 //     config delta, and the path names the model that answered.
 //   - model_blocked: the config settle for the request that was built,
 //     then a response entry with status failed, the hook's error and
-//     the request hash, so a call a BeforeModelCall guard refused is on
-//     the record and distinct from one that was made and failed.
+//     the request hash, so a call a BeforeModelCall hook refused is on
+//     the record and distinct from one that was made and failed; for a
+//     guard's stop, an error wrapping agentturn.ErrGuard, a custom
+//     entry in [ModelBlockedNS] carrying the same, since the run was
+//     stopped rather than failed.
 //   - item_end: an item entry; an item streamed by the model carries its
 //     response ID, and an item the caller marked with agentturn.Hidden
 //     carries visible false, the format's word for an item that is part
@@ -127,8 +130,9 @@
 //     an input nobody takes up is closed by the next run end, which is
 //     how a host declines one. A rewind or a fork into a run leaves
 //     what that run owed behind. An input the agent accepted while idle
-//     is reported, and so written, at the start of the next run, so a
-//     host that must not lose one between runs writes it itself. An
+//     is reported, and so written, at the start of the next run; a
+//     host that must not lose one between runs queues it through
+//     [Recorder.Queue], which writes it first. An
 //     input the filter keeps from the model is a custom entry, which
 //     cannot name its queued entry; the run's end closes that one.
 //   - a fold reported through [Recorder.Fold]: a compaction entry whose
@@ -396,6 +400,25 @@ type ModelRetry struct {
 	// attempt sends; the change itself is on the path as the config
 	// delta the next settle writes.
 	Revised bool `json:"revised,omitempty"`
+}
+
+// ModelBlockedNS is the namespace of the custom entry written for a
+// request a BeforeModelCall guard refused with an error wrapping
+// agentturn.ErrGuard, a policy stopping the run before the call. Its
+// data is a [ModelBlocked]. A hook's other errors are a failed
+// response entry, as a call that was refused for failing; a guard's
+// stop is not a failure, and a failed response would make the run's
+// end read as one.
+const ModelBlockedNS = "agentturn:model_blocked"
+
+// ModelBlocked is the data of a [ModelBlockedNS] custom entry.
+type ModelBlocked struct {
+	// Error is the guard's error.
+	Error string `json:"error"`
+	// RequestHash is the hash of the request that was refused, when the
+	// path rebuilds its input, and Model the model it named.
+	RequestHash string `json:"request_hash,omitempty"`
+	Model       string `json:"model,omitempty"`
 }
 
 // ElicitationNS is the namespace of the custom entry written for a
@@ -952,6 +975,42 @@ func (w *writer) requeue(ctx context.Context) error {
 			return err
 		}
 		in.entry = id
+	}
+	return nil
+}
+
+// Queue queues items into a's queue in mode, as agentturn.Agent.Queue
+// does with ctx's trigger, after writing each as a queued entry at the
+// session's leaf, durably, before it returns: the way to accept an
+// input that must not be lost while the agent is idle, whose queued
+// event would otherwise wait for the next run. The event then writes
+// nothing. An item whose entry cannot be written is not queued, and
+// the error says so; the items before it are.
+func (r *Recorder) Queue(ctx context.Context, a *agentturn.Agent, mode agentturn.QueueMode, items ...openresponses.Item) error {
+	trigger := agentturn.TriggerFromContext(ctx)
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		base, _ := agentturn.Unhide(item)
+		in := &inboxItem{item: base, mode: agentsession.ModeFollowUp, held: true, awaiting: true}
+		if mode == agentturn.QueueSteer {
+			in.mode = agentsession.ModeSteer
+		}
+		if !trigger.IsZero() {
+			in.trigger = &agentsession.Trigger{Kind: trigger.Kind, Ref: trigger.Ref, Source: trigger.Source}
+		}
+		r.mu.Lock()
+		r.root.inbox = append(r.root.inbox, in)
+		err := r.root.requeue(context.WithoutCancel(ctx))
+		if err != nil {
+			r.root.inbox = r.root.inbox[:len(r.root.inbox)-1]
+		}
+		r.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		a.Queue(ctx, mode, item)
 	}
 	return nil
 }
@@ -1849,6 +1908,17 @@ func (w *writer) blocked(ctx context.Context, e *agentturn.ModelBlocked) error {
 		return err
 	}
 	if err := w.settle(ctx, req); err != nil {
+		return err
+	}
+	if errors.Is(e.Err, agentturn.ErrGuard) {
+		// A policy stopped the run: the refused request is a record of
+		// its own, since a failed response would read as the run
+		// failing.
+		raw, err := json.Marshal(ModelBlocked{Error: errText(e.Err), RequestHash: hash, Model: req.Model})
+		if err != nil {
+			return fmt.Errorf("session: encode model blocked: %w", err)
+		}
+		_, err = w.append(ctx, &agentsession.CustomEntry{NS: ModelBlockedNS, Data: raw})
 		return err
 	}
 	w.responses++

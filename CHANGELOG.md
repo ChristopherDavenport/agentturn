@@ -98,9 +98,12 @@ versions may break the API.
   `BeforeModelCall` stops the run with `ReasonStopped` and `StopGuard`,
   the error on `RunEnd.Err`, as it does from `ShouldStopAfterTurn`; it
   ended the run with `ReasonError`, so a cost limit either overshot by a
-  call or was filed as a failure. The turn has no `turn_start` and no
-  `ModelBlocked`, and the recorder writes no failed response for a call
-  that was never made. Any other error is unchanged. (#116)
+  call or was filed as a failure. The turn has no `turn_start`; a stop
+  from `BeforeModelCall` still raises `ModelBlocked` with the refused
+  request, which the recorder writes as a custom entry in
+  `agentturn:model_blocked` carrying the error and the request hash,
+  since a failed response would make the record read the stop as a
+  failure. Any other error is unchanged. (#116)
 - **Breaking**: an item steered while the agent is idle joins the next
   run before its first model call, after the prompt, where it waited
   for the first batch and reached the model one call late. A run that
@@ -122,8 +125,9 @@ versions may break the API.
     it back to the agent without writing it a second time; an input
     nobody takes up is closed by the next run end and not written again.
     An input accepted while the agent is idle is reported, and written,
-    at the next run's start, so a host that must not lose one between
-    runs writes it itself.
+    at the next run's start; `Recorder.Queue(ctx, agent, mode, items...)`
+    writes it first and then queues it, for a host that must not lose
+    one between runs.
   - `Resume` closes a run left open at the leaf, which a crash cut off,
     with reason `error` and ref `cut off: closed on resume`, before it
     returns, and queues the inputs that run owed again after the end,

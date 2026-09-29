@@ -20,8 +20,8 @@ func (m *counting) CreateStream(ctx context.Context, req openresponses.Request, 
 
 // TestGuardBeforeTheCallStops pins #116: an error wrapping ErrGuard from
 // the hooks that run before the model call stops the run as a policy
-// stop, with no model call and no model_blocked; any other error is
-// still a failure.
+// stop, with no model call, a model_blocked carrying the request from
+// BeforeModelCall; any other error is still a failure.
 func TestGuardBeforeTheCallStops(t *testing.T) {
 	spent := fmt.Errorf("%w: cost limit reached", ErrGuard)
 	boom := errors.New("boom")
@@ -34,7 +34,7 @@ func TestGuardBeforeTheCallStops(t *testing.T) {
 		wantBlocked bool
 	}{
 		{name: "before turn, guard", turn: func(context.Context, TurnStartInfo) (openresponses.Items, error) { return nil, spent }, reason: ReasonStopped, wantErr: spent},
-		{name: "before model call, guard", call: func(context.Context, *openresponses.Request) error { return spent }, reason: ReasonStopped, wantErr: spent},
+		{name: "before model call, guard", call: func(context.Context, *openresponses.Request) error { return spent }, reason: ReasonStopped, wantErr: spent, wantBlocked: true},
 		{name: "before turn, failure", turn: func(context.Context, TurnStartInfo) (openresponses.Items, error) { return nil, boom }, reason: ReasonError, wantErr: boom},
 		{name: "before model call, failure", call: func(context.Context, *openresponses.Request) error { return boom }, reason: ReasonError, wantErr: boom, wantBlocked: true},
 	} {

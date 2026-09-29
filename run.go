@@ -688,15 +688,14 @@ func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponse
 	req.Input = r.cfg.filter()(input)
 	if r.cfg.BeforeModelCall != nil {
 		if err := r.cfg.BeforeModelCall(ctx, &req); err != nil {
-			if errors.Is(err, ErrGuard) {
-				// A policy stopped the run before the call: nothing was
-				// refused that a record should hold as a failed call.
-				return openresponses.Request{}, stopped(StopGuard, err)
-			}
 			// The call was never made; the request as built is the
-			// record of what was refused.
+			// record of what was refused, whether a policy stopped the
+			// run or the hook failed.
 			if eerr := r.emit(&ModelBlocked{RunID: r.runID, Turn: r.turn, Request: req, Err: err}); eerr != nil {
 				return openresponses.Request{}, eerr
+			}
+			if errors.Is(err, ErrGuard) {
+				return openresponses.Request{}, stopped(StopGuard, err)
 			}
 			return openresponses.Request{}, fmt.Errorf("agentturn: before-model-call hook: %w", err)
 		}

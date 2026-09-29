@@ -120,11 +120,10 @@ type Config struct {
 	// a session recorder writes that call without a request hash; a
 	// change to a setting is recorded as a config delta. A hook that
 	// refuses the call ends the run with ReasonError after a
-	// [ModelBlocked] event carrying the request as built, unless its
-	// error wraps [ErrGuard]: that is a policy stopping the run before
-	// the call, which ends it with ReasonStopped and StopGuard and
-	// raises no ModelBlocked, since nothing was refused that a record
-	// should hold as a failed call. A guard that
+	// [ModelBlocked] event carrying the request as built; an error that
+	// wraps [ErrGuard] is a policy stopping the run before the call,
+	// which raises the same ModelBlocked and ends the run with
+	// ReasonStopped and StopGuard. A guard that
 	// calls a model is on the critical path of every first token, since
 	// the request is not final until the hook returns.
 	//

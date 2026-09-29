@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -353,6 +354,17 @@ func TestGuardBeforeTheCallIsRecordedAsAStop(t *testing.T) {
 			t.Errorf("a response entry for a call never made: %q", entryTypes(s))
 		}
 	}
+	blocked := customs(s, ModelBlockedNS)
+	if len(blocked) != 1 {
+		t.Fatalf("model_blocked entries in %q", entryTypes(s))
+	}
+	var mb ModelBlocked
+	if err := json.Unmarshal(blocked[0].Data, &mb); err != nil {
+		t.Fatal(err)
+	}
+	if mb.RequestHash == "" || !strings.Contains(mb.Error, "cost limit") {
+		t.Errorf("model_blocked = %+v", mb)
+	}
 	runs := runsOf(t, s)
 	if len(runs) != 1 || runs[0].End == nil || !strings.HasPrefix(runs[0].End.Ref, "guard: ") {
 		t.Errorf("run end = %+v", runs[0].End)
@@ -515,4 +527,49 @@ func TestInboxHoldsOnlyWhatTheAgentHolds(t *testing.T) {
 			t.Errorf("verify records: %v", err)
 		}
 	})
+}
+
+// TestQueueWritesBeforeItQueues checks that an input queued through the
+// recorder while the agent is idle is on the record at once, and that
+// its queued event and the item that drains it add no second entry.
+func TestQueueWritesBeforeItQueues(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("first")); err != nil {
+		t.Fatal(err)
+	}
+	ctx := agentturn.ContextWithTrigger(context.Background(), agentturn.Trigger{Kind: "cron", Ref: "03:00"})
+	if err := rec.Queue(ctx, a, agentturn.QueueFollowUp, openresponses.UserText("the 03:00 firing")); err != nil {
+		t.Fatal(err)
+	}
+	owed, err := s.PendingQueued(s.Leaf())
+	if err != nil || len(owed) != 1 || owed[0].Trigger == nil || owed[0].Trigger.Ref != "03:00" {
+		t.Fatalf("owed while idle = %+v, %v", owed, err)
+	}
+	if a.State().FollowUps != 1 {
+		t.Fatalf("follow-ups = %d", a.State().FollowUps)
+	}
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("second")); err != nil {
+		t.Fatal(err)
+	}
+	if n := countQueued(s); n != 1 {
+		t.Errorf("queued entries = %d in %q", n, entryTypes(s))
+	}
+	var drained *agentsession.ItemEntry
+	for _, e := range s.Entries() {
+		if it, ok := e.(*agentsession.ItemEntry); ok && it.QueuedFrom != "" {
+			drained = it
+		}
+	}
+	if drained == nil || drained.QueuedFrom != owed[0].ID {
+		t.Errorf("drained = %+v", drained)
+	}
+	if err := s.VerifyRecords(s.Leaf()); err != nil {
+		t.Errorf("verify records: %v", err)
+	}
 }

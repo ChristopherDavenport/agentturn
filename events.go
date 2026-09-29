@@ -159,9 +159,10 @@ func (*ModelRetry) EventType() string { return EventModelRetry }
 // ModelBlocked reports that [Config.BeforeModelCall] refused the turn's
 // request, so no call was made: Request is the request as built when
 // the hook ran and Err is the hook's error. It is the last event before
-// the run ends with ReasonError, in place of the turn_start the call
-// would have had, so a recorder can write the call that was refused as
-// distinct from one that was made and failed.
+// the run ends, in place of the turn_start the call would have had, so
+// a recorder can write the call that was refused as distinct from one
+// that was made and failed. The run ends with ReasonError, or with
+// ReasonStopped and StopGuard when Err wraps [ErrGuard].
 type ModelBlocked struct {
 	RunID   string
 	Turn    int
@@ -364,8 +365,8 @@ const (
 	StopHook StopCause = "hook"
 	// StopGuard: ShouldStopAfterTurn, BeforeTurn or BeforeModelCall
 	// returned an error wrapping [ErrGuard]; the error is on RunEnd.Err.
-	// Stopped before the model call, the turn has no turn_start and no
-	// model_blocked.
+	// Stopped before the model call, the turn has no turn_start; from
+	// BeforeModelCall, the request it refused is on a model_blocked.
 	StopGuard StopCause = "guard"
 	// StopTerminate: every result of the batch set Terminate, so the
 	// tools answered on the model's behalf.
