@@ -5,6 +5,15 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Requires `agenttool` v0.0.9 and `agentsession` v0.0.9, up from
+  v0.0.8. The session recorder writes `agentsession/0.6`, which adds
+  optional members only; a 0.5 session reads as it stands, and v0.0.8
+  of agentsession refuses a 0.6 file, as a 0.x reader refuses a later
+  minor. A store now honours a header's `base` at `Create`, so a
+  forked session can be written through any of them.
+
 ## v0.0.9 - 2026-09-28
 
 - Requires `agenttool` v0.0.8 and `agentsession` v0.0.8, up from
