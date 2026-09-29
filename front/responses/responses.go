@@ -37,10 +37,14 @@
 // run continues from there. Only the deferred calls appear, never the
 // ones the agent executed itself, unless [WithToolItems] is on.
 //
-// A full run that a guard stopped (agentturn.StopGuard) before the
-// model answered fails with the guard's error, as a single turn does
-// when BeforeModelCall refuses it; one a guard stopped after an answer
-// completes with that answer.
+// A full run that a guard stopped (agentturn.StopGuard) with no answer
+// (agentturn.RunEnd.Answer) fails with the guard's error, as a single
+// turn does when BeforeModelCall refuses it. That holds whichever hook
+// the guard is on: BeforeTurn or BeforeModelCall, on the first turn or
+// on a later one after text that preceded a call, and
+// ShouldStopAfterTurn after a turn that only called tools. A run a
+// guard stopped after an answer completes with that answer, the
+// OutputGuard's replacement when it made one.
 package responses
 
 import (
@@ -185,12 +189,14 @@ func (a *Adapter) fullRun(ctx context.Context, req openresponses.Request, transc
 		}
 		return context.Canceled
 	case agentturn.ReasonStopped:
-		// A guard that stopped the run before the model answered, at
-		// BeforeTurn or BeforeModelCall, refused the request: an empty
-		// completed response would read as a success. One that stopped
-		// it after an answer, which OutputGuard may have withheld,
-		// completes with what the caller is to see.
-		if end.Cause == agentturn.StopGuard && !answered(end.Items) {
+		// A guard that stopped the run before the model answered
+		// refused the request, at whichever hook it stopped it: before
+		// the first call, on a tool's output before the next, or after
+		// a turn that only called tools. A completed response holding
+		// no answer, or only a preamble, would read as a success. One
+		// that stopped it after an answer, which OutputGuard may have
+		// replaced, completes with what the caller is to see.
+		if _, ok := end.Answer(); end.Cause == agentturn.StopGuard && !ok {
 			return end.Err
 		}
 	case agentturn.ReasonInputRequired:
@@ -208,16 +214,6 @@ func (a *Adapter) fullRun(ctx context.Context, req openresponses.Request, transc
 	}
 	rl.em.Response().Usage = &usage
 	return rl.em.Complete()
-}
-
-// answered reports whether items hold an assistant message with text.
-func answered(items agentturn.Transcript) bool {
-	for _, item := range items {
-		if m, ok := item.(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant && m.Text() != "" {
-			return true
-		}
-	}
-	return false
 }
 
 // oneTurn calls the model once with the agent's and the caller's tools

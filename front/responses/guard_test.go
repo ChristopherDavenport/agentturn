@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/openresponses"
 	"github.com/ChristopherDavenport/openresponses/echo"
@@ -152,11 +153,22 @@ func TestRelayReplacementIsWellFormed(t *testing.T) {
 }
 
 // TestGuardStopBeforeAnswerFails pins #138: a full run a guard stopped
-// before the model answered, at BeforeTurn or BeforeModelCall, fails
-// with the guard's error rather than completing empty; one a guard
-// stopped after the answer completes with it.
+// before the model answered fails with the guard's error rather than
+// completing empty or with a preamble, whichever hook the guard is on;
+// one a guard stopped after the answer completes with it, or with the
+// output guard's replacement, unless the replacement has no text.
 func TestGuardStopBeforeAnswerFails(t *testing.T) {
 	refuse := fmt.Errorf("%w: homework tripwire", agentturn.ErrGuard)
+	onToolOutput := func(_ context.Context, req *openresponses.Request) error {
+		for _, item := range req.Input {
+			if _, ok := item.(*openresponses.FunctionCallOutput); ok {
+				return refuse
+			}
+		}
+		return nil
+	}
+	afterTurn := func(context.Context, agentturn.TurnInfo) (bool, error) { return false, refuse }
+	lookup := agenttool.New("lookup", "", func(context.Context, agenttool.NoArgs) (string, error) { return "found", nil })
 	for _, tc := range []struct {
 		name string
 		cfg  agentturn.Config
@@ -168,13 +180,28 @@ func TestGuardStopBeforeAnswerFails(t *testing.T) {
 		{"before model call", agentturn.Config{BeforeModelCall: func(context.Context, *openresponses.Request) error {
 			return refuse
 		}}, ""},
-		{"after the answer", agentturn.Config{ShouldStopAfterTurn: func(context.Context, agentturn.TurnInfo) (bool, error) {
-			return false, refuse
-		}}, "solve x"},
+		{"before turn 2, after a preamble", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, BeforeTurn: func(_ context.Context, info agentturn.TurnStartInfo) (openresponses.Items, error) {
+			if info.Turn > 1 {
+				return nil, refuse
+			}
+			return nil, nil
+		}}, ""},
+		{"before model call 2, after a preamble", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, BeforeModelCall: onToolOutput}, ""},
+		{"after a turn that called tools", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, ShouldStopAfterTurn: afterTurn}, ""},
+		{"after the answer", agentturn.Config{ShouldStopAfterTurn: afterTurn}, "solve x"},
+		{"after the answer, withheld", agentturn.Config{ShouldStopAfterTurn: afterTurn, OutputGuard: func(context.Context, agentturn.OutputInfo) (*openresponses.Message, error) {
+			return openresponses.AssistantText("[withheld]"), nil
+		}}, "[withheld]"},
+		{"after the answer, withheld as nothing", agentturn.Config{ShouldStopAfterTurn: afterTurn, OutputGuard: func(context.Context, agentturn.OutputInfo) (*openresponses.Message, error) {
+			return openresponses.AssistantText(""), nil
+		}}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := tc.cfg
-			cfg.Model, cfg.ModelName = &echo.Adapter{}, "m"
+			if cfg.Model == nil {
+				cfg.Model = &echo.Adapter{}
+			}
+			cfg.ModelName = "m"
 			resp, err := New(cfg).Create(context.Background(), request(openresponses.UserText("solve x")))
 			if tc.want == "" {
 				if !errors.Is(err, agentturn.ErrGuard) {
@@ -190,4 +217,29 @@ func TestGuardStopBeforeAnswerFails(t *testing.T) {
 			}
 		})
 	}
+}
+
+// preamble says something and calls the first tool it is offered, then
+// echoes once a tool has answered.
+type preamble struct{}
+
+func (preamble) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	if _, ok := req.Input[len(req.Input)-1].(*openresponses.FunctionCallOutput); ok {
+		return (&echo.Adapter{}).CreateStream(ctx, req, sink)
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if err := em.Item(openresponses.AssistantText("Let me check.")); err != nil {
+		return err
+	}
+	w, err := em.FunctionCall("", req.Tools[0].(*openresponses.FunctionTool).Name)
+	if err != nil {
+		return err
+	}
+	if err := w.Arguments(`{}`); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
 }

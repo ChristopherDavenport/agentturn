@@ -124,15 +124,18 @@ func WithToolName(name string) Option {
 }
 
 // WithNoAnswer sets what the parent's model sees when the child ends
-// without a final assistant message: a run that hit its turn budget
-// or a stop hook still calling tools, or one that finished with an
-// empty message. The default returns an error naming the agent and
-// the cause, so the model knows the child did not answer rather than
+// without an answer (agentturn.RunEnd.Answer): a run that hit its turn
+// budget or a stop hook (agentturn.StopHook) still calling tools, text
+// before a call being no answer, or one that finished with an empty
+// message. The default returns an error naming the agent and the
+// cause, so the model knows the child did not answer rather than
 // reading an empty output as one; a child stopped by a terminating
 // tool result is the exception, whose last output stands as the
 // answer, since the tool answered on the model's behalf. A child a
-// guard stopped before it answered is not asked about here: the call
-// fails with the guard's error, which wraps agentturn.ErrGuard.
+// guard stopped (agentturn.StopGuard) without an answer is not asked
+// about here, whichever hook the guard is on, ShouldStopAfterTurn
+// included: that is a refusal, and the call fails with the guard's
+// error, which wraps agentturn.ErrGuard.
 func WithNoAnswer(fn func(ChildInfo) (agenttool.Result, error)) Option {
 	return func(o *options) { o.noAnswer = fn }
 }
@@ -463,11 +466,11 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		}
 		return agenttool.Result{Details: info}, err
 	}
-	text, ok := lastAssistantText(end.Items)
+	text, ok := end.Answer()
 	if !ok && end.Reason == agentturn.ReasonStopped && end.Cause == agentturn.StopGuard {
-		// A guard refused the child's input before it answered. The
-		// parent gets the guard's error, which wraps ErrGuard, as it
-		// gets a failed run's.
+		// A guard stopped the child before it answered, at whichever
+		// hook. The parent gets the guard's error, which wraps
+		// ErrGuard, as it gets a failed run's.
 		return agenttool.Result{Details: info}, fmt.Errorf("agent %q: %w", a.cfg.Name, end.Err)
 	}
 	if !ok {
@@ -563,24 +566,12 @@ func defaultNoAnswer(info ChildInfo) (agenttool.Result, error) {
 	}
 	name := "the agent"
 	if info.Agent != "" {
-		name = "agent " + strconv.Quote(info.Agent)
+		name = fmt.Sprintf("agent %q", info.Agent)
 	}
 	if info.Cause != "" {
 		return agenttool.Result{}, fmt.Errorf("%s stopped (%s) without a final answer", name, info.Cause)
 	}
 	return agenttool.Result{}, errors.New(name + " finished without a final answer")
-}
-
-// lastAssistantText returns the text of the last assistant message,
-// and whether there is one with text.
-func lastAssistantText(items agentturn.Transcript) (string, bool) {
-	for i := len(items) - 1; i >= 0; i-- {
-		if m, ok := items[i].(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant {
-			text := m.Text()
-			return text, text != ""
-		}
-	}
-	return "", false
 }
 
 // lastOutputText returns the text of the last function call output.
