@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"regexp"
 	"slices"
 	"strings"
 	"syscall"
@@ -1299,6 +1300,10 @@ func (m *callIDModel) CreateStream(_ context.Context, req openresponses.Request,
 	return em.Complete()
 }
 
+// callIDAlphabet is what every provider takes for a call ID; Anthropic
+// takes nothing else.
+var callIDAlphabet = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
 // TestCallIDsNameOneCall pins that a call ID names one call in the
 // transcript: a call whose ID the model left empty or gave an earlier
 // call runs under an ID of the loop's own, which its item_end, its
@@ -1315,6 +1320,7 @@ func TestCallIDsNameOneCall(t *testing.T) {
 		{name: "repeated across turns", turns: [][]string{{"call_0"}, {"call_0"}}, kept: []string{"call_0"}},
 		{name: "repeated in a response", turns: [][]string{{"call_0", "call_0"}}, kept: []string{"call_0"}},
 		{name: "empty", turns: [][]string{{"-", "-"}}},
+		{name: "repeated outside the alphabet", turns: [][]string{{"call.0:x"}, {"call.0:x"}}, kept: []string{"call.0:x"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1333,6 +1339,9 @@ func TestCallIDsNameOneCall(t *testing.T) {
 				}
 				if call.CallID == "" || seen[call.CallID] {
 					t.Errorf("call ID %q empty or repeated", call.CallID)
+				}
+				if !slices.Contains(tc.kept, call.CallID) && !callIDAlphabet.MatchString(call.CallID) {
+					t.Errorf("the loop's call ID %q is outside [A-Za-z0-9_-]", call.CallID)
 				}
 				seen[call.CallID] = true
 				ids = append(ids, call.CallID)
@@ -1376,8 +1385,12 @@ func TestCallIDsNameOneCall(t *testing.T) {
 func TestReservedCallIDs(t *testing.T) {
 	cases := []struct {
 		name string
-		// reserve is given to New, and reserveLater to ReserveCallIDs.
-		reserve, reserveLater []string
+		// reserve is given to New, reserveLater to ReserveCallIDs and
+		// reserveCtx to the prompt's context.
+		reserve, reserveLater, reserveCtx []string
+		// left seeds a transcript holding call_0 that SetTranscript
+		// then replaces with an empty one, as a rewind does.
+		left bool
 		// want is the item_end's ModelCallID; empty when the call keeps
 		// its ID.
 		want string
@@ -1385,6 +1398,8 @@ func TestReservedCallIDs(t *testing.T) {
 		{name: "not reserved", reserve: []string{"call_1"}},
 		{name: "reserved at New", reserve: []string{"call_0"}, want: "call_0"},
 		{name: "reserved later", reserveLater: []string{"call_0"}, want: "call_0"},
+		{name: "reserved by the context", reserveCtx: []string{"call_0"}, want: "call_0"},
+		{name: "left by SetTranscript", left: true, want: "call_0"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1392,6 +1407,15 @@ func TestReservedCallIDs(t *testing.T) {
 				WithReservedCallIDs(tc.reserve))
 			if err := a.ReserveCallIDs(tc.reserveLater...); err != nil {
 				t.Fatal(err)
+			}
+			if tc.left {
+				call := &openresponses.FunctionCall{CallID: "call_0", Name: "upper", Arguments: `{"text":"t"}`}
+				if err := a.SetTranscript(Transcript{openresponses.UserText("x"), call, openresponses.NewFunctionCallOutput("call_0", "T")}); err != nil {
+					t.Fatal(err)
+				}
+				if err := a.SetTranscript(nil); err != nil {
+					t.Fatal(err)
+				}
 			}
 			var ends []*ItemEnd
 			a.Subscribe(func(_ context.Context, ev Event) error {
@@ -1402,7 +1426,7 @@ func TestReservedCallIDs(t *testing.T) {
 				}
 				return nil
 			})
-			end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+			end, err := a.Prompt(ContextWithReservedCallIDs(context.Background(), tc.reserveCtx...), openresponses.UserText("x"))
 			if err != nil || end.Reason != ReasonDone || len(ends) != 1 {
 				t.Fatalf("err=%v end=%+v calls=%d", err, end, len(ends))
 			}

@@ -252,11 +252,16 @@ func TestResponselessRunReadsAsStoppedOnlyWhenItAnsweredACall(t *testing.T) {
 	first, second := end.Pending[0].Call.CallID, end.Pending[1].Call.CallID
 
 	// Each run below is a stop with no model call; they differ only in
-	// what the segment holds.
+	// what the segment holds. A run that answers nothing is an input,
+	// as the format reads its shape.
 	host := func(runID string, items ...openresponses.Item) {
 		t.Helper()
 		ctx := context.Background()
-		if err := rec.Handle(ctx, &agentturn.RunStart{RunID: runID, Source: agentturn.SourceResume}); err != nil {
+		source := agentturn.SourceInput
+		if len(items) > 0 {
+			source = agentturn.SourceResume
+		}
+		if err := rec.Handle(ctx, &agentturn.RunStart{RunID: runID, Source: source}); err != nil {
 			t.Fatal(err)
 		}
 		for _, item := range items {

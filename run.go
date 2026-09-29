@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"strings"
 	"sync"
 	"time"
 
@@ -202,6 +203,7 @@ type steeredKey struct{}
 type triggerKey struct{}
 type decidersKey struct{}
 type reasonsKey struct{}
+type reservedKey struct{}
 
 // ContextWithTrigger attaches a [Trigger] to ctx. A run started with
 // that context, through [Run], [Continue] or an [Agent], carries it on
@@ -216,6 +218,34 @@ func ContextWithTrigger(ctx context.Context, t Trigger) context.Context {
 func TriggerFromContext(ctx context.Context) Trigger {
 	t, _ := ctx.Value(triggerKey{}).(Trigger)
 	return t
+}
+
+// ContextWithReservedCallIDs attaches call IDs a call the model makes
+// in a run started with ctx must not take, beside those the agent
+// reserved with [WithReservedCallIDs] and those an outer context
+// attached: the IDs a record holds that the run's transcript does not,
+// such as a child session reopened under the call that made it, whose
+// new agent knows none of the calls its earlier runs made. The session
+// package's Recorder.ChildContext attaches them for a child run.
+func ContextWithReservedCallIDs(ctx context.Context, ids ...string) context.Context {
+	if len(ids) == 0 {
+		return ctx
+	}
+	reserved := map[string]bool{}
+	for id := range reservedFromContext(ctx) {
+		reserved[id] = true
+	}
+	for _, id := range ids {
+		reserved[id] = true
+	}
+	return context.WithValue(ctx, reservedKey{}, reserved)
+}
+
+// reservedFromContext returns the call IDs attached to ctx by
+// [ContextWithReservedCallIDs], or nil.
+func reservedFromContext(ctx context.Context) map[string]bool {
+	reserved, _ := ctx.Value(reservedKey{}).(map[string]bool)
+	return reserved
 }
 
 // ContextWithDeciders attaches who decided the answer to each pending
@@ -501,8 +531,8 @@ type runner struct {
 	prior []PendingCall
 	// reserved holds the call IDs the agent reserved, which a call the
 	// model makes must not take. The agent does not change it while the
-	// run is active.
-	reserved map[string]bool
+	// run is active. ctxReserved holds those the run's context names.
+	reserved, ctxReserved map[string]bool
 
 	// held are the completed items of the attempt in flight that the
 	// transcript does not have yet, because nothing has committed the
@@ -591,6 +621,7 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 		r.runID = openresponses.NewID("run")
 	}
 	r.mark = len(r.transcript)
+	r.ctxReserved = reservedFromContext(ctx)
 	// Everything the run calls, transform, hooks, model and tools, can
 	// tell which run it serves.
 	ctx = ContextWithRunID(ctx, r.runID)
@@ -1151,14 +1182,16 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 
 // uniqueCall returns call, or a copy with a call ID of the loop's own
 // when the model gave none, one a call in the transcript already has,
-// or one the agent reserved: a call ID names one call, since an
-// output, a pending list and the session record name the call by it
-// alone. The new ID is the model's with a random suffix, so it names no
-// call a fold took out of the transcript either. The item_start and item_update events of the
-// call carry the model's ID; its item_end, the transcript and the
-// response the turn acts on carry the new one.
+// or one the agent or the run's context reserved: a call ID names one
+// call, since an output, a pending list and the session record name the
+// call by it alone. The new ID is the model's, in the alphabet every
+// provider takes, with a random suffix, so it names no call a fold took
+// out of the transcript or another branch of the session holds either.
+// The item_start and item_update events of the call carry the model's
+// ID; its item_end, the transcript, the response the turn acts on and
+// every later request carry the new one.
 func (r *runner) uniqueCall(call *openresponses.FunctionCall, index int) *openresponses.FunctionCall {
-	taken := call.CallID == "" || r.reserved[call.CallID]
+	taken := call.CallID == "" || r.reserved[call.CallID] || r.ctxReserved[call.CallID]
 	for _, item := range r.transcript {
 		if c, ok := item.(*openresponses.FunctionCall); ok && c.CallID == call.CallID {
 			taken = true
@@ -1168,17 +1201,31 @@ func (r *runner) uniqueCall(call *openresponses.FunctionCall, index int) *openre
 	if !taken {
 		return call
 	}
-	prefix := call.CallID
-	if prefix == "" {
-		prefix = "call"
-	}
 	renamed := *call
-	renamed.CallID = openresponses.NewID(prefix)
+	renamed.CallID = openresponses.NewID(callIDPrefix(call.CallID))
 	if r.callIDs == nil {
 		r.callIDs = map[int]string{}
 	}
 	r.callIDs[index] = renamed.CallID
 	return &renamed
+}
+
+// callIDPrefix is the model's call ID with every character outside
+// letters, digits, '_' and '-' replaced by '_', the alphabet every
+// provider takes for a call ID, or "call" when it is empty. The ID the
+// loop gives a call is sent to the provider in the next request, which
+// may not be the one that made it.
+func callIDPrefix(id string) string {
+	if id == "" {
+		return "call"
+	}
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			return r
+		}
+		return '_'
+	}, id)
 }
 
 // renameCalls gives the function calls of a response the call IDs

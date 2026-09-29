@@ -8,9 +8,19 @@ versions may break the API.
 ## Unreleased
 
 - Requires `agenttool` v0.0.11, up from v0.0.10, and `agentsession`
-  v0.0.13, up from v0.0.11. The session recorder writes
+  v0.0.15, up from v0.0.11. The session recorder writes
   `agentsession/0.9`, and v0.0.11 of agentsession refuses a 0.9 file.
-  Under v0.0.13's reading of 0.9 the recorder writes a run end's
+  Under v0.0.15's reading of 0.9 a call ID names one call in the whole
+  session, on any branch: `session.CallIDs`, and so `AgentOptions` and
+  `Recorder.Rebase`, a rebase to `""` included, reserve every call ID
+  in the session rather than those on the path, and
+  `Recorder.ChildContext` reserves those of a child session reopened
+  under its call. A writer seeded from a path knows every call on it,
+  those with an output included, so a decision after a call's output
+  is skipped and a dispatch refused with `ErrCallCompleted` rather
+  than written, and a function call the filter writes as a custom
+  entry takes no decision or dispatch, whose `target` must name a
+  function call. The recorder writes a run end's
   `pending` list with the earlier runs' calls the run wrote a decision
   or a dispatch for, so a resume whose BeforeToolCall defers a call
   that never started ends `input_required` with that call pending; a
@@ -22,9 +32,13 @@ versions may break the API.
 - **A call ID names one call.** A function call the model gives no
   call ID, or one a call in the transcript already has, takes an ID of
   the loop's own when it completes, the model's with a random suffix:
-  its `ItemEnd`, the transcript, its output and the response the turn
-  runs carry it, and only its `ItemStart` and `ItemUpdate` carry the
-  model's. A provider that numbered its calls per response had a later
+  its `ItemEnd`, the transcript, its output, the response the turn
+  runs and every later request carry it, and only its `ItemStart` and
+  `ItemUpdate` carry the model's. The model's ID is kept in letters,
+  digits, `_` and `-`, the alphabet Anthropic takes, with anything else
+  replaced by `_`. `ContextWithReservedCallIDs` reserves IDs for the
+  runs started with a context, and `Agent.SetTranscript` keeps the IDs
+  of the transcript it replaces reserved. A provider that numbered its calls per response had a later
   call's output matched to an earlier call, and agentsession v0.0.13
   refuses the repeated call, which failed the run.
 - **The recorder writes the omitted list as keeps.** Under
