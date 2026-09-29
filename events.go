@@ -85,14 +85,25 @@ const (
 // recorder joins them as "kind:ref" when both are set, and writes the
 // three apart as well. Source names the layer that took the input, a
 // gateway or a scheduler, and is not part of the joined string.
+//
+// Extra holds the caller's richer facts about the firing, such as when
+// it was due or which attempt it is, each a JSON value under a name of
+// the caller's. A session recorder writes them as members of the run
+// start entry beside the ones the format defines, which is where the
+// format puts them, and refuses a name the format or the recorder
+// already uses there. They describe a run's start: a queued item's
+// trigger is written without them.
 type Trigger struct {
 	Kind   string
 	Ref    string
 	Source string
+	Extra  map[string]any
 }
 
 // IsZero reports whether the trigger names nothing.
-func (t Trigger) IsZero() bool { return t.Kind == "" && t.Ref == "" && t.Source == "" }
+func (t Trigger) IsZero() bool {
+	return t.Kind == "" && t.Ref == "" && t.Source == "" && len(t.Extra) == 0
+}
 
 // String returns "kind:ref", or whichever of the two is set.
 func (t Trigger) String() string {
@@ -230,6 +241,11 @@ type ItemEnd struct {
 	// in the model's context and a renderer should not show it. A
 	// session recorder writes its entry with visible false.
 	Hidden bool
+	// Trigger, for an item the run was prompted with, is the run's
+	// [Trigger], so a recorder can write how the input arrived; it is
+	// zero for every other item, a queued input included, whose own
+	// trigger rode on its [Queued] report.
+	Trigger Trigger
 }
 
 // EventType returns "item_end".
@@ -527,8 +543,10 @@ const (
 // next event, which is why it is not the accept itself and a
 // subscriber's error cannot refuse the item.
 //
-// RunID names the run that was in flight when the item was accepted,
-// and is empty when the agent was idle.
+// RunID names the run that was in flight when the item was accepted
+// and will still drain it, and is empty when the agent was idle or the
+// run in flight was past its last drain, delivering its final turn_end
+// or its run_end, so the item waits for the next run.
 type Queued struct {
 	RunID string
 	Item  openresponses.Item

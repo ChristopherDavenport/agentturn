@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/ChristopherDavenport/openresponses"
@@ -114,7 +115,7 @@ func TestQueueCarriesItsTrigger(t *testing.T) {
 	if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 3 || got[0].Trigger != cron || got[0].Mode != QueueFollowUp || !got[1].Trigger.IsZero() || got[1].Mode != QueueSteer || got[2].Mode != QueueFollowUp {
+	if len(got) != 3 || !reflect.DeepEqual(got[0].Trigger, cron) || got[0].Mode != QueueFollowUp || !got[1].Trigger.IsZero() || got[1].Mode != QueueSteer || got[2].Mode != QueueFollowUp {
 		t.Errorf("queued = %+v", got)
 	}
 }

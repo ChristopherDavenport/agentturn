@@ -278,8 +278,14 @@ func RunIDFromContext(ctx context.Context) string {
 // once and reports later, a watcher, a detached child. Once the run
 // has ended, Agent.Abort reaches the agent's next run and not this
 // one, so work that must be stoppable after that keeps a cancel of its
-// own. The transcript and the invoker of the call are not on it. It
-// reports false outside a loop. Each run registers it with the context
+// own. [Config.ToolRecorder] is on it, so a job that writes the handle
+// of what it started with agenttool.WriteRecord reaches the record; the
+// call is not, so such a job carries it with agenttool.WithCall(rc,
+// call), as tools/agent does for a detached child, for the record to
+// name the call it belongs to. The transcript, the invoker, the tool
+// elicitor and the steer signal of the call belong to its batch and
+// are not on it; a job that needs one carries it from the call's
+// context. It reports false outside a loop. Each run registers it with the context
 // it was started with until that context ends or the run is aborted,
 // so a host that prompts every run with one long-lived cancellable
 // context keeps one small registration per finished run until then.
@@ -386,6 +392,12 @@ type runner struct {
 	send       func(Event) error
 	steer      func() openresponses.Items
 	followUp   func() openresponses.Items
+	// last drains both queues for a run that would otherwise end and,
+	// when they are empty, marks it past its last drain in the same
+	// step; closing marks it so on any other way out. Both are nil for
+	// the low-level loop, which has no queues to deliver into.
+	last    func() openresponses.Items
+	closing func()
 	// steered returns the channel a steer closes, for the batch about
 	// to run; nil when nothing can steer the run.
 	steered func() <-chan struct{}
@@ -515,6 +527,10 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 	// tell which run it serves.
 	ctx = ContextWithRunID(ctx, r.runID)
 	r.runCtx = ContextWithRunID(r.runCtx, r.runID)
+	if r.cfg.ToolRecorder != nil {
+		// A record a background job writes goes where its call's would.
+		r.runCtx = agenttool.ContextWithRecorder(r.runCtx, r.cfg.ToolRecorder)
+	}
 	ctx = context.WithValue(ctx, runContextKey{}, r.runCtx)
 	r.ctx = ctx
 	end := &RunEnd{RunID: r.runID, Reason: ReasonDone}
@@ -546,6 +562,11 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 	// ones an abort or a failure cut off before their outputs were
 	// appended.
 	end.Pending = r.pending()
+	if r.closing != nil {
+		// Nothing is drained from here on, so an item steered during
+		// run_end waits for the next run, and the agent says so.
+		r.closing()
+	}
 	// A subscriber that fails on run_end cannot change the outcome; the
 	// run has already ended.
 	_ = r.emit(end)
@@ -622,10 +643,11 @@ func (r *runner) source(prompts openresponses.Items, approved []approval) Source
 }
 
 func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved []approval, terminate bool) error {
-	if err := r.emit(&RunStart{RunID: r.runID, Source: r.source(prompts, approved), Trigger: TriggerFromContext(ctx)}); err != nil {
+	trigger := TriggerFromContext(ctx)
+	if err := r.emit(&RunStart{RunID: r.runID, Source: r.source(prompts, approved), Trigger: trigger}); err != nil {
 		return err
 	}
-	if err := r.appendItems(prompts); err != nil {
+	if err := r.appendInput(prompts, trigger); err != nil {
 		return err
 	}
 	if len(approved) == 0 && !terminate {
@@ -713,9 +735,11 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 		if cause, ok := terminates(results); ok {
 			return stopped(cause, nil)
 		}
-		queued := r.drain(r.steer)
-		if len(calls) == 0 {
-			queued = append(queued, r.drain(r.followUp)...)
+		var queued openresponses.Items
+		if len(calls) > 0 {
+			queued = r.drain(r.steer)
+		} else {
+			queued = r.drainLast()
 			if len(queued) == 0 {
 				return nil
 			}
@@ -731,6 +755,15 @@ func (r *runner) drain(q func() openresponses.Items) openresponses.Items {
 		return nil
 	}
 	return q()
+}
+
+// drainLast drains the steered items and then the follow-ups for a run
+// that would otherwise end.
+func (r *runner) drainLast() openresponses.Items {
+	if r.last != nil {
+		return r.last()
+	}
+	return append(r.drain(r.steer), r.drain(r.followUp)...)
 }
 
 // terminates says whether a batch's results end the run, and how: every
@@ -761,6 +794,12 @@ func terminates(results []agenttool.Result) (StopCause, bool) {
 // transcript and the request hold the item itself and only its events
 // say it is hidden.
 func (r *runner) appendItems(items openresponses.Items) error {
+	return r.appendInput(items, Trigger{})
+}
+
+// appendInput is appendItems for the items the run was prompted with,
+// whose item_end carries the run's trigger.
+func (r *runner) appendInput(items openresponses.Items, trigger Trigger) error {
 	for _, item := range items {
 		if item == nil {
 			continue
@@ -771,7 +810,7 @@ func (r *runner) appendItems(items openresponses.Items) error {
 		}
 		r.transcript = append(r.transcript, item)
 		r.added = append(r.added, item)
-		if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden}); err != nil {
+		if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden, Trigger: trigger}); err != nil {
 			return err
 		}
 	}

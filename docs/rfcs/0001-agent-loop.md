@@ -261,8 +261,10 @@ attached to the context of everything the run calls — the transform,
 the hooks, the model, the tools — so a tool that composes another agent
 can say which run it was called from. A **trigger** the caller attaches
 to the context, a kind, a reference and the layer that took the input,
-in the caller's own terms, is
-carried on `run_start` and read by nothing in the loop; it is how a
+in the caller's own terms, with any richer facts of the caller's about
+the firing, when it was due or which attempt it is, is
+carried on `run_start` and on the `item_end` of each item the run was
+prompted with, and read by nothing in the loop; it is how a
 recorder learns what caused the run without the loop learning what a
 cron job is.
 
@@ -775,7 +777,11 @@ call's: the values of the context the run was started with and the run
 ID, cancelled when the run is cancelled, with the cause, and not when
 the batch or the run ends by itself. Once the run has ended, cancelling
 the agent reaches its next run and not that work, which keeps a cancel
-of its own if it must be stopped later.
+of its own if it must be stopped later. The tool recorder is on the run
+context too, so a record such work writes of what it started reaches
+the host; the call is not, and the work carries it for the record to
+name its call. What belongs to the batch, the transcript, the invoker,
+the tool elicitor and the steer signal, is not on it.
 
 A steer does not cancel a running tool. The loop puts beside each call
 a **steer signal** that is raised when an item is steered into the run,
@@ -807,7 +813,7 @@ turn number. The catalogue, with the members beyond those two:
 | `model_blocked` | `request`, `error` | in place of `turn_start` when the before-model-call hook refused; the last event before `run_end` |
 | `item_start` | `item`, `response_id`, `hidden` | an item entering the transcript: an input as it is appended, an output item as the stream opens it |
 | `item_update` | `item`, `stream`, `response_id` | one wire event of an output item, with the item as accumulated |
-| `item_end` | `item`, `response_id`, `hidden` | the item is complete and in the transcript |
+| `item_end` | `item`, `response_id`, `hidden`, `trigger` | the item is complete and in the transcript; `trigger` is the run's for an item the run was prompted with |
 | `response_end` | `response` | the stream ended; before any tool of the turn runs |
 | `tool_start` | `call_id`, `name`, `args`, `decision`, `parent` | after preflight, in the model's order |
 | `tool_dispatch` | `call_id`, `name`, `parent` | the call has been handed to its tool, before the tool runs; after its `tool_start` and before its `tool_end` |
@@ -974,6 +980,20 @@ agent at the start of the next run. A host that must not lose an input
 therefore writes it before queueing it rather than from the event, and
 a subscriber's error cannot refuse the item.
 
+A run drains the queues for the last time when it would otherwise end,
+after its final `turn_end`, and is then past its last drain: its
+`run_end` is still being delivered and the agent still reads as
+running, but an item steered then waits for the next run, and its
+`queued` event names no run. The mark is set in the same step as the
+drain that finds both queues empty, and on any other way out of the
+loop, so nothing falls between them. An agent offers a **delivery**
+for an input that arrives on its own time, a background task's result:
+the item is queued as a steer and, decided under the agent's lock,
+joins the run in flight when that run is not past its last drain, and
+otherwise starts a run that takes it once the run in flight has ended,
+as a continue after a steer would. A run the item joined that then
+stops without draining it leaves it queued, as it leaves any steer.
+
 The queues live in memory. An item accepted is in no record until a
 run appends it or a subscriber writes it, and it survives a
 cancellation, a configuration change and a transcript change but not
@@ -1109,8 +1129,10 @@ An agent stands in four places inside another system:
   the child's run has started, the child runs on the run context, so
   the parent's cancellation still cuts it and the parent's run ending
   does not, and its end goes to a callback from which the host delivers
-  the answer, a steer into a parent still running or a prompt to one
-  that is idle. A later run of a child the host marks as a retry
+  the answer with the agent's delivery, which joins the parent's run
+  when it will still take the answer and starts one otherwise; a steer
+  tested against whether the parent is running waits for the next
+  prompt when the parent's run is past its last drain. A later run of a child the host marks as a retry
   reaches the observer marked.
 - **As a peer.** The loop exposed to A2A callers, with its card derived
   from its name, description and tools; a remote A2A agent wrapped as a
@@ -1150,11 +1172,11 @@ of the events.
 
 | event | entry |
 | --- | --- |
-| `run_start` | `run` start, with the loop's source as the format's, the trigger joined as `kind:ref`, or whichever is set, as `ref`, and the trigger's kind, ref and source apart as `trigger`; an `env` entry, compared with the last one written members it does not define included, when the host supplies one and it changed; the full initial `config` from the configuration's base request when nothing has been written yet, and a `config` delta from it when the configuration changed since the last run, so the items the new configuration's before-turn hook appends are filed under it. The run entry carries the hash of the configuration's base request in a member of the recorder's own, so a recorder seeded from a stored path, by a resume, a fork, a rebase, a continuation or a child session reopened under its call, compares its first run with the base that path's last run started under; a path that recorded none is compared by its settings at the leaf, leaving out instructions the host composes as parts when the base does not join them |
+| `run_start` | `run` start, with the loop's source as the format's, the trigger joined as `kind:ref`, or whichever is set, as `ref`, and the trigger's kind, ref and source apart as `trigger`, with the trigger's richer facts as members of the entry the format does not define, refused when one names a member the entry already has; an `env` entry, compared with the last one written members it does not define included, when the host supplies one and it changed; the full initial `config` from the configuration's base request when nothing has been written yet, and a `config` delta from it when the configuration changed since the last run, so the items the new configuration's before-turn hook appends are filed under it. The run entry carries the hash of the configuration's base request in a member of the recorder's own, so a recorder seeded from a stored path, by a resume, a fork, a rebase, a continuation or a child session reopened under its call, compares its first run with the base that path's last run started under; a path that recorded none is compared by its settings at the leaf, leaving out instructions the host composes as parts when the base does not join them |
 | `turn_start` | a `config` delta when the request's settings differ from the path's; the request hash is computed here and written on the response. When the host names the parts the request's instructions are composed of, for any session the recorder writes, a child run's included, and they join to the instructions sent, the entries carry `instructions_parts`, a delta naming the parts that moved and each run of unchanged parts as a `keep`, and `instructions_omitted` for what the host left out; parts that do not join are dropped and the string is written, since the record describes what was sent |
 | `model_retry` | a record entry with the attempt, the error, the delay, the failed attempt's model and whether the retry policy revised the request, before the response of the attempt that answers; the revised request's settings are settled with that attempt, so only the attempt that answered is configured on the path. The record entry stays beside the count below, since it says what the count cannot |
 | `model_blocked` | for an error marked as a guard's, a custom entry in `agentturn:model_blocked` carrying the guard's error, the request hash and the model, since the run stopped rather than failed and a failed `response` would make its end read as a failure; for any other error, a failed `response` carrying the hook's error and the request hash. Either way the call that was refused is told from one that was made and failed |
-| `item_end` | an `item`, with the display flag off for a hidden item. Before a caller-supplied output for a call that was neither dispatched nor rejected, a `reject` decision with the output's text as its reason and the decider the caller named, and `policy` as the decider when the loop refused the call itself in this run, for a name no tool has or arguments that are not an object; before one for a call dispatched in an earlier run, nothing, since a `proceed` would say the call went on toward its tool and a `reject` that it never reached it: the output is the record, and no second `dispatch` says the tool did not run again |
+| `item_end` | an `item`, with the display flag off for a hidden item, and the run's trigger as `source` for an item the run was prompted with. Before a caller-supplied output for a call that was neither dispatched nor rejected, a `reject` decision with the output's text as its reason and the decider the caller named, and `policy` as the decider when the loop refused the call itself in this run, for a name no tool has or arguments that are not an object; before one for a call dispatched in an earlier run, nothing, since a `proceed` would say the call went on toward its tool and a `reject` that it never reached it: the output is the record, and no second `dispatch` says the tool did not run again |
 | `response_end` | the `response`, with `request_hash` when the input the loop sent is the input the recorded path rebuilds, and none otherwise, and `attempts`, the calls it took, when the retry policy tried it again; so is the failed `response` `run_end` writes for a call left in flight, where an abort during the retry's backoff counts the attempt that was due, since nothing tells it from an abort before that attempt streamed |
 | `tool_start` | a `decision`: `reject` with the reason for a block, `call blocked` when it gave none; `hold` for a defer, with the reason when given; `proceed` for a call that was held, whose arguments were rewritten, with the arguments, or whose decision gave a reason, with the reason. The decider is the decision's, and `policy` for a call nothing was holding whose decision names nobody. A nested call is a record entry instead |
 | `tool_dispatch` | a `dispatch`, durable before the event returns, so the tool runs after it or not at all, carrying the call's idempotency key as `idempotency_key`; a second one for a call an earlier run dispatched and a resume runs again, so the path holds one per hand-off; nothing for a nested call. Subscribers are called in order, so one that vetoes a dispatch is registered before the recorder; one registered after it refuses a call whose dispatch is already durable |
@@ -1208,7 +1230,7 @@ maps onto it as follows:
 | turn limit | `Config.MaxTurns` |
 | retry policy | `Config.Retry{MaxAttempts, Backoff, Retryable, Revise}`; `DefaultBackoff`, `DefaultRetryable` |
 | low-level loop | `Run(ctx, t, prompts, cfg)`, `Continue(ctx, t, cfg)` → `iter.Seq[Event]`; `EventBuffer`; `CanContinue` |
-| agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`, `WithPending`, `SetPending`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `State`, `SetConfig`, `SetTranscript`, `Config` |
+| agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`, `WithPending`, `SetPending`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Deliver`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `State`, `SetConfig`, `SetTranscript`, `Config` |
 | refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning`, `ErrAmbiguousCall` |
 | run ID, trigger, transcript on the context | `ContextWithRunID`/`RunIDFromContext`, `ContextWithTrigger`/`TriggerFromContext`, `ContextWithTranscript`/`TranscriptFromContext` |
 | run context, steer signal | `RunContext(ctx)`, `Steered(ctx)` |

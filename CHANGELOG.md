@@ -142,6 +142,32 @@ versions may break the API.
   `session.Pending` reads the calls, and `session.ReplayAnswers`
   returns the rule's answer for each call pending at the leaf that is
   not held. (#143)
+- Breaking: `agentturn.Trigger` gains `Extra`, the caller's richer
+  facts about a firing, such as when it was due or which attempt it
+  is, which the session recorder writes as members of the run start
+  entry, where agentsession #82 put them. A name the entry already
+  has, one of the envelope's, the format's or `config_base`, is
+  refused with `session.ErrTriggerMember` before anything of the run
+  is written. `Trigger` holds a map now and no longer compares with
+  `==`. The items a run was prompted with carry its trigger on
+  `ItemEnd.Trigger`, and the recorder writes it as their `source`, as
+  it already did for a queued input. (#146)
+- `Agent.Deliver` hands an input that arrives on its own time, a
+  detached child's answer, to a run that will take it: it joins the
+  run in flight when that run has not passed its last drain of the
+  queues, and otherwise starts a run for it once the run in flight has
+  ended. A steer made while a run delivered its `run_end`, when
+  `State().Running` still read true, waited for the user's next
+  prompt. The run marks itself past its last drain in the same step as
+  the drain that finds the queues empty, and a `Queued` report made
+  after it names no run. `tools/agent.WithDetach` documents delivering
+  with it. (#148)
+- `agentturn.RunContext` carries `Config.ToolRecorder`, so a record a
+  tool's background job writes with `agenttool.WriteRecord` reaches the
+  host rather than being dropped without an error. The call is not on
+  it: a job carries its call with `agenttool.WithCall` for the record
+  to name it. The tool elicitor stays off, with the rest of what
+  belongs to the batch. (#149)
 
 ## v0.0.10 - 2026-09-28
 

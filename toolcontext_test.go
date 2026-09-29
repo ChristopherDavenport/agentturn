@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -73,6 +74,77 @@ func TestRunContextOutlivesTheBatch(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("an abort did not cut the run context")
+	}
+}
+
+type jobRecord struct{ PID int }
+
+func (jobRecord) RecordNS() string { return "app:job" }
+
+// TestRunContextCarriesTheRecorder pins #149: a background job a tool
+// leaves running writes its handle from RunContext, and the record
+// reaches Config.ToolRecorder, naming the call when the job carries it,
+// through the loop and through an agent alike.
+func TestRunContextCarriesTheRecorder(t *testing.T) {
+	type written struct {
+		ns     string
+		callID string
+	}
+	for _, tc := range []struct {
+		name     string
+		withCall bool
+		lowLevel bool
+	}{
+		{"agent, the call carried", true, false},
+		{"agent, no call", false, false},
+		{"low-level loop", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var got []written
+			record := func(ctx context.Context, rec *agenttool.Record) error {
+				call, _ := agenttool.CallFrom(ctx)
+				mu.Lock()
+				defer mu.Unlock()
+				got = append(got, written{rec.NS, call.ID})
+				return nil
+			}
+			done := make(chan error, 1)
+			var callID string
+			bg := agenttool.NewFunc("bg", "", nil, func(ctx context.Context, call agenttool.Call) (agenttool.Result, error) {
+				rc, ok := RunContext(ctx)
+				if !ok {
+					return agenttool.Result{}, errors.New("no run context")
+				}
+				if tc.withCall {
+					rc = agenttool.WithCall(rc, call)
+				}
+				callID = call.ID
+				// The job outlives the call: it writes once the call has
+				// returned and its batch is over.
+				go func() { done <- agenttool.WriteRecord(rc, jobRecord{PID: 42}) }()
+				return agenttool.Text("started"), nil
+			})
+			cfg := Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{bg}, MaxTurns: 1, ToolRecorder: record}
+			if tc.lowLevel {
+				for range Run(context.Background(), nil, openresponses.Items{openresponses.UserText("go")}, cfg) {
+				}
+			} else if _, err := New(cfg).Prompt(context.Background(), openresponses.UserText("go")); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			want := written{"app:job", ""}
+			if tc.withCall {
+				want.callID = callID
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(got) != 1 || got[0] != want || callID == "" {
+				t.Errorf("records = %+v, want %+v", got, want)
+			}
+		})
 	}
 }
 

@@ -34,7 +34,10 @@
 //     the [agentturn.Trigger] on the context joined as ref and in its
 //     parts as trigger, and, when the recorder knows the agent's
 //     configuration ([Recorder.Attach] and [WithConfig] give it one),
-//     the hash of its base request as [ConfigBaseMember]; then, for
+//     the hash of its base request as [ConfigBaseMember], and the
+//     trigger's Extra as members of their own, refused with
+//     [ErrTriggerMember] when one names a member the entry already
+//     has; then, for
 //     the recorder's own session, the env entry [WithEnv] supplies
 //     when it differs from the last one written, members the library
 //     does not define included; then, with a configuration, a full
@@ -72,6 +75,8 @@
 //     response ID, and an item the caller marked with agentturn.Hidden
 //     carries visible false, the format's word for an item that is part
 //     of the model context and that a renderer should hide. An item the
+//     run was prompted with carries the run's trigger as its source, and
+//     a queued input the trigger it was queued with. An item the
 //     filter in force would hide from the
 //     model, an app-only extension item, is written as a custom entry
 //     instead so the path rebuilds exactly the input that was sent. A
@@ -496,6 +501,32 @@ type Elicitation struct {
 // ErrRunActive is returned by [Recorder.Rebase] while a run is being
 // written.
 var ErrRunActive = errors.New("session: a run is active")
+
+// ErrTriggerMember is returned, ending the run before anything else of
+// it is written, for an [agentturn.Trigger] whose Extra names a member
+// the run start entry already has: one of the envelope, one the format
+// defines for a run entry, or [ConfigBaseMember]. The format's members
+// take precedence, and the recorder refuses rather than drop the
+// caller's fact or write a line with the name twice.
+var ErrTriggerMember = errors.New("session: trigger extra names a member of the run entry")
+
+// runStartMembers are the names a run start entry holds whatever a
+// trigger's Extra says.
+var runStartMembers = map[string]bool{
+	"id": true, "type": true, "parent": true, "parents": true, "ts": true, "content": true,
+	"legacy_id": true, "normalised": true,
+	"run_id": true, "phase": true, "source": true, "reason": true, "ref": true, "pending": true, "trigger": true,
+	ConfigBaseMember: true,
+}
+
+// triggerParts returns the trigger member for t's parts, or nil when it
+// names none of them.
+func triggerParts(t agentturn.Trigger) *agentsession.Trigger {
+	if t.Kind == "" && t.Ref == "" && t.Source == "" {
+		return nil
+	}
+	return &agentsession.Trigger{Kind: t.Kind, Ref: t.Ref, Source: t.Source}
+}
 
 // Recorder is an agentturn subscriber that writes one session, and the
 // sessions of the child runs it observes. It is safe to attach to one
@@ -1211,9 +1242,7 @@ func (r *Recorder) Queue(ctx context.Context, a *agentturn.Agent, mode agentturn
 		if mode == agentturn.QueueSteer {
 			in.mode = agentsession.ModeSteer
 		}
-		if !trigger.IsZero() {
-			in.trigger = &agentsession.Trigger{Kind: trigger.Kind, Ref: trigger.Ref, Source: trigger.Source}
-		}
+		in.trigger = triggerParts(trigger)
 		r.mu.Lock()
 		r.root.inbox = append(r.root.inbox, in)
 		err := r.root.requeue(context.WithoutCancel(ctx))
@@ -1796,7 +1825,7 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 	case *agentturn.ModelBlocked:
 		return w.blocked(ctx, e)
 	case *agentturn.ItemEnd:
-		return w.item(ctx, e.Item, e.ResponseID, e.Hidden)
+		return w.item(ctx, e.Item, e.ResponseID, e.Hidden, triggerParts(e.Trigger))
 	case *agentturn.ResponseEnd:
 		return w.response(ctx, e)
 	case *agentturn.ToolStart:
@@ -1831,9 +1860,7 @@ func (w *writer) queued(ctx context.Context, e *agentturn.Queued) error {
 		mode = agentsession.ModeSteer
 	}
 	in := &inboxItem{item: e.Item, mode: mode, held: true}
-	if !e.Trigger.IsZero() {
-		in.trigger = &agentsession.Trigger{Kind: e.Trigger.Kind, Ref: e.Trigger.Ref, Source: e.Trigger.Source}
-	}
+	in.trigger = triggerParts(e.Trigger)
 	w.inbox = append(w.inbox, in)
 	return w.requeue(ctx)
 }
@@ -1940,15 +1967,30 @@ func decisionBy(d *agentturn.ToolDecision) string {
 // the agent's configuration when the writer has one and nothing has
 // been written yet.
 func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
+	// The caller's facts about the firing go in members the format
+	// does not define, where it says they go, and are checked before
+	// anything of the run is taken in.
+	var extra map[string]json.RawMessage
+	for name, v := range e.Trigger.Extra {
+		if runStartMembers[name] {
+			return fmt.Errorf("%w: %q", ErrTriggerMember, name)
+		}
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Errorf("session: encode trigger member %q: %w", name, err)
+		}
+		if extra == nil {
+			extra = map[string]json.RawMessage{}
+		}
+		extra[name] = raw
+	}
 	w.run = e.RunID
 	w.open = nil
 	w.responses = 0
 	w.lastCalls = false
 	w.answeredCall = false
 	start := agentsession.NewRunStart(e.RunID, string(e.Source), e.Trigger.String())
-	if !e.Trigger.IsZero() {
-		start.Trigger = &agentsession.Trigger{Kind: e.Trigger.Kind, Ref: e.Trigger.Ref, Source: e.Trigger.Source}
-	}
+	start.Trigger = triggerParts(e.Trigger)
 	// The comparison below does not ask a tool provider, which may cost
 	// a round trip or list its tools in another order each time; what
 	// it offers reaches the path at turn_start.
@@ -1969,6 +2011,12 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 			return fmt.Errorf("session: encode base request hash: %w", err)
 		}
 		start.Unknown = map[string]json.RawMessage{ConfigBaseMember: raw}
+	}
+	for name, raw := range extra {
+		if start.Unknown == nil {
+			start.Unknown = map[string]json.RawMessage{}
+		}
+		start.Unknown[name] = raw
 	}
 	if _, err := w.append(ctx, start); err != nil {
 		return err
@@ -2328,8 +2376,9 @@ func omittedBody(omitted []agentsession.OmittedPart) []byte {
 // function call is remembered so its records can name the entry; an
 // output the caller wrote for a call nothing dispatched is preceded by
 // the reject that ends it; an item the caller marked with
-// agentturn.Hidden is written with visible false.
-func (w *writer) item(ctx context.Context, item openresponses.Item, responseID string, hidden bool) error {
+// agentturn.Hidden is written with visible false. source is the run's
+// trigger for an item the run was prompted with.
+func (w *writer) item(ctx context.Context, item openresponses.Item, responseID string, hidden bool, source *agentsession.Trigger) error {
 	if item == nil {
 		return nil
 	}
@@ -2391,7 +2440,8 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		// An input the agent accepted through a queue names the queued
 		// entry it was accepted as, with what brought it in; one the
 		// filter keeps from the model is a custom entry, which cannot,
-		// and the run's end closes its queued entry.
+		// and the run's end closes its queued entry. An input the run
+		// was prompted with carries the run's trigger.
 		if in := w.drained(item); in != nil && !appOnly && in.entry != "" {
 			e := entry.(*agentsession.ItemEntry)
 			e.QueuedFrom = in.entry
@@ -2399,6 +2449,8 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 				trigger := *in.trigger
 				e.Source = &trigger
 			}
+		} else if e, ok := entry.(*agentsession.ItemEntry); ok && in == nil && source != nil {
+			e.Source = source
 		}
 	}
 	id, err := w.append(ctx, entry)
@@ -2886,7 +2938,7 @@ func (w *writer) child(ctx context.Context, callID string, info agent.ChildInfo)
 		if isModelOutput(item) {
 			responseID = info.RunID
 		}
-		if err := cw.item(ctx, item, responseID, false); err != nil {
+		if err := cw.item(ctx, item, responseID, false, nil); err != nil {
 			return err
 		}
 	}
