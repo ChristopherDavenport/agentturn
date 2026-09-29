@@ -199,9 +199,11 @@ versions may break the API.
   hash, as with one transform. `compact.Fold.First` is the first item
   a fold kept, and `Recorder.Fold` finds its entry by that item rather
   than by the fold's index, which counts the transcript the fold was
-  given; a fold whose first kept item the recorder did not write, after
-  a transform that replaced items, is refused rather than recorded
-  against the wrong entry. (#115)
+  given. A fold whose first kept item the recorder wrote nowhere, after
+  a transform that replaced items, or in two places, one item value
+  appended twice, is written as a custom entry in
+  `agentturn:compaction_unplaced` rather than a compaction naming the
+  wrong entry, and the run goes on. (#115)
 - `OutputInfo.Output` holds the items of the response that precede the
   message, and the guard's docs say that whether a message is the
   answer is unknown when it runs, since a model may speak before a

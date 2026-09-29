@@ -1093,7 +1093,8 @@ An agent stands in four places inside another system:
   leaves them unhashed. Where each agent keeps a session of its own,
   the receiver's is a fork of the sender's at the handoff's last entry,
   a session whose header names that entry as its base, and every hash
-  on the fork's path verifies.
+  on the fork's path verifies when the receiver starts from the fork's
+  context, the sender's transcript up to that entry.
 
 A configuration's name and description are the single source for how
 an agent presents itself in every one of these.

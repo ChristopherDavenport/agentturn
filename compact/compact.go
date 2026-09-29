@@ -117,7 +117,7 @@ type Fold struct {
 	// were sent verbatim after Output.
 	Split int
 	// First is the item at Split, the first one kept, nil when the fold
-	// kept none. A recorder that names the entry holding it finds it by
+	// kept none or failed. A recorder that names the entry holding it finds it by
 	// this item rather than by Split, which counts items of the
 	// transcript the transform was given: after another transform in a
 	// chain, not the agent's.

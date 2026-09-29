@@ -64,7 +64,10 @@ func ChainBeforeModelCall(fns ...func(context.Context, *openresponses.Request) e
 // rather than by the fold's index, which counts the shaped transcript.
 // A transform before the fold that replaces items rather than keeping,
 // dropping or adding them leaves the fold nothing the recorder wrote,
-// and Recorder.Fold refuses it rather than record the wrong entry.
+// and the recorder writes the fold as one it could not place rather
+// than name the wrong entry; the run goes on. A fold that kept nothing
+// names no item, and after a transform that dropped items its index is
+// not the recorder's: keep at least one item.
 func ChainTransform(fns ...func(context.Context, Transcript) (Transcript, error)) func(context.Context, Transcript) (Transcript, error) {
 	var kept []func(context.Context, Transcript) (Transcript, error)
 	for _, fn := range fns {
