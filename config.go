@@ -143,7 +143,9 @@ type Config struct {
 	// deltas of the original have already been delivered as item_update,
 	// so a front that must not show withheld text renders on item_end.
 	// Function calls, reasoning and every other output item never reach
-	// it, so a replay still has what it needs; a guard that also wants
+	// it, so a replay still has what it needs. A message the model
+	// speaks before a function call reaches it too, with nothing yet
+	// saying a call follows; see [OutputInfo]. A guard that also wants
 	// to end the run returns an error wrapping [ErrGuard] from
 	// ShouldStopAfterTurn, which sees the turn with TurnInfo.Final set.
 	// Several guards are joined with [ChainOutputGuard], each seeing
@@ -453,12 +455,24 @@ type TurnStartInfo struct {
 
 // OutputInfo describes an assistant message the stream has completed,
 // for [Config.OutputGuard].
+//
+// Whether the message is the answer is not known when the guard runs:
+// a model may speak before it calls a function, in the same response,
+// and the calls it makes arrive after the message. The guard sees every
+// assistant message as it completes and is not held until the response
+// does, since that would hold every message behind the whole response.
+// A guard that treats a message as final checks TurnInfo.Final in
+// ShouldStopAfterTurn instead, where the turn is complete.
 type OutputInfo struct {
 	RunID      string
 	Turn       int
 	ResponseID string
 	// Message is the message as the model produced it.
 	Message *openresponses.Message
+	// Output holds the items of the response that precede the message,
+	// in output order: a reasoning item, a message the model spoke
+	// before this one. Do not mutate them.
+	Output openresponses.Items
 }
 
 // DefaultFilter drops every item whose type carries a slug prefix such

@@ -127,13 +127,24 @@ func (r *relay) end(item openresponses.Item) error {
 			r.msg = w
 		}
 		text, refusal := messageText(v)
-		if rest, ok := strings.CutPrefix(text, r.text.String()); ok && rest != "" {
-			if err := r.msg.Text(rest); err != nil {
+		restText, extendsText := strings.CutPrefix(text, r.text.String())
+		restRefusal, extendsRefusal := strings.CutPrefix(refusal, r.refusal.String())
+		if !extendsText || !extendsRefusal {
+			// The final message does not extend what was streamed: an
+			// output guard replaced it after its deltas went out. They
+			// cannot be taken back, so the done events and the item
+			// carry the replacement, which is what a client that
+			// renders on done shows and what the response holds.
+			r.replace(v, text, refusal)
+			restText, restRefusal = "", ""
+		}
+		if restText != "" {
+			if err := r.msg.Text(restText); err != nil {
 				return err
 			}
 		}
-		if rest, ok := strings.CutPrefix(refusal, r.refusal.String()); ok && rest != "" {
-			if err := r.msg.Refusal(rest); err != nil {
+		if restRefusal != "" {
+			if err := r.msg.Refusal(restRefusal); err != nil {
 				return err
 			}
 		}
@@ -184,6 +195,29 @@ func (r *relay) end(item openresponses.Item) error {
 	default:
 		return r.em.Item(clone(item))
 	}
+}
+
+// replace puts the content of v in the open message in place of what
+// was streamed. The part still open keeps its place and takes the
+// replacement's text of its kind, since its done event is the one the
+// writer raises on close; every other part is the replacement's.
+func (r *relay) replace(v *openresponses.Message, text, refusal string) {
+	m := r.msg.Item()
+	if n := len(m.Content); n > 0 {
+		switch p := m.Content[n-1].(type) {
+		case *openresponses.OutputText:
+			p.Text, p.Annotations, p.Logprobs = text, nil, nil
+		case *openresponses.Refusal:
+			p.Refusal = refusal
+		}
+	}
+	content := clone(v).(*openresponses.Message).Content
+	if len(content) == 0 && len(m.Content) > 0 {
+		// Nothing replaces it: the open part stays, emptied, so its
+		// done event names a part the item has.
+		content = m.Content[len(m.Content)-1:]
+	}
+	m.Content = content
 }
 
 func messageText(m *openresponses.Message) (text, refusal string) {

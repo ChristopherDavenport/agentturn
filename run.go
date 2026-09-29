@@ -852,7 +852,11 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		item := e.Item
 		if m, ok := item.(*openresponses.Message); ok && r.cfg.OutputGuard != nil {
 			// The guard sees the message before anything keeps it.
-			replacement, err := r.cfg.OutputGuard(r.ctx, OutputInfo{RunID: r.runID, Turn: r.turn, ResponseID: responseID, Message: m})
+			var before openresponses.Items
+			if cur := acc.Response(); cur != nil && e.OutputIndex <= len(cur.Output) {
+				before = append(before, cur.Output[:e.OutputIndex]...)
+			}
+			replacement, err := r.cfg.OutputGuard(r.ctx, OutputInfo{RunID: r.runID, Turn: r.turn, ResponseID: responseID, Message: m, Output: before})
 			if err != nil {
 				return true, fmt.Errorf("agentturn: output guard: %w", err)
 			}

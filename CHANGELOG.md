@@ -150,6 +150,21 @@ versions may break the API.
   response into the record or count against `MaxTurns`. (#113)
 - RFC 0001 resolves its open questions on durable queues (#67) and a
   run the process died inside (#94), and says who closes an open run.
+- **Fixed**: `front/responses` relays what `OutputGuard` left. In a
+  full run a message the guard replaced after its deltas went out is
+  carried as the replacement on its `output_text.done`,
+  `content_part.done` and `output_item.done` events and in the
+  response, where the relay found the replacement did not extend the
+  streamed text and closed the message with the original; the deltas
+  cannot be taken back, so a client renders on done. A request with
+  the caller's tools, which calls the model once itself, now runs the
+  guard on each assistant message as the loop does; it ran none. A
+  message the guard kept streams exactly as before. (#108)
+- `OutputInfo.Output` holds the items of the response that precede the
+  message, and the guard's docs say that whether a message is the
+  answer is unknown when it runs, since a model may speak before a
+  function call; a guard that needs finality reads `TurnInfo.Final`.
+  (#111)
 
 ## v0.0.9 - 2026-09-28
 

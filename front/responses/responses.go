@@ -255,7 +255,20 @@ func (a *Adapter) oneTurn(ctx context.Context, req openresponses.Request, transc
 				return err
 			}
 		case *openresponses.OutputItemDoneEvent:
-			if err := rl.end(e.Item); err != nil {
+			item := e.Item
+			if m, ok := item.(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant && cfg.OutputGuard != nil {
+				// The guard sees the message before the caller does, as
+				// the loop's own turns have it.
+				out := acc.Response()
+				replacement, err := cfg.OutputGuard(ctx, agentturn.OutputInfo{Turn: 1, ResponseID: out.ID, Message: m, Output: append(openresponses.Items(nil), out.Output[:e.OutputIndex]...)})
+				if err != nil {
+					return fmt.Errorf("output guard: %w", err)
+				}
+				if replacement != nil {
+					item = replacement
+				}
+			}
+			if err := rl.end(item); err != nil {
 				return err
 			}
 		case *openresponses.ErrorEvent:
