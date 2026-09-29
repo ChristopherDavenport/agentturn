@@ -38,6 +38,14 @@ versions may break the API.
   the summary. A summary response with no text is asked once more
   before the fold fails with `compact: summary response has no text`,
   and the fold reports the call that answered. (#161)
+- A record a child's background job writes after the child's run ended
+  is filed in the child's session, under the job's call, rather than at
+  the root with no `call_id`: `session.Recorder.Annotate` and
+  `RecordFunc` reopen the child session `SessionIDFromContext` names
+  when it is one of the recorder's children and no run of it is being
+  written. `RunContext`'s doc no longer says the call is absent from
+  it: a child run's context carries the call that started the child,
+  so a job in a child names its own with `agenttool.WithCall`. (#168)
 
 ## v0.0.11 - 2026-09-29
 

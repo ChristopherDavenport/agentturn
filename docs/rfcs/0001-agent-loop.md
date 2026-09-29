@@ -800,8 +800,10 @@ the batch or the run ends by itself. Once the run has ended, cancelling
 the agent reaches its next run and not that work, which keeps a cancel
 of its own if it must be stopped later. The tool recorder is on the run
 context too, so a record such work writes of what it started reaches
-the host; the call is not, and the work carries it for the record to
-name its call. What belongs to the batch, the transcript, the invoker,
+the host. The call is not: the run context of a run started from a
+tool call, a child's, carries the call that started it and a root
+run's carries none, so the work carries its own call for the record to
+name it. What belongs to the batch, the transcript, the invoker,
 the tool elicitor and the steer signal, is not on it.
 
 A steer does not cancel a running tool. The loop puts beside each call

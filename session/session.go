@@ -575,6 +575,10 @@ type Recorder struct {
 	// written.
 	runs    map[string]*writer
 	rootRun string
+	// childIDs holds the ID of every child session the recorder has
+	// written, so a record naming one by [SessionIDFromContext] after
+	// its run ended is filed there rather than at the root.
+	childIDs map[string]bool
 }
 
 // writer is the state of one session being written.
@@ -1331,8 +1335,10 @@ func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) int {
 
 // Annotate appends a custom entry in namespace ns carrying data,
 // encoded as JSON, at the current leaf of the session of the run on
-// the context, or of the recorder's own session when the context
-// names no run it is writing, and returns the entry's ID, which a
+// the context; when the context names no run it is writing, of the
+// child session [SessionIDFromContext] names when that is one of this
+// recorder's, reopened at its leaf, or else of the recorder's own
+// session; and returns the entry's ID, which a
 // checkpoint or a rewind can branch to. It never contributes an item
 // or a setting, so the context and the request hashes are untouched.
 // Made with the context of a tool call, from inside the tool, the
@@ -1345,6 +1351,15 @@ func (r *Recorder) Annotate(ctx context.Context, ns string, data any) (string, e
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	w := r.writerOf(ctx)
+	if w == r.root {
+		cw, err := r.reopen(ctx)
+		if err != nil {
+			return "", err
+		}
+		if cw != nil {
+			w = cw
+		}
+	}
 	raw, err := json.Marshal(data)
 	if err != nil {
 		return "", fmt.Errorf("session: encode annotation %s: %w", ns, err)
@@ -1373,12 +1388,61 @@ func (r *Recorder) EntryOf(ctx context.Context, item openresponses.Item) (string
 	return "", false
 }
 
-// writerOf returns the writer of the run on the context, or the root.
+// writerOf returns the writer of the run on the context; failing
+// that, the writer of a run of the child session the context names,
+// which a later run under the same call continues; and failing that,
+// the root.
 func (r *Recorder) writerOf(ctx context.Context) *writer {
 	if cw, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
 		return cw
 	}
+	if id := SessionIDFromContext(ctx); r.childIDs[id] {
+		for _, cw := range r.runs {
+			if cw.id == id {
+				return cw
+			}
+		}
+	}
 	return r.root
+}
+
+// reopen returns a writer at the leaf of the child session the context
+// names when no run of it is being written, or nil when the context
+// names none of this recorder's children. It is what a record written
+// after a child's run ended, by a job the child started, is filed
+// with. The writer knows the calls on the session's path and the
+// nested calls their tools made, which is all callOn asks, and is
+// dropped after the write: the store keeps the leaf, and a later run
+// of the child seeds a writer of its own from it. The caller holds
+// r.mu, so no live writer of the session appends meanwhile.
+func (r *Recorder) reopen(ctx context.Context) (*writer, error) {
+	id := SessionIDFromContext(ctx)
+	if !r.childIDs[id] {
+		return nil, nil
+	}
+	s, err := r.store.Open(context.WithoutCancel(ctx), id)
+	if err != nil {
+		return nil, fmt.Errorf("session: reopen child session %s: %w", id, err)
+	}
+	calls, err := s.Calls(s.Leaf())
+	if err != nil {
+		return nil, fmt.Errorf("session: calls of child session %s: %w", id, err)
+	}
+	w := newWriter(r, id)
+	for _, c := range calls {
+		w.calls[c.ID()] = &callRecord{entry: c.Entry.Base().ID, args: c.Call.Arguments}
+	}
+	for _, e := range s.Path(s.Leaf()) {
+		c, ok := e.(*agentsession.CustomEntry)
+		if !ok || c.NS != NestedCallNS {
+			continue
+		}
+		var n NestedCall
+		if json.Unmarshal(c.Data, &n) == nil && n.Parent != "" {
+			w.parents[n.CallID] = n.Parent
+		}
+	}
+	return w, nil
 }
 
 // callOn returns the ID of the call on the context when the session
@@ -1403,10 +1467,14 @@ func (w *writer) callOn(ctx context.Context) string {
 //
 // A record written from agentturn.RunContext after the run it names
 // has ended, by a background job that outlived it, finds no run being
-// written and is filed at the leaf of the recorder's own session,
-// after whatever that session holds by then, a later run's entries
-// included; its call_id names the job's call when that session holds
-// it, and is empty for a call of a child session.
+// written. It is filed at the leaf of the child session the context
+// names, when [Recorder.ChildContext] named one of this recorder's
+// children there, and of the recorder's own session otherwise, after
+// whatever that session holds by then, a later run's entries included;
+// its call_id names the job's call when that session holds it. A job
+// in a child names its call with agenttool.WithCall(rc, call): the
+// child's run context carries the parent's call, which the child's
+// session does not hold, so a record without it names no call.
 func (r *Recorder) RecordFunc() agenttool.RecordFunc {
 	return func(ctx context.Context, rec *agenttool.Record) error {
 		_, err := r.Annotate(ctx, rec.NS, json.RawMessage(rec.Data))
@@ -1757,6 +1825,7 @@ func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, 
 	s, err := r.store.Create(ctx, h)
 	if errors.Is(err, agentsession.ErrSessionExists) {
 		if s, err = r.store.Open(ctx, h.ID); err == nil {
+			r.addChild(s.ID())
 			w := newWriter(r, s.ID())
 			w.cwd = parent.cwd
 			if agent.RetryFromContext(ctx) {
@@ -1776,9 +1845,18 @@ func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, 
 	if err != nil {
 		return nil, fmt.Errorf("session: create child session: %w", err)
 	}
+	r.addChild(s.ID())
 	w := newWriter(r, s.ID())
 	w.cwd = parent.cwd
 	return w, nil
+}
+
+// addChild notes id as a child session the recorder writes.
+func (r *Recorder) addChild(id string) {
+	if r.childIDs == nil {
+		r.childIDs = map[string]bool{}
+	}
+	r.childIDs[id] = true
 }
 
 // runID returns the run an event belongs to.
