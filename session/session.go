@@ -40,7 +40,10 @@
 //   - turn_start: a config entry when the settings in force changed
 //     since the last call (a full one first if none was written, deltas
 //     after, a tool list change as tools_added and tools_removed), so
-//     the stored path replays to the request's settings.
+//     the stored path replays to the request's settings. With
+//     [WithInstructionsParts] the instructions are written as the parts
+//     they are composed of, a delta naming only the parts that moved,
+//     and what the host left out as instructions_omitted.
 //   - model_retry: the settings of the request the next attempt will
 //     send, in place of the ones the attempt that failed carried, since
 //     that attempt answered nothing and wrote nothing. A Retry.Revise
@@ -344,6 +347,7 @@ type Recorder struct {
 	harness  *agentsession.Harness
 	children bool
 	env      func(context.Context) (*agentsession.EnvEntry, error)
+	parts    func(openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart)
 	now      func() time.Time
 	// agent is the agent Attach subscribed to, whose configuration is
 	// taken again at every run_start.
@@ -423,6 +427,10 @@ type writer struct {
 	// env is the last env entry written, encoded, so the next is
 	// written only when it differs.
 	env []byte
+	// omitted is the instructions_omitted of the last config entry that
+	// carried one, encoded, so a change to what was left out is written
+	// even when the settings did not move.
+	omitted []byte
 
 	// run is the ID of the run being written, "" between runs; open
 	// lists, in order, the calls of that run with no output yet;
@@ -509,6 +517,35 @@ func WithoutChildSessions() Option {
 // environment through parent_session.
 func WithEnv(fn func(context.Context) (*agentsession.EnvEntry, error)) Option {
 	return func(r *Recorder) { r.env = fn }
+}
+
+// WithInstructionsParts names the parts a request's instructions are
+// composed of, and the parts that were considered and left out, so the
+// recorder's config entries carry instructions_parts and
+// instructions_omitted rather than one string: a change to one layer,
+// a memory block or a skill catalogue, is then a delta naming that
+// part, the others carried by their hashes, rather than the whole
+// prompt again. fn is called with the canonical request whenever the
+// recorder settles the settings, which is with the request about to be
+// sent, after BeforeModelCall has rewritten it, so a product that edits
+// its instructions in a hook takes its parts from what the hook left.
+//
+// Parts are used only when their texts, joined as the format joins
+// them, equal the request's instructions; otherwise the entry carries
+// the string as it does without this option, since the record must
+// describe what the model was sent and must not fail the run over how
+// a product composed it; so are parts the format refuses, one with no
+// ID or two sharing one. The omitted parts are written on every config
+// entry while they are non-empty, and on an entry of their own when
+// they change and the settings do not. The format has no way to say
+// that nothing is omitted any more, so a list that empties is not
+// written and a reader keeps the last one. A session written before
+// the option was set has the joined string on its path, and the first
+// entry under the option carries the text of every part, once. It
+// applies to the recorder's own session; a child run's session keeps
+// the string.
+func WithInstructionsParts(fn func(req openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart)) Option {
+	return func(r *Recorder) { r.parts = fn }
 }
 
 // New returns a recorder writing to the session with the given ID in
@@ -686,6 +723,7 @@ func (w *writer) reset() {
 	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = false, 0, nil, nil
 	w.calls = map[string]*callRecord{}
 	w.env = nil
+	w.omitted = nil
 }
 
 // seed sets the writer's state from the session at its leaf.
@@ -705,6 +743,7 @@ func (w *writer) seed(s *agentsession.Session) error {
 	}
 	w.values = append(openresponses.Items(nil), cx.Items...)
 	w.custom = make([]bool, len(w.values))
+	w.omitted = omittedBody(cx.InstructionsOmitted())
 	for _, e := range cx.Entries {
 		if env, ok := e.(*agentsession.EnvEntry); ok {
 			w.env = envBody(env)
@@ -1294,25 +1333,86 @@ func (w *writer) blocked(ctx context.Context, e *agentturn.ModelBlocked) error {
 }
 
 // settle brings the recorded settings to those of req, writing a full
-// config first and deltas after.
+// config first and deltas after. With [WithInstructionsParts] the
+// entries carry the parts of the instructions when they join to the
+// request's, and what was left out.
 func (w *writer) settle(ctx context.Context, req openresponses.Request) error {
-	full, err := agentsession.ConfigFromRequest(req)
+	parts, omitted := w.instructionParts(req)
+	full, err := agentsession.ConfigFromRequestParts(req, parts...)
 	if err != nil {
 		return fmt.Errorf("session: %w", err)
 	}
-	next := agentsession.Settings{}.Apply(full)
-	if !w.wroteConfig {
-		if _, err := w.append(ctx, full); err != nil {
-			return err
-		}
-	} else if delta := configDelta(w.settings, next, full); delta != nil {
-		if _, err := w.append(ctx, delta); err != nil {
-			return err
+	omittedChanged := !bytes.Equal(omittedBody(omitted), w.omitted)
+	var entry *agentsession.ConfigEntry
+	switch {
+	case !w.wroteConfig:
+		entry = full
+	default:
+		entry = configDelta(w.settings, agentsession.Settings{}.Apply(full), full, parts)
+		if entry == nil && omittedChanged && len(omitted) > 0 {
+			// Nothing in force moved, but what was left out did: the
+			// entry says so and changes no setting.
+			entry = &agentsession.ConfigEntry{}
 		}
 	}
-	w.settings = next
+	if entry != nil {
+		if len(omitted) > 0 {
+			entry.InstructionsOmitted = omitted
+		}
+		if _, err := w.append(ctx, entry); err != nil {
+			return err
+		}
+		w.settings = w.settings.Apply(entry)
+		if len(omitted) > 0 {
+			w.omitted = omittedBody(omitted)
+		}
+	}
 	w.wroteConfig = true
 	return nil
+}
+
+// instructionParts asks the host for the parts of req's instructions
+// and what it left out, and returns them when the format can hold them
+// and the parts join to the instructions the request carries. Parts
+// that do not join, or that the format refuses, a part with no ID or
+// two with one, are dropped, and the omitted parts with them, since
+// they describe a composition that is not the one sent or cannot be
+// written; an omitted part with no ID is dropped alone. The record
+// falls back to the string rather than fail the run.
+func (w *writer) instructionParts(req openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
+	if w != w.rec.root || w.rec.parts == nil {
+		return nil, nil
+	}
+	parts, omitted := w.rec.parts(req)
+	if len(parts) == 0 || agentsession.JoinInstructions(parts) != req.Instructions {
+		return nil, nil
+	}
+	seen := make(map[string]bool, len(parts))
+	for _, p := range parts {
+		if p.ID == "" || seen[p.ID] {
+			return nil, nil
+		}
+		seen[p.ID] = true
+	}
+	var named []agentsession.OmittedPart
+	for _, o := range omitted {
+		if o.ID != "" {
+			named = append(named, o)
+		}
+	}
+	return parts, named
+}
+
+// omittedBody encodes omitted parts for comparison, nil for none.
+func omittedBody(omitted []agentsession.OmittedPart) []byte {
+	if len(omitted) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(omitted)
+	if err != nil {
+		return nil
+	}
+	return data
 }
 
 // item writes an item entry, or a custom entry for an item the model
@@ -1840,8 +1940,16 @@ func (w *writer) append(ctx context.Context, e agentsession.Entry) (string, erro
 // they are equal, or full (a replace entry) when the change cannot be
 // expressed as a delta: a model being cleared, a tool list change that
 // a delta would not replay in the request's order, or a delta that
-// would be larger than the replacement.
-func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntry) *agentsession.ConfigEntry {
+// would be larger than the replacement. parts, when set, are the parts
+// next's instructions are composed of, and the instructions change is
+// written as the parts that moved; otherwise it is the joined string,
+// and parts on the path whose join is unchanged are left in place.
+func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntry, parts []agentsession.InstructionPart) *agentsession.ConfigEntry {
+	if len(parts) == 0 {
+		// The string is what is compared: parts in force that join to
+		// the same text still describe it.
+		prev.InstructionsParts = nil
+	}
 	if equalJSON(prev, next) {
 		return nil
 	}
@@ -1861,7 +1969,12 @@ func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntr
 	if next.Model != prev.Model {
 		d.Model = next.Model
 	}
-	if next.Instructions != prev.Instructions {
+	switch {
+	case len(parts) > 0:
+		if pd := prev.InstructionsDelta(parts); pd != nil {
+			d.InstructionsParts = pd.InstructionsParts
+		}
+	case next.Instructions != prev.Instructions:
 		s := next.Instructions
 		d.Instructions = &s
 	}
@@ -1886,6 +1999,9 @@ func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntr
 		if _, ok := next.Extra[k]; !ok {
 			d.ClearExtra(k)
 		}
+	}
+	if equalJSON(d, &agentsession.ConfigEntry{}) {
+		return nil
 	}
 	if jsonLen(d) >= jsonLen(full) {
 		return full

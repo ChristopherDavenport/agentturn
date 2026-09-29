@@ -13,6 +13,27 @@ versions may break the API.
   of agentsession refuses a 0.6 file, as a 0.x reader refuses a later
   minor. A store now honours a header's `base` at `Create`, so a
   forked session can be written through any of them.
+- `session.WithInstructionsParts(fn)` gives the recorder the parts a
+  request's instructions are composed of and the parts the host left
+  out, so config entries carry `instructions_parts` and
+  `instructions_omitted` rather than one string. A change to one layer
+  is a delta naming that part, the others by hash: a 13 byte memory
+  write under two 4000 byte layers is a delta of a few hundred bytes
+  where it repeated the whole prompt. `fn` is called with the request
+  about to be sent, after `BeforeModelCall`, so a product whose hooks
+  rewrite the instructions takes its parts from what they left; parts
+  that do not join to the instructions sent are dropped and the string
+  is written, as without the option, so a product's composition never
+  fails the run; so are parts the format refuses, one with no ID or two
+  sharing one, and an omitted part with no ID is dropped. Omitted
+  parts are written on every config entry while there are any, and on
+  an entry of their own when only they changed; the format cannot say
+  the list emptied, so a reader keeps the last one written. A session
+  recorded before the option was set has the joined string on its
+  path, and its first entry under the option carries every part's
+  text, once. It applies to the recorder's own session. Without the option nothing
+  changes. RFC 0001 draft 0.2 resolves its open question on
+  instructions as parts. (#114, #121, #129, #90)
 
 ## v0.0.9 - 2026-09-28
 
