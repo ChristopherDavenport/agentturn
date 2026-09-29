@@ -82,7 +82,7 @@ func TestRunEntriesCarrySourceTriggerAndReason(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h := s.Header(); strings.Join(h.Records, ",") != "run,dispatch,decision" {
+	if h := s.Header(); strings.Join(h.Records, ",") != "run,dispatch,decision,queued" {
 		t.Errorf("header records = %v", h.Records)
 	}
 	deferAll := func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {

@@ -334,9 +334,10 @@ func TestStateExposesTheQueues(t *testing.T) {
 	if _, err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
 		t.Fatal(err)
 	}
-	// After the first answer the steered item and both follow-ups are
-	// drained together, and answered by one more turn.
-	if st := a.State(); st.Steering != 0 || st.FollowUps != 0 || itemTypes(st.Transcript) != "user assistant user user user assistant" {
+	// The item steered while the agent was idle joins the prompt before
+	// the first model call; the follow-ups are drained together after
+	// the first answer, and answered by one more turn.
+	if st := a.State(); st.Steering != 0 || st.FollowUps != 0 || itemTypes(st.Transcript) != "user user assistant user user assistant" {
 		t.Errorf("state after run = %q steer=%d followups=%d", itemTypes(st.Transcript), st.Steering, st.FollowUps)
 	}
 }

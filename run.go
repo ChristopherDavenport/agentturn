@@ -523,6 +523,16 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 	if err := r.appendItems(prompts); err != nil {
 		return err
 	}
+	if len(approved) == 0 && !terminate {
+		// What was steered in while the agent was idle joins the run
+		// before its first model call, as it would have joined a run in
+		// flight before its next one. A run that begins with approved
+		// calls drains after their batch, and a refusal leaves the
+		// queue for the run that follows it.
+		if err := r.appendItems(r.drain(r.steer)); err != nil {
+			return err
+		}
+	}
 	if len(approved) > 0 {
 		results, err := r.approvedBatch(ctx, approved)
 		if err != nil {
@@ -551,6 +561,9 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 		if r.cfg.BeforeTurn != nil {
 			items, err := r.cfg.BeforeTurn(ctx, TurnStartInfo{RunID: r.runID, Turn: r.turn, Transcript: r.transcript})
 			if err != nil {
+				if errors.Is(err, ErrGuard) {
+					return stopped(StopGuard, err)
+				}
 				return fmt.Errorf("agentturn: before-turn hook: %w", err)
 			}
 			if err := r.appendItems(items); err != nil {
@@ -675,6 +688,11 @@ func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponse
 	req.Input = r.cfg.filter()(input)
 	if r.cfg.BeforeModelCall != nil {
 		if err := r.cfg.BeforeModelCall(ctx, &req); err != nil {
+			if errors.Is(err, ErrGuard) {
+				// A policy stopped the run before the call: nothing was
+				// refused that a record should hold as a failed call.
+				return openresponses.Request{}, stopped(StopGuard, err)
+			}
 			// The call was never made; the request as built is the
 			// record of what was refused.
 			if eerr := r.emit(&ModelBlocked{RunID: r.runID, Turn: r.turn, Request: req, Err: err}); eerr != nil {
@@ -1283,7 +1301,8 @@ func (r *runner) collect(batch []*callState) ([]agenttool.Result, []*openrespons
 // approvedBatch runs the calls a caller approved on Resume as one
 // batch, before the first turn: preflight without BeforeToolCall, since
 // the caller has decided, then execute and collect as for any batch.
-// The tool events carry Turn 0.
+// The tool events carry Turn 0, the turn of a resume's batch, which
+// runs before the run's first model call.
 func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agenttool.Result, error) {
 	tools := r.cfg.tools(ctx)
 	ctx = r.toolContext(ctx, tools)

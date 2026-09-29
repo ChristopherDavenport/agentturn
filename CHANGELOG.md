@@ -94,6 +94,50 @@ versions may break the API.
   an open question. (#119)
 - RFC 0001's open question on a `proceed` with no `dispatch` is
   resolved by agentsession #78: the format admits it.
+- **Breaking**: an error wrapping `ErrGuard` from `BeforeTurn` or
+  `BeforeModelCall` stops the run with `ReasonStopped` and `StopGuard`,
+  the error on `RunEnd.Err`, as it does from `ShouldStopAfterTurn`; it
+  ended the run with `ReasonError`, so a cost limit either overshot by a
+  call or was filed as a failure. The turn has no `turn_start` and no
+  `ModelBlocked`, and the recorder writes no failed response for a call
+  that was never made. Any other error is unchanged. (#116)
+- **Breaking**: an item steered while the agent is idle joins the next
+  run before its first model call, after the prompt, where it waited
+  for the first batch and reached the model one call late. A run that
+  begins with approved calls still drains after their batch, and a
+  refusal on `Resume` leaves the queue for the run after it. (#123)
+- `Agent.Queue(ctx, mode, items...)` is `Steer` or `FollowUp` with the
+  trigger on `ctx` carried on each item's `Queued` report, which gains
+  `Trigger`: an input that joins a run has a provenance of its own. (#67)
+- **Breaking, in what is recorded.** The recorder writes the inbox and
+  closes the runs it inherits. (#67, #120, #94, #118)
+  - Every `Queued` report is a `queued` entry, with the mode and the
+    trigger, before the item is appended, and the item entry that
+    appends it names it in `queued_from` with the trigger as `source`.
+    A run end closes the entries of the inputs it did not append, so
+    the recorder writes them again after the end, since the agent
+    still holds them. `Start` promises `queued` in the header by
+    default. After a kill, `Session.PendingQueued` lists what was
+    accepted and not appended, and `Recorder.Requeue(ctx, agent)` hands
+    it back to the agent without writing it a second time.
+  - `Resume` closes a run left open at the leaf, which a crash cut off,
+    with reason `error` and ref `cut off: closed on resume`, before it
+    returns, and queues the inputs that run owed again after the end,
+    as agentsession #86 settled: the writer that continues the path
+    owns the run. `Rebase` into a run closes it `interrupted` with ref
+    `rewind to <entry>`, and re-queues what the agent holds on the new
+    branch; a rebase between runs still appends nothing.
+  - `Start` on a header with a `Base` seeds the recorder from the
+    context at the base, as `Resume` does at the leaf, so an agent
+    seeded with it records requests that carry hashes, and closes a run
+    the base is inside, `interrupted`, with ref `fork at <entry>`. Every
+    store honours a base since agentsession v0.0.9. (#118)
+- The batch of calls approved through `Agent.Resume` keeps turn 0,
+  which the tool events' docs now state: it runs before the run's first
+  model call, and a synthetic turn would either write a failed
+  response into the record or count against `MaxTurns`. (#113)
+- RFC 0001 resolves its open questions on durable queues (#67) and a
+  run the process died inside (#94), and says who closes an open run.
 
 ## v0.0.9 - 2026-09-28
 

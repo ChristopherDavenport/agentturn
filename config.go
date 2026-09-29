@@ -103,6 +103,10 @@ type Config struct {
 	// a recorded session rebuilds the request they were part of, which
 	// injection through Transform cannot give. nil or no items appends
 	// nothing. A guard on the request itself belongs in BeforeModelCall.
+	// An error wrapping [ErrGuard] is how a policy, a cost limit or a
+	// deadline, stops the run before the turn's model call: the run ends
+	// with ReasonStopped, StopGuard and the error on RunEnd.Err, and the
+	// turn has no turn_start. Any other error ends it with ReasonError.
 	//
 	// It is one field and several layers want it. Assigning it twice
 	// keeps the second assignment and loses the first with no error and
@@ -116,7 +120,11 @@ type Config struct {
 	// a session recorder writes that call without a request hash; a
 	// change to a setting is recorded as a config delta. A hook that
 	// refuses the call ends the run with ReasonError after a
-	// [ModelBlocked] event carrying the request as built; a guard that
+	// [ModelBlocked] event carrying the request as built, unless its
+	// error wraps [ErrGuard]: that is a policy stopping the run before
+	// the call, which ends it with ReasonStopped and StopGuard and
+	// raises no ModelBlocked, since nothing was refused that a record
+	// should hold as a failed call. A guard that
 	// calls a model is on the critical path of every first token, since
 	// the request is not final until the hook returns.
 	//

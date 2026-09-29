@@ -275,7 +275,7 @@ func TestContinueRollsOver(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h := next.Header(); h.ParentSession != s.ID() || h.Harness == nil || h.Harness.Name != "h" || strings.Join(h.Records, ",") != "run,dispatch,decision" {
+	if h := next.Header(); h.ParentSession != s.ID() || h.Harness == nil || h.Harness.Name != "h" || strings.Join(h.Records, ",") != "run,dispatch,decision,queued" {
 		t.Errorf("successor header = %+v", h)
 	}
 	if got := entryTypes(next); got != "config item:user" {
