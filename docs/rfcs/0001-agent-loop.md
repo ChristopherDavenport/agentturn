@@ -1086,7 +1086,14 @@ An agent stands in four places inside another system:
   the previous model produced, reasoning items included, and a
   reasoning item carries a signature its own provider issued; a
   handoff that changes the provider MUST drop them, and which component
-  owns that rule is open (#91).
+  owns that rule is open (#91). A handoff that trims what the receiver
+  sees does it once, between runs, by replacing the transcript; a
+  recorder moved to the last entry kept keeps every later response
+  verifiable when the trim takes a prefix, and a trim from the middle
+  leaves them unhashed. Where each agent keeps a session of its own,
+  the receiver's is a fork of the sender's at the handoff's last entry,
+  a session whose header names that entry as its base, and every hash
+  on the fork's path verifies.
 
 A configuration's name and description are the single source for how
 an agent presents itself in every one of these.
