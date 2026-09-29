@@ -658,8 +658,8 @@ func TestTriggerExtraReachesTheTrigger(t *testing.T) {
 			prompt := openresponses.UserText("go")
 			_, err = a.Prompt(agentturn.ContextWithTrigger(context.Background(), trigger), prompt)
 			if tc.wantErr {
-				if !errors.Is(err, ErrTriggerMember) {
-					t.Fatalf("err = %v, want ErrTriggerMember", err)
+				if !errors.Is(err, agentturn.ErrTriggerExtra) {
+					t.Fatalf("err = %v, want ErrTriggerExtra", err)
 				}
 				if leaf := s.Leaf(); leaf != "" {
 					t.Errorf("a refused run start left entry %s", leaf)
@@ -784,6 +784,49 @@ func TestQueuedTriggerKeepsItsExtra(t *testing.T) {
 				t.Fatal(err)
 			}
 			checkDrained(t, s2, want)
+		})
+	}
+}
+
+// TestBadTriggerExtraIsRefusedAtTheQueue checks that an input queued
+// with a trigger whose Extra cannot be written is refused by the call
+// that queues it, so it is neither queued nor recorded, and the next
+// run, which it used to fail, records as any other.
+func TestBadTriggerExtraIsRefusedAtTheQueue(t *testing.T) {
+	cases := []struct {
+		name  string
+		queue func(ctx context.Context, rec *Recorder, a *agentturn.Agent) error
+	}{
+		{"Agent.Queue", func(ctx context.Context, _ *Recorder, a *agentturn.Agent) error {
+			return a.Queue(ctx, agentturn.QueueSteer, openresponses.UserText("steered"))
+		}},
+		{"Recorder.Queue", func(ctx context.Context, rec *Recorder, a *agentturn.Agent) error {
+			return rec.Queue(ctx, a, agentturn.QueueFollowUp, openresponses.UserText("queued"))
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}})
+			defer rec.Attach(a)()
+			ctx := agentturn.ContextWithTrigger(context.Background(), agentturn.Trigger{Kind: "cron", Extra: map[string]any{"ref": "forged"}})
+			if err := tc.queue(ctx, rec, a); !errors.Is(err, agentturn.ErrTriggerExtra) {
+				t.Fatalf("err = %v, want ErrTriggerExtra", err)
+			}
+			if _, err := a.Prompt(context.Background(), openresponses.UserText("next")); err != nil {
+				t.Fatalf("the next prompt: %v", err)
+			}
+			if n := countQueued(s); n != 0 {
+				t.Errorf("queued entries = %d in %q", n, entryTypes(s))
+			}
+			if runs := runsOf(t, s); len(runs) != 1 || runs[0].End == nil || runs[0].End.Reason != agentsession.ReasonDone {
+				t.Errorf("runs = %+v", runs)
+			}
+			verifyAll(t, s)
 		})
 	}
 }

@@ -270,6 +270,32 @@ func TestHeldAfterDispatchCutAgainStaysAmbiguous(t *testing.T) {
 	}
 }
 
+// TestHeldAfterDispatchStaysHeldWhenResumeFails checks that a resume
+// that fails before its batch, here on a subscriber refusing
+// run_start, leaves a call held after its dispatch as it was: deferred,
+// dispatched, with its key, not relabelled as cut.
+func TestHeldAfterDispatchStaysHeldWhenResumeFails(t *testing.T) {
+	call := &openresponses.FunctionCall{CallID: "call_1", Name: "act", Arguments: `{"text":"t"}`}
+	k := &keyedTool{}
+	held := PendingCall{Call: call, Reason: PendingDeferred, Dispatched: true, IdempotencyKey: "k1"}
+	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{k.tool(agenttool.ReplayKeyed)}},
+		WithTranscript(Transcript{openresponses.UserText("go"), call}), WithPending([]PendingCall{held}))
+	refused := errors.New("refused")
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if _, ok := ev.(*RunStart); ok {
+			return refused
+		}
+		return nil
+	})
+	end, _ := a.Resume(context.Background(), Approve(call.CallID))
+	if end == nil || len(end.Pending) != 1 || len(k.keys) != 0 {
+		t.Fatalf("end = %+v, ran %d", end, len(k.keys))
+	}
+	if p := end.Pending[0]; p.Reason != PendingDeferred || !p.Dispatched || p.IdempotencyKey != "k1" {
+		t.Errorf("pending = %+v, want it held after its dispatch", p)
+	}
+}
+
 // TestSetTranscriptKeepsWhatTheAgentKnew checks that a held call stays
 // held across SetTranscript, so it is approved as a held call rather
 // than refused as one that may have run, and that SetPending tells a

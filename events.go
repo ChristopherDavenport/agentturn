@@ -2,6 +2,8 @@ package agentturn
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
@@ -92,16 +94,41 @@ const (
 // trigger object beside kind, ref and source, which is where the
 // format puts them, wherever it writes the trigger: on the run start,
 // on a queued input's entry and as the source of the item that drains
-// it, so a firing queued behind a busy run keeps its slot. It refuses
-// the three names the format defines there. The loop reads nothing
-// from Extra, so a name the recorder refuses, or a value that does not
-// encode as JSON, fails the run or the queueing only when a recorder
-// is attached.
+// it, so a firing queued behind a busy run keeps its slot. The loop
+// reads nothing from Extra, but it refuses, with [ErrTriggerExtra], a
+// trigger whose Extra names kind, ref or source, the members the
+// format defines beside it, or holds a value that does not encode as
+// JSON, where the trigger enters: a run started with it and an item
+// queued with it are refused at the call, whether or not a recorder is
+// attached, rather than failing a later run.
 type Trigger struct {
 	Kind   string
 	Ref    string
 	Source string
 	Extra  map[string]any
+}
+
+// ErrTriggerExtra is returned for a [Trigger] whose Extra cannot be
+// written beside kind, ref and source: it names one of the three, or a
+// value does not encode as JSON. [Agent.Prompt], [Agent.Continue],
+// [Agent.Resume], [Agent.Queue] and [Agent.Deliver] refuse such a
+// trigger on their context before anything happens, and [Run] and
+// [Continue] end with it before any other event.
+var ErrTriggerExtra = errors.New("agentturn: trigger extra cannot be written")
+
+// Validate returns [ErrTriggerExtra], naming the member, when Extra
+// cannot be written beside kind, ref and source, and nil otherwise.
+func (t Trigger) Validate() error {
+	for name, v := range t.Extra {
+		switch name {
+		case "kind", "ref", "source":
+			return fmt.Errorf("%w: %q is a member of the trigger", ErrTriggerExtra, name)
+		}
+		if _, err := json.Marshal(v); err != nil {
+			return fmt.Errorf("%w: %q: %w", ErrTriggerExtra, name, err)
+		}
+	}
+	return nil
 }
 
 // IsZero reports whether the trigger names nothing.

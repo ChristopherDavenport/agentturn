@@ -266,7 +266,11 @@ the firing, when it was due or which attempt it is, is
 carried on `run_start` and on the `item_end` of each item the run was
 prompted with, and read by nothing in the loop; it is how a
 recorder learns what caused the run without the loop learning what a
-cron job is.
+cron job is. The richer facts are written beside the kind, the
+reference and the layer, so a loop MUST refuse, where the trigger
+enters, a run or a queued item whose facts name one of those three or
+cannot be encoded as JSON, rather than let a recorder fail a later run
+over it.
 
 ### The turn
 
@@ -1266,7 +1270,7 @@ maps onto it as follows:
 | retry policy | `Config.Retry{MaxAttempts, Backoff, Retryable, Revise}`; `DefaultBackoff`, `DefaultRetryable` |
 | low-level loop | `Run(ctx, t, prompts, cfg)`, `Continue(ctx, t, cfg)` → `iter.Seq[Event]`; `EventBuffer`; `CanContinue` |
 | agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`, `WithPending`, `SetPending`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Deliver`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `State`, `SetConfig`, `SetTranscript`, `Config` |
-| refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning`, `ErrAmbiguousCall`, `ErrCallAnswered` |
+| refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning`, `ErrAmbiguousCall`, `ErrCallAnswered`, `ErrTriggerExtra` (`Trigger.Validate`) |
 | run ID, trigger, transcript on the context | `ContextWithRunID`/`RunIDFromContext`, `ContextWithTrigger`/`TriggerFromContext`, `ContextWithTranscript`/`TranscriptFromContext` |
 | run context, steer signal | `RunContext(ctx)`, `Steered(ctx)` |
 | source | `Source`: `SourceInput`, `SourceResume` |

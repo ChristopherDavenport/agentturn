@@ -120,6 +120,59 @@ func TestQueueCarriesItsTrigger(t *testing.T) {
 	}
 }
 
+// TestTriggerExtraRefusedWhereItEnters checks that a trigger whose
+// Extra cannot be written is refused by the call that brings it in, so
+// nothing is queued and nothing runs, and the next run on a plain
+// context is unaffected.
+func TestTriggerExtraRefusedWhereItEnters(t *testing.T) {
+	enter := map[string]func(ctx context.Context, a *Agent) error{
+		"Prompt": func(ctx context.Context, a *Agent) error {
+			_, err := a.Prompt(ctx, openresponses.UserText("go"))
+			return err
+		},
+		"Queue": func(ctx context.Context, a *Agent) error {
+			return a.Queue(ctx, QueueFollowUp, openresponses.UserText("queued"))
+		},
+		"Deliver": func(ctx context.Context, a *Agent) error {
+			_, _, err := a.Deliver(ctx, openresponses.UserText("delivered"))
+			return err
+		},
+		"Run": func(ctx context.Context, _ *Agent) error {
+			var end *RunEnd
+			for ev := range Run(ctx, nil, openresponses.Items{openresponses.UserText("go")}, Config{Model: &echo.Adapter{}}) {
+				if e, ok := ev.(*RunEnd); ok {
+					end = e
+				}
+			}
+			return end.Err
+		},
+	}
+	extras := map[string]map[string]any{
+		"a trigger member": {"kind": "forged"},
+		"not JSON":         {"due_at": func() {}},
+	}
+	for name, fn := range enter {
+		for bad, extra := range extras {
+			t.Run(name+", "+bad, func(t *testing.T) {
+				a := New(Config{Model: &echo.Adapter{}})
+				var events int
+				a.Subscribe(func(context.Context, Event) error { events++; return nil })
+				ctx := ContextWithTrigger(context.Background(), Trigger{Kind: "cron", Extra: extra})
+				if err := fn(ctx, a); !errors.Is(err, ErrTriggerExtra) {
+					t.Fatalf("err = %v, want ErrTriggerExtra", err)
+				}
+				if st := a.State(); st.Steering != 0 || st.FollowUps != 0 || len(st.Transcript) != 0 || events != 0 {
+					t.Fatalf("state after a refusal = %+v, %d events", st, events)
+				}
+				end, err := a.Prompt(context.Background(), openresponses.UserText("next"))
+				if err != nil || end.Reason != ReasonDone || len(a.State().Transcript) != 2 {
+					t.Errorf("the next prompt: err=%v end=%+v", err, end)
+				}
+			})
+		}
+	}
+}
+
 // TestRunEndAnswer pins the answer #138's consumers share: the assistant
 // message that ends the run's items, when it has text.
 func TestRunEndAnswer(t *testing.T) {

@@ -118,9 +118,9 @@ versions may break the API.
   after a restart. The session recorder writes it on the `dispatch` as
   `idempotency_key`, which format 0.8 defines, and `session.Pending`
   reads back the key of a call's last dispatch with the arguments
-  that dispatch ran with, the pair a run of it again repeats. A call a tool makes through
-  `Invoke` gets a fresh key each time, derived from nothing, which RFC
-  0001 lists as open. (#145)
+  that dispatch ran with, the pair a run of it again repeats. A call a
+  tool makes through `Invoke` gets a fresh key each time, derived from
+  nothing, which RFC 0001 lists as open. (#145)
 - The session recorder writes a second `dispatch` for a call an earlier
   run dispatched and a resume runs again, durably before the tool runs,
   carrying the key of the dispatch it repeats, so the record holds one
@@ -172,16 +172,23 @@ versions may break the API.
   the run start, on a queued input's `queued` entry, written again
   after a run end or a resume, and on the item that drains it, so a
   03:00 firing queued behind a busy run keeps its slot.
-  `Recorder.Requeue` hands them back to the agent. A name the format
-  defines there, `kind`, `ref` or `source`, or a value that does not
-  encode as JSON, is refused with `session.ErrTriggerMember` before
-  anything of the run, or the queued entry, is written. `Trigger`
-  holds a map now and no longer compares with `==`. The items a run was prompted with carry its trigger on
-  `ItemEnd.Trigger`, and the recorder writes it as their `source`, as
-  it already did for a queued input. A child run of `tools/agent` no
-  longer inherits the trigger of the parent's run, whose `Extra` its
-  recorder would otherwise write on the child's run start;
-  `WithRunContext` can give it one of its own. (#146)
+  `Recorder.Requeue` hands them back to the agent, as
+  `json.RawMessage` values. A name the format defines there, `kind`,
+  `ref` or `source`, or a value that does not encode as JSON, is
+  refused with `agentturn.ErrTriggerExtra` where the trigger enters,
+  whether or not a recorder is attached: the agent's `Prompt`,
+  `Continue`, `Resume` and `Deliver`, and the loop's `Run` and
+  `Continue`, refuse the run before it starts, and `Agent.Queue`,
+  which now returns an error, and `Recorder.Queue` queue nothing,
+  rather than failing the next, unrelated run. `Trigger.Validate`
+  makes the same check. `Trigger` holds a map now and no longer
+  compares with `==`. The items a run was prompted with carry its
+  trigger on `ItemEnd.Trigger`, and the recorder writes it as their
+  `source`, as it already did for a queued input. A child run of
+  `tools/agent` no longer inherits the trigger of the parent's run,
+  whose `Extra` its recorder would otherwise write on the child's run
+  start, nor who answered the parent's pending calls and why;
+  `WithRunContext` can give it a trigger of its own. (#146)
 - Behaviour change: an item steered during a turn after which the run
   stops, on `MaxTurns`, `ShouldStopAfterTurn`, a terminating result or
   a call that needs input, is no longer appended to the run that

@@ -33,7 +33,7 @@
 //     reports (input, or resume for a run that answers pending calls),
 //     the [agentturn.Trigger] on the context joined as ref and in its
 //     parts as trigger, the trigger's Extra as members of the trigger
-//     beside kind, ref and source, refused with [ErrTriggerMember]
+//     beside kind, ref and source, refused with agentturn.ErrTriggerExtra
 //     when one names one of the three, and, when the recorder knows
 //     the agent's configuration ([Recorder.Attach] and [WithConfig]
 //     give it one), the hash of its base request as
@@ -98,7 +98,9 @@
 //     again, whose by is Answer.By and whose reason is Answer.Reason;
 //     the absence of a second dispatch says the tool did not run
 //     again. A call the path shows answered already, its output lost
-//     to a crash between the two, gets its output alone.
+//     to a crash between the two or to a write that failed after the
+//     answer, gets its output alone; only an output answers it, and
+//     [Pending] reads it as [agentturn.PendingAnswered].
 //   - tool_start: the call's decision when there is one to record. A
 //     BeforeToolCall that blocked the call is a reject decision with
 //     its reason; one that deferred it is a hold carrying the same
@@ -509,25 +511,23 @@ type Elicitation struct {
 // written.
 var ErrRunActive = errors.New("session: a run is active")
 
-// ErrTriggerMember is returned for an [agentturn.Trigger] whose Extra
-// names kind, ref or source, the members the format defines for a
-// trigger object, or holds a value that does not encode as JSON. It
-// ends a run before anything else of it is written, and fails the
-// queueing of an input before its queued entry is. The format's
-// members take precedence, and the recorder refuses rather than drop
-// the caller's fact or write a line with the name twice.
-var ErrTriggerMember = errors.New("session: trigger extra names a member of the trigger")
-
 // sessionTrigger returns the trigger object for t, its Extra as
-// members of its own, or nil when t names nothing.
+// members of its own, or nil when t names nothing. The agent refuses
+// an Extra that cannot be written where the trigger enters; this
+// refuses it again, with [agentturn.ErrTriggerExtra], for a trigger
+// that reached the recorder some other way, such as through [Handle],
+// before anything of it is written.
 func sessionTrigger(t agentturn.Trigger) (*agentsession.Trigger, error) {
 	if t.IsZero() {
 		return nil, nil
 	}
+	if err := t.Validate(); err != nil {
+		return nil, err
+	}
 	out := &agentsession.Trigger{Kind: t.Kind, Ref: t.Ref, Source: t.Source}
 	for name, v := range t.Extra {
 		if err := out.SetMember(name, v); err != nil {
-			return nil, fmt.Errorf("%w: %w", ErrTriggerMember, err)
+			return nil, fmt.Errorf("%w: %w", agentturn.ErrTriggerExtra, err)
 		}
 	}
 	return out, nil
@@ -1278,7 +1278,9 @@ func (r *Recorder) Queue(ctx context.Context, a *agentturn.Agent, mode agentturn
 		if err != nil {
 			return err
 		}
-		a.Queue(ctx, mode, item)
+		// The trigger was checked above, so the agent does not refuse
+		// it.
+		_ = a.Queue(ctx, mode, item)
 	}
 	return nil
 }
@@ -1293,7 +1295,9 @@ func (r *Recorder) Queue(ctx context.Context, a *agentturn.Agent, mode agentturn
 // that end and dropped, which is how a host declines one. An input it
 // has handed over is not handed over again, and an input marked hidden
 // when it was accepted is queued without the mark, which the queued
-// entry does not carry.
+// entry does not carry. The trigger's members of its own come back in
+// its Extra as json.RawMessage values, as they were written, not as
+// the values the host first gave.
 func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) int {
 	r.mu.Lock()
 	var owed []*inboxItem
@@ -1313,7 +1317,9 @@ func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) int {
 		if in.mode == agentsession.ModeSteer {
 			mode = agentturn.QueueSteer
 		}
-		a.Queue(qctx, mode, in.item)
+		// A trigger read back from the path was written, so the agent
+		// does not refuse it.
+		_ = a.Queue(qctx, mode, in.item)
 	}
 	return len(owed)
 }
@@ -2439,6 +2445,12 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 			if _, err := w.append(ctx, dec); err != nil {
 				return err
 			}
+			// From here only the output may follow. Should its entry
+			// fail below, the path holds the answer alone, and the
+			// call is owed that output and nothing else: a retry with
+			// an output writes it, an approval's dispatch is refused
+			// by the store, and a recorder reseeded from the path
+			// reads the call as PendingAnswered.
 			c.held, c.ended = false, true
 		default:
 			// The caller wrote the output themselves: the call never

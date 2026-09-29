@@ -717,6 +717,9 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, approved
 	if a.running {
 		return nil, ErrRunning
 	}
+	if err := TriggerFromContext(ctx).Validate(); err != nil {
+		return nil, err
+	}
 	if len(a.pending) > 0 && !resuming {
 		// A prompt that opens with the outputs of every pending call
 		// answers them on the way to the next message.
@@ -928,7 +931,8 @@ func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe fu
 // can tell apart from its own items, such as a tool_end or a specific
 // item type it never steers.
 func (a *Agent) Steer(items ...openresponses.Item) {
-	a.Queue(context.Background(), QueueSteer, items...)
+	// No trigger, so nothing to refuse.
+	_ = a.Queue(context.Background(), QueueSteer, items...)
 }
 
 // FollowUp queues items to be injected when the run would otherwise
@@ -936,7 +940,7 @@ func (a *Agent) Steer(items ...openresponses.Item) {
 // the same life, the same [Queued] event and the same caveat about
 // subscribers as [Agent.Steer].
 func (a *Agent) FollowUp(items ...openresponses.Item) {
-	a.Queue(context.Background(), QueueFollowUp, items...)
+	_ = a.Queue(context.Background(), QueueFollowUp, items...)
 }
 
 // Queue is [Agent.Steer] or [Agent.FollowUp], as mode says, for an
@@ -946,15 +950,20 @@ func (a *Agent) FollowUp(items ...openresponses.Item) {
 // or a scheduled firing that overlapped a run, rather than only what
 // started the run it joins. Nothing else is read from ctx, and it
 // never blocks on delivery. A mode other than QueueSteer queues a
-// follow-up.
-func (a *Agent) Queue(ctx context.Context, mode QueueMode, items ...openresponses.Item) {
+// follow-up. A trigger whose Extra cannot be written is refused with
+// [ErrTriggerExtra], and nothing is queued.
+func (a *Agent) Queue(ctx context.Context, mode QueueMode, items ...openresponses.Item) error {
 	if mode != QueueSteer {
 		mode = QueueFollowUp
 	}
 	trigger := TriggerFromContext(ctx)
+	if err := trigger.Validate(); err != nil {
+		return err
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.queue(trigger, mode, items)
+	return nil
 }
 
 // Deliver hands items to the model, for an input that arrives on its
@@ -998,6 +1007,9 @@ func (a *Agent) Queue(ctx context.Context, mode QueueMode, items ...openresponse
 // A job running on [RunContext], and anything called with a context not
 // derived from the run's, waits as any caller does.
 func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joined bool, end *RunEnd, err error) {
+	if err := TriggerFromContext(ctx).Validate(); err != nil {
+		return false, nil, err
+	}
 	a.mu.Lock()
 	drains, before := a.drains, len(a.steer)
 	a.queue(TriggerFromContext(ctx), QueueSteer, items)
