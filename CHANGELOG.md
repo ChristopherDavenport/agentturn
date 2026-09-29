@@ -22,6 +22,22 @@ versions may break the API.
   change is written as a replace only when it is smaller with the
   list whole than a delta with what moved in it. Needs format 0.9.
   (agentsession #115)
+- The session recorder writes a tool that joins the list anywhere but
+  its end as a config delta rather than a full replace: `tools_added`
+  names every tool from the first one out of place, which replay
+  removes by name and appends, so an MCP server that lists a new tool
+  mid-list costs that tool and the ones after it, not every tool and
+  every instruction part. A tool moved to the end is added alone. The
+  size check still writes a replace when that is smaller. (#162)
+- `compact.WithRequest` edits the summary request `compact.NewLocal`
+  sends, after the transform has set its model, input and store. The
+  request carried nothing a caller passed but the model name, so a
+  thinking model left at its server's default reasoning thought
+  through the fold and now and then ended with a function call; a
+  caller whose requests set `effort: none` can now say the same for
+  the summary. A summary response with no text is asked once more
+  before the fold fails with `compact: summary response has no text`,
+  and the fold reports the call that answered. (#161)
 
 ## v0.0.11 - 2026-09-29
 

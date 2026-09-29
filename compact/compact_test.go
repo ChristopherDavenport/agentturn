@@ -207,11 +207,13 @@ func (p *probeCompactor) Compact(ctx context.Context, req openresponses.CompactR
 }
 
 // summarizer answers every request with a fixed summary and records
-// what it was asked.
+// what it was asked, except that it answers its first calls requests
+// with a function call and no text.
 type summarizer struct {
 	reqs  []openresponses.Request
 	reply string
 	fail  bool
+	calls int
 }
 
 func (s *summarizer) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
@@ -220,6 +222,19 @@ func (s *summarizer) CreateStream(_ context.Context, req openresponses.Request, 
 		return openresponses.ServerError("down", "no summary today")
 	}
 	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if len(s.reqs) <= s.calls {
+		fc, err := em.FunctionCall("call_1", "upper")
+		if err != nil {
+			return err
+		}
+		if err := fc.Arguments(`{"text":"x"}`); err != nil {
+			return err
+		}
+		if err := fc.Close(); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
 	w, err := em.Message(openresponses.PhaseFinalAnswer)
 	if err != nil {
 		return err
@@ -268,6 +283,51 @@ func TestLocalSummaryThroughRun(t *testing.T) {
 	// The model still answers.
 	if final := end.Items[len(end.Items)-1].(*openresponses.Message).Text(); final != "Tool result: LATEST" {
 		t.Errorf("final = %q", final)
+	}
+}
+
+func TestLocalSummaryRequestAndRetry(t *testing.T) {
+	cases := []struct {
+		name    string
+		calls   int
+		asked   int
+		wantErr string
+	}{
+		{"text on the first call", 0, 1, ""},
+		{"a call without text is asked again", 1, 2, ""},
+		{"no text twice fails the fold", 2, 2, "compact: summary response has no text"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &summarizer{reply: "They talked about things.", calls: tc.calls}
+			var folds []Fold
+			tr := NewLocal(s, WithBudget(1), WithKeepLast(1), WithEstimator(count), WithModel("small"),
+				WithRequest(func(req *openresponses.Request) {
+					if req.Model != "small" || len(req.Input) != 4 || req.Store == nil {
+						t.Errorf("request before the edit = %+v", req)
+					}
+					req.Reasoning = openresponses.ReasoningConfig{Effort: openresponses.ReasoningEffortNone}
+				}),
+				WithOnFold(func(_ context.Context, f Fold) error { folds = append(folds, f); return nil }))
+			_, err := tr.Transform(context.Background(), items(4))
+			if tc.wantErr == "" && err != nil || tc.wantErr != "" && (err == nil || err.Error() != tc.wantErr) {
+				t.Fatalf("err = %v, want %q", err, tc.wantErr)
+			}
+			if len(s.reqs) != tc.asked {
+				t.Fatalf("summary calls = %d, want %d", len(s.reqs), tc.asked)
+			}
+			for i, req := range s.reqs {
+				if req.Reasoning.Effort != openresponses.ReasoningEffortNone || req.Model != "small" {
+					t.Errorf("request %d = %+v", i, req)
+				}
+			}
+			if len(folds) != 1 {
+				t.Fatalf("folds = %d", len(folds))
+			}
+			if tc.wantErr == "" && (folds[0].Request == nil || folds[0].Request.Reasoning.Effort != openresponses.ReasoningEffortNone) {
+				t.Errorf("fold request = %+v", folds[0].Request)
+			}
+		})
 	}
 }
 

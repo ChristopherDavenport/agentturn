@@ -345,6 +345,10 @@ l := compact.NewLocal(model, compact.WithBudget(60_000), compact.WithModel("gpt-
 cfg.Transform = l.Transform
 ```
 
+`WithRequest(fn)` edits the summary request `NewLocal` sends, so it
+can carry the reasoning setting the agent's own requests do; a summary
+that comes back with no text is asked once more before the fold fails.
+
 `WithOnFold` reports every fold, applied or failed, with the index at
 which the transcript was split, so a recorder can write it.
 `WithPin(fn)` keeps the items `fn` reports through a fold: whatever

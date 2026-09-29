@@ -26,7 +26,9 @@
 // transcript was split; [Transform.Last] returns the latest summary.
 // [WithPin] keeps chosen items of the folded prefix verbatim after the
 // summary, for context a harness injected that must not become
-// whatever the summary made of it.
+// whatever the summary made of it. [WithRequest] edits the summary
+// request [NewLocal] sends, so it can carry the reasoning setting the
+// agent's own requests do.
 package compact
 
 import (
@@ -109,6 +111,22 @@ func WithFilter(fn func(agentturn.Transcript) agentturn.Transcript) Option {
 // items to fold. [New] ignores it.
 func WithSummaryPrompt(prompt string) Option { return func(t *Transform) { t.prompt = prompt } }
 
+// WithRequest sets a function that edits the request [NewLocal] sends
+// for a summary before it is sent, after the transform has set its
+// model, input and store. It is how the summary is asked the way the
+// agent asks everything else: a thinking model left at its server's
+// default reasoning may think through the whole fold and end with a
+// function call copied from the transcript, so a caller whose own
+// requests set Reasoning sets the same here, and may set
+// MaxOutputTokens, Temperature or any other field. A replay tells the
+// fold's call from a turn by its lack of tools and instructions, so
+// leave those empty. fn runs once per attempt on a fresh request; the
+// edited request is the one reported as [Fold.Request]. [New] ignores
+// it.
+func WithRequest(fn func(*openresponses.Request)) Option {
+	return func(t *Transform) { t.request = fn }
+}
+
 // Fold describes one compaction attempt on the transcript passed to
 // [Transform.Transform].
 type Fold struct {
@@ -146,11 +164,12 @@ type Fold struct {
 	// their order. They follow Output on the request and are not part
 	// of it.
 	Pinned openresponses.Items
-	// Request is the request [NewLocal] sent for the fold: the items
-	// being folded and the summary prompt. Its input is no path's
-	// context, so a hash of it never rebuilds from a stored path; a
-	// recorder that keeps it must mark it as the fold's own call. nil
-	// for [New], whose compaction request is not a Request.
+	// Request is the request [NewLocal] sent for the fold, as
+	// [WithRequest] left it: the items being folded and the summary
+	// prompt. Its input is no path's context, so a hash of it never
+	// rebuilds from a stored path; a recorder that keeps it must mark
+	// it as the fold's own call. nil for [New], whose compaction
+	// request is not a Request.
 	Request *openresponses.Request
 	// Err is set when the fold failed; Transform returns it. A fold cut
 	// off by an abort carries the context error.
@@ -193,6 +212,7 @@ type Transform struct {
 	prompt      string
 	summaryItem func(string) openresponses.Item
 	pin         func(openresponses.Item) bool
+	request     func(*openresponses.Request)
 
 	mu sync.Mutex
 	// prefixLen items of the transcript are represented by output. An
@@ -245,34 +265,56 @@ type folded struct {
 // the summary (see [WithSummaryItem]). It works against any server,
 // including those that answer 404 to the compaction endpoint. The
 // model is named by [WithModel]; leave it empty to let the server
-// pick its default.
+// pick its default. [WithRequest] edits the rest of the request.
+//
+// A summary response with no text, such as one that ends in a function
+// call, is a model error rather than a server one, so the summary is
+// asked once more before the fold fails with "compact: summary response
+// has no text". The fold then reports the call that answered: its
+// usage, response ID and request.
 func NewLocal(model openresponses.Streamer, opts ...Option) *Transform {
 	t := newTransform(opts)
 	t.fold = func(ctx context.Context, input openresponses.Items) (folded, error) {
-		store := false
-		req := openresponses.Request{
-			Model: t.model,
-			Input: append(append(openresponses.Items(nil), input...), openresponses.UserText(t.prompt)),
-			Store: &store,
+		f, err := t.summarize(ctx, model, input)
+		if errors.Is(err, errNoText) {
+			f, err = t.summarize(ctx, model, input)
 		}
-		resp, err := openresponses.CollectStream(ctx, model, req)
-		if err != nil {
-			return folded{}, fmt.Errorf("compact: summary: %w", err)
-		}
-		if resp.Status == openresponses.ResponseStatusFailed {
-			if resp.Error != nil {
-				return folded{}, fmt.Errorf("compact: summary: %w", resp.Error.Err(0))
-			}
-			return folded{}, errors.New("compact: summary response failed")
-		}
-		summary := strings.TrimSpace(resp.OutputText())
-		if summary == "" {
-			return folded{}, errors.New("compact: summary response has no text")
-		}
-		item := t.summaryItem(summary)
-		return folded{output: openresponses.Items{item}, summary: item, usage: resp.Usage, responseID: resp.ID, request: &req}, nil
+		return f, err
 	}
 	return t
+}
+
+// errNoText is the error of a summary response with no text, which
+// [NewLocal] asks again once.
+var errNoText = errors.New("compact: summary response has no text")
+
+// summarize asks model once for a summary of input.
+func (t *Transform) summarize(ctx context.Context, model openresponses.Streamer, input openresponses.Items) (folded, error) {
+	store := false
+	req := openresponses.Request{
+		Model: t.model,
+		Input: append(append(openresponses.Items(nil), input...), openresponses.UserText(t.prompt)),
+		Store: &store,
+	}
+	if t.request != nil {
+		t.request(&req)
+	}
+	resp, err := openresponses.CollectStream(ctx, model, req)
+	if err != nil {
+		return folded{}, fmt.Errorf("compact: summary: %w", err)
+	}
+	if resp.Status == openresponses.ResponseStatusFailed {
+		if resp.Error != nil {
+			return folded{}, fmt.Errorf("compact: summary: %w", resp.Error.Err(0))
+		}
+		return folded{}, errors.New("compact: summary response failed")
+	}
+	summary := strings.TrimSpace(resp.OutputText())
+	if summary == "" {
+		return folded{}, errNoText
+	}
+	item := t.summaryItem(summary)
+	return folded{output: openresponses.Items{item}, summary: item, usage: resp.Usage, responseID: resp.ID, request: &req}, nil
 }
 
 func newTransform(opts []Option) *Transform {
