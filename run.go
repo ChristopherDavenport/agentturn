@@ -349,6 +349,10 @@ type runner struct {
 	// deferred holds the IDs of the calls a hook handed to the caller
 	// during this run, so the run end can say why they are pending.
 	deferred map[string]bool
+	// undispatched holds the IDs of the calls whose tool_dispatch a
+	// subscriber refused, so the run end can say their tools never ran.
+	// It is written on the loop's goroutine as the batch is drained.
+	undispatched map[string]bool
 
 	// held are the completed items of the attempt in flight that the
 	// transcript does not have yet, because nothing has committed the
@@ -483,6 +487,8 @@ func (r *runner) pending() []PendingCall {
 		switch {
 		case r.deferred[call.CallID]:
 			reason = PendingDeferred
+		case r.undispatched[call.CallID]:
+			reason = PendingUndispatched
 		case mine[call]:
 			reason = PendingAborted
 		}
@@ -992,6 +998,9 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 // runs another of the turn's tools through the loop.
 func (r *runner) toolContext(ctx context.Context, tools agenttool.Set) context.Context {
 	ctx = ContextWithTranscript(ctx, append(Transcript(nil), r.transcript...))
+	if r.cfg.ToolElicitor != nil {
+		ctx = agenttool.ContextWithElicitor(ctx, r.cfg.ToolElicitor)
+	}
 	// The turn is taken here, on the loop's goroutine: a tool that
 	// keeps its context past its batch and invokes from a goroutine of
 	// its own must not read a turn the loop is writing.
@@ -1139,6 +1148,9 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 	for ev := range exec.Execute(bctx, jobs) {
 		p := batch[jobIndex[ev.Index]]
 		if failed != nil {
+			if ev.Final && p.dispatchErr != nil {
+				r.markUndispatched(p)
+			}
 			if !ev.Final || isCancellation(ev.Err, bctx) || hookFailed || p.dispatchErr != nil {
 				// Cut, or nothing to end yet: failBatch ends what
 				// has not ended once the drain is over.
@@ -1162,6 +1174,7 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 				// did not run; that is the run's failure, not the
 				// call's result, and the batch is drained and cut as
 				// for any delivery failure.
+				r.markUndispatched(p)
 				failed = p.dispatchErr
 				cancel(failed)
 				continue
@@ -1192,6 +1205,15 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 		return stop(ReasonAborted, context.Cause(ctx))
 	}
 	return nil
+}
+
+// markUndispatched remembers that p's tool_dispatch was refused, so its
+// tool never ran.
+func (r *runner) markUndispatched(p *callState) {
+	if r.undispatched == nil {
+		r.undispatched = map[string]bool{}
+	}
+	r.undispatched[p.call.CallID] = true
 }
 
 // isCancellation reports whether err is the cancellation of ctx, or its

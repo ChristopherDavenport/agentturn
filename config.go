@@ -160,6 +160,15 @@ type Config struct {
 	// recorder already on the run's context in place and installs
 	// nothing else, so under nil a tool's WriteRecord is a no-op.
 	ToolRecorder agenttool.RecordFunc
+	// ToolElicitor, when set, is installed on the context of every tool
+	// call with agenttool.ContextWithElicitor, so a question a tool asks
+	// the user mid-call, an MCP server's elicitation through mcpclient
+	// among them, reaches the host with the call on its context. A
+	// session recorder wraps one with session.Recorder.Elicitor so the
+	// question and the answer are written under the call. nil leaves an
+	// elicitor already on the run's context in place, and a tool with
+	// none asks nobody.
+	ToolElicitor agenttool.Elicitor
 	// MaxTurns stops a run after this many turns with ReasonStopped;
 	// zero means no limit.
 	MaxTurns int
@@ -262,7 +271,8 @@ type Retry struct {
 	// The revised request is on the [ModelRetry] event, and a session
 	// recorder takes its settings, so a fallback to another model is a
 	// config delta on the path and the record names the model that
-	// answered rather than the one that did not. A fallback chain
+	// answered rather than the one that did not, and writes a record of
+	// every attempt that failed. A fallback chain
 	// written as a Streamer under the loop still works and still says
 	// nothing.
 	Revise func(attempt int, req *openresponses.Request, err error) *openresponses.Request

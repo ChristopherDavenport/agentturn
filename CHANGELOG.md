@@ -34,6 +34,66 @@ versions may break the API.
   text, once. It applies to the recorder's own session. Without the option nothing
   changes. RFC 0001 draft 0.2 resolves its open question on
   instructions as parts. (#114, #121, #129, #90)
+- **Breaking, in what is recorded.** The recorder writes more of what
+  the loop knows, and every addition is an entry or a member a reader
+  written against 0.5 ignores; nothing already written changes its
+  hash, and no `ref` changes except a guard's.
+  - An allowed call whose decision gave a reason, the grant that
+    allowed it, is a `proceed` decision carrying the reason. A hook
+    that returns nil or no reason writes nothing, as before. (#130)
+  - A guard's stop writes the run end's `ref` as the cause followed by
+    the guard's error, `guard: <error>`, where it was `guard` alone and
+    the error was lost. The other causes are unchanged. (#110)
+  - Every failed model attempt that is tried again is a custom entry in
+    `agentturn:model_retry` (`session.ModelRetryNS`): the attempt, the
+    error, the delay, the failed attempt's model and whether
+    `Retry.Revise` changed the request. It precedes the response of the
+    attempt that answered and holds no item and no setting, so an
+    exporter can count a turn's calls; agentsession's exporter reading
+    it for `llm_call_count` is filed there. (#117)
+  - A configuration that changed since the last run, through
+    `Agent.SetConfig`, is settled at `run_start`, before any item of the
+    run, so what the new configuration's `BeforeTurn` appends is filed
+    under it. A configuration that did not change writes nothing there,
+    even when a hook edits the request every turn, and `turn_start`
+    still settles the request as sent. The first run of a resumed
+    recorder has no last configuration to compare with and settles at
+    `turn_start`, as before. (#109)
+  - `WithEnv` compares entries with the members the library does not
+    define, so a container restart named in one is written; an
+    unchanged environment still writes nothing. (#128)
+  - The run start carries the trigger in its parts as `trigger`, beside
+    the joined `ref`, which is unchanged. `agentturn.Trigger` gains
+    `Source`, the layer that took the input, which the joined string
+    leaves out. (agentsession #82)
+  - A custom entry a tool's record, a recordable details value or a
+    nested call writes carries `call_id`: the call on the tool's
+    context, or for a nested call the call whose tool made it, and
+    nothing when the session does not hold the call, as for a child
+    run's context, which carries its parent's call. The records of a
+    parallel batch now say whose each is. (agentsession #87)
+- `Recorder.Annotate` returns the ID of the entry it wrote, and
+  `Recorder.EntryOf(ctx, item)` returns the entry of an item the
+  recorder wrote, so a checkpoint does not depend on subscriber order.
+  **Breaking**: `Annotate` returned only an error; a caller that
+  ignored the ID writes `_, err :=`. (#124)
+- `Config.ToolElicitor` installs an `agenttool.Elicitor` on every tool
+  call's context, and `session.Recorder.Elicitor(by, fn)` wraps one so
+  a question a tool asks the user mid-call, an MCP server's elicitation
+  through mcpclient among them, is written as a custom entry in
+  `agentturn:elicitation` under the call, with the message, the schema
+  or URL, the action, the content and who answered, before the answer
+  returns to the tool. A nil `fn` answers `cancel`, since nobody was
+  asked. (agenttool #48)
+- A call whose `tool_dispatch` a subscriber refused is pending as
+  `PendingUndispatched`, since the loop knows its tool never ran, where
+  it read `aborted`, "may have run". The docs of `ToolDispatch`,
+  `Recorder.Attach` and RFC 0001's `tool_dispatch` row say a subscriber
+  that vetoes a dispatch is registered before the recorder. A `reject`
+  that withdraws a written dispatch waits on agentsession's RFC and is
+  an open question. (#119)
+- RFC 0001's open question on a `proceed` with no `dispatch` is
+  resolved by agentsession #78: the format admits it.
 
 ## v0.0.9 - 2026-09-28
 

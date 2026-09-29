@@ -119,7 +119,9 @@ func TestToolDispatchFailureStopsTheCall(t *testing.T) {
 	if starts, ends, unpaired := pairing(events); starts != 1 || ends != 1 || len(unpaired) != 0 {
 		t.Errorf("pairing: starts=%d ends=%d unpaired=%v", starts, ends, unpaired)
 	}
-	if len(end.Pending) != 1 || end.Pending[0].Reason != PendingAborted {
+	// The loop knows the tool never ran, which aborted, "may have run",
+	// would not say.
+	if len(end.Pending) != 1 || end.Pending[0].Reason != PendingUndispatched {
 		t.Errorf("pending: %v", pendingReasons(end))
 	}
 }
