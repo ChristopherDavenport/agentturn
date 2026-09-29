@@ -185,6 +185,21 @@ versions may break the API.
   it: a job carries its call with `agenttool.WithCall` for the record
   to name it. The tool elicitor stays off, with the rest of what
   belongs to the batch. (#149)
+- `front/a2a.WithRecorderFor` records the runs a served agent makes.
+  The executor drives each task on an `agentturn.Agent` seeded with the
+  stored conversation, rather than on `agentturn.Run`, and hands that
+  agent, with the task's context ID, to the function before the run
+  starts; a host opens that conversation's session there, points
+  `Config.ToolRecorder` at it with `SetConfig`, attaches the recorder
+  and returns a context carrying the session ID. What it subscribes
+  sees every event in step with the run, so a call's dispatch is
+  written before the tool runs and a tool's record lands under its
+  call, and a failure to open the record or to write an event fails the
+  task. `agentturn.Run` runs ahead of its consumer, which a recorder
+  cannot follow. The executor now runs one task per context ID at a
+  time: a second message on a busy context waits for the first rather
+  than running on the transcript it has not saved, which lost one of
+  the two turns. (#141)
 
 ## v0.0.10 - 2026-09-28
 

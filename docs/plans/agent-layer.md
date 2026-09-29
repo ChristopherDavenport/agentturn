@@ -393,7 +393,9 @@ behind the same hook.
 - `front/a2a`: the A2A bridge. Owns a conversation store
   keyed by A2A context ID, an artifact writer that coalesces text deltas,
   the local-versus-caller tool split with input-required as the boundary,
-  and a cancel registry. Only package that imports a2a-go.
+  a cancel registry, and a per-conversation hook that attaches a
+  recorder to the agent driving each task. Only package that imports
+  a2a-go.
 - TUI and chat channels: consume `Subscribe`, feed `Prompt`, `Steer`,
   `FollowUp`.
 

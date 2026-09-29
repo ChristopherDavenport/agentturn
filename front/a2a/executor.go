@@ -23,9 +23,21 @@ type Executor struct {
 	store       ConversationStore
 	chunkSize   int
 	callerTools []*openresponses.FunctionTool
+	recorderFor RecorderFor
 
 	mu      sync.Mutex
 	cancels map[a2a.TaskID]context.CancelFunc
+	// convs holds the lock of each conversation with a task in flight
+	// or waiting, so one context ID runs one task at a time.
+	convs map[string]*convLock
+}
+
+// convLock serialises the tasks of one conversation; waiters counts
+// the tasks holding or waiting for it, so the entry goes when the last
+// one leaves.
+type convLock struct {
+	held    chan struct{}
+	waiters int
 }
 
 var _ a2asrv.AgentExecutor = (*Executor)(nil)
@@ -50,9 +62,49 @@ func WithCallerTools(tools ...*openresponses.FunctionTool) Option {
 	return func(e *Executor) { e.callerTools = append(e.callerTools, tools...) }
 }
 
+// RecorderFor attaches what records one conversation's runs to the
+// agent that drives a task in it, before the task's run starts. The
+// executor calls it for every task with the task's context ID and a
+// fresh agent seeded with the stored transcript and configured with
+// the run's configuration, the caller-owned tools and the hook that
+// defers them included. What it subscribes to that agent is called
+// with every event of the run, synchronously and before the executor
+// relays the event, so a recorder writes a call's dispatch before the
+// tool runs and a subscriber error ends the run with ReasonError,
+// which fails the task. It may replace the agent's configuration with
+// SetConfig, to route Config.ToolRecorder to the conversation's
+// record, and it returns the context the run is prompted with, derived
+// from ctx, which carries whatever the tools and child runs read to
+// attribute their writes, and a detach function the executor calls
+// when the task's run is over; detach may be nil. An error fails the
+// task before the run starts.
+//
+// A host records each conversation as its own session with the
+// session module, which this one does not import:
+//
+//	a2a.WithRecorderFor(func(ctx context.Context, contextID string, a *agentturn.Agent) (context.Context, func(), error) {
+//		rec, err := openRecorder(ctx, store, contextID) // session.Start or session.Resume
+//		if err != nil {
+//			return nil, nil, err
+//		}
+//		cfg := a.Config()
+//		cfg.ToolRecorder = rec.RecordFunc()
+//		if err := a.SetConfig(cfg); err != nil {
+//			return nil, nil, err
+//		}
+//		return session.ContextWithSessionID(ctx, rec.SessionID()), rec.Attach(a), nil
+//	})
+type RecorderFor func(ctx context.Context, contextID string, a *agentturn.Agent) (context.Context, func(), error)
+
+// WithRecorderFor records every conversation the executor serves
+// through fn.
+func WithRecorderFor(fn RecorderFor) Option {
+	return func(e *Executor) { e.recorderFor = fn }
+}
+
 // New builds an executor for cfg.
 func New(cfg agentturn.Config, opts ...Option) *Executor {
-	e := &Executor{cfg: cfg, cancels: map[a2a.TaskID]context.CancelFunc{}}
+	e := &Executor{cfg: cfg, cancels: map[a2a.TaskID]context.CancelFunc{}, convs: map[string]*convLock{}}
 	for _, opt := range opts {
 		opt(e)
 	}
@@ -81,6 +133,15 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	if err != nil {
 		return fmt.Errorf("%w: %w", a2a.ErrInvalidParams, err)
 	}
+	// The conversation is loaded, run and saved under its lock: a
+	// second task on the same context ID would otherwise run on a
+	// stale transcript, one save would drop the other's turn, and two
+	// recorders would write one record at once.
+	unlock, err := e.lockConversation(ctx, reqCtx.ContextID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	transcript, err := e.store.Load(ctx, reqCtx.ContextID)
 	if err != nil {
 		return fmt.Errorf("load conversation %q: %w", reqCtx.ContextID, err)
@@ -95,14 +156,21 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer e.track(reqCtx.TaskID, cancel)()
+	agent := agentturn.New(e.runConfig(slices.Concat(e.callerTools, declared)), agentturn.WithTranscript(transcript))
+	if e.recorderFor != nil {
+		rctx, detach, err := e.recorderFor(runCtx, reqCtx.ContextID, agent)
+		if err != nil {
+			return fmt.Errorf("record conversation %q: %w", reqCtx.ContextID, err)
+		}
+		if detach != nil {
+			defer detach()
+		}
+		runCtx = rctx
+	}
 	if err := q.Write(ctx, a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateWorking, nil)); err != nil {
 		return err
 	}
-	cfg := e.runConfig(slices.Concat(e.callerTools, declared))
-	out := e.relay(ctx, runCtx, cancel, reqCtx, q, transcript, prompts, cfg)
-	if out.end == nil {
-		return errors.New("run produced no run_end")
-	}
+	out := e.relay(ctx, runCtx, cancel, reqCtx, q, agent, prompts)
 	if err := e.persist(ctx, reqCtx.ContextID, transcript, out.end); err != nil {
 		return err
 	}
@@ -132,6 +200,39 @@ func (e *Executor) track(id a2a.TaskID, cancel context.CancelFunc) func() {
 	}
 }
 
+// lockConversation waits for the conversation's lock, or for ctx, and
+// returns the function that releases it.
+func (e *Executor) lockConversation(ctx context.Context, contextID string) (func(), error) {
+	e.mu.Lock()
+	if e.convs == nil {
+		e.convs = map[string]*convLock{}
+	}
+	l := e.convs[contextID]
+	if l == nil {
+		l = &convLock{held: make(chan struct{}, 1)}
+		e.convs[contextID] = l
+	}
+	l.waiters++
+	e.mu.Unlock()
+	leave := func() {
+		e.mu.Lock()
+		if l.waiters--; l.waiters == 0 {
+			delete(e.convs, contextID)
+		}
+		e.mu.Unlock()
+	}
+	select {
+	case l.held <- struct{}{}:
+	case <-ctx.Done():
+		leave()
+		return nil, ctx.Err()
+	}
+	return func() {
+		<-l.held
+		leave()
+	}, nil
+}
+
 // outcome is what relay reports about a run.
 type outcome struct {
 	end      *agentturn.RunEnd
@@ -141,10 +242,11 @@ type outcome struct {
 	writeErr error
 }
 
-// relay drives the loop and streams assistant text into artifacts. A
-// failed write aborts the run through cancel and is reported on the
-// outcome; the run's own end and error are reported alongside.
-func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc, reqCtx *a2asrv.RequestContext, q eventqueue.Queue, transcript agentturn.Transcript, prompts openresponses.Items, cfg agentturn.Config) outcome {
+// relay prompts the agent and streams assistant text into artifacts
+// from a subscriber, after whatever RecorderFor subscribed. A failed
+// write aborts the run through cancel and is reported on the outcome;
+// the run's own end and error are reported alongside.
+func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc, reqCtx *a2asrv.RequestContext, q eventqueue.Queue, agent *agentturn.Agent, prompts openresponses.Items) outcome {
 	var out outcome
 	var writer *artifactWriter
 	fail := func(err error) {
@@ -153,7 +255,7 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 		}
 		cancel()
 	}
-	for ev := range agentturn.Run(runCtx, transcript, prompts, cfg) {
+	unsubscribe := agent.Subscribe(func(_ context.Context, ev agentturn.Event) error {
 		switch ev := ev.(type) {
 		case *agentturn.ItemStart:
 			if m, ok := ev.Item.(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant {
@@ -161,7 +263,7 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 			}
 		case *agentturn.ItemUpdate:
 			if writer == nil {
-				continue
+				return nil
 			}
 			var delta string
 			switch s := ev.Stream.(type) {
@@ -183,10 +285,17 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 				}
 				writer = nil
 			}
-		case *agentturn.RunEnd:
-			out.end = ev
 		}
+		return nil
+	})
+	defer unsubscribe()
+	end, err := agent.Prompt(runCtx, prompts...)
+	if end == nil {
+		// The run never started: a misuse the loop refused before any
+		// event, which fails the task as a run would.
+		end = &agentturn.RunEnd{Reason: agentturn.ReasonError, Err: err}
 	}
+	out.end = end
 	return out
 }
 

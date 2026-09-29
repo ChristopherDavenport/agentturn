@@ -5,8 +5,8 @@
 // A2A be a component of another agent and the reverse.
 //
 // [Executor] implements a2asrv.AgentExecutor. Each message/send runs the
-// loop once with agentturn.Run on the transcript stored for the message's
-// context ID, streams assistant text as artifact chunks, and ends the
+// loop once, on an agentturn.Agent seeded with the transcript stored for
+// the message's context ID, streams assistant text as artifact chunks, and ends the
 // task from the run's reason: completed, canceled, failed or, when the
 // model called a tool the caller owns, input-required with the pending
 // function_call items on the status message. A run a guard stopped
@@ -36,4 +36,15 @@
 // package documents for an input-required boundary. A2A's
 // input-required state and agentturn's ReasonInputRequired are the
 // same thing seen from the two sides.
+//
+// # Recording
+//
+// [WithRecorderFor] attaches a record to each conversation: it is
+// handed every task's agent, with the context ID, before the run
+// starts, and subscribes what writes the conversation's session. The
+// subscriber sees every event in step with the run, before the
+// executor relays it, and its failure fails the task. The executor
+// runs one task per context ID at a time, so a conversation's store
+// and its record never see two runs at once; a second message on a
+// busy context waits for the first task to end.
 package a2a
