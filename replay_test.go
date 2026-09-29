@@ -355,3 +355,63 @@ func TestSameArgs(t *testing.T) {
 		}
 	}
 }
+
+// TestResumePutsNeverStartedCallsToTheHook pins #159: nothing decided
+// a call that never started, so its approval goes through
+// BeforeToolCall, and a Block or a Defer applies as it would in a run;
+// a held call's approval is the decision and skips the hook; and a
+// call a record refused before its output takes only that output.
+func TestResumePutsNeverStartedCallsToTheHook(t *testing.T) {
+	call := &openresponses.FunctionCall{CallID: "call_1", Name: "act", Arguments: `{"text":"t"}`}
+	cases := []struct {
+		name     string
+		reason   PendingReason
+		decision *ToolDecision
+		wantErr  error
+		// wantHook says BeforeToolCall was asked; wantRuns is how many
+		// times the tool ran; wantEnd the reason the run ended with.
+		wantHook bool
+		wantRuns int
+		wantEnd  Reason
+	}{
+		{name: "never started, allowed", reason: PendingUndispatched, wantHook: true, wantRuns: 1, wantEnd: ReasonDone},
+		{name: "never started, blocked", reason: PendingUndispatched, decision: &ToolDecision{Action: Block, Reason: "denied by rm"},
+			wantHook: true, wantEnd: ReasonDone},
+		{name: "never started, deferred", reason: PendingUndispatched, decision: &ToolDecision{Action: Defer},
+			wantHook: true, wantEnd: ReasonInputRequired},
+		{name: "held", reason: PendingDeferred, decision: &ToolDecision{Action: Block}, wantRuns: 1, wantEnd: ReasonDone},
+		{name: "rejected", reason: PendingRejected, wantErr: ErrCallAnswered},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			k := &keyedTool{}
+			asked := false
+			a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{k.tool(agenttool.ReplayUnknown)},
+				BeforeToolCall: func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
+					asked = info.Call.CallID == call.CallID
+					return tc.decision, nil
+				}},
+				WithTranscript(Transcript{openresponses.UserText("go"), call}),
+				WithPending([]PendingCall{{Call: call, Reason: tc.reason}}))
+			end, err := a.Resume(context.Background(), Approve(call.CallID))
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("resume: err = %v, want %v", err, tc.wantErr)
+			}
+			if asked != tc.wantHook || len(k.keys) != tc.wantRuns {
+				t.Errorf("hook asked %v, ran %d; want %v, %d", asked, len(k.keys), tc.wantHook, tc.wantRuns)
+			}
+			if tc.wantErr != nil {
+				if _, err := a.Resume(context.Background(), Output(&openresponses.FunctionCallOutput{CallID: call.CallID, Output: openresponses.FunctionCallOutputData{Text: "denied"}})); err != nil {
+					t.Fatalf("its output: %v", err)
+				}
+				return
+			}
+			if end.Reason != tc.wantEnd {
+				t.Errorf("end = %+v, want %s", end, tc.wantEnd)
+			}
+			if tc.wantEnd == ReasonInputRequired && (len(end.Pending) != 1 || end.Pending[0].Reason != PendingDeferred) {
+				t.Errorf("pending = %+v, want it deferred", end.Pending)
+			}
+		})
+	}
+}

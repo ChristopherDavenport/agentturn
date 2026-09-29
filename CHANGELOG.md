@@ -71,6 +71,17 @@ versions may break the API.
   the last output of a call whose result set `Terminate`, where
   both fronts completed with no answer: an empty response, or a task
   with no message. (#163)
+- Breaking: `Agent.Resume` puts an approval of a call pending as
+  `PendingUndispatched` to `Config.BeforeToolCall`, since nothing has
+  decided it, and a Block or a Defer applies as it would in a run: a
+  deferred call ends the run with `input_required`. A call that never
+  started used to run with the hook skipped, so `session.ReplayAnswers`
+  followed by a resume ran, after a restart, exactly the calls the
+  policy had not yet allowed. A call a record refused and stopped
+  before the refusal's output is pending as the new `PendingRejected`
+  rather than as never started: it takes only an output, an approval
+  returns `ErrCallAnswered`, and `session.ReplayAnswers` answers it
+  with the reject's reason. (#159)
 
 ## v0.0.11 - 2026-09-29
 

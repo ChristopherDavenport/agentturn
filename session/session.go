@@ -925,6 +925,8 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // may have run and is [agentturn.PendingAborted]; one an answer
 // decision ended before its output was written is
 // [agentturn.PendingAnswered], owed that output and nothing else; one
+// a reject decision refused before its output was written is
+// [agentturn.PendingRejected], owed that refusal and nothing else; one
 // with no dispatch, when the header promises dispatch records, never
 // started and is [agentturn.PendingUndispatched]; and one the file
 // cannot say about is [agentturn.PendingUnknown]. A call that may have
@@ -954,6 +956,11 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 			p.Reason = agentturn.PendingAnswered
 		case agentsession.CallNeverStarted:
 			p.Reason = agentturn.PendingUndispatched
+		}
+		if (p.Reason == agentturn.PendingUndispatched || p.Reason == agentturn.PendingUnknown) && c.Rejected() {
+			// A reject ended the call before its tool, and the record
+			// stopped before the refusal's output.
+			p.Reason = agentturn.PendingRejected
 		}
 		var args string
 		switch {
@@ -991,7 +998,11 @@ func AgentOptions(s *agentsession.Session) ([]agentturn.Option, error) {
 // ReplayAnswers applies agenttool's rule for running a call again to
 // the calls pending at the session's leaf, and returns an answer for
 // each that is not held, by policy, in the order of the path. A call
-// that never started is approved. A call that may have run, in flight
+// that never started is approved, and Agent.Resume puts that approval
+// to the agent's BeforeToolCall, since nothing has decided the call:
+// the policy still rules on it. A call a reject decision refused
+// before its output was written is answered with the reject's reason
+// as its output, the refusal it is owed. A call that may have run, in flight
 // when the record stopped or one the file cannot say about, is
 // ambiguous: it is approved when its tool, looked up in tools by name,
 // says replay is safe for the arguments its last dispatch ran with,
@@ -1028,12 +1039,38 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 			ans = agentturn.Approve(id)
 		case agentturn.PendingAnswered:
 			ans = agentturn.OutcomeUnknown(id)
+		case agentturn.PendingRejected:
+			reason, err := refusal(s, id)
+			if err != nil {
+				return nil, err
+			}
+			ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Output: openresponses.FunctionCallOutputData{Text: reason}})
 		default:
 			ans = replayAnswer(ctx, set, p)
 		}
 		out = append(out, ans.WithBy(agentsession.ByPolicy))
 	}
 	return out, nil
+}
+
+// refusal is the reason of the last reject decision the session's
+// path holds for the call.
+func refusal(s *agentsession.Session, callID string) (string, error) {
+	calls, err := s.PendingCalls(s.Leaf())
+	if err != nil {
+		return "", fmt.Errorf("session: pending calls at leaf: %w", err)
+	}
+	for _, c := range calls {
+		if c.Call.CallID != callID {
+			continue
+		}
+		for i := len(c.Decisions) - 1; i >= 0; i-- {
+			if c.Decisions[i].Verdict == agentsession.VerdictReject {
+				return c.Decisions[i].Reason, nil
+			}
+		}
+	}
+	return "", nil
 }
 
 // replayAnswer is the answer to one call that may have run.

@@ -510,7 +510,9 @@ const (
 	// so the tool did not run: a subscriber refused its tool_dispatch,
 	// or the run was aborted or failed before the call's turn. A
 	// recorder registered before a subscriber that refused has already
-	// written the dispatch; see [ToolDispatch].
+	// written the dispatch; see [ToolDispatch]. Nothing has decided to
+	// run it, so an approval of it through [Agent.Resume] is put to
+	// BeforeToolCall as the call would be in a run.
 	PendingUndispatched PendingReason = "undispatched"
 	// PendingUnknown: the call was found without an output in a
 	// transcript the agent was seeded with, so the loop cannot say
@@ -524,6 +526,14 @@ const (
 	// approval with [ErrCallAnswered]. Only [WithPending] and
 	// [Agent.SetPending] give it; a live run never leaves one.
 	PendingAnswered PendingReason = "answered"
+	// PendingRejected: a record says a decision refused the call before
+	// it reached its tool, and stopped before the refusal's output: a
+	// crash between the two. The tool did not run, and the call is owed
+	// that refusal as its output and nothing else, so [Agent.Resume]
+	// answers it only with an output and refuses an approval with
+	// [ErrCallAnswered]. Only [WithPending] and [Agent.SetPending] give
+	// it; a live run never leaves one.
+	PendingRejected PendingReason = "rejected"
 )
 
 // PendingCall is a function call with no output and the reason it has
@@ -561,7 +571,8 @@ type PendingCall struct {
 // it is held to agenttool's replay rule: it is pending as
 // [PendingAborted] or [PendingUnknown], or deferred after it was
 // dispatched. A call pending as [PendingAnswered] may have run too,
-// but it is owed an output and no approval.
+// but it is owed an output and no approval, as one pending as
+// [PendingRejected] is.
 func (p PendingCall) MayHaveRun() bool {
 	return p.Reason == PendingAborted || p.Reason == PendingUnknown || p.Reason == PendingDeferred && p.Dispatched
 }

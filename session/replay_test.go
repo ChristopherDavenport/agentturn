@@ -171,8 +171,9 @@ func TestReplayAfterACrash(t *testing.T) {
 
 // TestReplayAnswersEachState checks the rule for each state a pending
 // call can be in, on a session written by hand: a call that never
-// started is approved, a held one is left to the caller, and one that
-// may have run is approved only as its tool's replay allows.
+// started is approved, a held one is left to the caller, one refused
+// before its output is owed that refusal (#159), and one that may have
+// run is approved only as its tool's replay allows.
 func TestReplayAnswersEachState(t *testing.T) {
 	replayTool := func(name string, replay agenttool.Replay) agenttool.Tool {
 		return agenttool.New(name, "", func(context.Context, echoArgs) (string, error) { return "", nil },
@@ -224,6 +225,16 @@ func TestReplayAnswersEachState(t *testing.T) {
 				return append(dispatched("k1")(id, target),
 					agentsession.NewDecision(id, target, agentsession.VerdictProceed, agentsession.ByHuman).WithArgs(json.RawMessage(`{"text":"rewritten"}`)))
 			}},
+		{name: "rejected, refusal owed", tool: "unknown", want: "refusal", state: func(id, target string) []agentsession.Entry {
+			return []agentsession.Entry{agentsession.NewDecision(id, target, agentsession.VerdictReject, agentsession.ByPolicy).WithReason("denied by rm")}
+		}},
+		{name: "held then rejected, refusal owed", tool: "unknown", want: "refusal", state: func(id, target string) []agentsession.Entry {
+			return []agentsession.Entry{agentsession.NewDecision(id, target, agentsession.VerdictHold, agentsession.ByPolicy),
+				agentsession.NewDecision(id, target, agentsession.VerdictReject, agentsession.ByHuman).WithReason("denied by rm")}
+		}},
+		{name: "no records, rejected", tool: "unknown", records: []string{}, want: "refusal", state: func(id, target string) []agentsession.Entry {
+			return []agentsession.Entry{agentsession.NewDecision(id, target, agentsession.VerdictReject, agentsession.ByPolicy).WithReason("denied by rm")}
+		}},
 		{name: "no records, safe", tool: "safe", records: []string{}, want: "approve"},
 		{name: "no records, unknown", tool: "unknown", records: []string{}, want: "unknown"},
 	}
@@ -258,7 +269,15 @@ func TestReplayAnswersEachState(t *testing.T) {
 			got := "none"
 			if len(answers) == 1 {
 				got = "approve"
-				if answers[0].Output != nil {
+				switch out := answers[0].Output; {
+				case out != nil && answers[0].Reason == "":
+					// An output with no reason is the refusal the
+					// record holds, and nothing else.
+					got = "refusal"
+					if out.Output.Text != "denied by rm" {
+						t.Errorf("refusal output %q", out.Output.Text)
+					}
+				case out != nil:
 					got = "unknown"
 				}
 				if answers[0].IdempotencyKey != tc.wantKey || answers[0].By != agentsession.ByPolicy || string(answers[0].Args) != tc.wantArgs {
@@ -295,13 +314,20 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 	answered := func(id, target string) []agentsession.Entry {
 		return append(dispatched("k1")(id, target), agentsession.NewDecision(id, target, agentsession.VerdictAnswer, agentsession.ByPolicy).WithReason("not run again: replay unknown"))
 	}
+	rejected := func(id, target string) []agentsession.Entry {
+		return []agentsession.Entry{agentsession.NewDecision(id, target, agentsession.VerdictReject, agentsession.ByPolicy).WithReason("denied by rm")}
+	}
 	cases := []struct {
 		name   string
 		replay agenttool.Replay
 		state  func(callID, target string) []agentsession.Entry
 		// want is the reason Pending gives the call.
-		want       agentturn.PendingReason
-		answer     func(callID string) agentturn.Answer
+		want   agentturn.PendingReason
+		answer func(callID string) agentturn.Answer
+		// replayed answers with what ReplayAnswers gives instead, and
+		// block has BeforeToolCall block every call.
+		replayed   bool
+		block      bool
 		wantErr    error
 		wantRuns   int
 		wantRecord []string
@@ -323,6 +349,14 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 		{name: "answered, output", replay: agenttool.ReplaySafe, state: answered, want: agentturn.PendingAnswered,
 			answer:     agentturn.OutcomeUnknown,
 			wantRecord: []string{"dispatch", "answer", "output"}},
+		// #159: the policy rules on a call that never started, and a
+		// call it refused before the crash is owed that refusal.
+		{name: "never started, replayed, the policy blocks", replay: agenttool.ReplaySafe, want: agentturn.PendingUndispatched,
+			replayed: true, block: true, wantRecord: []string{"reject", "output"}},
+		{name: "rejected, approved", replay: agenttool.ReplaySafe, state: rejected, want: agentturn.PendingRejected,
+			answer: agentturn.Approve, wantErr: agentturn.ErrCallAnswered},
+		{name: "rejected, replayed", replay: agenttool.ReplaySafe, state: rejected, want: agentturn.PendingRejected,
+			replayed: true, wantRecord: []string{"reject", "output"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -347,9 +381,11 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, e := range tc.state(call.CallID, target) {
-				if _, err := store.Append(ctx, s.ID(), e); err != nil {
-					t.Fatal(err)
+			if tc.state != nil {
+				for _, e := range tc.state(call.CallID, target) {
+					if _, err := store.Append(ctx, s.ID(), e); err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
 
@@ -371,9 +407,23 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{charge}}, opts...)
+			cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{charge}}
+			if tc.block {
+				cfg.BeforeToolCall = func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+					return &agentturn.ToolDecision{Action: agentturn.Block, Reason: "denied by rm"}, nil
+				}
+			}
+			a := agentturn.New(cfg, opts...)
 			defer rec.Attach(a)()
-			_, err = a.Resume(ctx, tc.answer(call.CallID))
+			var answers []agentturn.Answer
+			if tc.replayed {
+				if answers, err = ReplayAnswers(ctx, s2, []agenttool.Tool{charge}); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				answers = []agentturn.Answer{tc.answer(call.CallID)}
+			}
+			_, err = a.Resume(ctx, answers...)
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("resume: err = %v, want %v", err, tc.wantErr)
 			}
@@ -411,7 +461,7 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 			}
 			// The decision the resume wrote says who answered and why;
 			// an answered call's is the one on the path already.
-			if want := tc.answer(call.CallID); tc.want == agentturn.PendingDeferred && (last.By != want.By || last.Reason != want.Reason) {
+			if want := answers[0]; tc.want == agentturn.PendingDeferred && (last.By != want.By || last.Reason != want.Reason) {
 				t.Errorf("%s by %q for %q, want by %q for %q", last.Verdict, last.By, last.Reason, want.By, want.Reason)
 			}
 			verifyAll(t, s2)

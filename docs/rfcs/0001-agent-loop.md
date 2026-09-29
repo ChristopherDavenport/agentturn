@@ -643,9 +643,10 @@ the tool it resolved to, so a prompt can show what it asks about:
 | --- | --- |
 | `deferred` | the decision hook handed the call to the caller in this run and nothing has answered it. The tool did not run. An agent seeded from a record that holds the call after its dispatch reports it `deferred` and **dispatched**: it waits on the caller, it may have run, and it is **ambiguous**, with the key and the arguments of that dispatch |
 | `aborted` | the call was handed to its tool, by this run or an earlier one, and the run was cancelled or failed before its output was appended. The tool may have run to completion, so its side effect may have happened: the call is **ambiguous**, and carries the idempotency key and the arguments of its last hand-off, the dispatch a run of it again repeats |
-| `undispatched` | the loop did not hand the call to its tool, so the tool did not run: a subscriber refused its `tool_dispatch`, or the cancellation or the failure reached it before its turn. A recorder that took the event before a subscriber that refused has already written the dispatch |
+| `undispatched` | the loop did not hand the call to its tool, so the tool did not run: a subscriber refused its `tool_dispatch`, or the cancellation or the failure reached it before its turn. A recorder that took the event before a subscriber that refused has already written the dispatch. Nothing has decided to run it, so an approval of it goes to the decision hook |
 | `unknown` | the call was in the transcript the run was given, so the loop cannot say whether it ran, and it is **ambiguous** as well. A session recorded with dispatch entries can say, and an agent seeded with what it says reports the reasons above instead |
 | `answered` | a record the agent was seeded with ends the call with an answer, the format's verdict for a call ended without running again, and stopped before the answer's output: the call is owed that output and nothing else. A live run never leaves one |
+| `rejected` | a record the agent was seeded with ends the call with a reject before it reached its tool, and stopped before the refusal's output: the tool did not run, and the call is owed that refusal and nothing else. A live run never leaves one |
 
 A call pending when the run started that the run did not hand to its
 tool keeps the reason, the key and the arguments it had, except that a
@@ -674,7 +675,7 @@ An **answer** names one pending call and is one of:
   given, else the one the pending call carries, that of the dispatch
   it repeats, else a new one, and with the arguments given, else the
   ones that dispatch ran with, else its own. A call pending as
-  `answered` takes no approval.
+  `answered` or `rejected` takes no approval.
 
 An answer MAY carry a **note**, what the person said when answering,
 **who decided** it in the session format's terms (`human`, `policy`,
@@ -697,7 +698,7 @@ the arguments of the dispatch it repeats or a key the answer chose,
 since a key names one operation; otherwise it refuses the resume and
 runs nothing, and the caller answers the call with an output saying
 the outcome is unknown. An approval of a call pending as `answered`
-is refused.
+or `rejected` is refused.
 The one way past the rule is an approval that says the host accepts
 running the call again, recorded as the proceed's reason. The resume
 then runs as follows, and its source is `resume`:
@@ -706,10 +707,15 @@ then runs as follows, and its source is `resume`:
 2. The outputs of the answers that carry one are appended with their
    item events, then the notes of those answers as user messages.
 3. The approved calls run as **one batch before the first turn**, with
-   the decision hook skipped because the decision has been made: every
+   the decision hook skipped because the decision has been made, except
+   for a call pending as `undispatched`: nothing decided it, so the hook
+   rules on it with the approved batch as its batch, and a block or a
+   deferral applies as it would in a run, a deferred call ending the run
+   with `input_required` once the batch is in. Every
    `tool_start` is raised first, in the order the answers name the
    calls, each carrying a decision holding the caller's arguments, note,
-   decider and reason and nothing else; the tool events carry turn 0; the
+   decider and reason and nothing else, or the hook's decision when it
+   gave one; the tool events carry turn 0; the
    execution mode and bound apply; the after-call hook runs; the
    outputs are appended in the order the answers name the calls, not
    in transcript order, and their notes after them as user messages.
@@ -736,7 +742,7 @@ function call without an output is pending with reason `unknown`, and
 the agent refuses to run until they are answered. A host SHOULD seed it
 as well with what a record says of them, the reason, the key and the
 arguments, so only a call that may have run is held to the replay rule
-and one that never started is approved as it is. Replacing the
+and one that never started is approved without it. Replacing the
 transcript re-derives them the same way, except that a call the agent
 already had pending keeps what it knew of it, so a held call stays
 held; the host seeds the rest again from the record. Whatever the old
@@ -746,7 +752,9 @@ forgotten.
 A host resuming a stored session gets the replay rule's answers from
 the record through the recorder's library: a held call is the
 caller's, one held after its dispatch included; one that never
-started is approved; one in flight, a `dispatch` and no output nor a
+started is approved, and the resume puts that approval to the
+decision hook; one a reject refused before its output was written is
+answered with the reject's reason as that output; one in flight, a `dispatch` and no output nor a
 later hold or answer, or one the file cannot say about, is ambiguous,
 and is approved when its tool says *safe*, or *keyed* and its last
 dispatch carries a key, which the approval carries with the arguments

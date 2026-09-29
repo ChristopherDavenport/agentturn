@@ -41,8 +41,9 @@ var (
 	// [Answer.WithRunAgain].
 	ErrAmbiguousCall = errors.New("agentturn: a call that may have run cannot run again")
 	// ErrCallAnswered is returned when Resume was asked to approve a
-	// call pending as [PendingAnswered]: a record answered it without
-	// running it again, and only its output may follow.
+	// call pending as [PendingAnswered] or [PendingRejected]: a record
+	// answered it without running it again, or refused it, and only its
+	// output may follow.
 	ErrCallAnswered = errors.New("agentturn: an answered call is owed its output and nothing else")
 )
 
@@ -513,14 +514,19 @@ func (a Answer) WithRunAgain() Answer {
 // and runs nothing. [Answer.WithRunAgain] is the only way past it. An
 // agent seeded with [WithPending] from a record knows which calls
 // never started, and those are not checked, and which were answered
-// without running again: those take an output, and an approval of one
-// returns [ErrCallAnswered].
+// or refused without running: those take an output, and an approval
+// of one returns [ErrCallAnswered].
 //
 // The outputs are appended with their item events first, then the
 // notes of the answers that carry one, as user messages. The approved
 // calls then run as one batch as the loop runs any batch, with
-// BeforeToolCall skipped because the decision has been made: tool_start,
-// tool_update and tool_end are emitted with Turn 0, Sequential and
+// BeforeToolCall skipped for a call the approval decides, one held or
+// one that may have run. A call pending as [PendingUndispatched] was
+// decided by nothing, so its approval is put to BeforeToolCall, with
+// the approved batch as the batch: a Block or a Defer applies as it
+// would in a run, and a call it defers leaves the run ending with
+// [ReasonInputRequired] once the batch is in. tool_start, tool_update
+// and tool_end are emitted with Turn 0, Sequential and
 // MaxParallelTools apply, AfterToolCall runs, the outputs are appended
 // in the calls' transcript order and their notes after them, and
 // anything steered in meanwhile follows. A batch whose results set
@@ -564,7 +570,7 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 			}
 			continue
 		}
-		if p.Reason == PendingAnswered {
+		if p.Reason == PendingAnswered || p.Reason == PendingRejected {
 			return nil, fmt.Errorf("%w: %q", ErrCallAnswered, ans.CallID)
 		}
 		key := ans.IdempotencyKey
@@ -588,7 +594,7 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 				return nil, err
 			}
 		}
-		approved = append(approved, approval{call: p.Call, args: args, note: ans.Note, by: ans.By, reason: reason, key: key})
+		approved = append(approved, approval{call: p.Call, args: args, note: ans.Note, by: ans.By, reason: reason, key: key, decide: p.Reason == PendingUndispatched})
 	}
 	if len(byID) > 0 {
 		return nil, fmt.Errorf("%w: %d pending call(s) unanswered", ErrNotPending, len(byID))
