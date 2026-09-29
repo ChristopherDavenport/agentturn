@@ -58,7 +58,7 @@
 //     they are composed of, a delta naming only the parts that moved,
 //     and what the host left out as instructions_omitted when it
 //     changed, since the list stays in force until a config changes
-//     it.
+//     it, each run of parts unchanged in it a keep.
 //   - model_retry: a custom entry in the [ModelRetryNS] namespace
 //     saying which attempt failed, why, how long the loop waited and
 //     whether Retry.Revise changed the request; and the settings of the
@@ -811,8 +811,13 @@ func WithEnv(fn func(context.Context) (*agentsession.EnvEntry, error)) Option {
 // config changes them, so they are written on a config entry only
 // when they differ from the list in force, on an entry of their own
 // when the settings did not move, and as an empty list when nothing is
-// omitted any more; a replace, which clears the list, carries it
-// whenever it is non-empty. A session written before
+// omitted any more. A delta writes the list as
+// [agentsession.Settings.OmittedDelta] does, each run of parts
+// unchanged and in the order they are in force a keep, so a part
+// crossing a memory's budget costs that part and not the list; a
+// replace, which clears the list, carries it whole whenever it is
+// non-empty, since a keep would count over the list it discards. A
+// session written before
 // the option was set has the joined string on its path, and the first
 // entry under the option carries the text of every part, once.
 func WithInstructionsParts(fn func(ctx context.Context, req openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart)) Option {
@@ -2327,28 +2332,30 @@ func (w *writer) settle(ctx context.Context, req openresponses.Request) error {
 	if err != nil {
 		return fmt.Errorf("session: %w", err)
 	}
-	omittedChanged := !bytes.Equal(omittedBody(omitted), omittedBody(w.settings.InstructionsOmitted))
+	// The list in force stays until a config changes it, so a delta
+	// carries only what moved, each run of parts unchanged a keep, and
+	// [] when it emptied.
+	omittedDelta := w.settings.OmittedDelta(omitted)
 	var entry *agentsession.ConfigEntry
 	switch {
 	case !w.wroteConfig:
 		entry = full
 	default:
 		entry = configDelta(w.settings, agentsession.Settings{}.Apply(full), full, parts)
-		if entry == nil && omittedChanged {
+		if entry == nil && omittedDelta != nil {
 			// Nothing in force moved, but what was left out did: the
 			// entry says so and changes no setting.
 			entry = &agentsession.ConfigEntry{}
 		}
 	}
 	if entry != nil {
-		// The list in force stays until a config changes it, so a
-		// delta carries it only when it changed, as [] when it
-		// emptied; a replace clears it unless it carries it.
+		// A replace clears the list unless it carries it, and carries
+		// it whole, since a keep counts over the list it discards.
 		switch {
 		case entry.Replace && len(omitted) > 0:
 			entry.InstructionsOmitted = omitted
-		case !entry.Replace && omittedChanged:
-			entry.InstructionsOmitted = append([]agentsession.OmittedPart{}, omitted...)
+		case !entry.Replace:
+			entry.InstructionsOmitted = omittedDelta
 		}
 		if _, err := w.append(ctx, entry); err != nil {
 			return err
@@ -2391,18 +2398,6 @@ func (w *writer) instructionParts(ctx context.Context, req openresponses.Request
 		}
 	}
 	return parts, named
-}
-
-// omittedBody encodes omitted parts for comparison, nil for none.
-func omittedBody(omitted []agentsession.OmittedPart) []byte {
-	if len(omitted) == 0 {
-		return nil
-	}
-	data, err := json.Marshal(omitted)
-	if err != nil {
-		return nil
-	}
-	return data
 }
 
 // item writes an item entry, or a custom entry for an item the model

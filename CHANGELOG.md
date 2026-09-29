@@ -10,6 +10,16 @@ versions may break the API.
 - Requires `agenttool` v0.0.11, up from v0.0.10, and `agentsession`
   v0.0.12, up from v0.0.11. The session recorder writes
   `agentsession/0.9`, and v0.0.11 of agentsession refuses a 0.9 file.
+- **The recorder writes the omitted list as keeps.** Under
+  `session.WithInstructionsParts`, a config delta that changes
+  `instructions_omitted` now writes it as `Settings.OmittedDelta`
+  returns it, each run of parts unchanged in the list in force a
+  `{"keep":n}`, where it wrote the list whole: under a memory at its
+  budget a save or a forget moved one part and rewrote hundreds. A
+  replace still carries the list whole, since a keep in a replace
+  counts over nothing and `Append` refuses it, and a resumed or folded
+  recorder counts from the list the context resolves. Needs format 0.9.
+  (agentsession #115)
 
 ## v0.0.11 - 2026-09-29
 
