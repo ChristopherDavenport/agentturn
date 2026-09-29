@@ -614,7 +614,8 @@ before the stop hook is asked and the stop hook before the terminate
 hint is read.
 
 A **pending call** is a function call in the transcript with no output,
-in transcript order, each with a reason:
+in transcript order, each with a reason and, for a call the run made,
+the tool it resolved to, so a prompt can show what it asks about:
 
 | pending reason | meaning |
 | --- | --- |
@@ -727,6 +728,22 @@ stream and the running tools through their contexts, as agenttool RFC
 - The queues are untouched: anything steered or queued and not yet
   appended goes to the next run.
 
+A tool call's own context ends with its batch. A tool that starts work
+meant to outlive the call, a task that returns at once and reports
+later, derives it from the **run context** the loop puts beside the
+call's: the values of the context the run was started with and the run
+ID, cancelled when the run is cancelled, with the cause, and not when
+the batch or the run ends by itself. Once the run has ended, cancelling
+the agent reaches its next run and not that work, which keeps a cancel
+of its own if it must be stopped later.
+
+A steer does not cancel a running tool. The loop puts beside each call
+a **steer signal** that is raised when an item is steered into the run,
+during the batch or before it and not yet drained; a tool that only
+waits listens for it and returns early with what it has, and the
+steered item joins the run after the batch as ever. The signal is fresh
+for each batch that follows a drain.
+
 Every event a cancellation leaves behind — the `tool_end` of each
 cut-off call, the appended outputs, the `run_end` — MUST be delivered
 to the consumer, and an agent MUST deliver it with a context whose
@@ -755,7 +772,7 @@ turn number. The catalogue, with the members beyond those two:
 | `tool_start` | `call_id`, `name`, `args`, `decision`, `parent` | after preflight, in the model's order |
 | `tool_dispatch` | `call_id`, `name`, `parent` | the call has been handed to its tool, before the tool runs; after its `tool_start` and before its `tool_end` |
 | `tool_update` | `call_id`, `name`, `partial` | a progress update from a running tool |
-| `tool_end` | `call_id`, `name`, `result`, `error`, `blocked`, `deferred`, `parent` | the call settled, in completion order |
+| `tool_end` | `call_id`, `name`, `result`, `error`, `blocked`, `deferred`, `reason`, `parent` | the call settled, in completion order; `reason` is the decision's for a blocked or deferred call |
 | `turn_end` | `response`, `tool_results` | after the batch's outputs are appended |
 | `run_end` | `items`, `reason`, `cause`, `error`, `pending` | last event of a run |
 | `queued` | `item`, `mode`, `hidden` | an item accepted into a queue; belongs to no run |
@@ -1047,6 +1064,13 @@ An agent stands in four places inside another system:
   level of nesting; a **spawn** callback hands the host the child's
   agent, keyed by the call, so a hub can steer it, cancel it without
   cutting its siblings, or prompt it again once the tool has returned.
+  A **detached** child is the background task: the call returns once
+  the child's run has started, the child runs on the run context, so
+  the parent's cancellation still cuts it and the parent's run ending
+  does not, and its end goes to a callback from which the host delivers
+  the answer, a steer into a parent still running or a prompt to one
+  that is idle. A later run of a child the host marks as a retry
+  reaches the observer marked.
 - **As a peer.** The loop exposed to A2A callers, with its card derived
   from its name, description and tools; a remote A2A agent wrapped as a
   tool, a task mapped to one call and input-required to a returned
@@ -1138,12 +1162,13 @@ maps onto it as follows:
 | agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `State`, `SetConfig`, `SetTranscript`, `Config` |
 | refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning` |
 | run ID, trigger, transcript on the context | `ContextWithRunID`/`RunIDFromContext`, `ContextWithTrigger`/`TriggerFromContext`, `ContextWithTranscript`/`TranscriptFromContext` |
+| run context, steer signal | `RunContext(ctx)`, `Steered(ctx)` |
 | source | `Source`: `SourceInput`, `SourceResume` |
 | events | `Event` with `EventType()`; `RunStart`, `TurnStart`, `ModelRetry`, `ModelBlocked`, `ItemStart`, `ItemUpdate`, `ItemEnd`, `ResponseEnd`, `ToolStart`, `ToolDispatch`, `ToolUpdate`, `ToolEnd`, `TurnEnd`, `RunEnd`, `Queued`; the `Event*` name constants |
 | tool recorder | `Config.ToolRecorder`, the executor's recorder for every batch; `session.Recorder.RecordFunc` is the value a session recorder offers |
 | tool elicitor | `Config.ToolElicitor`, installed on every tool call's context; `session.Recorder.Elicitor(by, fn)` wraps one so the question and the answer are recorded under the call |
 | reason, cause | `Reason` (`ReasonDone`, `ReasonStopped`, `ReasonInputRequired`, `ReasonAborted`, `ReasonError`); `StopCause` (`StopMaxTurns`, `StopHook`, `StopGuard`, `StopTerminate`, `StopPartialTerminate`, `StopRefused`) |
-| pending call | `PendingCall{Call, Reason}`; `PendingReason` (`PendingDeferred`, `PendingAborted`, `PendingUndispatched`, `PendingUnknown`); `PendingCalls` |
+| pending call | `PendingCall{Call, Reason, Tool}`; `PendingReason` (`PendingDeferred`, `PendingAborted`, `PendingUndispatched`, `PendingUnknown`); `PendingCalls` |
 | decision | `ToolDecision{Action, Reason, Terminate, Args, By, Note}`; `ToolAction` (`Allow`, `Block`, `Defer`) |
 | answer | `Answer{CallID, Output, Args, Note, Terminate, By}`; `Output`, `Approve`, `ApproveWith`, `Refuse`, `WithNote`, `WithBy`; `ContextWithDeciders`/`DeciderFromContext` for a host driving `Run` |
 | hooks | `Config.BeforeTurn`, `BeforeModelCall`, `OutputGuard`, `BeforeToolCall`, `AfterToolCall`, `ShouldStopAfterTurn` |
@@ -1152,7 +1177,7 @@ maps onto it as follows:
 | nested call | `Invoke(ctx, name, args)`; `ErrNoInvoker`; `Parent` on the tool events |
 | queue mode | `QueueMode`: `QueueSteer`, `QueueFollowUp` |
 | the loop as a model | `front/responses.New(cfg)` → `openresponses.Adapter` |
-| the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
+| the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`; `tools/a2a.New(client, card)` |
 | the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `RecordFunc`, `Elicitor`, `Requeue`, `Rebase`; `WithInstructionsParts`; `session.RequestHash` |
 

@@ -105,6 +105,7 @@ type options struct {
 	noAnswer func(ChildInfo) (agenttool.Result, error)
 	spawn    func(callID string, child *agentturn.Agent)
 	runCtx   func(ctx context.Context, callID string) context.Context
+	detach   func(callID string, end *agentturn.RunEnd)
 }
 
 // toolName is the form a provider accepts for a function tool's name.
@@ -233,6 +234,25 @@ func WithRunContext(fn func(ctx context.Context, callID string) context.Context)
 	return func(o *options) { o.runCtx = fn }
 }
 
+// WithDetach makes a call return as soon as the child's run has
+// started, with an output saying the task is running and a [ChildInfo]
+// naming the run, and hands the run's end to fn when it comes, on the
+// child's goroutine. It is the background task: the parent's model
+// goes on while the child works, and the host delivers the answer, as
+// agentturn.Agent.Steer into a parent that is still running or a
+// Prompt to one that is idle, from fn.
+//
+// The child runs on agentturn.RunContext of the call, so an abort of
+// the parent's run still cuts it, and the parent's batch ending or its
+// run ending by itself does not. The observer stays subscribed, as
+// after any call, and WithSpawn still hands out the child's agent, so
+// a host can steer it or abort it alone. fn is called once, for the
+// run the call started, whatever its reason; a run that could not
+// start is the call's error and fn is not called.
+func WithDetach(fn func(callID string, end *agentturn.RunEnd)) Option {
+	return func(o *options) { o.detach = fn }
+}
+
 type configKey struct{}
 type retryKey struct{}
 
@@ -351,9 +371,23 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	var mu sync.Mutex
 	var soFar []string
 	done := false
-	child.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+	started := make(chan string, 1)
+	child.Subscribe(func(evCtx context.Context, ev agentturn.Event) error {
 		if a.opts.observer != nil {
-			a.opts.observer(obsCtx, ev)
+			octx := obsCtx
+			if RetryFromContext(evCtx) {
+				// A host that prompts the child again as a retry marks
+				// the run's context; the observer's is the call's, so
+				// the mark is carried to it.
+				octx = ContextWithRetry(octx)
+			}
+			a.opts.observer(octx, ev)
+		}
+		if e, ok := ev.(*agentturn.RunStart); ok {
+			select {
+			case started <- e.RunID:
+			default:
+			}
 		}
 		e, ok := ev.(*agentturn.ItemEnd)
 		if !ok {
@@ -380,8 +414,22 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	if a.opts.spawn != nil {
 		a.opts.spawn(call.ID, child)
 	}
+	if a.opts.detach != nil {
+		// The child outlives the call: it runs on the run's context,
+		// with the call on it for the child's own tools and hooks.
+		if rc, ok := agentturn.RunContext(ctx); ok {
+			ctx = agenttool.WithCall(rc, call)
+		}
+	}
 	if a.opts.runCtx != nil {
 		ctx = a.opts.runCtx(ctx, call.ID)
+	}
+	if a.opts.detach != nil {
+		return a.detached(ctx, call, child, prompts, started, func() {
+			mu.Lock()
+			done = true
+			mu.Unlock()
+		})
 	}
 	end, err := child.Prompt(ctx, prompts...)
 	mu.Lock()
@@ -416,6 +464,50 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		Output:  openresponses.FunctionCallOutputData{Text: text},
 		Details: info,
 	}, nil
+}
+
+// detached starts the child's run on its own goroutine and returns once
+// the run has started, or with the error that kept it from starting.
+// The run's end goes to the WithDetach function. finish stops the
+// call's progress updates, which have nowhere to go once it returns.
+func (a *agentTool) detached(ctx context.Context, call agenttool.Call, child *agentturn.Agent, prompts openresponses.Items, started <-chan string, finish func()) (agenttool.Result, error) {
+	type outcome struct {
+		end *agentturn.RunEnd
+		err error
+	}
+	ended := make(chan outcome, 1)
+	go func() {
+		end, err := child.Prompt(ctx, prompts...)
+		ended <- outcome{end, err}
+		if end != nil && end.RunID != "" {
+			a.opts.detach(call.ID, end)
+		}
+	}()
+	accepted := func(runID string) (agenttool.Result, error) {
+		finish()
+		return agenttool.Result{
+			Output:  openresponses.FunctionCallOutputData{Text: fmt.Sprintf("agent %s is working on it in the background as run %s; its answer will follow", strconv.Quote(a.cfg.Name), runID)},
+			Details: ChildInfo{RunID: runID},
+		}, nil
+	}
+	select {
+	case runID := <-started:
+		return accepted(runID)
+	case o := <-ended:
+		// A run that started and ended before this goroutine looked is
+		// still a run that started: its end has gone to fn.
+		select {
+		case runID := <-started:
+			return accepted(runID)
+		default:
+		}
+		finish()
+		err := o.err
+		if err == nil {
+			err = errors.New("child run produced no run_start")
+		}
+		return agenttool.Result{}, fmt.Errorf("agent %s: %w", strconv.Quote(a.cfg.Name), err)
+	}
 }
 
 // answered returns a copy of parent in which every function call

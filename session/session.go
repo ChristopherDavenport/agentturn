@@ -534,6 +534,10 @@ type writer struct {
 	// agentturn.Invoke, to the call whose tool made it, so a record the
 	// nested call writes names a call the path holds.
 	parents map[string]string
+	// detached is set for a child whose call returned while its run went
+	// on, so the writer is released at that run's end rather than at the
+	// call's.
+	detached bool
 	// replay is set while a transcript is being copied into a session
 	// rather than written from a live run, so the outputs in it answer
 	// calls that ran inside that run and no decision is written for
@@ -1397,6 +1401,10 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 		return
 	}
 	if err := w.handle(ctx, ev); err != nil {
+		delete(r.runs, runID(ev))
+		return
+	}
+	if _, end := ev.(*agentturn.RunEnd); end && w.detached {
 		delete(r.runs, runID(ev))
 	}
 }
@@ -2496,13 +2504,24 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 
 // child links the session of a child run to this one. A run that was
 // observed has its session already, and its link when the call was on
-// the observer's context; its writer is released. One that was not
-// observed gets a session holding only its items.
+// the observer's context; its writer is released, unless the call
+// returned while the child runs on, detached, whose writer is released
+// at the child's own run end. One that was not observed gets a session
+// holding only its items, and a detached one that was not observed has
+// none to write yet.
 func (w *writer) child(ctx context.Context, callID string, info agent.ChildInfo) error {
 	r := w.rec
+	running := info.Reason == ""
 	if cw, ok := r.runs[info.RunID]; ok {
-		delete(r.runs, info.RunID)
+		if running && cw.run != "" {
+			cw.detached = true
+		} else {
+			delete(r.runs, info.RunID)
+		}
 		return w.link(ctx, cw.id, callID)
+	}
+	if running {
+		return nil
 	}
 	cw, err := r.newChild(ctx, w, callID, false)
 	if err != nil {
