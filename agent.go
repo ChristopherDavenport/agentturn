@@ -138,7 +138,15 @@ func (a *Agent) SetConfig(cfg Config) error {
 }
 
 // SetTranscript replaces the transcript, as when switching to another
-// branch of a session. It returns [ErrRunning] while a run is active.
+// branch of a session, or when a handoff trims what the receiving
+// configuration sees, between runs and once. It returns [ErrRunning]
+// while a run is active. A session recorder writing the agent is moved
+// to match with its Rebase: to the entry of the last item kept, for a
+// trim that keeps a prefix, whose responses then carry hashes; a trim
+// from the middle runs as well and leaves the next responses without
+// one. The loop keeps whatever the transcript holds, reasoning items a
+// previous model wrote included, whose signatures another provider
+// refuses; a handoff to another provider drops them here.
 // The pending calls are derived from the new transcript as
 // [WithTranscript] derives them, so whatever the old transcript was
 // waiting on is forgotten and whatever the new one is waiting on must

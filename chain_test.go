@@ -266,3 +266,64 @@ func TestChainOutputGuard(t *testing.T) {
 		t.Errorf("transcript holds %v", end.Items[len(end.Items)-1])
 	}
 }
+
+// TestChainTransform pins #115: transforms run in order on what the one
+// before returned, nil ones are skipped, none is no transform, the
+// first error stops the chain, and each gets its own copy.
+func TestChainTransform(t *testing.T) {
+	boom := errors.New("boom")
+	tag := func(name string) func(context.Context, Transcript) (Transcript, error) {
+		return func(_ context.Context, in Transcript) (Transcript, error) {
+			return append(in, openresponses.UserText(name)), nil
+		}
+	}
+	fail := func(context.Context, Transcript) (Transcript, error) { return nil, boom }
+	scribble := func(_ context.Context, in Transcript) (Transcript, error) {
+		// Writes through its slice, which must not reach the caller's.
+		if len(in) > 0 {
+			in[0] = openresponses.UserText("scribbled")
+		}
+		return in, nil
+	}
+	for _, tc := range []struct {
+		name    string
+		fns     []func(context.Context, Transcript) (Transcript, error)
+		want    string
+		wantErr error
+		isNil   bool
+	}{
+		{name: "none", isNil: true},
+		{name: "only nil", fns: []func(context.Context, Transcript) (Transcript, error){nil}, isNil: true},
+		{name: "in order", fns: []func(context.Context, Transcript) (Transcript, error){tag("a"), nil, tag("b")}, want: "in a b"},
+		{name: "the first error stops it", fns: []func(context.Context, Transcript) (Transcript, error){tag("a"), fail, tag("b")}, wantErr: boom},
+		{name: "each gets a copy", fns: []func(context.Context, Transcript) (Transcript, error){scribble}, want: "scribbled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fn := ChainTransform(tc.fns...)
+			if tc.isNil {
+				if fn != nil {
+					t.Error("a chain of nothing is not nil")
+				}
+				return
+			}
+			in := Transcript{openresponses.UserText("in")}
+			out, err := fn(context.Background(), in)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v", err)
+			}
+			if tc.wantErr != nil {
+				return
+			}
+			var texts []string
+			for _, item := range out {
+				texts = append(texts, item.(*openresponses.Message).Text())
+			}
+			if got := strings.Join(texts, " "); got != tc.want {
+				t.Errorf("out = %q, want %q", got, tc.want)
+			}
+			if in[0].(*openresponses.Message).Text() != "in" {
+				t.Error("a transform wrote through to the caller's transcript")
+			}
+		})
+	}
+}

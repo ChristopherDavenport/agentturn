@@ -1086,7 +1086,15 @@ An agent stands in four places inside another system:
   the previous model produced, reasoning items included, and a
   reasoning item carries a signature its own provider issued; a
   handoff that changes the provider MUST drop them, and which component
-  owns that rule is open (#91).
+  owns that rule is open (#91). A handoff that trims what the receiver
+  sees does it once, between runs, by replacing the transcript; a
+  recorder moved to the last entry kept keeps every later response
+  verifiable when the trim takes a prefix, and a trim from the middle
+  leaves them unhashed. Where each agent keeps a session of its own,
+  the receiver's is a fork of the sender's at the handoff's last entry,
+  a session whose header names that entry as its base, and every hash
+  on the fork's path verifies when the receiver starts from the fork's
+  context, the sender's transcript up to that entry.
 
 A configuration's name and description are the single source for how
 an agent presents itself in every one of these.
@@ -1173,7 +1181,7 @@ maps onto it as follows:
 | answer | `Answer{CallID, Output, Args, Note, Terminate, By}`; `Output`, `Approve`, `ApproveWith`, `Refuse`, `WithNote`, `WithBy`; `ContextWithDeciders`/`DeciderFromContext` for a host driving `Run` |
 | hooks | `Config.BeforeTurn`, `BeforeModelCall`, `OutputGuard`, `BeforeToolCall`, `AfterToolCall`, `ShouldStopAfterTurn` |
 | guard stop | an error wrapping `ErrGuard` from `ShouldStopAfterTurn`, `BeforeTurn` or `BeforeModelCall` |
-| chains | `ChainBeforeTurn`, `ChainBeforeModelCall`, `ChainOutputGuard`, `ChainBeforeToolCall`, `ChainShouldStopAfterTurn` |
+| chains | `ChainBeforeTurn`, `ChainBeforeModelCall`, `ChainOutputGuard`, `ChainBeforeToolCall`, `ChainShouldStopAfterTurn`, `ChainTransform` |
 | nested call | `Invoke(ctx, name, args)`; `ErrNoInvoker`; `Parent` on the tool events |
 | queue mode | `QueueMode`: `QueueSteer`, `QueueFollowUp` |
 | the loop as a model | `front/responses.New(cfg)` → `openresponses.Adapter` |

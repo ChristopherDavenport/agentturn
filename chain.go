@@ -48,6 +48,47 @@ func ChainBeforeModelCall(fns ...func(context.Context, *openresponses.Request) e
 	}
 }
 
+// ChainTransform runs each transform in order, each on what the one
+// before it returned, and returns the last one's transcript, so a
+// product's own shaping, a redaction or a filter, runs before the
+// compact transform and the fold is over what the product shaped. The
+// first error stops the chain and is returned, which fails the turn as
+// a single transform's error does. Each is given a copy of the slice,
+// as the loop gives one, so none can reach the working transcript
+// through another's result.
+//
+// A request a product transform changed is one the record cannot
+// rebuild, so its response carries no hash, as with one transform. A
+// fold after it is still recorded: compact names the first item it
+// kept, and a session recorder finds that item's entry by the item
+// rather than by the fold's index, which counts the shaped transcript.
+// A transform before the fold that replaces items rather than keeping,
+// dropping or adding them leaves the fold nothing the recorder wrote,
+// and the recorder writes the fold as one it could not place rather
+// than name the wrong entry; the run goes on. A fold that kept nothing
+// names no item, and after a transform that dropped items its index is
+// not the recorder's: keep at least one item.
+func ChainTransform(fns ...func(context.Context, Transcript) (Transcript, error)) func(context.Context, Transcript) (Transcript, error) {
+	var kept []func(context.Context, Transcript) (Transcript, error)
+	for _, fn := range fns {
+		if fn != nil {
+			kept = append(kept, fn)
+		}
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return func(ctx context.Context, t Transcript) (Transcript, error) {
+		for _, fn := range kept {
+			var err error
+			if t, err = fn(ctx, append(Transcript(nil), t...)); err != nil {
+				return nil, err
+			}
+		}
+		return t, nil
+	}
+}
+
 // ChainBeforeTurn runs each hook in order and appends what they return,
 // in that order, so every layer contributes its items to the turn. The
 // first error stops the chain and is returned; the items of the hooks

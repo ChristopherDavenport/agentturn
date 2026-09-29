@@ -193,6 +193,17 @@ versions may break the API.
   transcript, and `ToolEnd.Reason` is the decision's reason for a
   blocked or deferred call, so a front asking the user can show what
   it asks about and why. Neither changes the record. (#112)
+- `ChainTransform(fns...)` runs transforms in order, each on a copy of
+  what the one before returned, so a product's own shaping runs before
+  the compact transform. A request a product transform changed has no
+  hash, as with one transform. `compact.Fold.First` is the first item
+  a fold kept, and `Recorder.Fold` finds its entry by that item rather
+  than by the fold's index, which counts the transcript the fold was
+  given. A fold whose first kept item the recorder wrote nowhere, after
+  a transform that replaced items, or in two places, one item value
+  appended twice, is written as a custom entry in
+  `agentturn:compaction_unplaced` rather than a compaction naming the
+  wrong entry, and the run goes on. (#115)
 - `OutputInfo.Output` holds the items of the response that precede the
   message, and the guard's docs say that whether a message is the
   answer is unknown when it runs, since a model may speak before a
