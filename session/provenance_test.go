@@ -940,6 +940,121 @@ func TestRecordsNameTheirCall(t *testing.T) {
 	verifyAll(t, s)
 }
 
+// TestChildJobRecordsReachTheChild pins #168: a job a child's tool
+// starts from agentturn.RunContext and that writes after the child's
+// run has ended is filed in the child's session, under the child's
+// call when it names it with agenttool.WithCall, and not at the root,
+// whether or not a later run of the child is being written by then.
+func TestChildJobRecordsReachTheChild(t *testing.T) {
+	for _, later := range []bool{false, true} {
+		t.Run(fmt.Sprintf("later=%v", later), func(t *testing.T) { testChildJobRecords(t, later) })
+	}
+}
+
+func testChildJobRecords(t *testing.T, later bool) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	errs := make(chan error, 3)
+	// bash backgrounds one job per name, each writing once release is
+	// closed; a name ending in -plain writes from the run context alone.
+	bash := func(jobs ...string) agenttool.Tool {
+		return agenttool.New("bash", "", func(ctx context.Context, _ echoArgs) (string, error) {
+			rc, ok := agentturn.RunContext(ctx)
+			call, _ := agenttool.CallFrom(ctx)
+			if !ok {
+				return "", errors.New("no run context")
+			}
+			for _, job := range jobs {
+				jctx := agenttool.WithCall(rc, call)
+				if strings.HasSuffix(job, "-plain") {
+					jctx = rc
+				}
+				go func() {
+					<-release
+					errs <- agenttool.WriteRecord(jctx, note{Text: job})
+				}()
+			}
+			return "started", nil
+		})
+	}
+	child := agent.New(agentturn.Config{Name: "specialist", Model: allCalls{}, MaxTurns: 1,
+		ToolRecorder: rec.RecordFunc(), Tools: []agenttool.Tool{bash("child", "child-plain")}},
+		agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+	a := agentturn.New(agentturn.Config{Model: allCalls{}, MaxTurns: 1, ToolRecorder: rec.RecordFunc(),
+		Tools: []agenttool.Tool{bash("root"), child}})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
+		t.Fatal(err)
+	}
+	rootCalls := callsOf(t, s)
+	childID := agentsession.SubsessionID(s.ID(), rootCalls["specialist"].ID())
+	if later {
+		// A later run of the child, seeded from its leaf as newChild
+		// seeds one, holds only the calls pending there.
+		cs, err := store.Open(context.Background(), childID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec.mu.Lock()
+		w := newWriter(rec, childID)
+		err = w.seed(cs, false)
+		rec.runs["later"] = w
+		rec.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(release)
+	for range 3 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	cs, err := store.Open(context.Background(), childID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childCalls := callsOf(t, cs)
+	notes := func(s *agentsession.Session) map[string]string {
+		out := map[string]string{}
+		for _, c := range customs(s, "app:note") {
+			var n note
+			if err := json.Unmarshal(c.Data, &n); err != nil {
+				t.Fatal(err)
+			}
+			out[n.Text] = c.CallID
+		}
+		return out
+	}
+	got := map[string]map[string]string{"root": notes(s), "child": notes(cs)}
+	for _, tc := range []struct {
+		job, session, call string
+	}{
+		{job: "root", session: "root", call: rootCalls["bash"].ID()},
+		{job: "child", session: "child", call: childCalls["bash"].ID()},
+		// The child's run context carries the call that started the
+		// child, which the child's session does not hold.
+		{job: "child-plain", session: "child", call: ""},
+	} {
+		call, ok := got[tc.session][tc.job]
+		if !ok {
+			t.Errorf("%s: no record in the %s session; root %v, child %v", tc.job, tc.session, got["root"], got["child"])
+			continue
+		}
+		if call != tc.call {
+			t.Errorf("%s: call_id = %q, want %q", tc.job, call, tc.call)
+		}
+	}
+	if len(got["root"]) != 1 || len(got["child"]) != 2 {
+		t.Errorf("root %v, child %v", got["root"], got["child"])
+	}
+	verifyAll(t, s)
+}
+
 // TestElicitationIsRecordedUnderTheCall checks that a question a tool
 // asks through the loop's elicitor is written under the call that
 // asked, with the answer and who gave it, before the tool goes on, and

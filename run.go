@@ -319,12 +319,18 @@ func RunIDFromContext(ctx context.Context) string {
 // has ended, Agent.Abort reaches the agent's next run and not this
 // one, so work that must be stoppable after that keeps a cancel of its
 // own. [Config.ToolRecorder] is on it, so a job that writes the handle
-// of what it started with agenttool.WriteRecord reaches the record; the
-// call is not, so such a job carries it with agenttool.WithCall(rc,
-// call), as tools/agent does for a detached child, for the record to
-// name the call it belongs to. Where a record written after the run
-// has ended is filed is the recorder's to say; a session recorder
-// files it at its own session's leaf. The transcript, the invoker, the tool
+// of what it started with agenttool.WriteRecord reaches the record. The
+// call it serves is not: a root run's context carries no call, and a
+// child run's, one a tool started on the context of its own call as
+// tools/agent does, carries the call that started the child. So a job
+// names its call with agenttool.WithCall(rc, call), as tools/agent does
+// for a detached child, and one in a child that does not is taken for
+// the work of the parent's call. Where a record written after the run
+// has ended is filed is the recorder's to say; a session recorder files
+// it at the leaf of the session of the run the job came from, the
+// child's when the child was given its session ID with
+// session.Recorder.ChildContext and the recorder's own otherwise, and
+// names the call when that session holds it. The transcript, the invoker, the tool
 // elicitor and the steer signal of the call belong to its batch and
 // are not on it; a job that needs one carries it from the call's
 // context. It reports false outside a loop. Each run registers it with the context
