@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -1247,6 +1248,123 @@ func TestAResponseKeepsWhatTheAttemptHeld(t *testing.T) {
 			}
 			if itemEnd < 0 || responseEnd < 0 || itemEnd > responseEnd {
 				t.Errorf("events = %v", order)
+			}
+		})
+	}
+}
+
+// callIDModel makes, on each turn, one call to upper per ID in turns,
+// then answers with nothing once the turns run out. An ID of "-" is
+// sent empty, as a provider that gives none does.
+type callIDModel struct {
+	turns [][]string
+	calls int
+}
+
+func (m *callIDModel) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.calls++
+	blank := openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+		var items openresponses.Items
+		switch e := ev.(type) {
+		case *openresponses.OutputItemAddedEvent:
+			items = openresponses.Items{e.Item}
+		case *openresponses.OutputItemDoneEvent:
+			items = openresponses.Items{e.Item}
+		}
+		if resp, ok := openresponses.TerminalResponse(ev); ok {
+			items = resp.Output
+		}
+		for _, item := range items {
+			if call, ok := item.(*openresponses.FunctionCall); ok && call.CallID == "-" {
+				call.CallID = ""
+			}
+		}
+		return sink.Send(ev)
+	})
+	em := openresponses.NewEmitter(blank, openresponses.NewResponse(req))
+	if m.calls <= len(m.turns) {
+		for _, id := range m.turns[m.calls-1] {
+			w, err := em.FunctionCall(id, "upper")
+			if err != nil {
+				return err
+			}
+			if err := w.Arguments(`{"text":"t"}`); err != nil {
+				return err
+			}
+			if err := w.Close(); err != nil {
+				return err
+			}
+		}
+	}
+	return em.Complete()
+}
+
+// TestCallIDsNameOneCall pins that a call ID names one call in the
+// transcript: a call whose ID the model left empty or gave an earlier
+// call runs under an ID of the loop's own, which its item_end, its
+// output and the turn's response all carry, and a call with an ID of
+// its own keeps it.
+func TestCallIDsNameOneCall(t *testing.T) {
+	cases := []struct {
+		name  string
+		turns [][]string
+		// kept are the IDs the transcript keeps as the model gave them.
+		kept []string
+	}{
+		{name: "unique", turns: [][]string{{"call_a", "call_b"}, {"call_c"}}, kept: []string{"call_a", "call_b", "call_c"}},
+		{name: "repeated across turns", turns: [][]string{{"call_0"}, {"call_0"}}, kept: []string{"call_0"}},
+		{name: "repeated in a response", turns: [][]string{{"call_0", "call_0"}}, kept: []string{"call_0"}},
+		{name: "empty", turns: [][]string{{"-", "-"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &callIDModel{turns: tc.turns}
+			events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")},
+				Config{Model: m, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}}))
+			if err != nil || end.Reason != ReasonDone {
+				t.Fatalf("err=%v reason=%s", err, end.Reason)
+			}
+			var ids, ended, turned []string
+			seen := map[string]bool{}
+			for _, item := range end.Items {
+				call, ok := item.(*openresponses.FunctionCall)
+				if !ok {
+					continue
+				}
+				if call.CallID == "" || seen[call.CallID] {
+					t.Errorf("call ID %q empty or repeated", call.CallID)
+				}
+				seen[call.CallID] = true
+				ids = append(ids, call.CallID)
+			}
+			for _, item := range end.Items {
+				if out, ok := item.(*openresponses.FunctionCallOutput); ok && !seen[out.CallID] {
+					t.Errorf("output %q names no call", out.CallID)
+				}
+			}
+			for _, ev := range events {
+				switch e := ev.(type) {
+				case *ItemEnd:
+					if call, ok := e.Item.(*openresponses.FunctionCall); ok {
+						ended = append(ended, call.CallID)
+					}
+				case *TurnEnd:
+					for _, call := range e.Response.FunctionCalls() {
+						turned = append(turned, call.CallID)
+					}
+				}
+			}
+			n := 0
+			for _, turn := range tc.turns {
+				n += len(turn)
+			}
+			if len(ids) != n || strings.Join(ended, " ") != strings.Join(ids, " ") || strings.Join(turned, " ") != strings.Join(ids, " ") {
+				t.Errorf("transcript %q, item_end %q, responses %q", ids, ended, turned)
+			}
+			for _, id := range tc.kept {
+				if !slices.Contains(ids, id) {
+					t.Errorf("%s not kept in %q", id, ids)
+				}
 			}
 		})
 	}

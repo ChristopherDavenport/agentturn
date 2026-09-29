@@ -923,6 +923,13 @@ A conforming loop holds these over every run, however it ends:
 - Outputs are appended in the model's order; `tool_end` arrives in
   completion order. A consumer correlates the two by call ID, never by
   position.
+- A call ID names one function call in the transcript. A call the
+  model gives no ID, or one a call in the transcript already has,
+  takes an ID of the loop's own when it completes, the model's with a
+  random suffix, so it names no call a fold took out either: its
+  `item_end`, the transcript, its output and the `response_end` the
+  turn acts on carry the new one, and only its `item_start` and
+  `item_update` carry the model's.
 - `response_end` precedes every `tool_start` of its turn, and every
   output item of the response has had its `item_end` before it.
 - `turn_start` is delivered once per turn and `response_end` at most

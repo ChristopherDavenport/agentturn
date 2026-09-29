@@ -1144,3 +1144,72 @@ func TestOnlyTheAttemptThatAnsweredIsConfigured(t *testing.T) {
 		t.Errorf("context = %+v, %d items", cx.Settings, len(cx.Items))
 	}
 }
+
+// sameIDModel makes, on each turn, one call to upper per ID in turns,
+// then answers with nothing once the turns run out, as a provider that
+// numbers its calls per response does.
+type sameIDModel struct {
+	turns [][]string
+	calls int
+}
+
+func (m *sameIDModel) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.calls++
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if m.calls <= len(m.turns) {
+		for _, id := range m.turns[m.calls-1] {
+			w, err := em.FunctionCall(id, "upper")
+			if err != nil {
+				return err
+			}
+			if err := w.Arguments(`{"text":"t"}`); err != nil {
+				return err
+			}
+			if err := w.Close(); err != nil {
+				return err
+			}
+		}
+	}
+	return em.Complete()
+}
+
+// TestRepeatedCallIDsAreRecorded checks that a model repeating a call
+// ID records a session: the format refuses a function call whose ID is
+// already on the path, and the loop gives such a call an ID of its
+// own before the recorder writes it.
+func TestRepeatedCallIDsAreRecorded(t *testing.T) {
+	cases := []struct {
+		name  string
+		turns [][]string
+	}{
+		{name: "across turns", turns: [][]string{{"call_0"}, {"call_0"}}},
+		{name: "in a response", turns: [][]string{{"call_0", "call_0"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{Records: agentsession.AllRecords})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := agentturn.New(agentturn.Config{Model: &sameIDModel{turns: tc.turns}, Tools: []agenttool.Tool{upper}})
+			defer rec.Attach(a)()
+			if end, err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil || end.Reason != agentturn.ReasonDone {
+				t.Fatalf("prompt: err=%v end=%+v", err, end)
+			}
+			calls, err := s.Calls(s.Leaf())
+			if err != nil || len(calls) != 2 {
+				t.Fatalf("calls = %d, %v", len(calls), err)
+			}
+			for _, c := range calls {
+				if c.Output == nil || c.Dispatch == nil {
+					t.Errorf("call %s = %+v", c.ID(), c)
+				}
+			}
+			verifyAll(t, s)
+			if err := s.VerifyRecords(s.Leaf()); err != nil {
+				t.Errorf("verify records: %v", err)
+			}
+		})
+	}
+}

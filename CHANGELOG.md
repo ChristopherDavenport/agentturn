@@ -19,6 +19,14 @@ versions may break the API.
   a `reject` or an `answer` ended gets no further decision.
   `session.Pending` reads a call rejected before its output from
   agentsession's `CallRejected`.
+- **A call ID names one call.** A function call the model gives no
+  call ID, or one a call in the transcript already has, takes an ID of
+  the loop's own when it completes, the model's with a random suffix:
+  its `ItemEnd`, the transcript, its output and the response the turn
+  runs carry it, and only its `ItemStart` and `ItemUpdate` carry the
+  model's. A provider that numbered its calls per response had a later
+  call's output matched to an earlier call, and agentsession v0.0.13
+  refuses the repeated call, which failed the run.
 - **The recorder writes the omitted list as keeps.** Under
   `session.WithInstructionsParts`, a config delta that changes
   `instructions_omitted` now writes it as `Settings.OmittedDelta`

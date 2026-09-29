@@ -506,6 +506,10 @@ type runner struct {
 	// are appended when the attempt commits and dropped when it ends
 	// without committing.
 	held []heldItem
+	// callIDs maps the output index of a function call the attempt in
+	// flight completed to the call ID the loop gave it, for a call whose
+	// own ID was empty or named a call the transcript already holds.
+	callIDs map[int]string
 }
 
 // heldItem is a completed item waiting for its attempt to commit.
@@ -1023,7 +1027,7 @@ func sleep(ctx context.Context, d time.Duration) error {
 // policy sees the transport or wire error itself.
 func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *openresponses.Response, committed bool, err error) {
 	var acc openresponses.Accumulator
-	r.held = nil
+	r.held, r.callIDs = nil, nil
 	for ev, err := range openresponses.Events(ctx, r.cfg.Model, req) {
 		if err != nil {
 			return nil, committed, err
@@ -1048,6 +1052,7 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 	if resp == nil {
 		return nil, committed, openresponses.ErrTruncatedStream
 	}
+	resp = r.renameCalls(resp)
 	if resp.Status != openresponses.ResponseStatusFailed {
 		// The response arrived, so what the attempt completed on the
 		// way to it is the model's output and belongs in the
@@ -1101,6 +1106,9 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		return commits, r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, ResponseID: responseID})
 	case *openresponses.OutputItemDoneEvent:
 		item := e.Item
+		if call, ok := item.(*openresponses.FunctionCall); ok {
+			item = r.uniqueCall(call, e.OutputIndex)
+		}
 		if m, ok := item.(*openresponses.Message); ok && r.cfg.OutputGuard != nil {
 			// The guard sees the message before anything keeps it.
 			var before openresponses.Items
@@ -1131,6 +1139,59 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		return false, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[idx], Stream: ev, ResponseID: responseID})
 	}
 	return false, nil
+}
+
+// uniqueCall returns call, or a copy with a call ID of the loop's own
+// when the model gave none or one a call in the transcript already
+// has: a call ID names one call, since an output, a pending list and
+// the session record name the call by it alone. The new ID is the
+// model's with a random suffix, so it names no call a fold took out of
+// the transcript either. The item_start and item_update events of the
+// call carry the model's ID; its item_end, the transcript and the
+// response the turn acts on carry the new one.
+func (r *runner) uniqueCall(call *openresponses.FunctionCall, index int) *openresponses.FunctionCall {
+	taken := call.CallID == ""
+	for _, item := range r.transcript {
+		if c, ok := item.(*openresponses.FunctionCall); ok && c.CallID == call.CallID {
+			taken = true
+			break
+		}
+	}
+	if !taken {
+		return call
+	}
+	prefix := call.CallID
+	if prefix == "" {
+		prefix = "call"
+	}
+	renamed := *call
+	renamed.CallID = openresponses.NewID(prefix)
+	if r.callIDs == nil {
+		r.callIDs = map[int]string{}
+	}
+	r.callIDs[index] = renamed.CallID
+	return &renamed
+}
+
+// renameCalls gives the function calls of a response the call IDs
+// uniqueCall gave them when they completed, so the calls the turn runs
+// are the ones the transcript holds.
+func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Response {
+	if len(r.callIDs) == 0 {
+		return resp
+	}
+	out := *resp
+	out.Output = append(openresponses.Items(nil), resp.Output...)
+	for index, id := range r.callIDs {
+		if index < len(out.Output) {
+			if call, ok := out.Output[index].(*openresponses.FunctionCall); ok {
+				renamed := *call
+				renamed.CallID = id
+				out.Output[index] = &renamed
+			}
+		}
+	}
+	return &out
 }
 
 // wireError carries an error event off the stream, so the attempt can

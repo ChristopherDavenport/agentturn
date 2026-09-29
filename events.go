@@ -260,7 +260,11 @@ func (*ItemUpdate) EventType() string { return EventItemUpdate }
 
 // ItemEnd carries a completed item. For an assistant item it is emitted
 // only after output_item.done; partial items never arrive here. The item
-// is in the transcript when this event is delivered.
+// is in the transcript when this event is delivered. A function call
+// the model gave no call ID, or one a call in the transcript already
+// has, carries an ID of the loop's own here, the model's with a random
+// suffix, where its ItemStart and ItemUpdate carry the model's: a call
+// ID names one call.
 type ItemEnd struct {
 	RunID string
 	Turn  int
