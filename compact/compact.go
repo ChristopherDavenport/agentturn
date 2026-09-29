@@ -116,6 +116,12 @@ type Fold struct {
 	// starts: the items before it were folded, and the items from it on
 	// were sent verbatim after Output.
 	Split int
+	// First is the item at Split, the first one kept, nil when the fold
+	// kept none. A recorder that names the entry holding it finds it by
+	// this item rather than by Split, which counts items of the
+	// transcript the transform was given: after another transform in a
+	// chain, not the agent's.
+	First openresponses.Item
 	// Output stands in for the folded items on the request: the
 	// compaction endpoint's output for [New], the summary message for
 	// [NewLocal]. nil when the fold failed. The request the transform
@@ -360,6 +366,10 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 		return view, nil
 	}
 	pinned := t.pinned(items[:split])
+	var first openresponses.Item
+	if split < len(items) {
+		first = items[split]
+	}
 	t.prefixLen = split
 	t.prefixHash = hash(items[:split])
 	t.output = append(append(openresponses.Items(nil), f.output...), pinned...)
@@ -372,7 +382,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 		// The fold's own output and the pinned items, as locals: the
 		// memory they were written to belongs to the lock that was just
 		// released.
-		if err := t.onFold(ctx, Fold{Split: split, Output: f.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, Request: f.request}); err != nil {
+		if err := t.onFold(ctx, Fold{Split: split, First: first, Output: f.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, Request: f.request}); err != nil {
 			return nil, fmt.Errorf("compact: on-fold: %w", err)
 		}
 	}

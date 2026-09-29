@@ -2470,12 +2470,13 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 	if f.Summary == nil {
 		return errors.New("session: fold has no summary item")
 	}
-	if f.Split < 0 || f.Split >= len(w.items) {
-		return fmt.Errorf("session: fold keeps the transcript from item %d, but the recorder wrote %d items", f.Split, len(w.items))
+	split, err := w.foldSplitOf(f)
+	if err != nil {
+		return err
 	}
-	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = true, f.Split, f.Summary, f.Pinned
+	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = true, split, f.Summary, f.Pinned
 	entry := &agentsession.CompactionEntry{
-		FirstKept:    w.items[f.Split],
+		FirstKept:    w.items[split],
 		Summary:      f.Summary,
 		Pinned:       f.Pinned,
 		Config:       w.settings,
@@ -2498,8 +2499,34 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 		}
 		entry.Unknown = map[string]json.RawMessage{FoldMember: raw}
 	}
-	_, err := w.append(ctx, entry)
+	_, err = w.append(ctx, entry)
 	return err
+}
+
+// foldSplitOf returns the index into the items the writer wrote at which
+// a fold's kept tail starts: the item the fold names as its first kept
+// one, found by identity, since a transform chained before the fold may
+// have dropped or added items and the fold's own index counts those.
+// A fold that names no item, or names one at its index, is taken at
+// its index. One whose first kept item the writer did not write cannot
+// be placed on the path, and is an error rather than a compaction
+// naming the wrong entry.
+func (w *writer) foldSplitOf(f compact.Fold) (int, error) {
+	if f.First != nil {
+		if f.Split >= 0 && f.Split < len(w.values) && w.values[f.Split] == f.First {
+			return f.Split, nil
+		}
+		for i := len(w.values) - 1; i >= 0; i-- {
+			if w.values[i] == f.First {
+				return i, nil
+			}
+		}
+		return 0, fmt.Errorf("session: fold keeps the transcript from a %s item the recorder did not write", f.First.ItemType())
+	}
+	if f.Split < 0 || f.Split >= len(w.items) {
+		return 0, fmt.Errorf("session: fold keeps the transcript from item %d, but the recorder wrote %d items", f.Split, len(w.items))
+	}
+	return f.Split, nil
 }
 
 // child links the session of a child run to this one. A run that was
