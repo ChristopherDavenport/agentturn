@@ -116,6 +116,9 @@ type Agent struct {
 	// seeded is what WithPending gave, applied to the pending calls
 	// once every option has run.
 	seeded []PendingCall
+	// reserved holds the call IDs a record names beyond the transcript,
+	// which a call the model makes must not take.
+	reserved map[string]bool
 }
 
 type subscription struct {
@@ -159,6 +162,18 @@ func WithPending(pending []PendingCall) Option {
 	return func(a *Agent) {
 		a.seeded = append([]PendingCall(nil), pending...)
 	}
+}
+
+// WithReservedCallIDs names call IDs a call the model makes must not
+// take although the transcript does not hold them: the calls a
+// compaction folded out of a session's context, or a trim dropped, are
+// still on its path, and a provider that numbers its calls per response
+// repeats their IDs. A call that repeats one runs under an ID of the
+// loop's own, as a call repeating one in the transcript does. The
+// session package's AgentOptions gives every call ID on a stored
+// session's path.
+func WithReservedCallIDs(ids []string) Option {
+	return func(a *Agent) { a.reserve(ids) }
 }
 
 // New builds an agent.
@@ -272,6 +287,30 @@ func (a *Agent) SetPending(pending []PendingCall) error {
 	}
 	mergePending(a.pending, pending)
 	return nil
+}
+
+// ReserveCallIDs adds to the call IDs a call the model makes must not
+// take, as [WithReservedCallIDs] does for a new agent: after
+// [Agent.SetTranscript] to a session's context, with every call ID on
+// its path. The IDs reserved earlier stay reserved. It returns
+// [ErrRunning] while a run is active.
+func (a *Agent) ReserveCallIDs(ids ...string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		return ErrRunning
+	}
+	a.reserve(ids)
+	return nil
+}
+
+func (a *Agent) reserve(ids []string) {
+	for _, id := range ids {
+		if a.reserved == nil {
+			a.reserved = map[string]bool{}
+		}
+		a.reserved[id] = true
+	}
 }
 
 // State is a snapshot of the agent.
@@ -802,6 +841,7 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, approved
 			steered:    a.steerSignal,
 			runCtx:     runCtx,
 			prior:      prior,
+			reserved:   a.reserved,
 			runID:      runID,
 			resuming:   resuming,
 		}

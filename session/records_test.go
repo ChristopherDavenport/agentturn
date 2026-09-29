@@ -1213,3 +1213,111 @@ func TestRepeatedCallIDsAreRecorded(t *testing.T) {
 		})
 	}
 }
+
+// perResponseModel numbers its calls per response, as some providers
+// do: it calls upper as call_0 unless the input ends with an output,
+// which it answers.
+type perResponseModel struct{}
+
+func (perResponseModel) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if _, ok := req.Input[len(req.Input)-1].(*openresponses.FunctionCallOutput); ok {
+		if err := em.Item(openresponses.AssistantText("ok")); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	w, err := em.FunctionCall("call_0", "upper")
+	if err != nil {
+		return err
+	}
+	if err := w.Arguments(`{"text":"t"}`); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestFoldedCallIDsStayReserved checks that an agent seeded from a
+// session's context after a fold does not reuse the ID of a call the
+// fold left out: the calls are still on the path, whose format refuses
+// a repeated call ID. AgentOptions reserves them for a resume, and
+// Rebase for the agent it is attached to. The renamed call keeps the
+// model's ID beside its item.
+func TestFoldedCallIDsStayReserved(t *testing.T) {
+	for _, reseed := range []string{"resume", "rebase"} {
+		t.Run(reseed, func(t *testing.T) {
+			ctx := context.Background()
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(ctx, store, agentsession.Header{Records: agentsession.AllRecords})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tr := compact.NewLocal(&echo.Adapter{}, compact.WithBudget(4), compact.WithKeepLast(2), compact.WithEstimator(countItems), compact.WithOnFold(rec.Fold))
+			cfg := agentturn.Config{Model: perResponseModel{}, ModelName: "m", Tools: []agenttool.Tool{upper}, Transform: tr.Transform}
+			a := agentturn.New(cfg)
+			detach := rec.Attach(a)
+			for _, text := range []string{"one", "two", "three"} {
+				if _, err := a.Prompt(ctx, openresponses.UserText(text)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			switch reseed {
+			case "resume":
+				detach()
+				var opts []agentturn.Option
+				if rec, s, err = Resume(ctx, store, s.ID()); err != nil {
+					t.Fatal(err)
+				}
+				if opts, err = AgentOptions(s); err != nil {
+					t.Fatal(err)
+				}
+				a = agentturn.New(cfg, opts...)
+				detach = rec.Attach(a)
+			case "rebase":
+				if err := rec.Rebase(s, s.Leaf()); err != nil {
+					t.Fatal(err)
+				}
+				cx, err := s.Context()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := a.SetTranscript(cx.Items); err != nil {
+					t.Fatal(err)
+				}
+			}
+			defer detach()
+			cx, err := s.Context()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, item := range cx.Items {
+				if call, ok := item.(*openresponses.FunctionCall); ok && call.CallID == "call_0" {
+					t.Fatal("the fold kept call_0; the test needs it folded away")
+				}
+			}
+			if _, err := a.Prompt(ctx, openresponses.UserText("four")); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.VerifyRecords(s.Leaf()); err != nil {
+				t.Errorf("verify records: %v", err)
+			}
+			renamed := 0
+			for _, e := range s.Path(s.Leaf()) {
+				if ie, ok := e.(*agentsession.ItemEntry); ok {
+					if _, ok := ie.Item.(*openresponses.FunctionCall); ok && ie.Unknown[ModelCallIDMember] != nil {
+						renamed++
+						if string(ie.Unknown[ModelCallIDMember]) != `"call_0"` {
+							t.Errorf("model call ID = %s", ie.Unknown[ModelCallIDMember])
+						}
+					}
+				}
+			}
+			if renamed != 3 {
+				t.Errorf("%d calls keep the model's ID, want the three after the first", renamed)
+			}
+		})
+	}
+}

@@ -128,6 +128,24 @@ versions may break the API.
   items, under which a never-started call's approval is held to the
   replay rule and refused; the package doc resumes a session with
   both. (#167)
+- **Call IDs a record holds stay taken.** The new
+  `WithReservedCallIDs` and `Agent.ReserveCallIDs` name call IDs a
+  call the model makes must not take although the transcript does not
+  hold them; such a call is renamed as a repeat in the transcript is.
+  `session.AgentOptions` reserves every call ID on the path, the new
+  `session.CallIDs`, and `Recorder.Rebase` reserves them on the agent
+  it is attached to. An agent seeded with a session's context after a
+  fold did not see the calls the fold left out, so a provider that
+  numbers its calls per response reused one, agentsession refused it,
+  and the run failed.
+- `ItemEnd.ModelCallID` keeps the ID the model gave a call the loop
+  renamed, and the session recorder writes it beside the item in an
+  `agentturn:model_call_id` member, the new
+  `session.ModelCallIDMember`, as the format asks of a writer that
+  replaces an ID.
+- The Open Responses front relays a renamed call under the loop's ID,
+  the one its output names; it carried the model's, so a caller saw a
+  call and an output that did not match.
 
 ## v0.0.11 - 2026-09-29
 

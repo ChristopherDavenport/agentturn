@@ -1369,3 +1369,53 @@ func TestCallIDsNameOneCall(t *testing.T) {
 		})
 	}
 }
+
+// TestReservedCallIDs pins that a call whose ID the agent reserved runs
+// under an ID of the loop's own, as one repeating a call in the
+// transcript does, and that its item_end keeps the model's ID.
+func TestReservedCallIDs(t *testing.T) {
+	cases := []struct {
+		name string
+		// reserve is given to New, and reserveLater to ReserveCallIDs.
+		reserve, reserveLater []string
+		// want is the item_end's ModelCallID; empty when the call keeps
+		// its ID.
+		want string
+	}{
+		{name: "not reserved", reserve: []string{"call_1"}},
+		{name: "reserved at New", reserve: []string{"call_0"}, want: "call_0"},
+		{name: "reserved later", reserveLater: []string{"call_0"}, want: "call_0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New(Config{Model: &callIDModel{turns: [][]string{{"call_0"}}}, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}},
+				WithReservedCallIDs(tc.reserve))
+			if err := a.ReserveCallIDs(tc.reserveLater...); err != nil {
+				t.Fatal(err)
+			}
+			var ends []*ItemEnd
+			a.Subscribe(func(_ context.Context, ev Event) error {
+				if e, ok := ev.(*ItemEnd); ok {
+					if _, ok := e.Item.(*openresponses.FunctionCall); ok {
+						ends = append(ends, e)
+					}
+				}
+				return nil
+			})
+			end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+			if err != nil || end.Reason != ReasonDone || len(ends) != 1 {
+				t.Fatalf("err=%v end=%+v calls=%d", err, end, len(ends))
+			}
+			call := ends[0].Item.(*openresponses.FunctionCall)
+			renamed := call.CallID != "call_0"
+			if ends[0].ModelCallID != tc.want || renamed != (tc.want != "") || (renamed && !strings.HasPrefix(call.CallID, "call_0")) {
+				t.Errorf("call ID %q, model's %q", call.CallID, ends[0].ModelCallID)
+			}
+			for _, item := range end.Items {
+				if out, ok := item.(*openresponses.FunctionCallOutput); ok && out.CallID != call.CallID {
+					t.Errorf("output for %q, call is %q", out.CallID, call.CallID)
+				}
+			}
+		})
+	}
+}

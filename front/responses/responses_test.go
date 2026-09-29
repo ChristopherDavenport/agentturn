@@ -274,6 +274,62 @@ func TestRelayCatchesUp(t *testing.T) {
 	}
 }
 
+// TestRelayCarriesTheLoopsCallID pins that a call the loop renamed,
+// because the model repeated an earlier call's ID, reaches the caller
+// under the loop's ID, the one its output names.
+func TestRelayCarriesTheLoopsCallID(t *testing.T) {
+	a := New(agentturn.Config{Model: numbering{}, ModelName: "m", Tools: []agenttool.Tool{upper}}, WithToolItems())
+	sink, err := streamtest.Run(context.Background(), a, request(openresponses.UserText("x")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := sink.Response()
+	if got := itemTypes(resp.Output); got != "function_call function_call_output function_call function_call_output assistant" {
+		t.Fatalf("output = %q", got)
+	}
+	first, second := resp.Output[0].(*openresponses.FunctionCall), resp.Output[2].(*openresponses.FunctionCall)
+	if first.CallID != "call_0" || second.CallID == "call_0" || !strings.HasPrefix(second.CallID, "call_0") {
+		t.Errorf("call IDs %q %q", first.CallID, second.CallID)
+	}
+	for i, call := range []*openresponses.FunctionCall{first, second} {
+		if out := resp.Output[2*i+1].(*openresponses.FunctionCallOutput); out.CallID != call.CallID {
+			t.Errorf("output %q answers call %q", out.CallID, call.CallID)
+		}
+	}
+}
+
+// numbering is a model that numbers its calls per response, as some
+// providers do: it calls upper as call_0 until two outputs are in, then
+// answers.
+type numbering struct{}
+
+func (numbering) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	outputs := 0
+	for _, item := range req.Input {
+		if _, ok := item.(*openresponses.FunctionCallOutput); ok {
+			outputs++
+		}
+	}
+	if outputs >= 2 {
+		if err := em.Item(openresponses.AssistantText("done")); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	w, err := em.FunctionCall("call_0", "upper")
+	if err != nil {
+		return err
+	}
+	if err := w.Arguments(`{"text":"t"}`); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
 // whole is a model that emits complete items with no deltas.
 type whole struct{}
 

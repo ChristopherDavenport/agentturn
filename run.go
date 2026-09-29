@@ -499,6 +499,10 @@ type runner struct {
 	// started, so a call this run did not dispatch keeps the reason and
 	// the key an earlier run gave it.
 	prior []PendingCall
+	// reserved holds the call IDs the agent reserved, which a call the
+	// model makes must not take. The agent does not change it while the
+	// run is active.
+	reserved map[string]bool
 
 	// held are the completed items of the attempt in flight that the
 	// transcript does not have yet, because nothing has committed the
@@ -514,8 +518,9 @@ type runner struct {
 
 // heldItem is a completed item waiting for its attempt to commit.
 type heldItem struct {
-	item       openresponses.Item
-	responseID string
+	item        openresponses.Item
+	responseID  string
+	modelCallID string
 }
 
 // emit delivers one event to the consumer. An Agent serialises them
@@ -1106,8 +1111,11 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		return commits, r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, ResponseID: responseID})
 	case *openresponses.OutputItemDoneEvent:
 		item := e.Item
+		modelCallID := ""
 		if call, ok := item.(*openresponses.FunctionCall); ok {
-			item = r.uniqueCall(call, e.OutputIndex)
+			if unique := r.uniqueCall(call, e.OutputIndex); unique != call {
+				item, modelCallID = unique, call.CallID
+			}
 		}
 		if m, ok := item.(*openresponses.Message); ok && r.cfg.OutputGuard != nil {
 			// The guard sees the message before anything keeps it.
@@ -1126,12 +1134,12 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		if !committed {
 			// Nothing commits the attempt yet, so the item waits: a
 			// failure now is retried and leaves no trace.
-			r.held = append(r.held, heldItem{item: item, responseID: responseID})
+			r.held = append(r.held, heldItem{item: item, responseID: responseID, modelCallID: modelCallID})
 			return false, nil
 		}
 		r.transcript = append(r.transcript, item)
 		r.added = append(r.added, item)
-		return false, r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, ResponseID: responseID})
+		return false, r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, ResponseID: responseID, ModelCallID: modelCallID})
 	case *openresponses.ErrorEvent:
 		return false, &wireError{err: e.Err()}
 	}
@@ -1142,15 +1150,15 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 }
 
 // uniqueCall returns call, or a copy with a call ID of the loop's own
-// when the model gave none or one a call in the transcript already
-// has: a call ID names one call, since an output, a pending list and
-// the session record name the call by it alone. The new ID is the
-// model's with a random suffix, so it names no call a fold took out of
-// the transcript either. The item_start and item_update events of the
+// when the model gave none, one a call in the transcript already has,
+// or one the agent reserved: a call ID names one call, since an
+// output, a pending list and the session record name the call by it
+// alone. The new ID is the model's with a random suffix, so it names no
+// call a fold took out of the transcript either. The item_start and item_update events of the
 // call carry the model's ID; its item_end, the transcript and the
 // response the turn acts on carry the new one.
 func (r *runner) uniqueCall(call *openresponses.FunctionCall, index int) *openresponses.FunctionCall {
-	taken := call.CallID == ""
+	taken := call.CallID == "" || r.reserved[call.CallID]
 	for _, item := range r.transcript {
 		if c, ok := item.(*openresponses.FunctionCall); ok && c.CallID == call.CallID {
 			taken = true
@@ -1221,7 +1229,7 @@ func (r *runner) flushHeld() error {
 	for _, h := range held {
 		r.transcript = append(r.transcript, h.item)
 		r.added = append(r.added, h.item)
-		if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: h.item, ResponseID: h.responseID}); err != nil {
+		if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: h.item, ResponseID: h.responseID, ModelCallID: h.modelCallID}); err != nil {
 			return err
 		}
 	}

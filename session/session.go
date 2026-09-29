@@ -90,7 +90,10 @@
 //     run was prompted with carries the run's trigger as its source,
 //     other than an output Agent.Resume appends for a pending call,
 //     whose decision says who gave it, and a queued input the trigger
-//     it was queued with, Extra and all. An
+//     it was queued with, Extra and all. A function call the loop gave
+//     an ID of its own, since the model's repeated one on the path,
+//     carries the model's in a [ModelCallIDMember] member beside the
+//     item, as the format asks. An
 //     item the filter in force would hide from the model, an app-only
 //     extension item, is written as a custom entry
 //     instead so the path rebuilds exactly the input that was sent. A
@@ -527,6 +530,12 @@ type Elicitation struct {
 	// error rather than an answer.
 	Error string `json:"error,omitempty"`
 }
+
+// ModelCallIDMember is the member of an item entry, beside its item,
+// that keeps the call ID the model gave a function call the loop gave
+// an ID of its own (agentturn.ItemEnd.ModelCallID): the format asks a
+// writer that replaces a repeated ID to keep the native one there.
+const ModelCallIDMember = "agentturn:model_call_id"
 
 // ErrRunActive is returned by [Recorder.Rebase] while a run is being
 // written.
@@ -1000,10 +1009,12 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 }
 
 // AgentOptions returns the options that seed an agent with the
-// session at its leaf: the context's items, and the pending calls as
+// session at its leaf: the context's items, the pending calls as
 // [Pending] reads them, so the agent's Resume holds only the calls
-// that may have run to the replay rule. It is what a host resuming a
-// session passes to agentturn.New.
+// that may have run to the replay rule, and every call ID on the path
+// as reserved, so a call the model makes does not take the ID of one a
+// compaction folded out of the context, which the format refuses. It
+// is what a host resuming a session passes to agentturn.New.
 func AgentOptions(s *agentsession.Session) ([]agentturn.Option, error) {
 	cx, err := s.Context()
 	if err != nil {
@@ -1013,7 +1024,31 @@ func AgentOptions(s *agentsession.Session) ([]agentturn.Option, error) {
 	if err != nil {
 		return nil, err
 	}
-	return []agentturn.Option{agentturn.WithTranscript(cx.Items), agentturn.WithPending(pending)}, nil
+	ids, err := CallIDs(s)
+	if err != nil {
+		return nil, err
+	}
+	return []agentturn.Option{agentturn.WithTranscript(cx.Items), agentturn.WithPending(pending), agentturn.WithReservedCallIDs(ids)}, nil
+}
+
+// CallIDs returns the call ID of every function call on the path to the
+// session's leaf, those a compaction folded out of its context
+// included: the IDs agentturn.WithReservedCallIDs keeps a call the
+// model makes from taking, since the format refuses a call ID repeated
+// on a path.
+func CallIDs(s *agentsession.Session) ([]string, error) {
+	if s.Leaf() == "" {
+		return nil, nil
+	}
+	calls, err := s.Calls(s.Leaf())
+	if err != nil {
+		return nil, fmt.Errorf("session: calls at leaf: %w", err)
+	}
+	ids := make([]string, len(calls))
+	for i, c := range calls {
+		ids[i] = c.ID()
+	}
+	return ids, nil
 }
 
 // ReplayAnswers applies agenttool's rule for running a call again to
@@ -1209,7 +1244,10 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 // caller's to set, with Agent.SetTranscript from s.Context().Items and
 // then Agent.SetPending from [Pending], so a call held on the branch
 // is approved as a held call and one that may have run is held to the
-// replay rule.
+// replay rule. Rebase reserves every call ID on the new path, [CallIDs],
+// on the agent [Recorder.Attach] attached, so a call the model makes
+// does not take the ID of one the context leaves out; a host driving
+// another agent calls Agent.ReserveCallIDs with them itself.
 //
 // A rebase appends nothing of its own, with two exceptions the format
 // asks of the writer that continues a path. An entry inside a run, a
@@ -1279,7 +1317,20 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 	if err := w.requeue(ctx); err != nil {
 		return err
 	}
-	return w.seed(s, false)
+	if err := w.seed(s, false); err != nil {
+		return err
+	}
+	if r.agent == nil {
+		return nil
+	}
+	ids, err := CallIDs(s)
+	if err != nil {
+		return err
+	}
+	if err := r.agent.ReserveCallIDs(ids...); err != nil {
+		return fmt.Errorf("session: rebase: %w", err)
+	}
+	return nil
 }
 
 // endInbox closes the inbox at a run end: an input the agent holds is
@@ -2005,7 +2056,7 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 		if err != nil {
 			return err
 		}
-		return w.item(ctx, e.Item, e.ResponseID, e.Hidden, source)
+		return w.item(ctx, e.Item, e.ResponseID, e.Hidden, source, e.ModelCallID)
 	case *agentturn.ResponseEnd:
 		return w.response(ctx, e)
 	case *agentturn.ToolStart:
@@ -2540,8 +2591,9 @@ func (w *writer) instructionParts(ctx context.Context, req openresponses.Request
 // the reject that ends it, and one for a call that may have run by the
 // answer that ends it; an item the caller marked with
 // agentturn.Hidden is written with visible false. source is the run's
-// trigger for an item the run was prompted with.
-func (w *writer) item(ctx context.Context, item openresponses.Item, responseID string, hidden bool, source *agentsession.Trigger) error {
+// trigger for an item the run was prompted with, and modelCallID the
+// ID the model gave a call the loop renamed.
+func (w *writer) item(ctx context.Context, item openresponses.Item, responseID string, hidden bool, source *agentsession.Trigger, modelCallID string) error {
 	if item == nil {
 		return nil
 	}
@@ -2626,6 +2678,13 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		if hidden {
 			visible := false
 			e.Visible = &visible
+		}
+		if modelCallID != "" {
+			raw, err := json.Marshal(modelCallID)
+			if err != nil {
+				return fmt.Errorf("session: encode model call ID: %w", err)
+			}
+			e.Unknown = map[string]json.RawMessage{ModelCallIDMember: raw}
 		}
 		entry = e
 	}
@@ -2850,6 +2909,7 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 		if _, err := w.append(ctx, dec); err != nil {
 			return err
 		}
+		w.takeUp(e.CallID)
 		c.again = nil
 	}
 	d := agentsession.NewDispatch(e.CallID, c.entry).WithIdempotencyKey(e.IdempotencyKey)
@@ -3169,7 +3229,7 @@ func (w *writer) child(ctx context.Context, callID string, info agent.ChildInfo)
 		if isModelOutput(item) {
 			responseID = info.RunID
 		}
-		if err := cw.item(ctx, item, responseID, false, nil); err != nil {
+		if err := cw.item(ctx, item, responseID, false, nil, ""); err != nil {
 			return err
 		}
 	}
