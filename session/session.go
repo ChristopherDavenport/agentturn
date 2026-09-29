@@ -115,14 +115,17 @@
 //     again. A call the path shows answered already, its output lost
 //     to a crash between the two or to a write that failed after the
 //     answer, gets its output alone; only an output answers it, and
-//     [Pending] reads it as [agentturn.PendingAnswered].
+//     [Pending] reads it as [agentturn.PendingAnswered]. A second
+//     output for a call whose output is on the path is refused with
+//     agentsession.ErrCallCompleted, since the context would hold two.
 //   - tool_start: the call's decision when there is one to record. A
 //     BeforeToolCall that blocked the call is a reject decision with
 //     its reason, or an answer decision for a call that may have run,
 //     since the format keeps reject for a call no dispatch reached; a
 //     call a reject or an answer already ended gets nothing, since only
-//     its output may follow, and neither does one with its output,
-//     which ends it; one that deferred it is a hold carrying the same
+//     its output may follow, and one with its output is refused with
+//     agentsession.ErrCallCompleted, since the output ended it and a
+//     loop deciding on it again has lost track of it; one that deferred it is a hold carrying the same
 //     reason, the rule that raised the prompt; one that rewrote the
 //     arguments, one that allowed the call and gave a reason, such as
 //     the grant that allowed it, or an approval through Agent.Resume of
@@ -152,8 +155,11 @@
 //     path holds one per hand-off to the tool, and a reader counts the
 //     times it may have run. A dispatch for a call whose output is on
 //     the path is refused with agentsession.ErrCallCompleted, so the
-//     tool does not run again as the same call. Every decision and
-//     dispatch names its call's function_call entry as target.
+//     tool does not run again as the same call, and so is one for a
+//     call the path holds no function_call entry for, other than one
+//     the filter kept from the model, so no tool runs unrecorded. Every
+//     decision and dispatch names its call's function_call entry as
+//     target.
 //   - response_end: the response entry with status, usage, error and the
 //     request hash, after the items it produced and before any tool
 //     output of the turn; for a call Retry tried again, attempts, the
@@ -670,6 +676,11 @@ type writer struct {
 	// agentturn.Invoke, to the call whose tool made it, so a record the
 	// nested call writes names a call the path holds.
 	parents map[string]string
+	// appOnly holds the call IDs of function calls the filter kept from
+	// the model, written as custom entries: a dispatch for one has no
+	// entry to name and is not written, and a dispatch for any other
+	// call the writer does not know is refused.
+	appOnly map[string]bool
 	// detached is set for a child whose call returned while its run went
 	// on, so the writer is released at that run's end rather than at the
 	// call's.
@@ -884,7 +895,7 @@ func New(store agentsession.Store, sessionID string, opts ...Option) *Recorder {
 }
 
 func newWriter(r *Recorder, id string) *writer {
-	return &writer{rec: r, id: id, calls: map[string]*callRecord{}, linked: map[string]bool{}, parents: map[string]string{}}
+	return &writer{rec: r, id: id, calls: map[string]*callRecord{}, linked: map[string]bool{}, parents: map[string]string{}, appOnly: map[string]bool{}}
 }
 
 // Start creates a session from h and returns a recorder for it. When
@@ -1549,6 +1560,7 @@ func (r *Recorder) reopen(ctx context.Context) (*writer, error) {
 	for _, c := range calls {
 		w.calls[c.ID()] = callRecordOf(c, s.Header())
 	}
+	w.appOnly = appOnlyCalls(s.Path(s.Leaf()))
 	for _, e := range s.Path(s.Leaf()) {
 		c, ok := e.(*agentsession.CustomEntry)
 		if !ok || c.NS != NestedCallNS {
@@ -1658,6 +1670,7 @@ func (w *writer) reset() {
 	w.base = ""
 	w.attempt, w.attemptModel, w.retries = nil, "", 0
 	w.parents = map[string]string{}
+	w.appOnly = map[string]bool{}
 }
 
 // seed sets the writer's state from the session at its leaf.
@@ -1704,7 +1717,25 @@ func (w *writer) seed(s *agentsession.Session, owed bool) error {
 	for _, c := range calls {
 		w.calls[c.ID()] = callRecordOf(c, s.Header())
 	}
+	w.appOnly = appOnlyCalls(s.Path(s.Leaf()))
 	return nil
+}
+
+// appOnlyCalls returns the call IDs of the function calls on path
+// written as custom entries, since the filter kept them from the model.
+func appOnlyCalls(path []agentsession.Entry) map[string]bool {
+	ids := map[string]bool{}
+	for _, e := range path {
+		c, ok := e.(*agentsession.CustomEntry)
+		if !ok || c.NS != openresponses.ItemTypeFunctionCall {
+			continue
+		}
+		var call openresponses.FunctionCall
+		if json.Unmarshal(c.Data, &call) == nil {
+			ids[call.CallID] = true
+		}
+	}
+	return ids
 }
 
 // callRecordOf is what the path holds for a call, for a writer seeded
@@ -2637,10 +2668,15 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 	if out, ok := item.(*openresponses.FunctionCallOutput); ok && !w.replay {
 		c := w.calls[out.CallID]
 		switch {
-		case c == nil || c.rejected || c.ended || c.answered:
+		case c != nil && c.answered:
+			// The path has the call's output, which ended it; a second
+			// one is a harness that lost track of the call, and would
+			// put two outputs for one call in the context.
+			return fmt.Errorf("session: output of call %s: %w", out.CallID, agentsession.ErrCallCompleted)
+		case c == nil || c.rejected || c.ended:
 			// Nothing to anchor a decision to, or the call's fate is
 			// on the path already: after a reject or an answer, only
-			// its output, and after its output, nothing.
+			// its output.
 		case c.dispatched && c.dispatchRun != "" && c.dispatchRun == w.run:
 			// The tool's own output: the dispatch is the record.
 		case c.dispatched || c.unknown:
@@ -2752,6 +2788,7 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		if appOnly {
 			// A custom entry is no function call a decision or a
 			// dispatch can name by target, nor one a run end lists.
+			w.appOnly[v.CallID] = true
 			break
 		}
 		w.calls[v.CallID] = &callRecord{entry: id, args: v.Arguments}
@@ -2845,9 +2882,14 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 		// there is no entry to anchor a record to.
 		return nil
 	}
-	if c.rejected || c.ended || c.answered {
-		// The call's fate is on the path: only its output may follow,
-		// and nothing follows the output.
+	if c.answered {
+		// The output ended the call: a harness that decides on it again
+		// has lost track of it, and whatever it decides has nowhere to
+		// go on the path.
+		return fmt.Errorf("session: decision on call %s: %w", e.CallID, agentsession.ErrCallCompleted)
+	}
+	if c.rejected || c.ended {
+		// The call's fate is on the path: only its output may follow.
 		return nil
 	}
 	d := e.Decision
@@ -2943,6 +2985,12 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 		return nil
 	}
 	c := w.calls[e.CallID]
+	if c == nil && !w.appOnly[e.CallID] {
+		// No function call on the path for the dispatch to name: the
+		// agent holds a call the record does not, and its tool would
+		// run with nothing written for it.
+		return fmt.Errorf("session: dispatch of call %s: no function call on the path", e.CallID)
+	}
 	if c == nil || c.rejected || (c.dispatched && c.dispatchRun == w.run) {
 		return nil
 	}

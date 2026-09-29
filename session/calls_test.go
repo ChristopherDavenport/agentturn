@@ -258,36 +258,35 @@ func TestRenamedCallIDIsSent(t *testing.T) {
 	}
 }
 
-// TestNoRecordAfterAnOutput checks that the recorder writes no
-// decision or dispatch for a call whose output it has written, which
-// the format refuses: the output ends the call. A host driving
-// Handle, or a loop handed a call already answered, can raise one; a
-// decision is skipped and a dispatch refused, so the tool does not
-// run a second time as the same call.
+// TestNoRecordAfterAnOutput checks that the recorder refuses a
+// decision, a dispatch or a second output for a call whose output it
+// has written, with agentsession.ErrCallCompleted: the output ends the
+// call, and a loop that raises one has lost track of it, so the run
+// fails rather than the record hiding it. The format refuses a
+// dispatch there and does not refuse a second output, which would put
+// two outputs for one call in the context.
 func TestNoRecordAfterAnOutput(t *testing.T) {
 	cases := []struct {
 		name string
-		// after are the events raised for the call after its output;
-		// dispatchErr says a dispatch among them is refused.
-		after       func(runID, callID string) []agentturn.Event
-		dispatchErr bool
+		// after is the event raised for the call after its output.
+		after func(runID, callID string) agentturn.Event
 	}{
-		{name: "blocked", after: func(runID, callID string) []agentturn.Event {
-			return []agentturn.Event{&agentturn.ToolStart{RunID: runID, CallID: callID, Name: "upper", Args: json.RawMessage(`{"text":"t"}`),
-				Decision: &agentturn.ToolDecision{Action: agentturn.Block, Reason: "no"}}}
+		{name: "blocked", after: func(runID, callID string) agentturn.Event {
+			return &agentturn.ToolStart{RunID: runID, CallID: callID, Name: "upper", Args: json.RawMessage(`{"text":"t"}`),
+				Decision: &agentturn.ToolDecision{Action: agentturn.Block, Reason: "no"}}
 		}},
-		{name: "deferred", after: func(runID, callID string) []agentturn.Event {
-			return []agentturn.Event{&agentturn.ToolStart{RunID: runID, CallID: callID, Name: "upper", Args: json.RawMessage(`{"text":"t"}`),
-				Decision: &agentturn.ToolDecision{Action: agentturn.Defer}}}
+		{name: "deferred", after: func(runID, callID string) agentturn.Event {
+			return &agentturn.ToolStart{RunID: runID, CallID: callID, Name: "upper", Args: json.RawMessage(`{"text":"t"}`),
+				Decision: &agentturn.ToolDecision{Action: agentturn.Defer}}
 		}},
-		{name: "output again", after: func(runID, callID string) []agentturn.Event {
-			return []agentturn.Event{&agentturn.ItemEnd{RunID: runID, Item: openresponses.NewFunctionCallOutput(callID, "again")}}
+		{name: "allowed", after: func(runID, callID string) agentturn.Event {
+			return &agentturn.ToolStart{RunID: runID, CallID: callID, Name: "upper", Args: json.RawMessage(`{"text":"t"}`)}
 		}},
-		{name: "dispatched again", dispatchErr: true, after: func(runID, callID string) []agentturn.Event {
-			return []agentturn.Event{
-				&agentturn.ToolStart{RunID: runID, CallID: callID, Name: "upper", Args: json.RawMessage(`{"text":"t"}`)},
-				&agentturn.ToolDispatch{RunID: runID, CallID: callID, Name: "upper"},
-			}
+		{name: "output again", after: func(runID, callID string) agentturn.Event {
+			return &agentturn.ItemEnd{RunID: runID, Item: openresponses.NewFunctionCallOutput(callID, "again")}
+		}},
+		{name: "dispatched again", after: func(runID, callID string) agentturn.Event {
+			return &agentturn.ToolDispatch{RunID: runID, CallID: callID, Name: "upper"}
 		}},
 	}
 	for _, tc := range cases {
@@ -317,21 +316,23 @@ func TestNoRecordAfterAnOutput(t *testing.T) {
 				if err := r.Handle(ctx, &agentturn.RunStart{RunID: runID, Source: agentturn.SourceInput}); err != nil {
 					t.Fatal(err)
 				}
-				for _, ev := range tc.after(runID, "call_a") {
-					err := r.Handle(ctx, ev)
-					if _, ok := ev.(*agentturn.ToolDispatch); ok && tc.dispatchErr {
-						if !errors.Is(err, agentsession.ErrCallCompleted) {
-							t.Errorf("dispatch after the output: %v, want ErrCallCompleted", err)
-						}
-						continue
-					}
-					if err != nil {
-						t.Fatalf("%T after the output: %v", ev, err)
-					}
+				if err := r.Handle(ctx, tc.after(runID, "call_a")); !errors.Is(err, agentsession.ErrCallCompleted) {
+					t.Errorf("after the output: %v, want ErrCallCompleted", err)
 				}
 				if err := r.Handle(ctx, &agentturn.RunEnd{RunID: runID, Reason: agentturn.ReasonAborted, Err: context.Canceled}); err != nil {
 					t.Fatal(err)
 				}
+			}
+			outputs := 0
+			for _, e := range s.Entries() {
+				if ie, ok := e.(*agentsession.ItemEntry); ok {
+					if _, ok := ie.Item.(*openresponses.FunctionCallOutput); ok {
+						outputs++
+					}
+				}
+			}
+			if outputs != 1 {
+				t.Errorf("%d outputs written, want the tool's one", outputs)
 			}
 			dispatches := 0
 			for _, e := range s.Entries() {
@@ -440,10 +441,64 @@ func TestAppOnlyCallTakesNoRecord(t *testing.T) {
 			t.Fatalf("%T: %v", ev, err)
 		}
 	}
+	// A recorder seeded from the store knows the call as the writer
+	// did, and takes its dispatch without writing one.
+	rec, s, err = Resume(ctx, store, s.ID(), WithFilter(noCalls))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range []agentturn.Event{
+		&agentturn.RunStart{RunID: "run_again", Source: agentturn.SourceInput},
+		&agentturn.ToolDispatch{RunID: "run_again", CallID: call.CallID, Name: call.Name},
+		&agentturn.RunEnd{RunID: "run_again", Reason: agentturn.ReasonAborted, Err: context.Canceled},
+	} {
+		if err := rec.Handle(ctx, ev); err != nil {
+			t.Fatalf("seeded %T: %v", ev, err)
+		}
+	}
 	if got := entryTypes(s); strings.Contains(got, "decision") || strings.Contains(got, "dispatch") {
 		t.Errorf("entries = %q", got)
 	}
 	if err := s.VerifyRecords(s.Leaf()); err != nil {
 		t.Errorf("verify records: %v", err)
+	}
+}
+
+// TestDispatchOfUnknownCallIsRefused checks that the recorder refuses
+// the dispatch of a call it has no function call entry for, so its
+// tool does not run unrecorded: an agent holding a call the path does
+// not, such as one left on a transcript a host did not reset after a
+// rebase, would otherwise run it with no dispatch and put an output
+// for no call on the path.
+func TestDispatchOfUnknownCallIsRefused(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{Records: agentsession.AllRecords})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: &sameIDModel{turns: [][]string{{"call_a"}}}, Tools: []agenttool.Tool{upper},
+		BeforeToolCall: func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+			return &agentturn.ToolDecision{Action: agentturn.Defer}, nil
+		}})
+	defer rec.Attach(a)()
+	if end, err := a.Prompt(ctx, openresponses.UserText("abc")); err != nil || end.Reason != agentturn.ReasonInputRequired {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	// A rebase to before the call, and no SetTranscript after it.
+	if err := rec.Rebase(s, firstEntryOf(t, s, "abc")); err != nil {
+		t.Fatal(err)
+	}
+	cfg := a.Config()
+	cfg.BeforeToolCall = nil
+	if err := a.SetConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	end, err := a.Resume(ctx, agentturn.Approve("call_a"))
+	if err == nil || end == nil || end.Reason != agentturn.ReasonError {
+		t.Fatalf("resume: err=%v end=%+v", err, end)
+	}
+	if got := entryTypes(s); strings.Contains(got, "dispatch") || strings.Contains(got, "function_call_output") {
+		t.Errorf("entries = %q", got)
 	}
 }

@@ -1210,22 +1210,29 @@ func (r *runner) uniqueCall(call *openresponses.FunctionCall, index int) *openre
 	return &renamed
 }
 
+// maxCallIDPrefix is the longest prefix callIDPrefix keeps, so the ID
+// with openresponses.NewID's '_' and 24 hex digits is at most 64
+// characters, which OpenAI and Anthropic both take.
+const maxCallIDPrefix = 64 - 1 - 24
+
 // callIDPrefix is the model's call ID with every character outside
 // letters, digits, '_' and '-' replaced by '_', the alphabet every
-// provider takes for a call ID, or "call" when it is empty. The ID the
-// loop gives a call is sent to the provider in the next request, which
-// may not be the one that made it.
+// provider takes for a call ID, cut to maxCallIDPrefix, or "call" when
+// it is empty. The ID the loop gives a call is sent to the provider in
+// the next request, which may not be the one that made it. Two IDs
+// that give one prefix still give two IDs, since the suffix is random.
 func callIDPrefix(id string) string {
 	if id == "" {
 		return "call"
 	}
-	return strings.Map(func(r rune) rune {
+	prefix := strings.Map(func(r rune) rune {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
 			return r
 		}
 		return '_'
 	}, id)
+	return prefix[:min(len(prefix), maxCallIDPrefix)]
 }
 
 // renameCalls gives the function calls of a response the call IDs

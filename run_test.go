@@ -1304,6 +1304,9 @@ func (m *callIDModel) CreateStream(_ context.Context, req openresponses.Request,
 // takes nothing else.
 var callIDAlphabet = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
+// longCallID is a call ID prefix longer than the one the loop keeps.
+var longCallID = strings.Repeat("toolu_", 10)
+
 // TestCallIDsNameOneCall pins that a call ID names one call in the
 // transcript: a call whose ID the model left empty or gave an earlier
 // call runs under an ID of the loop's own, which its item_end, its
@@ -1321,6 +1324,8 @@ func TestCallIDsNameOneCall(t *testing.T) {
 		{name: "repeated in a response", turns: [][]string{{"call_0", "call_0"}}, kept: []string{"call_0"}},
 		{name: "empty", turns: [][]string{{"-", "-"}}},
 		{name: "repeated outside the alphabet", turns: [][]string{{"call.0:x"}, {"call.0:x"}}, kept: []string{"call.0:x"}},
+		{name: "two that map to one prefix", turns: [][]string{{"call.a", "call:a"}, {"call.a", "call:a"}}, kept: []string{"call.a", "call:a"}},
+		{name: "long", turns: [][]string{{longCallID + "1", longCallID + "2"}, {longCallID + "1", longCallID + "2"}}, kept: []string{longCallID + "1", longCallID + "2"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1340,8 +1345,8 @@ func TestCallIDsNameOneCall(t *testing.T) {
 				if call.CallID == "" || seen[call.CallID] {
 					t.Errorf("call ID %q empty or repeated", call.CallID)
 				}
-				if !slices.Contains(tc.kept, call.CallID) && !callIDAlphabet.MatchString(call.CallID) {
-					t.Errorf("the loop's call ID %q is outside [A-Za-z0-9_-]", call.CallID)
+				if !slices.Contains(tc.kept, call.CallID) && (!callIDAlphabet.MatchString(call.CallID) || len(call.CallID) > 64) {
+					t.Errorf("the loop's call ID %q is outside [A-Za-z0-9_-] or longer than 64", call.CallID)
 				}
 				seen[call.CallID] = true
 				ids = append(ids, call.CallID)

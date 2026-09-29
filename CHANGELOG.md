@@ -16,11 +16,13 @@ versions may break the API.
   in the session rather than those on the path, and
   `Recorder.ChildContext` reserves those of a child session reopened
   under its call. A writer seeded from a path knows every call on it,
-  those with an output included, so a decision after a call's output
-  is skipped and a dispatch refused with `ErrCallCompleted` rather
-  than written, and a function call the filter writes as a custom
-  entry takes no decision or dispatch, whose `target` must name a
-  function call. The recorder writes a run end's
+  those with an output included, so a decision, a dispatch or a
+  second output after a call's output is refused with
+  `ErrCallCompleted` rather than written, failing the run, and a
+  dispatch for a call the path holds no function call entry for is
+  refused, so its tool does not run unrecorded. A function call the
+  filter writes as a custom entry takes no decision or dispatch,
+  whose `target` must name a function call. The recorder writes a run end's
   `pending` list with the earlier runs' calls the run wrote a decision
   or a dispatch for, so a resume whose BeforeToolCall defers a call
   that never started ends `input_required` with that call pending; a
@@ -36,7 +38,7 @@ versions may break the API.
   runs and every later request carry it, and only its `ItemStart` and
   `ItemUpdate` carry the model's. The model's ID is kept in letters,
   digits, `_` and `-`, the alphabet Anthropic takes, with anything else
-  replaced by `_`. `ContextWithReservedCallIDs` reserves IDs for the
+  replaced by `_`, and cut so the new ID is at most 64 characters. `ContextWithReservedCallIDs` reserves IDs for the
   runs started with a context, and `Agent.SetTranscript` keeps the IDs
   of the transcript it replaces reserved. A provider that numbered its calls per response had a later
   call's output matched to an earlier call, and agentsession v0.0.13
