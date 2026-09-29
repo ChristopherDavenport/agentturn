@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"regexp"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -1247,6 +1249,201 @@ func TestAResponseKeepsWhatTheAttemptHeld(t *testing.T) {
 			}
 			if itemEnd < 0 || responseEnd < 0 || itemEnd > responseEnd {
 				t.Errorf("events = %v", order)
+			}
+		})
+	}
+}
+
+// callIDModel makes, on each turn, one call to upper per ID in turns,
+// then answers with nothing once the turns run out. An ID of "-" is
+// sent empty, as a provider that gives none does.
+type callIDModel struct {
+	turns [][]string
+	calls int
+}
+
+func (m *callIDModel) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.calls++
+	blank := openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+		var items openresponses.Items
+		switch e := ev.(type) {
+		case *openresponses.OutputItemAddedEvent:
+			items = openresponses.Items{e.Item}
+		case *openresponses.OutputItemDoneEvent:
+			items = openresponses.Items{e.Item}
+		}
+		if resp, ok := openresponses.TerminalResponse(ev); ok {
+			items = resp.Output
+		}
+		for _, item := range items {
+			if call, ok := item.(*openresponses.FunctionCall); ok && call.CallID == "-" {
+				call.CallID = ""
+			}
+		}
+		return sink.Send(ev)
+	})
+	em := openresponses.NewEmitter(blank, openresponses.NewResponse(req))
+	if m.calls <= len(m.turns) {
+		for _, id := range m.turns[m.calls-1] {
+			w, err := em.FunctionCall(id, "upper")
+			if err != nil {
+				return err
+			}
+			if err := w.Arguments(`{"text":"t"}`); err != nil {
+				return err
+			}
+			if err := w.Close(); err != nil {
+				return err
+			}
+		}
+	}
+	return em.Complete()
+}
+
+// callIDAlphabet is what every provider takes for a call ID; Anthropic
+// takes nothing else.
+var callIDAlphabet = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// longCallID is a call ID prefix longer than the one the loop keeps.
+var longCallID = strings.Repeat("toolu_", 10)
+
+// TestCallIDsNameOneCall pins that a call ID names one call in the
+// transcript: a call whose ID the model left empty or gave an earlier
+// call runs under an ID of the loop's own, which its item_end, its
+// output and the turn's response all carry, and a call with an ID of
+// its own keeps it.
+func TestCallIDsNameOneCall(t *testing.T) {
+	cases := []struct {
+		name  string
+		turns [][]string
+		// kept are the IDs the transcript keeps as the model gave them.
+		kept []string
+	}{
+		{name: "unique", turns: [][]string{{"call_a", "call_b"}, {"call_c"}}, kept: []string{"call_a", "call_b", "call_c"}},
+		{name: "repeated across turns", turns: [][]string{{"call_0"}, {"call_0"}}, kept: []string{"call_0"}},
+		{name: "repeated in a response", turns: [][]string{{"call_0", "call_0"}}, kept: []string{"call_0"}},
+		{name: "empty", turns: [][]string{{"-", "-"}}},
+		{name: "repeated outside the alphabet", turns: [][]string{{"call.0:x"}, {"call.0:x"}}, kept: []string{"call.0:x"}},
+		{name: "two that map to one prefix", turns: [][]string{{"call.a", "call:a"}, {"call.a", "call:a"}}, kept: []string{"call.a", "call:a"}},
+		{name: "long", turns: [][]string{{longCallID + "1", longCallID + "2"}, {longCallID + "1", longCallID + "2"}}, kept: []string{longCallID + "1", longCallID + "2"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &callIDModel{turns: tc.turns}
+			events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")},
+				Config{Model: m, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}}))
+			if err != nil || end.Reason != ReasonDone {
+				t.Fatalf("err=%v reason=%s", err, end.Reason)
+			}
+			var ids, ended, turned []string
+			seen := map[string]bool{}
+			for _, item := range end.Items {
+				call, ok := item.(*openresponses.FunctionCall)
+				if !ok {
+					continue
+				}
+				if call.CallID == "" || seen[call.CallID] {
+					t.Errorf("call ID %q empty or repeated", call.CallID)
+				}
+				if !slices.Contains(tc.kept, call.CallID) && (!callIDAlphabet.MatchString(call.CallID) || len(call.CallID) > 64) {
+					t.Errorf("the loop's call ID %q is outside [A-Za-z0-9_-] or longer than 64", call.CallID)
+				}
+				seen[call.CallID] = true
+				ids = append(ids, call.CallID)
+			}
+			for _, item := range end.Items {
+				if out, ok := item.(*openresponses.FunctionCallOutput); ok && !seen[out.CallID] {
+					t.Errorf("output %q names no call", out.CallID)
+				}
+			}
+			for _, ev := range events {
+				switch e := ev.(type) {
+				case *ItemEnd:
+					if call, ok := e.Item.(*openresponses.FunctionCall); ok {
+						ended = append(ended, call.CallID)
+					}
+				case *TurnEnd:
+					for _, call := range e.Response.FunctionCalls() {
+						turned = append(turned, call.CallID)
+					}
+				}
+			}
+			n := 0
+			for _, turn := range tc.turns {
+				n += len(turn)
+			}
+			if len(ids) != n || strings.Join(ended, " ") != strings.Join(ids, " ") || strings.Join(turned, " ") != strings.Join(ids, " ") {
+				t.Errorf("transcript %q, item_end %q, responses %q", ids, ended, turned)
+			}
+			for _, id := range tc.kept {
+				if !slices.Contains(ids, id) {
+					t.Errorf("%s not kept in %q", id, ids)
+				}
+			}
+		})
+	}
+}
+
+// TestReservedCallIDs pins that a call whose ID the agent reserved runs
+// under an ID of the loop's own, as one repeating a call in the
+// transcript does, and that its item_end keeps the model's ID.
+func TestReservedCallIDs(t *testing.T) {
+	cases := []struct {
+		name string
+		// reserve is given to New, reserveLater to ReserveCallIDs and
+		// reserveCtx to the prompt's context.
+		reserve, reserveLater, reserveCtx []string
+		// left seeds a transcript holding call_0 that SetTranscript
+		// then replaces with an empty one, as a rewind does.
+		left bool
+		// want is the item_end's ModelCallID; empty when the call keeps
+		// its ID.
+		want string
+	}{
+		{name: "not reserved", reserve: []string{"call_1"}},
+		{name: "reserved at New", reserve: []string{"call_0"}, want: "call_0"},
+		{name: "reserved later", reserveLater: []string{"call_0"}, want: "call_0"},
+		{name: "reserved by the context", reserveCtx: []string{"call_0"}, want: "call_0"},
+		{name: "left by SetTranscript", left: true, want: "call_0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New(Config{Model: &callIDModel{turns: [][]string{{"call_0"}}}, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}},
+				WithReservedCallIDs(tc.reserve))
+			if err := a.ReserveCallIDs(tc.reserveLater...); err != nil {
+				t.Fatal(err)
+			}
+			if tc.left {
+				call := &openresponses.FunctionCall{CallID: "call_0", Name: "upper", Arguments: `{"text":"t"}`}
+				if err := a.SetTranscript(Transcript{openresponses.UserText("x"), call, openresponses.NewFunctionCallOutput("call_0", "T")}); err != nil {
+					t.Fatal(err)
+				}
+				if err := a.SetTranscript(nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var ends []*ItemEnd
+			a.Subscribe(func(_ context.Context, ev Event) error {
+				if e, ok := ev.(*ItemEnd); ok {
+					if _, ok := e.Item.(*openresponses.FunctionCall); ok {
+						ends = append(ends, e)
+					}
+				}
+				return nil
+			})
+			end, err := a.Prompt(ContextWithReservedCallIDs(context.Background(), tc.reserveCtx...), openresponses.UserText("x"))
+			if err != nil || end.Reason != ReasonDone || len(ends) != 1 {
+				t.Fatalf("err=%v end=%+v calls=%d", err, end, len(ends))
+			}
+			call := ends[0].Item.(*openresponses.FunctionCall)
+			renamed := call.CallID != "call_0"
+			if ends[0].ModelCallID != tc.want || renamed != (tc.want != "") || (renamed && !strings.HasPrefix(call.CallID, "call_0")) {
+				t.Errorf("call ID %q, model's %q", call.CallID, ends[0].ModelCallID)
+			}
+			for _, item := range end.Items {
+				if out, ok := item.(*openresponses.FunctionCallOutput); ok && out.CallID != call.CallID {
+					t.Errorf("output for %q, call is %q", out.CallID, call.CallID)
+				}
 			}
 		})
 	}

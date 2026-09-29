@@ -90,7 +90,10 @@
 //     run was prompted with carries the run's trigger as its source,
 //     other than an output Agent.Resume appends for a pending call,
 //     whose decision says who gave it, and a queued input the trigger
-//     it was queued with, Extra and all. An
+//     it was queued with, Extra and all. A function call the loop gave
+//     an ID of its own, since the model's repeated one in the session,
+//     carries the model's in a [ModelCallIDMember] member beside the
+//     item, as the format asks. An
 //     item the filter in force would hide from the model, an app-only
 //     extension item, is written as a custom entry
 //     instead so the path rebuilds exactly the input that was sent. A
@@ -112,10 +115,17 @@
 //     again. A call the path shows answered already, its output lost
 //     to a crash between the two or to a write that failed after the
 //     answer, gets its output alone; only an output answers it, and
-//     [Pending] reads it as [agentturn.PendingAnswered].
+//     [Pending] reads it as [agentturn.PendingAnswered]. A second
+//     output for a call whose output is on the path is refused with
+//     agentsession.ErrCallCompleted, since the context would hold two.
 //   - tool_start: the call's decision when there is one to record. A
 //     BeforeToolCall that blocked the call is a reject decision with
-//     its reason; one that deferred it is a hold carrying the same
+//     its reason, or an answer decision for a call that may have run,
+//     since the format keeps reject for a call no dispatch reached; a
+//     call a reject or an answer already ended gets nothing, since only
+//     its output may follow, and one with its output is refused with
+//     agentsession.ErrCallCompleted, since the output ended it and a
+//     loop deciding on it again has lost track of it; one that deferred it is a hold carrying the same
 //     reason, the rule that raised the prompt; one that rewrote the
 //     arguments, one that allowed the call and gave a reason, such as
 //     the grant that allowed it, or an approval through Agent.Resume of
@@ -143,7 +153,13 @@
 //     as idempotency_key. A call run again after a restart gets a
 //     second dispatch carrying the key of the one it repeats, so the
 //     path holds one per hand-off to the tool, and a reader counts the
-//     times it may have run.
+//     times it may have run. A dispatch for a call whose output is on
+//     the path is refused with agentsession.ErrCallCompleted, so the
+//     tool does not run again as the same call, and so is one for a
+//     call the path holds no function_call entry for, other than one
+//     the filter kept from the model, so no tool runs unrecorded. Every
+//     decision and dispatch names its call's function_call entry as
+//     target.
 //   - response_end: the response entry with status, usage, error and the
 //     request hash, after the items it produced and before any tool
 //     output of the turn; for a call Retry tried again, attempts, the
@@ -159,12 +175,9 @@
 //     its input; then the run entry with
 //     phase end, the reason in the
 //     format's terms and the IDs of the run's calls left without an
-//     output. The loop's reasons map onto the format's cascade: done
-//     as it is, input_required as it is when the run holds a call its
-//     own response made and, for a resume whose BeforeToolCall
-//     deferred a call an earlier run made, as aborted with
-//     input_required as ref, since the format reads a held call only
-//     in the run that made it, error with the error as ref,
+//     output, an earlier run's call this run wrote a decision or a
+//     dispatch for among them, as the format counts it. The loop's reasons map onto the format's cascade: done
+//     and input_required as they are, error with the error as ref,
 //     aborted as interrupted with the context error as ref, since the
 //     host asked for the stop, and stopped as stopped when the last
 //     response requested tools, as done when it did not, and, when the
@@ -352,6 +365,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -527,6 +541,12 @@ type Elicitation struct {
 	Error string `json:"error,omitempty"`
 }
 
+// ModelCallIDMember is the member of an item entry, beside its item,
+// that keeps the call ID the model gave a function call the loop gave
+// an ID of its own (agentturn.ItemEnd.ModelCallID): the format asks a
+// writer that replaces a repeated ID to keep the native one there.
+const ModelCallIDMember = "agentturn:model_call_id"
+
 // ErrRunActive is returned by [Recorder.Rebase] while a run is being
 // written.
 var ErrRunActive = errors.New("session: a run is active")
@@ -656,6 +676,11 @@ type writer struct {
 	// agentturn.Invoke, to the call whose tool made it, so a record the
 	// nested call writes names a call the path holds.
 	parents map[string]string
+	// appOnly holds the call IDs of function calls the filter kept from
+	// the model, written as custom entries: a dispatch for one has no
+	// entry to name and is not written, and a dispatch for any other
+	// call the writer does not know is refused.
+	appOnly map[string]bool
 	// detached is set for a child whose call returned while its run went
 	// on, so the writer is released at that run's end rather than at the
 	// call's.
@@ -870,7 +895,7 @@ func New(store agentsession.Store, sessionID string, opts ...Option) *Recorder {
 }
 
 func newWriter(r *Recorder, id string) *writer {
-	return &writer{rec: r, id: id, calls: map[string]*callRecord{}, linked: map[string]bool{}, parents: map[string]string{}}
+	return &writer{rec: r, id: id, calls: map[string]*callRecord{}, linked: map[string]bool{}, parents: map[string]string{}, appOnly: map[string]bool{}}
 }
 
 // Start creates a session from h and returns a recorder for it. When
@@ -977,13 +1002,10 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 			p.Reason = agentturn.PendingAborted
 		case agentsession.CallAnswered:
 			p.Reason = agentturn.PendingAnswered
+		case agentsession.CallRejected:
+			p.Reason = agentturn.PendingRejected
 		case agentsession.CallNeverStarted:
 			p.Reason = agentturn.PendingUndispatched
-		}
-		if (p.Reason == agentturn.PendingUndispatched || p.Reason == agentturn.PendingUnknown) && c.Rejected() {
-			// A reject ended the call before its tool, and the record
-			// stopped before the refusal's output.
-			p.Reason = agentturn.PendingRejected
 		}
 		var args string
 		switch {
@@ -1002,9 +1024,12 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 }
 
 // AgentOptions returns the options that seed an agent with the
-// session at its leaf: the context's items, and the pending calls as
+// session at its leaf: the context's items, the pending calls as
 // [Pending] reads them, so the agent's Resume holds only the calls
-// that may have run to the replay rule. It is what a host resuming a
+// that may have run to the replay rule, and every call ID in the
+// session as reserved, [CallIDs], so a call the model makes does not
+// take the ID of one a compaction folded out of the context or another
+// branch holds, which the format refuses. It is what a host resuming a
 // session passes to agentturn.New.
 func AgentOptions(s *agentsession.Session) ([]agentturn.Option, error) {
 	cx, err := s.Context()
@@ -1015,7 +1040,29 @@ func AgentOptions(s *agentsession.Session) ([]agentturn.Option, error) {
 	if err != nil {
 		return nil, err
 	}
-	return []agentturn.Option{agentturn.WithTranscript(cx.Items), agentturn.WithPending(pending)}, nil
+	ids, err := CallIDs(s)
+	if err != nil {
+		return nil, err
+	}
+	return []agentturn.Option{agentturn.WithTranscript(cx.Items), agentturn.WithPending(pending), agentturn.WithReservedCallIDs(ids)}, nil
+}
+
+// CallIDs returns the call ID of every function call in the session,
+// on every branch, those a compaction folded out of a context included:
+// the IDs agentturn.WithReservedCallIDs keeps a call the model makes
+// from taking, since the format names one call by a call ID in the
+// whole session and refuses one another branch holds. A rewind or a
+// fork leaves the calls of the branch it left in the session.
+func CallIDs(s *agentsession.Session) ([]string, error) {
+	var ids []string
+	for _, e := range s.Entries() {
+		if ie, ok := e.(*agentsession.ItemEntry); ok {
+			if call, ok := ie.Item.(*openresponses.FunctionCall); ok && call.CallID != "" {
+				ids = append(ids, call.CallID)
+			}
+		}
+	}
+	return ids, nil
 }
 
 // ReplayAnswers applies agenttool's rule for running a call again to
@@ -1211,7 +1258,11 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 // caller's to set, with Agent.SetTranscript from s.Context().Items and
 // then Agent.SetPending from [Pending], so a call held on the branch
 // is approved as a held call and one that may have run is held to the
-// replay rule.
+// replay rule. Rebase reserves every call ID in the session, [CallIDs],
+// on the agent [Recorder.Attach] attached, so a call the model makes
+// does not take the ID of one the context leaves out or the branch
+// left behind holds; a host driving another agent calls
+// Agent.ReserveCallIDs with them itself.
 //
 // A rebase appends nothing of its own, with two exceptions the format
 // asks of the writer that continues a path. An entry inside a run, a
@@ -1256,7 +1307,10 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 		for _, in := range w.inbox {
 			in.entry = ""
 		}
-		return w.requeue(ctx)
+		if err := w.requeue(ctx); err != nil {
+			return err
+		}
+		return r.reserve(s)
 	}
 	if err := s.Branch(entryID); err != nil {
 		return fmt.Errorf("session: rebase: %w", err)
@@ -1281,7 +1335,26 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 	if err := w.requeue(ctx); err != nil {
 		return err
 	}
-	return w.seed(s, false)
+	if err := w.seed(s, false); err != nil {
+		return err
+	}
+	return r.reserve(s)
+}
+
+// reserve reserves every call ID in the session on the attached agent,
+// for a rebase.
+func (r *Recorder) reserve(s *agentsession.Session) error {
+	if r.agent == nil {
+		return nil
+	}
+	ids, err := CallIDs(s)
+	if err != nil {
+		return err
+	}
+	if err := r.agent.ReserveCallIDs(ids...); err != nil {
+		return fmt.Errorf("session: rebase: %w", err)
+	}
+	return nil
 }
 
 // endInbox closes the inbox at a run end: an input the agent holds is
@@ -1485,8 +1558,9 @@ func (r *Recorder) reopen(ctx context.Context) (*writer, error) {
 	}
 	w := newWriter(r, id)
 	for _, c := range calls {
-		w.calls[c.ID()] = &callRecord{entry: c.Entry.Base().ID, args: c.Call.Arguments}
+		w.calls[c.ID()] = callRecordOf(c, s.Header())
 	}
+	w.appOnly = appOnlyCalls(s.Path(s.Leaf()))
 	for _, e := range s.Path(s.Leaf()) {
 		c, ok := e.(*agentsession.CustomEntry)
 		if !ok || c.NS != NestedCallNS {
@@ -1596,6 +1670,7 @@ func (w *writer) reset() {
 	w.base = ""
 	w.attempt, w.attemptModel, w.retries = nil, "", 0
 	w.parents = map[string]string{}
+	w.appOnly = map[string]bool{}
 }
 
 // seed sets the writer's state from the session at its leaf.
@@ -1632,18 +1707,48 @@ func (w *writer) seed(s *agentsession.Session, owed bool) error {
 			w.inbox = append(w.inbox, &inboxItem{item: q.Item, mode: q.Mode, trigger: q.Trigger, entry: q.ID})
 		}
 	}
-	pending, err := s.PendingCalls(s.Leaf())
+	// Every call on the path, a call with its output included, so a
+	// decision or dispatch for one the path has ended is skipped or
+	// refused here rather than by the store.
+	calls, err := s.Calls(s.Leaf())
 	if err != nil {
-		return fmt.Errorf("session: pending calls at leaf: %w", err)
+		return fmt.Errorf("session: calls at leaf: %w", err)
 	}
-	for _, c := range pending {
-		w.calls[c.ID()] = &callRecord{
-			entry: c.Entry.Base().ID, args: c.Call.Arguments,
-			held: c.Held(), dispatched: len(c.Dispatches) > 0, rejected: c.Rejected(), ended: c.Answered(),
-			unknown: c.State(s.Header()) == agentsession.CallUnknown,
+	for _, c := range calls {
+		w.calls[c.ID()] = callRecordOf(c, s.Header())
+	}
+	w.appOnly = appOnlyCalls(s.Path(s.Leaf()))
+	return nil
+}
+
+// appOnlyCalls returns the call IDs of the function calls on path
+// written as custom entries, since the filter kept them from the model.
+func appOnlyCalls(path []agentsession.Entry) map[string]bool {
+	ids := map[string]bool{}
+	for _, e := range path {
+		c, ok := e.(*agentsession.CustomEntry)
+		if !ok || c.NS != openresponses.ItemTypeFunctionCall {
+			continue
+		}
+		var call openresponses.FunctionCall
+		if json.Unmarshal(c.Data, &call) == nil {
+			ids[call.CallID] = true
 		}
 	}
-	return nil
+	return ids
+}
+
+// callRecordOf is what the path holds for a call, for a writer seeded
+// from it.
+func callRecordOf(c *agentsession.Call, h agentsession.Header) *callRecord {
+	if c.Output != nil {
+		return &callRecord{entry: c.Entry.Base().ID, args: c.Call.Arguments, dispatched: len(c.Dispatches) > 0, answered: true}
+	}
+	return &callRecord{
+		entry: c.Entry.Base().ID, args: c.Call.Arguments,
+		held: c.Held(), dispatched: len(c.Dispatches) > 0, rejected: c.Rejected(), ended: c.Answered(),
+		unknown: c.State(h) == agentsession.CallUnknown,
+	}
 }
 
 // hasConfig reports whether a config entry is on the path.
@@ -1693,6 +1798,12 @@ func SessionIDFromContext(ctx context.Context) string {
 // derived one, writes that child elsewhere; the context then names a
 // session the run did not go to, which is the one case this is wrong
 // and the one where nothing was recorded properly anyway.
+//
+// When the store already holds the child's session, because the call
+// runs again, the context also reserves every call ID in it with
+// agentturn.ContextWithReservedCallIDs: the child's agent is new and
+// knows none of the calls its earlier runs made, and the format names
+// one call by a call ID in the whole session.
 func (r *Recorder) ChildContext(ctx context.Context, callID string) context.Context {
 	if callID == "" {
 		return ctx
@@ -1702,9 +1813,15 @@ func (r *Recorder) ChildContext(ctx context.Context, callID string) context.Cont
 	if p, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
 		parent = p
 	}
-	id := parent.id
+	id := agentsession.SubsessionID(parent.id, callID)
 	r.mu.Unlock()
-	return ContextWithSessionID(ctx, agentsession.SubsessionID(id, callID))
+	ctx = ContextWithSessionID(ctx, id)
+	if s, err := r.store.Open(context.WithoutCancel(ctx), id); err == nil {
+		if ids, err := CallIDs(s); err == nil {
+			ctx = agentturn.ContextWithReservedCallIDs(ctx, ids...)
+		}
+	}
+	return ctx
 }
 
 // SessionID returns the ID of the session being written.
@@ -2007,7 +2124,7 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 		if err != nil {
 			return err
 		}
-		return w.item(ctx, e.Item, e.ResponseID, e.Hidden, source)
+		return w.item(ctx, e.Item, e.ResponseID, e.Hidden, source, e.ModelCallID)
 	case *agentturn.ResponseEnd:
 		return w.response(ctx, e)
 	case *agentturn.ToolStart:
@@ -2542,17 +2659,24 @@ func (w *writer) instructionParts(ctx context.Context, req openresponses.Request
 // the reject that ends it, and one for a call that may have run by the
 // answer that ends it; an item the caller marked with
 // agentturn.Hidden is written with visible false. source is the run's
-// trigger for an item the run was prompted with.
-func (w *writer) item(ctx context.Context, item openresponses.Item, responseID string, hidden bool, source *agentsession.Trigger) error {
+// trigger for an item the run was prompted with, and modelCallID the
+// ID the model gave a call the loop renamed.
+func (w *writer) item(ctx context.Context, item openresponses.Item, responseID string, hidden bool, source *agentsession.Trigger, modelCallID string) error {
 	if item == nil {
 		return nil
 	}
 	if out, ok := item.(*openresponses.FunctionCallOutput); ok && !w.replay {
 		c := w.calls[out.CallID]
 		switch {
+		case c != nil && c.answered:
+			// The path has the call's output, which ended it; a second
+			// one is a harness that lost track of the call, and would
+			// put two outputs for one call in the context.
+			return fmt.Errorf("session: output of call %s: %w", out.CallID, agentsession.ErrCallCompleted)
 		case c == nil || c.rejected || c.ended:
 			// Nothing to anchor a decision to, or the call's fate is
-			// on the path already: after an answer, only its output.
+			// on the path already: after a reject or an answer, only
+			// its output.
 		case c.dispatched && c.dispatchRun != "" && c.dispatchRun == w.run:
 			// The tool's own output: the dispatch is the record.
 		case c.dispatched || c.unknown:
@@ -2581,6 +2705,7 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 			// an output writes it, an approval's dispatch is refused
 			// by the store, and a recorder reseeded from the path
 			// reads the call as PendingAnswered.
+			w.takeUp(out.CallID)
 			c.held, c.ended = false, true
 		default:
 			// The caller wrote the output themselves: the call never
@@ -2607,6 +2732,7 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 			if _, err := w.append(ctx, dec); err != nil {
 				return err
 			}
+			w.takeUp(out.CallID)
 			c.held, c.rejected = false, true
 		}
 	}
@@ -2626,6 +2752,13 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		if hidden {
 			visible := false
 			e.Visible = &visible
+		}
+		if modelCallID != "" {
+			raw, err := json.Marshal(modelCallID)
+			if err != nil {
+				return fmt.Errorf("session: encode model call ID: %w", err)
+			}
+			e.Unknown = map[string]json.RawMessage{ModelCallIDMember: raw}
 		}
 		entry = e
 	}
@@ -2652,6 +2785,12 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 	w.custom = append(w.custom, appOnly)
 	switch v := item.(type) {
 	case *openresponses.FunctionCall:
+		if appOnly {
+			// A custom entry is no function call a decision or a
+			// dispatch can name by target, nor one a run end lists.
+			w.appOnly[v.CallID] = true
+			break
+		}
 		w.calls[v.CallID] = &callRecord{entry: id, args: v.Arguments}
 		w.open = append(w.open, v.CallID)
 	case *openresponses.FunctionCallOutput:
@@ -2685,6 +2824,17 @@ func (w *writer) close(callID string) {
 			return
 		}
 	}
+}
+
+// takeUp adds a call an earlier run made to the run's open list once
+// the run writes a decision or a dispatch for it: the format counts
+// such a call among the run's own, so its end lists the call while it
+// has no output.
+func (w *writer) takeUp(callID string) {
+	if c := w.calls[callID]; c == nil || c.answered || slices.Contains(w.open, callID) {
+		return
+	}
+	w.open = append(w.open, callID)
 }
 
 // outputText is the text of an output, for a reject's reason.
@@ -2732,6 +2882,16 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 		// there is no entry to anchor a record to.
 		return nil
 	}
+	if c.answered {
+		// The output ended the call: a harness that decides on it again
+		// has lost track of it, and whatever it decides has nowhere to
+		// go on the path.
+		return fmt.Errorf("session: decision on call %s: %w", e.CallID, agentsession.ErrCallCompleted)
+	}
+	if c.rejected || c.ended {
+		// The call's fate is on the path: only its output may follow.
+		return nil
+	}
 	d := e.Decision
 	// A call an earlier run dispatched goes to its tool again only on
 	// an approval, which names its decider as a held call's does.
@@ -2751,9 +2911,20 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 			if reason == "" {
 				reason = "call blocked"
 			}
+			if c.dispatched || c.unknown {
+				// A call that may have run is ended by an answer: the
+				// format keeps reject for a call no dispatch reached.
+				if _, err := w.append(ctx, agentsession.NewDecision(e.CallID, c.entry, agentsession.VerdictAnswer, by).WithReason(reason)); err != nil {
+					return err
+				}
+				w.takeUp(e.CallID)
+				c.held, c.ended = false, true
+				return nil
+			}
 			if _, err := w.append(ctx, agentsession.NewDecision(e.CallID, c.entry, agentsession.VerdictReject, by).WithReason(reason)); err != nil {
 				return err
 			}
+			w.takeUp(e.CallID)
 			c.held, c.rejected = false, true
 			return nil
 		case agentturn.Defer:
@@ -2766,12 +2937,10 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 			if _, err := w.append(ctx, hold); err != nil {
 				return err
 			}
+			w.takeUp(e.CallID)
 			c.held = true
 			return nil
 		}
-	}
-	if c.rejected {
-		return nil
 	}
 	// An allowed call is recorded when something was decided about it:
 	// it was held and is now approved, its arguments were rewritten, or
@@ -2791,6 +2960,7 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 		if _, err := w.append(ctx, dec); err != nil {
 			return err
 		}
+		w.takeUp(e.CallID)
 	} else if again {
 		c.again = &by
 	}
@@ -2815,8 +2985,19 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 		return nil
 	}
 	c := w.calls[e.CallID]
+	if c == nil && !w.appOnly[e.CallID] {
+		// No function call on the path for the dispatch to name: the
+		// agent holds a call the record does not, and its tool would
+		// run with nothing written for it.
+		return fmt.Errorf("session: dispatch of call %s: no function call on the path", e.CallID)
+	}
 	if c == nil || c.rejected || (c.dispatched && c.dispatchRun == w.run) {
 		return nil
+	}
+	if c.answered {
+		// The output ended the call, and the format reads a tool run
+		// after it as a new call: refusing the dispatch stops the tool.
+		return fmt.Errorf("session: dispatch of call %s: %w", e.CallID, agentsession.ErrCallCompleted)
 	}
 	if c.again != nil {
 		// Running a call again is the harness's choice, and the format
@@ -2825,12 +3006,14 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 		if _, err := w.append(ctx, dec); err != nil {
 			return err
 		}
+		w.takeUp(e.CallID)
 		c.again = nil
 	}
 	d := agentsession.NewDispatch(e.CallID, c.entry).WithIdempotencyKey(e.IdempotencyKey)
 	if _, err := w.append(ctx, d); err != nil {
 		return err
 	}
+	w.takeUp(e.CallID)
 	c.dispatched, c.dispatchRun, c.unknown = true, w.run, false
 	return nil
 }
@@ -2925,13 +3108,6 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 	case agentturn.ReasonDone:
 		return agentsession.ReasonDone, ""
 	case agentturn.ReasonInputRequired:
-		if !w.heldInRun() {
-			// A resume whose BeforeToolCall deferred a call that never
-			// started ends before its first model call, holding a call
-			// an earlier run made: the format reads a held call only in
-			// the segment its item is in, and this one as aborted.
-			return agentsession.ReasonAborted, string(e.Reason)
-		}
 		return agentsession.ReasonInputRequired, ""
 	case agentturn.ReasonError:
 		return agentsession.ReasonError, errText(e.Err)
@@ -2980,16 +3156,6 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 		return agentsession.ReasonDone, cause
 	}
 	return string(e.Reason), ""
-}
-
-// heldInRun reports whether a call the run appended is held.
-func (w *writer) heldInRun() bool {
-	for _, id := range w.open {
-		if c := w.calls[id]; c != nil && c.held {
-			return true
-		}
-	}
-	return false
 }
 
 // pendingOnPath reports whether any call the writer knows of is still
@@ -3160,7 +3326,7 @@ func (w *writer) child(ctx context.Context, callID string, info agent.ChildInfo)
 		if isModelOutput(item) {
 			responseID = info.RunID
 		}
-		if err := cw.item(ctx, item, responseID, false, nil); err != nil {
+		if err := cw.item(ctx, item, responseID, false, nil, ""); err != nil {
 			return err
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -77,10 +78,70 @@ func verifyAllUnhashed(t *testing.T, s *agentsession.Session, want int) int {
 	if unhashed != want {
 		t.Errorf("responses the record cannot rebuild = %d, want %d", unhashed, want)
 	}
-	if err := s.VerifyRecords(s.Leaf()); err != nil {
-		t.Errorf("verify records: %v", err)
+	leaves := s.Leaves()
+	if !slices.Contains(leaves, s.Leaf()) {
+		leaves = append(leaves, s.Leaf())
+	}
+	for _, leaf := range leaves {
+		if err := s.VerifyRecords(leaf); err != nil {
+			t.Errorf("verify records at %s: %v", leaf, err)
+		}
+		verifySources(t, s, leaf)
 	}
 	return n
+}
+
+// verifySources checks the source of every run start on the path to
+// leaf against the format's rule, which VerifyRecords does not: a run
+// is a resume when the first function call output, decision or
+// dispatch of its segment takes up a call that had no output on the
+// path when the run began, messages before it aside.
+func verifySources(t *testing.T, s *agentsession.Session, leaf string) {
+	t.Helper()
+	runs, err := s.Runs(leaf)
+	if err != nil {
+		t.Errorf("runs at %s: %v", leaf, err)
+		return
+	}
+	for _, r := range runs {
+		before := r.Path[:len(r.Path)-len(r.Segment)]
+		open := map[string]string{}
+		for _, c := range agentsession.Calls(before) {
+			if c.Output == nil {
+				open[c.Entry.ID] = c.ID()
+			}
+		}
+		want := agentsession.SourceInput
+	scan:
+		for _, e := range r.Segment {
+			switch v := e.(type) {
+			case *agentsession.ItemEntry:
+				out, ok := v.Item.(*openresponses.FunctionCallOutput)
+				if !ok {
+					continue
+				}
+				for _, id := range open {
+					if id == out.CallID {
+						want = agentsession.SourceResume
+					}
+				}
+				break scan
+			case *agentsession.DecisionEntry:
+				if open[v.Target] != "" {
+					want = agentsession.SourceResume
+				}
+				break scan
+			case *agentsession.DispatchEntry:
+				if open[v.Target] != "" {
+					want = agentsession.SourceResume
+				}
+				break scan
+			}
+		}
+		if r.Start.Source != want {
+			t.Errorf("run %s wrote source %s, its segment reads %s", r.RunID(), r.Start.Source, want)
+		}
+	}
 }
 
 func TestRecordsEveryEventAndVerifies(t *testing.T) {

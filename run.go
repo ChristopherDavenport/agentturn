@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"strings"
 	"sync"
 	"time"
 
@@ -202,6 +203,7 @@ type steeredKey struct{}
 type triggerKey struct{}
 type decidersKey struct{}
 type reasonsKey struct{}
+type reservedKey struct{}
 
 // ContextWithTrigger attaches a [Trigger] to ctx. A run started with
 // that context, through [Run], [Continue] or an [Agent], carries it on
@@ -216,6 +218,34 @@ func ContextWithTrigger(ctx context.Context, t Trigger) context.Context {
 func TriggerFromContext(ctx context.Context) Trigger {
 	t, _ := ctx.Value(triggerKey{}).(Trigger)
 	return t
+}
+
+// ContextWithReservedCallIDs attaches call IDs a call the model makes
+// in a run started with ctx must not take, beside those the agent
+// reserved with [WithReservedCallIDs] and those an outer context
+// attached: the IDs a record holds that the run's transcript does not,
+// such as a child session reopened under the call that made it, whose
+// new agent knows none of the calls its earlier runs made. The session
+// package's Recorder.ChildContext attaches them for a child run.
+func ContextWithReservedCallIDs(ctx context.Context, ids ...string) context.Context {
+	if len(ids) == 0 {
+		return ctx
+	}
+	reserved := map[string]bool{}
+	for id := range reservedFromContext(ctx) {
+		reserved[id] = true
+	}
+	for _, id := range ids {
+		reserved[id] = true
+	}
+	return context.WithValue(ctx, reservedKey{}, reserved)
+}
+
+// reservedFromContext returns the call IDs attached to ctx by
+// [ContextWithReservedCallIDs], or nil.
+func reservedFromContext(ctx context.Context) map[string]bool {
+	reserved, _ := ctx.Value(reservedKey{}).(map[string]bool)
+	return reserved
 }
 
 // ContextWithDeciders attaches who decided the answer to each pending
@@ -499,6 +529,10 @@ type runner struct {
 	// started, so a call this run did not dispatch keeps the reason and
 	// the key an earlier run gave it.
 	prior []PendingCall
+	// reserved holds the call IDs the agent reserved, which a call the
+	// model makes must not take. The agent does not change it while the
+	// run is active. ctxReserved holds those the run's context names.
+	reserved, ctxReserved map[string]bool
 
 	// held are the completed items of the attempt in flight that the
 	// transcript does not have yet, because nothing has committed the
@@ -506,12 +540,17 @@ type runner struct {
 	// are appended when the attempt commits and dropped when it ends
 	// without committing.
 	held []heldItem
+	// callIDs maps the output index of a function call the attempt in
+	// flight completed to the call ID the loop gave it, for a call whose
+	// own ID was empty or named a call the transcript already holds.
+	callIDs map[int]string
 }
 
 // heldItem is a completed item waiting for its attempt to commit.
 type heldItem struct {
-	item       openresponses.Item
-	responseID string
+	item        openresponses.Item
+	responseID  string
+	modelCallID string
 }
 
 // emit delivers one event to the consumer. An Agent serialises them
@@ -582,6 +621,7 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 		r.runID = openresponses.NewID("run")
 	}
 	r.mark = len(r.transcript)
+	r.ctxReserved = reservedFromContext(ctx)
 	// Everything the run calls, transform, hooks, model and tools, can
 	// tell which run it serves.
 	ctx = ContextWithRunID(ctx, r.runID)
@@ -1023,7 +1063,7 @@ func sleep(ctx context.Context, d time.Duration) error {
 // policy sees the transport or wire error itself.
 func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *openresponses.Response, committed bool, err error) {
 	var acc openresponses.Accumulator
-	r.held = nil
+	r.held, r.callIDs = nil, nil
 	for ev, err := range openresponses.Events(ctx, r.cfg.Model, req) {
 		if err != nil {
 			return nil, committed, err
@@ -1048,6 +1088,7 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 	if resp == nil {
 		return nil, committed, openresponses.ErrTruncatedStream
 	}
+	resp = r.renameCalls(resp)
 	if resp.Status != openresponses.ResponseStatusFailed {
 		// The response arrived, so what the attempt completed on the
 		// way to it is the model's output and belongs in the
@@ -1101,6 +1142,12 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		return commits, r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, ResponseID: responseID})
 	case *openresponses.OutputItemDoneEvent:
 		item := e.Item
+		modelCallID := ""
+		if call, ok := item.(*openresponses.FunctionCall); ok {
+			if unique := r.uniqueCall(call, e.OutputIndex); unique != call {
+				item, modelCallID = unique, call.CallID
+			}
+		}
 		if m, ok := item.(*openresponses.Message); ok && r.cfg.OutputGuard != nil {
 			// The guard sees the message before anything keeps it.
 			var before openresponses.Items
@@ -1118,12 +1165,12 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		if !committed {
 			// Nothing commits the attempt yet, so the item waits: a
 			// failure now is retried and leaves no trace.
-			r.held = append(r.held, heldItem{item: item, responseID: responseID})
+			r.held = append(r.held, heldItem{item: item, responseID: responseID, modelCallID: modelCallID})
 			return false, nil
 		}
 		r.transcript = append(r.transcript, item)
 		r.added = append(r.added, item)
-		return false, r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, ResponseID: responseID})
+		return false, r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, ResponseID: responseID, ModelCallID: modelCallID})
 	case *openresponses.ErrorEvent:
 		return false, &wireError{err: e.Err()}
 	}
@@ -1131,6 +1178,82 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		return false, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[idx], Stream: ev, ResponseID: responseID})
 	}
 	return false, nil
+}
+
+// uniqueCall returns call, or a copy with a call ID of the loop's own
+// when the model gave none, one a call in the transcript already has,
+// or one the agent or the run's context reserved: a call ID names one
+// call, since an output, a pending list and the session record name the
+// call by it alone. The new ID is the model's, in the alphabet every
+// provider takes, with a random suffix, so it names no call a fold took
+// out of the transcript or another branch of the session holds either.
+// The item_start and item_update events of the call carry the model's
+// ID; its item_end, the transcript, the response the turn acts on and
+// every later request carry the new one.
+func (r *runner) uniqueCall(call *openresponses.FunctionCall, index int) *openresponses.FunctionCall {
+	taken := call.CallID == "" || r.reserved[call.CallID] || r.ctxReserved[call.CallID]
+	for _, item := range r.transcript {
+		if c, ok := item.(*openresponses.FunctionCall); ok && c.CallID == call.CallID {
+			taken = true
+			break
+		}
+	}
+	if !taken {
+		return call
+	}
+	renamed := *call
+	renamed.CallID = openresponses.NewID(callIDPrefix(call.CallID))
+	if r.callIDs == nil {
+		r.callIDs = map[int]string{}
+	}
+	r.callIDs[index] = renamed.CallID
+	return &renamed
+}
+
+// maxCallIDPrefix is the longest prefix callIDPrefix keeps, so the ID
+// with openresponses.NewID's '_' and 24 hex digits is at most 64
+// characters, which OpenAI and Anthropic both take.
+const maxCallIDPrefix = 64 - 1 - 24
+
+// callIDPrefix is the model's call ID with every character outside
+// letters, digits, '_' and '-' replaced by '_', the alphabet every
+// provider takes for a call ID, cut to maxCallIDPrefix, or "call" when
+// it is empty. The ID the loop gives a call is sent to the provider in
+// the next request, which may not be the one that made it. Two IDs
+// that give one prefix still give two IDs, since the suffix is random.
+func callIDPrefix(id string) string {
+	if id == "" {
+		return "call"
+	}
+	prefix := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			return r
+		}
+		return '_'
+	}, id)
+	return prefix[:min(len(prefix), maxCallIDPrefix)]
+}
+
+// renameCalls gives the function calls of a response the call IDs
+// uniqueCall gave them when they completed, so the calls the turn runs
+// are the ones the transcript holds.
+func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Response {
+	if len(r.callIDs) == 0 {
+		return resp
+	}
+	out := *resp
+	out.Output = append(openresponses.Items(nil), resp.Output...)
+	for index, id := range r.callIDs {
+		if index < len(out.Output) {
+			if call, ok := out.Output[index].(*openresponses.FunctionCall); ok {
+				renamed := *call
+				renamed.CallID = id
+				out.Output[index] = &renamed
+			}
+		}
+	}
+	return &out
 }
 
 // wireError carries an error event off the stream, so the attempt can
@@ -1160,7 +1283,7 @@ func (r *runner) flushHeld() error {
 	for _, h := range held {
 		r.transcript = append(r.transcript, h.item)
 		r.added = append(r.added, h.item)
-		if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: h.item, ResponseID: h.responseID}); err != nil {
+		if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: h.item, ResponseID: h.responseID, ModelCallID: h.modelCallID}); err != nil {
 			return err
 		}
 	}

@@ -8,8 +8,41 @@ versions may break the API.
 ## Unreleased
 
 - Requires `agenttool` v0.0.11, up from v0.0.10, and `agentsession`
-  v0.0.12, up from v0.0.11. The session recorder writes
+  v0.0.15, up from v0.0.11. The session recorder writes
   `agentsession/0.9`, and v0.0.11 of agentsession refuses a 0.9 file.
+  Under v0.0.15's reading of 0.9 a call ID names one call in the whole
+  session, on any branch: `session.CallIDs`, and so `AgentOptions` and
+  `Recorder.Rebase`, a rebase to `""` included, reserve every call ID
+  in the session rather than those on the path, and
+  `Recorder.ChildContext` reserves those of a child session reopened
+  under its call. A writer seeded from a path knows every call on it,
+  those with an output included, so a decision, a dispatch or a
+  second output after a call's output is refused with
+  `ErrCallCompleted` rather than written, failing the run, and a
+  dispatch for a call the path holds no function call entry for is
+  refused, so its tool does not run unrecorded. A function call the
+  filter writes as a custom entry takes no decision or dispatch,
+  whose `target` must name a function call. The recorder writes a run end's
+  `pending` list with the earlier runs' calls the run wrote a decision
+  or a dispatch for, so a resume whose BeforeToolCall defers a call
+  that never started ends `input_required` with that call pending; a
+  block of a call that may have run is an `answer`, where it was a
+  `reject`, which the format now refuses after a `dispatch`; and a call
+  a `reject` or an `answer` ended gets no further decision.
+  `session.Pending` reads a call rejected before its output from
+  agentsession's `CallRejected`.
+- **A call ID names one call.** A function call the model gives no
+  call ID, or one a call in the transcript already has, takes an ID of
+  the loop's own when it completes, the model's with a random suffix:
+  its `ItemEnd`, the transcript, its output, the response the turn
+  runs and every later request carry it, and only its `ItemStart` and
+  `ItemUpdate` carry the model's. The model's ID is kept in letters,
+  digits, `_` and `-`, the alphabet Anthropic takes, with anything else
+  replaced by `_`, and cut so the new ID is at most 64 characters. `ContextWithReservedCallIDs` reserves IDs for the
+  runs started with a context, and `Agent.SetTranscript` keeps the IDs
+  of the transcript it replaces reserved. A provider that numbered its calls per response had a later
+  call's output matched to an earlier call, and agentsession v0.0.13
+  refuses the repeated call, which failed the run.
 - **The recorder writes the omitted list as keeps.** Under
   `session.WithInstructionsParts`, a config delta that changes
   `instructions_omitted` now writes it as `Settings.OmittedDelta`
@@ -81,10 +114,7 @@ versions may break the API.
   before the refusal's output is pending as the new `PendingRejected`
   rather than as never started: it takes only an output, an approval
   returns `ErrCallAnswered`, and `session.ReplayAnswers` answers it
-  with the reject's reason. The session recorder writes the end of a
-  resume that a deferral ends before its first model call as `aborted`
-  with `input_required` as its ref, which is what the format reads of
-  a run holding a call it did not append. (#159)
+  with the reject's reason. (#159)
 - The outputs `Agent.Resume` appends for pending calls carry no
   trigger on their `item_end`, so the session recorder writes no
   `source` on them: their decision says who gave them, and a policy's
@@ -114,6 +144,24 @@ versions may break the API.
   items, under which a never-started call's approval is held to the
   replay rule and refused; the package doc resumes a session with
   both. (#167)
+- **Call IDs a record holds stay taken.** The new
+  `WithReservedCallIDs` and `Agent.ReserveCallIDs` name call IDs a
+  call the model makes must not take although the transcript does not
+  hold them; such a call is renamed as a repeat in the transcript is.
+  `session.AgentOptions` reserves every call ID on the path, the new
+  `session.CallIDs`, and `Recorder.Rebase` reserves them on the agent
+  it is attached to. An agent seeded with a session's context after a
+  fold did not see the calls the fold left out, so a provider that
+  numbers its calls per response reused one, agentsession refused it,
+  and the run failed.
+- `ItemEnd.ModelCallID` keeps the ID the model gave a call the loop
+  renamed, and the session recorder writes it beside the item in an
+  `agentturn:model_call_id` member, the new
+  `session.ModelCallIDMember`, as the format asks of a writer that
+  replaces an ID.
+- The Open Responses front relays a renamed call under the loop's ID,
+  the one its output names; it carried the model's, so a caller saw a
+  call and an output that did not match.
 
 ## v0.0.11 - 2026-09-29
 

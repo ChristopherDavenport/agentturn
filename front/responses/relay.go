@@ -162,6 +162,13 @@ func (r *relay) end(item openresponses.Item) error {
 			}
 			r.call = w
 		}
+		if v.CallID != "" {
+			// The loop gives a call whose ID the model repeated one of
+			// its own when the call completes, after the writer opened
+			// under the model's: the done item carries the loop's,
+			// which its output names.
+			r.call.Item().CallID = v.CallID
+		}
 		if rest, ok := strings.CutPrefix(v.Arguments, r.args.String()); ok && rest != "" {
 			if err := r.call.Arguments(rest); err != nil {
 				return err

@@ -116,6 +116,9 @@ type Agent struct {
 	// seeded is what WithPending gave, applied to the pending calls
 	// once every option has run.
 	seeded []PendingCall
+	// reserved holds the call IDs a record names beyond the transcript,
+	// which a call the model makes must not take.
+	reserved map[string]bool
 }
 
 type subscription struct {
@@ -159,6 +162,19 @@ func WithPending(pending []PendingCall) Option {
 	return func(a *Agent) {
 		a.seeded = append([]PendingCall(nil), pending...)
 	}
+}
+
+// WithReservedCallIDs names call IDs a call the model makes must not
+// take although the transcript does not hold them: the calls a
+// compaction folded out of a session's context, or a trim dropped, are
+// still on its path, those of a branch a rewind or a fork left are
+// still in the session, and a provider that numbers its calls per
+// response repeats their IDs. A call that repeats one runs under an ID
+// of the loop's own, as a call repeating one in the transcript does.
+// The session package's AgentOptions gives every call ID in a stored
+// session.
+func WithReservedCallIDs(ids []string) Option {
+	return func(a *Agent) { a.reserve(ids) }
 }
 
 // New builds an agent.
@@ -242,12 +258,20 @@ func (a *Agent) SetConfig(cfg Config) error {
 // not hold is forgotten, and whatever the new one is waiting on must be
 // answered through [Agent.Resume]. Queued Steer and FollowUp items are
 // kept and go to the next run on the new transcript; a host that does
-// not want them there reads them from [Agent.State] first.
+// not want them there reads them from [Agent.State] first. The call IDs
+// the old transcript holds stay reserved, as [Agent.ReserveCallIDs]
+// reserves them, since a session that recorded them holds them on the
+// branch the agent left.
 func (a *Agent) SetTranscript(t Transcript) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.running {
 		return ErrRunning
+	}
+	for _, item := range a.transcript {
+		if call, ok := item.(*openresponses.FunctionCall); ok && call.CallID != "" {
+			a.reserve([]string{call.CallID})
+		}
 	}
 	known := a.pending
 	a.transcript = append(Transcript(nil), t...)
@@ -272,6 +296,30 @@ func (a *Agent) SetPending(pending []PendingCall) error {
 	}
 	mergePending(a.pending, pending)
 	return nil
+}
+
+// ReserveCallIDs adds to the call IDs a call the model makes must not
+// take, as [WithReservedCallIDs] does for a new agent: after
+// [Agent.SetTranscript] to a session's context, with every call ID in
+// the session. The IDs reserved earlier stay reserved. It returns
+// [ErrRunning] while a run is active.
+func (a *Agent) ReserveCallIDs(ids ...string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		return ErrRunning
+	}
+	a.reserve(ids)
+	return nil
+}
+
+func (a *Agent) reserve(ids []string) {
+	for _, id := range ids {
+		if a.reserved == nil {
+			a.reserved = map[string]bool{}
+		}
+		a.reserved[id] = true
+	}
 }
 
 // State is a snapshot of the agent.
@@ -802,6 +850,7 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, approved
 			steered:    a.steerSignal,
 			runCtx:     runCtx,
 			prior:      prior,
+			reserved:   a.reserved,
 			runID:      runID,
 			resuming:   resuming,
 		}
