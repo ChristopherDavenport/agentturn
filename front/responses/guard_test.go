@@ -93,3 +93,58 @@ func TestOutputGuardSeesWhatPrecedes(t *testing.T) {
 		t.Errorf("output before the message = %q, response %q", got, info.ResponseID)
 	}
 }
+
+// TestRelayReplacementIsWellFormed drives the relay with the shapes a
+// guard's replacement can take over what was streamed, and checks that
+// the stream stays valid and ends holding the replacement.
+func TestRelayReplacementIsWellFormed(t *testing.T) {
+	text := func(s string) openresponses.Content { return &openresponses.OutputText{Text: s} }
+	refusal := func(s string) openresponses.Content { return &openresponses.Refusal{Refusal: s} }
+	type delta struct{ text, refusal string }
+	for _, tc := range []struct {
+		name        string
+		streamed    []delta
+		replacement openresponses.Contents
+		wantText    string
+		wantRefusal string
+	}{
+		{"text over text", []delta{{text: "secret"}}, openresponses.Contents{text("X")}, "X", ""},
+		{"text over text then refusal", []delta{{text: "secret"}, {refusal: "no"}}, openresponses.Contents{text("X")}, "X", ""},
+		{"text and refusal over text", []delta{{text: "secret"}}, openresponses.Contents{text("X"), refusal("R")}, "X", "R"},
+		{"refusal over text", []delta{{text: "secret"}}, openresponses.Contents{refusal("R")}, "", "R"},
+		{"two texts over text", []delta{{text: "secret"}}, openresponses.Contents{text("a"), text("b")}, "ab", ""},
+		{"nothing over text", []delta{{text: "secret"}}, nil, "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := &streamtest.Sink{}
+			resp := openresponses.NewResponse(openresponses.Request{Model: "m"})
+			rl := newRelay(sink, resp)
+			if err := rl.start(&openresponses.Message{Role: openresponses.RoleAssistant}); err != nil {
+				t.Fatal(err)
+			}
+			for _, d := range tc.streamed {
+				var ev openresponses.StreamEvent = &openresponses.OutputTextDeltaEvent{Delta: d.text}
+				if d.refusal != "" {
+					ev = &openresponses.RefusalDeltaEvent{Delta: d.refusal}
+				}
+				if err := rl.update(ev); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := rl.end(&openresponses.Message{Role: openresponses.RoleAssistant, Content: tc.replacement}); err != nil {
+				t.Fatal(err)
+			}
+			if err := rl.em.Complete(); err != nil {
+				t.Fatal(err)
+			}
+			if err := streamtest.Validate(sink.Events()); err != nil {
+				t.Fatalf("stream: %v", err)
+			}
+			msg := sink.Response().Output[0].(*openresponses.Message)
+			gotText, gotRefusal := messageText(msg)
+			if gotText != tc.wantText || gotRefusal != tc.wantRefusal {
+				t.Errorf("message = %q / %q, want %q / %q", gotText, gotRefusal, tc.wantText, tc.wantRefusal)
+			}
+		})
+	}
+}

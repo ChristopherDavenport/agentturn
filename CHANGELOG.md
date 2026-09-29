@@ -158,8 +158,12 @@ versions may break the API.
   streamed text and closed the message with the original; the deltas
   cannot be taken back, so a client renders on done. A request with
   the caller's tools, which calls the model once itself, now runs the
-  guard on each assistant message as the loop does; it ran none. A
-  message the guard kept streams exactly as before. (#108)
+  guard on each assistant message as the loop does, with no run ID and
+  turn 1; it ran none. A replacement of another shape than what was
+  streamed, a refusal over text or two parts over one, keeps the
+  stream well formed: the streamed parts are emptied at their indices
+  and the replacement's other parts are written after them. A message
+  the guard kept streams exactly as before. (#108)
 - `OutputInfo.Output` holds the items of the response that precede the
   message, and the guard's docs say that whether a message is the
   answer is unknown when it runs, since a model may speak before a

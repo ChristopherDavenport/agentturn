@@ -15,7 +15,11 @@
 //     and the caller's, and any function call it makes is emitted as an
 //     output item for the caller to run. Nothing is executed, not even a
 //     call to one of the agent's own tools, because a single response
-//     cannot interleave execution with the caller's turn.
+//     cannot interleave execution with the caller's turn. There is no
+//     run: Transform, BeforeModelCall and OutputGuard run as the loop
+//     runs them, the guard with no run ID and turn 1, and no other
+//     hook does, ShouldStopAfterTurn among them, so a guard that needs
+//     to know whether a message is final has nothing to ask here.
 //   - The request carries no tools. The agent owns the run: it executes
 //     its own tools through the loop until the model answers. The
 //     response output carries the assistant messages and reasoning the
