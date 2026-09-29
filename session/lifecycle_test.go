@@ -347,7 +347,8 @@ func TestAnnotateLandsBeforeTheTurnConfig(t *testing.T) {
 	// handling has already run when this subscriber annotates.
 	a.Subscribe(func(ctx context.Context, ev agentturn.Event) error {
 		if e, ok := ev.(*agentturn.TurnStart); ok {
-			return rec.Annotate(ctx, "app:render", manifest{Rendered: []string{"memory-1"}, Turn: e.Turn})
+			_, err := rec.Annotate(ctx, "app:render", manifest{Rendered: []string{"memory-1"}, Turn: e.Turn})
+			return err
 		}
 		return nil
 	})
@@ -380,18 +381,19 @@ func TestAnnotateLandsBeforeTheTurnConfig(t *testing.T) {
 	}
 	// Outside a run, the annotation goes to the recorder's session at
 	// its leaf; with a child's run on the context, to the child's.
-	if err := rec.Annotate(context.Background(), "app:idle", map[string]int{"n": 1}); err != nil {
+	id, err := rec.Annotate(context.Background(), "app:idle", map[string]int{"n": 1})
+	if err != nil {
 		t.Fatal(err)
 	}
 	entries := s.Entries()
-	if c, ok := entries[len(entries)-1].(*agentsession.CustomEntry); !ok || c.NS != "app:idle" {
-		t.Errorf("idle annotation = %+v", entries[len(entries)-1])
+	if c, ok := entries[len(entries)-1].(*agentsession.CustomEntry); !ok || c.NS != "app:idle" || c.ID != id {
+		t.Errorf("idle annotation = %+v, Annotate returned %q", entries[len(entries)-1], id)
 	}
 	child := agent.New(agentturn.Config{Name: "child", Model: &echo.Adapter{}},
 		agent.WithObserver(func(ctx context.Context, ev agentturn.Event) {
 			rec.Observe(ctx, ev)
 			if e, ok := ev.(*agentturn.TurnStart); ok {
-				_ = rec.Annotate(agentturn.ContextWithRunID(ctx, e.RunID), "app:child", "seen")
+				_, _ = rec.Annotate(agentturn.ContextWithRunID(ctx, e.RunID), "app:child", "seen")
 			}
 		}))
 	if err := a.SetConfig(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{child}}); err != nil {

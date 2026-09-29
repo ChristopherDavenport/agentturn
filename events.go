@@ -82,14 +82,17 @@ const (
 // job, a channel message, a user's turn. The loop learns nothing from
 // it; it carries the value from [ContextWithTrigger] to [RunStart] so a
 // recorder can write it. Kind is the category and Ref the instance; a
-// recorder joins them as "kind:ref" when both are set.
+// recorder joins them as "kind:ref" when both are set, and writes the
+// three apart as well. Source names the layer that took the input, a
+// gateway or a scheduler, and is not part of the joined string.
 type Trigger struct {
-	Kind string
-	Ref  string
+	Kind   string
+	Ref    string
+	Source string
 }
 
 // IsZero reports whether the trigger names nothing.
-func (t Trigger) IsZero() bool { return t.Kind == "" && t.Ref == "" }
+func (t Trigger) IsZero() bool { return t.Kind == "" && t.Ref == "" && t.Source == "" }
 
 // String returns "kind:ref", or whichever of the two is set.
 func (t Trigger) String() string {
@@ -280,7 +283,11 @@ func (*ToolStart) EventType() string { return EventToolStart }
 // serialised with the run's events, and a subscriber that fails on it
 // stops the call: it ends with that error and the tool does not run,
 // so a dispatch that could not be made durable is never followed by a
-// side effect the record cannot see. Parent is set for a nested call.
+// side effect the record cannot see. The call is then pending as
+// [PendingUndispatched]. Subscribers are called in registration order,
+// so a subscriber that vetoes a dispatch is registered before the
+// recorder: one registered after it refuses a call whose dispatch is
+// already durable. Parent is set for a nested call.
 type ToolDispatch struct {
 	RunID  string
 	Turn   int
@@ -412,6 +419,12 @@ const (
 	// in flight, after its tool_start. The tool may have run to
 	// completion, so its side effect may have happened.
 	PendingAborted PendingReason = "aborted"
+	// PendingUndispatched: a subscriber refused the call's
+	// tool_dispatch, so the loop did not hand it to its tool and the
+	// tool did not run. A recorder registered before the subscriber
+	// that refused has already written the dispatch; see
+	// [ToolDispatch].
+	PendingUndispatched PendingReason = "undispatched"
 	// PendingUnknown: the call was found without an output in a
 	// transcript the agent was seeded with, so the loop cannot say
 	// whether it ran. A session recorded with dispatch entries can.

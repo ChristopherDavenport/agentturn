@@ -260,7 +260,8 @@ A run has an ID the loop mints, carried on every event of the run and
 attached to the context of everything the run calls — the transform,
 the hooks, the model, the tools — so a tool that composes another agent
 can say which run it was called from. A **trigger** the caller attaches
-to the context, a kind and a reference in the caller's own terms, is
+to the context, a kind, a reference and the layer that took the input,
+in the caller's own terms, is
 carried on `run_start` and read by nothing in the loop; it is how a
 recorder learns what caused the run without the loop learning what a
 cron job is.
@@ -441,8 +442,9 @@ The revision MAY move the next attempt to another model or another
 setting, which is how a fallback chain lives in the loop rather than
 under it: the revised request is on the `model_retry` event, a recorder
 takes its settings, and the path names the model that answered rather
-than the one that did not. A fallback written as a model under the
-loop still works and still says nothing.
+than the one that did not, beside a record of each attempt that
+failed. A fallback written as a model under the loop still works and
+still says nothing.
 
 ### The batch
 
@@ -609,6 +611,7 @@ in transcript order, each with a reason:
 | --- | --- |
 | `deferred` | the decision hook handed the call to the caller in this run and nothing has answered it. The tool did not run |
 | `aborted` | the call was appended by this run and the run was cancelled or failed before its output was appended: while it was in flight, after its `tool_start`, or before it was reached, when the failure came earlier in the batch. The tool may have run to completion, so its side effect may have happened |
+| `undispatched` | a subscriber refused the call's `tool_dispatch`, so the loop did not hand it over and the tool did not run. A recorder that took the event before the subscriber that refused has already written the dispatch |
 | `unknown` | the call was in the transcript the run was given, so the loop cannot say whether it ran. A session recorded with dispatch entries can. A call approved on resume and then cut off reads `unknown` too, since the run did not append it, although the run knows it started |
 
 The pending list is empty for `done` and `stopped`. Whatever ended the
@@ -1056,17 +1059,18 @@ of the events.
 
 | event | entry |
 | --- | --- |
-| `run_start` | `run` start, with the loop's source as the format's and the trigger joined as `kind:ref`, or whichever is set, as `ref`; an `env` entry when the host supplies one and it changed; the full initial `config` from the configuration's base request when nothing has been written yet |
+| `run_start` | `run` start, with the loop's source as the format's, the trigger joined as `kind:ref`, or whichever is set, as `ref`, and the trigger's kind, ref and source apart as `trigger`; an `env` entry, compared with the last one written members it does not define included, when the host supplies one and it changed; the full initial `config` from the configuration's base request when nothing has been written yet, and a `config` delta from it when the configuration changed since the last run, so the items the new configuration's before-turn hook appends are filed under it |
 | `turn_start` | a `config` delta when the request's settings differ from the path's; the request hash is computed here and written on the response. When the host names the parts the request's instructions are composed of, and they join to the instructions sent, the entries carry `instructions_parts`, a delta naming the parts that moved and the others by hash, and `instructions_omitted` for what the host left out; parts that do not join are dropped and the string is written, since the record describes what was sent |
-| `model_retry` | a `config` delta when the revised request's settings differ |
+| `model_retry` | a record entry with the attempt, the error, the delay, the failed attempt's model and whether the retry policy revised the request, before the response of the attempt that answers; the revised request's settings are settled with that attempt, so only the attempt that answered is configured on the path |
 | `model_blocked` | a failed `response` carrying the hook's error and the request hash, so the call that was refused is told from one that was made and failed |
 | `item_end` | an `item`, with the display flag off for a hidden item. Before a caller-supplied output for a call that was neither dispatched nor rejected, a `reject` decision with the output's text as its reason and the decider the caller named, and `policy` as the decider when the loop refused the call itself in this run, for a name no tool has or arguments that are not an object; before one for a call dispatched in an earlier run, a `proceed` with the decider when one was named |
 | `response_end` | the `response`, with `request_hash` when the input the loop sent is the input the recorded path rebuilds, and none otherwise |
-| `tool_start` | a `decision`: `reject` with the reason for a block, `call blocked` when it gave none; `hold` for a defer, with the reason when given; `proceed` for a call that was held or whose arguments were rewritten, with the arguments. The decider is the decision's, and `policy` for a call nothing was holding whose decision names nobody. A nested call is a record entry instead |
-| `tool_dispatch` | a `dispatch`, durable before the event returns, so the tool runs after it or not at all; nothing for a nested call |
-| `tool_end` | a recordable details value as a record entry in its namespace; a nested call's record; for a child run that was not observed, its session written from the items it added and its `link`; an observed child's `link` and session are written by the observer from the child's own events, starting at its `run_start` |
+| `tool_start` | a `decision`: `reject` with the reason for a block, `call blocked` when it gave none; `hold` for a defer, with the reason when given; `proceed` for a call that was held, whose arguments were rewritten, with the arguments, or whose decision gave a reason, with the reason. The decider is the decision's, and `policy` for a call nothing was holding whose decision names nobody. A nested call is a record entry instead |
+| `tool_dispatch` | a `dispatch`, durable before the event returns, so the tool runs after it or not at all; nothing for a nested call. Subscribers are called in order, so one that vetoes a dispatch is registered before the recorder; one registered after it refuses a call whose dispatch is already durable |
+| `tool_end` | a recordable details value as a record entry in its namespace, its `call_id` naming the call, or for a nested call the call whose tool made it; a nested call's record; for a child run that was not observed, its session written from the items it added and its `link`; an observed child's `link` and session are written by the observer from the child's own events, starting at its `run_start` |
 | `turn_end` | nothing of its own |
-| `run_end` | first, when a `turn_start` had no `response_end`, a failed `response` carrying the run's error; then `run` end with the reason mapped onto the format's cascade: `done`, `input_required` and `error` as themselves, the error's text as `ref`; `aborted` as `interrupted` with the error's text, since the host asked; `stopped` as `stopped` when the last response made calls, as `done` when it made none, and for a run with no response of its own as `stopped` when it answered a pending call and left none, `aborted` otherwise, with the cause as `ref` |
+| `run_end` | first, when a `turn_start` had no `response_end`, a failed `response` carrying the run's error; then `run` end with the reason mapped onto the format's cascade: `done`, `input_required` and `error` as themselves, the error's text as `ref`; `aborted` as `interrupted` with the error's text, since the host asked; `stopped` as `stopped` when the last response made calls, as `done` when it made none, and for a run with no response of its own as `stopped` when it answered a pending call and left none, `aborted` otherwise, with the cause as `ref`, and for a guard's stop the cause followed by the guard's error |
+| a record a tool writes while it runs, a question it asks the user | a record entry at the leaf, its `call_id` naming the call on the tool's context when the session holds it, or the nearest call up a nested call's chain that it holds |
 | a fold the transform reports | a `compaction` naming what was kept and what was pinned, or a record entry for a fold that failed |
 | `queued` | nothing today; the format has `queued`, and writing it is open (#67). The loop's follow-up mode is spelled `follow_up` and the format's `followup`; a writer maps the one onto the other |
 
@@ -1110,8 +1114,9 @@ maps onto it as follows:
 | source | `Source`: `SourceInput`, `SourceResume` |
 | events | `Event` with `EventType()`; `RunStart`, `TurnStart`, `ModelRetry`, `ModelBlocked`, `ItemStart`, `ItemUpdate`, `ItemEnd`, `ResponseEnd`, `ToolStart`, `ToolDispatch`, `ToolUpdate`, `ToolEnd`, `TurnEnd`, `RunEnd`, `Queued`; the `Event*` name constants |
 | tool recorder | `Config.ToolRecorder`, the executor's recorder for every batch; `session.Recorder.RecordFunc` is the value a session recorder offers |
+| tool elicitor | `Config.ToolElicitor`, installed on every tool call's context; `session.Recorder.Elicitor(by, fn)` wraps one so the question and the answer are recorded under the call |
 | reason, cause | `Reason` (`ReasonDone`, `ReasonStopped`, `ReasonInputRequired`, `ReasonAborted`, `ReasonError`); `StopCause` (`StopMaxTurns`, `StopHook`, `StopGuard`, `StopTerminate`, `StopPartialTerminate`, `StopRefused`) |
-| pending call | `PendingCall{Call, Reason}`; `PendingReason` (`PendingDeferred`, `PendingAborted`, `PendingUnknown`); `PendingCalls` |
+| pending call | `PendingCall{Call, Reason}`; `PendingReason` (`PendingDeferred`, `PendingAborted`, `PendingUndispatched`, `PendingUnknown`); `PendingCalls` |
 | decision | `ToolDecision{Action, Reason, Terminate, Args, By, Note}`; `ToolAction` (`Allow`, `Block`, `Defer`) |
 | answer | `Answer{CallID, Output, Args, Note, Terminate, By}`; `Output`, `Approve`, `ApproveWith`, `Refuse`, `WithNote`, `WithBy`; `ContextWithDeciders`/`DeciderFromContext` for a host driving `Run` |
 | hooks | `Config.BeforeTurn`, `BeforeModelCall`, `OutputGuard`, `BeforeToolCall`, `AfterToolCall`, `ShouldStopAfterTurn` |
@@ -1122,7 +1127,7 @@ maps onto it as follows:
 | the loop as a model | `front/responses.New(cfg)` → `openresponses.Adapter` |
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`; `tools/a2a.New(client, card)` |
-| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `RecordFunc`; `session.RequestHash` |
+| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `RecordFunc`, `Elicitor`; `WithInstructionsParts`; `session.RequestHash` |
 
 Every error the package returns to its caller, sentinel or wrapped,
 begins with `agentturn:`; the error texts a call's output carries,
@@ -1226,15 +1231,11 @@ module and is listed in the changelog as one.
 
 ## Open questions
 
-- **A `proceed` with no `dispatch` after it** (agentsession #78). With
-  the `dispatch` written at hand-off, an approval or a rewrite that a
-  cut or the loop's own refusal overtakes leaves a `proceed` decision
-  that no `dispatch` follows, which agentsession RFC 0001's `decision`
-  section does not admit and its verifier does not check. Whether the
-  format admits the shape, with a `reject` or the run's end saying the
-  call did not go, or a writer holds the `proceed` until the dispatch
-  and loses what the overtaken approval said, is agentsession's to
-  rule; the recorder writes the first shape until it does.
+- **A dispatch a later subscriber refuses** (#119). The loop reports
+  such a call as `undispatched`; the recorder has written its
+  `dispatch`, and the record reads the call as possibly run until
+  agentsession RFC 0001 says what withdraws a hand-off, a `reject`
+  after the `dispatch` being the proposal.
 - **Who closes a provided tool** (#95). The host closes what it built,
   and under a tool provider the host never holds the value. Documenting
   that a provider caches per session, or a release hook called after

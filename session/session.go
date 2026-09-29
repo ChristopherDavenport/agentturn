@@ -30,13 +30,17 @@
 // # What is written
 //
 //   - run_start: a run entry with phase start, the source the loop
-//     reports (input, or resume for a run that answers pending calls)
-//     and the [agentturn.Trigger] on the context as ref; then, for the
-//     recorder's own session, the env entry [WithEnv] supplies when it
-//     differs from the last one written; then, when the recorder knows
-//     the agent's configuration ([Recorder.Attach] and [WithConfig]
-//     give it one), a full config entry before the first item, so a
-//     root starts with one as the format recommends.
+//     reports (input, or resume for a run that answers pending calls),
+//     the [agentturn.Trigger] on the context joined as ref and in its
+//     parts as trigger; then, for the recorder's own session, the env
+//     entry [WithEnv] supplies when it differs from the last one
+//     written, members the library does not define included; then,
+//     when the recorder knows the agent's configuration
+//     ([Recorder.Attach] and [WithConfig] give it one), a full config
+//     entry before the first item, so a root starts with one as the
+//     format recommends, and a delta when the configuration changed
+//     since the last run, so the items a new configuration's
+//     BeforeTurn appends are filed under it.
 //   - turn_start: a config entry when the settings in force changed
 //     since the last call (a full one first if none was written, deltas
 //     after, a tool list change as tools_added and tools_removed), so
@@ -44,11 +48,13 @@
 //     [WithInstructionsParts] the instructions are written as the parts
 //     they are composed of, a delta naming only the parts that moved,
 //     and what the host left out as instructions_omitted.
-//   - model_retry: the settings of the request the next attempt will
-//     send, in place of the ones the attempt that failed carried, since
-//     that attempt answered nothing and wrote nothing. A Retry.Revise
-//     that moves the turn to another model is then a config delta, and
-//     the path names the model that answered.
+//   - model_retry: a custom entry in the [ModelRetryNS] namespace
+//     saying which attempt failed, why, how long the loop waited and
+//     whether Retry.Revise changed the request; and the settings of the
+//     request the next attempt will send, in place of the ones the
+//     attempt that failed carried, since that attempt answered nothing.
+//     A Retry.Revise that moves the turn to another model is then a
+//     config delta, and the path names the model that answered.
 //   - model_blocked: the config settle for the request that was built,
 //     then a response entry with status failed, the hook's error and
 //     the request hash, so a call a BeforeModelCall guard refused is on
@@ -72,9 +78,11 @@
 //     BeforeToolCall that blocked the call is a reject decision with
 //     its reason; one that deferred it is a hold carrying the same
 //     reason, the rule that raised the prompt; one that rewrote the
-//     arguments, or an approval through Agent.Resume of a held call,
-//     is a proceed decision carrying the arguments the tool ran with
-//     when they differ from the model's. The decision's by is
+//     arguments, one that allowed the call and gave a reason, such as
+//     the grant that allowed it, or an approval through Agent.Resume of
+//     a held call, is a proceed decision carrying the arguments the
+//     tool ran with when they differ from the model's and the reason
+//     when there is one. The decision's by is
 //     ToolDecision.By, which Answer.By sets for an approval, and policy
 //     for a hook's decision about a call nothing was holding; an answer
 //     that names nobody is written with no by, since a policy engine
@@ -105,7 +113,8 @@
 //     response requested tools, as done when it did not, and, when the
 //     run made no model call of its own, as stopped when it answered a
 //     call an earlier one made and left nothing pending and as aborted
-//     otherwise, with the stop's cause as ref in every case.
+//     otherwise, with the stop's cause as ref in every case, followed
+//     for a guard's stop by the guard's error.
 //   - a fold reported through [Recorder.Fold]: a compaction entry whose
 //     first_kept is the entry of the first item the transform kept, with
 //     the summary and the settings in force, and a fold member naming
@@ -139,7 +148,13 @@
 //     count the calls a turn ran.
 //   - tool_end whose Result.Details implements agenttool.Recordable: a
 //     custom entry in the namespace the value names, carrying its JSON,
-//     between the call's dispatch and its output. This is how a tool
+//     between the call's dispatch and its output, with call_id naming
+//     the call.
+//   - a record a tool writes while it runs, through [Recorder.RecordFunc],
+//     and a question it asks the user, through [Recorder.Elicitor]: a
+//     custom entry at the leaf whose call_id names the call that wrote
+//     it, or for a nested call the call whose tool made it, so the
+//     records of a parallel batch say whose each one is. This is how a tool
 //     keeps what its output does not carry, the full bytes of a
 //     truncated result for one, in the session without the recorder
 //     knowing its type. Details for in-process subscribers alone are
@@ -333,6 +348,51 @@ type NestedCall struct {
 	Error  string `json:"error,omitempty"`
 }
 
+// ModelRetryNS is the namespace of the custom entry written for each
+// failed attempt of a model call that [agentturn.Retry] tries again.
+// Its data is a [ModelRetry]. It is appended where the next entry
+// goes, before the response of the attempt that answered, so a reader
+// counting the calls a turn took counts these and adds one.
+const ModelRetryNS = "agentturn:model_retry"
+
+// ModelRetry is the data of a [ModelRetryNS] custom entry.
+type ModelRetry struct {
+	// Attempt is the number of the attempt that failed, from 1.
+	Attempt int `json:"attempt"`
+	// Error is the failure's text.
+	Error string `json:"error,omitempty"`
+	// DelayMS is how long the loop waited before the next attempt.
+	DelayMS int64 `json:"delay_ms"`
+	// Model is the model the failed attempt named.
+	Model string `json:"model,omitempty"`
+	// Revised is set when Retry.Revise changed the request the next
+	// attempt sends; the change itself is on the path as the config
+	// delta the next settle writes.
+	Revised bool `json:"revised,omitempty"`
+}
+
+// ElicitationNS is the namespace of the custom entry written for a
+// question a tool asked the user mid-call, through the elicitor
+// [Recorder.Elicitor] wraps. Its data is an [Elicitation], and its
+// call_id names the call that asked when the session holds it.
+const ElicitationNS = "agentturn:elicitation"
+
+// Elicitation is the data of an [ElicitationNS] custom entry: the
+// question and what became of it.
+type Elicitation struct {
+	Message string          `json:"message,omitempty"`
+	Schema  json.RawMessage `json:"schema,omitempty"`
+	URL     string          `json:"url,omitempty"`
+	// Action is accept, decline or cancel; empty when Error is set.
+	Action  string          `json:"action,omitempty"`
+	Content json.RawMessage `json:"content,omitempty"`
+	// By is who answered, in the session format's terms.
+	By string `json:"by,omitempty"`
+	// Error is the harness's failure to ask, which the tool sees as an
+	// error rather than an answer.
+	Error string `json:"error,omitempty"`
+}
+
 // ErrRunActive is returned by [Recorder.Rebase] while a run is being
 // written.
 var ErrRunActive = errors.New("session: a run is active")
@@ -419,6 +479,10 @@ type writer struct {
 	calls map[string]*callRecord
 	// linked marks the calls whose subsession link is written.
 	linked map[string]bool
+	// parents maps a nested call, one a tool made through
+	// agentturn.Invoke, to the call whose tool made it, so a record the
+	// nested call writes names a call the path holds.
+	parents map[string]string
 	// replay is set while a transcript is being copied into a session
 	// rather than written from a live run, so the outputs in it answer
 	// calls that ran inside that run and no decision is written for
@@ -427,6 +491,13 @@ type writer struct {
 	// env is the last env entry written, encoded, so the next is
 	// written only when it differs.
 	env []byte
+	// base is the canonical base request of the configuration the last
+	// run started under, encoded, so a run whose configuration changed
+	// settles it before any of its items.
+	base []byte
+	// attempt is the canonical request of the model call in flight, so
+	// a retry can say whether Revise changed it.
+	attempt *openresponses.Request
 	// omitted is the instructions_omitted of the last config entry that
 	// carried one, encoded, so a change to what was left out is written
 	// even when the settings did not move.
@@ -567,7 +638,7 @@ func New(store agentsession.Store, sessionID string, opts ...Option) *Recorder {
 }
 
 func newWriter(r *Recorder, id string) *writer {
-	return &writer{rec: r, id: id, calls: map[string]*callRecord{}, linked: map[string]bool{}}
+	return &writer{rec: r, id: id, calls: map[string]*callRecord{}, linked: map[string]bool{}, parents: map[string]string{}}
 }
 
 // Start creates a session from h and returns a recorder for it. When
@@ -680,35 +751,109 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 // Annotate appends a custom entry in namespace ns carrying data,
 // encoded as JSON, at the current leaf of the session of the run on
 // the context, or of the recorder's own session when the context
-// names no run it is writing. It never contributes an item or a
-// setting, so the context and the request hashes are untouched. Made
-// from a subscriber during turn_start, the entry lands before that
-// turn's config entry, whatever the order the subscribers were
-// registered in; made during any later event of the turn, after it.
-func (r *Recorder) Annotate(ctx context.Context, ns string, data any) error {
+// names no run it is writing, and returns the entry's ID, which a
+// checkpoint or a rewind can branch to. It never contributes an item
+// or a setting, so the context and the request hashes are untouched.
+// Made with the context of a tool call, from inside the tool, the
+// entry's call_id names the call when the session holds it, so a
+// record of one call of a parallel batch says whose it is. Made from a
+// subscriber during turn_start, the entry lands before that turn's
+// config entry, whatever the order the subscribers were registered in;
+// made during any later event of the turn, after it.
+func (r *Recorder) Annotate(ctx context.Context, ns string, data any) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	w := r.root
-	if cw, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
-		w = cw
-	}
+	w := r.writerOf(ctx)
 	raw, err := json.Marshal(data)
 	if err != nil {
-		return fmt.Errorf("session: encode annotation %s: %w", ns, err)
+		return "", fmt.Errorf("session: encode annotation %s: %w", ns, err)
 	}
-	_, err = w.append(context.WithoutCancel(ctx), &agentsession.CustomEntry{NS: ns, Data: raw})
-	return err
+	return w.append(context.WithoutCancel(ctx), &agentsession.CustomEntry{NS: ns, Data: raw, CallID: w.callOn(ctx)})
+}
+
+// EntryOf returns the ID of the entry the recorder wrote for item, the
+// value the loop delivered on item_end, in the session of the run on
+// the context, or the recorder's own when the context names none. It
+// is false for an item the recorder did not write there, which
+// includes an item whose item_end has not reached the recorder yet. A
+// subscriber that marks a checkpoint asks this rather than reading the
+// session's leaf, which moves with every entry: asked on the item's own
+// item_end it needs to run after the recorder, and asked on any later
+// event, turn_end or run_end, it finds the entry whatever the order.
+func (r *Recorder) EntryOf(ctx context.Context, item openresponses.Item) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	w := r.writerOf(ctx)
+	for i := len(w.values) - 1; i >= 0; i-- {
+		if w.values[i] == item {
+			return w.items[i], true
+		}
+	}
+	return "", false
+}
+
+// writerOf returns the writer of the run on the context, or the root.
+func (r *Recorder) writerOf(ctx context.Context) *writer {
+	if cw, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
+		return cw
+	}
+	return r.root
+}
+
+// callOn returns the ID of the call on the context when the session
+// holds its function call, the call whose tool made it for a nested
+// call, and "" otherwise: a child run's context carries the parent's
+// call, which is not in the child's session.
+func (w *writer) callOn(ctx context.Context) string {
+	call, ok := agenttool.CallFrom(ctx)
+	if !ok {
+		return ""
+	}
+	return w.heldCall(call.ID)
 }
 
 // RecordFunc returns the recorder a tool's agenttool.WriteRecord
 // reaches: each record is written as a custom entry in the record's
-// namespace, at the leaf of the run on the context, durably before it
-// returns, as [Recorder.Annotate] writes one. Set it as
+// namespace, at the leaf of the run on the context, with call_id
+// naming the call that wrote it, durably before it returns, as
+// [Recorder.Annotate] writes one. Set it as
 // agentturn.Config.ToolRecorder, or install it with
 // agenttool.ContextWithRecorder on the context a run is prompted with.
 func (r *Recorder) RecordFunc() agenttool.RecordFunc {
 	return func(ctx context.Context, rec *agenttool.Record) error {
-		return r.Annotate(ctx, rec.NS, json.RawMessage(rec.Data))
+		_, err := r.Annotate(ctx, rec.NS, json.RawMessage(rec.Data))
+		return err
+	}
+}
+
+// Elicitor returns an elicitor that puts each question to fn and
+// writes the question and its answer as an [ElicitationNS] custom
+// entry, under the call that asked, before the answer returns to the
+// tool; by names who answers, in the session format's terms. Set it as
+// agentturn.Config.ToolElicitor, or install it with
+// agenttool.ContextWithElicitor on the context a run is prompted with.
+// A nil fn answers every question with agenttool.ActionCancel, since
+// nobody was asked, and records that. A failure to write the entry is
+// returned to the tool as the harness failing to ask.
+func (r *Recorder) Elicitor(by string, fn agenttool.Elicitor) agenttool.Elicitor {
+	return func(ctx context.Context, q agenttool.Elicitation) (agenttool.Answer, error) {
+		ans := agenttool.Answer{Action: agenttool.ActionCancel}
+		var err error
+		who := ""
+		if fn != nil {
+			ans, err = fn(ctx, q)
+			who = by
+		}
+		data := Elicitation{Message: q.Message, Schema: q.Schema, URL: q.URL, By: who}
+		if err != nil {
+			data.Error = err.Error()
+		} else {
+			data.Action, data.Content = string(ans.Action), ans.Content
+		}
+		if _, werr := r.Annotate(ctx, ElicitationNS, data); werr != nil {
+			return agenttool.Answer{}, errors.Join(err, werr)
+		}
+		return ans, err
 	}
 }
 
@@ -724,6 +869,8 @@ func (w *writer) reset() {
 	w.calls = map[string]*callRecord{}
 	w.env = nil
 	w.omitted = nil
+	w.base = nil
+	w.attempt = nil
 }
 
 // seed sets the writer's state from the session at its leaf.
@@ -830,6 +977,14 @@ func (r *Recorder) Store() agentsession.Store { return r.store }
 // function. The recorder takes the agent's configuration at every
 // run_start from then on, so a change through Agent.SetConfig reaches
 // the record as a config delta and as the filter in force.
+//
+// Subscribers are called in registration order and the recorder writes
+// a call's dispatch when tool_dispatch reaches it, durably, before the
+// tool runs. A subscriber that may refuse a dispatch, a policy that
+// vetoes a call at hand-off, is therefore subscribed before the
+// recorder: one subscribed after it refuses a call whose dispatch is
+// already on the record, and the record reads that call as possibly
+// run although the loop never handed it over.
 func (r *Recorder) Attach(a *agentturn.Agent) (unsubscribe func()) {
 	r.mu.Lock()
 	r.agent = a
@@ -1125,7 +1280,7 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 			Name:   e.Name,
 			Output: e.Result.Output.Text,
 			Error:  errText(e.Err),
-		}); err != nil {
+		}, e.Parent); err != nil {
 			return err
 		}
 	}
@@ -1139,18 +1294,41 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 	if rec == nil {
 		return nil
 	}
-	_, err = w.append(ctx, &agentsession.CustomEntry{NS: rec.NS, Data: rec.Data})
+	// A nested call has no function call on the path; its record is
+	// the work of the call that made it.
+	owner := e.CallID
+	if e.Parent != "" {
+		owner = e.Parent
+	}
+	_, err = w.append(ctx, &agentsession.CustomEntry{NS: rec.NS, Data: rec.Data, CallID: w.heldCall(owner)})
 	return err
 }
 
+// heldCall returns callID when the session holds its function call,
+// the nearest call up its chain that the session holds for a nested
+// call, and "" otherwise.
+func (w *writer) heldCall(callID string) string {
+	for range len(w.parents) + 1 {
+		if _, ok := w.calls[callID]; ok {
+			return callID
+		}
+		parent, ok := w.parents[callID]
+		if !ok {
+			return ""
+		}
+		callID = parent
+	}
+	return ""
+}
+
 // nested writes one custom entry for a call a tool made through
-// agentturn.Invoke.
-func (w *writer) nested(ctx context.Context, n NestedCall) error {
+// agentturn.Invoke, with call_id naming the call whose tool made it.
+func (w *writer) nested(ctx context.Context, n NestedCall, parent string) error {
 	raw, err := json.Marshal(n)
 	if err != nil {
 		return fmt.Errorf("session: encode nested call %s: %w", n.CallID, err)
 	}
-	_, err = w.append(ctx, &agentsession.CustomEntry{NS: NestedCallNS, Data: raw})
+	_, err = w.append(ctx, &agentsession.CustomEntry{NS: NestedCallNS, Data: raw, CallID: w.heldCall(parent)})
 	return err
 }
 
@@ -1180,7 +1358,11 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 	w.responses = 0
 	w.lastCalls = false
 	w.answeredCall = false
-	if _, err := w.append(ctx, agentsession.NewRunStart(e.RunID, string(e.Source), e.Trigger.String())); err != nil {
+	start := agentsession.NewRunStart(e.RunID, string(e.Source), e.Trigger.String())
+	if !e.Trigger.IsZero() {
+		start.Trigger = &agentsession.Trigger{Kind: e.Trigger.Kind, Ref: e.Trigger.Ref, Source: e.Trigger.Source}
+	}
+	if _, err := w.append(ctx, start); err != nil {
 		return err
 	}
 	if w == w.rec.root && w.rec.env != nil {
@@ -1188,11 +1370,32 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 			return err
 		}
 	}
-	if w.wroteConfig || w.cfg == nil {
+	if w.cfg == nil {
 		return nil
 	}
-	req := w.cfg.BaseRequest(ctx)
-	return w.settle(ctx, Canonical(req))
+	req := Canonical(w.cfg.BaseRequest(ctx))
+	base, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("session: encode base request: %w", err)
+	}
+	// The configuration is settled before any item of the run when
+	// nothing has been written, and when it changed since the last run
+	// this writer saw, so the items a new configuration's BeforeTurn
+	// appends are filed under it. A configuration that did not change
+	// is left to turn_start, which settles the request as sent: a hook
+	// that edits the request every turn would otherwise be undone here
+	// and redone there on every run. The first run of a resumed writer
+	// has no last configuration to compare with and is left to
+	// turn_start too.
+	prev := w.base
+	w.base = base
+	switch {
+	case !w.wroteConfig:
+	case prev != nil && !bytes.Equal(prev, base):
+	default:
+		return nil
+	}
+	return w.settle(ctx, req)
 }
 
 // writeEnv asks the host for the environment and writes it when it
@@ -1217,11 +1420,13 @@ func (w *writer) writeEnv(ctx context.Context) error {
 }
 
 // envBody encodes an env entry without its envelope, so one read from
-// the path compares equal to a fresh one with the same content.
+// the path compares equal to a fresh one with the same content. The
+// members the library does not define are kept: a container restart a
+// host names in one of them is a change of environment.
 func envBody(env *agentsession.EnvEntry) []byte {
 	body := *env
-	body.EntryBase = agentsession.EntryBase{}
-	data, err := json.Marshal(&body)
+	body.EntryBase = agentsession.EntryBase{Unknown: env.Unknown}
+	data, err := agentsession.MarshalEntry(&body)
 	if err != nil {
 		return nil
 	}
@@ -1240,6 +1445,7 @@ func (w *writer) turnStart(ctx context.Context, e *agentturn.TurnStart) error {
 		return err
 	}
 	w.settleReq = &req
+	w.attempt = &req
 	w.inFlight = true
 	w.pending = hash
 	w.started = w.rec.now()
@@ -1258,6 +1464,22 @@ func (w *writer) retry(ctx context.Context, e *agentturn.ModelRetry) error {
 	if err != nil {
 		return err
 	}
+	rec := ModelRetry{Attempt: e.Attempt, Error: errText(e.Err), DelayMS: e.Delay.Milliseconds()}
+	if w.attempt != nil {
+		rec.Model = w.attempt.Model
+		rec.Revised = !equalJSON(*w.attempt, req)
+	}
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("session: encode model retry: %w", err)
+	}
+	// The settle held for the failed attempt stays held: the attempt
+	// that follows replaces it, and only the one that answers is
+	// configured on the path.
+	if _, err := w.append(ctx, &agentsession.CustomEntry{NS: ModelRetryNS, Data: raw}); err != nil {
+		return err
+	}
+	w.attempt = &req
 	w.settleReq = &req
 	w.inFlight = true
 	w.pending = hash
@@ -1548,6 +1770,7 @@ func outputText(out *openresponses.FunctionCallOutput) string {
 // which tool_dispatch reports.
 func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 	if e.Parent != "" {
+		w.parents[e.CallID] = e.Parent
 		return w.nested(ctx, NestedCall{
 			Phase:  agentsession.RunStart,
 			CallID: e.CallID,
@@ -1567,7 +1790,7 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 			}(),
 			Reason: decisionReason(e.Decision),
 			By:     decisionBy(e.Decision),
-		})
+		}, e.Parent)
 	}
 	c := w.calls[e.CallID]
 	if c == nil {
@@ -1612,10 +1835,17 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 	if c.rejected {
 		return nil
 	}
-	if rewritten := !sameJSON(e.Args, c.args); c.held || rewritten {
+	// An allowed call is recorded when something was decided about it:
+	// it was held and is now approved, its arguments were rewritten, or
+	// the hook gave a reason, such as the grant that allowed it.
+	reason := decisionReason(d)
+	if rewritten := !sameJSON(e.Args, c.args); c.held || rewritten || reason != "" {
 		dec := agentsession.NewDecision(e.CallID, c.entry, agentsession.VerdictProceed, by)
 		if rewritten {
 			dec.WithArgs(e.Args)
+		}
+		if reason != "" {
+			dec.WithReason(reason)
 		}
 		if _, err := w.append(ctx, dec); err != nil {
 			return err
@@ -1738,7 +1968,13 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 		return agentsession.ReasonInterrupted, errText(e.Err)
 	case agentturn.ReasonStopped:
 		// The cause is the ref throughout: what stopped the run is what a
-		// reader asks, whichever shape the segment has.
+		// reader asks, whichever shape the segment has. A guard's error
+		// says which guard and why, so it follows the cause, as an
+		// error's text is the ref of a failure.
+		cause := string(e.Cause)
+		if e.Cause == agentturn.StopGuard && e.Err != nil {
+			cause += ": " + e.Err.Error()
+		}
 		switch {
 		case w.responses == 0:
 			// A resume whose approved batch terminated, or a refusal on
@@ -1758,15 +1994,15 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 			// loop's events can break that, since a call without an
 			// output keeps the model from being called again.
 			if w.answeredCall && !w.pendingOnPath() {
-				return agentsession.ReasonStopped, string(e.Cause)
+				return agentsession.ReasonStopped, cause
 			}
-			return agentsession.ReasonAborted, string(e.Cause)
+			return agentsession.ReasonAborted, cause
 		case w.lastCalls:
-			return agentsession.ReasonStopped, string(e.Cause)
+			return agentsession.ReasonStopped, cause
 		}
 		// A guard or a turn budget stopped a run whose last response
 		// requested nothing, which the format reads as done.
-		return agentsession.ReasonDone, string(e.Cause)
+		return agentsession.ReasonDone, cause
 	}
 	return string(e.Reason), ""
 }
