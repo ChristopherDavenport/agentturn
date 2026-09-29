@@ -207,8 +207,8 @@ func (p *probeCompactor) Compact(ctx context.Context, req openresponses.CompactR
 }
 
 // summarizer answers every request with a fixed summary and records
-// what it was asked, except that its first calls answers are a
-// function call with no text.
+// what it was asked, except that it answers its first calls requests
+// with a function call and no text.
 type summarizer struct {
 	reqs  []openresponses.Request
 	reply string

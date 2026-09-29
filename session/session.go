@@ -3041,15 +3041,18 @@ func (w *writer) append(ctx context.Context, e agentsession.Entry) (string, erro
 
 // configDelta returns the config entry that takes prev to next, nil when
 // they are equal, or full (a replace entry) when the change cannot be
-// expressed as a delta: a model being cleared, or a delta that would be
-// larger than the replacement. A tool list change is always a delta
-// that replays in the request's order (see toolDelta), however much of
-// the list it names. parts, when set, are the parts
-// next's instructions are composed of, and the instructions change is
-// written as the parts that moved; otherwise it is the joined string,
-// and parts on the path whose join is unchanged are left in place.
-// omitted is what the host left out: settle writes it, whole on a
-// replace and as what moved on a delta, so each is sized carrying it.
+// expressed as a delta: a model being cleared, a tool list replay
+// cannot rebuild in the request's order, or a delta that would be
+// larger than the replacement. Replay removes tools by name, so a list
+// with two tools under one name, or a nameless tool (a built-in such as
+// web_search) after the first tool out of place, is written as a
+// replace; any other tool list change is a delta (see toolDelta).
+// parts, when set, are the parts next's instructions are composed of,
+// and the instructions change is written as the parts that moved;
+// otherwise it is the joined string, and parts on the path whose join
+// is unchanged are left in place. omitted is what the host left out:
+// settle writes it, whole on a replace and as what moved on a delta,
+// so each is sized carrying it.
 func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntry, parts []agentsession.InstructionPart, omitted []agentsession.OmittedPart) *agentsession.ConfigEntry {
 	if len(parts) == 0 {
 		// The string is what is compared: parts in force that join to
