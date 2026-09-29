@@ -37,6 +37,10 @@ type Executor struct {
 // a2a.ErrInvalidRequest, which is what a caller across the wire sees.
 var ErrConversationBusy = errors.New("conversation has a task in flight")
 
+// RefusedText is the status message of a task a guard refused. It is
+// fixed, so a guard's reason never reaches the caller.
+const RefusedText = "the agent's guard refused this request"
+
 var _ a2asrv.AgentExecutor = (*Executor)(nil)
 
 // Option configures an [Executor].
@@ -326,9 +330,12 @@ func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, 
 	case agentturn.ReasonDone, agentturn.ReasonStopped:
 		if _, ok := out.end.Answer(); out.end.Cause == agentturn.StopGuard && !ok {
 			// A guard stopped the run before the agent answered, at
-			// whichever hook: the task failed, not completed empty or
-			// with a preamble.
-			return e.finish(ctx, reqCtx, q, a2a.TaskStateFailed, errorMessage(reqCtx, out.end.Err))
+			// whichever hook: the agent refused the task, which neither
+			// completed, empty or with a preamble, nor failed, which a
+			// caller would retry or re-plan. The guard's error stays
+			// with the host: its text may carry the rule a caller could
+			// phrase around.
+			return e.finish(ctx, reqCtx, q, a2a.TaskStateRejected, a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: RefusedText}))
 		}
 		var msg *a2a.Message
 		if out.lastText != "" {

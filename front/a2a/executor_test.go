@@ -285,12 +285,14 @@ func TestFailedRun(t *testing.T) {
 	}
 }
 
-// TestGuardStopBeforeAnswerFailsTask pins #138: a guard that stops the
-// run before the agent answers fails the task with its error, whichever
-// hook it is on and whatever preamble came before, and one that stops
-// it after an answer completes it with that answer.
-func TestGuardStopBeforeAnswerFailsTask(t *testing.T) {
-	refuse := fmt.Errorf("%w: homework tripwire", agentturn.ErrGuard)
+// TestGuardStopBeforeAnswerRejectsTask pins #138 and #164: a guard that
+// stops the run before the agent answers rejects the task with a fixed
+// message, whichever hook it is on and whatever preamble came before,
+// and the guard's reason is nowhere in the task; one that stops it
+// after an answer completes it with that answer.
+func TestGuardStopBeforeAnswerRejectsTask(t *testing.T) {
+	const reason = "homework tripwire"
+	refuse := fmt.Errorf("%w: %s", agentturn.ErrGuard, reason)
 	onToolOutput := func(_ context.Context, req *openresponses.Request) error {
 		for _, item := range req.Input {
 			if _, ok := item.(*openresponses.FunctionCallOutput); ok {
@@ -309,12 +311,12 @@ func TestGuardStopBeforeAnswerFailsTask(t *testing.T) {
 	}{
 		{"before turn", agentturn.Config{BeforeTurn: func(context.Context, agentturn.TurnStartInfo) (openresponses.Items, error) {
 			return nil, refuse
-		}}, a2a.TaskStateFailed, "homework tripwire"},
+		}}, a2a.TaskStateRejected, RefusedText},
 		{"before model call", agentturn.Config{BeforeModelCall: func(context.Context, *openresponses.Request) error {
 			return refuse
-		}}, a2a.TaskStateFailed, "homework tripwire"},
-		{"before model call 2, after a preamble", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, BeforeModelCall: onToolOutput}, a2a.TaskStateFailed, "homework tripwire"},
-		{"after a turn that called tools", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, ShouldStopAfterTurn: afterTurn}, a2a.TaskStateFailed, "homework tripwire"},
+		}}, a2a.TaskStateRejected, RefusedText},
+		{"before model call 2, after a preamble", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, BeforeModelCall: onToolOutput}, a2a.TaskStateRejected, RefusedText},
+		{"after a turn that called tools", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, ShouldStopAfterTurn: afterTurn}, a2a.TaskStateRejected, RefusedText},
 		{"after the answer", agentturn.Config{ShouldStopAfterTurn: afterTurn}, a2a.TaskStateCompleted, "solve x"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -324,8 +326,11 @@ func TestGuardStopBeforeAnswerFailsTask(t *testing.T) {
 			}
 			cfg.ModelName = "m"
 			task := sendTask(t, a2asrv.NewHandler(New(cfg)), userMessage("solve x"))
-			if task.Status.State != tc.state || !strings.Contains(taskText(task), tc.text) {
+			if task.Status.State != tc.state || task.Status.Message == nil || partsText(task.Status.Message.Parts) != tc.text {
 				t.Errorf("task = %s %q, want %s %q", task.Status.State, taskText(task), tc.state, tc.text)
+			}
+			if b, _ := json.Marshal(task); strings.Contains(string(b), reason) {
+				t.Errorf("task carries the guard's reason: %s", b)
 			}
 		})
 	}

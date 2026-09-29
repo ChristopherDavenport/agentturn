@@ -11,10 +11,13 @@
 // failed or, when the model called a tool the caller owns,
 // input-required with the pending function_call items on the status
 // message. A run a guard stopped
-// (agentturn.StopGuard) with no answer (agentturn.RunEnd.Answer) fails
-// the task with the guard's error rather than completing it, whichever
-// hook the guard is on, ShouldStopAfterTurn after a turn that only
-// called tools included.
+// (agentturn.StopGuard) with no answer (agentturn.RunEnd.Answer) is a
+// refusal: the task ends rejected, with [RefusedText] as its status
+// message, rather than completed or failed, whichever hook the guard
+// is on, ShouldStopAfterTurn after a turn that only called tools
+// included. The guard's error is not sent, since its text may carry
+// the rule a caller could phrase around; the host has it on
+// RunEnd.Err and in the record.
 //
 //	exec := a2a.New(cfg)
 //	handler := a2asrv.NewHandler(exec)

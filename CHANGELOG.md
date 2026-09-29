@@ -46,6 +46,16 @@ versions may break the API.
   written. `RunContext`'s doc no longer says the call is absent from
   it: a child run's context carries the call that started the child,
   so a job in a child names its own with `agenttool.WithCall`. (#168)
+- Breaking: a guard that stops a run before the agent answers reaches
+  a front's caller as a refusal rather than a failure. `front/responses`
+  ends the response `incomplete` with `incomplete_details.reason`
+  `content_filter`, collected and streamed, where it failed with a 500
+  `server_error` a web tier retries; a single turn that
+  `BeforeModelCall` refuses as a guard does the same. `front/a2a` ends
+  the task `rejected` with the fixed `RefusedText`, where it failed the
+  task, which an orchestrator re-plans. Neither sends the guard's error,
+  whose text named the rule a caller could phrase around; the host has
+  it on `RunEnd.Err` and in the record. (#164)
 
 ## v0.0.11 - 2026-09-29
 
