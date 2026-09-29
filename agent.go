@@ -67,12 +67,18 @@ type Agent struct {
 	// queued holds the accepts not yet reported: Steer and FollowUp
 	// append, and the goroutine that owns delivery reports them at its
 	// next event.
-	queued  []*Queued
+	queued []*Queued
+	// steered is closed by a steer and replaced when the steer queue is
+	// drained, so a tool's batch hears a steer made during it.
+	steered chan struct{}
 	runID   string
 	turn    int
 	cancel  context.CancelCauseFunc
-	idle    chan struct{}
-	pending []PendingCall
+	// runCancel cancels the context RunContext hands the run's tools,
+	// which outlives the run's own.
+	runCancel context.CancelCauseFunc
+	idle      chan struct{}
+	pending   []PendingCall
 }
 
 type subscription struct {
@@ -99,7 +105,7 @@ func WithTranscript(t Transcript) Option {
 
 // New builds an agent.
 func New(cfg Config, opts ...Option) *Agent {
-	a := &Agent{cfg: cfg, idle: closedChan()}
+	a := &Agent{cfg: cfg, idle: closedChan(), steered: make(chan struct{})}
 	for _, opt := range opts {
 		opt(a)
 	}
@@ -409,9 +415,14 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved [
 		}
 	}
 	a.pending = nil
+	// The context a tool's background work derives from: the prompt's
+	// values, cancelled by an abort of this run or by the prompt's own
+	// cancellation, and not by the run ending.
+	runCtx, runCancel := linkRunContext(ctx)
 	ctx, cancel := context.WithCancelCause(ctx)
 	a.running = true
 	a.cancel = cancel
+	a.runCancel = runCancel
 	a.turn = 0
 	a.idle = make(chan struct{})
 	transcript := append(Transcript(nil), a.transcript...)
@@ -428,13 +439,15 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved [
 		send:       func(ev Event) error { return a.deliver(subCtx, ev) },
 		steer:      a.drainSteer,
 		followUp:   a.drainFollowUp,
+		steered:    a.steerSignal,
+		runCtx:     runCtx,
 	}
 	end := r.run(ctx, prompts, approved, terminate)
 	cancel(nil)
 
 	a.mu.Lock()
 	a.running = false
-	a.cancel = nil
+	a.cancel, a.runCancel = nil, nil
 	close(a.idle)
 	a.mu.Unlock()
 
@@ -611,6 +624,11 @@ func (a *Agent) Queue(ctx context.Context, mode QueueMode, items ...openresponse
 		base, hidden := Unhide(item)
 		if mode == QueueSteer {
 			a.steer = append(a.steer, item)
+			select {
+			case <-a.steered:
+			default:
+				close(a.steered)
+			}
 		} else {
 			a.followUp = append(a.followUp, item)
 		}
@@ -623,7 +641,19 @@ func (a *Agent) drainSteer() openresponses.Items {
 	defer a.mu.Unlock()
 	items := a.steer
 	a.steer = nil
+	if len(items) > 0 {
+		// What was heard has been taken; the next batch listens afresh.
+		a.steered = make(chan struct{})
+	}
 	return items
+}
+
+// steerSignal returns the channel the next steer closes, already
+// closed when a steered item is waiting to be drained.
+func (a *Agent) steerSignal() <-chan struct{} {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.steered
 }
 
 func (a *Agent) drainFollowUp() openresponses.Items {
@@ -656,10 +686,16 @@ func (a *Agent) Abort() { a.AbortCause(nil) }
 // reports.
 func (a *Agent) AbortCause(cause error) {
 	a.mu.Lock()
-	cancel := a.cancel
+	cancel, runCancel := a.cancel, a.runCancel
 	a.mu.Unlock()
 	if cancel != nil {
 		cancel(cause)
+	}
+	if runCancel != nil {
+		if cause == nil {
+			cause = context.Canceled
+		}
+		runCancel(cause)
 	}
 }
 

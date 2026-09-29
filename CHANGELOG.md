@@ -164,6 +164,35 @@ versions may break the API.
   stream well formed: the streamed parts are emptied at their indices
   and the replacement's other parts are written after them. A message
   the guard kept streams exactly as before. (#108)
+- `agentturn.RunContext(ctx)` returns, on the context of a tool call, a
+  hook, the transform or the model call, the run's context: the values of the context the run was
+  started with and the run ID, cancelled by `Agent.Abort`,
+  `AbortCause` or the cancellation of the prompt's context, with the
+  cause, and not when the batch or the run ends by itself. Background
+  work that must outlive its call derives from it, where the call's
+  own context ended with the batch and nothing else was on it. The
+  low-level `Run` and `Continue` cut it when the caller's context ends
+  or the consumer breaks out before the run's end. (#125)
+- `agentturn.Steered(ctx)` returns a channel a steer into the tool's run
+  closes, during its batch or before it and not yet drained, so a tool
+  that only waits returns early; the steered item joins the run after
+  the batch as before, the loop does not cut the tool, and the next
+  batch listens afresh. nil outside an agent's run. (#126)
+- `tools/agent.WithDetach(fn)` makes a call return once the child's run
+  has started, with an output saying it is working and a `ChildInfo`
+  naming the run, and hands the run's end to `fn`; the child runs on
+  `RunContext`, so an abort of the parent's run cuts it and the parent
+  ending does not. The session recorder writes a detached child's
+  session through its end, after the call's `tool_end`, and releases
+  its writer then. (#127)
+- `tools/agent` carries `ContextWithRetry` from a later `Prompt` of a
+  spawned child to its observer, so a recorder starts that child's
+  session afresh; it never saw the mark. (#122)
+- `PendingCall.Tool` is the tool a pending call resolved to in the run
+  that made it, nil for a call no tool has or one found in a seeded
+  transcript, and `ToolEnd.Reason` is the decision's reason for a
+  blocked or deferred call, so a front asking the user can show what
+  it asks about and why. Neither changes the record. (#112)
 - `OutputInfo.Output` holds the items of the response that precede the
   message, and the guard's docs say that whether a message is the
   answer is unknown when it runs, since a model may speak before a

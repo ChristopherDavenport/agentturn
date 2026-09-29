@@ -136,6 +136,10 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 			yield(&RunEnd{Reason: ReasonError, Err: err})
 			return
 		}
+		// The context RunContext hands the tools: the caller's values,
+		// cut by the caller's cancellation or a consumer that breaks
+		// out, and not by the run ending.
+		runCtx, runCancel := linkRunContext(ctx)
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		events := make(chan Event, EventBuffer)
@@ -144,6 +148,7 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 			r := &runner{
 				cfg:        cfg,
 				transcript: append(Transcript(nil), t...),
+				runCtx:     runCtx,
 				// Every event is sent, cancelled or not: the consumer
 				// below drains the channel until the run returns, so a
 				// send never blocks for good, and the events an abort
@@ -165,12 +170,18 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 			if stopped {
 				continue
 			}
+			_, isEnd := ev.(*RunEnd)
 			if !yield(ev) {
 				stopped = true
 				cancel()
+				if !isEnd {
+					// Breaking out before the end is an abort; breaking
+					// out on it is not, and work the run started goes on.
+					runCancel(context.Canceled)
+				}
 				continue
 			}
-			if _, isEnd := ev.(*RunEnd); isEnd {
+			if isEnd {
 				stopped = true
 			}
 		}
@@ -179,6 +190,8 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 
 type transcriptKey struct{}
 type runIDKey struct{}
+type runContextKey struct{}
+type steeredKey struct{}
 type triggerKey struct{}
 type decidersKey struct{}
 
@@ -255,6 +268,50 @@ func RunIDFromContext(ctx context.Context) string {
 	return id
 }
 
+// RunContext returns the context of the run a tool call, a hook, the
+// transform or the model call serves: the values of the context the
+// run was started with, the run ID among them, cancelled when the run
+// is aborted, through [Agent.Abort], [Agent.AbortCause] or the
+// cancellation of the context given to Prompt, and not when the batch
+// ends or the run ends by itself. It is what a tool derives background work from that must
+// outlive its call and not the run's abort: a task that returns at
+// once and reports later, a watcher, a detached child. Once the run
+// has ended, Agent.Abort reaches the agent's next run and not this
+// one, so work that must be stoppable after that keeps a cancel of its
+// own. The transcript and the invoker of the call are not on it. It
+// reports false outside a loop. Each run registers it with the context
+// it was started with until that context ends or the run is aborted,
+// so a host that prompts every run with one long-lived cancellable
+// context keeps one small registration per finished run until then.
+func RunContext(ctx context.Context) (context.Context, bool) {
+	rc, ok := ctx.Value(runContextKey{}).(context.Context)
+	return rc, ok
+}
+
+// Steered returns a channel that is closed when an item is steered into
+// the run the tool serves, with [Agent.Steer] or [Agent.Queue], after
+// its batch began or before it and not yet drained, so a tool that only
+// waits, a sleep, a poll, a wait on another agent, selects on it and
+// returns early with what it has; the steered item then joins the run
+// after the batch, as ever. The loop does not cut the tool: hearing the
+// steer is the tool's choice. It returns nil outside an agent's run,
+// and a nil channel never closes.
+func Steered(ctx context.Context) <-chan struct{} {
+	ch, _ := ctx.Value(steeredKey{}).(<-chan struct{})
+	return ch
+}
+
+// linkRunContext returns the context RunContext hands a run's tools:
+// the values of ctx, cancelled with ctx's cause when ctx is, or by the
+// cancel returned, and released from ctx once it is cancelled either
+// way.
+func linkRunContext(ctx context.Context) (context.Context, context.CancelCauseFunc) {
+	runCtx, runCancel := context.WithCancelCause(context.WithoutCancel(ctx))
+	stop := context.AfterFunc(ctx, func() { runCancel(context.Cause(ctx)) })
+	context.AfterFunc(runCtx, func() { stop() })
+	return runCtx, runCancel
+}
+
 func (c Config) validate() error {
 	if c.Model == nil {
 		return ErrNoModel
@@ -329,6 +386,12 @@ type runner struct {
 	send       func(Event) error
 	steer      func() openresponses.Items
 	followUp   func() openresponses.Items
+	// steered returns the channel a steer closes, for the batch about
+	// to run; nil when nothing can steer the run.
+	steered func() <-chan struct{}
+	// runCtx is the context RunContext hands a tool: the run's values,
+	// cancelled on abort and not when the run ends by itself.
+	runCtx context.Context
 
 	// hookMu serialises the tool hooks. A nested call runs on the
 	// goroutine of the tool that made it, so without it two tools of
@@ -349,6 +412,9 @@ type runner struct {
 	// deferred holds the IDs of the calls a hook handed to the caller
 	// during this run, so the run end can say why they are pending.
 	deferred map[string]bool
+	// callTools holds the tool each call of this run's batches resolved
+	// to, so a pending call carries the tool a prompt asks about.
+	callTools map[string]agenttool.Tool
 	// undispatched holds the IDs of the calls whose tool_dispatch a
 	// subscriber refused, so the run end can say their tools never ran.
 	// It is written on the loop's goroutine as the batch is drained.
@@ -431,6 +497,8 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 	// Everything the run calls, transform, hooks, model and tools, can
 	// tell which run it serves.
 	ctx = ContextWithRunID(ctx, r.runID)
+	r.runCtx = ContextWithRunID(r.runCtx, r.runID)
+	ctx = context.WithValue(ctx, runContextKey{}, r.runCtx)
 	r.ctx = ctx
 	end := &RunEnd{RunID: r.runID, Reason: ReasonDone}
 	err := r.loop(ctx, prompts, approved, terminate)
@@ -492,7 +560,7 @@ func (r *runner) pending() []PendingCall {
 		case mine[call]:
 			reason = PendingAborted
 		}
-		out[i] = PendingCall{Call: call, Reason: reason}
+		out[i] = PendingCall{Call: call, Reason: reason, Tool: r.callTools[call.CallID]}
 	}
 	return out
 }
@@ -993,6 +1061,8 @@ type callState struct {
 	// note is text appended after the batch's outputs, from the
 	// decision or the approval, as a developer or a user message.
 	note openresponses.Item
+	// reason is the decision's reason for a blocked call.
+	reason string
 }
 
 // toolBatch runs the calls of a turn: preflight in order, execute,
@@ -1021,6 +1091,9 @@ func (r *runner) toolContext(ctx context.Context, tools agenttool.Set) context.C
 	ctx = ContextWithTranscript(ctx, append(Transcript(nil), r.transcript...))
 	if r.cfg.ToolElicitor != nil {
 		ctx = agenttool.ContextWithElicitor(ctx, r.cfg.ToolElicitor)
+	}
+	if r.steered != nil {
+		ctx = context.WithValue(ctx, steeredKey{}, r.steered())
 	}
 	// The turn is taken here, on the loop's goroutine: a tool that
 	// keeps its context past its batch and invokes from a goroutine of
@@ -1312,6 +1385,7 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 	batch := make([]*callState, len(approved))
 	for i, ap := range approved {
 		p := r.prepare(tools, r.turn, ap.call, ap.args)
+		r.resolved(p)
 		if ap.note != "" {
 			p.note = openresponses.UserText(ap.note)
 		}
@@ -1340,6 +1414,7 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 // tool_end; before that there is nothing to end and the state is nil.
 func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openresponses.FunctionCall, batch []*openresponses.FunctionCall, index int) (*callState, error) {
 	p := r.prepare(tools, r.turn, call, nil)
+	r.resolved(p)
 	var decision *ToolDecision
 	if r.cfg.BeforeToolCall != nil {
 		var err error
@@ -1363,6 +1438,7 @@ func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openr
 				}
 				p.blocked = true
 				p.err = errors.New(reason)
+				p.reason = reason
 			case Defer:
 				p.deferred = true
 				if r.deferred == nil {
@@ -1377,7 +1453,7 @@ func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openr
 	}
 	if p.deferred {
 		p.settled, p.ended = true, true
-		return p, r.emit(&ToolEnd{RunID: r.runID, Turn: r.turn, CallID: call.CallID, Name: call.Name, Deferred: true})
+		return p, r.emit(&ToolEnd{RunID: r.runID, Turn: r.turn, CallID: call.CallID, Name: call.Name, Deferred: true, Reason: decision.Reason})
 	}
 	return p, r.check(ctx, p)
 }
@@ -1395,6 +1471,19 @@ func (r *runner) prepare(tools agenttool.Set, turn int, call *openresponses.Func
 	}
 	p.tool, _ = tools.Lookup(call.Name)
 	return p
+}
+
+// resolved remembers the tool a call of the model's resolved to, for
+// the pending list. It runs on the loop's goroutine; a nested call,
+// prepared on its tool's, is never pending.
+func (r *runner) resolved(p *callState) {
+	if p.tool == nil {
+		return
+	}
+	if r.callTools == nil {
+		r.callTools = map[string]agenttool.Tool{}
+	}
+	r.callTools[p.call.CallID] = p.tool
 }
 
 // check settles a call that will not execute: one a hook blocked, one
@@ -1455,7 +1544,7 @@ func (r *runner) finish(p *callState) error {
 	// delivery that fails is the consumer's failure, and the call is
 	// not ended a second time for it.
 	p.ended = true
-	return r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Parent: p.parent})
+	return r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Reason: p.reason, Parent: p.parent})
 }
 
 func validObject(raw json.RawMessage) bool {
@@ -1538,6 +1627,7 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 				}
 				p.blocked = true
 				p.err = errors.New(reason)
+				p.reason = reason
 			}
 		}
 	}

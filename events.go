@@ -333,6 +333,10 @@ type ToolEnd struct {
 	Err      error
 	Blocked  bool
 	Deferred bool
+	// Reason is the decision's reason for a blocked or a deferred call:
+	// the rule that refused it, or the one that raised the question a
+	// front now asks the user. Empty otherwise.
+	Reason string
 	// Parent is the ID of the call whose tool made this one with
 	// [Invoke], and empty for a call the model made.
 	Parent string
@@ -443,6 +447,11 @@ const (
 type PendingCall struct {
 	Call   *openresponses.FunctionCall
 	Reason PendingReason
+	// Tool is the tool the call resolved to in the run that made it, so
+	// a prompt can show what it asks about, its annotations and where
+	// it runs; nil for a call no tool has the name of and for a call the
+	// run did not make, one found in a seeded transcript.
+	Tool agenttool.Tool
 }
 
 // PendingCalls returns the calls of pending, in order.
