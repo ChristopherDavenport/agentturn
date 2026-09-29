@@ -46,7 +46,11 @@ func (f *fakeRecorder) attach(ctx context.Context, contextID string, a *agenttur
 	f.contexts = append(f.contexts, contextID)
 	f.seeded = append(f.seeded, len(a.State().Transcript))
 	var names []string
-	for _, tl := range a.Config().ToolProvider(ctx) {
+	offered := a.Config().Tools
+	if provider := a.Config().ToolProvider; provider != nil {
+		offered = provider(ctx)
+	}
+	for _, tl := range offered {
 		names = append(names, tl.Name())
 	}
 	f.offered = append(f.offered, names)

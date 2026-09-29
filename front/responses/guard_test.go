@@ -1,10 +1,13 @@
 package responses
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -152,13 +155,16 @@ func TestRelayReplacementIsWellFormed(t *testing.T) {
 	}
 }
 
-// TestGuardStopBeforeAnswerFails pins #138: a full run a guard stopped
-// before the model answered fails with the guard's error rather than
-// completing empty or with a preamble, whichever hook the guard is on;
-// one a guard stopped after the answer completes with it, or with the
+// TestGuardStopBeforeAnswerIsARefusal pins #138 and #164: a full run a
+// guard stopped before the model answered, whichever hook the guard is
+// on, and a single turn BeforeModelCall refused as a guard, end the
+// response incomplete with reason content_filter over HTTP, collected
+// and streamed, and the guard's reason reaches the caller in no form.
+// A run a guard stopped after the answer completes with it, or with the
 // output guard's replacement, unless the replacement has no text.
-func TestGuardStopBeforeAnswerFails(t *testing.T) {
-	refuse := fmt.Errorf("%w: homework tripwire", agentturn.ErrGuard)
+func TestGuardStopBeforeAnswerIsARefusal(t *testing.T) {
+	const reason = "homework tripwire"
+	refuse := fmt.Errorf("%w: %s", agentturn.ErrGuard, reason)
 	onToolOutput := func(_ context.Context, req *openresponses.Request) error {
 		for _, item := range req.Input {
 			if _, ok := item.(*openresponses.FunctionCallOutput); ok {
@@ -169,32 +175,37 @@ func TestGuardStopBeforeAnswerFails(t *testing.T) {
 	}
 	afterTurn := func(context.Context, agentturn.TurnInfo) (bool, error) { return false, refuse }
 	lookup := agenttool.New("lookup", "", func(context.Context, agenttool.NoArgs) (string, error) { return "found", nil })
+	callerTool := openresponses.NewFunctionTool("remote", "caller owned", json.RawMessage(`{"type":"object"}`))
 	for _, tc := range []struct {
-		name string
-		cfg  agentturn.Config
-		want string
+		name   string
+		cfg    agentturn.Config
+		caller bool
+		want   string
 	}{
 		{"before turn", agentturn.Config{BeforeTurn: func(context.Context, agentturn.TurnStartInfo) (openresponses.Items, error) {
 			return nil, refuse
-		}}, ""},
+		}}, false, ""},
 		{"before model call", agentturn.Config{BeforeModelCall: func(context.Context, *openresponses.Request) error {
 			return refuse
-		}}, ""},
+		}}, false, ""},
+		{"before model call, single turn", agentturn.Config{BeforeModelCall: func(context.Context, *openresponses.Request) error {
+			return refuse
+		}}, true, ""},
 		{"before turn 2, after a preamble", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, BeforeTurn: func(_ context.Context, info agentturn.TurnStartInfo) (openresponses.Items, error) {
 			if info.Turn > 1 {
 				return nil, refuse
 			}
 			return nil, nil
-		}}, ""},
-		{"before model call 2, after a preamble", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, BeforeModelCall: onToolOutput}, ""},
-		{"after a turn that called tools", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, ShouldStopAfterTurn: afterTurn}, ""},
-		{"after the answer", agentturn.Config{ShouldStopAfterTurn: afterTurn}, "solve x"},
+		}}, false, ""},
+		{"before model call 2, after a preamble", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, BeforeModelCall: onToolOutput}, false, ""},
+		{"after a turn that called tools", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, ShouldStopAfterTurn: afterTurn}, false, ""},
+		{"after the answer", agentturn.Config{ShouldStopAfterTurn: afterTurn}, false, "solve x"},
 		{"after the answer, withheld", agentturn.Config{ShouldStopAfterTurn: afterTurn, OutputGuard: func(context.Context, agentturn.OutputInfo) (*openresponses.Message, error) {
 			return openresponses.AssistantText("[withheld]"), nil
-		}}, "[withheld]"},
+		}}, false, "[withheld]"},
 		{"after the answer, withheld as nothing", agentturn.Config{ShouldStopAfterTurn: afterTurn, OutputGuard: func(context.Context, agentturn.OutputInfo) (*openresponses.Message, error) {
 			return openresponses.AssistantText(""), nil
-		}}, ""},
+		}}, false, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := tc.cfg
@@ -202,21 +213,62 @@ func TestGuardStopBeforeAnswerFails(t *testing.T) {
 				cfg.Model = &echo.Adapter{}
 			}
 			cfg.ModelName = "m"
-			resp, err := New(cfg).Create(context.Background(), request(openresponses.UserText("solve x")))
+			srv := httptest.NewServer(openresponses.NewHandler(New(cfg)))
+			defer srv.Close()
+			req := request(openresponses.UserText("solve x"))
+			if tc.caller {
+				req.Tools = openresponses.Tools{callerTool}
+			}
+
+			status, body := post(t, srv.URL, req)
+			if strings.Contains(body, reason) {
+				t.Errorf("collected body carries the guard's reason: %s", body)
+			}
+			var resp openresponses.Response
+			if err := json.Unmarshal([]byte(body), &resp); err != nil || status != http.StatusOK {
+				t.Fatalf("collected: %d %s (%v)", status, body, err)
+			}
 			if tc.want == "" {
-				if !errors.Is(err, agentturn.ErrGuard) {
-					t.Fatalf("err = %v, want the guard's", err)
+				if resp.Status != openresponses.ResponseStatusIncomplete || resp.IncompleteDetails == nil || resp.IncompleteDetails.Reason != openresponses.IncompleteReasonContentFilter {
+					t.Errorf("collected = %s %+v, want incomplete content_filter", resp.Status, resp.IncompleteDetails)
 				}
-				return
+			} else if resp.Status != openresponses.ResponseStatusCompleted || resp.OutputText() != tc.want {
+				t.Errorf("collected = %s %q, want completed %q", resp.Status, resp.OutputText(), tc.want)
 			}
-			if err != nil {
-				t.Fatal(err)
+
+			req.Stream = true
+			status, body = post(t, srv.URL, req)
+			if strings.Contains(body, reason) {
+				t.Errorf("stream carries the guard's reason: %s", body)
 			}
-			if resp.Status != openresponses.ResponseStatusCompleted || resp.OutputText() != tc.want {
-				t.Errorf("response = %s %q, want completed %q", resp.Status, resp.OutputText(), tc.want)
+			terminal := "event: response.completed"
+			if tc.want == "" {
+				terminal = "event: response.incomplete"
+			}
+			if status != http.StatusOK || !strings.Contains(body, terminal) || strings.Contains(body, "event: error") {
+				t.Errorf("streamed: %d, want %q and no error:\n%s", status, terminal, body)
 			}
 		})
 	}
+}
+
+// post sends req to a handler at base and returns the status and body.
+func post(t *testing.T, base string, req openresponses.Request) (int, string) {
+	t.Helper()
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := http.Post(base+"/v1/responses", "application/json", bytes.NewReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	out, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res.StatusCode, string(out)
 }
 
 // preamble says something and calls the first tool it is offered, then

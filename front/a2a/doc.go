@@ -11,10 +11,25 @@
 // failed or, when the model called a tool the caller owns,
 // input-required with the pending function_call items on the status
 // message. A run a guard stopped
-// (agentturn.StopGuard) with no answer (agentturn.RunEnd.Answer) fails
-// the task with the guard's error rather than completing it, whichever
-// hook the guard is on, ShouldStopAfterTurn after a turn that only
-// called tools included.
+// (agentturn.StopGuard) with no answer (agentturn.RunEnd.Answer) is a
+// refusal: the task ends rejected, with [RefusedText] as its status
+// message, rather than completed or failed, whichever hook the guard
+// is on, ShouldStopAfterTurn after a turn that only called tools
+// included. The guard's error is not sent, since its text may carry
+// the rule a caller could phrase around; the host has it on
+// RunEnd.Err and in the record.
+//
+// A run that a terminating tool result stopped
+// (agentturn.StopTerminate or agentturn.StopPartialTerminate) is how a
+// handoff ends the sender's part. [WithHandoff] is asked for the
+// receiver's configuration, which the executor sets on the task's
+// agent before continuing it, so the receiver answers within the same
+// task, its text streamed as the sender's was, and the record holds
+// both runs. Without the option, or when it declines, a terminating
+// stop with no answer completes the task with the text of the last
+// output of a call whose result set Terminate, the answer the tools
+// gave on the model's behalf; a sibling's output, or a blocked or
+// failed call's, is not taken for it.
 //
 //	exec := a2a.New(cfg)
 //	handler := a2asrv.NewHandler(exec)
