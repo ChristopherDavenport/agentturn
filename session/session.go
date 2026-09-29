@@ -102,8 +102,9 @@
 //     output of the turn; for a call Retry tried again, attempts, the
 //     calls it took with the one that answered.
 //   - run_end: a response entry with status failed, the error, the
-//     request hash, attempts as on response_end, and the ID of the
-//     response the stream had named,
+//     request hash, attempts as on response_end, an abort during a
+//     retry's backoff counting the attempt that was due, and the ID of
+//     the response the stream had named,
 //     when a call was still in flight because the model failed or the
 //     run was aborted before the stream produced a response; the ID
 //     names the response the call was cut out of and lets the context
@@ -563,9 +564,11 @@ type writer struct {
 	// calls that ran inside that run and no decision is written for
 	// them.
 	replay bool
-	// env is the last env entry written, encoded, so the next is
+	// env is the last env entry written, encoded without its
+	// workspace, and envWorkspace that workspace, so the next is
 	// written only when it differs.
-	env []byte
+	env          []byte
+	envWorkspace *agentsession.Workspace
 	// base is the canonical base request of the configuration the last
 	// run started under, encoded, so a run whose configuration changed
 	// settles it before any of its items.
@@ -688,8 +691,9 @@ func WithoutChildSessions() Option {
 // the workspace, with whatever tells one file system from another, a
 // container's host or instance, inside it through
 // agentsession.Workspace.SetMember rather than beside it, where the
-// format's substitution rule does not look. The entry is written when it differs from the last
-// one written, or found on the path by [Resume], so a run in an
+// format's substitution rule does not look. The entry is written when
+// it differs from the last one written, or found on the path by
+// [Resume], its workspace compared by that rule, so a run in an
 // unchanged environment adds nothing; a nil entry writes nothing. The
 // recorder gathers nothing itself: what the host knows about its
 // environment is the host's to supply, and the recorder stays free of
@@ -1214,7 +1218,7 @@ func (w *writer) reset() {
 	w.items, w.values, w.custom = nil, nil, nil
 	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = false, 0, nil, nil
 	w.calls = map[string]*callRecord{}
-	w.env = nil
+	w.env, w.envWorkspace = nil, nil
 	w.omitted = nil
 	w.base = nil
 	w.attempt, w.attemptModel, w.retries = nil, "", 0
@@ -1241,7 +1245,7 @@ func (w *writer) seed(s *agentsession.Session, owed bool) error {
 	w.omitted = omittedBody(cx.InstructionsOmitted())
 	for _, e := range cx.Entries {
 		if env, ok := e.(*agentsession.EnvEntry); ok {
-			w.env = envBody(env)
+			w.env, w.envWorkspace = envBody(env), env.Workspace
 		}
 	}
 	if owed {
@@ -1817,23 +1821,27 @@ func (w *writer) writeEnv(ctx context.Context) error {
 		return nil
 	}
 	data := envBody(env)
-	if bytes.Equal(data, w.env) {
+	if w.env != nil && bytes.Equal(data, w.env) && agentsession.SameWorkspace(env.Workspace, w.envWorkspace) {
 		return nil
 	}
 	if _, err := w.append(ctx, env); err != nil {
 		return err
 	}
-	w.env = data
+	w.env, w.envWorkspace = data, env.Workspace
 	return nil
 }
 
-// envBody encodes an env entry without its envelope, so one read from
-// the path compares equal to a fresh one with the same content. The
-// members the library does not define are kept: a container restart a
-// host names in one of them is a change of environment.
+// envBody encodes an env entry without its envelope or its workspace,
+// so one read from the path compares equal to a fresh one with the
+// same content; the workspace is compared by the format's rule, which
+// reads its members in canonical form, so one written with its keys in
+// another order is the same workspace. The members the library does
+// not define are kept: a container restart a host names in one of them
+// is a change of environment.
 func envBody(env *agentsession.EnvEntry) []byte {
 	body := *env
 	body.EntryBase = agentsession.EntryBase{Unknown: env.Unknown}
+	body.Workspace = nil
 	data, err := agentsession.MarshalEntry(&body)
 	if err != nil {
 		return nil
@@ -1866,7 +1874,9 @@ func (w *writer) turnStart(ctx context.Context, e *agentturn.TurnStart) error {
 
 // attempts is the attempts member of the response entry of the call in
 // flight: the calls it took, itself included, or zero for one, which
-// the format reads as one.
+// the format reads as one. The loop reports a retry before its backoff
+// and nothing more until the next attempt streams, so an abort during
+// the backoff counts the attempt that was due.
 func (w *writer) attempts() int {
 	if w.retries == 0 {
 		return 0

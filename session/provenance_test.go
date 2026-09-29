@@ -194,7 +194,10 @@ func TestModelRetryIsRecorded(t *testing.T) {
 // TestResponseCarriesAttempts pins the recorder's half of agentsession
 // #93: the response entry of a call Retry tried again carries the
 // calls it took, the one that answered or failed last included, and a
-// call that took one leaves the member off.
+// call that took one leaves the member off. An abort during the
+// backoff counts the attempt that was due, since the loop reports the
+// retry before the delay and nothing after it until the attempt
+// streams.
 func TestResponseCarriesAttempts(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -203,12 +206,15 @@ func TestResponseCarriesAttempts(t *testing.T) {
 		// the first.
 		prompts int
 		failed  bool
-		want    []int
+		// abort cancels the run in the first backoff.
+		abort bool
+		want  []int
 	}{
 		{name: "no retry", fails: 0, prompts: 1, want: []int{0}},
 		{name: "two failures then an answer", fails: 2, prompts: 1, want: []int{3}},
 		{name: "the count is per call", fails: 1, prompts: 2, want: []int{2, 0}},
 		{name: "retries exhausted", fails: 5, prompts: 1, failed: true, want: []int{3}},
+		{name: "aborted in the backoff", fails: 1, prompts: 1, failed: true, abort: true, want: []int{2}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := agentsession.NewMemoryStore()
@@ -218,13 +224,25 @@ func TestResponseCarriesAttempts(t *testing.T) {
 			}
 			var n atomic.Int32
 			n.Store(tc.fails)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 			a := agentturn.New(agentturn.Config{Model: flaky{fails: &n}, ModelName: "a", Retry: agentturn.Retry{
 				MaxAttempts: 3,
-				Backoff:     func(int, error) time.Duration { return 0 },
+				Backoff: func(int, error) time.Duration {
+					if tc.abort {
+						cancel()
+						return time.Hour
+					}
+					return 0
+				},
 			}})
 			defer rec.Attach(a)()
 			for i := range tc.prompts {
-				if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); (err != nil) != tc.failed {
+				end, err := a.Prompt(ctx, openresponses.UserText("go"))
+				if err == nil && end.Reason == agentturn.ReasonAborted {
+					err = context.Canceled
+				}
+				if (err != nil) != tc.failed {
 					t.Fatalf("prompt %d: %v", i, err)
 				}
 			}
@@ -358,6 +376,47 @@ func TestEnvUnknownMembersAreCompared(t *testing.T) {
 		}
 		if got := count(); got != want {
 			t.Errorf("after run %d: %d env entries, want %d", i+1, got, want)
+		}
+	}
+}
+
+// TestEnvWorkspaceIsComparedCanonically checks that a workspace whose
+// members are the same in canonical form writes nothing, however its
+// host encoded them, and that one member changing is a new env entry.
+func TestEnvWorkspaceIsComparedCanonically(t *testing.T) {
+	var instance string
+	env := func(context.Context) (*agentsession.EnvEntry, error) {
+		ws := &agentsession.Workspace{Kind: "container", Ref: "sha256:abc"}
+		ws.Unknown = map[string]json.RawMessage{"instance": json.RawMessage(instance)}
+		return &agentsession.EnvEntry{CWD: "/work", Workspace: ws}, nil
+	}
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{}, WithEnv(env))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}})
+	defer rec.Attach(a)()
+	for i, run := range []struct {
+		instance string
+		want     int
+	}{
+		{`{"id":"i-1","zone":"a"}`, 1},
+		{`{"zone": "a", "id": "i-1"}`, 1},
+		{`{"id":"i-2","zone":"a"}`, 2},
+	} {
+		instance = run.instance
+		if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, e := range s.Entries() {
+			if _, ok := e.(*agentsession.EnvEntry); ok {
+				n++
+			}
+		}
+		if n != run.want {
+			t.Errorf("after run %d: %d env entries, want %d", i+1, n, run.want)
 		}
 	}
 }

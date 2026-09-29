@@ -10,20 +10,28 @@ versions may break the API.
 - Requires `agenttool` v0.0.10 and `agentsession` v0.0.10, up from
   v0.0.9. The session recorder writes `agentsession/0.7`, which adds
   optional members only; a 0.5 or 0.6 session reads as it stands, and
-  v0.0.9 of agentsession refuses a 0.7 file. An instructions delta under
-  `session.WithInstructionsParts` now writes each run of unchanged parts
-  as one `keep` rather than naming every part by hash, so a memory
-  write under many layers costs the part that moved. A tool served by
-  agenttool's `mcpserver` finds an elicitor that asks the MCP client on
-  its call's context; an agent run inside one puts its tools' questions
-  there when `Config.ToolElicitor` is nil, and `Recorder.Elicitor`
-  documents how to record them.
+  v0.0.9 of agentsession refuses a 0.7 file.
+- An instructions delta under `session.WithInstructionsParts` writes
+  each run of unchanged parts as one `keep` rather than naming every
+  part by hash, so a memory write under many layers costs the part
+  that moved.
+- A tool served by agenttool's `mcpserver` finds an elicitor that asks
+  the MCP client on its call's context; an agent run inside one puts
+  its tools' questions there when `Config.ToolElicitor` is nil, and
+  `Recorder.Elicitor` documents how to record them.
+- The session recorder compares an env entry's workspace by the
+  format's rule, member by member in canonical form, so a workspace
+  whose members its host encodes with their keys in another order no
+  longer writes a new env entry every run.
 - The response entry of a model call that `Config.Retry` tried again
   carries `attempts`, the calls it took with the one that answered, so
   an exporter's `llm_call_count` counts the retries without knowing the
   `agentturn:model_retry` namespace; so does the failed response
   `run_end` writes for a call whose retries ran out. A call that took
-  one leaves the member off. The `model_retry` custom entries stay,
+  one leaves the member off. An abort during a retry's backoff counts
+  the attempt that was due, since the loop reports the retry before
+  the delay and the recorder cannot tell that abort from one before
+  the attempt streamed. The `model_retry` custom entries stay,
   since they carry what a count cannot: each failure, its delay, its
   model and whether `Retry.Revise` changed the request. (#117)
 
