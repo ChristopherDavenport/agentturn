@@ -127,13 +127,26 @@ func (r *relay) end(item openresponses.Item) error {
 			r.msg = w
 		}
 		text, refusal := messageText(v)
-		if rest, ok := strings.CutPrefix(text, r.text.String()); ok && rest != "" {
-			if err := r.msg.Text(rest); err != nil {
+		restText, extendsText := strings.CutPrefix(text, r.text.String())
+		restRefusal, extendsRefusal := strings.CutPrefix(refusal, r.refusal.String())
+		if !extendsText || !extendsRefusal {
+			// The final message does not extend what was streamed: an
+			// output guard replaced it after its deltas went out. They
+			// cannot be taken back, so the done events and the item
+			// carry the replacement, which is what a client that
+			// renders on done shows and what the response holds.
+			if err := r.replace(v); err != nil {
+				return err
+			}
+			restText, restRefusal = "", ""
+		}
+		if restText != "" {
+			if err := r.msg.Text(restText); err != nil {
 				return err
 			}
 		}
-		if rest, ok := strings.CutPrefix(refusal, r.refusal.String()); ok && rest != "" {
-			if err := r.msg.Refusal(rest); err != nil {
+		if restRefusal != "" {
+			if err := r.msg.Refusal(restRefusal); err != nil {
 				return err
 			}
 		}
@@ -184,6 +197,59 @@ func (r *relay) end(item openresponses.Item) error {
 	default:
 		return r.em.Item(clone(item))
 	}
+}
+
+// replace puts the content of v in the open message in place of what
+// was streamed, keeping the stream well formed: every part streamed
+// keeps its index and is emptied, the part still open takes the
+// replacement's first part when it is of the same kind, without a
+// delta, since its done event is the one the writer raises on close,
+// and the replacement's other parts are written through the writer,
+// each with its own events. The writer merges consecutive parts of one
+// kind, so two text parts in a row arrive as one.
+func (r *relay) replace(v *openresponses.Message) error {
+	m := r.msg.Item()
+	for _, part := range m.Content {
+		switch p := part.(type) {
+		case *openresponses.OutputText:
+			p.Text, p.Annotations, p.Logprobs = "", nil, nil
+		case *openresponses.Refusal:
+			p.Refusal = ""
+		}
+	}
+	rest := clone(v).(*openresponses.Message).Content
+	if n := len(m.Content); n > 0 && len(rest) > 0 {
+		switch open := m.Content[n-1].(type) {
+		case *openresponses.OutputText:
+			if p, ok := rest[0].(*openresponses.OutputText); ok {
+				*open = *p
+				rest = rest[1:]
+			}
+		case *openresponses.Refusal:
+			if p, ok := rest[0].(*openresponses.Refusal); ok {
+				*open = *p
+				rest = rest[1:]
+			}
+		}
+	}
+	for _, part := range rest {
+		switch p := part.(type) {
+		case *openresponses.OutputText:
+			if err := r.msg.Text(p.Text); err != nil {
+				return err
+			}
+			for _, a := range p.Annotations {
+				if err := r.msg.Annotation(a); err != nil {
+					return err
+				}
+			}
+		case *openresponses.Refusal:
+			if err := r.msg.Refusal(p.Refusal); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func messageText(m *openresponses.Message) (text, refusal string) {

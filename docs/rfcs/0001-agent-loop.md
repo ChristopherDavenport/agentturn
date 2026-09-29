@@ -391,11 +391,20 @@ the transcript.
   delivered as `item_update`, so a front that must not show withheld
   text renders on `item_end`. Function calls, reasoning and every other
   output item never reach the guard, so a replay still has what it
-  needs. A guard error fails the run. The replacement reaches the transcript and `item_end` only: the
+  needs. The guard is given the items of the response that precede the
+  message. Whether the message is the answer is not known when it
+  runs: a model may speak before it calls a function in the same
+  response, and the guard is not held until the response completes; a
+  guard that needs finality reads it from the stop hook. A guard error
+  fails the run. The replacement reaches the transcript and `item_end`
+  only: the
   response carried by `response_end`, `turn_end` and the stop hook is
   the wire response as the model produced it, with the original
   message, so a front that must not show withheld text renders from
-  the item events and never from the response.
+  the item events and never from the response. A front that relays the
+  stream, whose deltas it cannot take back, carries the replacement on
+  the item's done events and in the response it builds, and a front
+  that calls the model itself runs the guard as the loop does.
 - `response_end` carries the folded response, usage included, as soon
   as the stream ends and before any tool of the turn runs. A response
   that arrived with a failed status is delivered here too, before the

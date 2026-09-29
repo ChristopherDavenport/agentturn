@@ -15,7 +15,11 @@
 //     and the caller's, and any function call it makes is emitted as an
 //     output item for the caller to run. Nothing is executed, not even a
 //     call to one of the agent's own tools, because a single response
-//     cannot interleave execution with the caller's turn.
+//     cannot interleave execution with the caller's turn. There is no
+//     run: Transform, BeforeModelCall and OutputGuard run as the loop
+//     runs them, the guard with no run ID and turn 1, and no other
+//     hook does, ShouldStopAfterTurn among them, so a guard that needs
+//     to know whether a message is final has nothing to ask here.
 //   - The request carries no tools. The agent owns the run: it executes
 //     its own tools through the loop until the model answers. The
 //     response output carries the assistant messages and reasoning the
@@ -255,7 +259,20 @@ func (a *Adapter) oneTurn(ctx context.Context, req openresponses.Request, transc
 				return err
 			}
 		case *openresponses.OutputItemDoneEvent:
-			if err := rl.end(e.Item); err != nil {
+			item := e.Item
+			if m, ok := item.(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant && cfg.OutputGuard != nil {
+				// The guard sees the message before the caller does, as
+				// the loop's own turns have it.
+				out := acc.Response()
+				replacement, err := cfg.OutputGuard(ctx, agentturn.OutputInfo{Turn: 1, ResponseID: out.ID, Message: m, Output: append(openresponses.Items(nil), out.Output[:e.OutputIndex]...)})
+				if err != nil {
+					return fmt.Errorf("output guard: %w", err)
+				}
+				if replacement != nil {
+					item = replacement
+				}
+			}
+			if err := rl.end(item); err != nil {
 				return err
 			}
 		case *openresponses.ErrorEvent:
