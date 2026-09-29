@@ -13,19 +13,22 @@ import (
 )
 
 // keyedTool is a tool named "act" whose replay is replay, and which
-// records the idempotency key of every call it runs. While block is
-// set it waits for its context, so an abort cuts it after dispatch.
+// records the idempotency key and the text argument of every call it
+// runs. While block is set it waits for its context, so an abort cuts
+// it after dispatch.
 type keyedTool struct {
 	mu    sync.Mutex
 	keys  []string
+	texts []string
 	block bool
 }
 
 func (k *keyedTool) tool(replay agenttool.Replay) agenttool.Tool {
-	return agenttool.New("act", "", func(ctx context.Context, _ echoArgs) (string, error) {
+	return agenttool.New("act", "", func(ctx context.Context, args echoArgs) (string, error) {
 		call, _ := agenttool.CallFrom(ctx)
 		k.mu.Lock()
 		k.keys = append(k.keys, call.IdempotencyKey)
+		k.texts = append(k.texts, args.Text)
 		block := k.block
 		k.mu.Unlock()
 		if block {
@@ -76,7 +79,10 @@ func TestLoopMintsIdempotencyKeys(t *testing.T) {
 // TestResumeAppliesTheReplayRule pins the loop half of #143: an
 // approval of a call that may have run is held to agenttool's replay
 // rule, whether the agent saw the cut itself or was seeded with what a
-// record says; a call the loop cannot say about is not checked.
+// record says, and a call the loop cannot say about is held to it too;
+// a call run again runs with the arguments it was handed over with; a
+// keyed call run with other arguments needs a key of its own; and
+// WithRunAgain is the way past the rule.
 func TestResumeAppliesTheReplayRule(t *testing.T) {
 	call := &openresponses.FunctionCall{CallID: "call_1", Name: "act", Arguments: `{"text":"t"}`}
 	seeded := Transcript{openresponses.UserText("go"), call}
@@ -85,12 +91,17 @@ func TestResumeAppliesTheReplayRule(t *testing.T) {
 		replay agenttool.Replay
 		// cut runs the agent into the pending call itself; otherwise
 		// it is seeded with seeded and, when set, pending.
-		cut     bool
+		cut bool
+		// rewrite has the decision hook rewrite the call's arguments
+		// before the cut.
+		rewrite bool
 		pending []PendingCall
 		answer  func(callID string) Answer
 		wantErr error
-		// wantKey is the key the call runs again with, "" for any.
-		wantKey string
+		// wantKey is the key the call runs again with, "" for any, and
+		// wantText the text argument, "" for the call's own.
+		wantKey  string
+		wantText string
 	}{
 		{name: "cut, safe", replay: agenttool.ReplaySafe, cut: true},
 		{name: "cut, keyed", replay: agenttool.ReplayKeyed, cut: true},
@@ -106,13 +117,37 @@ func TestResumeAppliesTheReplayRule(t *testing.T) {
 			pending: []PendingCall{{Call: call, Reason: PendingAborted, IdempotencyKey: "k1"}}, wantErr: ErrAmbiguousCall},
 		{name: "seeded never started, unknown", replay: agenttool.ReplayUnknown,
 			pending: []PendingCall{{Call: call, Reason: PendingUndispatched}}},
-		{name: "seeded without a record, unknown", replay: agenttool.ReplayUnknown},
+		{name: "seeded without a record, unknown", replay: agenttool.ReplayUnknown, wantErr: ErrAmbiguousCall},
+		{name: "seeded without a record, safe", replay: agenttool.ReplaySafe},
+		{name: "seeded without a record, keyed", replay: agenttool.ReplayKeyed, wantErr: ErrAmbiguousCall},
+		{name: "seeded without a record, unknown, run again", replay: agenttool.ReplayUnknown,
+			answer: func(id string) Answer { return Approve(id).WithRunAgain() }},
+		{name: "cut, unknown, run again", replay: agenttool.ReplayUnknown, cut: true,
+			answer: func(id string) Answer { return Approve(id).WithRunAgain() }},
+		{name: "cut after a rewrite, safe", replay: agenttool.ReplaySafe, cut: true, rewrite: true, wantText: "rewritten"},
+		{name: "cut after a rewrite, keyed", replay: agenttool.ReplayKeyed, cut: true, rewrite: true, wantText: "rewritten"},
+		{name: "seeded aborted with rewritten arguments, keyed", replay: agenttool.ReplayKeyed,
+			pending: []PendingCall{{Call: call, Reason: PendingAborted, IdempotencyKey: "k1", Args: json.RawMessage(`{"text":"rewritten"}`)}},
+			wantKey: "k1", wantText: "rewritten"},
+		{name: "cut, keyed, other arguments", replay: agenttool.ReplayKeyed, cut: true,
+			answer: func(id string) Answer { return ApproveWith(id, json.RawMessage(`{"text":"other"}`)) }, wantErr: ErrAmbiguousCall},
+		{name: "cut, keyed, other arguments under a new key", replay: agenttool.ReplayKeyed, cut: true,
+			answer: func(id string) Answer {
+				return ApproveWith(id, json.RawMessage(`{"text":"other"}`)).WithIdempotencyKey("k3")
+			}, wantKey: "k3", wantText: "other"},
+		{name: "cut, keyed, the same arguments respelled", replay: agenttool.ReplayKeyed, cut: true,
+			answer: func(id string) Answer { return ApproveWith(id, json.RawMessage(`{ "text": "go" }`)) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			k := &keyedTool{block: tc.cut}
 			cfg := Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{k.tool(tc.replay)}}
 			var a *Agent
+			if tc.rewrite {
+				cfg.BeforeToolCall = func(context.Context, ToolCallInfo) (*ToolDecision, error) {
+					return &ToolDecision{Args: json.RawMessage(`{"text":"rewritten"}`)}, nil
+				}
+			}
 			if tc.cut {
 				a = New(cfg)
 				a.Subscribe(func(_ context.Context, ev Event) error {
@@ -154,15 +189,43 @@ func TestResumeAppliesTheReplayRule(t *testing.T) {
 			if len(k.keys) != len(first)+1 {
 				t.Fatalf("keys = %q", k.keys)
 			}
+			if text := k.texts[len(k.texts)-1]; tc.wantText != "" && text != tc.wantText {
+				t.Errorf("ran with text %q, want %q", text, tc.wantText)
+			}
 			got := k.keys[len(k.keys)-1]
 			switch {
 			case tc.wantKey != "" && got != tc.wantKey:
 				t.Errorf("ran with key %q, want %q", got, tc.wantKey)
-			case tc.cut && got != first[0]:
+			case tc.cut && tc.wantKey == "" && got != first[0]:
 				t.Errorf("ran again with key %q, want the first, %q", got, first[0])
 			case got == "":
 				t.Error("ran with no key")
 			}
 		})
+	}
+}
+
+// TestApprovedCallCutBeforeDispatchIsUndispatched checks that a
+// deferred call approved on resume and cut before it was handed to its
+// tool reads as never handed over, not as still waiting for an answer.
+func TestApprovedCallCutBeforeDispatchIsUndispatched(t *testing.T) {
+	k := &keyedTool{}
+	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{k.tool(agenttool.ReplayUnknown)},
+		BeforeToolCall: func(context.Context, ToolCallInfo) (*ToolDecision, error) {
+			return &ToolDecision{Action: Defer}, nil
+		}})
+	end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if end.Reason != ReasonInputRequired || len(end.Pending) != 1 || end.Pending[0].Reason != PendingDeferred {
+		t.Fatalf("end = %+v", end)
+	}
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if _, ok := ev.(*ToolStart); ok {
+			a.Abort()
+		}
+		return nil
+	})
+	end, _ = a.Resume(context.Background(), Approve(end.Pending[0].Call.CallID))
+	if end.Reason != ReasonAborted || len(end.Pending) != 1 || end.Pending[0].Reason != PendingUndispatched || len(k.keys) != 0 {
+		t.Errorf("end = %+v, pending %+v, ran %d", end, end.Pending, len(k.keys))
 	}
 }

@@ -96,11 +96,19 @@ func TestAbortAppendsFinishedOutputs(t *testing.T) {
 	cfg := Config{Model: &twoCalls{}, Tools: []agenttool.Tool{fast, slow}}
 	var events []Event
 	var end *RunEnd
+	finished, dispatched := false, false
 	for ev := range Run(ctx, nil, openresponses.Items{openresponses.UserText("x")}, cfg) {
 		events = append(events, ev)
-		// Abort once the fast call has finished; the slow one is still
-		// blocked on the context.
-		if e, ok := ev.(*ToolEnd); ok && e.Name == "a" {
+		// Abort once the fast call has finished and the slow one has
+		// been handed to its tool, where it is blocked on the context;
+		// a cut before its hand-off would leave it undispatched.
+		switch e := ev.(type) {
+		case *ToolEnd:
+			finished = finished || e.Name == "a"
+		case *ToolDispatch:
+			dispatched = dispatched || e.Name == "b"
+		}
+		if finished && dispatched {
 			cancel()
 		}
 		if e, ok := ev.(*RunEnd); ok {

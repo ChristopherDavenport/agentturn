@@ -121,11 +121,11 @@ func TestReplayAfterACrash(t *testing.T) {
 		t.Errorf("notify answer = %+v", ans)
 	}
 
-	cx, err := s2.Context()
+	opts, err := AgentOptions(s2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := agentturn.New(agentturn.Config{Model: allCalls{}, Tools: tools}, agentturn.WithTranscript(cx.Items), agentturn.WithPending(pending))
+	b := agentturn.New(agentturn.Config{Model: allCalls{}, Tools: tools}, opts...)
 	defer rec2.Attach(b)()
 	end, err := b.Resume(context.Background(), answers...)
 	if err != nil || end.Reason != agentturn.ReasonDone {
@@ -184,6 +184,9 @@ func TestReplayAnswersEachState(t *testing.T) {
 		state   func(callID, target string) []agentsession.Entry
 		want    string
 		wantKey string
+		// wantArgs are the arguments the approval carries, nil for the
+		// call's own.
+		wantArgs string
 	}{
 		{name: "never started", tool: "unknown", want: "approve"},
 		{name: "held", tool: "unknown", want: "none", state: func(id, target string) []agentsession.Entry {
@@ -194,6 +197,11 @@ func TestReplayAnswersEachState(t *testing.T) {
 		{name: "in flight, keyed without a key", tool: "keyed", want: "unknown", state: dispatched("")},
 		{name: "in flight, unknown", tool: "unknown", want: "unknown", state: dispatched("k1")},
 		{name: "in flight, no such tool", tool: "gone", want: "unknown", state: dispatched("")},
+		{name: "in flight after a rewrite, keyed", tool: "keyed", want: "approve", wantKey: "k1", wantArgs: `{"text":"rewritten"}`,
+			state: func(id, target string) []agentsession.Entry {
+				return append([]agentsession.Entry{agentsession.NewDecision(id, target, agentsession.VerdictProceed, agentsession.ByPolicy).WithArgs(json.RawMessage(`{"text":"rewritten"}`))},
+					dispatched("k1")(id, target)...)
+			}},
 		{name: "no records, safe", tool: "safe", records: []string{}, want: "approve"},
 		{name: "no records, unknown", tool: "unknown", records: []string{}, want: "unknown"},
 	}
@@ -231,8 +239,8 @@ func TestReplayAnswersEachState(t *testing.T) {
 				if answers[0].Output != nil {
 					got = "unknown"
 				}
-				if answers[0].IdempotencyKey != tc.wantKey || answers[0].By != agentsession.ByPolicy {
-					t.Errorf("answer = %+v, want key %q by policy", answers[0], tc.wantKey)
+				if answers[0].IdempotencyKey != tc.wantKey || answers[0].By != agentsession.ByPolicy || string(answers[0].Args) != tc.wantArgs {
+					t.Errorf("answer = %+v, want key %q and args %s by policy", answers[0], tc.wantKey, tc.wantArgs)
 				}
 			}
 			if got != tc.want || len(answers) > 1 {

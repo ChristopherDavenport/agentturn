@@ -168,21 +168,26 @@ names nobody is recorded as an anonymous decision.
 The same path repairs a run that was aborted mid-batch: the cut-off
 calls are on `end.Pending`, and an agent built with
 `agentturn.WithTranscript` from a stored session marks them pending
-again. A call that was handed to its tool may have run, so `Resume`
-approves it only as agenttool's replay rule allows, with the
-idempotency key it first ran with, and refuses otherwise with
-`ErrAmbiguousCall`; `agentturn.OutcomeUnknown` is the answer for such a
-call. After a restart, `session.Pending` reads each call's reason and
-key from the record for `agentturn.WithPending`, and
-`session.ReplayAnswers` applies the rule to them:
+again. A call that was handed to its tool may have run, and one in a
+transcript the agent was seeded with may have too, so `Resume`
+approves either only as agenttool's replay rule allows, with the
+idempotency key and the arguments it first ran with, and refuses
+otherwise with `ErrAmbiguousCall`. `agentturn.OutcomeUnknown` is the
+answer for such a call, and `Answer.WithRunAgain` the only way past the
+rule, for a host that accepts the risk. A tool without `WithReplay`
+reads as unknown, so an approval of it after a cut is refused. After a
+restart, `session.AgentOptions` seeds the agent with the context and
+with what the record says of each pending call, so a call that never
+started is approved as it is, and `session.ReplayAnswers` applies the
+rule to the rest:
 
 ```go
 rec, s, _ := session.Resume(ctx, store, id)
-cx, _ := s.Context()
-pending, _ := session.Pending(s)
-a := agentturn.New(cfg, agentturn.WithTranscript(cx.Items), agentturn.WithPending(pending))
+opts, _ := session.AgentOptions(s)
+a := agentturn.New(cfg, opts...)
 defer rec.Attach(a)()
-answers, _ := session.ReplayAnswers(ctx, s, cfg.Tools) // plus the held calls' answers
+// The tools the resume will run: cfg.ResolveTools asks a ToolProvider.
+answers, _ := session.ReplayAnswers(ctx, s, cfg.ResolveTools(ctx)) // plus the held calls' answers
 end, err := a.Resume(ctx, answers...)
 ```
 

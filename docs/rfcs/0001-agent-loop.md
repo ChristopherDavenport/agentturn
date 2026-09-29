@@ -628,12 +628,13 @@ the tool it resolved to, so a prompt can show what it asks about:
 | pending reason | meaning |
 | --- | --- |
 | `deferred` | the decision hook handed the call to the caller in this run and nothing has answered it. The tool did not run |
-| `aborted` | the call was handed to its tool, by this run or an earlier one, and the run was cancelled or failed before its output was appended. The tool may have run to completion, so its side effect may have happened: the call is **ambiguous**, and carries the idempotency key it was handed over with |
+| `aborted` | the call was handed to its tool, by this run or an earlier one, and the run was cancelled or failed before its output was appended. The tool may have run to completion, so its side effect may have happened: the call is **ambiguous**, and carries the idempotency key and the arguments it was handed over with |
 | `undispatched` | the loop did not hand the call to its tool, so the tool did not run: a subscriber refused its `tool_dispatch`, or the cancellation or the failure reached it before its turn. A recorder that took the event before a subscriber that refused has already written the dispatch |
-| `unknown` | the call was in the transcript the run was given, so the loop cannot say whether it ran. A session recorded with dispatch entries can, and an agent seeded with what it says reports the reasons above instead |
+| `unknown` | the call was in the transcript the run was given, so the loop cannot say whether it ran, and it is **ambiguous** as well. A session recorded with dispatch entries can say, and an agent seeded with what it says reports the reasons above instead |
 
 A call pending when the run started that the run did not hand to its
-tool keeps the reason and the key it had.
+tool keeps the reason, the key and the arguments it had, except that a
+call the resume approved and the cut reached first is `undispatched`.
 
 The pending list is empty for `done` and `stopped`. Whatever ended the
 run, the calls without an output are the caller's to answer, and the
@@ -654,7 +655,9 @@ An **answer** names one pending call and is one of:
   function call output.
 - an **approval**, optionally with replacement arguments, a reason and
   an idempotency key: the loop runs the call itself, with the key
-  given, else the one the pending call carries, else a new one.
+  given, else the one the pending call carries, else a new one, and
+  with the arguments given, else the ones the call was handed over
+  with, else its own.
 
 An answer MAY carry a **note**, what the person said when answering,
 and **who decided** it in the session format's terms (`human`,
@@ -667,14 +670,17 @@ outputs are still appended, so the transcript stays valid.
 
 A resume MUST answer every pending call exactly once and MUST NOT name
 a call that is not pending. An approval of an ambiguous call, pending
-as `aborted`, is held to agenttool RFC 0001's rule for running a call
-again: the loop asks the tool's replay for the arguments the call would
-run with, and approves it when the answer is *safe*, or *keyed* with a
-key known; otherwise it refuses the resume and runs nothing, and the
+as `aborted` or `unknown`, is held to agenttool RFC 0001's rule for
+running a call again, since the loop does not have its result: the
+loop asks the tool's replay for the arguments the call would run with,
+under the call it would run as, and approves it when the answer is
+*safe*, or *keyed* with a key known and either the arguments it was
+handed over with or a key the answer chose, since a key names one
+operation; otherwise it refuses the resume and runs nothing, and the
 caller answers the call with an output saying the outcome is unknown.
-A call pending as `unknown` is not checked, since the loop cannot say
-whether it ran. The resume then runs as follows, and its source is
-`resume`:
+The one way past the rule is an approval that says the host accepts
+running the call again, recorded as the proceed's reason. The resume
+then runs as follows, and its source is `resume`:
 
 1. `run_start`.
 2. The outputs of the answers that carry one are appended with their
@@ -707,18 +713,20 @@ pending, or a prompt that leaves a pending call unanswered, is refused.
 An agent given a transcript to start from — a stored session being
 resumed — derives its pending calls from that transcript: every
 function call without an output is pending with reason `unknown`, and
-the agent refuses to run until they are answered. A host MAY seed it as
-well with what a record says of them, the reason and the key, so a
-call that may have run is held to the replay rule. Replacing the
-transcript re-derives them the same way: whatever the old transcript
-was waiting on is forgotten.
+the agent refuses to run until they are answered. A host SHOULD seed it
+as well with what a record says of them, the reason, the key and the
+arguments, so only a call that may have run is held to the replay rule
+and one that never started is approved as it is. Replacing the
+transcript re-derives them the same way, as `unknown`: whatever the old
+transcript was waiting on is forgotten.
 
-A recorder that resumes a stored session applies the replay rule
-itself, from the record: a held call is the caller's; one that never
+A host resuming a stored session gets the replay rule's answers from
+the record through the recorder's library: a held call is the caller's; one that never
 started is approved; one with a `dispatch` and no output, or one the
 file cannot say about, is ambiguous, and is approved when its tool
 says *safe*, or *keyed* and the dispatch carries the key, which the
-approval carries, and answered with the outcome unknown otherwise.
+approval carries with the arguments it was handed over with, and
+answered with the outcome unknown otherwise.
 
 ## Cancellation
 
@@ -1207,9 +1215,9 @@ maps onto it as follows:
 | tool elicitor | `Config.ToolElicitor`, installed on every tool call's context; `session.Recorder.Elicitor(by, fn)` wraps one so the question and the answer are recorded under the call |
 | reason, cause | `Reason` (`ReasonDone`, `ReasonStopped`, `ReasonInputRequired`, `ReasonAborted`, `ReasonError`); `StopCause` (`StopMaxTurns`, `StopHook`, `StopGuard`, `StopTerminate`, `StopPartialTerminate`, `StopRefused`) |
 | idempotency key | `ToolDispatch.IdempotencyKey`, on `agenttool.Call` for the tool |
-| pending call | `PendingCall{Call, Reason, Tool, IdempotencyKey}`; `PendingReason` (`PendingDeferred`, `PendingAborted`, `PendingUndispatched`, `PendingUnknown`); `PendingCalls` |
+| pending call | `PendingCall{Call, Reason, Tool, IdempotencyKey, Args}`; `PendingReason` (`PendingDeferred`, `PendingAborted`, `PendingUndispatched`, `PendingUnknown`); `PendingCalls` |
 | decision | `ToolDecision{Action, Reason, Terminate, Args, By, Note}`; `ToolAction` (`Allow`, `Block`, `Defer`) |
-| answer | `Answer{CallID, Output, Args, Note, Terminate, By, Reason, IdempotencyKey}`; `Output`, `Approve`, `ApproveWith`, `Refuse`, `OutcomeUnknown`, `WithNote`, `WithBy`, `WithReason`, `WithIdempotencyKey`; `ContextWithDeciders`/`DeciderFromContext` for a host driving `Run` |
+| answer | `Answer{CallID, Output, Args, Note, Terminate, By, Reason, IdempotencyKey, RunAgain}`; `Output`, `Approve`, `ApproveWith`, `Refuse`, `OutcomeUnknown`, `WithNote`, `WithBy`, `WithReason`, `WithIdempotencyKey`, `WithRunAgain`, `RunAgainReason`; `ContextWithDeciders`/`DeciderFromContext` for a host driving `Run` |
 | hooks | `Config.BeforeTurn`, `BeforeModelCall`, `OutputGuard`, `BeforeToolCall`, `AfterToolCall`, `ShouldStopAfterTurn` |
 | guard stop | an error wrapping `ErrGuard` from `ShouldStopAfterTurn`, `BeforeTurn` or `BeforeModelCall` |
 | chains | `ChainBeforeTurn`, `ChainBeforeModelCall`, `ChainOutputGuard`, `ChainBeforeToolCall`, `ChainShouldStopAfterTurn`, `ChainTransform` |
@@ -1218,7 +1226,7 @@ maps onto it as follows:
 | the loop as a model | `front/responses.New(cfg)` → `openresponses.Adapter` |
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`; `tools/a2a.New(client, card)` |
-| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `RecordFunc`, `Elicitor`, `Requeue`, `Rebase`; `WithInstructionsParts`; `session.RequestHash`; the replay rule from the record: `session.Pending`, `session.ReplayAnswers`, `session.DispatchKey`, `session.IdempotencyKeyMember` |
+| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `RecordFunc`, `Elicitor`, `Requeue`, `Rebase`; `WithInstructionsParts`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.DispatchKey`, `session.IdempotencyKeyMember` |
 
 Every error the package returns to its caller, sentinel or wrapped,
 begins with `agentturn:`; the error texts a call's output carries,
@@ -1329,6 +1337,13 @@ module and is listed in the changelog as one.
   the format accepts, reads as the first to a reader that keeps one
   per call. The format defining the member, and saying that a second
   `dispatch` is a second hand-off, is proposed.
+- **A key for a nested call** (#145). A call a tool makes through
+  `Invoke` gets a fresh key on every invocation, derived from nothing,
+  so a parent run again after a restart invokes its nested calls with
+  new keys and a keyed tool reached that way deduplicates nothing
+  across the parent's attempts. Deriving the nested key from the
+  parent's and the nested call's position, or letting the invoking
+  tool pass one, are the options.
 
 - **A dispatch a later subscriber refuses** (#119). The loop reports
   such a call as `undispatched`; the recorder has written its

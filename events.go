@@ -487,6 +487,12 @@ type PendingCall struct {
 	// approval of the call through [Agent.Resume] runs it with this
 	// key unless the answer carries its own.
 	IdempotencyKey string
+	// Args are the arguments the call was handed to its tool with, for
+	// a call that may have run, which a decision may have rewritten;
+	// nil when they are the call's own or it was not handed over. An
+	// approval runs it again with them unless the answer carries its
+	// own.
+	Args json.RawMessage
 }
 
 // PendingCalls returns the calls of pending, in order.

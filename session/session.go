@@ -880,12 +880,14 @@ func DispatchKey(d *agentsession.DispatchEntry) string {
 // lists them, with the reason the record gives each: a call held by a
 // hold decision is [agentturn.PendingDeferred]; one with a dispatch
 // may have run and is [agentturn.PendingAborted], with the key its
-// first dispatch carried; one with none, when the header promises
+// first dispatch carried and the arguments a decision gave it; one with
+// none, when the header promises
 // dispatch records, never started and is
 // [agentturn.PendingUndispatched]; and one the file cannot say about
-// is [agentturn.PendingUnknown]. It is what [agentturn.WithPending]
-// seeds an agent with beside the context's items, so the agent's
-// Resume holds an approval to the replay rule.
+// is [agentturn.PendingUnknown], with those arguments too. It is what
+// [agentturn.WithPending] seeds an agent with beside the context's
+// items, so the agent's Resume knows which calls never started;
+// [AgentOptions] gives both.
 func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 	if s.Leaf() == "" {
 		return nil, nil
@@ -905,9 +907,29 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 		case agentsession.CallNeverStarted:
 			p.Reason = agentturn.PendingUndispatched
 		}
+		if args := c.Args(); args != c.Call.Arguments && (p.Reason == agentturn.PendingAborted || p.Reason == agentturn.PendingUnknown) {
+			p.Args = json.RawMessage(args)
+		}
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// AgentOptions returns the options that seed an agent with the
+// session at its leaf: the context's items, and the pending calls as
+// [Pending] reads them, so the agent's Resume holds only the calls
+// that may have run to the replay rule. It is what a host resuming a
+// session passes to agentturn.New.
+func AgentOptions(s *agentsession.Session) ([]agentturn.Option, error) {
+	cx, err := s.Context()
+	if err != nil {
+		return nil, fmt.Errorf("session: context at leaf: %w", err)
+	}
+	pending, err := Pending(s)
+	if err != nil {
+		return nil, err
+	}
+	return []agentturn.Option{agentturn.WithTranscript(cx.Items), agentturn.WithPending(pending)}, nil
 }
 
 // ReplayAnswers applies agenttool's rule for running a call again to
@@ -916,8 +938,9 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 // that never started is approved. A call that may have run, in flight
 // when the record stopped or one the file cannot say about, is
 // ambiguous: it is approved when its tool, looked up in tools by name,
-// says replay is safe for its arguments, or keyed and its first
-// dispatch carries the key, which the approval then carries; and it is
+// says replay is safe for the arguments it was handed over with, or
+// keyed and its first dispatch carries the key, and the approval then
+// carries those arguments and that key; and it is
 // answered with [agentturn.OutcomeUnknown] otherwise, including when
 // no tool has its name. A held call is waiting for someone and is the
 // caller's to answer; [Pending] lists it as deferred.
@@ -955,16 +978,22 @@ func replayAnswer(ctx context.Context, tools agenttool.Set, p agentturn.PendingC
 	if !ok {
 		return agentturn.OutcomeUnknown(id)
 	}
-	args := json.RawMessage(p.Call.Arguments)
+	args := p.Args
+	if args == nil {
+		args = json.RawMessage(p.Call.Arguments)
+	}
 	if len(args) == 0 {
 		args = json.RawMessage("{}")
 	}
+	// The tool is asked under the call it would run as.
+	ctx = agenttool.WithCall(ctx, agenttool.Call{ID: id, Args: args, IdempotencyKey: p.IdempotencyKey})
+	again := agentturn.ApproveWith(id, p.Args).WithIdempotencyKey(p.IdempotencyKey)
 	switch agenttool.ReplayOf(ctx, tool, args) {
 	case agenttool.ReplaySafe:
-		return agentturn.Approve(id).WithReason("run again: safe").WithIdempotencyKey(p.IdempotencyKey)
+		return again.WithReason("run again: safe")
 	case agenttool.ReplayKeyed:
 		if p.IdempotencyKey != "" {
-			return agentturn.Approve(id).WithReason("run again: keyed").WithIdempotencyKey(p.IdempotencyKey)
+			return again.WithReason("run again: keyed")
 		}
 	}
 	return agentturn.OutcomeUnknown(id)
@@ -2305,9 +2334,9 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		// A call an earlier run dispatched, answered now with an output
 		// of the caller's, gets no decision: a proceed says the call
 		// went on toward its tool, which it did not, and a reject that
-		// it never reached its tool, which may be false. The output is the record,
-		// and no second dispatch before it says the tool did not run
-		// again.
+		// it never reached its tool, which may be false. The output is
+		// the record, and no second dispatch before it says the tool
+		// did not run again.
 		if c := w.calls[out.CallID]; c != nil && !c.dispatched && !c.rejected {
 			// The caller wrote the output themselves: the call never
 			// reached its tool, and the output is what the model sees.

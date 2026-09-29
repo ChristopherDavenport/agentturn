@@ -104,27 +104,41 @@ versions may break the API.
   the call again with it, and `Answer.IdempotencyKey` supplies one
   after a restart. The session recorder writes it on the `dispatch` as
   `idempotency_key`, a member agentsession does not define yet, and
-  `session.DispatchKey` reads it back. (#145)
+  `session.DispatchKey` reads it back. A call a tool makes through
+  `Invoke` gets a fresh key each time, derived from nothing, which RFC
+  0001 lists as open. (#145)
 - The session recorder writes a second `dispatch` for a call an earlier
   run dispatched and a resume runs again, durably before the tool runs,
   so the record holds one per hand-off. An output the caller writes for
   such a call, `agentturn.OutcomeUnknown` for one, is written with no
   decision before it rather than a `proceed`, since the call did not go
-  on toward its tool; a call run again gets a `proceed` carrying the
-  approval's new `Answer.Reason`. (#144)
+  on toward its tool, so the answer's `By` and `Reason` are not
+  recorded for it: the format has no place for them. A call run again
+  gets a `proceed` carrying the approval's new `Answer.Reason`. (#144)
 - Breaking: `Agent.Resume` applies agenttool's rule for running a call
-  again to an approval of a call pending as `PendingAborted`: it runs
-  the call when the tool's replay is safe, or keyed with a key known,
-  and otherwise returns `ErrAmbiguousCall` and runs nothing;
-  `agentturn.OutcomeUnknown` is the answer the rule asks for. A call
-  cut before it was handed to its tool is now pending as
-  `PendingUndispatched`, not `PendingAborted`, since it did not run,
-  and one a resume approved keeps its earlier reason and key rather
+  again to an approval of a call that may have run, pending as
+  `PendingAborted` or, since the loop cannot say, as `PendingUnknown`:
+  it runs the call when the tool's replay is safe, or keyed with a key
+  known, and otherwise returns `ErrAmbiguousCall` and runs nothing. A
+  tool without `WithReplay`, which reads as `ReplayUnknown`, can no
+  longer be approved after an abort cut it mid-call, nor after a
+  restart or a `SetTranscript` that seeds its call as unknown; answer
+  it with `agentturn.OutcomeUnknown`, or approve it with
+  `Answer.WithRunAgain`, the only way past the rule, whose proceed
+  carries `agentturn.RunAgainReason`. A keyed call approved with other
+  arguments than it was handed over with is refused unless the answer
+  carries a key of its own. A call run again runs with the arguments
+  it was first handed over with, a decision's rewrite included, which
+  `PendingCall.Args` carries. A call cut before it was handed to its
+  tool is now pending as `PendingUndispatched`, not `PendingAborted`,
+  since it did not run, a deferred call approved and cut so included,
+  and one that may have run keeps its reason, key and arguments rather
   than reading `PendingUnknown`. `agentturn.WithPending` seeds an agent
-  with what a record says of its pending calls, `session.Pending`
-  reads it from a session, and `session.ReplayAnswers` returns the
-  rule's answer for each call pending at the leaf that is not held.
-  (#143)
+  with what a record says of its pending calls; `session.AgentOptions`
+  gives it and the context's items for a stored session in one call,
+  `session.Pending` reads the calls, and `session.ReplayAnswers`
+  returns the rule's answer for each call pending at the leaf that is
+  not held. (#143)
 
 ## v0.0.10 - 2026-09-28
 
