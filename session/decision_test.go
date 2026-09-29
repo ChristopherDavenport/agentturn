@@ -200,11 +200,13 @@ func TestReplayedChildWritesNoDecisions(t *testing.T) {
 	verifyAll(t, child)
 }
 
-// TestAnswerToAnAbortedCallNamesWhoAnswered covers the call an abort
+// TestAnswerToAnAbortedCallWritesNoDecision covers the call an abort
 // cut off in flight: it was handed to its tool, so its dispatch is on
-// the path, the caller's output is not a reject, and who wrote it is
-// still worth recording.
-func TestAnswerToAnAbortedCallNamesWhoAnswered(t *testing.T) {
+// the path, and the caller's output is neither a reject, which would
+// say the tool never ran, nor a proceed, which would say it went on
+// toward its tool again (#144). The output is the record, and the one
+// dispatch says the tool was handed the call once.
+func TestAnswerToAnAbortedCallWritesNoDecision(t *testing.T) {
 	store := agentsession.NewMemoryStore()
 	rec, s, err := Start(context.Background(), store, agentsession.Header{})
 	if err != nil {
@@ -242,11 +244,17 @@ func TestAnswerToAnAbortedCallNamesWhoAnswered(t *testing.T) {
 	if c == nil || c.Dispatch == nil || c.Output == nil {
 		t.Fatalf("call = %+v", c)
 	}
-	if len(c.Decisions) != 1 {
-		t.Fatalf("decisions = %+v", c.Decisions)
+	if len(c.Decisions) != 0 {
+		t.Errorf("decisions = %+v, want none", c.Decisions)
 	}
-	if d := c.Decisions[0]; d.Verdict != agentsession.VerdictProceed || d.By != agentsession.ByHuman {
-		t.Errorf("decision = %+v, want a proceed by a human", d)
+	dispatches := 0
+	for _, e := range s.Path(s.Leaf()) {
+		if _, ok := e.(*agentsession.DispatchEntry); ok {
+			dispatches++
+		}
+	}
+	if dispatches != 1 {
+		t.Errorf("dispatches = %d, want 1", dispatches)
 	}
 	if c.Rejected() {
 		t.Error("a call that reached its tool is recorded as rejected")

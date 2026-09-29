@@ -289,16 +289,24 @@ func (*ToolStart) EventType() string { return EventToolStart }
 // stops the call: it ends with that error and the tool does not run,
 // so a dispatch that could not be made durable is never followed by a
 // side effect the record cannot see. The call is then pending as
-// [PendingUndispatched]. Subscribers are called in registration order,
+// [PendingUndispatched], or still as [PendingAborted] when an earlier
+// run dispatched it. Subscribers are called in registration order,
 // so a subscriber that vetoes a dispatch is registered before the
 // recorder: one registered after it refuses a call whose dispatch is
 // already durable. Parent is set for a nested call.
+//
+// IdempotencyKey is the key the tool receives on agenttool.Call: the
+// loop mints one for every call it dispatches and keeps it when the
+// call runs again, from the pending call or the [Answer] that approved
+// it. A recorder writes it with the dispatch, so a host resuming after
+// a restart can hand a keyed tool the key its first attempt carried.
 type ToolDispatch struct {
-	RunID  string
-	Turn   int
-	CallID string
-	Name   string
-	Parent string
+	RunID          string
+	Turn           int
+	CallID         string
+	Name           string
+	Parent         string
+	IdempotencyKey string
 }
 
 // EventType returns "tool_dispatch".
@@ -445,19 +453,22 @@ const (
 	// PendingDeferred: BeforeToolCall handed the call to the caller and
 	// nothing has answered it. The tool did not run.
 	PendingDeferred PendingReason = "deferred"
-	// PendingAborted: the run was aborted or failed while the call was
-	// in flight, after its tool_start. The tool may have run to
-	// completion, so its side effect may have happened.
+	// PendingAborted: the run was aborted or failed after the call was
+	// handed to its tool, in this run or an earlier one. The tool may
+	// have run to completion, so its side effect may have happened, and
+	// the call is ambiguous: [Agent.Resume] runs it again only as
+	// agenttool's replay rule allows.
 	PendingAborted PendingReason = "aborted"
-	// PendingUndispatched: a subscriber refused the call's
-	// tool_dispatch, so the loop did not hand it to its tool and the
-	// tool did not run. A recorder registered before the subscriber
-	// that refused has already written the dispatch; see
-	// [ToolDispatch].
+	// PendingUndispatched: the loop did not hand the call to its tool,
+	// so the tool did not run: a subscriber refused its tool_dispatch,
+	// or the run was aborted or failed before the call's turn. A
+	// recorder registered before a subscriber that refused has already
+	// written the dispatch; see [ToolDispatch].
 	PendingUndispatched PendingReason = "undispatched"
 	// PendingUnknown: the call was found without an output in a
 	// transcript the agent was seeded with, so the loop cannot say
-	// whether it ran. A session recorded with dispatch entries can.
+	// whether it ran. A session recorded with dispatch entries can, and
+	// [WithPending] seeds the agent with what it says.
 	PendingUnknown PendingReason = "unknown"
 )
 
@@ -471,6 +482,11 @@ type PendingCall struct {
 	// it runs; nil for a call no tool has the name of and for a call the
 	// run did not make, one found in a seeded transcript.
 	Tool agenttool.Tool
+	// IdempotencyKey is the key the call carried when it was handed to
+	// its tool, for a call that may have run, and empty otherwise. An
+	// approval of the call through [Agent.Resume] runs it with this
+	// key unless the answer carries its own.
+	IdempotencyKey string
 }
 
 // PendingCalls returns the calls of pending, in order.

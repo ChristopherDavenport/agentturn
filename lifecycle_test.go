@@ -272,8 +272,9 @@ func TestAbortCause(t *testing.T) {
 			t.Errorf("end = %+v", end)
 		}
 		// The cut-off call is the caller's to answer, as after any
-		// abort: its output was not appended.
-		if len(end.Pending) != 1 || end.Pending[0].Reason != PendingAborted {
+		// abort: its output was not appended. The cut came at its
+		// tool_start, before it was handed to its tool.
+		if len(end.Pending) != 1 || end.Pending[0].Reason != PendingUndispatched {
 			t.Errorf("pending = %+v", end.Pending)
 		}
 		if got := itemTypes(end.Items); got != "user function_call" {

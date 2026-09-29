@@ -168,7 +168,25 @@ names nobody is recorded as an anonymous decision.
 The same path repairs a run that was aborted mid-batch: the cut-off
 calls are on `end.Pending`, and an agent built with
 `agentturn.WithTranscript` from a stored session marks them pending
-again. A front whose user has moved on answers them on the way to the
+again. A call that was handed to its tool may have run, so `Resume`
+approves it only as agenttool's replay rule allows, with the
+idempotency key it first ran with, and refuses otherwise with
+`ErrAmbiguousCall`; `agentturn.OutcomeUnknown` is the answer for such a
+call. After a restart, `session.Pending` reads each call's reason and
+key from the record for `agentturn.WithPending`, and
+`session.ReplayAnswers` applies the rule to them:
+
+```go
+rec, s, _ := session.Resume(ctx, store, id)
+cx, _ := s.Context()
+pending, _ := session.Pending(s)
+a := agentturn.New(cfg, agentturn.WithTranscript(cx.Items), agentturn.WithPending(pending))
+defer rec.Attach(a)()
+answers, _ := session.ReplayAnswers(ctx, s, cfg.Tools) // plus the held calls' answers
+end, err := a.Resume(ctx, answers...)
+```
+
+A front whose user has moved on answers them on the way to the
 next message instead: a `Prompt` that opens with an output for each
 pending call is accepted, and the model sees the outputs and the
 message in one call. `AfterToolCall` overrides results;

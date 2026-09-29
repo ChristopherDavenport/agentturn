@@ -145,9 +145,21 @@ func TestFailureMidBatchPairsEveryCall(t *testing.T) {
 			if got := itemTypes(end.Items); got != tc.want {
 				t.Errorf("items: got %q want %q", got, tc.want)
 			}
+			// A call handed to its tool may have run; one cut before
+			// that did not.
+			dispatched := map[string]bool{}
+			for _, ev := range events {
+				if d, ok := ev.(*ToolDispatch); ok {
+					dispatched[d.CallID] = true
+				}
+			}
 			for _, p := range end.Pending {
-				if p.Reason != PendingAborted {
-					t.Errorf("pending %s: reason %s, want aborted", p.Call.CallID, p.Reason)
+				want := PendingUndispatched
+				if dispatched[p.Call.CallID] {
+					want = PendingAborted
+				}
+				if p.Reason != want {
+					t.Errorf("pending %s: reason %s, want %s", p.Call.CallID, p.Reason, want)
 				}
 			}
 			if len(end.Pending) != tc.pending {

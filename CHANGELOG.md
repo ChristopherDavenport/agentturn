@@ -96,6 +96,35 @@ versions may break the API.
   the context is now asked for every child session too: a child whose
   instructions are the root's gets the root's parts and omitted list.
   (#142)
+- The loop mints an idempotency key for every call it hands to a tool,
+  the run's ID and the call's, and puts it on `agenttool.Call`, so a
+  tool that claims `ReplayKeyed` deduplicates under the reference
+  harness without a host wrapper. `ToolDispatch` and a pending call
+  that may have run carry it, an approval through `Agent.Resume` runs
+  the call again with it, and `Answer.IdempotencyKey` supplies one
+  after a restart. The session recorder writes it on the `dispatch` as
+  `idempotency_key`, a member agentsession does not define yet, and
+  `session.DispatchKey` reads it back. (#145)
+- The session recorder writes a second `dispatch` for a call an earlier
+  run dispatched and a resume runs again, durably before the tool runs,
+  so the record holds one per hand-off. An output the caller writes for
+  such a call, `agentturn.OutcomeUnknown` for one, is written with no
+  decision before it rather than a `proceed`, since the call did not go
+  on toward its tool; a call run again gets a `proceed` carrying the
+  approval's new `Answer.Reason`. (#144)
+- Breaking: `Agent.Resume` applies agenttool's rule for running a call
+  again to an approval of a call pending as `PendingAborted`: it runs
+  the call when the tool's replay is safe, or keyed with a key known,
+  and otherwise returns `ErrAmbiguousCall` and runs nothing;
+  `agentturn.OutcomeUnknown` is the answer the rule asks for. A call
+  cut before it was handed to its tool is now pending as
+  `PendingUndispatched`, not `PendingAborted`, since it did not run,
+  and one a resume approved keeps its earlier reason and key rather
+  than reading `PendingUnknown`. `agentturn.WithPending` seeds an agent
+  with what a record says of its pending calls, `session.Pending`
+  reads it from a session, and `session.ReplayAnswers` returns the
+  rule's answer for each call pending at the leaf that is not held.
+  (#143)
 
 ## v0.0.10 - 2026-09-28
 
