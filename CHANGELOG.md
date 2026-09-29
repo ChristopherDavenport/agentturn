@@ -29,6 +29,15 @@ versions may break the API.
   mid-list costs that tool and the ones after it, not every tool and
   every instruction part. A tool moved to the end is added alone. The
   size check still writes a replace when that is smaller. (#162)
+- `compact.WithRequest` edits the summary request `compact.NewLocal`
+  sends, after the transform has set its model, input and store. The
+  request carried nothing a caller passed but the model name, so a
+  thinking model left at its server's default reasoning thought
+  through the fold and now and then ended with a function call; a
+  caller whose requests set `effort: none` can now say the same for
+  the summary. A summary response with no text is asked once more
+  before the fold fails with `compact: summary response has no text`,
+  and the fold reports the call that answered. (#161)
 
 ## v0.0.11 - 2026-09-29
 
