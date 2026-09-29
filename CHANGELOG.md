@@ -185,6 +185,11 @@ versions may break the API.
   it: a job carries its call with `agenttool.WithCall` for the record
   to name it. The tool elicitor stays off, with the rest of what
   belongs to the batch. (#149)
+- A panic while an `Agent` starts a run, from a nil or misbehaving
+  tool in the configuration, no longer leaves the agent's lock held:
+  a caller that recovers it can fix the configuration and prompt
+  again, where every later call on the agent used to block for good.
+  `Prompt`, `Continue`, `Resume` and `Deliver` all release it.
 - `front/a2a.WithRecorderFor` records the runs a served agent makes.
   The executor drives each task on an `agentturn.Agent` seeded with the
   stored conversation, rather than on `agentturn.Run`, and hands that

@@ -663,12 +663,20 @@ func answersPending(pending []PendingCall, prompts openresponses.Items) error {
 
 func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved []approval, resuming, terminate bool) (*RunEnd, error) {
 	a.mu.Lock()
-	run, err := a.start(ctx, prompts, approved, resuming, terminate)
-	a.mu.Unlock()
+	run, err := a.startUnlock(ctx, prompts, approved, resuming, terminate)
 	if err != nil {
 		return nil, err
 	}
 	return run()
+}
+
+// startUnlock calls start, with a.mu held by the caller, and releases
+// it however start returns: a panic there, from a tool the
+// configuration holds, leaves the agent usable by a caller that
+// recovers it.
+func (a *Agent) startUnlock(ctx context.Context, prompts openresponses.Items, approved []approval, resuming, terminate bool) (func() (*RunEnd, error), error) {
+	defer a.mu.Unlock()
+	return a.start(ctx, prompts, approved, resuming, terminate)
 }
 
 // start begins a run with a.mu held, so the check that the agent is
@@ -1021,8 +1029,7 @@ func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joine
 		a.mu.Unlock()
 		return false, nil, ErrCannotContinue
 	}
-	run, err := a.start(ctx, nil, nil, false, false)
-	a.mu.Unlock()
+	run, err := a.startUnlock(ctx, nil, nil, false, false)
 	if err != nil {
 		return false, nil, err
 	}
