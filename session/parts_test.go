@@ -81,19 +81,12 @@ func TestInstructionsPartsAreRecorded(t *testing.T) {
 				if len(added) != 1 || added[0].Replace || added[0].Instructions != nil {
 					t.Fatalf("delta = %+v", added)
 				}
-				texts, hashes := 0, 0
-				for _, p := range added[0].InstructionsParts {
-					if p.Text != "" {
-						texts++
-					} else if p.Hash != "" {
-						hashes++
-					}
-				}
-				if texts != 1 || hashes != 2 {
-					t.Errorf("delta parts: %d with text, %d by hash; want 1 and 2", texts, hashes)
-				}
-				// The two unchanged 4000 byte layers are hashes, so the
+				// The two unchanged 4000 byte layers are one keep, so the
 				// delta costs the memory layer, not the prompt.
+				ps := added[0].InstructionsParts
+				if len(ps) != 2 || ps[0].Keep != 2 || ps[1].ID != "memory" || ps[1].Text == "" {
+					t.Errorf("delta parts = %+v, want a keep of 2 and the memory text", ps)
+				}
 				if n := jsonLen(added[0]); n > 1000 {
 					t.Errorf("delta is %d bytes", n)
 				}
