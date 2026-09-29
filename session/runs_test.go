@@ -361,3 +361,158 @@ func TestGuardBeforeTheCallIsRecordedAsAStop(t *testing.T) {
 		t.Errorf("verify records: %v", err)
 	}
 }
+
+// countQueued counts the queued entries of s.
+func countQueued(s *agentsession.Session) int {
+	n := 0
+	for _, e := range s.Entries() {
+		if _, ok := e.(*agentsession.QueuedEntry); ok {
+			n++
+		}
+	}
+	return n
+}
+
+// TestInboxHoldsOnlyWhatTheAgentHolds pins the rules the review of #67
+// asked for: a rewind leaves the branch's queued inputs behind rather
+// than writing them after every later run end; a resumed input nobody
+// takes up is dropped at the next run end; a rebase between runs does
+// not write again an input whose entry is still pending; and one item
+// queued twice is two inputs.
+func TestInboxHoldsOnlyWhatTheAgentHolds(t *testing.T) {
+	t.Run("a rewind past a queued input", func(t *testing.T) {
+		store := agentsession.NewMemoryStore()
+		rec, s, err := Start(context.Background(), store, agentsession.Header{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var a *agentturn.Agent
+		once := false
+		follow := agenttool.New("follow", "", func(context.Context, echoArgs) (string, error) {
+			if !once {
+				once = true
+				a.FollowUp(openresponses.UserText("later"))
+			}
+			return "ok", nil
+		})
+		a = agentturn.New(agentturn.Config{Model: blockingModel{}, Tools: []agenttool.Tool{follow}})
+		defer rec.Attach(a)()
+		if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
+			t.Fatal(err)
+		}
+		// The first output: after the queued entry, before the item
+		// that drained it.
+		var output string
+		for _, e := range s.Entries() {
+			if it, ok := e.(*agentsession.ItemEntry); ok && output == "" {
+				if _, ok := it.Item.(*openresponses.FunctionCallOutput); ok {
+					output = e.Base().ID
+				}
+			}
+		}
+		if owed, _ := s.PendingQueued(output); len(owed) != 1 {
+			t.Fatalf("owed at the rewind point = %d in %q", len(owed), entryTypes(s))
+		}
+		if err := rec.Rebase(s, output); err != nil {
+			t.Fatal(err)
+		}
+		cx, _ := s.Context()
+		if err := a.SetTranscript(cx.Items); err != nil {
+			t.Fatal(err)
+		}
+		before := countQueued(s)
+		for range 3 {
+			if _, err := a.Prompt(context.Background(), openresponses.UserText("again")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if n := countQueued(s); n != before {
+			t.Errorf("queued entries grew from %d to %d: %q", before, n, entryTypes(s))
+		}
+		if owed, _ := s.PendingQueued(s.Leaf()); len(owed) != 0 {
+			t.Errorf("owed = %+v", owed)
+		}
+	})
+	t.Run("a resumed input nobody takes up", func(t *testing.T) {
+		store := agentsession.NewMemoryStore()
+		s := cutRun(t, store)
+		rec, s, err := Resume(context.Background(), store, s.ID())
+		if err != nil {
+			t.Fatal(err)
+		}
+		cx, _ := s.Context()
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"}, agentturn.WithTranscript(cx.Items))
+		defer rec.Attach(a)()
+		before := countQueued(s)
+		for range 2 {
+			if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if n := countQueued(s); n != before {
+			t.Errorf("queued entries grew from %d to %d", before, n)
+		}
+		if owed, _ := s.PendingQueued(s.Leaf()); len(owed) != 0 {
+			t.Errorf("owed = %+v", owed)
+		}
+		if n := rec.Requeue(context.Background(), a); n != 0 {
+			t.Errorf("requeued %d after a run closed them", n)
+		}
+	})
+	t.Run("a rebase between runs keeps a pending entry", func(t *testing.T) {
+		store := agentsession.NewMemoryStore()
+		rec, s, err := Start(context.Background(), store, agentsession.Header{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}})
+		defer rec.Attach(a)()
+		// Queued while a subscriber holds run_end: reported after the
+		// end, so its entry follows it and is pending between runs.
+		a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+			if _, ok := ev.(*agentturn.RunEnd); ok && a.State().FollowUps == 0 && countQueued(s) == 0 {
+				a.FollowUp(openresponses.UserText("next"))
+			}
+			return nil
+		})
+		if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
+			t.Fatal(err)
+		}
+		if n := countQueued(s); n != 1 {
+			t.Fatalf("queued entries = %d in %q", n, entryTypes(s))
+		}
+		if err := rec.Rebase(s, s.Leaf()); err != nil {
+			t.Fatal(err)
+		}
+		if n := countQueued(s); n != 1 {
+			t.Errorf("a rebase to where the entry is pending wrote %d", n-1)
+		}
+	})
+	t.Run("one item queued twice", func(t *testing.T) {
+		store := agentsession.NewMemoryStore()
+		rec, s, err := Start(context.Background(), store, agentsession.Header{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}})
+		defer rec.Attach(a)()
+		same := openresponses.UserText("twice")
+		a.Steer(same)
+		a.Steer(same)
+		if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
+			t.Fatal(err)
+		}
+		named := map[string]bool{}
+		for _, e := range s.Entries() {
+			if it, ok := e.(*agentsession.ItemEntry); ok && it.QueuedFrom != "" {
+				named[it.QueuedFrom] = true
+			}
+		}
+		if countQueued(s) != 2 || len(named) != 2 {
+			t.Errorf("queued = %d, drained naming %d, in %q", countQueued(s), len(named), entryTypes(s))
+		}
+		if err := s.VerifyRecords(s.Leaf()); err != nil {
+			t.Errorf("verify records: %v", err)
+		}
+	})
+}

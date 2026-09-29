@@ -119,18 +119,26 @@ versions may break the API.
     still holds them. `Start` promises `queued` in the header by
     default. After a kill, `Session.PendingQueued` lists what was
     accepted and not appended, and `Recorder.Requeue(ctx, agent)` hands
-    it back to the agent without writing it a second time.
+    it back to the agent without writing it a second time; an input
+    nobody takes up is closed by the next run end and not written again.
+    An input accepted while the agent is idle is reported, and written,
+    at the next run's start, so a host that must not lose one between
+    runs writes it itself.
   - `Resume` closes a run left open at the leaf, which a crash cut off,
     with reason `error` and ref `cut off: closed on resume`, before it
     returns, and queues the inputs that run owed again after the end,
     as agentsession #86 settled: the writer that continues the path
     owns the run. `Rebase` into a run closes it `interrupted` with ref
-    `rewind to <entry>`, and re-queues what the agent holds on the new
-    branch; a rebase between runs still appends nothing.
+    `rewind to <entry>`, leaving what that run owed behind, and writes
+    on the new branch what the agent holds, unless its entry is still
+    pending there; a rebase between runs with nothing held appends
+    nothing.
   - `Start` on a header with a `Base` seeds the recorder from the
     context at the base, as `Resume` does at the leaf, so an agent
     seeded with it records requests that carry hashes, and closes a run
-    the base is inside, `interrupted`, with ref `fork at <entry>`. Every
+    the base is inside, `interrupted`, with ref `fork at <entry>`, and
+    the inputs the prefix owes after a run's end are the fork's to take
+    up with `Requeue`. Every
     store honours a base since agentsession v0.0.9. (#118)
 - The batch of calls approved through `Agent.Resume` keeps turn 0,
   which the tool events' docs now state: it runs before the run's first
