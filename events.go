@@ -159,9 +159,10 @@ func (*ModelRetry) EventType() string { return EventModelRetry }
 // ModelBlocked reports that [Config.BeforeModelCall] refused the turn's
 // request, so no call was made: Request is the request as built when
 // the hook ran and Err is the hook's error. It is the last event before
-// the run ends with ReasonError, in place of the turn_start the call
-// would have had, so a recorder can write the call that was refused as
-// distinct from one that was made and failed.
+// the run ends, in place of the turn_start the call would have had, so
+// a recorder can write the call that was refused as distinct from one
+// that was made and failed. The run ends with ReasonError, or with
+// ReasonStopped and StopGuard when Err wraps [ErrGuard].
 type ModelBlocked struct {
 	RunID   string
 	Turn    int
@@ -249,6 +250,10 @@ type ResponseEnd struct {
 func (*ResponseEnd) EventType() string { return EventResponseEnd }
 
 // ToolStart announces a tool call after preflight, in the model's order.
+// Turn is the turn whose response made the call, and 0 for a call
+// approved through Agent.Resume, whose batch runs before the run's
+// first model call; its tool_dispatch, tool_update and tool_end carry
+// 0 too.
 // Args are the arguments the tool receives, which a decision may have
 // rewritten; the function_call item in the transcript keeps the model's.
 // Decision is what BeforeToolCall returned for the call, nil when there
@@ -358,8 +363,10 @@ const (
 	StopMaxTurns StopCause = "max_turns"
 	// StopHook: ShouldStopAfterTurn returned true.
 	StopHook StopCause = "hook"
-	// StopGuard: ShouldStopAfterTurn returned an error wrapping
-	// [ErrGuard]; the error is on RunEnd.Err.
+	// StopGuard: ShouldStopAfterTurn, BeforeTurn or BeforeModelCall
+	// returned an error wrapping [ErrGuard]; the error is on RunEnd.Err.
+	// Stopped before the model call, the turn has no turn_start; from
+	// BeforeModelCall, the request it refused is on a model_blocked.
 	StopGuard StopCause = "guard"
 	// StopTerminate: every result of the batch set Terminate, so the
 	// tools answered on the model's behalf.
@@ -478,6 +485,11 @@ type Queued struct {
 	Mode  QueueMode
 	// Hidden is set for an item the caller marked with [Hidden].
 	Hidden bool
+	// Trigger is what brought the item in, from the context given to
+	// [Agent.Queue], zero for [Agent.Steer] and [Agent.FollowUp]: the
+	// run start names what started the run, and an input that joins it
+	// has a provenance of its own.
+	Trigger Trigger
 }
 
 // EventType returns "queued".

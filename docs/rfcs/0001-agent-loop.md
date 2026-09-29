@@ -587,7 +587,7 @@ calls** with why each is pending.
 | --- | --- |
 | `max_turns` | the turn limit was reached before another model call |
 | `hook` | the stop hook ended the run |
-| `guard` | the stop hook ended the run with an error marked as a guard's; the error is on the end event |
+| `guard` | the stop hook, the before-turn hook or the before-model-call hook ended the run with an error marked as a guard's; the error is on the end event. Stopped before the model call, the turn has no `turn_start` |
 | `terminate` | every result of the batch set the terminate hint |
 | `partial_terminate` | some results of the batch set it and others did not |
 | `refused` | an answer on resume asked the run to end without calling the model |
@@ -883,13 +883,18 @@ stated point:
 
 - **steer**: the item is appended after the current batch, before the
   next model call. When the agent is idle it is consumed by the next
-  run at the same point: after that run's first batch, or on a resume
-  after the approved batch, so a steered item never precedes the
-  prompt that starts a run.
+  run before that run's first model call: after its prompt, or on a
+  resume after the approved batch, so a steered item never precedes
+  the prompt that starts a run and never waits a model call for it. A
+  resume that refuses without calling the model leaves it queued.
 - **follow-up**: the item is appended when the run would otherwise
   end, so the agent keeps going instead of going idle. It is drained
   only after a turn in which the model called no tools, after the
   steered items.
+
+An item MAY be queued with a trigger of its own, what brought it in,
+which rides on its `queued` event: the run's trigger names what started
+the run, and an input that joins it has a provenance of its own.
 
 Accepting an item MUST NOT block on the delivery barrier, so steering
 from inside a subscriber is safe. Each accepted item is reported as a
@@ -905,9 +910,10 @@ a subscriber's error cannot refuse the item.
 The queues live in memory. An item accepted is in no record until a
 run appends it or a subscriber writes it, and it survives a
 cancellation, a configuration change and a transcript change but not
-the process; a host reads the queues back from the agent's state and
-queues them again after a restart. Whether the loop should make them
-durable through the record is open (#67).
+the process. A session recorder writes each `queued` event as a
+`queued` entry, which makes the inbox durable from the event to the
+append; a host that must not lose an input it accepted while the agent
+was idle, whose event waits for the next run, writes it itself.
 
 A steered item is appended with its own item events. A subscriber that
 steers in reaction to an event the steered item itself produces feeds
@@ -923,8 +929,8 @@ provide a way to chain each, with the fold rule the table gives.
 
 | hook | when | sees | returns | an error | chain |
 | --- | --- | --- | --- | --- | --- |
-| before turn | turn phase 2 | the working transcript | items to append as facts | fails the run | items appended in order; the first error drops them all |
-| before model call | turn phase 4, last | the finished request | edits it in place | `model_blocked`, then the run fails | in order, each seeing what the last left; the first error stops |
+| before turn | turn phase 2 | the working transcript | items to append as facts | fails the run unless marked as a guard's, which stops it with cause `guard` | items appended in order; the first error drops them all |
+| before model call | turn phase 4, last | the finished request | edits it in place | `model_blocked`, then the run fails; marked as a guard's, the run stops with cause `guard` and no `model_blocked` | in order, each seeing what the last left; the first error stops |
 | output guard | as the stream completes an assistant message | the message | a replacement or none | fails the run | in order, each seeing the last's replacement; the last stands |
 | decision (before tool call) | preflight, per call, model order; a nested call as a batch of one | the call, the tool, the arguments, the batch and index | a decision or none | fails the run; returned to the tool for a nested call | the strictest action wins, block over defer over allow; a block ends the chain, a defer does not; rewritten arguments pass to the hooks after; the first reason and decider of the standing action, the first note; terminate if any set it |
 | after tool call | as each call settles, blocked calls excepted | the call, the result, the error | an override or none | fails the run; returned to the tool for a nested call | — |
@@ -932,8 +938,11 @@ provide a way to chain each, with the fold rule the table gives.
 | transform | request step 2 | a copy of the transcript | the input for this call | fails the run | — |
 | filter | request step 3 | the transformed list | what the model sees | — | — |
 
-The stop hook tells a policy stop from a failure by marking its error
-as a guard's, which the reference binds as a sentinel the error wraps.
+The stop hook, the before-turn hook and the before-model-call hook
+tell a policy stop from a failure by marking the error as a guard's,
+which the reference binds as a sentinel the error wraps. The two that
+run before the model call are where a cost limit or a deadline stops a
+run before it spends another call.
 Whether the decision should be returned as data instead is open (#82).
 A layer that must see every turn, a meter for one, belongs in a
 subscriber rather than in the stop hook, which stops at the first hook
@@ -1072,7 +1081,7 @@ of the events.
 | `run_end` | first, when a `turn_start` had no `response_end`, a failed `response` carrying the run's error; then `run` end with the reason mapped onto the format's cascade: `done`, `input_required` and `error` as themselves, the error's text as `ref`; `aborted` as `interrupted` with the error's text, since the host asked; `stopped` as `stopped` when the last response made calls, as `done` when it made none, and for a run with no response of its own as `stopped` when it answered a pending call and left none, `aborted` otherwise, with the cause as `ref`, and for a guard's stop the cause followed by the guard's error |
 | a record a tool writes while it runs, a question it asks the user | a record entry at the leaf, its `call_id` naming the call on the tool's context when the session holds it, or the nearest call up a nested call's chain that it holds |
 | a fold the transform reports | a `compaction` naming what was kept and what was pinned, or a record entry for a fold that failed |
-| `queued` | nothing today; the format has `queued`, and writing it is open (#67). The loop's follow-up mode is spelled `follow_up` and the format's `followup`; a writer maps the one onto the other |
+| `queued` | a `queued` entry with the item, the mode and the trigger, before anything appends the item; the item entry that drains it names it in `queued_from` with the trigger as `source`. A run end closes the entries of the inputs it did not append, and the recorder writes them again after it, since the agent still holds them; so does a rewind. The loop's follow-up mode is spelled `follow_up` and the format's `followup`; a writer maps the one onto the other |
 
 Three rules follow from the writing discipline of that format and are
 met by the delivery rules here. An item is durable before the tool that
@@ -1084,6 +1093,15 @@ that records one, so a call the cut reached first, or one the loop
 refused itself, has none and reads as never started. And every entry a
 cancellation leaves to write is written, because every event after a
 cancellation is delivered with a usable context.
+
+A recorder that continues a path on which a run is open that it is
+not running owns that run and closes it before it writes anything
+else, as agentsession RFC 0001 has it: on resuming a session a crash
+cut off, with `error` and a `ref` naming the cut; on a rewind into the
+run, and on a fork whose base is inside it, with `interrupted` and a
+`ref` naming the rewind or the fork. The inputs the closed run owed are
+queued again after its end. The loop is not involved: a run it is
+running is never open to anyone else.
 
 Two facts the record needs are supplied by the caller and carried by
 the loop unread: the trigger of a run, and who decided an answer. The
@@ -1108,7 +1126,7 @@ maps onto it as follows:
 | turn limit | `Config.MaxTurns` |
 | retry policy | `Config.Retry{MaxAttempts, Backoff, Retryable, Revise}`; `DefaultBackoff`, `DefaultRetryable` |
 | low-level loop | `Run(ctx, t, prompts, cfg)`, `Continue(ctx, t, cfg)` → `iter.Seq[Event]`; `EventBuffer`; `CanContinue` |
-| agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `State`, `SetConfig`, `SetTranscript`, `Config` |
+| agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `State`, `SetConfig`, `SetTranscript`, `Config` |
 | refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning` |
 | run ID, trigger, transcript on the context | `ContextWithRunID`/`RunIDFromContext`, `ContextWithTrigger`/`TriggerFromContext`, `ContextWithTranscript`/`TranscriptFromContext` |
 | source | `Source`: `SourceInput`, `SourceResume` |
@@ -1120,14 +1138,14 @@ maps onto it as follows:
 | decision | `ToolDecision{Action, Reason, Terminate, Args, By, Note}`; `ToolAction` (`Allow`, `Block`, `Defer`) |
 | answer | `Answer{CallID, Output, Args, Note, Terminate, By}`; `Output`, `Approve`, `ApproveWith`, `Refuse`, `WithNote`, `WithBy`; `ContextWithDeciders`/`DeciderFromContext` for a host driving `Run` |
 | hooks | `Config.BeforeTurn`, `BeforeModelCall`, `OutputGuard`, `BeforeToolCall`, `AfterToolCall`, `ShouldStopAfterTurn` |
-| guard stop | an error wrapping `ErrGuard` from `ShouldStopAfterTurn` |
+| guard stop | an error wrapping `ErrGuard` from `ShouldStopAfterTurn`, `BeforeTurn` or `BeforeModelCall` |
 | chains | `ChainBeforeTurn`, `ChainBeforeModelCall`, `ChainOutputGuard`, `ChainBeforeToolCall`, `ChainShouldStopAfterTurn` |
 | nested call | `Invoke(ctx, name, args)`; `ErrNoInvoker`; `Parent` on the tool events |
 | queue mode | `QueueMode`: `QueueSteer`, `QueueFollowUp` |
 | the loop as a model | `front/responses.New(cfg)` → `openresponses.Adapter` |
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`; `tools/a2a.New(client, card)` |
-| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `RecordFunc`, `Elicitor`; `WithInstructionsParts`; `session.RequestHash` |
+| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `RecordFunc`, `Elicitor`, `Requeue`, `Rebase`; `WithInstructionsParts`; `session.RequestHash` |
 
 Every error the package returns to its caller, sentinel or wrapped,
 begins with `agentturn:`; the error texts a call's output carries,
@@ -1240,10 +1258,6 @@ module and is listed in the changelog as one.
   and under a tool provider the host never holds the value. Documenting
   that a provider caches per session, or a release hook called after
   each turn, are the options.
-- **Durable queues** (#67). An accepted item is in no record until a
-  run appends it. The format has a `queued` entry and an inbox rule; a
-  recorder writing one from the `queued` event and a resume draining
-  it would make the inbox durable from accept to append.
 - **The stop decision as data** (#82). A guard stop is an error
   wrapping a sentinel, and a hook that returns a bare error records a
   failure and is retried by a supervisor that honours policy stops.
@@ -1277,11 +1291,6 @@ module and is listed in the changelog as one.
   cannot stand behind, and a response with no hash has three
   indistinguishable causes. A member on the response entry saying why,
   or a callback at the moment, is proposed.
-- **A run the process died inside** (#94). The format has
-  `interrupted` for it and the library can build the missing end; the
-  resume writes nothing, so a crash and a branch taken mid-run are the
-  same shape. Closing the open run at resume, or returning it for the
-  caller to close, is open.
 - **A front that serves a person** (#80). The Open Responses front is
   agent-as-a-model by design. Steering, cancellation, a deferred call's
   question and a tool's progress have no carrier over a socket. A

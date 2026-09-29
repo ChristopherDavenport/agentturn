@@ -81,8 +81,8 @@ func TestSpawnedChildIsSteerableAndRevivable(t *testing.T) {
 		agent.WithSpawn(func(callID string, child *agentturn.Agent) {
 			spawnedFor = append(spawnedFor, callID)
 			children = append(children, child)
-			// Reaching a child that has not finished: the steered
-			// message joins the run before it ends.
+			// Reaching a child before its run starts: the steered
+			// message joins its first model call.
 			child.Steer(openresponses.UserText("also note duplicates"))
 		}))
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{specialist}})
@@ -98,8 +98,8 @@ func TestSpawnedChildIsSteerableAndRevivable(t *testing.T) {
 	if len(l) != 1 || l[0].CallID != spawnedFor[0] {
 		t.Fatalf("links = %+v, spawned for %v", l, spawnedFor)
 	}
-	// The steered message reached the running child.
-	if got := itemRoles(child.State().Transcript); got != "user assistant user assistant" {
+	// The steered message reached the child with its input.
+	if got := itemRoles(child.State().Transcript); got != "user user assistant" {
 		t.Errorf("child transcript = %q", got)
 	}
 	cs, err := store.Open(context.Background(), l[0].Session)
@@ -123,9 +123,9 @@ func TestSpawnedChildIsSteerableAndRevivable(t *testing.T) {
 	if n := len(runsOf(t, cs)); n != 2 {
 		t.Errorf("child runs = %d", n)
 	}
-	// Two turns in the first run, one in the second, every one of them
-	// on a path that rebuilds its request.
-	if n := verifyAll(t, cs); n != 3 || hashed(cs) != 3 {
+	// One turn in each run, every one of them on a path that rebuilds
+	// its request.
+	if n := verifyAll(t, cs); n != 2 || hashed(cs) != 2 {
 		t.Errorf("child responses = %d hashed = %d", n, hashed(cs))
 	}
 	verifyAll(t, s)

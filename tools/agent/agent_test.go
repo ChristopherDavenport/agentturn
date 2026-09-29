@@ -433,8 +433,10 @@ func TestSpawnHandsOutTheChild(t *testing.T) {
 	if handle.State().RunID != info.RunID {
 		t.Errorf("handle run %q, child run %q", handle.State().RunID, info.RunID)
 	}
-	// The steered message joined the run before it ended.
-	if got := itemTypes(handle.State().Transcript); !strings.Contains(got, "function_call_output user") {
+	// The steered message joined the run with its input: the hook runs
+	// before the run starts, and an item steered into an idle agent is
+	// drained before the first model call.
+	if got := itemTypes(handle.State().Transcript); !strings.HasPrefix(got, "user user function_call") {
 		t.Errorf("child transcript = %q", got)
 	}
 	// The handle outlives the call: a second prompt continues the

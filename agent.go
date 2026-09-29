@@ -540,7 +540,8 @@ func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe fu
 
 // Steer queues items to be injected after the current tool batch,
 // before the next model call. When the agent is idle they are consumed
-// by the next run at the same point.
+// by the next run before its first model call, after its prompt, or
+// after the batch of calls a Resume approved.
 //
 // Each item is reported to the subscribers as a [Queued] event, so a
 // host writing what it accepted has it before the run appends it and
@@ -559,8 +560,10 @@ func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe fu
 // The queues live in memory: an item accepted here is in no record
 // until a run appends it or a subscriber writes it, and it survives
 // [Agent.Abort], [SetConfig] and [SetTranscript] but not the process. A
-// host reads the queues back from [Agent.State] and queues them again
-// after a restart.
+// session recorder writes each [Queued] report as a queued entry and
+// hands the inputs a resumed session owes back with its Requeue; a
+// host without one reads the queues back from [Agent.State] and queues
+// them again after a restart.
 //
 // A steered item is appended with its own item events, which reach
 // every subscriber. A subscriber that steers in reaction to an event
@@ -571,7 +574,7 @@ func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe fu
 // can tell apart from its own items, such as a tool_end or a specific
 // item type it never steers.
 func (a *Agent) Steer(items ...openresponses.Item) {
-	a.queue(QueueSteer, items)
+	a.Queue(context.Background(), QueueSteer, items...)
 }
 
 // FollowUp queues items to be injected when the run would otherwise
@@ -579,11 +582,22 @@ func (a *Agent) Steer(items ...openresponses.Item) {
 // the same life, the same [Queued] event and the same caveat about
 // subscribers as [Agent.Steer].
 func (a *Agent) FollowUp(items ...openresponses.Item) {
-	a.queue(QueueFollowUp, items)
+	a.Queue(context.Background(), QueueFollowUp, items...)
 }
 
-// queue accepts items and records the report the next event delivers.
-func (a *Agent) queue(mode QueueMode, items openresponses.Items) {
+// Queue is [Agent.Steer] or [Agent.FollowUp], as mode says, for an
+// input with a provenance of its own: the [Trigger] attached to ctx
+// with [ContextWithTrigger] rides on each item's [Queued] report, so a
+// recorder writes what brought the input in, a second person steering
+// or a scheduled firing that overlapped a run, rather than only what
+// started the run it joins. Nothing else is read from ctx, and it
+// never blocks on delivery. A mode other than QueueSteer queues a
+// follow-up.
+func (a *Agent) Queue(ctx context.Context, mode QueueMode, items ...openresponses.Item) {
+	if mode != QueueSteer {
+		mode = QueueFollowUp
+	}
+	trigger := TriggerFromContext(ctx)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	runID := ""
@@ -600,7 +614,7 @@ func (a *Agent) queue(mode QueueMode, items openresponses.Items) {
 		} else {
 			a.followUp = append(a.followUp, item)
 		}
-		a.queued = append(a.queued, &Queued{RunID: runID, Item: base, Mode: mode, Hidden: hidden})
+		a.queued = append(a.queued, &Queued{RunID: runID, Item: base, Mode: mode, Hidden: hidden, Trigger: trigger})
 	}
 }
 

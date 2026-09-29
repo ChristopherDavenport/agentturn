@@ -57,8 +57,11 @@
 //     config delta, and the path names the model that answered.
 //   - model_blocked: the config settle for the request that was built,
 //     then a response entry with status failed, the hook's error and
-//     the request hash, so a call a BeforeModelCall guard refused is on
-//     the record and distinct from one that was made and failed.
+//     the request hash, so a call a BeforeModelCall hook refused is on
+//     the record and distinct from one that was made and failed; for a
+//     guard's stop, an error wrapping agentturn.ErrGuard, a custom
+//     entry in [ModelBlockedNS] carrying the same, since the run was
+//     stopped rather than failed.
 //   - item_end: an item entry; an item streamed by the model carries its
 //     response ID, and an item the caller marked with agentturn.Hidden
 //     carries visible false, the format's word for an item that is part
@@ -115,6 +118,23 @@
 //     call an earlier one made and left nothing pending and as aborted
 //     otherwise, with the stop's cause as ref in every case, followed
 //     for a guard's stop by the guard's error.
+//   - queued: a queued entry for each input [agentturn.Agent] accepted
+//     into a queue, with its mode and the trigger it was queued with,
+//     before anything appends it; the item entry that appends it names
+//     the queued entry in queued_from and carries the trigger as
+//     source. A run end closes the queued entries of the inputs the run
+//     did not append, and since the agent still holds them the recorder
+//     writes them again after the end, so the path says what is owed.
+//     [Resume] writes again, after the end it gives a cut run, what
+//     that run owed, and [Recorder.Requeue] hands it back to the agent;
+//     an input nobody takes up is closed by the next run end, which is
+//     how a host declines one. A rewind or a fork into a run leaves
+//     what that run owed behind. An input the agent accepted while idle
+//     is reported, and so written, at the start of the next run; a
+//     host that must not lose one between runs queues it through
+//     [Recorder.Queue], which writes it first. An
+//     input the filter keeps from the model is a custom entry, which
+//     cannot name its queued entry; the run's end closes that one.
 //   - a fold reported through [Recorder.Fold]: a compaction entry whose
 //     first_kept is the entry of the first item the transform kept, with
 //     the summary and the settings in force, and a fold member naming
@@ -255,6 +275,13 @@
 // settings within one session is a config entry, and a rollover is a
 // successor whose first entries carry what it needs.
 //
+// A path on which a run is open that no recorder is running, because a
+// crash cut it off or a rewind or a fork branched into it, is closed
+// by the recorder that continues it before anything else is written,
+// as the format has it: [Resume] closes a cut run with reason error,
+// and [Recorder.Rebase] and a [Start] on a base inside a run close it
+// interrupted, each with a ref saying why.
+//
 // [Recorder.Annotate] appends a custom entry at the current leaf of the
 // session of the run on the context, the recorder's own when none is,
 // so a consumer records its own state, a render manifest or a policy's
@@ -373,6 +400,25 @@ type ModelRetry struct {
 	// attempt sends; the change itself is on the path as the config
 	// delta the next settle writes.
 	Revised bool `json:"revised,omitempty"`
+}
+
+// ModelBlockedNS is the namespace of the custom entry written for a
+// request a BeforeModelCall guard refused with an error wrapping
+// agentturn.ErrGuard, a policy stopping the run before the call. Its
+// data is a [ModelBlocked]. A hook's other errors are a failed
+// response entry, as a call that was refused for failing; a guard's
+// stop is not a failure, and a failed response would make the run's
+// end read as one.
+const ModelBlockedNS = "agentturn:model_blocked"
+
+// ModelBlocked is the data of a [ModelBlockedNS] custom entry.
+type ModelBlocked struct {
+	// Error is the guard's error.
+	Error string `json:"error"`
+	// RequestHash is the hash of the request that was refused, when the
+	// path rebuilds its input, and Model the model it named.
+	RequestHash string `json:"request_hash,omitempty"`
+	Model       string `json:"model,omitempty"`
 }
 
 // ElicitationNS is the namespace of the custom entry written for a
@@ -506,6 +552,12 @@ type writer struct {
 	attempt []byte
 	// attemptModel is the model that request named.
 	attemptModel string
+	// inbox lists, in the order they were accepted, the inputs that no
+	// item has drained yet: the ones the agent holds, which a queued
+	// event reported or Requeue handed back, and the ones a resumed or
+	// forked path owes that nobody has taken up. The agent's own
+	// outlive a rebase, since the agent still holds them.
+	inbox []*inboxItem
 	// omitted is the instructions_omitted of the last config entry that
 	// carried one, encoded, so a change to what was left out is written
 	// even when the settings did not move.
@@ -523,6 +575,25 @@ type writer struct {
 	responses    int
 	lastCalls    bool
 	answeredCall bool
+}
+
+// inboxItem is one input accepted into a queue and not appended yet.
+type inboxItem struct {
+	item    openresponses.Item
+	mode    string
+	trigger *agentsession.Trigger
+	// entry is the ID of the queued entry holding the input on the
+	// current path, "" when a run end or a rewind has closed the one
+	// that did.
+	entry string
+	// held says the agent holds the input: its queued event was seen,
+	// or Requeue handed it back. An input the path owes and nobody has
+	// taken up is not held, and the next run end drops it, since the
+	// format reads the end as closing it.
+	held bool
+	// awaiting is set while an input Requeue handed back waits for its
+	// queued event, which then writes nothing: the path holds it.
+	awaiting bool
 }
 
 // callRecord is what the path holds for one function call.
@@ -650,13 +721,24 @@ func newWriter(r *Recorder, id string) *writer {
 }
 
 // Start creates a session from h and returns a recorder for it. When
-// h.Records is nil the header promises the run, dispatch and decision
-// records, which this recorder writes whenever their event occurs.
-// Child sessions name h.Harness as their writer unless [WithHarness]
-// says otherwise. The caller keeps store for Sync, Release and Close.
+// h.Records is nil the header promises the run, dispatch, decision and
+// queued records, which this recorder writes whenever their event
+// occurs. Child sessions name h.Harness as their writer unless
+// [WithHarness] says otherwise. The caller keeps store for Sync,
+// Release and Close.
+//
+// A header with a Base forks the session that holds it: the store
+// writes the prefix, and the recorder is seeded from the context at
+// the base, as [Resume] seeds one at the leaf, so an agent seeded with
+// s.Context().Items records requests that carry hashes. A base inside
+// a run leaves that run open on the fork, as a rewind does, and Start
+// closes it, interrupted, with a ref naming the fork, before it
+// returns; what that run had queued and not appended is closed with
+// it, as a rewind leaves it. Inputs the prefix owes after a run's end
+// are the fork's to take up with [Recorder.Requeue].
 func Start(ctx context.Context, store agentsession.Store, h agentsession.Header, opts ...Option) (*Recorder, *agentsession.Session, error) {
 	if h.Records == nil {
-		h.Records = append([]string(nil), agentsession.AllRecords...)
+		h.Records = append(append([]string(nil), agentsession.AllRecords...), agentsession.TypeQueued)
 	}
 	s, err := store.Create(ctx, h)
 	if err != nil {
@@ -667,6 +749,14 @@ func Start(ctx context.Context, store agentsession.Store, h agentsession.Header,
 		r.harness = s.Header().Harness
 	}
 	r.root.cwd = s.Header().CWD
+	if s.Header().Base != "" {
+		if err := r.root.closeOpenRun(ctx, s, agentsession.ReasonInterrupted, "fork at "+s.Header().Base, false); err != nil {
+			return nil, nil, err
+		}
+		if err := r.root.seed(s, true); err != nil {
+			return nil, nil, err
+		}
+	}
 	return r, s, nil
 }
 
@@ -680,12 +770,22 @@ func Start(ctx context.Context, store agentsession.Store, h agentsession.Header,
 // dispatches and decisions anchor to the entries that hold them; and
 // from the last env entry on the path. Child sessions name the
 // header's harness unless [WithHarness] says otherwise.
+//
+// A run with no end at the leaf was cut off: the process died inside
+// it, since a recorder that is running one holds it. The recorder owns
+// that run now, and closes it before it returns, as the format has it:
+// a run end with reason error and a ref naming the cut, whose pending
+// list is the segment's. The inputs queued on the path and not yet
+// appended are queued again after it, so the run end does not close
+// them; [Recorder.Requeue] hands them to the agent. Resume is for the
+// one process continuing the session: a second one writing it while the
+// first still runs would close a run that is not cut off.
 func Resume(ctx context.Context, store agentsession.Store, sessionID string, opts ...Option) (*Recorder, *agentsession.Session, error) {
 	s, err := store.Open(ctx, sessionID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("session: open: %w", err)
 	}
-	return resume(s, store, opts)
+	return resume(ctx, s, store, opts)
 }
 
 // Continue rolls the session with the given ID over into a successor
@@ -703,29 +803,83 @@ func Continue(ctx context.Context, store agentsession.Store, sessionID string, s
 	if err != nil {
 		return nil, nil, fmt.Errorf("session: continue: %w", err)
 	}
-	return resume(next, store, opts)
+	return resume(ctx, next, store, opts)
 }
 
-func resume(s *agentsession.Session, store agentsession.Store, opts []Option) (*Recorder, *agentsession.Session, error) {
+func resume(ctx context.Context, s *agentsession.Session, store agentsession.Store, opts []Option) (*Recorder, *agentsession.Session, error) {
 	r := New(store, s.ID(), opts...)
 	if r.harness == nil {
 		r.harness = s.Header().Harness
 	}
 	r.root.cwd = s.Header().CWD
-	if err := r.root.seed(s); err != nil {
+	if err := r.root.closeOpenRun(ctx, s, agentsession.ReasonError, "cut off: closed on resume", true); err != nil {
+		return nil, nil, err
+	}
+	if err := r.root.seed(s, true); err != nil {
 		return nil, nil, err
 	}
 	return r, s, nil
+}
+
+// closeOpenRun ends the run open at the session's leaf, if there is
+// one, with reason and ref, as the writer that continues the path. The
+// end closes the queued entries of the inputs the run had not
+// appended; keepOwed writes them again after it, for a cut, whose
+// inputs were accepted and never answered, and not for a rewind or a
+// fork, which leaves them behind with the rest of the branch.
+func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reason, ref string, keepOwed bool) error {
+	if s.Leaf() == "" {
+		return nil
+	}
+	run, err := s.OpenRun(s.Leaf())
+	if err != nil {
+		return fmt.Errorf("session: open run at leaf: %w", err)
+	}
+	if run == nil {
+		return nil
+	}
+	owed, err := s.PendingQueued(s.Leaf())
+	if err != nil {
+		return fmt.Errorf("session: queued inputs at leaf: %w", err)
+	}
+	end, err := s.EndRun(reason, ref)
+	if err != nil {
+		return fmt.Errorf("session: close run %s: %w", run.RunID(), err)
+	}
+	if _, err := w.append(ctx, end); err != nil {
+		return err
+	}
+	if !keepOwed {
+		return nil
+	}
+	for _, q := range owed {
+		again := agentsession.NewQueued(q.Item, q.Mode)
+		if q.Trigger != nil {
+			again.WithTrigger(q.Trigger.Kind, q.Trigger.Ref, q.Trigger.Source)
+		}
+		if _, err := w.append(ctx, again); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Rebase moves the session's leaf to entryID and reseeds the recorder
 // from the context there, as [Resume] seeds it from the leaf at open,
 // so the next run records against the settings, items and pending
 // calls of the branch it continues rather than the one it left. It
-// appends nothing: a rebase is not a change to the record. It refuses
-// with [ErrRunActive] while a run is being written, and s must be the
-// session the recorder writes. The agent's transcript is the caller's
-// to set, with Agent.SetTranscript from s.Context().Items.
+// refuses with [ErrRunActive] while a run is being written, and s must
+// be the session the recorder writes. The agent's transcript is the
+// caller's to set, with Agent.SetTranscript from s.Context().Items.
+//
+// A rebase appends nothing of its own, with two exceptions the format
+// asks of the writer that continues a path. An entry inside a run, a
+// checkpoint the run made, leaves that run open on the new branch, and
+// Rebase closes it, interrupted, with a ref naming the rewind; what
+// that run had queued and not appended is left behind with the rest
+// of the branch. And an input the agent holds, queued and not
+// appended, is written as a queued entry on the new branch unless the
+// entry that holds it is still pending there.
 //
 // The empty entry ID is the reset a product's /clear makes: the
 // session's leaf is reset so the next append starts a new root
@@ -744,16 +898,156 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 	if r.root.run != "" {
 		return ErrRunActive
 	}
+	w := r.root
+	ctx := context.Background()
+	// Only what the agent holds carries over; an input the old path
+	// owed and nobody took up stays with it.
+	var held []*inboxItem
+	for _, in := range w.inbox {
+		if in.held {
+			held = append(held, in)
+		}
+	}
+	w.inbox = held
 	if entryID == "" {
 		s.ResetLeaf()
-		r.root.reset()
-		return nil
+		w.reset()
+		for _, in := range w.inbox {
+			in.entry = ""
+		}
+		return w.requeue(ctx)
 	}
 	if err := s.Branch(entryID); err != nil {
 		return fmt.Errorf("session: rebase: %w", err)
 	}
-	r.root.reset()
-	return r.root.seed(s)
+	w.reset()
+	if err := w.closeOpenRun(ctx, s, agentsession.ReasonInterrupted, "rewind to "+entryID, false); err != nil {
+		return err
+	}
+	owed, err := s.PendingQueued(s.Leaf())
+	if err != nil {
+		return fmt.Errorf("session: queued inputs at leaf: %w", err)
+	}
+	pending := make(map[string]bool, len(owed))
+	for _, q := range owed {
+		pending[q.ID] = true
+	}
+	for _, in := range w.inbox {
+		if !pending[in.entry] {
+			in.entry = ""
+		}
+	}
+	if err := w.requeue(ctx); err != nil {
+		return err
+	}
+	return w.seed(s, false)
+}
+
+// endInbox closes the inbox at a run end: an input the agent holds is
+// written again after it, since the end closed its entry and the agent
+// still owes it to the conversation, and one it does not hold is
+// dropped, as the format reads the end.
+func (w *writer) endInbox(ctx context.Context) error {
+	var held []*inboxItem
+	for _, in := range w.inbox {
+		if in.held {
+			in.entry = ""
+			held = append(held, in)
+		}
+	}
+	w.inbox = held
+	return w.requeue(ctx)
+}
+
+// requeue writes a queued entry for each input of the inbox that no
+// entry on the current path holds.
+func (w *writer) requeue(ctx context.Context) error {
+	for _, in := range w.inbox {
+		if in.entry != "" {
+			continue
+		}
+		q := agentsession.NewQueued(in.item, in.mode)
+		if in.trigger != nil {
+			q.WithTrigger(in.trigger.Kind, in.trigger.Ref, in.trigger.Source)
+		}
+		id, err := w.append(ctx, q)
+		if err != nil {
+			return err
+		}
+		in.entry = id
+	}
+	return nil
+}
+
+// Queue queues items into a's queue in mode, as agentturn.Agent.Queue
+// does with ctx's trigger, after writing each as a queued entry at the
+// session's leaf, durably, before it returns: the way to accept an
+// input that must not be lost while the agent is idle, whose queued
+// event would otherwise wait for the next run. The event then writes
+// nothing. An item whose entry cannot be written is not queued, and
+// the error says so; the items before it are.
+func (r *Recorder) Queue(ctx context.Context, a *agentturn.Agent, mode agentturn.QueueMode, items ...openresponses.Item) error {
+	trigger := agentturn.TriggerFromContext(ctx)
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		base, _ := agentturn.Unhide(item)
+		in := &inboxItem{item: base, mode: agentsession.ModeFollowUp, held: true, awaiting: true}
+		if mode == agentturn.QueueSteer {
+			in.mode = agentsession.ModeSteer
+		}
+		if !trigger.IsZero() {
+			in.trigger = &agentsession.Trigger{Kind: trigger.Kind, Ref: trigger.Ref, Source: trigger.Source}
+		}
+		r.mu.Lock()
+		r.root.inbox = append(r.root.inbox, in)
+		err := r.root.requeue(context.WithoutCancel(ctx))
+		if err != nil {
+			r.root.inbox = r.root.inbox[:len(r.root.inbox)-1]
+		}
+		r.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		a.Queue(ctx, mode, item)
+	}
+	return nil
+}
+
+// Requeue hands the agent the inputs the session owes, the ones queued
+// on the path at [Resume], or at a [Start] on a base, and not yet
+// appended, in the order they were accepted and each in its own mode
+// and with its trigger, and returns how many. The path already holds
+// each, so their queued events write nothing and the item that drains
+// each names its entry. Call it after Resume and before the agent's
+// first run: an input nobody has taken up when a run ends is closed by
+// that end and dropped, which is how a host declines one. An input it
+// has handed over is not handed over again, and an input marked hidden
+// when it was accepted is queued without the mark, which the queued
+// entry does not carry.
+func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) int {
+	r.mu.Lock()
+	var owed []*inboxItem
+	for _, in := range r.root.inbox {
+		if !in.held && in.entry != "" {
+			in.held, in.awaiting = true, true
+			owed = append(owed, in)
+		}
+	}
+	r.mu.Unlock()
+	for _, in := range owed {
+		qctx := ctx
+		if in.trigger != nil {
+			qctx = agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: in.trigger.Kind, Ref: in.trigger.Ref, Source: in.trigger.Source})
+		}
+		mode := agentturn.QueueFollowUp
+		if in.mode == agentsession.ModeSteer {
+			mode = agentturn.QueueSteer
+		}
+		a.Queue(qctx, mode, in.item)
+	}
+	return len(owed)
 }
 
 // Annotate appends a custom entry in namespace ns carrying data,
@@ -884,7 +1178,7 @@ func (w *writer) reset() {
 }
 
 // seed sets the writer's state from the session at its leaf.
-func (w *writer) seed(s *agentsession.Session) error {
+func (w *writer) seed(s *agentsession.Session, owed bool) error {
 	if s.Leaf() == "" {
 		return nil
 	}
@@ -904,6 +1198,17 @@ func (w *writer) seed(s *agentsession.Session) error {
 	for _, e := range cx.Entries {
 		if env, ok := e.(*agentsession.EnvEntry); ok {
 			w.env = envBody(env)
+		}
+	}
+	if owed {
+		// The inputs the path still owes, for a recorder new to it:
+		// Requeue hands them to the agent.
+		queued, err := s.PendingQueued(s.Leaf())
+		if err != nil {
+			return fmt.Errorf("session: queued inputs at leaf: %w", err)
+		}
+		for _, q := range queued {
+			w.inbox = append(w.inbox, &inboxItem{item: q.Item, mode: q.Mode, trigger: q.Trigger, entry: q.ID})
 		}
 	}
 	pending, err := s.PendingCalls(s.Leaf())
@@ -1152,7 +1457,7 @@ func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, 
 				s.ResetLeaf()
 				return w, nil
 			}
-			if err := w.seed(s); err != nil {
+			if err := w.seed(s, false); err != nil {
 				return nil, err
 			}
 			return w, nil
@@ -1270,6 +1575,46 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 		return w.runEnd(ctx, e)
 	case *agentturn.ToolEnd:
 		return w.toolEnd(ctx, e)
+	case *agentturn.Queued:
+		return w.queued(ctx, e)
+	}
+	return nil
+}
+
+// queued writes the queued entry for an input the agent accepted,
+// before anything appends it, unless the path already holds it: an
+// input Requeue handed back.
+func (w *writer) queued(ctx context.Context, e *agentturn.Queued) error {
+	if e.Item == nil {
+		return nil
+	}
+	for _, in := range w.inbox {
+		if in.awaiting && in.item == e.Item {
+			in.awaiting = false
+			return nil
+		}
+	}
+	mode := agentsession.ModeFollowUp
+	if e.Mode == agentturn.QueueSteer {
+		mode = agentsession.ModeSteer
+	}
+	in := &inboxItem{item: e.Item, mode: mode, held: true}
+	if !e.Trigger.IsZero() {
+		in.trigger = &agentsession.Trigger{Kind: e.Trigger.Kind, Ref: e.Trigger.Ref, Source: e.Trigger.Source}
+	}
+	w.inbox = append(w.inbox, in)
+	return w.requeue(ctx)
+}
+
+// drained removes item from the inbox and returns the input it was,
+// the first accepted when it was queued more than once, or nil when
+// the agent did not accept it through a queue.
+func (w *writer) drained(item openresponses.Item) *inboxItem {
+	for i, in := range w.inbox {
+		if in.held && in.item == item {
+			w.inbox = append(w.inbox[:i:i], w.inbox[i+1:]...)
+			return in
+		}
 	}
 	return nil
 }
@@ -1565,6 +1910,17 @@ func (w *writer) blocked(ctx context.Context, e *agentturn.ModelBlocked) error {
 	if err := w.settle(ctx, req); err != nil {
 		return err
 	}
+	if errors.Is(e.Err, agentturn.ErrGuard) {
+		// A policy stopped the run: the refused request is a record of
+		// its own, since a failed response would read as the run
+		// failing.
+		raw, err := json.Marshal(ModelBlocked{Error: errText(e.Err), RequestHash: hash, Model: req.Model})
+		if err != nil {
+			return fmt.Errorf("session: encode model blocked: %w", err)
+		}
+		_, err = w.append(ctx, &agentsession.CustomEntry{NS: ModelBlockedNS, Data: raw})
+		return err
+	}
 	w.responses++
 	w.lastCalls = false
 	_, err = w.append(ctx, &agentsession.ResponseEntry{
@@ -1729,6 +2085,20 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 			e.Visible = &visible
 		}
 		entry = e
+	}
+	if responseID == "" {
+		// An input the agent accepted through a queue names the queued
+		// entry it was accepted as, with what brought it in; one the
+		// filter keeps from the model is a custom entry, which cannot,
+		// and the run's end closes its queued entry.
+		if in := w.drained(item); in != nil && !appOnly && in.entry != "" {
+			e := entry.(*agentsession.ItemEntry)
+			e.QueuedFrom = in.entry
+			if in.trigger != nil {
+				trigger := *in.trigger
+				e.Source = &trigger
+			}
+		}
 	}
 	id, err := w.append(ctx, entry)
 	if err != nil {
@@ -1969,8 +2339,12 @@ func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
 	reason, ref := w.endReason(e)
 	entry := agentsession.NewRunEnd(w.run, reason, ref, append([]string(nil), w.open...))
 	w.run, w.open = "", nil
-	_, err := w.append(ctx, entry)
-	return err
+	if _, err := w.append(ctx, entry); err != nil {
+		return err
+	}
+	// The end closes the queued entries of the inputs the run did not
+	// append; the ones the agent still holds are written again.
+	return w.endInbox(ctx)
 }
 
 // endReason maps the loop's reason onto the format's cascade, with the
