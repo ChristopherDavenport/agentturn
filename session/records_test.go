@@ -330,10 +330,20 @@ func TestAbortRecordsInterruptedAndFinishedCalls(t *testing.T) {
 	})
 	a := agentturn.New(agentturn.Config{Model: allCalls{}, Tools: []agenttool.Tool{fast, slow}})
 	defer rec.Attach(a)()
-	fastDone := make(chan struct{})
+	// The abort comes once the fast call has ended and the slow one has
+	// been handed to its tool, so the slow call is cut after its
+	// dispatch whichever order the batch ran them in.
+	fastDone, slowDispatched := make(chan struct{}), make(chan struct{})
 	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
-		if e, ok := ev.(*agentturn.ToolEnd); ok && e.Name == "fast" {
-			close(fastDone)
+		switch e := ev.(type) {
+		case *agentturn.ToolEnd:
+			if e.Name == "fast" {
+				close(fastDone)
+			}
+		case *agentturn.ToolDispatch:
+			if e.Name == "slow" {
+				close(slowDispatched)
+			}
 		}
 		return nil
 	})
@@ -343,6 +353,7 @@ func TestAbortRecordsInterruptedAndFinishedCalls(t *testing.T) {
 		done <- end
 	}()
 	<-fastDone
+	<-slowDispatched
 	a.Abort()
 	end := <-done
 	if end == nil || end.Reason != agentturn.ReasonAborted || len(end.Pending) != 1 || end.Pending[0].Call.Name != "slow" || end.Pending[0].Reason != agentturn.PendingAborted {

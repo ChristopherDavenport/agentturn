@@ -577,3 +577,46 @@ func TestSpawnedChildAbortsAlone(t *testing.T) {
 		t.Errorf("the call's context was cancelled: %v", ctx.Err())
 	}
 }
+
+// TestChildRunCarriesNoParentTrigger checks that a child run does not
+// inherit the trigger of the run whose call started it, whose Extra a
+// recorder would otherwise write on the child's run start and whose
+// source it would give the child's prompt, and that WithRunContext can
+// give it one of its own.
+func TestChildRunCarriesNoParentTrigger(t *testing.T) {
+	parent := agentturn.Trigger{Kind: "cron", Ref: "nightly", Extra: map[string]any{"attempt": 2}}
+	own := agentturn.Trigger{Kind: "task", Ref: "c1"}
+	for _, tc := range []struct {
+		name string
+		opts []Option
+		want agentturn.Trigger
+	}{
+		{"inherited", nil, agentturn.Trigger{}},
+		{"given by the host", []Option{WithRunContext(func(ctx context.Context, callID string) context.Context {
+			return agentturn.ContextWithTrigger(ctx, own)
+		})}, own},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var start agentturn.Trigger
+			var prompt agentturn.Trigger
+			opts := append([]Option{WithObserver(func(_ context.Context, ev agentturn.Event) {
+				switch e := ev.(type) {
+				case *agentturn.RunStart:
+					start = e.Trigger
+				case *agentturn.ItemEnd:
+					if e.ResponseID == "" {
+						prompt = e.Trigger
+					}
+				}
+			})}, tc.opts...)
+			child := New(agentturn.Config{Name: "helper", Model: &echo.Adapter{}}, opts...)
+			ctx := agentturn.ContextWithTrigger(context.Background(), parent)
+			if _, err := child.Execute(ctx, agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"go"}`)}); err != nil {
+				t.Fatal(err)
+			}
+			if start.String() != tc.want.String() || len(start.Extra) != 0 || prompt.String() != tc.want.String() {
+				t.Errorf("child run start %+v, prompt %+v, want %+v", start, prompt, tc.want)
+			}
+		})
+	}
+}

@@ -626,6 +626,65 @@ func TestRunStartCarriesTheTriggerInParts(t *testing.T) {
 	}
 }
 
+// TestTriggerExtraReachesTheRunStart pins #146: a firing's own facts,
+// its due time and attempt, are members of the run start entry, where
+// agentsession #82 put them; the prompt's item carries the trigger as
+// its source; and a name the entry already has is refused before
+// anything of the run is written.
+func TestTriggerExtraReachesTheRunStart(t *testing.T) {
+	cases := []struct {
+		name    string
+		extra   map[string]any
+		wantErr bool
+	}{
+		{"facts", map[string]any{"due_at": "2026-09-29T03:00:00Z", "attempt": 2}, false},
+		{"a format member", map[string]any{"run_id": "run_forged"}, true},
+		{"the envelope", map[string]any{"parent": "e1"}, true},
+		{"the recorder's member", map[string]any{ConfigBaseMember: "sha256:0"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}})
+			defer rec.Attach(a)()
+			trigger := agentturn.Trigger{Kind: "cron", Ref: "nightly", Source: "scheduler", Extra: tc.extra}
+			prompt := openresponses.UserText("go")
+			_, err = a.Prompt(agentturn.ContextWithTrigger(context.Background(), trigger), prompt)
+			if tc.wantErr {
+				if !errors.Is(err, ErrTriggerMember) {
+					t.Fatalf("err = %v, want ErrTriggerMember", err)
+				}
+				if leaf := s.Leaf(); leaf != "" {
+					t.Errorf("a refused run start left entry %s", leaf)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			start := runsOf(t, s)[0].Start
+			if string(start.Unknown["due_at"]) != `"2026-09-29T03:00:00Z"` || string(start.Unknown["attempt"]) != "2" {
+				t.Errorf("run start members = %s", start.Unknown)
+			}
+			if start.Trigger == nil || *start.Trigger != (agentsession.Trigger{Kind: "cron", Ref: "nightly", Source: "scheduler"}) {
+				t.Errorf("run start trigger = %+v", start.Trigger)
+			}
+			id, ok := rec.EntryOf(context.Background(), prompt)
+			if !ok {
+				t.Fatal("the prompt has no entry")
+			}
+			e, _ := s.Entry(id)
+			if it, ok := e.(*agentsession.ItemEntry); !ok || it.Source == nil || *it.Source != *start.Trigger {
+				t.Errorf("prompt entry = %+v", e)
+			}
+		})
+	}
+}
+
 type note struct{ Text string }
 
 func (note) RecordNS() string { return "app:note" }

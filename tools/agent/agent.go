@@ -236,7 +236,9 @@ func WithSpawn(fn func(callID string, child *agentturn.Agent)) Option {
 // layer that attributes its writes to a session, a memory journal for
 // one, names the child's rather than the parent's. It runs once per
 // call, before the run starts, and the context it returns is the one
-// the child's hooks and tools see.
+// the child's hooks and tools see. The child's run carries no trigger
+// of the parent's run, whose call started it; one this puts on the
+// context with agentturn.ContextWithTrigger is the child's own.
 func WithRunContext(fn func(ctx context.Context, callID string) context.Context) Option {
 	return func(o *options) { o.runCtx = fn }
 }
@@ -245,9 +247,15 @@ func WithRunContext(fn func(ctx context.Context, callID string) context.Context)
 // started, with an output saying the task is running and a [ChildInfo]
 // naming the run, and hands the run's end to fn when it comes, on the
 // child's goroutine. It is the background task: the parent's model
-// goes on while the child works, and the host delivers the answer, as
-// agentturn.Agent.Steer into a parent that is still running or a
-// Prompt to one that is idle, from fn.
+// goes on while the child works, and the host delivers the answer to
+// the parent from fn with agentturn.Agent.Deliver, which joins the
+// parent's run when it will still take the answer and otherwise starts
+// one for it. State().Running is not the test: it reads true while the
+// parent's run is ending and takes no more steers, and an answer
+// steered then waits for the user's next prompt. fn runs on the
+// child's goroutine, which is not inside a parent's event, so it may
+// wait on the parent's run to end; a host that must not block the
+// child calls Deliver from a goroutine of its own.
 //
 // The child runs on agentturn.RunContext of the call, so an abort of
 // the parent's run still cuts it, and the parent's batch ending or its
@@ -433,6 +441,10 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 			ctx = agenttool.WithCall(rc, call)
 		}
 	}
+	// The parent's trigger names what started the parent's run; the
+	// child's run was started by the call, which the child's link
+	// names, so it carries none unless WithRunContext gives it one.
+	ctx = agentturn.ContextWithTrigger(ctx, agentturn.Trigger{})
 	if a.opts.runCtx != nil {
 		ctx = a.opts.runCtx(ctx, call.ID)
 	}

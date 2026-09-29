@@ -261,8 +261,10 @@ attached to the context of everything the run calls — the transform,
 the hooks, the model, the tools — so a tool that composes another agent
 can say which run it was called from. A **trigger** the caller attaches
 to the context, a kind, a reference and the layer that took the input,
-in the caller's own terms, is
-carried on `run_start` and read by nothing in the loop; it is how a
+in the caller's own terms, with any richer facts of the caller's about
+the firing, when it was due or which attempt it is, is
+carried on `run_start` and on the `item_end` of each item the run was
+prompted with, and read by nothing in the loop; it is how a
 recorder learns what caused the run without the loop learning what a
 cron job is.
 
@@ -272,10 +274,8 @@ A turn proceeds in these phases, in this order. Each names the events
 it raises and the hooks it calls; the events are defined
 [below](#events).
 
-1. **Limits.** If the run has taken its turn limit's worth of turns,
-   it ends with reason `stopped` and cause `max_turns`, whatever would
-   have started the next one: a tool batch to answer or a steered item.
-   If the run's context is cancelled, it ends with reason `aborted`.
+1. **Cancellation.** If the run's context is cancelled, it ends with
+   reason `aborted`.
 2. **Before the turn.** The before-turn hook MAY return items, which
    the loop appends to the transcript with their item events as it
    appends any input. They are then facts about the transcript: a
@@ -324,10 +324,20 @@ it raises and the hooks it calls; the events are defined
     call that asked to end the run. agenttool RFC 0001 requires a
     harness to report a partial batch as partial and leaves the policy
     to it; this loop's policy is to stop and say so.
-12. **Queues.** Items steered in while the turn ran are appended, with
+12. **Limits.** If the run has taken its turn limit's worth of turns,
+    it ends with reason `stopped` and cause `max_turns` when the model
+    called tools or anything is queued, and with reason `done`
+    otherwise. What is queued is not drained: it stays queued for the
+    next run, which takes it after its prompt.
+13. **Queues.** Items steered in while the turn ran are appended, with
     their item events. If the model called no tools, the follow-up
     queue is drained after them; if nothing was queued, the run ends
     with reason `done`. Otherwise the next turn begins at phase 1.
+
+Phases 9 to 12 decide a stop before phase 13 drains anything, so an
+item steered during a turn that ends the run stays queued for the next
+run rather than being appended to a run that will not call the model
+again; the run is past its last drain from that decision on.
 
 A batch of zero calls runs phases 7 and 8 trivially: `turn_end` carries
 no results, and phase 9 finds nothing pending.
@@ -602,7 +612,7 @@ calls** with why each is pending.
 
 | cause | meaning |
 | --- | --- |
-| `max_turns` | the turn limit was reached before another model call |
+| `max_turns` | the turn limit was reached with tools called or items queued; the queued items wait for the next run |
 | `hook` | the stop hook ended the run |
 | `guard` | the stop hook, the before-turn hook or the before-model-call hook ended the run with an error marked as a guard's; the error is on the end event. Stopped before the model call, the turn has no `turn_start` |
 | `terminate` | every result of the batch set the terminate hint |
@@ -775,7 +785,11 @@ call's: the values of the context the run was started with and the run
 ID, cancelled when the run is cancelled, with the cause, and not when
 the batch or the run ends by itself. Once the run has ended, cancelling
 the agent reaches its next run and not that work, which keeps a cancel
-of its own if it must be stopped later.
+of its own if it must be stopped later. The tool recorder is on the run
+context too, so a record such work writes of what it started reaches
+the host; the call is not, and the work carries it for the record to
+name its call. What belongs to the batch, the transcript, the invoker,
+the tool elicitor and the steer signal, is not on it.
 
 A steer does not cancel a running tool. The loop puts beside each call
 a **steer signal** that is raised when an item is steered into the run,
@@ -807,7 +821,7 @@ turn number. The catalogue, with the members beyond those two:
 | `model_blocked` | `request`, `error` | in place of `turn_start` when the before-model-call hook refused; the last event before `run_end` |
 | `item_start` | `item`, `response_id`, `hidden` | an item entering the transcript: an input as it is appended, an output item as the stream opens it |
 | `item_update` | `item`, `stream`, `response_id` | one wire event of an output item, with the item as accumulated |
-| `item_end` | `item`, `response_id`, `hidden` | the item is complete and in the transcript |
+| `item_end` | `item`, `response_id`, `hidden`, `trigger` | the item is complete and in the transcript; `trigger` is the run's for an item the run was prompted with |
 | `response_end` | `response` | the stream ended; before any tool of the turn runs |
 | `tool_start` | `call_id`, `name`, `args`, `decision`, `parent` | after preflight, in the model's order |
 | `tool_dispatch` | `call_id`, `name`, `parent` | the call has been handed to its tool, before the tool runs; after its `tool_start` and before its `tool_end` |
@@ -974,6 +988,38 @@ agent at the start of the next run. A host that must not lose an input
 therefore writes it before queueing it rather than from the event, and
 a subscriber's error cannot refuse the item.
 
+A run that stops after a turn, on its turn limit, a stop hook, a
+terminating result or a call that needs input, decides so before it
+drains the queues, so an item steered during that turn stays queued
+for the next run rather than being appended to a run that will not
+call the model again. A run drains the queues for the last time when
+it would otherwise end, after its final `turn_end`, or not at all once
+it has decided to stop, and is then past its last drain: its `run_end`
+is still being delivered and the agent still reads as running, but an
+item steered then waits for the next run, and its `queued` event names
+no run. The mark is set in the same step as the drain that finds both
+queues empty, or as the decision to stop is made; a run that ends
+another way, a guard before the model call, a cancellation or a
+failure, is marked as it leaves the loop, and drains nothing between.
+
+An agent offers a **delivery** for an input that arrives on its own
+time, a background task's result: the item is queued as a steer, and
+the delivery waits until a model call has seen it. A run in flight
+that drains it and then sends a request has taken it. A run that stops
+after its turn or ends without draining it leaves it queued, and the
+delivery starts a run that takes it once that run has ended, as a
+continue after a steer would, unless calls are pending, when it is
+left for the resume and the delivery says input is required. A run
+that drained it and ended before the next request, on a guard, a
+cancellation or a failure, leaves it in the transcript unanswered,
+and the delivery reports that run's end rather than start another. The
+asymmetry is deliberate: a stop after the turn was decided without the
+item, and one before the call with it. A delivery made from inside
+the run, by its tool, hook or subscriber or by a child run a tool
+made, does not wait, since the run waits on it: the item joins the run
+as any steer does, or waits for the next run when the run is past its
+last drain.
+
 The queues live in memory. An item accepted is in no record until a
 run appends it or a subscriber writes it, and it survives a
 cancellation, a configuration change and a transcript change but not
@@ -1109,8 +1155,10 @@ An agent stands in four places inside another system:
   the child's run has started, the child runs on the run context, so
   the parent's cancellation still cuts it and the parent's run ending
   does not, and its end goes to a callback from which the host delivers
-  the answer, a steer into a parent still running or a prompt to one
-  that is idle. A later run of a child the host marks as a retry
+  the answer with the agent's delivery, which joins the parent's run
+  when it will still take the answer and starts one otherwise; a steer
+  tested against whether the parent is running waits for the next
+  prompt when the parent's run is past its last drain. A later run of a child the host marks as a retry
   reaches the observer marked.
 - **As a peer.** The loop exposed to A2A callers, with its card derived
   from its name, description and tools; a remote A2A agent wrapped as a
@@ -1150,11 +1198,11 @@ of the events.
 
 | event | entry |
 | --- | --- |
-| `run_start` | `run` start, with the loop's source as the format's, the trigger joined as `kind:ref`, or whichever is set, as `ref`, and the trigger's kind, ref and source apart as `trigger`; an `env` entry, compared with the last one written members it does not define included, when the host supplies one and it changed; the full initial `config` from the configuration's base request when nothing has been written yet, and a `config` delta from it when the configuration changed since the last run, so the items the new configuration's before-turn hook appends are filed under it. The run entry carries the hash of the configuration's base request in a member of the recorder's own, so a recorder seeded from a stored path, by a resume, a fork, a rebase, a continuation or a child session reopened under its call, compares its first run with the base that path's last run started under; a path that recorded none is compared by its settings at the leaf, leaving out instructions the host composes as parts when the base does not join them |
+| `run_start` | `run` start, with the loop's source as the format's, the trigger joined as `kind:ref`, or whichever is set, as `ref`, and the trigger's kind, ref and source apart as `trigger`, with the trigger's richer facts as members of the entry the format does not define, refused when one names a member the entry already has; an `env` entry, compared with the last one written members it does not define included, when the host supplies one and it changed; the full initial `config` from the configuration's base request when nothing has been written yet, and a `config` delta from it when the configuration changed since the last run, so the items the new configuration's before-turn hook appends are filed under it. The run entry carries the hash of the configuration's base request in a member of the recorder's own, so a recorder seeded from a stored path, by a resume, a fork, a rebase, a continuation or a child session reopened under its call, compares its first run with the base that path's last run started under; a path that recorded none is compared by its settings at the leaf, leaving out instructions the host composes as parts when the base does not join them |
 | `turn_start` | a `config` delta when the request's settings differ from the path's; the request hash is computed here and written on the response. When the host names the parts the request's instructions are composed of, for any session the recorder writes, a child run's included, and they join to the instructions sent, the entries carry `instructions_parts`, a delta naming the parts that moved and each run of unchanged parts as a `keep`, and `instructions_omitted` for what the host left out; parts that do not join are dropped and the string is written, since the record describes what was sent |
 | `model_retry` | a record entry with the attempt, the error, the delay, the failed attempt's model and whether the retry policy revised the request, before the response of the attempt that answers; the revised request's settings are settled with that attempt, so only the attempt that answered is configured on the path. The record entry stays beside the count below, since it says what the count cannot |
 | `model_blocked` | for an error marked as a guard's, a custom entry in `agentturn:model_blocked` carrying the guard's error, the request hash and the model, since the run stopped rather than failed and a failed `response` would make its end read as a failure; for any other error, a failed `response` carrying the hook's error and the request hash. Either way the call that was refused is told from one that was made and failed |
-| `item_end` | an `item`, with the display flag off for a hidden item. Before a caller-supplied output for a call that was neither dispatched nor rejected, a `reject` decision with the output's text as its reason and the decider the caller named, and `policy` as the decider when the loop refused the call itself in this run, for a name no tool has or arguments that are not an object; before one for a call dispatched in an earlier run, nothing, since a `proceed` would say the call went on toward its tool and a `reject` that it never reached it: the output is the record, and no second `dispatch` says the tool did not run again |
+| `item_end` | an `item`, with the display flag off for a hidden item, and the run's trigger as `source` for an item the run was prompted with. Before a caller-supplied output for a call that was neither dispatched nor rejected, a `reject` decision with the output's text as its reason and the decider the caller named, and `policy` as the decider when the loop refused the call itself in this run, for a name no tool has or arguments that are not an object; before one for a call dispatched in an earlier run, nothing, since a `proceed` would say the call went on toward its tool and a `reject` that it never reached it: the output is the record, and no second `dispatch` says the tool did not run again |
 | `response_end` | the `response`, with `request_hash` when the input the loop sent is the input the recorded path rebuilds, and none otherwise, and `attempts`, the calls it took, when the retry policy tried it again; so is the failed `response` `run_end` writes for a call left in flight, where an abort during the retry's backoff counts the attempt that was due, since nothing tells it from an abort before that attempt streamed |
 | `tool_start` | a `decision`: `reject` with the reason for a block, `call blocked` when it gave none; `hold` for a defer, with the reason when given; `proceed` for a call that was held, whose arguments were rewritten, with the arguments, or whose decision gave a reason, with the reason. The decider is the decision's, and `policy` for a call nothing was holding whose decision names nobody. A nested call is a record entry instead |
 | `tool_dispatch` | a `dispatch`, durable before the event returns, so the tool runs after it or not at all, carrying the call's idempotency key as `idempotency_key`; a second one for a call an earlier run dispatched and a resume runs again, so the path holds one per hand-off; nothing for a nested call. Subscribers are called in order, so one that vetoes a dispatch is registered before the recorder; one registered after it refuses a call whose dispatch is already durable |
@@ -1208,7 +1256,7 @@ maps onto it as follows:
 | turn limit | `Config.MaxTurns` |
 | retry policy | `Config.Retry{MaxAttempts, Backoff, Retryable, Revise}`; `DefaultBackoff`, `DefaultRetryable` |
 | low-level loop | `Run(ctx, t, prompts, cfg)`, `Continue(ctx, t, cfg)` → `iter.Seq[Event]`; `EventBuffer`; `CanContinue` |
-| agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`, `WithPending`, `SetPending`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `State`, `SetConfig`, `SetTranscript`, `Config` |
+| agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`, `WithPending`, `SetPending`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Deliver`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `State`, `SetConfig`, `SetTranscript`, `Config` |
 | refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning`, `ErrAmbiguousCall` |
 | run ID, trigger, transcript on the context | `ContextWithRunID`/`RunIDFromContext`, `ContextWithTrigger`/`TriggerFromContext`, `ContextWithTranscript`/`TranscriptFromContext` |
 | run context, steer signal | `RunContext(ctx)`, `Steered(ctx)` |

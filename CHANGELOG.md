@@ -142,6 +142,49 @@ versions may break the API.
   `session.Pending` reads the calls, and `session.ReplayAnswers`
   returns the rule's answer for each call pending at the leaf that is
   not held. (#143)
+- Breaking: `agentturn.Trigger` gains `Extra`, the caller's richer
+  facts about a firing, such as when it was due or which attempt it
+  is, which the session recorder writes as members of the run start
+  entry, where agentsession #82 put them. A name the entry already
+  has, one of the envelope's, the format's or `config_base`, is
+  refused with `session.ErrTriggerMember` before anything of the run
+  is written. `Trigger` holds a map now and no longer compares with
+  `==`. The items a run was prompted with carry its trigger on
+  `ItemEnd.Trigger`, and the recorder writes it as their `source`, as
+  it already did for a queued input. A child run of `tools/agent` no
+  longer inherits the trigger of the parent's run, whose `Extra` its
+  recorder would otherwise write on the child's run start;
+  `WithRunContext` can give it one of its own. (#146)
+- Behaviour change: an item steered during a turn after which the run
+  stops, on `MaxTurns`, `ShouldStopAfterTurn`, a terminating result or
+  a call that needs input, is no longer appended to the run that
+  stopped. It stays queued, and the next run takes it after its
+  prompt: a `Prompt("second")` after a `MaxTurns` stop now sends
+  `second` before the item steered in the last turn, where the item
+  used to come first. A host that wants the item answered first calls
+  `Agent.Continue`. `MaxTurns` is now checked at the end of the turn
+  rather than at the top of the next. (#148)
+- `Agent.Deliver` hands an input that arrives on its own time, a
+  detached child's answer, to the model: it returns joined once a
+  request of the run in flight has followed the drain that took it,
+  and when that run will not call the model again it starts a run for
+  it once the run in flight has ended. Called from inside the run, by
+  its tool, hook or subscriber or a child run one of its tools made,
+  it does not wait. A steer made while a run
+  delivered its `run_end`, when `State().Running` still read true,
+  waited for the user's next prompt. The run marks itself past its last drain as it
+  decides to stop, or in the same step as the drain that finds the
+  queues empty, and a `Queued` report made after it names no run. An
+  agent mints a run's ID as it starts the run, so `State().RunID` and
+  a `Queued` report made before `run_start` name that run rather than
+  the one before. `tools/agent.WithDetach` documents delivering with
+  it. (#148)
+- `agentturn.RunContext` carries `Config.ToolRecorder`, so a record a
+  tool's background job writes with `agenttool.WriteRecord` reaches the
+  host rather than being dropped without an error. The call is not on
+  it: a job carries its call with `agenttool.WithCall` for the record
+  to name it. The tool elicitor stays off, with the rest of what
+  belongs to the batch. (#149)
 
 ## v0.0.10 - 2026-09-28
 

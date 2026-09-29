@@ -162,9 +162,11 @@ type Config struct {
 	// agenttool.DefaultMaxParallel.
 	MaxParallelTools int
 	// ToolRecorder, when set, is agenttool.Executor.Recorder for every
-	// batch: installed on each call's context, so a tool that writes a
-	// record while it runs with agenttool.WriteRecord reaches the host
-	// without the host threading a context through Prompt. A session
+	// batch: installed on each call's context, and on [RunContext] for
+	// the work a call leaves running, so a tool that writes a record
+	// with agenttool.WriteRecord, while it runs or from a job it
+	// started, reaches the host without the host threading a context
+	// through Prompt. A session
 	// recorder offers one as session.Recorder.RecordFunc. nil leaves a
 	// recorder already on the run's context in place and installs
 	// nothing else, so under nil a tool's WriteRecord is a no-op.
@@ -181,8 +183,11 @@ type Config struct {
 	// that asks the MCP client, then puts its tools' questions to that
 	// client.
 	ToolElicitor agenttool.Elicitor
-	// MaxTurns stops a run after this many turns with ReasonStopped;
-	// zero means no limit.
+	// MaxTurns stops a run after this many turns with ReasonStopped and
+	// StopMaxTurns when its last turn called tools or anything is
+	// queued, which stays queued for the next run; a last turn that
+	// called none with nothing queued ends the run done. Zero means no
+	// limit.
 	MaxTurns int
 
 	// Filter drops app-only items before each model call and returns
