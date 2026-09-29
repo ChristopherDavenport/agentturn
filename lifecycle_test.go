@@ -77,6 +77,54 @@ func TestRunStartSourceAndTrigger(t *testing.T) {
 	}
 }
 
+// TestResumeOutputsCarryNoTrigger pins #160: the outputs a resume
+// appends for pending calls were given by whoever decided them, which
+// their decisions say, so their item_end carries no trigger; the
+// run's start and the notes the caller supplied keep it.
+func TestResumeOutputsCarryNoTrigger(t *testing.T) {
+	ctx := ContextWithTrigger(context.Background(), Trigger{Kind: "human", Ref: "chris:http:1", Source: "http"})
+	deferAll := func(context.Context, ToolCallInfo) (*ToolDecision, error) { return &ToolDecision{Action: Defer}, nil }
+	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}, BeforeToolCall: deferAll})
+	if _, err := a.Prompt(ctx, openresponses.UserText("abc")); err != nil {
+		t.Fatal(err)
+	}
+	pending := a.State().Pending
+	if len(pending) != 1 {
+		t.Fatalf("pending = %+v", pending)
+	}
+	rec := &recorder{}
+	rec.subscribe(a)
+	refusal := &openresponses.FunctionCallOutput{CallID: pending[0].Call.CallID, Output: openresponses.FunctionCallOutputData{Text: "Denied by policy"}}
+	if _, err := a.Resume(ctx, Refuse(refusal).WithBy("policy").WithNote("not that one")); err != nil {
+		t.Fatal(err)
+	}
+	if rs := runStartOf(rec.events); rs == nil || rs.Trigger.Kind != "human" {
+		t.Errorf("run_start = %+v, want the trigger", rs)
+	}
+	var sawOutput, sawNote bool
+	for _, ev := range rec.events {
+		e, ok := ev.(*ItemEnd)
+		if !ok {
+			continue
+		}
+		switch e.Item.(type) {
+		case *openresponses.FunctionCallOutput:
+			sawOutput = true
+			if !e.Trigger.IsZero() {
+				t.Errorf("the refusal carries trigger %v", e.Trigger)
+			}
+		case *openresponses.Message:
+			sawNote = true
+			if e.Trigger.Kind != "human" {
+				t.Errorf("the note carries trigger %v, want the run's", e.Trigger)
+			}
+		}
+	}
+	if !sawOutput || !sawNote {
+		t.Errorf("output %v, note %v", sawOutput, sawNote)
+	}
+}
+
 func sourceStrings(s []Source) []string {
 	out := make([]string, len(s))
 	for i, v := range s {

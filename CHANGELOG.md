@@ -82,6 +82,11 @@ versions may break the API.
   rather than as never started: it takes only an output, an approval
   returns `ErrCallAnswered`, and `session.ReplayAnswers` answers it
   with the reject's reason. (#159)
+- The outputs `Agent.Resume` appends for pending calls carry no
+  trigger on their `item_end`, so the session recorder writes no
+  `source` on them: their decision says who gave them, and a policy's
+  refusal no longer reads as sent by the person who started the run.
+  The run's start and the answers' notes keep the trigger. (#160)
 
 ## v0.0.11 - 2026-09-29
 

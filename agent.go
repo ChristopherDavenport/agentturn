@@ -771,6 +771,7 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, approved
 			runCtx:     runCtx,
 			prior:      prior,
 			runID:      runID,
+			resuming:   resuming,
 		}
 		end := r.run(ctx, prompts, approved, terminate)
 		cancel(nil)

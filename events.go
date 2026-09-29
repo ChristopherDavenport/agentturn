@@ -275,7 +275,8 @@ type ItemEnd struct {
 	// Trigger, for an item the run was prompted with, is the run's
 	// [Trigger], so a recorder can write how the input arrived; it is
 	// zero for every other item, a queued input included, whose own
-	// trigger rode on its [Queued] report.
+	// trigger rode on its [Queued] report, and an output [Agent.Resume]
+	// appends for a pending call, whose decision says who gave it.
 	Trigger Trigger
 }
 

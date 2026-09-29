@@ -456,6 +456,10 @@ type runner struct {
 	// runCtx is the context RunContext hands a tool: the run's values,
 	// cancelled on abort and not when the run ends by itself.
 	runCtx context.Context
+	// resuming is set for a run Agent.Resume started, whose leading
+	// outputs answer pending calls rather than carry what the trigger
+	// sent.
+	resuming bool
 
 	// hookMu serialises the tool hooks. A nested call runs on the
 	// goroutine of the tool that made it, so without it two tools of
@@ -707,7 +711,20 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 	if err := r.emit(&RunStart{RunID: r.runID, Source: r.source(prompts, approved), Trigger: trigger}); err != nil {
 		return err
 	}
-	if err := r.appendInput(prompts, trigger); err != nil {
+	// The outputs a resume opens with answer pending calls, and their
+	// decisions say who gave them, so the trigger rides only on what
+	// follows them: the notes the caller supplied.
+	answers := 0
+	for r.resuming && answers < len(prompts) {
+		if _, ok := prompts[answers].(*openresponses.FunctionCallOutput); !ok {
+			break
+		}
+		answers++
+	}
+	if err := r.appendItems(prompts[:answers]); err != nil {
+		return err
+	}
+	if err := r.appendInput(prompts[answers:], trigger); err != nil {
 		return err
 	}
 	if len(approved) == 0 && !terminate {
