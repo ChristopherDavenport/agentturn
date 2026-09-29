@@ -140,6 +140,14 @@ func TestModelRetryIsRecorded(t *testing.T) {
 			return nil
 		},
 		want: []ModelRetry{{Attempt: 1, Model: "a", Revised: true}},
+	}, {
+		name:  "a revision that edits a map in place",
+		model: flaky{fails: func() *atomic.Int32 { var n atomic.Int32; n.Store(1); return &n }()},
+		revise: func(_ int, req *openresponses.Request, _ error) *openresponses.Request {
+			req.Metadata["route"] = "fallback"
+			return nil
+		},
+		want: []ModelRetry{{Attempt: 1, Model: "a", Revised: true}},
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := agentsession.NewMemoryStore()
@@ -147,7 +155,7 @@ func TestModelRetryIsRecorded(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			a := agentturn.New(agentturn.Config{Model: tc.model, ModelName: "a", Retry: agentturn.Retry{
+			a := agentturn.New(agentturn.Config{Model: tc.model, ModelName: "a", Request: openresponses.Request{Metadata: map[string]string{"route": "primary"}}, Retry: agentturn.Retry{
 				MaxAttempts: 3,
 				Backoff:     func(int, error) time.Duration { return 7 * time.Millisecond },
 				Revise:      tc.revise,
@@ -489,7 +497,7 @@ func TestElicitationIsRecordedUnderTheCall(t *testing.T) {
 		ask: func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
 			return agenttool.Answer{}, errors.New("terminal closed")
 		},
-		want: Elicitation{Message: "delete the branch?", Error: "terminal closed", By: agentsession.ByHuman},
+		want: Elicitation{Message: "delete the branch?", Error: "terminal closed"},
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := agentsession.NewMemoryStore()
@@ -542,4 +550,82 @@ func TestElicitationIsRecordedUnderTheCall(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEntryOfAfterRebase checks that the items of an agent seeded from
+// the session's context after a rebase are found, as the items a run
+// appends are.
+func TestEntryOfAfterRebase(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}})
+	defer rec.Attach(a)()
+	for _, text := range []string{"one", "two"} {
+		if _, err := a.Prompt(context.Background(), openresponses.UserText(text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var mark string
+	for _, e := range s.Entries() {
+		if it, ok := e.(*agentsession.ItemEntry); ok && it.ResponseID != "" {
+			mark = e.Base().ID
+			break
+		}
+	}
+	if err := rec.Rebase(s, mark); err != nil {
+		t.Fatal(err)
+	}
+	cx, err := s.Context()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range cx.Items {
+		if _, ok := rec.EntryOf(context.Background(), item); !ok {
+			t.Errorf("no entry for the seeded %s", item.ItemType())
+		}
+	}
+}
+
+// TestProviderIsNotAskedAtEveryRunStart checks that comparing the
+// configuration at run_start does not call a tool provider, so one that
+// lists its tools in a different order each time writes no config
+// entries for a configuration that did not change.
+func TestProviderIsNotAskedAtEveryRunStart(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := agenttool.New("lower", "lowercase", func(_ context.Context, a echoArgs) (string, error) { return strings.ToLower(a.Text), nil })
+	asked := 0
+	provider := func(context.Context) []agenttool.Tool {
+		asked++
+		if asked%2 == 0 {
+			return []agenttool.Tool{other, upper}
+		}
+		return []agenttool.Tool{upper, other}
+	}
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ToolProvider: provider})
+	turns := 0
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if _, ok := ev.(*agentturn.TurnStart); ok {
+			turns++
+		}
+		return nil
+	})
+	defer rec.Attach(a)()
+	for range 3 {
+		if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The first run settles in full, which asks the provider once;
+	// each turn asks it once more, and nothing else does.
+	if asked != turns+1 {
+		t.Errorf("the provider was asked %d times over %d turns", asked, turns)
+	}
+	verifyAll(t, s)
 }

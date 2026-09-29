@@ -352,7 +352,11 @@ type NestedCall struct {
 // failed attempt of a model call that [agentturn.Retry] tries again.
 // Its data is a [ModelRetry]. It is appended where the next entry
 // goes, before the response of the attempt that answered, so a reader
-// counting the calls a turn took counts these and adds one.
+// counting the calls a turn took counts these and adds one. It lands
+// before the config entry of the turn, which is written with the first
+// entry of the attempt that answers, so only that attempt's settings
+// are on the path; on a fresh session with no configuration to settle
+// at run_start, that can put it before the first config entry.
 const ModelRetryNS = "agentturn:model_retry"
 
 // ModelRetry is the data of a [ModelRetryNS] custom entry.
@@ -386,7 +390,8 @@ type Elicitation struct {
 	// Action is accept, decline or cancel; empty when Error is set.
 	Action  string          `json:"action,omitempty"`
 	Content json.RawMessage `json:"content,omitempty"`
-	// By is who answered, in the session format's terms.
+	// By is who answered, in the session format's terms; empty when
+	// nobody was asked or the asking failed.
 	By string `json:"by,omitempty"`
 	// Error is the harness's failure to ask, which the tool sees as an
 	// error rather than an answer.
@@ -495,9 +500,12 @@ type writer struct {
 	// run started under, encoded, so a run whose configuration changed
 	// settles it before any of its items.
 	base []byte
-	// attempt is the canonical request of the model call in flight, so
-	// a retry can say whether Revise changed it.
-	attempt *openresponses.Request
+	// attempt is the canonical request of the model call in flight,
+	// encoded when it was reported and before a retry policy could edit
+	// its maps in place, so a retry can say whether Revise changed it.
+	attempt []byte
+	// attemptModel is the model that request named.
+	attemptModel string
 	// omitted is the instructions_omitted of the last config entry that
 	// carried one, encoded, so a change to what was left out is written
 	// even when the settings did not move.
@@ -844,11 +852,12 @@ func (r *Recorder) Elicitor(by string, fn agenttool.Elicitor) agenttool.Elicitor
 			ans, err = fn(ctx, q)
 			who = by
 		}
-		data := Elicitation{Message: q.Message, Schema: q.Schema, URL: q.URL, By: who}
+		data := Elicitation{Message: q.Message, Schema: q.Schema, URL: q.URL}
 		if err != nil {
+			// Nobody answered: the harness failed to ask.
 			data.Error = err.Error()
 		} else {
-			data.Action, data.Content = string(ans.Action), ans.Content
+			data.Action, data.Content, data.By = string(ans.Action), ans.Content, who
 		}
 		if _, werr := r.Annotate(ctx, ElicitationNS, data); werr != nil {
 			return agenttool.Answer{}, errors.Join(err, werr)
@@ -870,7 +879,8 @@ func (w *writer) reset() {
 	w.env = nil
 	w.omitted = nil
 	w.base = nil
-	w.attempt = nil
+	w.attempt, w.attemptModel = nil, ""
+	w.parents = map[string]string{}
 }
 
 // seed sets the writer's state from the session at its leaf.
@@ -1373,11 +1383,6 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 	if w.cfg == nil {
 		return nil
 	}
-	req := Canonical(w.cfg.BaseRequest(ctx))
-	base, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("session: encode base request: %w", err)
-	}
 	// The configuration is settled before any item of the run when
 	// nothing has been written, and when it changed since the last run
 	// this writer saw, so the items a new configuration's BeforeTurn
@@ -1386,7 +1391,17 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 	// that edits the request every turn would otherwise be undone here
 	// and redone there on every run. The first run of a resumed writer
 	// has no last configuration to compare with and is left to
-	// turn_start too.
+	// turn_start too. The comparison does not ask a tool provider, which
+	// may cost a round trip or list its tools in another order each
+	// time; what it offers reaches the path at turn_start.
+	probe := *w.cfg
+	if probe.ToolProvider != nil {
+		probe.ToolProvider, probe.Tools = nil, nil
+	}
+	base, err := json.Marshal(Canonical(probe.BaseRequest(ctx)))
+	if err != nil {
+		return fmt.Errorf("session: encode base request: %w", err)
+	}
 	prev := w.base
 	w.base = base
 	switch {
@@ -1395,7 +1410,7 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 	default:
 		return nil
 	}
-	return w.settle(ctx, req)
+	return w.settle(ctx, Canonical(w.cfg.BaseRequest(ctx)))
 }
 
 // writeEnv asks the host for the environment and writes it when it
@@ -1445,7 +1460,10 @@ func (w *writer) turnStart(ctx context.Context, e *agentturn.TurnStart) error {
 		return err
 	}
 	w.settleReq = &req
-	w.attempt = &req
+	if w.attempt, err = json.Marshal(req); err != nil {
+		return fmt.Errorf("session: encode request: %w", err)
+	}
+	w.attemptModel = req.Model
 	w.inFlight = true
 	w.pending = hash
 	w.started = w.rec.now()
@@ -1464,10 +1482,13 @@ func (w *writer) retry(ctx context.Context, e *agentturn.ModelRetry) error {
 	if err != nil {
 		return err
 	}
-	rec := ModelRetry{Attempt: e.Attempt, Error: errText(e.Err), DelayMS: e.Delay.Milliseconds()}
+	next, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("session: encode request: %w", err)
+	}
+	rec := ModelRetry{Attempt: e.Attempt, Error: errText(e.Err), DelayMS: e.Delay.Milliseconds(), Model: w.attemptModel}
 	if w.attempt != nil {
-		rec.Model = w.attempt.Model
-		rec.Revised = !equalJSON(*w.attempt, req)
+		rec.Revised = !bytes.Equal(w.attempt, next)
 	}
 	raw, err := json.Marshal(rec)
 	if err != nil {
@@ -1479,7 +1500,7 @@ func (w *writer) retry(ctx context.Context, e *agentturn.ModelRetry) error {
 	if _, err := w.append(ctx, &agentsession.CustomEntry{NS: ModelRetryNS, Data: raw}); err != nil {
 		return err
 	}
-	w.attempt = &req
+	w.attempt, w.attemptModel = next, req.Model
 	w.settleReq = &req
 	w.inFlight = true
 	w.pending = hash
