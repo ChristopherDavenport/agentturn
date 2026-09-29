@@ -214,6 +214,11 @@ func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, 
 	case agentturn.ReasonInputRequired:
 		return e.inputRequired(ctx, reqCtx, q, agentturn.PendingCalls(out.end.Pending), "")
 	case agentturn.ReasonDone, agentturn.ReasonStopped:
+		if out.end.Cause == agentturn.StopGuard && out.lastText == "" {
+			// A guard refused the input before the agent answered: the
+			// task failed, not completed empty.
+			return e.finish(ctx, reqCtx, q, a2a.TaskStateFailed, errorMessage(reqCtx, out.end.Err))
+		}
 		var msg *a2a.Message
 		if out.lastText != "" {
 			msg = a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: out.lastText})

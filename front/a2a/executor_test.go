@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -281,6 +282,38 @@ func TestFailedRun(t *testing.T) {
 	_, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: bad})
 	if !errors.Is(err, a2a.ErrInvalidParams) {
 		t.Errorf("bad metadata err = %v", err)
+	}
+}
+
+// TestGuardStopBeforeAnswerFailsTask pins #138: a guard that stops the
+// run before the agent answers fails the task with its error, and one
+// that stops it after an answer completes it with that answer.
+func TestGuardStopBeforeAnswerFailsTask(t *testing.T) {
+	refuse := fmt.Errorf("%w: homework tripwire", agentturn.ErrGuard)
+	for _, tc := range []struct {
+		name  string
+		cfg   agentturn.Config
+		state a2a.TaskState
+		text  string
+	}{
+		{"before turn", agentturn.Config{BeforeTurn: func(context.Context, agentturn.TurnStartInfo) (openresponses.Items, error) {
+			return nil, refuse
+		}}, a2a.TaskStateFailed, "homework tripwire"},
+		{"before model call", agentturn.Config{BeforeModelCall: func(context.Context, *openresponses.Request) error {
+			return refuse
+		}}, a2a.TaskStateFailed, "homework tripwire"},
+		{"after the answer", agentturn.Config{ShouldStopAfterTurn: func(context.Context, agentturn.TurnInfo) (bool, error) {
+			return false, refuse
+		}}, a2a.TaskStateCompleted, "solve x"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			cfg.Model, cfg.ModelName = &echo.Adapter{}, "m"
+			task := sendTask(t, a2asrv.NewHandler(New(cfg)), userMessage("solve x"))
+			if task.Status.State != tc.state || !strings.Contains(taskText(task), tc.text) {
+				t.Errorf("task = %s %q, want %s %q", task.Status.State, taskText(task), tc.state, tc.text)
+			}
+		})
 	}
 }
 

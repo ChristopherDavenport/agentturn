@@ -3,6 +3,8 @@ package responses
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -144,6 +146,47 @@ func TestRelayReplacementIsWellFormed(t *testing.T) {
 			gotText, gotRefusal := messageText(msg)
 			if gotText != tc.wantText || gotRefusal != tc.wantRefusal {
 				t.Errorf("message = %q / %q, want %q / %q", gotText, gotRefusal, tc.wantText, tc.wantRefusal)
+			}
+		})
+	}
+}
+
+// TestGuardStopBeforeAnswerFails pins #138: a full run a guard stopped
+// before the model answered, at BeforeTurn or BeforeModelCall, fails
+// with the guard's error rather than completing empty; one a guard
+// stopped after the answer completes with it.
+func TestGuardStopBeforeAnswerFails(t *testing.T) {
+	refuse := fmt.Errorf("%w: homework tripwire", agentturn.ErrGuard)
+	for _, tc := range []struct {
+		name string
+		cfg  agentturn.Config
+		want string
+	}{
+		{"before turn", agentturn.Config{BeforeTurn: func(context.Context, agentturn.TurnStartInfo) (openresponses.Items, error) {
+			return nil, refuse
+		}}, ""},
+		{"before model call", agentturn.Config{BeforeModelCall: func(context.Context, *openresponses.Request) error {
+			return refuse
+		}}, ""},
+		{"after the answer", agentturn.Config{ShouldStopAfterTurn: func(context.Context, agentturn.TurnInfo) (bool, error) {
+			return false, refuse
+		}}, "solve x"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			cfg.Model, cfg.ModelName = &echo.Adapter{}, "m"
+			resp, err := New(cfg).Create(context.Background(), request(openresponses.UserText("solve x")))
+			if tc.want == "" {
+				if !errors.Is(err, agentturn.ErrGuard) {
+					t.Fatalf("err = %v, want the guard's", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.Status != openresponses.ResponseStatusCompleted || resp.OutputText() != tc.want {
+				t.Errorf("response = %s %q, want completed %q", resp.Status, resp.OutputText(), tc.want)
 			}
 		})
 	}

@@ -299,6 +299,48 @@ func TestChildInputRequired(t *testing.T) {
 	}
 }
 
+// TestChildGuardStop pins #138: a child a guard stopped before it
+// answered fails the call with the guard's error, named for the agent
+// and wrapping ErrGuard, with its ChildInfo; one a guard stopped after
+// it answered returns the answer.
+func TestChildGuardStop(t *testing.T) {
+	refuse := fmt.Errorf("%w: homework tripwire", agentturn.ErrGuard)
+	for _, tc := range []struct {
+		name string
+		cfg  agentturn.Config
+		want string
+	}{
+		{"before turn", agentturn.Config{BeforeTurn: func(context.Context, agentturn.TurnStartInfo) (openresponses.Items, error) {
+			return nil, refuse
+		}}, ""},
+		{"before model call", agentturn.Config{BeforeModelCall: func(context.Context, *openresponses.Request) error {
+			return refuse
+		}}, ""},
+		{"after the answer", agentturn.Config{ShouldStopAfterTurn: func(context.Context, agentturn.TurnInfo) (bool, error) {
+			return false, refuse
+		}}, "solve x"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			cfg.Name, cfg.Model = "Billing agent", &echo.Adapter{}
+			res, err := New(cfg, WithToolName("billing")).Execute(context.Background(), agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"solve x"}`)})
+			info, ok := res.Details.(ChildInfo)
+			if !ok || info.Agent != "Billing agent" || info.Cause != agentturn.StopGuard {
+				t.Errorf("details = %+v", res.Details)
+			}
+			if tc.want == "" {
+				if !errors.Is(err, agentturn.ErrGuard) || !strings.HasPrefix(err.Error(), `agent "Billing agent": `) {
+					t.Errorf("err = %v, want the guard's naming the agent", err)
+				}
+				return
+			}
+			if err != nil || res.Output.Text != tc.want {
+				t.Errorf("res = %q, err = %v, want %q", res.Output.Text, err, tc.want)
+			}
+		})
+	}
+}
+
 func TestChildWithoutAnAnswer(t *testing.T) {
 	// A child that hits its turn budget while still calling tools has no
 	// final message: the parent's model sees an error naming the cause.
@@ -309,7 +351,7 @@ func TestChildWithoutAnAnswer(t *testing.T) {
 	})
 	child := New(agentturn.Config{Name: "explore", Model: &echo.Adapter{}, Tools: []agenttool.Tool{looping}, MaxTurns: 1})
 	res, err := child.Execute(context.Background(), agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"x"}`)})
-	if err == nil || !strings.Contains(err.Error(), "max_turns") || !strings.Contains(err.Error(), "without a final answer") {
+	if err == nil || !strings.Contains(err.Error(), `agent "explore" stopped (max_turns) without a final answer`) {
 		t.Errorf("err = %v", err)
 	}
 	info, ok := res.Details.(ChildInfo)

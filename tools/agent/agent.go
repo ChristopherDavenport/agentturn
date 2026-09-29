@@ -47,6 +47,8 @@ type Input struct {
 
 // ChildInfo is the Result.Details of a child run.
 type ChildInfo struct {
+	// Agent is the child's name, its Config.Name.
+	Agent string
 	// RunID is the child's run ID.
 	RunID string
 	// Items are the items the child run appended to its transcript,
@@ -128,7 +130,9 @@ func WithToolName(name string) Option {
 // the cause, so the model knows the child did not answer rather than
 // reading an empty output as one; a child stopped by a terminating
 // tool result is the exception, whose last output stands as the
-// answer, since the tool answered on the model's behalf.
+// answer, since the tool answered on the model's behalf. A child a
+// guard stopped before it answered is not asked about here: the call
+// fails with the guard's error, which wraps agentturn.ErrGuard.
 func WithNoAnswer(fn func(ChildInfo) (agenttool.Result, error)) Option {
 	return func(o *options) { o.noAnswer = fn }
 }
@@ -412,7 +416,7 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		soFar = append(soFar, m.Text())
 		call.Update(agenttool.Result{
 			Output:  openresponses.FunctionCallOutputData{Text: strings.Join(soFar, "\n\n")},
-			Details: ChildInfo{RunID: e.RunID},
+			Details: ChildInfo{Agent: a.cfg.Name, RunID: e.RunID},
 		})
 		return nil
 	})
@@ -446,7 +450,7 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		}
 		return agenttool.Result{}, fmt.Errorf("agent %s: %w", strconv.Quote(a.cfg.Name), err)
 	}
-	info := ChildInfo{RunID: end.RunID, Items: end.Items, Reason: end.Reason, Cause: end.Cause, Pending: end.Pending}
+	info := ChildInfo{Agent: a.cfg.Name, RunID: end.RunID, Items: end.Items, Reason: end.Reason, Cause: end.Cause, Pending: end.Pending}
 	switch end.Reason {
 	case agentturn.ReasonInputRequired:
 		return agenttool.Result{Details: info}, &InputRequiredError{Agent: a.cfg.Name, RunID: end.RunID, Pending: end.Pending}
@@ -460,6 +464,12 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		return agenttool.Result{Details: info}, err
 	}
 	text, ok := lastAssistantText(end.Items)
+	if !ok && end.Reason == agentturn.ReasonStopped && end.Cause == agentturn.StopGuard {
+		// A guard refused the child's input before it answered. The
+		// parent gets the guard's error, which wraps ErrGuard, as it
+		// gets a failed run's.
+		return agenttool.Result{Details: info}, fmt.Errorf("agent %q: %w", a.cfg.Name, end.Err)
+	}
 	if !ok {
 		res, err := a.opts.noAnswer(info)
 		res.Details = info
@@ -492,7 +502,7 @@ func (a *agentTool) detached(ctx context.Context, call agenttool.Call, child *ag
 		finish()
 		return agenttool.Result{
 			Output:  openresponses.FunctionCallOutputData{Text: fmt.Sprintf("agent %s is working on it in the background as run %s; its answer will follow", strconv.Quote(a.cfg.Name), runID)},
-			Details: ChildInfo{RunID: runID},
+			Details: ChildInfo{Agent: a.cfg.Name, RunID: runID},
 		}, nil
 	}
 	select {
@@ -552,6 +562,9 @@ func defaultNoAnswer(info ChildInfo) (agenttool.Result, error) {
 		}
 	}
 	name := "the agent"
+	if info.Agent != "" {
+		name = "agent " + strconv.Quote(info.Agent)
+	}
 	if info.Cause != "" {
 		return agenttool.Result{}, fmt.Errorf("%s stopped (%s) without a final answer", name, info.Cause)
 	}
