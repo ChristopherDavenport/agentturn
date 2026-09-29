@@ -1,6 +1,6 @@
 # RFC 0001: Agent Loop
 
-Status: draft 0.1
+Status: draft 0.2
 Author: Christopher Davenport
 Discussion: to be opened against this repository. The Go module at its
 root is the reference loop; agenttool RFC 0001 is the tool contract it
@@ -1057,7 +1057,7 @@ of the events.
 | event | entry |
 | --- | --- |
 | `run_start` | `run` start, with the loop's source as the format's and the trigger joined as `kind:ref`, or whichever is set, as `ref`; an `env` entry when the host supplies one and it changed; the full initial `config` from the configuration's base request when nothing has been written yet |
-| `turn_start` | a `config` delta when the request's settings differ from the path's; the request hash is computed here and written on the response |
+| `turn_start` | a `config` delta when the request's settings differ from the path's; the request hash is computed here and written on the response. When the host names the parts the request's instructions are composed of, and they join to the instructions sent, the entries carry `instructions_parts`, a delta naming the parts that moved and the others by hash, and `instructions_omitted` for what the host left out; parts that do not join are dropped and the string is written, since the record describes what was sent |
 | `model_retry` | a `config` delta when the revised request's settings differ |
 | `model_blocked` | a failed `response` carrying the hook's error and the request hash, so the call that was refused is told from one that was made and failed |
 | `item_end` | an `item`, with the display flag off for a hidden item. Before a caller-supplied output for a call that was neither dispatched nor rejected, a `reject` decision with the output's text as its reason and the decider the caller named, and `policy` as the decider when the loop refused the call itself in this run, for a name no tool has or arguments that are not an object; before one for a call dispatched in an earlier run, a `proceed` with the decider when one was named |
@@ -1286,7 +1286,3 @@ module and is listed in the changelog as one.
   question and a tool's progress have no carrier over a socket. A
   second front with a written-down, versioned extension vocabulary and
   a way for the server to advertise it is proposed.
-- **Instructions as parts** (#90). The format records instructions as
-  named parts so a one-layer change is one part; the recorder records
-  the joined string. An option supplying the parts for the request
-  being settled is proposed.

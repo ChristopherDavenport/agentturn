@@ -388,7 +388,7 @@ func TestConfigDelta(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			d := configDelta(base, tc.next, full(tc.next))
+			d := configDelta(base, tc.next, full(tc.next), nil)
 			if !tc.want(d) {
 				t.Errorf("delta = %+v", d)
 			}
