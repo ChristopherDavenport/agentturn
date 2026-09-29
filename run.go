@@ -282,7 +282,9 @@ func RunIDFromContext(ctx context.Context) string {
 // of what it started with agenttool.WriteRecord reaches the record; the
 // call is not, so such a job carries it with agenttool.WithCall(rc,
 // call), as tools/agent does for a detached child, for the record to
-// name the call it belongs to. The transcript, the invoker, the tool
+// name the call it belongs to. Where a record written after the run
+// has ended is filed is the recorder's to say; a session recorder
+// files it at its own session's leaf. The transcript, the invoker, the tool
 // elicitor and the steer signal of the call belong to its batch and
 // are not on it; a job that needs one carries it from the call's
 // context. It reports false outside a loop. Each run registers it with the context
@@ -394,10 +396,14 @@ type runner struct {
 	followUp   func() openresponses.Items
 	// last drains both queues for a run that would otherwise end and,
 	// when they are empty, marks it past its last drain in the same
-	// step; closing marks it so on any other way out. Both are nil for
-	// the low-level loop, which has no queues to deliver into.
+	// step; closing marks it so when the run decides to stop, and
+	// reports whether anything is still queued. Both are nil for the
+	// low-level loop, which has no queues to deliver into.
 	last    func() openresponses.Items
-	closing func()
+	closing func() bool
+	// runID, when set before the run, is the ID the run takes, minted
+	// where the run was started so the agent names it from then on.
+	runID string
 	// steered returns the channel a steer closes, for the batch about
 	// to run; nil when nothing can steer the run.
 	steered func() <-chan struct{}
@@ -413,7 +419,6 @@ type runner struct {
 	// only way to block on it is to call Invoke from inside a hook.
 	hookMu sync.Mutex
 
-	runID string
 	turn  int
 	added Transcript
 	// ctx is the run's context, for the hooks the stream calls.
@@ -521,7 +526,9 @@ type approval struct {
 // PanicError the model sees as an error output; a panic in a hook or a
 // subscriber is not recovered and unwinds without a RunEnd.
 func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved []approval, terminate bool) *RunEnd {
-	r.runID = openresponses.NewID("run")
+	if r.runID == "" {
+		r.runID = openresponses.NewID("run")
+	}
 	r.mark = len(r.transcript)
 	// Everything the run calls, transform, hooks, model and tools, can
 	// tell which run it serves.
@@ -562,11 +569,10 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 	// ones an abort or a failure cut off before their outputs were
 	// appended.
 	end.Pending = r.pending()
-	if r.closing != nil {
-		// Nothing is drained from here on, so an item steered during
-		// run_end waits for the next run, and the agent says so.
-		r.closing()
-	}
+	// Nothing is drained from here on, whatever ended the run, so an
+	// item steered during run_end waits for the next run, and the agent
+	// says so.
+	r.ending()
 	// A subscriber that fails on run_end cannot change the outcome; the
 	// run has already ended.
 	_ = r.emit(end)
@@ -717,23 +723,41 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 		if err := r.emit(&TurnEnd{RunID: r.runID, Turn: r.turn, Response: resp, ToolResults: results}); err != nil {
 			return err
 		}
+		// Every stop after the turn is decided before the queues are
+		// drained, and marks the run past its last drain as it is
+		// decided, so an item steered during the turn stays queued for
+		// the run that follows rather than being appended to a run that
+		// will not call the model again.
 		if len(pending) > 0 {
+			r.ending()
 			return stop(ReasonInputRequired, nil)
 		}
 		if r.cfg.ShouldStopAfterTurn != nil {
 			halt, err := r.cfg.ShouldStopAfterTurn(ctx, TurnInfo{RunID: r.runID, Turn: r.turn, Response: resp, ToolResults: results, Final: len(calls) == 0, Transcript: r.transcript})
 			if err != nil {
+				r.ending()
 				if errors.Is(err, ErrGuard) {
 					return stopped(StopGuard, err)
 				}
 				return fmt.Errorf("agentturn: should-stop-after-turn hook: %w", err)
 			}
 			if halt {
+				r.ending()
 				return stopped(StopHook, nil)
 			}
 		}
 		if cause, ok := terminates(results); ok {
+			r.ending()
 			return stopped(cause, nil)
+		}
+		if r.cfg.MaxTurns > 0 && r.turn >= r.cfg.MaxTurns {
+			// The budget is spent: a turn with calls stops, and so does a
+			// final turn with anything queued, which the run can no
+			// longer answer; a final turn with nothing queued is done.
+			if waiting := r.ending(); len(calls) > 0 || waiting {
+				return stopped(StopMaxTurns, nil)
+			}
+			return nil
 		}
 		var queued openresponses.Items
 		if len(calls) > 0 {
@@ -755,6 +779,15 @@ func (r *runner) drain(q func() openresponses.Items) openresponses.Items {
 		return nil
 	}
 	return q()
+}
+
+// ending marks the run past its last drain and reports whether an item
+// is still queued; the low-level loop has no queues.
+func (r *runner) ending() bool {
+	if r.closing == nil {
+		return false
+	}
+	return r.closing()
 }
 
 // drainLast drains the steered items and then the follow-ups for a run

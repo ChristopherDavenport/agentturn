@@ -1364,6 +1364,13 @@ func (w *writer) callOn(ctx context.Context) string {
 // [Recorder.Annotate] writes one. Set it as
 // agentturn.Config.ToolRecorder, or install it with
 // agenttool.ContextWithRecorder on the context a run is prompted with.
+//
+// A record written from agentturn.RunContext after the run it names
+// has ended, by a background job that outlived it, finds no run being
+// written and is filed at the leaf of the recorder's own session,
+// after whatever that session holds by then, a later run's entries
+// included; its call_id names the job's call when that session holds
+// it, and is empty for a call of a child session.
 func (r *Recorder) RecordFunc() agenttool.RecordFunc {
 	return func(ctx context.Context, rec *agenttool.Record) error {
 		_, err := r.Annotate(ctx, rec.NS, json.RawMessage(rec.Data))

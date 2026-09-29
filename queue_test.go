@@ -3,6 +3,7 @@ package agentturn
 import (
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
 	"strings"
 	"sync"
@@ -182,14 +183,17 @@ func TestQueuedIsDeliveredUnderTheSameBarrier(t *testing.T) {
 	}
 }
 
-// TestDeliverReachesARunThatIsEnding pins #148: an item delivered while
-// a run is in its final turn_end joins it, one delivered during its
+// TestDeliverReachesARunThatIsEnding pins #148: a delivered item joins
+// the run in flight only when a model call of that run then sees it. An
+// item delivered in the final turn_end joins; one delivered during
 // run_end, when State still reads Running and the run takes no more
 // steers, starts a run of its own rather than waiting for the next
-// prompt, and one delivered to an idle agent starts a run too. The
-// run_end case delivers from a goroutine, as a detached child's end
-// does, and holds the subscriber until the item is queued, so the
-// window is hit every time.
+// prompt, as one delivered to an idle agent does; and one delivered
+// during a turn that then stops, on its turn budget or a stop hook,
+// stays queued past that stop and starts a run too, rather than being
+// appended unanswered. Each delivers from a goroutine, as a detached
+// child's end does, and holds the event or the tool until the item is
+// queued, so the window is hit every time.
 func TestDeliverReachesARunThatIsEnding(t *testing.T) {
 	type outcome struct {
 		joined bool
@@ -197,53 +201,68 @@ func TestDeliverReachesARunThatIsEnding(t *testing.T) {
 		err    error
 	}
 	for _, tc := range []struct {
-		name       string
+		name string
+		// at is the event the item is delivered during, "tool" for
+		// inside the turn's tool call and "" for once the agent is idle.
 		at         string
+		tool       bool
+		maxTurns   int
+		stopHook   bool
 		wantJoined bool
-		wantCalls  int
 		wantRuns   int
-		// wantQueuedRun says the queued report names the run in flight.
+		// wantQueuedRun says the queued report names the first run.
 		wantQueuedRun bool
 	}{
-		{name: "final turn_end", at: EventTurnEnd, wantJoined: true, wantCalls: 2, wantRuns: 1, wantQueuedRun: true},
-		{name: "run_end", at: EventRunEnd, wantCalls: 2, wantRuns: 2},
-		{name: "idle", wantCalls: 2, wantRuns: 2},
+		{name: "final turn_end", at: EventTurnEnd, wantJoined: true, wantRuns: 1, wantQueuedRun: true},
+		{name: "run_end", at: EventRunEnd, wantRuns: 2},
+		{name: "idle", wantRuns: 2},
+		{name: "a turn the budget stops", at: "tool", tool: true, maxTurns: 1, wantRuns: 2, wantQueuedRun: true},
+		{name: "a turn a hook stops", at: "tool", tool: true, stopHook: true, wantRuns: 2, wantQueuedRun: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			model := &counting{}
-			a := New(Config{Model: model})
+			delivered := openresponses.UserText("the task is done")
 			result := make(chan outcome, 1)
-			deliver := func() {
-				joined, end, err := a.Deliver(context.Background(), openresponses.UserText("the task is done"))
-				result <- outcome{joined, end, err}
-			}
+			var a *Agent
 			var once sync.Once
-			var runs []string
+			// hold delivers from a goroutine and waits until the item is
+			// queued, from inside an event or a tool.
+			hold := func() {
+				once.Do(func() {
+					go func() {
+						joined, end, err := a.Deliver(context.Background(), delivered)
+						result <- outcome{joined, end, err}
+					}()
+					for a.State().Steering == 0 {
+						runtime.Gosched()
+					}
+				})
+			}
+			cfg := Config{Model: &echo.Adapter{}, MaxTurns: tc.maxTurns}
+			if tc.tool {
+				cfg.Tools = []agenttool.Tool{agenttool.New("work", "", func(context.Context, echoArgs) (string, error) {
+					hold()
+					return "started", nil
+				})}
+			}
+			if tc.stopHook {
+				cfg.ShouldStopAfterTurn = func(context.Context, TurnInfo) (bool, error) { return true, nil }
+			}
+			a = New(cfg)
+			var runs []*RunEnd
 			var queued []*Queued
 			a.Subscribe(func(_ context.Context, ev Event) error {
 				switch e := ev.(type) {
 				case *RunEnd:
-					runs = append(runs, e.RunID)
+					runs = append(runs, e)
 				case *Queued:
 					queued = append(queued, e)
 				}
-				if ev.EventType() != tc.at {
-					return nil
-				}
-				once.Do(func() {
-					if tc.at == EventTurnEnd {
-						// Joining does not wait, so a subscriber may.
-						deliver()
-						return
-					}
-					go deliver()
-					for a.State().Steering == 0 {
-						runtime.Gosched()
-					}
-					if !a.State().Running {
+				if ev.EventType() == tc.at {
+					hold()
+					if tc.at == EventRunEnd && !a.State().Running {
 						t.Error("the run reads idle during its run_end")
 					}
-				})
+				}
 				return nil
 			})
 			first, err := a.Prompt(context.Background(), openresponses.UserText("start the task"))
@@ -251,7 +270,10 @@ func TestDeliverReachesARunThatIsEnding(t *testing.T) {
 				t.Fatal(err)
 			}
 			if tc.at == "" {
-				deliver()
+				// An idle agent's run takes the item at once, so there is
+				// no window to hold: deliver and wait for the run.
+				joined, end, err := a.Deliver(context.Background(), delivered)
+				result <- outcome{joined, end, err}
 			}
 			got := <-result
 			if got.err != nil || got.joined != tc.wantJoined || (got.end == nil) != tc.wantJoined {
@@ -261,11 +283,18 @@ func TestDeliverReachesARunThatIsEnding(t *testing.T) {
 				t.Fatal(err)
 			}
 			st := a.State()
-			if model.calls != tc.wantCalls || len(runs) != tc.wantRuns || st.Steering != 0 {
-				t.Errorf("model calls %d, runs %d, still steering %d", model.calls, len(runs), st.Steering)
+			if len(runs) != tc.wantRuns || st.Steering != 0 {
+				t.Errorf("runs %d, still steering %d", len(runs), st.Steering)
 			}
-			if last, ok := st.Transcript[len(st.Transcript)-1].(*openresponses.Message); !ok || !strings.Contains(last.Text(), "the task is done") {
-				t.Errorf("the model did not answer the delivered item: %+v", st.Transcript)
+			// The model answered the item: something it produced follows.
+			at := -1
+			for i, item := range st.Transcript {
+				if item == openresponses.Item(delivered) {
+					at = i
+				}
+			}
+			if at < 0 || at == len(st.Transcript)-1 {
+				t.Errorf("the model did not answer the delivered item (at %d of %d)", at, len(st.Transcript))
 			}
 			wantRun := ""
 			if tc.wantQueuedRun {
@@ -302,5 +331,47 @@ func TestDeliverWhenNoRunCanStart(t *testing.T) {
 				t.Errorf("state = %+v", st)
 			}
 		})
+	}
+}
+
+// TestDeliverToARunThatStopsAfterTakingIt checks the stop that cannot be
+// decided before the drain: a guard before the next model call. The run
+// took the item and ended without a model call seeing it, and Deliver
+// says so with that run's end rather than reporting that it joined.
+func TestDeliverToARunThatStopsAfterTakingIt(t *testing.T) {
+	spent := fmt.Errorf("%w: cost limit reached", ErrGuard)
+	result := make(chan error, 1)
+	var a *Agent
+	var endOf *RunEnd
+	work := agenttool.New("work", "", func(context.Context, echoArgs) (string, error) {
+		go func() {
+			joined, end, err := a.Deliver(context.Background(), openresponses.UserText("the task is done"))
+			endOf = end
+			if err == nil && joined {
+				err = errors.New("joined a run whose model never saw the item")
+			}
+			result <- err
+		}()
+		for a.State().Steering == 0 {
+			runtime.Gosched()
+		}
+		return "started", nil
+	})
+	a = New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{work},
+		BeforeTurn: func(_ context.Context, info TurnStartInfo) (openresponses.Items, error) {
+			if info.Turn > 1 {
+				return nil, spent
+			}
+			return nil, nil
+		}})
+	first, err := a.Prompt(context.Background(), openresponses.UserText("start the task"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if endOf == nil || endOf.RunID != first.RunID || endOf.Cause != StopGuard {
+		t.Errorf("Deliver's end = %+v, want the guarded run %s", endOf, first.RunID)
 	}
 }

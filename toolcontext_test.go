@@ -120,9 +120,12 @@ func TestRunContextCarriesTheRecorder(t *testing.T) {
 					rc = agenttool.WithCall(rc, call)
 				}
 				callID = call.ID
-				// The job outlives the call: it writes once the call has
-				// returned and its batch is over.
-				go func() { done <- agenttool.WriteRecord(rc, jobRecord{PID: 42}) }()
+				// The job outlives the call: it writes once the call's
+				// own context has ended with its batch.
+				go func() {
+					<-ctx.Done()
+					done <- agenttool.WriteRecord(rc, jobRecord{PID: 42})
+				}()
 				return agenttool.Text("started"), nil
 			})
 			cfg := Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{bg}, MaxTurns: 1, ToolRecorder: record}

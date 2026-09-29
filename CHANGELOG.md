@@ -151,17 +151,27 @@ versions may break the API.
   is written. `Trigger` holds a map now and no longer compares with
   `==`. The items a run was prompted with carry its trigger on
   `ItemEnd.Trigger`, and the recorder writes it as their `source`, as
-  it already did for a queued input. (#146)
+  it already did for a queued input. A child run of `tools/agent` no
+  longer inherits the trigger of the parent's run, whose `Extra` its
+  recorder would otherwise write on the child's run start;
+  `WithRunContext` can give it one of its own. (#146)
 - `Agent.Deliver` hands an input that arrives on its own time, a
-  detached child's answer, to a run that will take it: it joins the
-  run in flight when that run has not passed its last drain of the
-  queues, and otherwise starts a run for it once the run in flight has
-  ended. A steer made while a run delivered its `run_end`, when
-  `State().Running` still read true, waited for the user's next
-  prompt. The run marks itself past its last drain in the same step as
-  the drain that finds the queues empty, and a `Queued` report made
-  after it names no run. `tools/agent.WithDetach` documents delivering
-  with it. (#148)
+  detached child's answer, to the model: it returns joined once a
+  request of the run in flight has followed the drain that took it,
+  and when that run will not call the model again it starts a run for
+  it once the run in flight has ended. A steer made while a run
+  delivered its `run_end`, when `State().Running` still read true,
+  waited for the user's next prompt. A run that stops after a turn, on
+  `MaxTurns`, `ShouldStopAfterTurn`, a terminating result or a call
+  that needs input, now decides so before it drains the queues, so an
+  item steered during that turn stays queued rather than being
+  appended unanswered. The run marks itself past its last drain as it
+  decides to stop, or in the same step as the drain that finds the
+  queues empty, and a `Queued` report made after it names no run. An
+  agent mints a run's ID as it starts the run, so `State().RunID` and
+  a `Queued` report made before `run_start` name that run rather than
+  the one before. `tools/agent.WithDetach` documents delivering with
+  it. (#148)
 - `agentturn.RunContext` carries `Config.ToolRecorder`, so a record a
   tool's background job writes with `agenttool.WriteRecord` reaches the
   host rather than being dropped without an error. The call is not on

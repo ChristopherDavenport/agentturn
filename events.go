@@ -92,7 +92,9 @@ const (
 // start entry beside the ones the format defines, which is where the
 // format puts them, and refuses a name the format or the recorder
 // already uses there. They describe a run's start: a queued item's
-// trigger is written without them.
+// trigger is written without them. The loop reads nothing from Extra,
+// so a name the recorder refuses, or a value that does not encode as
+// JSON, fails the run only when a recorder is attached.
 type Trigger struct {
 	Kind   string
 	Ref    string
@@ -543,10 +545,12 @@ const (
 // next event, which is why it is not the accept itself and a
 // subscriber's error cannot refuse the item.
 //
-// RunID names the run that was in flight when the item was accepted
-// and will still drain it, and is empty when the agent was idle or the
-// run in flight was past its last drain, delivering its final turn_end
-// or its run_end, so the item waits for the next run.
+// RunID names the run that was in flight when the item was accepted,
+// from the moment it was started, and is empty when the agent was idle
+// or the run in flight was past its last drain, after its final
+// turn_end or once it had decided to stop, so the item waits for the
+// next run. A run named here may still stop before it drains the item,
+// which then waits as well.
 type Queued struct {
 	RunID string
 	Item  openresponses.Item

@@ -236,7 +236,9 @@ func WithSpawn(fn func(callID string, child *agentturn.Agent)) Option {
 // layer that attributes its writes to a session, a memory journal for
 // one, names the child's rather than the parent's. It runs once per
 // call, before the run starts, and the context it returns is the one
-// the child's hooks and tools see.
+// the child's hooks and tools see. The child's run carries no trigger
+// of the parent's run, whose call started it; one this puts on the
+// context with agentturn.ContextWithTrigger is the child's own.
 func WithRunContext(fn func(ctx context.Context, callID string) context.Context) Option {
 	return func(o *options) { o.runCtx = fn }
 }
@@ -439,6 +441,10 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 			ctx = agenttool.WithCall(rc, call)
 		}
 	}
+	// The parent's trigger names what started the parent's run; the
+	// child's run was started by the call, which the child's link
+	// names, so it carries none unless WithRunContext gives it one.
+	ctx = agentturn.ContextWithTrigger(ctx, agentturn.Trigger{})
 	if a.opts.runCtx != nil {
 		ctx = a.opts.runCtx(ctx, call.ID)
 	}

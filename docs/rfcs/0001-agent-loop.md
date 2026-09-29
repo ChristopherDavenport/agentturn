@@ -980,19 +980,30 @@ agent at the start of the next run. A host that must not lose an input
 therefore writes it before queueing it rather than from the event, and
 a subscriber's error cannot refuse the item.
 
-A run drains the queues for the last time when it would otherwise end,
-after its final `turn_end`, and is then past its last drain: its
-`run_end` is still being delivered and the agent still reads as
-running, but an item steered then waits for the next run, and its
-`queued` event names no run. The mark is set in the same step as the
-drain that finds both queues empty, and on any other way out of the
-loop, so nothing falls between them. An agent offers a **delivery**
-for an input that arrives on its own time, a background task's result:
-the item is queued as a steer and, decided under the agent's lock,
-joins the run in flight when that run is not past its last drain, and
-otherwise starts a run that takes it once the run in flight has ended,
-as a continue after a steer would. A run the item joined that then
-stops without draining it leaves it queued, as it leaves any steer.
+A run that stops after a turn, on its turn limit, a stop hook, a
+terminating result or a call that needs input, decides so before it
+drains the queues, so an item steered during that turn stays queued
+for the next run rather than being appended to a run that will not
+call the model again. A run drains the queues for the last time when
+it would otherwise end, after its final `turn_end`, or not at all once
+it has decided to stop, and is then past its last drain: its `run_end`
+is still being delivered and the agent still reads as running, but an
+item steered then waits for the next run, and its `queued` event names
+no run. The mark is set in the same step as the drain that finds both
+queues empty, or as the decision to stop is made; a run that ends
+another way, a guard before the model call, a cancellation or a
+failure, is marked as it leaves the loop, and drains nothing between.
+
+An agent offers a **delivery** for an input that arrives on its own
+time, a background task's result: the item is queued as a steer, and
+the delivery waits until a model call has seen it. A run in flight
+that drains it and then sends a request has taken it. A run that stops
+or ends without draining it leaves it queued, and the delivery starts
+a run that takes it once that run has ended, as a continue after a
+steer would. A run that drained it and ended before the next request,
+on a guard, a cancellation or a failure, leaves it in the transcript
+unanswered, and the delivery reports that run's end rather than start
+another.
 
 The queues live in memory. An item accepted is in no record until a
 run appends it or a subscriber writes it, and it survives a
