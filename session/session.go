@@ -2341,7 +2341,7 @@ func (w *writer) settle(ctx context.Context, req openresponses.Request) error {
 	case !w.wroteConfig:
 		entry = full
 	default:
-		entry = configDelta(w.settings, agentsession.Settings{}.Apply(full), full, parts)
+		entry = configDelta(w.settings, agentsession.Settings{}.Apply(full), full, parts, omitted)
 		if entry == nil && omittedDelta != nil {
 			// Nothing in force moved, but what was left out did: the
 			// entry says so and changes no setting.
@@ -3045,13 +3045,16 @@ func (w *writer) append(ctx context.Context, e agentsession.Entry) (string, erro
 // next's instructions are composed of, and the instructions change is
 // written as the parts that moved; otherwise it is the joined string,
 // and parts on the path whose join is unchanged are left in place.
-func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntry, parts []agentsession.InstructionPart) *agentsession.ConfigEntry {
+// omitted is what the host left out: settle writes it, whole on a
+// replace and as what moved on a delta, so each is sized carrying it.
+func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntry, parts []agentsession.InstructionPart, omitted []agentsession.OmittedPart) *agentsession.ConfigEntry {
 	if len(parts) == 0 {
 		// The string is what is compared: parts in force that join to
 		// the same text still describe it.
 		prev.InstructionsParts = nil
 	}
 	// What was left out reaches no request, and settle writes it.
+	omittedDelta := prev.OmittedDelta(omitted)
 	prev.InstructionsOmitted = nil
 	if equalJSON(prev, next) {
 		return nil
@@ -3106,7 +3109,12 @@ func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntr
 	if equalJSON(d, &agentsession.ConfigEntry{}) {
 		return nil
 	}
-	if jsonLen(d) >= jsonLen(full) {
+	dl, fl := *d, *full
+	dl.InstructionsOmitted = omittedDelta
+	if len(omitted) > 0 {
+		fl.InstructionsOmitted = omitted
+	}
+	if jsonLen(&dl) >= jsonLen(&fl) {
 		return full
 	}
 	return d

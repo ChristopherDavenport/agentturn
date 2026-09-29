@@ -18,7 +18,9 @@ versions may break the API.
   budget a save or a forget moved one part and rewrote hundreds. A
   replace still carries the list whole, since a keep in a replace
   counts over nothing and `Append` refuses it, and a resumed or folded
-  recorder counts from the list the context resolves. Needs format 0.9.
+  recorder counts from the list the context resolves. A settings
+  change is written as a replace only when it is smaller with the
+  list whole than a delta with what moved in it. Needs format 0.9.
   (agentsession #115)
 
 ## v0.0.11 - 2026-09-29
