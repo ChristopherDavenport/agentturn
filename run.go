@@ -684,9 +684,6 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 		return stopped(StopRefused, nil)
 	}
 	for {
-		if r.cfg.MaxTurns > 0 && r.turn >= r.cfg.MaxTurns {
-			return stopped(StopMaxTurns, nil)
-		}
 		if ctx.Err() != nil {
 			return stop(ReasonAborted, context.Cause(ctx))
 		}

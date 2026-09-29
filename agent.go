@@ -712,6 +712,7 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, approved
 		// Subscribers get the values of ctx but never its cancellation:
 		// an abort cuts the model and the tools, and what they leave
 		// behind still has to be written.
+		ctx := context.WithValue(ctx, inRunKey{a}, runID)
 		subCtx := context.WithoutCancel(ctx)
 		r := &runner{
 			cfg:        cfg,
@@ -799,9 +800,6 @@ func (a *Agent) dispatch(ctx context.Context, ev Event) error {
 		a.runID = e.RunID
 	case *TurnStart:
 		a.turn = e.Turn
-		// The request carries everything drained so far.
-		a.seen = a.drains
-		a.signal()
 	case *ItemEnd:
 		a.transcript = append(a.transcript, e.Item)
 	case *RunEnd:
@@ -816,6 +814,14 @@ func (a *Agent) dispatch(ctx context.Context, ev Event) error {
 		if err := s.fn(ctx, ev); err != nil {
 			return err
 		}
+	}
+	if _, ok := ev.(*TurnStart); ok {
+		// Every subscriber took the turn_start, so the request goes out
+		// carrying everything drained so far.
+		a.mu.Lock()
+		a.seen = a.drains
+		a.signal()
+		a.mu.Unlock()
 	}
 	return nil
 }
@@ -859,7 +865,11 @@ func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe fu
 // after its final turn_end or once it has decided to stop, when it
 // waits for the next run like an item steered into an idle agent; a
 // host whose input arrives on its own time and must reach the model
-// calls [Agent.Deliver] instead.
+// calls [Agent.Deliver] instead. A run that stops after a turn, on its
+// turn limit, a stop hook or a terminating result, decides so before
+// it drains, so what was steered during that turn is not appended to
+// it: the next run takes it, after its prompt, so a host that wants it
+// answered first calls [Agent.Continue] rather than Prompt.
 //
 // It never blocks on the delivery barrier, so steering from inside a
 // subscriber is safe: the item is queued and the event follows on the
@@ -920,28 +930,37 @@ func (a *Agent) Queue(ctx context.Context, mode QueueMode, items ...openresponse
 // A run in flight drains them after its batch, or when it would
 // otherwise end, and Deliver returns joined true once the request that
 // follows the drain has gone out. A run that decides to stop after its
-// turn, on its turn budget, a stop hook, a terminating result or a call
-// that needs input, decides before it drains and leaves them queued, as
-// does a run past its last drain, after its final turn_end, while
-// [State].Running still reads true. Deliver then waits for that run to
-// end and, as with an idle agent, starts a run on ctx that takes the
-// items before its first model call, as [Agent.Continue] would after a
-// steer, and returns that run's end as Prompt returns it, joined false.
+// turn, on its turn limit, a stop hook, a guard in ShouldStopAfterTurn
+// or a terminating result, decides before it drains and leaves them
+// queued, as does a run past its last drain, after its final turn_end,
+// while [State].Running still reads true. Deliver then waits for that
+// run to end and, as with an idle agent, starts a run on ctx that takes
+// the items before its first model call, as [Agent.Continue] would
+// after a steer, and returns that run's end as Prompt returns it,
+// joined false. The stop is not repeated for the delivered items: a
+// host that wants it to stick reads the reason on the end returned and
+// on the run it asked for, or aborts the run Deliver started.
 //
 // A run that drained the items and then ended before a model call, on
 // a guard before the call, an abort or a failure, has them in its
-// transcript unanswered: Deliver returns joined false with that run's
-// end, and does not start another, since what stopped the run is the
-// host's to look at. When a run cannot be started the items stay
-// queued, and the error says why: [ErrInputRequired] while calls are
-// pending, whose Resume then takes them after its batch,
-// [ErrCannotContinue] when the items do not end in something a model
-// can answer, or ctx's error when it ended while Deliver waited.
+// transcript unanswered: Deliver returns joined false with the end of
+// the last run, which is that one unless another began and ended as
+// well before Deliver looked, and starts nothing, since what stopped
+// the run is the host's to look at. When no run can be started the
+// items stay queued, and the error says why: [ErrInputRequired] while
+// calls are pending, the run having stopped for input, whose Resume
+// then takes them after its batch; [ErrCannotContinue] when the items
+// do not end in something a model can answer; or ctx's error when it
+// ended while Deliver waited.
 //
-// Deliver waits on the run in flight, so a subscriber of this agent
-// does not call it from inside an event, whose run cannot end until the
-// subscriber returns; it steers there, or calls Deliver from a
-// goroutine of its own.
+// Called from inside the agent's run, from a tool, a hook, a
+// subscriber or a child run one of its tools made, with the context it
+// was handed, Deliver does not wait, since the run waits on the caller:
+// it returns joined true when the run will still drain the items, whose
+// stop decisions then apply as they do to any steer, and [ErrRunning]
+// when the run is past its last drain, when they wait for the next run.
+// A job running on [RunContext], and anything called with a context not
+// derived from the run's, waits as any caller does.
 func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joined bool, end *RunEnd, err error) {
 	a.mu.Lock()
 	drains, before := a.drains, len(a.steer)
@@ -949,6 +968,20 @@ func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joine
 	if len(a.steer) == before {
 		a.mu.Unlock()
 		return false, nil, ErrNoPrompt
+	}
+	if a.running && !a.closing && ctx.Value(inRunKey{a}) == a.runID {
+		// Called from inside the run, by a tool, a hook, a subscriber or
+		// a child run a tool made, which the run waits on: the items
+		// join it as a steer, and waiting for its next request would
+		// wait on the caller.
+		a.mu.Unlock()
+		return true, nil, nil
+	}
+	if a.running && ctx.Value(inRunKey{a}) == a.runID {
+		// Inside a run past its last drain, which ends only once the
+		// caller returns: the items wait for the next run.
+		a.mu.Unlock()
+		return false, nil, ErrRunning
 	}
 	for {
 		if a.seen > drains {
@@ -996,6 +1029,12 @@ func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joine
 	end, err = run()
 	return false, end, err
 }
+
+// inRunKey marks the context of everything an agent's run calls, its
+// tools, hooks and subscribers and what they call in turn, with the
+// run's ID, so Deliver can tell a caller the run is waiting on. The
+// run context of background work does not carry it.
+type inRunKey struct{ a *Agent }
 
 // queue is Queue with a.mu held.
 func (a *Agent) queue(trigger Trigger, mode QueueMode, items openresponses.Items) {

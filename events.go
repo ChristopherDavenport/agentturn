@@ -389,7 +389,7 @@ type StopCause string
 // Stop causes.
 const (
 	// StopMaxTurns: Config.MaxTurns was reached with tools still being
-	// called.
+	// called or items still queued, which the next run takes.
 	StopMaxTurns StopCause = "max_turns"
 	// StopHook: ShouldStopAfterTurn returned true.
 	StopHook StopCause = "hook"

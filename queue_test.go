@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/openresponses"
@@ -373,5 +374,102 @@ func TestDeliverToARunThatStopsAfterTakingIt(t *testing.T) {
 	}
 	if endOf == nil || endOf.RunID != first.RunID || endOf.Cause != StopGuard {
 		t.Errorf("Deliver's end = %+v, want the guarded run %s", endOf, first.RunID)
+	}
+}
+
+// TestDeliverFromInsideTheRun checks that Deliver called with the
+// context of the run's own tool, of a child run one of its tools made,
+// or of a subscriber, which the run waits on, does not wait for the
+// run: it joins a run that will still drain the items, which the model
+// then answers in that run, and reports ErrRunning from a run past its
+// last drain, the items left for the next run.
+func TestDeliverFromInsideTheRun(t *testing.T) {
+	type outcome struct {
+		joined bool
+		err    error
+	}
+	for _, tc := range []struct {
+		name       string
+		from       string
+		wantJoined bool
+		wantErr    error
+		wantRuns   int
+	}{
+		{"the run's tool", "tool", true, nil, 1},
+		{"a child run's tool", "child", true, nil, 1},
+		{"a subscriber in run_end", "run_end", false, ErrRunning, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			delivered := openresponses.UserText("the task is done")
+			var a *Agent
+			var once sync.Once
+			var got outcome
+			deliver := func(ctx context.Context) {
+				once.Do(func() {
+					joined, _, err := a.Deliver(ctx, delivered)
+					got = outcome{joined, err}
+				})
+			}
+			var tools []agenttool.Tool
+			switch tc.from {
+			case "tool":
+				tools = []agenttool.Tool{agenttool.New("work", "", func(ctx context.Context, _ echoArgs) (string, error) {
+					deliver(ctx)
+					return "started", nil
+				})}
+			case "child":
+				child := New(Config{Model: &echo.Adapter{}, MaxTurns: 1, Tools: []agenttool.Tool{agenttool.New("inner", "", func(ctx context.Context, _ echoArgs) (string, error) {
+					deliver(ctx)
+					return "started", nil
+				})}})
+				tools = []agenttool.Tool{agenttool.New("work", "", func(ctx context.Context, _ echoArgs) (string, error) {
+					_, err := child.Prompt(ctx, openresponses.UserText("go"))
+					return "started", err
+				})}
+			}
+			a = New(Config{Model: &echo.Adapter{}, Tools: tools})
+			runs := 0
+			a.Subscribe(func(ctx context.Context, ev Event) error {
+				if _, ok := ev.(*RunEnd); ok {
+					runs++
+					if tc.from == "run_end" {
+						deliver(ctx)
+					}
+				}
+				return nil
+			})
+			done := make(chan error, 1)
+			go func() {
+				_, err := a.Prompt(context.Background(), openresponses.UserText("start the task"))
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Deliver from inside the run waited on the run")
+			}
+			if got.joined != tc.wantJoined || !errors.Is(got.err, tc.wantErr) {
+				t.Fatalf("Deliver = %+v", got)
+			}
+			st := a.State()
+			if runs != tc.wantRuns {
+				t.Errorf("runs = %d", runs)
+			}
+			at := -1
+			for i, item := range st.Transcript {
+				if item == openresponses.Item(delivered) {
+					at = i
+				}
+			}
+			if tc.wantJoined && (at < 0 || at == len(st.Transcript)-1) {
+				t.Errorf("the run did not answer the delivered item (at %d of %d)", at, len(st.Transcript))
+			}
+			if !tc.wantJoined && (at >= 0 || st.Steering != 1) {
+				t.Errorf("the item was not left for the next run: at %d, steering %d", at, st.Steering)
+			}
+		})
 	}
 }

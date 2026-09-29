@@ -155,17 +155,24 @@ versions may break the API.
   longer inherits the trigger of the parent's run, whose `Extra` its
   recorder would otherwise write on the child's run start;
   `WithRunContext` can give it one of its own. (#146)
+- Behaviour change: an item steered during a turn after which the run
+  stops, on `MaxTurns`, `ShouldStopAfterTurn`, a terminating result or
+  a call that needs input, is no longer appended to the run that
+  stopped. It stays queued, and the next run takes it after its
+  prompt: a `Prompt("second")` after a `MaxTurns` stop now sends
+  `second` before the item steered in the last turn, where the item
+  used to come first. A host that wants the item answered first calls
+  `Agent.Continue`. `MaxTurns` is now checked at the end of the turn
+  rather than at the top of the next. (#148)
 - `Agent.Deliver` hands an input that arrives on its own time, a
   detached child's answer, to the model: it returns joined once a
   request of the run in flight has followed the drain that took it,
   and when that run will not call the model again it starts a run for
-  it once the run in flight has ended. A steer made while a run
+  it once the run in flight has ended. Called from inside the run, by
+  its tool, hook or subscriber or a child run one of its tools made,
+  it does not wait. A steer made while a run
   delivered its `run_end`, when `State().Running` still read true,
-  waited for the user's next prompt. A run that stops after a turn, on
-  `MaxTurns`, `ShouldStopAfterTurn`, a terminating result or a call
-  that needs input, now decides so before it drains the queues, so an
-  item steered during that turn stays queued rather than being
-  appended unanswered. The run marks itself past its last drain as it
+  waited for the user's next prompt. The run marks itself past its last drain as it
   decides to stop, or in the same step as the drain that finds the
   queues empty, and a `Queued` report made after it names no run. An
   agent mints a run's ID as it starts the run, so `State().RunID` and

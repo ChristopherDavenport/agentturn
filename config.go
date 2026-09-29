@@ -183,8 +183,11 @@ type Config struct {
 	// that asks the MCP client, then puts its tools' questions to that
 	// client.
 	ToolElicitor agenttool.Elicitor
-	// MaxTurns stops a run after this many turns with ReasonStopped;
-	// zero means no limit.
+	// MaxTurns stops a run after this many turns with ReasonStopped and
+	// StopMaxTurns when its last turn called tools or anything is
+	// queued, which stays queued for the next run; a last turn that
+	// called none with nothing queued ends the run done. Zero means no
+	// limit.
 	MaxTurns int
 
 	// Filter drops app-only items before each model call and returns

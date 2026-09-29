@@ -274,10 +274,8 @@ A turn proceeds in these phases, in this order. Each names the events
 it raises and the hooks it calls; the events are defined
 [below](#events).
 
-1. **Limits.** If the run has taken its turn limit's worth of turns,
-   it ends with reason `stopped` and cause `max_turns`, whatever would
-   have started the next one: a tool batch to answer or a steered item.
-   If the run's context is cancelled, it ends with reason `aborted`.
+1. **Cancellation.** If the run's context is cancelled, it ends with
+   reason `aborted`.
 2. **Before the turn.** The before-turn hook MAY return items, which
    the loop appends to the transcript with their item events as it
    appends any input. They are then facts about the transcript: a
@@ -326,10 +324,20 @@ it raises and the hooks it calls; the events are defined
     call that asked to end the run. agenttool RFC 0001 requires a
     harness to report a partial batch as partial and leaves the policy
     to it; this loop's policy is to stop and say so.
-12. **Queues.** Items steered in while the turn ran are appended, with
+12. **Limits.** If the run has taken its turn limit's worth of turns,
+    it ends with reason `stopped` and cause `max_turns` when the model
+    called tools or anything is queued, and with reason `done`
+    otherwise. What is queued is not drained: it stays queued for the
+    next run, which takes it after its prompt.
+13. **Queues.** Items steered in while the turn ran are appended, with
     their item events. If the model called no tools, the follow-up
     queue is drained after them; if nothing was queued, the run ends
     with reason `done`. Otherwise the next turn begins at phase 1.
+
+Phases 9 to 12 decide a stop before phase 13 drains anything, so an
+item steered during a turn that ends the run stays queued for the next
+run rather than being appended to a run that will not call the model
+again; the run is past its last drain from that decision on.
 
 A batch of zero calls runs phases 7 and 8 trivially: `turn_end` carries
 no results, and phase 9 finds nothing pending.
@@ -604,7 +612,7 @@ calls** with why each is pending.
 
 | cause | meaning |
 | --- | --- |
-| `max_turns` | the turn limit was reached before another model call |
+| `max_turns` | the turn limit was reached with tools called or items queued; the queued items wait for the next run |
 | `hook` | the stop hook ended the run |
 | `guard` | the stop hook, the before-turn hook or the before-model-call hook ended the run with an error marked as a guard's; the error is on the end event. Stopped before the model call, the turn has no `turn_start` |
 | `terminate` | every result of the batch set the terminate hint |
@@ -998,12 +1006,19 @@ An agent offers a **delivery** for an input that arrives on its own
 time, a background task's result: the item is queued as a steer, and
 the delivery waits until a model call has seen it. A run in flight
 that drains it and then sends a request has taken it. A run that stops
-or ends without draining it leaves it queued, and the delivery starts
-a run that takes it once that run has ended, as a continue after a
-steer would. A run that drained it and ended before the next request,
-on a guard, a cancellation or a failure, leaves it in the transcript
-unanswered, and the delivery reports that run's end rather than start
-another.
+after its turn or ends without draining it leaves it queued, and the
+delivery starts a run that takes it once that run has ended, as a
+continue after a steer would, unless calls are pending, when it is
+left for the resume and the delivery says input is required. A run
+that drained it and ended before the next request, on a guard, a
+cancellation or a failure, leaves it in the transcript unanswered,
+and the delivery reports that run's end rather than start another. The
+asymmetry is deliberate: a stop after the turn was decided without the
+item, and one before the call with it. A delivery made from inside
+the run, by its tool, hook or subscriber or by a child run a tool
+made, does not wait, since the run waits on it: the item joins the run
+as any steer does, or waits for the next run when the run is past its
+last drain.
 
 The queues live in memory. An item accepted is in no record until a
 run appends it or a subscriber writes it, and it survives a
