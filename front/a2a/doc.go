@@ -19,6 +19,17 @@
 // the rule a caller could phrase around; the host has it on
 // RunEnd.Err and in the record.
 //
+// A run that a terminating tool result stopped
+// (agentturn.StopTerminate or agentturn.StopPartialTerminate) is how a
+// handoff ends the sender's part. [WithHandoff] is asked for the
+// receiver's configuration, which the executor sets on the task's
+// agent before continuing it, so the receiver answers within the same
+// task, its text streamed as the sender's was, and the record holds
+// both runs. Without the option, or when it declines, a terminating
+// stop with no answer completes the task with the text of the last
+// function_call_output, the answer the tools gave on the model's
+// behalf, as tools/agent reports the same stop.
+//
 //	exec := a2a.New(cfg)
 //	handler := a2asrv.NewHandler(exec)
 //	mux.Handle("/invoke", a2asrv.NewJSONRPCHandler(handler))

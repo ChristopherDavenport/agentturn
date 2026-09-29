@@ -24,6 +24,7 @@ type Executor struct {
 	chunkSize   int
 	callerTools []*openresponses.FunctionTool
 	recorderFor RecorderFor
+	handoff     func(context.Context, *agentturn.RunEnd) (agentturn.Config, bool)
 
 	mu      sync.Mutex
 	cancels map[a2a.TaskID]context.CancelFunc
@@ -114,6 +115,29 @@ func WithRecorderFor(fn RecorderFor) Option {
 	return func(e *Executor) { e.recorderFor = fn }
 }
 
+// WithHandoff is asked when a task's run stops on StopTerminate or
+// StopPartialTerminate. A configuration it returns continues the same
+// transcript within the same task: the executor sets it on the task's
+// agent and continues, so what [WithRecorderFor] subscribed records
+// the switch and the receiver's run, and the receiver's text streams
+// into the task as the sender's did. The caller-owned tools are
+// offered under it as under the executor's own configuration, and a
+// ToolRecorder or ToolElicitor the configuration leaves nil is kept
+// from the agent's, where a recorder put its own. false ends the task
+// as it would without the option. fn finds the destination in
+// end.Items, the terminating call and its output. It is asked again
+// each time a run it started stops the same way, so a pair of agents
+// that hand back and forth runs until fn declines or the task is
+// canceled; a host that wants a bound counts on a value it puts on the
+// context RecorderFor returns, which fn is given.
+//
+// Without the option, or when it declines, a terminating stop with no
+// answer completes the task with the text of the last
+// function_call_output, as tools/agent reports the same stop.
+func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd) (agentturn.Config, bool)) Option {
+	return func(e *Executor) { e.handoff = fn }
+}
+
 // New builds an executor for cfg.
 func New(cfg agentturn.Config, opts ...Option) *Executor {
 	e := &Executor{cfg: cfg, cancels: map[a2a.TaskID]context.CancelFunc{}, busy: map[string]bool{}}
@@ -171,7 +195,8 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer e.track(reqCtx.TaskID, cancel)()
-	agent := agentturn.New(e.runConfig(slices.Concat(e.callerTools, declared)), agentturn.WithTranscript(transcript))
+	caller := slices.Concat(e.callerTools, declared)
+	agent := agentturn.New(e.runConfig(e.cfg, caller), agentturn.WithTranscript(transcript))
 	if e.recorderFor != nil {
 		rctx, detach, err := e.recorderFor(runCtx, reqCtx.ContextID, agent)
 		if detach != nil {
@@ -188,8 +213,8 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	if err := q.Write(ctx, a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateWorking, nil)); err != nil {
 		return err
 	}
-	out := e.relay(ctx, runCtx, cancel, reqCtx, q, agent, prompts)
-	if err := e.persist(ctx, reqCtx.ContextID, transcript, out.end); err != nil {
+	out := e.relay(ctx, runCtx, cancel, reqCtx, q, agent, prompts, caller)
+	if err := e.persist(ctx, reqCtx.ContextID, transcript, out); err != nil {
 		return err
 	}
 	if out.writeErr != nil {
@@ -240,7 +265,10 @@ func (e *Executor) claim(contextID string) (func(), error) {
 
 // outcome is what relay reports about a run.
 type outcome struct {
+	// end is the last run's end; items holds what every run appended,
+	// the sender's and each receiver's after a handoff.
 	end      *agentturn.RunEnd
+	items    openresponses.Items
 	lastText string
 	// writeErr is the first failure to write an event to the queue; it
 	// aborted the run.
@@ -248,10 +276,11 @@ type outcome struct {
 }
 
 // relay prompts the agent and streams assistant text into artifacts
-// from a subscriber, after whatever RecorderFor subscribed. A failed
+// from a subscriber, after whatever RecorderFor subscribed, and
+// continues it under each configuration WithHandoff returns. A failed
 // write aborts the run through cancel and is reported on the outcome;
 // the run's own end and error are reported alongside.
-func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc, reqCtx *a2asrv.RequestContext, q eventqueue.Queue, agent *agentturn.Agent, prompts openresponses.Items) outcome {
+func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc, reqCtx *a2asrv.RequestContext, q eventqueue.Queue, agent *agentturn.Agent, prompts openresponses.Items, caller []*openresponses.FunctionTool) outcome {
 	var out outcome
 	var writer *artifactWriter
 	fail := func(err error) {
@@ -295,13 +324,50 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 	})
 	defer unsubscribe()
 	end, err := agent.Prompt(runCtx, prompts...)
-	if end == nil {
-		// The run never started: a misuse the loop refused before any
-		// event, which fails the task as a run would.
-		end = &agentturn.RunEnd{Reason: agentturn.ReasonError, Err: err}
+	for {
+		if end == nil {
+			// The run never started: a misuse the loop refused before
+			// any event, which fails the task as a run would.
+			end = &agentturn.RunEnd{Reason: agentturn.ReasonError, Err: err}
+		}
+		out.end = end
+		out.items = append(out.items, end.Items...)
+		if out.writeErr != nil || e.handoff == nil || !terminated(end) {
+			return out
+		}
+		next, ok := e.handoff(runCtx, end)
+		if !ok {
+			return out
+		}
+		prev := agent.Config()
+		cfg := e.runConfig(next, caller)
+		if cfg.ToolRecorder == nil {
+			cfg.ToolRecorder = prev.ToolRecorder
+		}
+		if cfg.ToolElicitor == nil {
+			cfg.ToolElicitor = prev.ToolElicitor
+		}
+		if err = agent.SetConfig(cfg); err == nil {
+			end, err = agent.Continue(runCtx)
+		} else {
+			end = nil
+		}
 	}
-	out.end = end
-	return out
+}
+
+// terminated reports whether a terminating tool result stopped the run.
+func terminated(end *agentturn.RunEnd) bool {
+	return end.Reason == agentturn.ReasonStopped && (end.Cause == agentturn.StopTerminate || end.Cause == agentturn.StopPartialTerminate)
+}
+
+// lastOutputText returns the text of the last function call output.
+func lastOutputText(items openresponses.Items) (string, bool) {
+	for i := len(items) - 1; i >= 0; i-- {
+		if out, ok := items[i].(*openresponses.FunctionCallOutput); ok {
+			return out.Output.Text, out.Output.Text != ""
+		}
+	}
+	return "", false
 }
 
 // persist stores the conversation after a run: everything the run
@@ -309,9 +375,9 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 // caller answers it on the next message; after an abort or a failure
 // the calls that will never be answered are dropped so the next message
 // is a valid input.
-func (e *Executor) persist(ctx context.Context, contextID string, transcript agentturn.Transcript, end *agentturn.RunEnd) error {
-	next := append(transcript, end.Items...)
-	switch end.Reason {
+func (e *Executor) persist(ctx context.Context, contextID string, transcript agentturn.Transcript, out outcome) error {
+	next := append(transcript, out.items...)
+	switch out.end.Reason {
 	case agentturn.ReasonDone, agentturn.ReasonStopped, agentturn.ReasonInputRequired:
 	default:
 		next = stripUnanswered(next)
@@ -337,9 +403,17 @@ func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, 
 			// phrase around.
 			return e.finish(ctx, reqCtx, q, a2a.TaskStateRejected, a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: RefusedText}))
 		}
+		text := out.lastText
+		if _, ok := out.end.Answer(); terminated(out.end) && !ok {
+			// A terminating result nobody handed off from answered on
+			// the model's behalf; text before its call was a preamble.
+			if t, ok := lastOutputText(out.end.Items); ok {
+				text = t
+			}
+		}
 		var msg *a2a.Message
-		if out.lastText != "" {
-			msg = a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: out.lastText})
+		if text != "" {
+			msg = a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: text})
 		}
 		return e.finish(ctx, reqCtx, q, a2a.TaskStateCompleted, msg)
 	case agentturn.ReasonAborted:
@@ -352,14 +426,13 @@ func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, 
 	}
 }
 
-// runConfig returns the config for one run: the agent's tools plus the
+// runConfig returns the config for one run: cfg's tools plus the
 // caller-owned ones, offered to the model but never executed here, and
 // a BeforeToolCall that defers every call to a caller-owned tool. The
 // loop then ends the run with ReasonInputRequired and the pending calls
 // on the RunEnd, which is the input-required boundary of the task. The
 // agent's own hook runs first and its block or rewrite is respected.
-func (e *Executor) runConfig(caller []*openresponses.FunctionTool) agentturn.Config {
-	cfg := e.cfg
+func (e *Executor) runConfig(cfg agentturn.Config, caller []*openresponses.FunctionTool) agentturn.Config {
 	if len(caller) == 0 {
 		return cfg
 	}
@@ -379,7 +452,7 @@ func (e *Executor) runConfig(caller []*openresponses.FunctionTool) agentturn.Con
 			return agenttool.Result{}, fmt.Errorf("tool %q is owned by the caller and cannot run here", name)
 		}, opts...))
 	}
-	local, provider := e.cfg.Tools, e.cfg.ToolProvider
+	local, provider := cfg.Tools, cfg.ToolProvider
 	cfg.Tools = nil
 	cfg.ToolProvider = func(ctx context.Context) []agenttool.Tool {
 		base := local
@@ -388,7 +461,7 @@ func (e *Executor) runConfig(caller []*openresponses.FunctionTool) agentturn.Con
 		}
 		return slices.Concat(base, stubs)
 	}
-	before := e.cfg.BeforeToolCall
+	before := cfg.BeforeToolCall
 	cfg.BeforeToolCall = func(ctx context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
 		var decision *agentturn.ToolDecision
 		if before != nil {

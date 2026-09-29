@@ -1186,7 +1186,11 @@ An agent stands in four places inside another system:
   recorder writes the switch as a config delta, so the settings any
   response was produced under are on its path. A terminating tool
   result is the usual trigger, with the destination in the result's
-  details where the model cannot see it. A transcript holds whatever
+  details where the model cannot see it. A front that owns the loop
+  takes the handoff within the one request: both fronts ask a host
+  function for the receiver's configuration when a run stops on a
+  terminating result, and relay the receiver's run in the same
+  response or task. A transcript holds whatever
   the previous model produced, reasoning items included, and a
   reasoning item carries a signature its own provider issued; a
   handoff that changes the provider MUST drop them, and which component

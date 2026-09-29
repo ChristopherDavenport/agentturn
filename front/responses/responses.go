@@ -51,6 +51,19 @@
 // could phrase around; the host has it on RunEnd.Err and in the
 // record. A run a guard stopped after an answer completes with that
 // answer, the OutputGuard's replacement when it made one.
+//
+// A full run that a terminating tool result stopped
+// (agentturn.StopTerminate or agentturn.StopPartialTerminate) is how a
+// handoff ends the sender's part. [WithHandoff] is asked for the
+// receiver's configuration, and the transcript continues under it
+// within the same response: the receiver's items are relayed as the
+// sender's were, usage sums both, and the receiver's answer is the
+// response's. A receiver that hands off again is asked about in turn,
+// with nothing counting the handoffs but the function. Without the
+// option, or when it declines, a terminating stop with no answer
+// completes with the text of the last function_call_output as an
+// assistant message, the answer the tools gave on the model's behalf,
+// as tools/agent reports the same stop.
 package responses
 
 import (
@@ -68,6 +81,7 @@ type Adapter struct {
 	cfg                 agentturn.Config
 	requestInstructions bool
 	toolItems           bool
+	handoff             func(context.Context, *agentturn.RunEnd) (agentturn.Config, bool)
 }
 
 var _ openresponses.Adapter = (*Adapter)(nil)
@@ -87,6 +101,21 @@ func WithRequestInstructions() Option {
 // that feed the output back into a loop should leave this off.
 func WithToolItems() Option {
 	return func(a *Adapter) { a.toolItems = true }
+}
+
+// WithHandoff is asked when a full run stops on StopTerminate or
+// StopPartialTerminate. A configuration it returns continues the same
+// transcript within the same response, under the request's model and
+// instructions as the adapter's own configuration is; false ends the
+// response as it would without the option. fn finds the destination
+// in end.Items, the terminating call and its output; a host that
+// routes on a result's Details, which the model never sees, reads them
+// from a ToolEnd event its tool or a subscriber kept. It is asked again each time a run it started stops the same way, so
+// a pair of agents that hand back and forth runs until fn declines or
+// the request's context ends; a host that wants a bound counts on a
+// value it puts on that context.
+func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd) (agentturn.Config, bool)) Option {
+	return func(a *Adapter) { a.handoff = fn }
 }
 
 // New builds an adapter over cfg.
@@ -147,44 +176,20 @@ func (a *Adapter) CreateStream(ctx context.Context, req openresponses.Request, s
 
 // fullRun lets the agent execute its own tools until it answers.
 func (a *Adapter) fullRun(ctx context.Context, req openresponses.Request, transcript agentturn.Transcript, rl *relay) error {
-	cfg := a.cfg
-	cfg.ModelName = a.model(req.Model)
-	cfg.Instructions = a.instructions(req.Instructions)
+	cfg := a.perRequest(a.cfg, req)
 	var usage openresponses.Usage
 	var end *agentturn.RunEnd
-	for ev := range agentturn.Continue(ctx, transcript, cfg) {
-		switch e := ev.(type) {
-		case *agentturn.ItemStart:
-			if _, ok := e.Item.(*openresponses.FunctionCallOutput); ok || !a.emits(e.Item) {
-				continue
-			}
-			if err := rl.start(e.Item); err != nil {
-				return err
-			}
-		case *agentturn.ItemUpdate:
-			if !a.emits(e.Item) {
-				continue
-			}
-			if err := rl.update(e.Stream); err != nil {
-				return err
-			}
-		case *agentturn.ItemEnd:
-			if !a.emits(e.Item) {
-				continue
-			}
-			if err := rl.end(e.Item); err != nil {
-				return err
-			}
-		case *agentturn.TurnEnd:
-			if e.Response != nil && e.Response.Usage != nil {
-				addUsage(&usage, *e.Response.Usage)
-			}
-		case *agentturn.RunEnd:
-			end = e
+	for {
+		var err error
+		if end, err = a.relayRun(ctx, transcript, cfg, rl, &usage); err != nil {
+			return err
 		}
-	}
-	if end == nil {
-		return errors.New("responses: run produced no run_end")
+		next, ok := a.handsOff(ctx, end)
+		if !ok {
+			break
+		}
+		transcript = append(transcript, end.Items...)
+		cfg = a.perRequest(next, req)
 	}
 	switch end.Reason {
 	case agentturn.ReasonError:
@@ -207,6 +212,16 @@ func (a *Adapter) fullRun(ctx context.Context, req openresponses.Request, transc
 			rl.em.Response().Usage = &usage
 			return rl.em.Incomplete(openresponses.IncompleteReasonContentFilter)
 		}
+		// A terminating result nobody handed off from answered on the
+		// model's behalf. Its text is the answer, as tools/agent has
+		// it; without it the response would complete empty.
+		if _, ok := end.Answer(); terminated(end) && !ok {
+			if text, ok := lastOutputText(end.Items); ok {
+				if err := rl.end(openresponses.AssistantText(text)); err != nil {
+					return err
+				}
+			}
+		}
 	case agentturn.ReasonInputRequired:
 		// Open Responses has no interrupted state: a response whose
 		// output ends with function_call items is the caller's cue to
@@ -222,6 +237,78 @@ func (a *Adapter) fullRun(ctx context.Context, req openresponses.Request, transc
 	}
 	rl.em.Response().Usage = &usage
 	return rl.em.Complete()
+}
+
+// relayRun runs cfg over transcript, relaying its items and adding its
+// usage, and returns its end.
+func (a *Adapter) relayRun(ctx context.Context, transcript agentturn.Transcript, cfg agentturn.Config, rl *relay, usage *openresponses.Usage) (*agentturn.RunEnd, error) {
+	var end *agentturn.RunEnd
+	for ev := range agentturn.Continue(ctx, transcript, cfg) {
+		switch e := ev.(type) {
+		case *agentturn.ItemStart:
+			if _, ok := e.Item.(*openresponses.FunctionCallOutput); ok || !a.emits(e.Item) {
+				continue
+			}
+			if err := rl.start(e.Item); err != nil {
+				return nil, err
+			}
+		case *agentturn.ItemUpdate:
+			if !a.emits(e.Item) {
+				continue
+			}
+			if err := rl.update(e.Stream); err != nil {
+				return nil, err
+			}
+		case *agentturn.ItemEnd:
+			if !a.emits(e.Item) {
+				continue
+			}
+			if err := rl.end(e.Item); err != nil {
+				return nil, err
+			}
+		case *agentturn.TurnEnd:
+			if e.Response != nil && e.Response.Usage != nil {
+				addUsage(usage, *e.Response.Usage)
+			}
+		case *agentturn.RunEnd:
+			end = e
+		}
+	}
+	if end == nil {
+		return nil, errors.New("responses: run produced no run_end")
+	}
+	return end, nil
+}
+
+// handsOff asks WithHandoff for the next configuration when end is a
+// terminating stop.
+func (a *Adapter) handsOff(ctx context.Context, end *agentturn.RunEnd) (agentturn.Config, bool) {
+	if a.handoff == nil || !terminated(end) {
+		return agentturn.Config{}, false
+	}
+	return a.handoff(ctx, end)
+}
+
+// perRequest returns cfg under the request's model and instructions.
+func (a *Adapter) perRequest(cfg agentturn.Config, req openresponses.Request) agentturn.Config {
+	cfg.ModelName = modelName(cfg, req.Model)
+	cfg.Instructions = a.instructionsFor(cfg, req.Instructions)
+	return cfg
+}
+
+// terminated reports whether a terminating tool result stopped the run.
+func terminated(end *agentturn.RunEnd) bool {
+	return end.Reason == agentturn.ReasonStopped && (end.Cause == agentturn.StopTerminate || end.Cause == agentturn.StopPartialTerminate)
+}
+
+// lastOutputText returns the text of the last function call output.
+func lastOutputText(items agentturn.Transcript) (string, bool) {
+	for i := len(items) - 1; i >= 0; i-- {
+		if out, ok := items[i].(*openresponses.FunctionCallOutput); ok {
+			return out.Output.Text, out.Output.Text != ""
+		}
+	}
+	return "", false
 }
 
 // oneTurn calls the model once with the agent's and the caller's tools
@@ -348,21 +435,27 @@ func (a *Adapter) emits(item openresponses.Item) bool {
 	return true
 }
 
-func (a *Adapter) model(requested string) string {
-	if a.cfg.ModelName != "" {
-		return a.cfg.ModelName
+func (a *Adapter) model(requested string) string { return modelName(a.cfg, requested) }
+
+func modelName(cfg agentturn.Config, requested string) string {
+	if cfg.ModelName != "" {
+		return cfg.ModelName
 	}
 	return requested
 }
 
 func (a *Adapter) instructions(requested string) string {
+	return a.instructionsFor(a.cfg, requested)
+}
+
+func (a *Adapter) instructionsFor(cfg agentturn.Config, requested string) string {
 	switch {
 	case !a.requestInstructions || requested == "":
-		return a.cfg.Instructions
-	case a.cfg.Instructions == "":
+		return cfg.Instructions
+	case cfg.Instructions == "":
 		return requested
 	default:
-		return a.cfg.Instructions + "\n\n" + requested
+		return cfg.Instructions + "\n\n" + requested
 	}
 }
 
