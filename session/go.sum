@@ -1,5 +1,5 @@
-github.com/ChristopherDavenport/agentsession v0.0.10 h1:Vc2p2A9vijtzjqECer6NXnQXKbTrqnwGSx10cDyjsaE=
-github.com/ChristopherDavenport/agentsession v0.0.10/go.mod h1:lx4LgOt9hgxBAWDvMy29zgJ4YDChR7X5bROKHDp0Hiw=
+github.com/ChristopherDavenport/agentsession v0.0.11-0.20260929155507-2456736d1651 h1:nBUZGozRYIIIbxMwLzzcgMEGgldwtHjgQMecU9rRCZI=
+github.com/ChristopherDavenport/agentsession v0.0.11-0.20260929155507-2456736d1651/go.mod h1:lx4LgOt9hgxBAWDvMy29zgJ4YDChR7X5bROKHDp0Hiw=
 github.com/ChristopherDavenport/agenttool v0.0.10 h1:N59VfLCB78EqP9mkIydIhBNJbcT5OUkcJZkyeisYgMw=
 github.com/ChristopherDavenport/agenttool v0.0.10/go.mod h1:7XGX4PGUU01SxN/H94FYTZ9QhKyM8YNBYyJW1tBYY30=
 github.com/ChristopherDavenport/openresponses v0.0.12 h1:Cg4gYqf1ZMVQhYRmD94f068OLUQEv4rIK/9bl8EBUA4=

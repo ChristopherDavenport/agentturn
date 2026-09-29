@@ -171,15 +171,19 @@ calls are on `end.Pending`, and an agent built with
 again. A call that was handed to its tool may have run, and one in a
 transcript the agent was seeded with may have too, so `Resume`
 approves either only as agenttool's replay rule allows, with the
-idempotency key and the arguments it first ran with, and refuses
-otherwise with `ErrAmbiguousCall`. `agentturn.OutcomeUnknown` is the
-answer for such a call, and `Answer.WithRunAgain` the only way past the
-rule, for a host that accepts the risk. A tool without `WithReplay`
-reads as unknown, so an approval of it after a cut is refused. After a
-restart, `session.AgentOptions` seeds the agent with the context and
-with what the record says of each pending call, so a call that never
-started is approved as it is, and `session.ReplayAnswers` applies the
-rule to the rest:
+idempotency key and the arguments of the dispatch it repeats, and
+refuses otherwise with `ErrAmbiguousCall`. `agentturn.OutcomeUnknown`
+is the answer for such a call, which a recorder writes as an `answer`
+decision with the answer's `By` and `Reason` before the output, and
+`Answer.WithRunAgain` the only way past the rule, for a host that
+accepts the risk. A tool without `WithReplay` reads as unknown, so an
+approval of it after a cut is refused. After a restart,
+`session.AgentOptions` seeds the agent with the context and with what
+the record says of each pending call, so a call that never started is
+approved as it is, a call held after its dispatch is held to the rule
+when approved, and a call answered before the crash wrote its output
+takes that output alone; `session.ReplayAnswers` applies the rule to
+the calls nobody holds:
 
 ```go
 rec, s, _ := session.Resume(ctx, store, id)

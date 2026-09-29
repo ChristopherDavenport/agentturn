@@ -194,6 +194,7 @@ type runContextKey struct{}
 type steeredKey struct{}
 type triggerKey struct{}
 type decidersKey struct{}
+type reasonsKey struct{}
 
 // ContextWithTrigger attaches a [Trigger] to ctx. A run started with
 // that context, through [Run], [Continue] or an [Agent], carries it on
@@ -234,6 +235,30 @@ func ContextWithDeciders(ctx context.Context, by map[string]string) context.Cont
 func DeciderFromContext(ctx context.Context, callID string) string {
 	by, _ := ctx.Value(decidersKey{}).(map[string]string)
 	return by[callID]
+}
+
+// ContextWithReasons attaches why each pending call was answered as it
+// was, by call ID, as [ContextWithDeciders] attaches who decided.
+// [Agent.Resume] does it from the [Answer.Reason] of the answers it was
+// given as outputs, so a subscriber writing the record of an output
+// for a call that may have run can say why the call was not run again.
+// The loop reads nothing from it.
+func ContextWithReasons(ctx context.Context, reasons map[string]string) context.Context {
+	if len(reasons) == 0 {
+		return ctx
+	}
+	out := make(map[string]string, len(reasons))
+	for k, v := range reasons {
+		out[k] = v
+	}
+	return context.WithValue(ctx, reasonsKey{}, out)
+}
+
+// ReasonFromContext returns the reason the caller gave for the answer
+// to callID, or "" when none was given.
+func ReasonFromContext(ctx context.Context, callID string) string {
+	reasons, _ := ctx.Value(reasonsKey{}).(map[string]string)
+	return reasons[callID]
 }
 
 // ContextWithTranscript attaches a transcript to ctx. The loop does this
@@ -612,10 +637,16 @@ func (r *runner) pending() []PendingCall {
 			if !sameArgs(h.args, orEmpty(nil, call.Arguments)) {
 				p.Args = h.args
 			}
-		case known && (before.Reason == PendingAborted || before.Reason == PendingUnknown):
+		case known && before.MayHaveRun():
 			// It may have run before this run, which did not run it
-			// again, so it is as ambiguous as it was.
+			// again, so it is as ambiguous as it was. A call held
+			// after its dispatch was approved by this run, so the
+			// hold is answered and the call is left as a cut leaves
+			// one.
 			p.Reason, p.IdempotencyKey, p.Args = before.Reason, before.IdempotencyKey, before.Args
+			if before.Reason == PendingDeferred {
+				p.Reason = PendingAborted
+			}
 		case r.undispatched[call.CallID] || mine[call] || r.approved[call.CallID]:
 			p.Reason = PendingUndispatched
 		case known:

@@ -88,13 +88,15 @@ const (
 //
 // Extra holds the caller's richer facts about the firing, such as when
 // it was due or which attempt it is, each a JSON value under a name of
-// the caller's. A session recorder writes them as members of the run
-// start entry beside the ones the format defines, which is where the
-// format puts them, and refuses a name the format or the recorder
-// already uses there. They describe a run's start: a queued item's
-// trigger is written without them. The loop reads nothing from Extra,
-// so a name the recorder refuses, or a value that does not encode as
-// JSON, fails the run only when a recorder is attached.
+// the caller's. A session recorder writes them as members of the
+// trigger object beside kind, ref and source, which is where the
+// format puts them, wherever it writes the trigger: on the run start,
+// on a queued input's entry and as the source of the item that drains
+// it, so a firing queued behind a busy run keeps its slot. It refuses
+// the three names the format defines there. The loop reads nothing
+// from Extra, so a name the recorder refuses, or a value that does not
+// encode as JSON, fails the run or the queueing only when a recorder
+// is attached.
 type Trigger struct {
 	Kind   string
 	Ref    string
@@ -317,7 +319,7 @@ func (*ToolStart) EventType() string { return EventToolStart }
 // loop mints one for every call it dispatches and keeps it when the
 // call runs again, from the pending call or the [Answer] that approved
 // it. A recorder writes it with the dispatch, so a host resuming after
-// a restart can hand a keyed tool the key its first attempt carried.
+// a restart can hand a keyed tool the key of the dispatch it repeats.
 type ToolDispatch struct {
 	RunID          string
 	Turn           int
@@ -488,6 +490,13 @@ const (
 	// whether it ran. A session recorded with dispatch entries can, and
 	// [WithPending] seeds the agent with what it says.
 	PendingUnknown PendingReason = "unknown"
+	// PendingAnswered: a record says the call was answered without
+	// being run again, and stopped before the answer's output: a crash
+	// between the two. It is owed its output and nothing else, so
+	// [Agent.Resume] answers it only with an output and refuses an
+	// approval with [ErrCallAnswered]. Only [WithPending] and
+	// [Agent.SetPending] give it; a live run never leaves one.
+	PendingAnswered PendingReason = "answered"
 )
 
 // PendingCall is a function call with no output and the reason it has
@@ -500,17 +509,34 @@ type PendingCall struct {
 	// it runs; nil for a call no tool has the name of and for a call the
 	// run did not make, one found in a seeded transcript.
 	Tool agenttool.Tool
-	// IdempotencyKey is the key the call carried when it was handed to
-	// its tool, for a call that may have run, and empty otherwise. An
+	// Dispatched, for a deferred call, says it was handed to its tool
+	// before it was held: a record holds a hold after the call's
+	// dispatch, so the call may have run and waits on someone to say
+	// whether it runs again. Its approval is held to the replay rule as
+	// an aborted call's is, with IdempotencyKey and Args. The loop's
+	// own BeforeToolCall defers a call before it is handed over, so
+	// only [WithPending] and [Agent.SetPending] set it.
+	Dispatched bool
+	// IdempotencyKey is the key the call carried the last time it was
+	// handed to its tool, for a call that may have run, and empty
+	// otherwise: the key of the dispatch an approval repeats. An
 	// approval of the call through [Agent.Resume] runs it with this
 	// key unless the answer carries its own.
 	IdempotencyKey string
-	// Args are the arguments the call was handed to its tool with, for
-	// a call that may have run, which a decision may have rewritten;
-	// nil when they are the call's own or it was not handed over. An
-	// approval runs it again with them unless the answer carries its
-	// own.
+	// Args are the arguments that hand-off gave the tool, for a call
+	// that may have run, which a decision may have rewritten; nil when
+	// they are the call's own or it was not handed over. An approval
+	// runs it again with them unless the answer carries its own.
 	Args json.RawMessage
+}
+
+// MayHaveRun reports whether the call may have run and an approval of
+// it is held to agenttool's replay rule: it is pending as
+// [PendingAborted] or [PendingUnknown], or deferred after it was
+// dispatched. A call pending as [PendingAnswered] may have run too,
+// but it is owed an output and no approval.
+func (p PendingCall) MayHaveRun() bool {
+	return p.Reason == PendingAborted || p.Reason == PendingUnknown || p.Reason == PendingDeferred && p.Dispatched
 }
 
 // PendingCalls returns the calls of pending, in order.
