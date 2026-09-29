@@ -1,12 +1,15 @@
 package agentturn
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 
+	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/openresponses"
 )
 
@@ -27,6 +30,16 @@ var (
 	// called with nothing pending, and when a Prompt opens with an
 	// output for a call that is not pending.
 	ErrNotPending = errors.New("agentturn: output does not answer a pending call")
+	// ErrAmbiguousCall is returned when Resume was asked to approve a
+	// call that may already have run, one pending as [PendingAborted]
+	// or [PendingUnknown], whose tool does not say it can run again:
+	// agenttool's replay is unknown, or keyed and the key the first
+	// attempt carried is not known, or keyed and the approval changes
+	// the arguments under that key. Such a call must not run again;
+	// answer it with [OutcomeUnknown] so the model can check before it
+	// asks again, or, when the host accepts the risk, approve it with
+	// [Answer.WithRunAgain].
+	ErrAmbiguousCall = errors.New("agentturn: a call that may have run cannot run again")
 )
 
 // Agent is the stateful loop: a transcript, queues, subscribers and run
@@ -79,6 +92,9 @@ type Agent struct {
 	runCancel context.CancelCauseFunc
 	idle      chan struct{}
 	pending   []PendingCall
+	// seeded is what WithPending gave, applied to the pending calls
+	// once every option has run.
+	seeded []PendingCall
 }
 
 type subscription struct {
@@ -95,11 +111,31 @@ type Option func(*Agent)
 // loop cannot say whether they ran, as they would be after the run
 // that made them: Prompt and Continue return [ErrInputRequired] until
 // [Agent.Resume] has answered them, or a Prompt opens with their
-// outputs.
+// outputs. Resume holds an approval of such a call to the replay rule,
+// since it may have run; [WithPending] says which ones did not.
 func WithTranscript(t Transcript) Option {
 	return func(a *Agent) {
 		a.transcript = append(Transcript(nil), t...)
 		a.pending = pendingCalls(unansweredCalls(a.transcript), PendingUnknown)
+	}
+}
+
+// WithPending says why the calls the seeded transcript leaves without
+// an output are pending, and with what key they were handed to their
+// tools, from a record that knows more than the transcript does: a
+// session's dispatch entries tell a call that never started from one
+// that may have run. Each is matched to a pending call by its call ID,
+// with the same name and arguments; one that matches none is ignored,
+// and a pending call it does not list stays [PendingUnknown]. A call
+// it lists as never started, or as deferred, is approved without the
+// replay rule [Agent.Resume] applies to the others. It applies to the
+// transcript [WithTranscript] gives, whichever option comes first; for
+// one [Agent.SetTranscript] sets later, [Agent.SetPending] does the
+// same. The session package's AgentOptions gives both options for a
+// stored session.
+func WithPending(pending []PendingCall) Option {
+	return func(a *Agent) {
+		a.seeded = append([]PendingCall(nil), pending...)
 	}
 }
 
@@ -109,7 +145,34 @@ func New(cfg Config, opts ...Option) *Agent {
 	for _, opt := range opts {
 		opt(a)
 	}
+	a.seedPending()
 	return a
+}
+
+// seedPending applies what WithPending gave to the pending calls.
+func (a *Agent) seedPending() {
+	mergePending(a.pending, a.seeded)
+	a.seeded = nil
+}
+
+// mergePending replaces each of pending with what known says of the
+// same call, matched by call ID and, where known has the call, its name
+// and arguments, keeping the transcript's own call item.
+func mergePending(pending, known []PendingCall) {
+	byID := make(map[string]PendingCall, len(known))
+	for _, p := range known {
+		if p.Call != nil {
+			byID[p.Call.CallID] = p
+		}
+	}
+	for i, p := range pending {
+		q, ok := byID[p.Call.CallID]
+		if !ok || q.Call.Name != p.Call.Name || q.Call.Arguments != p.Call.Arguments {
+			continue
+		}
+		q.Call = p.Call
+		pending[i] = q
+	}
 }
 
 func closedChan() chan struct{} {
@@ -148,19 +211,44 @@ func (a *Agent) SetConfig(cfg Config) error {
 // previous model wrote included, whose signatures another provider
 // refuses; a handoff to another provider drops them here.
 // The pending calls are derived from the new transcript as
-// [WithTranscript] derives them, so whatever the old transcript was
-// waiting on is forgotten and whatever the new one is waiting on must
-// be answered through [Agent.Resume]. Queued Steer and FollowUp items
-// are kept and go to the next run on the new transcript; a host that
-// does not want them there reads them from [Agent.State] first.
+// [WithTranscript] derives them, except that a call the agent already
+// had pending, the same call under the same ID, keeps its reason, key
+// and arguments: a held call stays held. Any other is [PendingUnknown],
+// so an approval of it is held to the replay rule as for any call that
+// may have run, until [Agent.SetPending] says what a record knows of
+// it. Whatever the old transcript was waiting on and the new one does
+// not hold is forgotten, and whatever the new one is waiting on must be
+// answered through [Agent.Resume]. Queued Steer and FollowUp items are
+// kept and go to the next run on the new transcript; a host that does
+// not want them there reads them from [Agent.State] first.
 func (a *Agent) SetTranscript(t Transcript) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.running {
 		return ErrRunning
 	}
+	known := a.pending
 	a.transcript = append(Transcript(nil), t...)
 	a.pending = pendingCalls(unansweredCalls(a.transcript), PendingUnknown)
+	mergePending(a.pending, known)
+	return nil
+}
+
+// SetPending says why the calls the transcript leaves without an output
+// are pending, and with what key and arguments they were handed to
+// their tools, as [WithPending] does for a new agent: after
+// [Agent.SetTranscript] to a branch of a session, with what the
+// session package's Pending reads there. Each is matched to a pending
+// call by its call ID, with the same name and arguments, and ignored
+// when it matches none. It returns
+// [ErrRunning] while a run is active.
+func (a *Agent) SetPending(pending []PendingCall) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		return ErrRunning
+	}
+	mergePending(a.pending, pending)
 	return nil
 }
 
@@ -245,9 +333,9 @@ func (a *Agent) Continue(ctx context.Context) (*RunEnd, error) {
 
 // Answer resolves one pending call for [Agent.Resume]: an output the
 // caller produced, or an approval that runs the call inside the loop.
-// Build one with [Output], [Approve], [ApproveWith] or [Refuse],
-// attach what the user said with [Answer.WithNote] and who said it
-// with [Answer.WithBy].
+// Build one with [Output], [Approve], [ApproveWith], [Refuse] or
+// [OutcomeUnknown], attach what the user said with [Answer.WithNote]
+// and who said it with [Answer.WithBy].
 type Answer struct {
 	// CallID names the pending call.
 	CallID string
@@ -276,7 +364,28 @@ type Answer struct {
 	// Resume as often as a person does, so an answer that names nobody
 	// is recorded as an anonymous decision rather than guessed at.
 	By string
+	// Reason, for an approval, says why the call runs, and rides on the
+	// ToolDecision as By does: "run again: keyed" for a call that may
+	// have run, for instance. A session recorder writes it on the
+	// proceed decision.
+	Reason string
+	// IdempotencyKey, for an approval, is the key the tool receives in
+	// place of the one the loop would give it: the pending call's, for
+	// a call that may have run, and a new one otherwise. A host that
+	// resumes after a restart sets the key the first attempt carried,
+	// which a session recorder wrote on the call's dispatch.
+	IdempotencyKey string
+	// RunAgain, for an approval, says the host accepts running a call
+	// that may have run although its tool does not say that is safe.
+	// It is the only way past the replay rule [Agent.Resume] applies,
+	// and the proceed is recorded with [RunAgainReason] when the
+	// answer gives no reason of its own.
+	RunAgain bool
 }
+
+// RunAgainReason is the reason an approval built with
+// [Answer.WithRunAgain] carries when it gives none.
+const RunAgainReason = "run again: accepted by the caller"
 
 // Output answers a pending call with out.
 func Output(out *openresponses.FunctionCallOutput) Answer {
@@ -292,6 +401,15 @@ func Refuse(out *openresponses.FunctionCallOutput) Answer {
 	a := Output(out)
 	a.Terminate = true
 	return a
+}
+
+// OutcomeUnknown answers a pending call that may have run and must not
+// run again with the error agenttool's replay rule asks for, so the
+// model sees that the call may or may not have taken effect and can
+// check before it asks again.
+func OutcomeUnknown(callID string) Answer {
+	res := agenttool.ErrorResult(errors.New("outcome unknown: the call was cut off after it was handed to its tool, and it may or may not have taken effect; check before calling it again"))
+	return Output(&openresponses.FunctionCallOutput{CallID: callID, Output: res.Output})
 }
 
 // Approve runs the pending call with the arguments the model gave.
@@ -315,6 +433,28 @@ func (a Answer) WithBy(by string) Answer {
 	return a
 }
 
+// WithReason returns the answer with reason attached: why an approval
+// runs the call.
+func (a Answer) WithReason(reason string) Answer {
+	a.Reason = reason
+	return a
+}
+
+// WithIdempotencyKey returns the approval with key as the key its tool
+// receives.
+func (a Answer) WithIdempotencyKey(key string) Answer {
+	a.IdempotencyKey = key
+	return a
+}
+
+// WithRunAgain returns the approval with [Answer.RunAgain] set: the
+// call runs even if it may have run and its tool does not say it can
+// run again, whatever its side effect.
+func (a Answer) WithRunAgain() Answer {
+	a.RunAgain = true
+	return a
+}
+
 // Resume answers the calls the last run left pending and continues,
 // whether they were deferred to the caller or cut off by an abort or a
 // failure. Every pending call must have exactly one answer, and no
@@ -323,6 +463,20 @@ func (a Answer) WithBy(by string) Answer {
 // refusal as text, which the model then sees; a caller that approves a
 // deferred call lets the loop run it. [Answer.By] says who decided,
 // for the record.
+//
+// An approved call runs with the idempotency key the answer carries,
+// else the one it was first handed to its tool with, else a new one,
+// and with the arguments the answer carries, else the ones it was
+// first handed over with, else its own. A call that may already have
+// run, pending as [PendingAborted] or, since the loop cannot say, as
+// [PendingUnknown], is ambiguous, and Resume applies agenttool's rule
+// for running it again: it approves the call when its tool's replay
+// for the arguments it would run with is safe, or keyed with a key
+// known and the arguments it first ran with or a key the answer
+// chose, and otherwise returns [ErrAmbiguousCall] and runs nothing.
+// [Answer.WithRunAgain] is the only way past it. An agent seeded with
+// [WithPending] from a record knows which calls never started, and
+// those are not checked.
 //
 // The outputs are appended with their item events first, then the
 // notes of the answers that carry one, as user messages. The approved
@@ -339,20 +493,21 @@ func (a Answer) WithBy(by string) Answer {
 func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) {
 	a.mu.Lock()
 	pending := append([]PendingCall(nil), a.pending...)
+	cfg := a.cfg
 	a.mu.Unlock()
 	if len(pending) == 0 {
 		return nil, fmt.Errorf("%w: nothing is pending", ErrNotPending)
 	}
-	byID := make(map[string]*openresponses.FunctionCall, len(pending))
+	byID := make(map[string]PendingCall, len(pending))
 	for _, p := range pending {
-		byID[p.Call.CallID] = p.Call
+		byID[p.Call.CallID] = p
 	}
 	var outputs, notes openresponses.Items
 	var approved []approval
 	deciders := map[string]string{}
 	terminate := false
 	for _, ans := range answers {
-		call, ok := byID[ans.CallID]
+		p, ok := byID[ans.CallID]
 		if !ok {
 			return nil, fmt.Errorf("%w: %q", ErrNotPending, ans.CallID)
 		}
@@ -368,7 +523,28 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 			}
 			continue
 		}
-		approved = append(approved, approval{call: call, args: ans.Args, note: ans.Note, by: ans.By})
+		key := ans.IdempotencyKey
+		if key == "" {
+			key = p.IdempotencyKey
+		}
+		// A call run again runs as it was handed over, with the
+		// arguments a decision gave it, unless the answer says
+		// otherwise.
+		args := ans.Args
+		if args == nil {
+			args = p.Args
+		}
+		reason := ans.Reason
+		if p.Reason == PendingAborted || p.Reason == PendingUnknown {
+			if ans.RunAgain {
+				if reason == "" {
+					reason = RunAgainReason
+				}
+			} else if err := mayRunAgain(ctx, cfg, p, ans, args, key); err != nil {
+				return nil, err
+			}
+		}
+		approved = append(approved, approval{call: p.Call, args: args, note: ans.Note, by: ans.By, reason: reason, key: key})
 	}
 	if len(byID) > 0 {
 		return nil, fmt.Errorf("%w: %d pending call(s) unanswered", ErrNotPending, len(byID))
@@ -377,6 +553,69 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 	// of an answer of that kind rides on the run's context, where a
 	// recorder writing the decision for it finds it.
 	return a.run(ContextWithDeciders(ctx, deciders), append(outputs, notes...), approved, true, terminate)
+}
+
+// mayRunAgain applies agenttool's rule for running a call again to an
+// approval of p, which may have run: its tool's replay for args, the
+// arguments it would run with, asked under the call it would run as,
+// must be safe, or keyed with key known. A keyed call run with other
+// arguments than it was handed over with would reuse the key for
+// another operation, so it needs a key the answer chose. A call no
+// tool has the name of runs nothing, and the loop refuses it.
+func mayRunAgain(ctx context.Context, cfg Config, p PendingCall, ans Answer, args json.RawMessage, key string) error {
+	call := p.Call
+	tool, ok := cfg.tools(ctx).Lookup(call.Name)
+	if !ok {
+		return nil
+	}
+	args = orEmpty(args, call.Arguments)
+	ctx = agenttool.WithCall(ctx, agenttool.Call{ID: call.CallID, Args: args, IdempotencyKey: key})
+	switch agenttool.ReplayOf(ctx, tool, args) {
+	case agenttool.ReplaySafe:
+		return nil
+	case agenttool.ReplayKeyed:
+		switch {
+		case key == "":
+			return fmt.Errorf("%w: %q is keyed and the key it first ran with is not known", ErrAmbiguousCall, call.CallID)
+		case (ans.IdempotencyKey == "" || ans.IdempotencyKey == p.IdempotencyKey) && !sameArgs(args, orEmpty(p.Args, call.Arguments)):
+			return fmt.Errorf("%w: %q is keyed and would run again with other arguments under its first key", ErrAmbiguousCall, call.CallID)
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: %q", ErrAmbiguousCall, call.CallID)
+}
+
+// orEmpty is args, else the call's own arguments, an empty object
+// standing in for none.
+func orEmpty(args json.RawMessage, own string) json.RawMessage {
+	if args == nil {
+		args = json.RawMessage(own)
+	}
+	if len(args) == 0 {
+		args = json.RawMessage("{}")
+	}
+	return args
+}
+
+// sameArgs reports whether two argument objects are the same JSON
+// value, whatever their spelling.
+func sameArgs(a, b json.RawMessage) bool {
+	x, errX := decodeNumbers(a)
+	y, errY := decodeNumbers(b)
+	if errX != nil || errY != nil {
+		return bytes.Equal(a, b)
+	}
+	return reflect.DeepEqual(x, y)
+}
+
+// decodeNumbers decodes raw keeping numbers as written, so two integers
+// past float64's precision are not taken for the same one.
+func decodeNumbers(raw json.RawMessage) (any, error) {
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.UseNumber()
+	var v any
+	err := d.Decode(&v)
+	return v, err
 }
 
 // answersPending checks the outputs that open a prompt against the
@@ -422,6 +661,7 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved [
 			return nil, err
 		}
 	}
+	prior := a.pending
 	a.pending = nil
 	// The context a tool's background work derives from: the prompt's
 	// values, cancelled by an abort of this run or by the prompt's own
@@ -449,6 +689,7 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved [
 		followUp:   a.drainFollowUp,
 		steered:    a.steerSignal,
 		runCtx:     runCtx,
+		prior:      prior,
 	}
 	end := r.run(ctx, prompts, approved, terminate)
 	cancel(nil)

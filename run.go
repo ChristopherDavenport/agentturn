@@ -419,6 +419,19 @@ type runner struct {
 	// subscriber refused, so the run end can say their tools never ran.
 	// It is written on the loop's goroutine as the batch is drained.
 	undispatched map[string]bool
+	// dispatched holds each call this run handed to its tool, with the
+	// key and the arguments it was handed over with, so the run end can
+	// say which calls may have run and how. It is written on the loop's
+	// goroutine once a batch is drained.
+	dispatched map[string]handOff
+	// approved holds the IDs of the calls a Resume approved, so one cut
+	// before its dispatch reads as never handed over rather than as
+	// waiting for an answer it has had.
+	approved map[string]bool
+	// prior is what the agent knew of the calls pending when the run
+	// started, so a call this run did not dispatch keeps the reason and
+	// the key an earlier run gave it.
+	prior []PendingCall
 
 	// held are the completed items of the attempt in flight that the
 	// transcript does not have yet, because nothing has committed the
@@ -478,12 +491,16 @@ func stopped(cause StopCause, err error) error {
 // approval is a pending call the caller approved through Agent.Resume:
 // it runs before the first model call of the run, with args in place of
 // the call's own when set, note, when set, appended after the batch's
-// outputs, and by naming who approved it, for the record.
+// outputs, by and reason saying who approved it and why, for the
+// record, and key, when set, as the idempotency key in place of a new
+// one.
 type approval struct {
-	call *openresponses.FunctionCall
-	args json.RawMessage
-	note string
-	by   string
+	call   *openresponses.FunctionCall
+	args   json.RawMessage
+	note   string
+	by     string
+	reason string
+	key    string
 }
 
 // run drives the loop and returns the RunEnd. terminate says the caller
@@ -536,8 +553,10 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 }
 
 // pending lists the calls of the transcript without an output, each
-// with why: deferred by a hook in this run, cut off in this run, or
-// found in the transcript the run started from.
+// with why: deferred by a hook in this run, cut off after or before
+// its dispatch in this run, or as the agent knew it when the run
+// started. A call an earlier run dispatched that this one did not
+// dispatch again is still the ambiguous call it was, with its key.
 func (r *runner) pending() []PendingCall {
 	calls := unansweredCalls(r.transcript)
 	if len(calls) == 0 {
@@ -549,18 +568,36 @@ func (r *runner) pending() []PendingCall {
 			mine[call] = true
 		}
 	}
+	prior := make(map[string]PendingCall, len(r.prior))
+	for _, p := range r.prior {
+		prior[p.Call.CallID] = p
+	}
 	out := make([]PendingCall, len(calls))
 	for i, call := range calls {
-		reason := PendingUnknown
+		before, known := prior[call.CallID]
+		h, dispatched := r.dispatched[call.CallID]
+		p := PendingCall{Call: call, Reason: PendingUnknown, Tool: r.callTools[call.CallID]}
 		switch {
 		case r.deferred[call.CallID]:
-			reason = PendingDeferred
-		case r.undispatched[call.CallID]:
-			reason = PendingUndispatched
-		case mine[call]:
-			reason = PendingAborted
+			p.Reason = PendingDeferred
+		case dispatched:
+			p.Reason, p.IdempotencyKey = PendingAborted, h.key
+			if !sameArgs(h.args, orEmpty(nil, call.Arguments)) {
+				p.Args = h.args
+			}
+		case known && (before.Reason == PendingAborted || before.Reason == PendingUnknown):
+			// It may have run before this run, which did not run it
+			// again, so it is as ambiguous as it was.
+			p.Reason, p.IdempotencyKey, p.Args = before.Reason, before.IdempotencyKey, before.Args
+		case r.undispatched[call.CallID] || mine[call] || r.approved[call.CallID]:
+			p.Reason = PendingUndispatched
+		case known:
+			p.Reason = before.Reason
 		}
-		out[i] = PendingCall{Call: call, Reason: reason, Tool: r.callTools[call.CallID]}
+		if p.Tool == nil {
+			p.Tool = before.Tool
+		}
+		out[i] = p
 	}
 	return out
 }
@@ -1063,6 +1100,11 @@ type callState struct {
 	note openresponses.Item
 	// reason is the decision's reason for a blocked call.
 	reason string
+	// key is the idempotency key the tool receives, and dispatched is
+	// set on the call's goroutine once its tool_dispatch was delivered,
+	// read by the loop after the executor has drained.
+	key        string
+	dispatched bool
 }
 
 // toolBatch runs the calls of a turn: preflight in order, execute,
@@ -1219,7 +1261,7 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 		if p.settled {
 			continue
 		}
-		jobs = append(jobs, agenttool.Job{Tool: p.tool, Call: agenttool.Call{ID: p.call.CallID, Args: p.args}})
+		jobs = append(jobs, agenttool.Job{Tool: p.tool, Call: agenttool.Call{ID: p.call.CallID, Args: p.args, IdempotencyKey: p.key}})
 		jobIndex = append(jobIndex, i)
 		byID[p.call.CallID] = p
 	}
@@ -1287,6 +1329,13 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 			cancel(err)
 		}
 	}
+	// The executor has drained, so every dispatch it made has been
+	// delivered and its mark is safe to read here.
+	for _, p := range batch {
+		if p.dispatched {
+			r.markDispatched(p)
+		}
+	}
 	if failed != nil {
 		// The tools have returned; the calls that did not finish are
 		// ended with the failure, as an abort ends them.
@@ -1308,6 +1357,21 @@ func (r *runner) markUndispatched(p *callState) {
 		r.undispatched = map[string]bool{}
 	}
 	r.undispatched[p.call.CallID] = true
+}
+
+// handOff is how a call was handed to its tool.
+type handOff struct {
+	key  string
+	args json.RawMessage
+}
+
+// markDispatched remembers that p was handed to its tool, with what
+// key and what arguments.
+func (r *runner) markDispatched(p *callState) {
+	if r.dispatched == nil {
+		r.dispatched = map[string]handOff{}
+	}
+	r.dispatched[p.call.CallID] = handOff{key: p.key, args: p.args}
 }
 
 // isCancellation reports whether err is the cancellation of ctx, or its
@@ -1337,13 +1401,14 @@ func (r *runner) executor(find func(agenttool.Job) *callState) agenttool.Executo
 			if p == nil {
 				return nil
 			}
-			err := r.emit(&ToolDispatch{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Parent: p.parent})
+			err := r.emit(&ToolDispatch{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Parent: p.parent, IdempotencyKey: p.key})
 			// Remembered on the call itself: the executor hands the
 			// failure back as the job's error, and the loop reads
 			// the state, not the error, to tell a refused dispatch
 			// from a tool's own failure. The final event crosses a
 			// channel, so the loop goroutine reads it after this.
 			p.dispatchErr = err
+			p.dispatched = err == nil
 			return err
 		},
 	}
@@ -1386,11 +1451,18 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 	for i, ap := range approved {
 		p := r.prepare(tools, r.turn, ap.call, ap.args)
 		r.resolved(p)
+		if r.approved == nil {
+			r.approved = map[string]bool{}
+		}
+		r.approved[ap.call.CallID] = true
+		if ap.key != "" {
+			p.key = ap.key
+		}
 		if ap.note != "" {
 			p.note = openresponses.UserText(ap.note)
 		}
 		batch[i] = p
-		if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args, Decision: &ToolDecision{Args: ap.args, Note: ap.note, By: ap.by}}); err != nil {
+		if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args, Decision: &ToolDecision{Args: ap.args, Note: ap.note, By: ap.by, Reason: ap.reason}}); err != nil {
 			return nil, r.failBatch(ctx, batch, err)
 		}
 		if err := r.check(ctx, p); err != nil {
@@ -1459,10 +1531,12 @@ func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openr
 }
 
 // prepare starts the state of a call: the tool with its name, if any,
-// and its arguments, args when given and the call's own otherwise, an
-// empty object standing in for none.
+// its arguments, args when given and the call's own otherwise, an
+// empty object standing in for none, and a new idempotency key: the
+// run's ID and the call's. A run ID is random, so no other run's key
+// shares it, and within the run a call ID names one call.
 func (r *runner) prepare(tools agenttool.Set, turn int, call *openresponses.FunctionCall, args json.RawMessage) *callState {
-	p := &callState{call: call, args: args, turn: turn}
+	p := &callState{call: call, args: args, turn: turn, key: r.runID + "/" + call.CallID}
 	if p.args == nil {
 		p.args = json.RawMessage(call.Arguments)
 	}
@@ -1582,6 +1656,12 @@ var ErrNoInvoker = errors.New("agentturn: no loop on the context to invoke a too
 // implements the interface itself and wants the parent named passes
 // agenttool.WithCall. Outside a loop, Invoke returns [ErrNoInvoker].
 //
+// A nested call gets an idempotency key of its own, fresh on every
+// Invoke: nothing derives it from the key of the call that made it, so
+// a parent run again after a restart invokes with new keys, and a
+// keyed tool reached this way deduplicates nothing across the parent's
+// attempts; see the open question in RFC 0001.
+//
 // Call it from a tool, with the context the tool was given, and not
 // from a hook or a subscriber: BeforeToolCall and AfterToolCall take
 // one call at a time, and a subscriber is called while the agent holds
@@ -1640,7 +1720,7 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 	if p.settled {
 		return p.result, p.err
 	}
-	job := agenttool.Job{Tool: p.tool, Call: agenttool.Call{ID: call.CallID, Args: p.args}}
+	job := agenttool.Job{Tool: p.tool, Call: agenttool.Call{ID: call.CallID, Args: p.args, IdempotencyKey: p.key}}
 	results, errs := r.executor(func(agenttool.Job) *callState { return p }).Results(ctx, []agenttool.Job{job})
 	if p.dispatchErr != nil {
 		// The consumer refused the nested call's dispatch, so its tool
