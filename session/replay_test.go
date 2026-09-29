@@ -337,6 +337,9 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 		wantKey    string
 		wantBy     string
 		wantReason string
+		// wantEnd, when set, is the reason the resume's run end gives,
+		// with the call pending.
+		wantEnd string
 	}{
 		{name: "held after dispatch, keyed, approved", replay: agenttool.ReplayKeyed, state: hold, want: agentturn.PendingDeferred,
 			answer: func(id string) agentturn.Answer {
@@ -360,7 +363,7 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 		{name: "never started, replayed, the policy blocks", replay: agenttool.ReplaySafe, want: agentturn.PendingUndispatched,
 			replayed: true, block: true, wantRecord: []string{"reject", "output"}},
 		{name: "never started, replayed, the policy holds", replay: agenttool.ReplaySafe, want: agentturn.PendingUndispatched,
-			replayed: true, hold: true, wantRecord: []string{"hold"}},
+			replayed: true, hold: true, wantRecord: []string{"hold"}, wantEnd: agentsession.ReasonInputRequired},
 		{name: "rejected, approved", replay: agenttool.ReplaySafe, state: rejected, want: agentturn.PendingRejected,
 			answer: agentturn.Approve, wantErr: agentturn.ErrCallAnswered},
 		{name: "rejected, replayed", replay: agenttool.ReplaySafe, state: rejected, want: agentturn.PendingRejected,
@@ -505,6 +508,20 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 			if tc.wantBy != "" && (last.By != tc.wantBy || last.Reason != tc.wantReason) {
 				t.Errorf("%s by %q for %q, want by %q for %q", last.Verdict, last.By, last.Reason, tc.wantBy, tc.wantReason)
 			}
+			// The resume takes the call up, by its decision or its
+			// output, so its run is a resume and, when it leaves the
+			// call held, lists it.
+			runs, err := s2.Runs(s2.Leaf())
+			if err != nil || len(runs) == 0 {
+				t.Fatalf("runs = %d, %v", len(runs), err)
+			}
+			run := runs[0]
+			if run.Start.Source != agentsession.SourceResume {
+				t.Errorf("run source = %q, want resume", run.Start.Source)
+			}
+			if tc.wantEnd != "" && (run.End == nil || run.End.Reason != tc.wantEnd || strings.Join(run.End.Pending, " ") != call.CallID) {
+				t.Errorf("run end = %+v, want %s pending %s", run.End, tc.wantEnd, call.CallID)
+			}
 			verifyAll(t, s2)
 			if err := s2.VerifyRecords(s2.Leaf()); err != nil {
 				t.Errorf("verify records: %v", err)
@@ -580,15 +597,26 @@ func TestRebaseSeedsHeldCalls(t *testing.T) {
 // dispatched that goes to its tool again gets a proceed naming who
 // approved it, written before its second dispatch with a reason of
 // the recorder's own, and one the loop then refuses before any
-// dispatch gets none.
+// dispatch gets none. A block of such a call is an answer, since the
+// format keeps reject for a call no dispatch reached, and a call a
+// reject ended takes no decision after it.
 func TestRunAgainIsAlwaysDecided(t *testing.T) {
 	cases := []struct {
-		name       string
-		dispatch   bool
+		name     string
+		dispatch bool
+		// decision is what BeforeToolCall said, an approval by a person
+		// when nil; rejected seeds the call with a reject rather than a
+		// dispatch.
+		decision   *agentturn.ToolDecision
+		rejected   bool
 		wantRecord []string
 	}{
 		{name: "dispatched again", dispatch: true, wantRecord: []string{"dispatch", "proceed", "dispatch", "output"}},
 		{name: "refused before its dispatch", wantRecord: []string{"dispatch", "answer", "output"}},
+		{name: "blocked", decision: &agentturn.ToolDecision{Action: agentturn.Block, Reason: "denied by rm"},
+			wantRecord: []string{"dispatch", "answer", "output"}},
+		{name: "held after a reject", decision: &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "confirm"}, rejected: true,
+			wantRecord: []string{"reject", "output"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -598,12 +626,21 @@ func TestRunAgainIsAlwaysDecided(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			// The call's response is on the path, so a run that answers
+			// it and calls no model reads as stopped.
 			call := &openresponses.FunctionCall{CallID: "call_1", Name: "charge", Arguments: `{"text":"t"}`}
-			target, err := store.Append(ctx, s.ID(), &agentsession.ItemEntry{Item: call})
+			target, err := store.Append(ctx, s.ID(), &agentsession.ItemEntry{Item: call, ResponseID: "resp_1"})
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := store.Append(ctx, s.ID(), agentsession.NewDispatch(call.CallID, target).WithIdempotencyKey("k1")); err != nil {
+			if _, err := store.Append(ctx, s.ID(), &agentsession.ResponseEntry{ResponseID: "resp_1", Status: openresponses.ResponseStatusCompleted}); err != nil {
+				t.Fatal(err)
+			}
+			seed := agentsession.Entry(agentsession.NewDispatch(call.CallID, target).WithIdempotencyKey("k1"))
+			if tc.rejected {
+				seed = agentsession.NewDecision(call.CallID, target, agentsession.VerdictReject, agentsession.ByPolicy).WithReason("denied by rm")
+			}
+			if _, err := store.Append(ctx, s.ID(), seed); err != nil {
 				t.Fatal(err)
 			}
 			rec, s2, err := Resume(ctx, store, s.ID())
@@ -611,9 +648,13 @@ func TestRunAgainIsAlwaysDecided(t *testing.T) {
 				t.Fatal(err)
 			}
 			const runID = "run_again"
+			decision := tc.decision
+			if decision == nil {
+				decision = &agentturn.ToolDecision{By: agentsession.ByHuman}
+			}
 			events := []agentturn.Event{
 				&agentturn.RunStart{RunID: runID, Source: agentturn.SourceResume},
-				&agentturn.ToolStart{RunID: runID, CallID: call.CallID, Name: call.Name, Args: json.RawMessage(call.Arguments), Decision: &agentturn.ToolDecision{By: agentsession.ByHuman}},
+				&agentturn.ToolStart{RunID: runID, CallID: call.CallID, Name: call.Name, Args: json.RawMessage(call.Arguments), Decision: decision},
 			}
 			if tc.dispatch {
 				events = append(events, &agentturn.ToolDispatch{RunID: runID, CallID: call.CallID, Name: call.Name, IdempotencyKey: "k1"},
@@ -646,6 +687,9 @@ func TestRunAgainIsAlwaysDecided(t *testing.T) {
 			}
 			if strings.Join(record, " ") != strings.Join(tc.wantRecord, " ") {
 				t.Errorf("record = %q, want %q", record, tc.wantRecord)
+			}
+			if err := s2.VerifyRecords(s2.Leaf()); err != nil {
+				t.Errorf("verify records: %v", err)
 			}
 		})
 	}

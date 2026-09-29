@@ -115,7 +115,10 @@
 //     [Pending] reads it as [agentturn.PendingAnswered].
 //   - tool_start: the call's decision when there is one to record. A
 //     BeforeToolCall that blocked the call is a reject decision with
-//     its reason; one that deferred it is a hold carrying the same
+//     its reason, or an answer decision for a call that may have run,
+//     since the format keeps reject for a call no dispatch reached; a
+//     call a reject or an answer already ended gets nothing, since only
+//     its output may follow; one that deferred it is a hold carrying the same
 //     reason, the rule that raised the prompt; one that rewrote the
 //     arguments, one that allowed the call and gave a reason, such as
 //     the grant that allowed it, or an approval through Agent.Resume of
@@ -159,12 +162,9 @@
 //     its input; then the run entry with
 //     phase end, the reason in the
 //     format's terms and the IDs of the run's calls left without an
-//     output. The loop's reasons map onto the format's cascade: done
-//     as it is, input_required as it is when the run holds a call its
-//     own response made and, for a resume whose BeforeToolCall
-//     deferred a call an earlier run made, as aborted with
-//     input_required as ref, since the format reads a held call only
-//     in the run that made it, error with the error as ref,
+//     output, an earlier run's call this run wrote a decision or a
+//     dispatch for among them, as the format counts it. The loop's reasons map onto the format's cascade: done
+//     and input_required as they are, error with the error as ref,
 //     aborted as interrupted with the context error as ref, since the
 //     host asked for the stop, and stopped as stopped when the last
 //     response requested tools, as done when it did not, and, when the
@@ -352,6 +352,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -977,13 +978,10 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 			p.Reason = agentturn.PendingAborted
 		case agentsession.CallAnswered:
 			p.Reason = agentturn.PendingAnswered
+		case agentsession.CallRejected:
+			p.Reason = agentturn.PendingRejected
 		case agentsession.CallNeverStarted:
 			p.Reason = agentturn.PendingUndispatched
-		}
-		if (p.Reason == agentturn.PendingUndispatched || p.Reason == agentturn.PendingUnknown) && c.Rejected() {
-			// A reject ended the call before its tool, and the record
-			// stopped before the refusal's output.
-			p.Reason = agentturn.PendingRejected
 		}
 		var args string
 		switch {
@@ -2581,6 +2579,7 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 			// an output writes it, an approval's dispatch is refused
 			// by the store, and a recorder reseeded from the path
 			// reads the call as PendingAnswered.
+			w.takeUp(out.CallID)
 			c.held, c.ended = false, true
 		default:
 			// The caller wrote the output themselves: the call never
@@ -2607,6 +2606,7 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 			if _, err := w.append(ctx, dec); err != nil {
 				return err
 			}
+			w.takeUp(out.CallID)
 			c.held, c.rejected = false, true
 		}
 	}
@@ -2687,6 +2687,17 @@ func (w *writer) close(callID string) {
 	}
 }
 
+// takeUp adds a call an earlier run made to the run's open list once
+// the run writes a decision or a dispatch for it: the format counts
+// such a call among the run's own, so its end lists the call while it
+// has no output.
+func (w *writer) takeUp(callID string) {
+	if c := w.calls[callID]; c == nil || c.answered || slices.Contains(w.open, callID) {
+		return
+	}
+	w.open = append(w.open, callID)
+}
+
 // outputText is the text of an output, for a reject's reason.
 func outputText(out *openresponses.FunctionCallOutput) string {
 	if out.Output.Text != "" || out.Output.Parts == nil {
@@ -2732,6 +2743,10 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 		// there is no entry to anchor a record to.
 		return nil
 	}
+	if c.rejected || c.ended {
+		// The call's fate is on the path: only its output may follow.
+		return nil
+	}
 	d := e.Decision
 	// A call an earlier run dispatched goes to its tool again only on
 	// an approval, which names its decider as a held call's does.
@@ -2751,9 +2766,20 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 			if reason == "" {
 				reason = "call blocked"
 			}
+			if c.dispatched || c.unknown {
+				// A call that may have run is ended by an answer: the
+				// format keeps reject for a call no dispatch reached.
+				if _, err := w.append(ctx, agentsession.NewDecision(e.CallID, c.entry, agentsession.VerdictAnswer, by).WithReason(reason)); err != nil {
+					return err
+				}
+				w.takeUp(e.CallID)
+				c.held, c.ended = false, true
+				return nil
+			}
 			if _, err := w.append(ctx, agentsession.NewDecision(e.CallID, c.entry, agentsession.VerdictReject, by).WithReason(reason)); err != nil {
 				return err
 			}
+			w.takeUp(e.CallID)
 			c.held, c.rejected = false, true
 			return nil
 		case agentturn.Defer:
@@ -2766,12 +2792,10 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 			if _, err := w.append(ctx, hold); err != nil {
 				return err
 			}
+			w.takeUp(e.CallID)
 			c.held = true
 			return nil
 		}
-	}
-	if c.rejected {
-		return nil
 	}
 	// An allowed call is recorded when something was decided about it:
 	// it was held and is now approved, its arguments were rewritten, or
@@ -2791,6 +2815,7 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 		if _, err := w.append(ctx, dec); err != nil {
 			return err
 		}
+		w.takeUp(e.CallID)
 	} else if again {
 		c.again = &by
 	}
@@ -2831,6 +2856,7 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 	if _, err := w.append(ctx, d); err != nil {
 		return err
 	}
+	w.takeUp(e.CallID)
 	c.dispatched, c.dispatchRun, c.unknown = true, w.run, false
 	return nil
 }
@@ -2925,13 +2951,6 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 	case agentturn.ReasonDone:
 		return agentsession.ReasonDone, ""
 	case agentturn.ReasonInputRequired:
-		if !w.heldInRun() {
-			// A resume whose BeforeToolCall deferred a call that never
-			// started ends before its first model call, holding a call
-			// an earlier run made: the format reads a held call only in
-			// the segment its item is in, and this one as aborted.
-			return agentsession.ReasonAborted, string(e.Reason)
-		}
 		return agentsession.ReasonInputRequired, ""
 	case agentturn.ReasonError:
 		return agentsession.ReasonError, errText(e.Err)
@@ -2980,16 +2999,6 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 		return agentsession.ReasonDone, cause
 	}
 	return string(e.Reason), ""
-}
-
-// heldInRun reports whether a call the run appended is held.
-func (w *writer) heldInRun() bool {
-	for _, id := range w.open {
-		if c := w.calls[id]; c != nil && c.held {
-			return true
-		}
-	}
-	return false
 }
 
 // pendingOnPath reports whether any call the writer knows of is still

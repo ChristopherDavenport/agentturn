@@ -8,8 +8,17 @@ versions may break the API.
 ## Unreleased
 
 - Requires `agenttool` v0.0.11, up from v0.0.10, and `agentsession`
-  v0.0.12, up from v0.0.11. The session recorder writes
+  v0.0.13, up from v0.0.11. The session recorder writes
   `agentsession/0.9`, and v0.0.11 of agentsession refuses a 0.9 file.
+  Under v0.0.13's reading of 0.9 the recorder writes a run end's
+  `pending` list with the earlier runs' calls the run wrote a decision
+  or a dispatch for, so a resume whose BeforeToolCall defers a call
+  that never started ends `input_required` with that call pending; a
+  block of a call that may have run is an `answer`, where it was a
+  `reject`, which the format now refuses after a `dispatch`; and a call
+  a `reject` or an `answer` ended gets no further decision.
+  `session.Pending` reads a call rejected before its output from
+  agentsession's `CallRejected`.
 - **The recorder writes the omitted list as keeps.** Under
   `session.WithInstructionsParts`, a config delta that changes
   `instructions_omitted` now writes it as `Settings.OmittedDelta`
@@ -81,10 +90,7 @@ versions may break the API.
   before the refusal's output is pending as the new `PendingRejected`
   rather than as never started: it takes only an output, an approval
   returns `ErrCallAnswered`, and `session.ReplayAnswers` answers it
-  with the reject's reason. The session recorder writes the end of a
-  resume that a deferral ends before its first model call as `aborted`
-  with `input_required` as its ref, which is what the format reads of
-  a run holding a call it did not append. (#159)
+  with the reject's reason. (#159)
 - The outputs `Agent.Resume` appends for pending calls carry no
   trigger on their `item_end`, so the session recorder writes no
   `source` on them: their decision says who gave them, and a policy's
