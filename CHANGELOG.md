@@ -7,10 +7,23 @@ versions may break the API.
 
 ## Unreleased
 
-- Requires `agenttool` v0.0.10 and `agentsession` v0.0.10, up from
-  v0.0.9. The session recorder writes `agentsession/0.7`, which adds
-  optional members only; a 0.5 or 0.6 session reads as it stands, and
-  v0.0.9 of agentsession refuses a 0.7 file.
+- Requires `agenttool` v0.0.10, up from v0.0.9, and `agentsession`
+  v0.0.11, up from v0.0.9. The session recorder writes
+  `agentsession/0.8`: a 0.5, 0.6 or 0.7 session reads as it stands,
+  and v0.0.10 of agentsession refuses a 0.8 file. Two rules read an
+  earlier file differently, as agentsession's RFC states: the omitted
+  instruction parts stay in force past the entry that wrote them, and
+  a call held after its dispatch is held, not in flight.
+- The omitted instruction parts under `session.WithInstructionsParts`
+  are written only when they differ from the list in force, rather
+  than on every config entry, since format 0.8 keeps the list in force
+  until a config changes it. A memory with 474 omissions paid 37 KB
+  for the list on every write, more than the joined string the parts
+  were meant to beat; a 9 byte patch under that list now writes a
+  320 byte delta. A list that empties is written as `[]`, which 0.7
+  had no way to say, a replace carries the list whenever it is
+  non-empty, and a recorder resumed on a path, or after a compaction,
+  whose checkpoint carries it, starts from the list in force. (#147)
 - An instructions delta under `session.WithInstructionsParts` writes
   each run of unchanged parts as one `keep` rather than naming every
   part by hash, so a memory write under many layers costs the part
@@ -103,18 +116,28 @@ versions may break the API.
   that may have run carry it, an approval through `Agent.Resume` runs
   the call again with it, and `Answer.IdempotencyKey` supplies one
   after a restart. The session recorder writes it on the `dispatch` as
-  `idempotency_key`, a member agentsession does not define yet, and
-  `session.DispatchKey` reads it back. A call a tool makes through
-  `Invoke` gets a fresh key each time, derived from nothing, which RFC
-  0001 lists as open. (#145)
+  `idempotency_key`, which format 0.8 defines, and `session.Pending`
+  reads back the key of a call's last dispatch with the arguments
+  that dispatch ran with, the pair a run of it again repeats. A call a
+  tool makes through `Invoke` gets a fresh key each time, derived from
+  nothing, which RFC 0001 lists as open. (#145)
 - The session recorder writes a second `dispatch` for a call an earlier
   run dispatched and a resume runs again, durably before the tool runs,
-  so the record holds one per hand-off. An output the caller writes for
-  such a call, `agentturn.OutcomeUnknown` for one, is written with no
-  decision before it rather than a `proceed`, since the call did not go
-  on toward its tool, so the answer's `By` and `Reason` are not
-  recorded for it: the format has no place for them. A call run again
-  gets a `proceed` carrying the approval's new `Answer.Reason`. (#144)
+  carrying the key of the dispatch it repeats, so the record holds one
+  per hand-off. An output the caller writes for such a call,
+  `agentturn.OutcomeUnknown` for one, is preceded by an `answer`
+  decision, format 0.8's verdict for a call ended without running
+  again, rather than a `proceed`, since the call did not go on toward
+  its tool, or a `reject`, since it may have run. The answer carries
+  `Answer.By` and `Answer.Reason`, which `Agent.Resume` puts on the
+  run's context for an output with `agentturn.ContextWithReasons`
+  beside `ContextWithDeciders`; `OutcomeUnknown` carries
+  `agentturn.OutcomeUnknownReason`, and `session.ReplayAnswers` says
+  which rule declined the call: "not run again: replay unknown", "not
+  run again: keyed without a key" or "not run again: no tool". A call
+  on a path without dispatch records, which may have run, is answered
+  the same way. A call run again gets a `proceed` carrying the
+  approval's new `Answer.Reason`. (#144)
 - Breaking: `Agent.Resume` applies agenttool's rule for running a call
   again to an approval of a call that may have run, pending as
   `PendingAborted` or, since the loop cannot say, as `PendingUnknown`:
@@ -126,9 +149,9 @@ versions may break the API.
   it with `agentturn.OutcomeUnknown`, or approve it with
   `Answer.WithRunAgain`, the only way past the rule, whose proceed
   carries `agentturn.RunAgainReason`. A keyed call approved with other
-  arguments than it was handed over with is refused unless the answer
-  carries a key of its own. A call run again runs with the arguments
-  it was first handed over with, a decision's rewrite included, which
+  arguments than the dispatch it repeats ran with is refused unless the
+  answer carries a key of its own. A call run again runs with the
+  arguments of that dispatch, a decision's rewrite included, which
   `PendingCall.Args` carries. A call cut before it was handed to its
   tool is now pending as `PendingUndispatched`, not `PendingAborted`,
   since it did not run, a deferred call approved and cut so included,
@@ -144,17 +167,28 @@ versions may break the API.
   not held. (#143)
 - Breaking: `agentturn.Trigger` gains `Extra`, the caller's richer
   facts about a firing, such as when it was due or which attempt it
-  is, which the session recorder writes as members of the run start
-  entry, where agentsession #82 put them. A name the entry already
-  has, one of the envelope's, the format's or `config_base`, is
-  refused with `session.ErrTriggerMember` before anything of the run
-  is written. `Trigger` holds a map now and no longer compares with
-  `==`. The items a run was prompted with carry its trigger on
-  `ItemEnd.Trigger`, and the recorder writes it as their `source`, as
-  it already did for a queued input. A child run of `tools/agent` no
-  longer inherits the trigger of the parent's run, whose `Extra` its
-  recorder would otherwise write on the child's run start;
-  `WithRunContext` can give it one of its own. (#146)
+  is, which the session recorder writes as members of the trigger
+  object beside kind, ref and source, where format 0.8 puts them: on
+  the run start, on a queued input's `queued` entry, written again
+  after a run end or a resume, and on the item that drains it, so a
+  03:00 firing queued behind a busy run keeps its slot.
+  `Recorder.Requeue` hands them back to the agent, as
+  `json.RawMessage` values. A name the format defines there, `kind`,
+  `ref` or `source`, or a value that does not encode as JSON, is
+  refused with `agentturn.ErrTriggerExtra` where the trigger enters,
+  whether or not a recorder is attached: the agent's `Prompt`,
+  `Continue`, `Resume` and `Deliver`, and the loop's `Run` and
+  `Continue`, refuse the run before it starts, and `Agent.Queue`,
+  which now returns an error, and `Recorder.Queue` queue nothing,
+  rather than failing the next, unrelated run. `Trigger.Validate`
+  makes the same check. `Trigger` holds a map now and no longer
+  compares with `==`. The items a run was prompted with carry its
+  trigger on `ItemEnd.Trigger`, and the recorder writes it as their
+  `source`, as it already did for a queued input. A child run of
+  `tools/agent` no longer inherits the trigger of the parent's run,
+  whose `Extra` its recorder would otherwise write on the child's run
+  start, nor who answered the parent's pending calls and why;
+  `WithRunContext` can give it a trigger of its own. (#146)
 - Behaviour change: an item steered during a turn after which the run
   stops, on `MaxTurns`, `ShouldStopAfterTurn`, a terminating result or
   a call that needs input, is no longer appended to the run that
@@ -213,6 +247,27 @@ versions may break the API.
   than running on the transcript the first task has not saved, which
   lost one of the two turns; a served agent whose tool sends to its own
   conversation gets that error instead of waiting on itself. (#141)
+- Two pending states from format 0.8. A call a record holds after its
+  dispatch is pending as `PendingDeferred` with the new
+  `PendingCall.Dispatched` set, the key and the arguments of that
+  dispatch: it waits on the caller and may have run, so
+  `Agent.Resume` holds an approval of it to the replay rule as it
+  does an aborted call's, which `PendingCall.MayHaveRun` reports, and
+  the recorder writes the approval as a `proceed` and a second
+  `dispatch`, and an output as an `answer`. A call an `answer` ended
+  before a crash wrote its output is pending as the new
+  `PendingAnswered`: `Agent.Resume` refuses an approval of it with
+  `ErrCallAnswered`, the recorder writes its output with no decision,
+  since the format allows nothing else after an answer, and
+  `session.ReplayAnswers` gives `OutcomeUnknown` as that output.
+  `session.Pending` read both as other states: the first as a plain
+  hold approved without the rule, the second as unknown, whose
+  approval the store refused. (#143)
+- Breaking: `session.DispatchKey` and `session.IdempotencyKeyMember`
+  are gone. agentsession reads the key into
+  `DispatchEntry.IdempotencyKey`, so a dispatch no longer holds it in
+  `Unknown`, and `Call.IdempotencyKey` with `Call.DispatchedArgs` read
+  the pair a run again repeats.
 
 ## v0.0.10 - 2026-09-28
 

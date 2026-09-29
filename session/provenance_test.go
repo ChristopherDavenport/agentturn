@@ -618,7 +618,7 @@ func TestRunStartCarriesTheTriggerInParts(t *testing.T) {
 	}
 	runs := runsOf(t, s)
 	start := runs[0].Start
-	if start.Ref != "cron:nightly" || start.Trigger == nil || *start.Trigger != (agentsession.Trigger{Kind: "cron", Ref: "nightly", Source: "scheduler"}) {
+	if start.Ref != "cron:nightly" || !start.Trigger.Equal(&agentsession.Trigger{Kind: "cron", Ref: "nightly", Source: "scheduler"}) {
 		t.Errorf("run start = %+v trigger %+v", start, start.Trigger)
 	}
 	if runs[1].Start.Trigger != nil || runs[1].Start.Ref != "" {
@@ -626,21 +626,24 @@ func TestRunStartCarriesTheTriggerInParts(t *testing.T) {
 	}
 }
 
-// TestTriggerExtraReachesTheRunStart pins #146: a firing's own facts,
-// its due time and attempt, are members of the run start entry, where
-// agentsession #82 put them; the prompt's item carries the trigger as
-// its source; and a name the entry already has is refused before
-// anything of the run is written.
-func TestTriggerExtraReachesTheRunStart(t *testing.T) {
+// TestTriggerExtraReachesTheTrigger pins #146 under format 0.8: a
+// firing's own facts, its due time and attempt, are members of the run
+// start's trigger object, where agentsession #101 put them, not of the
+// run entry; the prompt's item carries the same trigger as its source;
+// a name the run entry has is the trigger's to use; and one of the
+// trigger's own three is refused before anything of the run is
+// written.
+func TestTriggerExtraReachesTheTrigger(t *testing.T) {
 	cases := []struct {
 		name    string
 		extra   map[string]any
 		wantErr bool
 	}{
 		{"facts", map[string]any{"due_at": "2026-09-29T03:00:00Z", "attempt": 2}, false},
-		{"a format member", map[string]any{"run_id": "run_forged"}, true},
-		{"the envelope", map[string]any{"parent": "e1"}, true},
-		{"the recorder's member", map[string]any{ConfigBaseMember: "sha256:0"}, true},
+		{"a run entry member", map[string]any{"run_id": "run_7", ConfigBaseMember: "sha256:0"}, false},
+		{"kind", map[string]any{"kind": "forged"}, true},
+		{"source", map[string]any{"source": "forged"}, true},
+		{"not JSON", map[string]any{"due_at": func() {}}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -655,8 +658,8 @@ func TestTriggerExtraReachesTheRunStart(t *testing.T) {
 			prompt := openresponses.UserText("go")
 			_, err = a.Prompt(agentturn.ContextWithTrigger(context.Background(), trigger), prompt)
 			if tc.wantErr {
-				if !errors.Is(err, ErrTriggerMember) {
-					t.Fatalf("err = %v, want ErrTriggerMember", err)
+				if !errors.Is(err, agentturn.ErrTriggerExtra) {
+					t.Fatalf("err = %v, want ErrTriggerExtra", err)
 				}
 				if leaf := s.Leaf(); leaf != "" {
 					t.Errorf("a refused run start left entry %s", leaf)
@@ -666,23 +669,182 @@ func TestTriggerExtraReachesTheRunStart(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			start := runsOf(t, s)[0].Start
-			if string(start.Unknown["due_at"]) != `"2026-09-29T03:00:00Z"` || string(start.Unknown["attempt"]) != "2" {
-				t.Errorf("run start members = %s", start.Unknown)
+			want := &agentsession.Trigger{Kind: "cron", Ref: "nightly", Source: "scheduler"}
+			for name, v := range tc.extra {
+				if err := want.SetMember(name, v); err != nil {
+					t.Fatal(err)
+				}
 			}
-			if start.Trigger == nil || *start.Trigger != (agentsession.Trigger{Kind: "cron", Ref: "nightly", Source: "scheduler"}) {
-				t.Errorf("run start trigger = %+v", start.Trigger)
+			start := runsOf(t, s)[0].Start
+			if !start.Trigger.Equal(want) {
+				t.Errorf("run start trigger = %+v, want %+v", start.Trigger, want)
+			}
+			for name := range tc.extra {
+				if _, ok := start.Unknown[name]; ok && name != ConfigBaseMember {
+					t.Errorf("run start carries %q as a member of its own: %s", name, start.Unknown)
+				}
+			}
+			if start.RunID == "run_7" {
+				t.Errorf("the trigger's run_id reached the run entry")
 			}
 			id, ok := rec.EntryOf(context.Background(), prompt)
 			if !ok {
 				t.Fatal("the prompt has no entry")
 			}
 			e, _ := s.Entry(id)
-			if it, ok := e.(*agentsession.ItemEntry); !ok || it.Source == nil || *it.Source != *start.Trigger {
+			if it, ok := e.(*agentsession.ItemEntry); !ok || !it.Source.Equal(start.Trigger) {
 				t.Errorf("prompt entry = %+v", e)
 			}
+			verifyAll(t, s)
 		})
 	}
+}
+
+// TestQueuedTriggerKeepsItsExtra pins #146 and agentsession #101 for a
+// queued input: a firing queued behind a busy run keeps its due time
+// and attempt on the queued entry, through a crash and Requeue, and
+// on the item that drains it, the same object each time.
+func TestQueuedTriggerKeepsItsExtra(t *testing.T) {
+	cases := []struct {
+		name string
+		// queue queues the item on a with ctx, through the recorder or
+		// the agent.
+		queue func(ctx context.Context, rec *Recorder, a *agentturn.Agent, item openresponses.Item) error
+	}{
+		{"Recorder.Queue", func(ctx context.Context, rec *Recorder, a *agentturn.Agent, item openresponses.Item) error {
+			return rec.Queue(ctx, a, agentturn.QueueFollowUp, item)
+		}},
+		{"Agent.Queue", func(ctx context.Context, _ *Recorder, a *agentturn.Agent, item openresponses.Item) error {
+			a.Queue(ctx, agentturn.QueueFollowUp, item)
+			return nil
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}})
+			unsub := rec.Attach(a)
+			if _, err := a.Prompt(context.Background(), openresponses.UserText("first")); err != nil {
+				t.Fatal(err)
+			}
+			firing := agentturn.Trigger{Kind: "cron", Ref: "03:00", Extra: map[string]any{"due_at": "2026-09-29T03:00:00Z", "attempt": 2}}
+			item := openresponses.UserText("the 03:00 firing")
+			if err := tc.queue(agentturn.ContextWithTrigger(context.Background(), firing), rec, a, item); err != nil {
+				t.Fatal(err)
+			}
+			if tc.name == "Agent.Queue" {
+				// The agent's queued event waits for a run; a run
+				// the crash cuts short takes the event and not the
+				// item.
+				if _, err := a.Prompt(context.Background(), openresponses.UserText("second")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			want := &agentsession.Trigger{Kind: "cron", Ref: "03:00"}
+			for name, v := range firing.Extra {
+				if err := want.SetMember(name, v); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var queued *agentsession.QueuedEntry
+			for _, e := range s.Entries() {
+				if q, ok := e.(*agentsession.QueuedEntry); ok {
+					queued = q
+				}
+			}
+			if queued == nil || !queued.Trigger.Equal(want) {
+				t.Fatalf("queued = %+v", queued)
+			}
+			if tc.name == "Agent.Queue" {
+				// The second run drained it already.
+				checkDrained(t, s, want)
+				return
+			}
+			// The crash: a new process resumes and hands the owed
+			// input back.
+			unsub()
+			rec2, s2, err := Resume(context.Background(), store, s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts, err := AgentOptions(s2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := agentturn.New(agentturn.Config{Model: &echo.Adapter{}}, opts...)
+			defer rec2.Attach(b)()
+			if n := rec2.Requeue(context.Background(), b); n != 1 {
+				t.Fatalf("requeued %d", n)
+			}
+			if _, err := b.Prompt(context.Background(), openresponses.UserText("second")); err != nil {
+				t.Fatal(err)
+			}
+			checkDrained(t, s2, want)
+		})
+	}
+}
+
+// TestBadTriggerExtraIsRefusedAtTheQueue checks that an input queued
+// with a trigger whose Extra cannot be written is refused by the call
+// that queues it, so it is neither queued nor recorded, and the next
+// run, which it used to fail, records as any other.
+func TestBadTriggerExtraIsRefusedAtTheQueue(t *testing.T) {
+	cases := []struct {
+		name  string
+		queue func(ctx context.Context, rec *Recorder, a *agentturn.Agent) error
+	}{
+		{"Agent.Queue", func(ctx context.Context, _ *Recorder, a *agentturn.Agent) error {
+			return a.Queue(ctx, agentturn.QueueSteer, openresponses.UserText("steered"))
+		}},
+		{"Recorder.Queue", func(ctx context.Context, rec *Recorder, a *agentturn.Agent) error {
+			return rec.Queue(ctx, a, agentturn.QueueFollowUp, openresponses.UserText("queued"))
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}})
+			defer rec.Attach(a)()
+			ctx := agentturn.ContextWithTrigger(context.Background(), agentturn.Trigger{Kind: "cron", Extra: map[string]any{"ref": "forged"}})
+			if err := tc.queue(ctx, rec, a); !errors.Is(err, agentturn.ErrTriggerExtra) {
+				t.Fatalf("err = %v, want ErrTriggerExtra", err)
+			}
+			if _, err := a.Prompt(context.Background(), openresponses.UserText("next")); err != nil {
+				t.Fatalf("the next prompt: %v", err)
+			}
+			if n := countQueued(s); n != 0 {
+				t.Errorf("queued entries = %d in %q", n, entryTypes(s))
+			}
+			if runs := runsOf(t, s); len(runs) != 1 || runs[0].End == nil || runs[0].End.Reason != agentsession.ReasonDone {
+				t.Errorf("runs = %+v", runs)
+			}
+			verifyAll(t, s)
+		})
+	}
+}
+
+// checkDrained checks that the item a queue drained carries want as its
+// source, and that the path verifies.
+func checkDrained(t *testing.T, s *agentsession.Session, want *agentsession.Trigger) {
+	t.Helper()
+	var drained *agentsession.ItemEntry
+	for _, e := range s.Path(s.Leaf()) {
+		if it, ok := e.(*agentsession.ItemEntry); ok && it.QueuedFrom != "" {
+			drained = it
+		}
+	}
+	if drained == nil || !drained.Source.Equal(want) {
+		t.Errorf("drained = %+v", drained)
+	}
+	verifyAll(t, s)
 }
 
 type note struct{ Text string }

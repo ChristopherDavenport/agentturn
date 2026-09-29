@@ -838,17 +838,21 @@ func TestRecordableDetailsBecomeACustomEntry(t *testing.T) {
 		return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: "first 4 KB ... last 4 KB"}, Details: sideData{Path: "/tmp/out.log", Bytes: 300_000}}, nil
 	})
 	plain := agenttool.New("plain", "", func(_ context.Context, _ echoArgs) (string, error) { return "x", nil })
-	// A serial batch, so the dispatches fall in one order: the executor
-	// hands the second call over as soon as the first returns, before
-	// the loop has settled the first, so its record follows both.
+	// A serial batch. The executor hands the second call over as soon as
+	// the first returns, racing the loop settling the first, so the
+	// record may fall on either side of the second dispatch.
 	a := agentturn.New(agentturn.Config{Model: allCalls{}, Tools: []agenttool.Tool{keeper, plain}, ToolExecution: agentturn.ExecSequential})
 	defer rec.Attach(a)()
 	if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
 		t.Fatal(err)
 	}
-	// Only the recordable value is written, between the dispatches and
-	// the outputs; a Details value for subscribers alone is not.
-	if got := entryTypes(s); got != "run config item:user item:function_call* item:function_call* response dispatch dispatch custom item:function_call_output item:function_call_output item:assistant* response run" {
+	// Only the recordable value is written, after its call's dispatch
+	// and before the outputs; a Details value for subscribers alone is
+	// not.
+	switch got := entryTypes(s); got {
+	case "run config item:user item:function_call* item:function_call* response dispatch dispatch custom item:function_call_output item:function_call_output item:assistant* response run",
+		"run config item:user item:function_call* item:function_call* response dispatch custom dispatch item:function_call_output item:function_call_output item:assistant* response run":
+	default:
 		t.Errorf("entries = %q", got)
 	}
 	var found *agentsession.CustomEntry

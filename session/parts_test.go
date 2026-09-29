@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -382,4 +383,137 @@ func TestInstructionsPartsSurviveEveryResume(t *testing.T) {
 			verifyAll(t, s)
 		})
 	}
+}
+
+// TestOmittedPartsStayInForce pins #147 under format 0.8, where the
+// omitted list stays in force until a config changes it: a memory
+// larger than its block, with 474 omissions, pays for the list once and
+// for the part that moved on each write after, rather than repeating
+// the list on every delta, which cost more than the joined string. A
+// list that changes is written, on an entry of its own when nothing
+// else moved; one that empties is written as []; and a resumed
+// recorder, seeded with the list in force, writes nothing for it.
+func TestOmittedPartsStayInForce(t *testing.T) {
+	l := &layers{ids: []string{"product", "memory"}, text: map[string]string{"product": strings.Repeat("p", 2000), "memory": "Memory: likes tea"}}
+	for i := range 474 {
+		l.omitted = append(l.omitted, agentsession.OmittedPart{ID: fmt.Sprintf("memory/%03d", i), Reason: "budget", Size: 80})
+	}
+	listBytes := jsonLen(l.omitted)
+	partsOf := func(context.Context, openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
+		return l.parts(), append([]agentsession.OmittedPart(nil), l.omitted...)
+	}
+	cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Instructions: "unrendered",
+		BeforeModelCall: func(_ context.Context, req *openresponses.Request) error {
+			req.Instructions = l.render()
+			return nil
+		}}
+	// omittedMember is the instructions_omitted member of a config
+	// entry as written, "" when it has none.
+	omittedMember := func(t *testing.T, c *agentsession.ConfigEntry) string {
+		t.Helper()
+		raw, err := agentsession.MarshalEntry(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		return string(m["instructions_omitted"])
+	}
+	steps := []struct {
+		name   string
+		change func()
+		// resume reopens the session in a new recorder and agent
+		// before the prompt.
+		resume bool
+		// want checks the config entries the prompt added.
+		want func(t *testing.T, added []*agentsession.ConfigEntry)
+	}{
+		{"first", nil, false, func(t *testing.T, added []*agentsession.ConfigEntry) {
+			// The base the hook renders over, then the request sent.
+			if len(added) != 2 || len(added[1].InstructionsOmitted) != 474 {
+				t.Errorf("first configs = %d entries", len(added))
+			}
+		}},
+		{"a memory write", func() { l.text["memory"] += ", Bristol" }, false, func(t *testing.T, added []*agentsession.ConfigEntry) {
+			if len(added) != 1 || omittedMember(t, added[0]) != "" {
+				t.Fatalf("delta = %+v", added)
+			}
+			n := jsonLen(added[0])
+			t.Logf("a %d byte patch under %d omitted parts: a %d byte delta, the list %d bytes", len(", Bristol"), len(l.omitted), n, listBytes)
+			if n >= listBytes/10 {
+				t.Errorf("the delta for a %d byte patch is %d bytes, the list %d", len(", Bristol"), n, listBytes)
+			}
+		}},
+		{"another", func() { l.text["memory"] += ", cats" }, false, func(t *testing.T, added []*agentsession.ConfigEntry) {
+			if len(added) != 1 || omittedMember(t, added[0]) != "" {
+				t.Errorf("delta = %+v", added)
+			}
+		}},
+		{"the list moves alone", func() { l.omitted = l.omitted[1:] }, false, func(t *testing.T, added []*agentsession.ConfigEntry) {
+			if len(added) != 1 || len(added[0].InstructionsOmitted) != 473 || added[0].InstructionsParts != nil || added[0].Instructions != nil {
+				t.Errorf("entry = %+v", added)
+			}
+		}},
+		{"nothing moves", nil, false, func(t *testing.T, added []*agentsession.ConfigEntry) {
+			if len(added) != 0 {
+				t.Errorf("configs = %+v", added)
+			}
+		}},
+		{"a resume", nil, true, func(t *testing.T, added []*agentsession.ConfigEntry) {
+			if len(added) != 0 {
+				t.Errorf("configs = %+v", added)
+			}
+		}},
+		{"the list empties", func() { l.omitted = nil }, false, func(t *testing.T, added []*agentsession.ConfigEntry) {
+			if len(added) != 1 || omittedMember(t, added[0]) != "[]" || added[0].InstructionsParts != nil {
+				t.Errorf("entry = %+v", added)
+			}
+		}},
+		{"an empty list after a resume", nil, true, func(t *testing.T, added []*agentsession.ConfigEntry) {
+			if len(added) != 0 {
+				t.Errorf("configs = %+v", added)
+			}
+		}},
+	}
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{}, WithInstructionsParts(partsOf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(cfg)
+	unsub := rec.Attach(a)
+	for _, st := range steps {
+		if st.change != nil {
+			st.change()
+		}
+		if st.resume {
+			unsub()
+			rec, s, err = Resume(context.Background(), store, s.ID(), WithInstructionsParts(partsOf))
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts, err := AgentOptions(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a = agentturn.New(cfg, opts...)
+			unsub = rec.Attach(a)
+		}
+		seen := len(configs(s))
+		if _, err := a.Prompt(context.Background(), openresponses.UserText(st.name)); err != nil {
+			t.Fatalf("%s: %v", st.name, err)
+		}
+		st.want(t, configs(s)[seen:])
+		cx, err := s.Context()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(cx.InstructionsOmitted()) != len(l.omitted) {
+			t.Errorf("%s: %d omitted in force, the host left out %d", st.name, len(cx.InstructionsOmitted()), len(l.omitted))
+		}
+	}
+	unsub()
+	verifyAll(t, s)
 }

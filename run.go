@@ -41,7 +41,8 @@ const EventBuffer = 256
 // run ended and its Err carries the failure when Reason is ReasonError,
 // the context error when Reason is ReasonAborted, and nil otherwise. A
 // misuse before the run starts ([ErrNoPrompt], [ErrCannotContinue],
-// [ErrNoModel], a duplicate tool name, or [ErrInputRequired] for a
+// [ErrNoModel], [ErrTriggerExtra], a duplicate tool name, or
+// [ErrInputRequired] for a
 // transcript with a function call that neither the transcript nor the
 // prompts' leading outputs answer) yields one RunEnd with ReasonError
 // and no other event.
@@ -56,6 +57,9 @@ func Run(ctx context.Context, t Transcript, prompts openresponses.Items, cfg Con
 	if len(prompts) == 0 {
 		return failNow(ErrNoPrompt)
 	}
+	if err := TriggerFromContext(ctx).Validate(); err != nil {
+		return failNow(err)
+	}
 	if err := answersPending(pendingCalls(unansweredCalls(t), PendingUnknown), prompts); err != nil {
 		return failNow(err)
 	}
@@ -66,6 +70,9 @@ func Run(ctx context.Context, t Transcript, prompts openresponses.Items, cfg Con
 // satisfy [CanContinue] and answer every function call it holds. Events
 // arrive as for [Run].
 func Continue(ctx context.Context, t Transcript, cfg Config) iter.Seq[Event] {
+	if err := TriggerFromContext(ctx).Validate(); err != nil {
+		return failNow(err)
+	}
 	if calls := unansweredCalls(t); len(calls) > 0 {
 		return failNow(fmt.Errorf("%w: %d call(s) unanswered", ErrInputRequired, len(calls)))
 	}
@@ -194,6 +201,7 @@ type runContextKey struct{}
 type steeredKey struct{}
 type triggerKey struct{}
 type decidersKey struct{}
+type reasonsKey struct{}
 
 // ContextWithTrigger attaches a [Trigger] to ctx. A run started with
 // that context, through [Run], [Continue] or an [Agent], carries it on
@@ -212,7 +220,8 @@ func TriggerFromContext(ctx context.Context) Trigger {
 
 // ContextWithDeciders attaches who decided the answer to each pending
 // call, by call ID, in the session format's terms ("human", "policy",
-// "agent"). [Agent.Resume] does it from the [Answer.By] of the answers
+// "agent"), in place of any an outer context attached; an empty map
+// clears them. [Agent.Resume] does it from the [Answer.By] of the answers
 // it was given, so a subscriber writing the record of an output the
 // caller supplied, which raises no tool_start to carry a decision, can
 // say who wrote it. A host driving the low-level [Run] with the
@@ -220,7 +229,10 @@ func TriggerFromContext(ctx context.Context) Trigger {
 // it.
 func ContextWithDeciders(ctx context.Context, by map[string]string) context.Context {
 	if len(by) == 0 {
-		return ctx
+		if ctx.Value(decidersKey{}) == nil {
+			return ctx
+		}
+		return context.WithValue(ctx, decidersKey{}, map[string]string(nil))
 	}
 	out := make(map[string]string, len(by))
 	for k, v := range by {
@@ -234,6 +246,34 @@ func ContextWithDeciders(ctx context.Context, by map[string]string) context.Cont
 func DeciderFromContext(ctx context.Context, callID string) string {
 	by, _ := ctx.Value(decidersKey{}).(map[string]string)
 	return by[callID]
+}
+
+// ContextWithReasons attaches why each pending call was answered as it
+// was, by call ID, as [ContextWithDeciders] attaches who decided, in
+// place of any an outer context attached; an empty map clears them.
+// [Agent.Resume] does it from the [Answer.Reason] of the answers it was
+// given as outputs, so a subscriber writing the record of an output
+// for a call that may have run can say why the call was not run again.
+// The loop reads nothing from it.
+func ContextWithReasons(ctx context.Context, reasons map[string]string) context.Context {
+	if len(reasons) == 0 {
+		if ctx.Value(reasonsKey{}) == nil {
+			return ctx
+		}
+		return context.WithValue(ctx, reasonsKey{}, map[string]string(nil))
+	}
+	out := make(map[string]string, len(reasons))
+	for k, v := range reasons {
+		out[k] = v
+	}
+	return context.WithValue(ctx, reasonsKey{}, out)
+}
+
+// ReasonFromContext returns the reason the caller gave for the answer
+// to callID, or "" when none was given.
+func ReasonFromContext(ctx context.Context, callID string) string {
+	reasons, _ := ctx.Value(reasonsKey{}).(map[string]string)
+	return reasons[callID]
 }
 
 // ContextWithTranscript attaches a transcript to ctx. The loop does this
@@ -612,10 +652,16 @@ func (r *runner) pending() []PendingCall {
 			if !sameArgs(h.args, orEmpty(nil, call.Arguments)) {
 				p.Args = h.args
 			}
-		case known && (before.Reason == PendingAborted || before.Reason == PendingUnknown):
+		case known && before.MayHaveRun():
 			// It may have run before this run, which did not run it
-			// again, so it is as ambiguous as it was.
-			p.Reason, p.IdempotencyKey, p.Args = before.Reason, before.IdempotencyKey, before.Args
+			// again, so it is as ambiguous as it was. A call held
+			// after its dispatch that this run approved has its hold
+			// answered and is left as a cut leaves one; a resume that
+			// failed before its batch leaves it held.
+			p.Reason, p.Dispatched, p.IdempotencyKey, p.Args = before.Reason, before.Dispatched, before.IdempotencyKey, before.Args
+			if before.Reason == PendingDeferred && r.approved[call.CallID] {
+				p.Reason, p.Dispatched = PendingAborted, false
+			}
 		case r.undispatched[call.CallID] || mine[call] || r.approved[call.CallID]:
 			p.Reason = PendingUndispatched
 		case known:

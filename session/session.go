@@ -32,12 +32,12 @@
 //   - run_start: a run entry with phase start, the source the loop
 //     reports (input, or resume for a run that answers pending calls),
 //     the [agentturn.Trigger] on the context joined as ref and in its
-//     parts as trigger, and, when the recorder knows the agent's
-//     configuration ([Recorder.Attach] and [WithConfig] give it one),
-//     the hash of its base request as [ConfigBaseMember], and the
-//     trigger's Extra as members of their own, refused with
-//     [ErrTriggerMember] when one names a member the entry already
-//     has; then, for
+//     parts as trigger, the trigger's Extra as members of the trigger
+//     beside kind, ref and source, refused with agentturn.ErrTriggerExtra
+//     when one names one of the three, and, when the recorder knows
+//     the agent's configuration ([Recorder.Attach] and [WithConfig]
+//     give it one), the hash of its base request as
+//     [ConfigBaseMember]; then, for
 //     the recorder's own session, the env entry [WithEnv] supplies
 //     when it differs from the last one written, members the library
 //     does not define included; then, with a configuration, a full
@@ -56,7 +56,9 @@
 //     the stored path replays to the request's settings. With
 //     [WithInstructionsParts] the instructions are written as the parts
 //     they are composed of, a delta naming only the parts that moved,
-//     and what the host left out as instructions_omitted.
+//     and what the host left out as instructions_omitted when it
+//     changed, since the list stays in force until a config changes
+//     it.
 //   - model_retry: a custom entry in the [ModelRetryNS] namespace
 //     saying which attempt failed, why, how long the loop waited and
 //     whether Retry.Revise changed the request; and the settings of the
@@ -76,9 +78,9 @@
 //     carries visible false, the format's word for an item that is part
 //     of the model context and that a renderer should hide. An item the
 //     run was prompted with carries the run's trigger as its source, and
-//     a queued input the trigger it was queued with. An item the
-//     filter in force would hide from the
-//     model, an app-only extension item, is written as a custom entry
+//     a queued input the trigger it was queued with, Extra and all. An
+//     item the filter in force would hide from the model, an app-only
+//     extension item, is written as a custom entry
 //     instead so the path rebuilds exactly the input that was sent. A
 //     function_call_output for a call the path holds no dispatch and no
 //     reject for, one the caller answered through Agent.Resume with an
@@ -88,10 +90,17 @@
 //     dispatch behind is the same thing to a reader. A call the loop
 //     refused itself, for a name no tool has or arguments that are not
 //     an object, is the same shape with policy as the decider. An
-//     output the caller wrote for a call an earlier run dispatched,
-//     the [agentturn.OutcomeUnknown] answer to a call that may have
-//     run, has no decision before it: the output is the record, and
-//     the absence of a second dispatch says the tool did not run again.
+//     output the caller wrote for a call that may have run, one an
+//     earlier run dispatched or one a path without dispatch records
+//     cannot say about, such as the [agentturn.OutcomeUnknown] answer
+//     to a call in flight at a crash, is preceded by an answer
+//     decision, the format's verdict for a call ended without running
+//     again, whose by is Answer.By and whose reason is Answer.Reason;
+//     the absence of a second dispatch says the tool did not run
+//     again. A call the path shows answered already, its output lost
+//     to a crash between the two or to a write that failed after the
+//     answer, gets its output alone; only an output answers it, and
+//     [Pending] reads it as [agentturn.PendingAnswered].
 //   - tool_start: the call's decision when there is one to record. A
 //     BeforeToolCall that blocked the call is a reject decision with
 //     its reason; one that deferred it is a hold carrying the same
@@ -115,10 +124,10 @@
 //     call's own goroutine and the barrier holds it there, so the
 //     dispatch is durable before the tool runs, and a write that fails
 //     stops the call. It carries the idempotency key the tool receives
-//     as an idempotency_key member, which the format does not yet
-//     define and keeps as written. A call run again after a restart
-//     gets a second dispatch, so the path holds one per hand-off to
-//     the tool, and a reader counts the times it may have run.
+//     as idempotency_key. A call run again after a restart gets a
+//     second dispatch carrying the key of the one it repeats, so the
+//     path holds one per hand-off to the tool, and a reader counts the
+//     times it may have run.
 //   - response_end: the response entry with status, usage, error and the
 //     request hash, after the items it produced and before any tool
 //     output of the turn; for a call Retry tried again, attempts, the
@@ -502,30 +511,39 @@ type Elicitation struct {
 // written.
 var ErrRunActive = errors.New("session: a run is active")
 
-// ErrTriggerMember is returned, ending the run before anything else of
-// it is written, for an [agentturn.Trigger] whose Extra names a member
-// the run start entry already has: one of the envelope, one the format
-// defines for a run entry, or [ConfigBaseMember]. The format's members
-// take precedence, and the recorder refuses rather than drop the
-// caller's fact or write a line with the name twice.
-var ErrTriggerMember = errors.New("session: trigger extra names a member of the run entry")
-
-// runStartMembers are the names a run start entry holds whatever a
-// trigger's Extra says.
-var runStartMembers = map[string]bool{
-	"id": true, "type": true, "parent": true, "parents": true, "ts": true, "content": true,
-	"legacy_id": true, "normalised": true,
-	"run_id": true, "phase": true, "source": true, "reason": true, "ref": true, "pending": true, "trigger": true,
-	ConfigBaseMember: true,
+// sessionTrigger returns the trigger object for t, its Extra as
+// members of its own, or nil when t names nothing. The agent refuses
+// an Extra that cannot be written where the trigger enters; this
+// refuses it again, with [agentturn.ErrTriggerExtra], for a trigger
+// that reached the recorder some other way, such as through [Handle],
+// before anything of it is written.
+func sessionTrigger(t agentturn.Trigger) (*agentsession.Trigger, error) {
+	if t.IsZero() {
+		return nil, nil
+	}
+	if err := t.Validate(); err != nil {
+		return nil, err
+	}
+	out := &agentsession.Trigger{Kind: t.Kind, Ref: t.Ref, Source: t.Source}
+	for name, v := range t.Extra {
+		if err := out.SetMember(name, v); err != nil {
+			return nil, fmt.Errorf("%w: %w", agentturn.ErrTriggerExtra, err)
+		}
+	}
+	return out, nil
 }
 
-// triggerParts returns the trigger member for t's parts, or nil when it
-// names none of them.
-func triggerParts(t agentturn.Trigger) *agentsession.Trigger {
-	if t.Kind == "" && t.Ref == "" && t.Source == "" {
-		return nil
+// agentTrigger is the agentturn trigger for a trigger object read back
+// from the path, its members of its own as Extra.
+func agentTrigger(t *agentsession.Trigger) agentturn.Trigger {
+	out := agentturn.Trigger{Kind: t.Kind, Ref: t.Ref, Source: t.Source}
+	for name, raw := range t.Unknown {
+		if out.Extra == nil {
+			out.Extra = make(map[string]any, len(t.Unknown))
+		}
+		out.Extra[name] = raw
 	}
-	return &agentsession.Trigger{Kind: t.Kind, Ref: t.Ref, Source: t.Source}
+	return out
 }
 
 // Recorder is an agentturn subscriber that writes one session, and the
@@ -650,10 +668,6 @@ type writer struct {
 	// forked path owes that nobody has taken up. The agent's own
 	// outlive a rebase, since the agent still holds them.
 	inbox []*inboxItem
-	// omitted is the instructions_omitted of the last config entry that
-	// carried one, encoded, so a change to what was left out is written
-	// even when the settings did not move.
-	omitted []byte
 
 	// run is the ID of the run being written, "" between runs; open
 	// lists, in order, the calls of that run with no output yet;
@@ -696,15 +710,21 @@ type callRecord struct {
 	args string
 	// held is set while the latest decision is a hold that nothing has
 	// answered; dispatched once a dispatch is written; rejected once a
-	// reject is; answered once an output for it is on the path, which
-	// is what the format reads as a call that is no longer pending.
-	// dispatchRun is the run the last dispatch was written in, so a
-	// call an earlier run dispatched and this one runs again gets a
-	// dispatch of its own.
+	// reject is; ended once an answer decision is, which only the
+	// output may follow; answered once an output for it is on the
+	// path, which is what the format reads as a call that is no longer
+	// pending. unknown marks a call seeded from a path whose header
+	// does not promise dispatch records, which may have run without
+	// one. dispatchRun is the run the last dispatch was written in, ""
+	// for one on the path the writer was seeded from, so a call an
+	// earlier run dispatched and this one runs again gets a dispatch
+	// of its own.
 	held        bool
 	dispatched  bool
 	rejected    bool
+	ended       bool
 	answered    bool
+	unknown     bool
 	dispatchRun string
 	// settledRun is the run whose tool_end ended the call without a
 	// dispatch: the loop refused it itself, for a name no tool has or
@@ -787,11 +807,12 @@ func WithEnv(fn func(context.Context) (*agentsession.EnvEntry, error)) Option {
 // the string as it does without this option, since the record must
 // describe what the model was sent and must not fail the run over how
 // a product composed it; so are parts the format refuses, one with no
-// ID or two sharing one. The omitted parts are written on every config
-// entry while they are non-empty, and on an entry of their own when
-// they change and the settings do not. The format has no way to say
-// that nothing is omitted any more, so a list that empties is not
-// written and a reader keeps the last one. A session written before
+// ID or two sharing one. The omitted parts stay in force until a later
+// config changes them, so they are written on a config entry only
+// when they differ from the list in force, on an entry of their own
+// when the settings did not move, and as an empty list when nothing is
+// omitted any more; a replace, which clears the list, carries it
+// whenever it is non-empty. A session written before
 // the option was set has the joined string on its path, and the first
 // entry under the option carries the text of every part, once.
 func WithInstructionsParts(fn func(ctx context.Context, req openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart)) Option {
@@ -888,34 +909,19 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 	return resume(ctx, s, store, opts)
 }
 
-// IdempotencyKeyMember is the member of a dispatch entry that carries
-// the idempotency key the call was handed to its tool with. The format
-// does not define it yet, and a reader that does not know it keeps it
-// as written.
-const IdempotencyKeyMember = "idempotency_key"
-
-// DispatchKey returns the idempotency key a dispatch carries, or ""
-// when it carries none.
-func DispatchKey(d *agentsession.DispatchEntry) string {
-	if d == nil {
-		return ""
-	}
-	var key string
-	if raw, ok := d.Unknown[IdempotencyKeyMember]; !ok || json.Unmarshal(raw, &key) != nil {
-		return ""
-	}
-	return key
-}
-
 // Pending returns the calls pending at the session's leaf as the agent
 // lists them, with the reason the record gives each: a call held by a
-// hold decision is [agentturn.PendingDeferred]; one with a dispatch
-// may have run and is [agentturn.PendingAborted], with the key its
-// first dispatch carried and the arguments a decision gave it; one with
-// none, when the header promises
-// dispatch records, never started and is
-// [agentturn.PendingUndispatched]; and one the file cannot say about
-// is [agentturn.PendingUnknown], with those arguments too. It is what
+// hold decision is [agentturn.PendingDeferred], and Dispatched when
+// the hold follows its dispatch; one in flight when the record stopped
+// may have run and is [agentturn.PendingAborted]; one an answer
+// decision ended before its output was written is
+// [agentturn.PendingAnswered], owed that output and nothing else; one
+// with no dispatch, when the header promises dispatch records, never
+// started and is [agentturn.PendingUndispatched]; and one the file
+// cannot say about is [agentturn.PendingUnknown]. A call that may have
+// run carries the key of its last dispatch and the arguments that
+// dispatch ran with, the pair a run of it again repeats, and one the
+// file cannot say about the arguments a decision gave it. It is what
 // [agentturn.WithPending] seeds an agent with beside the context's
 // items, so the agent's Resume knows which calls never started;
 // [AgentOptions] gives both.
@@ -932,13 +938,23 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 		p := agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingUnknown}
 		switch c.State(s.Header()) {
 		case agentsession.CallHeld:
-			p.Reason = agentturn.PendingDeferred
+			p.Reason, p.Dispatched = agentturn.PendingDeferred, len(c.Dispatches) > 0
 		case agentsession.CallInFlight:
-			p.Reason, p.IdempotencyKey = agentturn.PendingAborted, DispatchKey(c.Dispatch)
+			p.Reason = agentturn.PendingAborted
+		case agentsession.CallAnswered:
+			p.Reason = agentturn.PendingAnswered
 		case agentsession.CallNeverStarted:
 			p.Reason = agentturn.PendingUndispatched
 		}
-		if args := c.Args(); args != c.Call.Arguments && (p.Reason == agentturn.PendingAborted || p.Reason == agentturn.PendingUnknown) {
+		var args string
+		switch {
+		case !p.MayHaveRun():
+		case len(c.Dispatches) > 0:
+			p.IdempotencyKey, args = c.IdempotencyKey(), c.DispatchedArgs()
+		default:
+			args = c.Args()
+		}
+		if args != "" && args != c.Call.Arguments {
 			p.Args = json.RawMessage(args)
 		}
 		out = append(out, p)
@@ -969,12 +985,19 @@ func AgentOptions(s *agentsession.Session) ([]agentturn.Option, error) {
 // that never started is approved. A call that may have run, in flight
 // when the record stopped or one the file cannot say about, is
 // ambiguous: it is approved when its tool, looked up in tools by name,
-// says replay is safe for the arguments it was handed over with, or
-// keyed and its first dispatch carries the key, and the approval then
-// carries those arguments and that key; and it is
-// answered with [agentturn.OutcomeUnknown] otherwise, including when
-// no tool has its name. A held call is waiting for someone and is the
-// caller's to answer; [Pending] lists it as deferred.
+// says replay is safe for the arguments its last dispatch ran with,
+// or keyed and that dispatch carries a key, and the approval then
+// carries those arguments and that key, with the reason "run again:
+// safe" or "run again: keyed"; and it is answered with
+// [agentturn.OutcomeUnknown] otherwise, including when no tool has its
+// name, with a reason saying which: "not run again: no tool", "not run
+// again: keyed without a key" or "not run again: replay unknown". A
+// recorder writes that answer as an answer decision before the
+// output. A call an answer ended before its output was written gets
+// [agentturn.OutcomeUnknown] as that output, since the record holds
+// the answer and not the output it gave. A held call is waiting for
+// someone and is the caller's to answer, a call held after its
+// dispatch included; [Pending] lists it as deferred.
 //
 // The answers are what a host passes to Agent.Resume after [Resume],
 // with its own for the held calls, once the agent is seeded with the
@@ -994,6 +1017,8 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 			continue
 		case agentturn.PendingUndispatched:
 			ans = agentturn.Approve(id)
+		case agentturn.PendingAnswered:
+			ans = agentturn.OutcomeUnknown(id)
 		default:
 			ans = replayAnswer(ctx, set, p)
 		}
@@ -1007,7 +1032,7 @@ func replayAnswer(ctx context.Context, tools agenttool.Set, p agentturn.PendingC
 	id := p.Call.CallID
 	tool, ok := tools.Lookup(p.Call.Name)
 	if !ok {
-		return agentturn.OutcomeUnknown(id)
+		return agentturn.OutcomeUnknown(id).WithReason("not run again: no tool")
 	}
 	args := p.Args
 	if args == nil {
@@ -1026,8 +1051,9 @@ func replayAnswer(ctx context.Context, tools agenttool.Set, p agentturn.PendingC
 		if p.IdempotencyKey != "" {
 			return again.WithReason("run again: keyed")
 		}
+		return agentturn.OutcomeUnknown(id).WithReason("not run again: keyed without a key")
 	}
-	return agentturn.OutcomeUnknown(id)
+	return agentturn.OutcomeUnknown(id).WithReason("not run again: replay unknown")
 }
 
 // Continue rolls the session with the given ID over into a successor
@@ -1096,9 +1122,7 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 	}
 	for _, q := range owed {
 		again := agentsession.NewQueued(q.Item, q.Mode)
-		if q.Trigger != nil {
-			again.WithTrigger(q.Trigger.Kind, q.Trigger.Ref, q.Trigger.Source)
-		}
+		again.Trigger = q.Trigger.Clone()
 		if _, err := w.append(ctx, again); err != nil {
 			return err
 		}
@@ -1212,9 +1236,7 @@ func (w *writer) requeue(ctx context.Context) error {
 			continue
 		}
 		q := agentsession.NewQueued(in.item, in.mode)
-		if in.trigger != nil {
-			q.WithTrigger(in.trigger.Kind, in.trigger.Ref, in.trigger.Source)
-		}
+		q.Trigger = in.trigger.Clone()
 		id, err := w.append(ctx, q)
 		if err != nil {
 			return err
@@ -1232,7 +1254,10 @@ func (w *writer) requeue(ctx context.Context) error {
 // nothing. An item whose entry cannot be written is not queued, and
 // the error says so; the items before it are.
 func (r *Recorder) Queue(ctx context.Context, a *agentturn.Agent, mode agentturn.QueueMode, items ...openresponses.Item) error {
-	trigger := agentturn.TriggerFromContext(ctx)
+	trigger, err := sessionTrigger(agentturn.TriggerFromContext(ctx))
+	if err != nil {
+		return err
+	}
 	for _, item := range items {
 		if item == nil {
 			continue
@@ -1242,7 +1267,7 @@ func (r *Recorder) Queue(ctx context.Context, a *agentturn.Agent, mode agentturn
 		if mode == agentturn.QueueSteer {
 			in.mode = agentsession.ModeSteer
 		}
-		in.trigger = triggerParts(trigger)
+		in.trigger = trigger.Clone()
 		r.mu.Lock()
 		r.root.inbox = append(r.root.inbox, in)
 		err := r.root.requeue(context.WithoutCancel(ctx))
@@ -1253,7 +1278,9 @@ func (r *Recorder) Queue(ctx context.Context, a *agentturn.Agent, mode agentturn
 		if err != nil {
 			return err
 		}
-		a.Queue(ctx, mode, item)
+		// The trigger was checked above, so the agent does not refuse
+		// it.
+		_ = a.Queue(ctx, mode, item)
 	}
 	return nil
 }
@@ -1268,7 +1295,9 @@ func (r *Recorder) Queue(ctx context.Context, a *agentturn.Agent, mode agentturn
 // that end and dropped, which is how a host declines one. An input it
 // has handed over is not handed over again, and an input marked hidden
 // when it was accepted is queued without the mark, which the queued
-// entry does not carry.
+// entry does not carry. The trigger's members of its own come back in
+// its Extra as json.RawMessage values, as they were written, not as
+// the values the host first gave.
 func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) int {
 	r.mu.Lock()
 	var owed []*inboxItem
@@ -1282,13 +1311,15 @@ func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) int {
 	for _, in := range owed {
 		qctx := ctx
 		if in.trigger != nil {
-			qctx = agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: in.trigger.Kind, Ref: in.trigger.Ref, Source: in.trigger.Source})
+			qctx = agentturn.ContextWithTrigger(ctx, agentTrigger(in.trigger))
 		}
 		mode := agentturn.QueueFollowUp
 		if in.mode == agentsession.ModeSteer {
 			mode = agentturn.QueueSteer
 		}
-		a.Queue(qctx, mode, in.item)
+		// A trigger read back from the path was written, so the agent
+		// does not refuse it.
+		_ = a.Queue(qctx, mode, in.item)
 	}
 	return len(owed)
 }
@@ -1434,7 +1465,6 @@ func (w *writer) reset() {
 	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = false, 0, nil, nil
 	w.calls = map[string]*callRecord{}
 	w.env, w.envWorkspace = nil, nil
-	w.omitted = nil
 	w.base = ""
 	w.attempt, w.attemptModel, w.retries = nil, "", 0
 	w.parents = map[string]string{}
@@ -1457,7 +1487,6 @@ func (w *writer) seed(s *agentsession.Session, owed bool) error {
 	}
 	w.values = append(openresponses.Items(nil), cx.Items...)
 	w.custom = make([]bool, len(w.values))
-	w.omitted = omittedBody(cx.InstructionsOmitted())
 	w.base = lastConfigBase(s.Path(s.Leaf()))
 	for _, e := range cx.Entries {
 		if env, ok := e.(*agentsession.EnvEntry); ok {
@@ -1480,7 +1509,11 @@ func (w *writer) seed(s *agentsession.Session, owed bool) error {
 		return fmt.Errorf("session: pending calls at leaf: %w", err)
 	}
 	for _, c := range pending {
-		w.calls[c.ID()] = &callRecord{entry: c.Entry.Base().ID, args: c.Call.Arguments, held: c.Held(), dispatched: c.Dispatch != nil, rejected: c.Rejected()}
+		w.calls[c.ID()] = &callRecord{
+			entry: c.Entry.Base().ID, args: c.Call.Arguments,
+			held: c.Held(), dispatched: len(c.Dispatches) > 0, rejected: c.Rejected(), ended: c.Answered(),
+			unknown: c.State(s.Header()) == agentsession.CallUnknown,
+		}
 	}
 	return nil
 }
@@ -1832,7 +1865,11 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 	case *agentturn.ModelBlocked:
 		return w.blocked(ctx, e)
 	case *agentturn.ItemEnd:
-		return w.item(ctx, e.Item, e.ResponseID, e.Hidden, triggerParts(e.Trigger))
+		source, err := sessionTrigger(e.Trigger)
+		if err != nil {
+			return err
+		}
+		return w.item(ctx, e.Item, e.ResponseID, e.Hidden, source)
 	case *agentturn.ResponseEnd:
 		return w.response(ctx, e)
 	case *agentturn.ToolStart:
@@ -1866,8 +1903,11 @@ func (w *writer) queued(ctx context.Context, e *agentturn.Queued) error {
 	if e.Mode == agentturn.QueueSteer {
 		mode = agentsession.ModeSteer
 	}
-	in := &inboxItem{item: e.Item, mode: mode, held: true}
-	in.trigger = triggerParts(e.Trigger)
+	trigger, err := sessionTrigger(e.Trigger)
+	if err != nil {
+		return err
+	}
+	in := &inboxItem{item: e.Item, mode: mode, held: true, trigger: trigger}
 	w.inbox = append(w.inbox, in)
 	return w.requeue(ctx)
 }
@@ -1974,22 +2014,12 @@ func decisionBy(d *agentturn.ToolDecision) string {
 // the agent's configuration when the writer has one and nothing has
 // been written yet.
 func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
-	// The caller's facts about the firing go in members the format
-	// does not define, where it says they go, and are checked before
-	// anything of the run is taken in.
-	var extra map[string]json.RawMessage
-	for name, v := range e.Trigger.Extra {
-		if runStartMembers[name] {
-			return fmt.Errorf("%w: %q", ErrTriggerMember, name)
-		}
-		raw, err := json.Marshal(v)
-		if err != nil {
-			return fmt.Errorf("session: encode trigger member %q: %w", name, err)
-		}
-		if extra == nil {
-			extra = map[string]json.RawMessage{}
-		}
-		extra[name] = raw
+	// The caller's facts about the firing go in members of the trigger
+	// the format does not define, where it says they go, and are
+	// checked before anything of the run is taken in.
+	trigger, err := sessionTrigger(e.Trigger)
+	if err != nil {
+		return err
 	}
 	w.run = e.RunID
 	w.open = nil
@@ -1997,7 +2027,7 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 	w.lastCalls = false
 	w.answeredCall = false
 	start := agentsession.NewRunStart(e.RunID, string(e.Source), e.Trigger.String())
-	start.Trigger = triggerParts(e.Trigger)
+	start.Trigger = trigger
 	// The comparison below does not ask a tool provider, which may cost
 	// a round trip or list its tools in another order each time; what
 	// it offers reaches the path at turn_start.
@@ -2018,12 +2048,6 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 			return fmt.Errorf("session: encode base request hash: %w", err)
 		}
 		start.Unknown = map[string]json.RawMessage{ConfigBaseMember: raw}
-	}
-	for name, raw := range extra {
-		if start.Unknown == nil {
-			start.Unknown = map[string]json.RawMessage{}
-		}
-		start.Unknown[name] = raw
 	}
 	if _, err := w.append(ctx, start); err != nil {
 		return err
@@ -2092,7 +2116,7 @@ func (w *writer) differs(ctx context.Context, req openresponses.Request, tools b
 		return false
 	}
 	next, have := agentsession.Settings{}.Apply(full), w.settings
-	have.InstructionsParts = nil
+	have.InstructionsParts, have.InstructionsOmitted = nil, nil
 	if len(w.settings.InstructionsParts) > 0 {
 		if parts, _ := w.instructionParts(ctx, req); len(parts) == 0 {
 			next.Instructions, have.Instructions = "", ""
@@ -2303,30 +2327,33 @@ func (w *writer) settle(ctx context.Context, req openresponses.Request) error {
 	if err != nil {
 		return fmt.Errorf("session: %w", err)
 	}
-	omittedChanged := !bytes.Equal(omittedBody(omitted), w.omitted)
+	omittedChanged := !bytes.Equal(omittedBody(omitted), omittedBody(w.settings.InstructionsOmitted))
 	var entry *agentsession.ConfigEntry
 	switch {
 	case !w.wroteConfig:
 		entry = full
 	default:
 		entry = configDelta(w.settings, agentsession.Settings{}.Apply(full), full, parts)
-		if entry == nil && omittedChanged && len(omitted) > 0 {
+		if entry == nil && omittedChanged {
 			// Nothing in force moved, but what was left out did: the
 			// entry says so and changes no setting.
 			entry = &agentsession.ConfigEntry{}
 		}
 	}
 	if entry != nil {
-		if len(omitted) > 0 {
+		// The list in force stays until a config changes it, so a
+		// delta carries it only when it changed, as [] when it
+		// emptied; a replace clears it unless it carries it.
+		switch {
+		case entry.Replace && len(omitted) > 0:
 			entry.InstructionsOmitted = omitted
+		case !entry.Replace && omittedChanged:
+			entry.InstructionsOmitted = append([]agentsession.OmittedPart{}, omitted...)
 		}
 		if _, err := w.append(ctx, entry); err != nil {
 			return err
 		}
 		w.settings = w.settings.Apply(entry)
-		if len(omitted) > 0 {
-			w.omitted = omittedBody(omitted)
-		}
 	}
 	w.wroteConfig = true
 	return nil
@@ -2382,7 +2409,8 @@ func omittedBody(omitted []agentsession.OmittedPart) []byte {
 // did not see, and records its ID against the working transcript. A
 // function call is remembered so its records can name the entry; an
 // output the caller wrote for a call nothing dispatched is preceded by
-// the reject that ends it; an item the caller marked with
+// the reject that ends it, and one for a call that may have run by the
+// answer that ends it; an item the caller marked with
 // agentturn.Hidden is written with visible false. source is the run's
 // trigger for an item the run was prompted with.
 func (w *writer) item(ctx context.Context, item openresponses.Item, responseID string, hidden bool, source *agentsession.Trigger) error {
@@ -2390,13 +2418,41 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		return nil
 	}
 	if out, ok := item.(*openresponses.FunctionCallOutput); ok && !w.replay {
-		// A call an earlier run dispatched, answered now with an output
-		// of the caller's, gets no decision: a proceed says the call
-		// went on toward its tool, which it did not, and a reject that
-		// it never reached its tool, which may be false. The output is
-		// the record, and no second dispatch before it says the tool
-		// did not run again.
-		if c := w.calls[out.CallID]; c != nil && !c.dispatched && !c.rejected {
+		c := w.calls[out.CallID]
+		switch {
+		case c == nil || c.rejected || c.ended:
+			// Nothing to anchor a decision to, or the call's fate is
+			// on the path already: after an answer, only its output.
+		case c.dispatched && c.dispatchRun != "" && c.dispatchRun == w.run:
+			// The tool's own output: the dispatch is the record.
+		case c.dispatched || c.unknown:
+			// A call an earlier run dispatched, or one the path
+			// cannot say about, answered now with an output rather
+			// than run again, is answered: a proceed says the call
+			// went on toward its tool, which it did not, and a reject
+			// that it never reached its tool, which may be false. The
+			// answer says who gave the output and why.
+			by, reason := agentturn.DeciderFromContext(ctx, out.CallID), agentturn.ReasonFromContext(ctx, out.CallID)
+			if c.settledRun != "" && c.settledRun == w.run {
+				// The loop refused it after an approval, finding no
+				// tool, and the output says why.
+				by, reason = agentsession.ByPolicy, outputText(out)
+			}
+			dec := agentsession.NewDecision(out.CallID, c.entry, agentsession.VerdictAnswer, by)
+			if reason != "" {
+				dec.WithReason(reason)
+			}
+			if _, err := w.append(ctx, dec); err != nil {
+				return err
+			}
+			// From here only the output may follow. Should its entry
+			// fail below, the path holds the answer alone, and the
+			// call is owed that output and nothing else: a retry with
+			// an output writes it, an approval's dispatch is refused
+			// by the store, and a recorder reseeded from the path
+			// reads the call as PendingAnswered.
+			c.held, c.ended = false, true
+		default:
 			// The caller wrote the output themselves: the call never
 			// reached its tool, and the output is what the model sees.
 			// A held call is the common case, but a call seeded from a
@@ -2452,10 +2508,7 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		if in := w.drained(item); in != nil && !appOnly && in.entry != "" {
 			e := entry.(*agentsession.ItemEntry)
 			e.QueuedFrom = in.entry
-			if in.trigger != nil {
-				trigger := *in.trigger
-				e.Source = &trigger
-			}
+			e.Source = in.trigger.Clone()
 		} else if e, ok := entry.(*agentsession.ItemEntry); ok && in == nil && source != nil {
 			e.Source = source
 		}
@@ -2622,18 +2675,11 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 	if c == nil || c.rejected || (c.dispatched && c.dispatchRun == w.run) {
 		return nil
 	}
-	d := agentsession.NewDispatch(e.CallID, c.entry)
-	if e.IdempotencyKey != "" {
-		key, err := json.Marshal(e.IdempotencyKey)
-		if err != nil {
-			return fmt.Errorf("session: encode idempotency key of %s: %w", e.CallID, err)
-		}
-		d.Unknown = map[string]json.RawMessage{IdempotencyKeyMember: key}
-	}
+	d := agentsession.NewDispatch(e.CallID, c.entry).WithIdempotencyKey(e.IdempotencyKey)
 	if _, err := w.append(ctx, d); err != nil {
 		return err
 	}
-	c.dispatched, c.dispatchRun = true, w.run
+	c.dispatched, c.dispatchRun, c.unknown = true, w.run, false
 	return nil
 }
 
@@ -3010,6 +3056,8 @@ func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntr
 		// the same text still describe it.
 		prev.InstructionsParts = nil
 	}
+	// What was left out reaches no request, and settle writes it.
+	prev.InstructionsOmitted = nil
 	if equalJSON(prev, next) {
 		return nil
 	}

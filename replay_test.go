@@ -142,6 +142,15 @@ func TestResumeAppliesTheReplayRule(t *testing.T) {
 			}, wantErr: ErrAmbiguousCall},
 		{name: "cut, keyed, the same arguments respelled", replay: agenttool.ReplayKeyed, cut: true,
 			answer: func(id string) Answer { return ApproveWith(id, json.RawMessage(`{ "text": "go" }`)) }},
+		{name: "seeded held before dispatch, unknown", replay: agenttool.ReplayUnknown,
+			pending: []PendingCall{{Call: call, Reason: PendingDeferred}}},
+		{name: "seeded held after dispatch, unknown", replay: agenttool.ReplayUnknown,
+			pending: []PendingCall{{Call: call, Reason: PendingDeferred, Dispatched: true, IdempotencyKey: "k1"}}, wantErr: ErrAmbiguousCall},
+		{name: "seeded held after dispatch, keyed", replay: agenttool.ReplayKeyed,
+			pending: []PendingCall{{Call: call, Reason: PendingDeferred, Dispatched: true, IdempotencyKey: "k1", Args: json.RawMessage(`{"text":"rewritten"}`)}},
+			wantKey: "k1", wantText: "rewritten"},
+		{name: "seeded answered", replay: agenttool.ReplaySafe,
+			pending: []PendingCall{{Call: call, Reason: PendingAnswered}}, wantErr: ErrCallAnswered},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -232,6 +241,58 @@ func TestApprovedCallCutBeforeDispatchIsUndispatched(t *testing.T) {
 	end, _ = a.Resume(context.Background(), Approve(end.Pending[0].Call.CallID))
 	if end.Reason != ReasonAborted || len(end.Pending) != 1 || end.Pending[0].Reason != PendingUndispatched || len(k.keys) != 0 {
 		t.Errorf("end = %+v, pending %+v, ran %d", end, end.Pending, len(k.keys))
+	}
+}
+
+// TestHeldAfterDispatchCutAgainStaysAmbiguous checks that a call a
+// record held after its dispatch, approved and cut before it was
+// handed to its tool again, reads as a call that may have run, with
+// the key and arguments of the dispatch it would repeat, not as one
+// that never started nor as one still held.
+func TestHeldAfterDispatchCutAgainStaysAmbiguous(t *testing.T) {
+	call := &openresponses.FunctionCall{CallID: "call_1", Name: "act", Arguments: `{"text":"t"}`}
+	k := &keyedTool{}
+	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{k.tool(agenttool.ReplayKeyed)}},
+		WithTranscript(Transcript{openresponses.UserText("go"), call}),
+		WithPending([]PendingCall{{Call: call, Reason: PendingDeferred, Dispatched: true, IdempotencyKey: "k1", Args: json.RawMessage(`{"text":"r"}`)}}))
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if _, ok := ev.(*ToolStart); ok {
+			a.Abort()
+		}
+		return nil
+	})
+	end, _ := a.Resume(context.Background(), Approve(call.CallID))
+	if end == nil || end.Reason != ReasonAborted || len(end.Pending) != 1 || len(k.keys) != 0 {
+		t.Fatalf("end = %+v, ran %d", end, len(k.keys))
+	}
+	if p := end.Pending[0]; p.Reason != PendingAborted || p.IdempotencyKey != "k1" || string(p.Args) != `{"text":"r"}` || !p.MayHaveRun() {
+		t.Errorf("pending = %+v", p)
+	}
+}
+
+// TestHeldAfterDispatchStaysHeldWhenResumeFails checks that a resume
+// that fails before its batch, here on a subscriber refusing
+// run_start, leaves a call held after its dispatch as it was: deferred,
+// dispatched, with its key, not relabelled as cut.
+func TestHeldAfterDispatchStaysHeldWhenResumeFails(t *testing.T) {
+	call := &openresponses.FunctionCall{CallID: "call_1", Name: "act", Arguments: `{"text":"t"}`}
+	k := &keyedTool{}
+	held := PendingCall{Call: call, Reason: PendingDeferred, Dispatched: true, IdempotencyKey: "k1"}
+	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{k.tool(agenttool.ReplayKeyed)}},
+		WithTranscript(Transcript{openresponses.UserText("go"), call}), WithPending([]PendingCall{held}))
+	refused := errors.New("refused")
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if _, ok := ev.(*RunStart); ok {
+			return refused
+		}
+		return nil
+	})
+	end, _ := a.Resume(context.Background(), Approve(call.CallID))
+	if end == nil || len(end.Pending) != 1 || len(k.keys) != 0 {
+		t.Fatalf("end = %+v, ran %d", end, len(k.keys))
+	}
+	if p := end.Pending[0]; p.Reason != PendingDeferred || !p.Dispatched || p.IdempotencyKey != "k1" {
+		t.Errorf("pending = %+v, want it held after its dispatch", p)
 	}
 }
 

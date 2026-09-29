@@ -200,64 +200,72 @@ func TestReplayedChildWritesNoDecisions(t *testing.T) {
 	verifyAll(t, child)
 }
 
-// TestAnswerToAnAbortedCallWritesNoDecision covers the call an abort
+// TestAnswerToAnAbortedCallWritesAnAnswer covers the call an abort
 // cut off in flight: it was handed to its tool, so its dispatch is on
 // the path, and the caller's output is neither a reject, which would
 // say the tool never ran, nor a proceed, which would say it went on
-// toward its tool again (#144). The output is the record, and the one
-// dispatch says the tool was handed the call once.
-func TestAnswerToAnAbortedCallWritesNoDecision(t *testing.T) {
-	store := agentsession.NewMemoryStore()
-	rec, s, err := Start(context.Background(), store, agentsession.Header{})
-	if err != nil {
-		t.Fatal(err)
+// toward its tool again (#144). It is an answer decision, format 0.8's
+// verdict for it, carrying the answer's by and reason (#100), then the
+// output; the one dispatch says the tool was handed the call once.
+func TestAnswerToAnAbortedCallWritesAnAnswer(t *testing.T) {
+	cases := []struct {
+		name       string
+		answer     func(callID string) agentturn.Answer
+		by, reason string
+	}{
+		{"the caller's output", func(id string) agentturn.Answer {
+			return agentturn.Output(openresponses.NewFunctionCallOutput(id, "I ran it myself")).WithBy(agentsession.ByHuman).WithReason("checked by hand")
+		}, agentsession.ByHuman, "checked by hand"},
+		{"outcome unknown", agentturn.OutcomeUnknown, "", agentturn.OutcomeUnknownReason},
 	}
-	blocking := agenttool.New("wait", "waits", func(ctx context.Context, _ echoArgs) (string, error) {
-		<-ctx.Done()
-		return "", ctx.Err()
-	})
-	cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{blocking}}
-	a := agentturn.New(cfg)
-	defer rec.Attach(a)()
-	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
-		if _, ok := ev.(*agentturn.ToolDispatch); ok {
-			a.Abort()
-		}
-		return nil
-	})
-	end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
-	if end == nil || end.Reason != agentturn.ReasonAborted || len(end.Pending) != 1 {
-		t.Fatalf("end = %+v", end)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			blocking := agenttool.New("wait", "waits", func(ctx context.Context, _ echoArgs) (string, error) {
+				<-ctx.Done()
+				return "", ctx.Err()
+			})
+			cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{blocking}}
+			a := agentturn.New(cfg)
+			defer rec.Attach(a)()
+			a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+				if _, ok := ev.(*agentturn.ToolDispatch); ok {
+					a.Abort()
+				}
+				return nil
+			})
+			end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+			if end == nil || end.Reason != agentturn.ReasonAborted || len(end.Pending) != 1 {
+				t.Fatalf("end = %+v", end)
+			}
+			callID := end.Pending[0].Call.CallID
+			// The user answers the cut-off call themselves; the tools
+			// are put away so the next turn is an answer.
+			cfg.Tools = nil
+			if err := a.SetConfig(cfg); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := a.Resume(context.Background(), tc.answer(callID)); err != nil {
+				t.Fatal(err)
+			}
+			c := callsOf(t, s)["wait"]
+			if c == nil || c.Dispatch == nil || c.Output == nil {
+				t.Fatalf("call = %+v", c)
+			}
+			if len(c.Decisions) != 1 || c.Decisions[0].Verdict != agentsession.VerdictAnswer || c.Decisions[0].By != tc.by || c.Decisions[0].Reason != tc.reason {
+				t.Errorf("decisions = %+v, want an answer by %q for %q", c.Decisions, tc.by, tc.reason)
+			}
+			if len(c.Dispatches) != 1 {
+				t.Errorf("dispatches = %d, want 1", len(c.Dispatches))
+			}
+			if c.Rejected() || !c.Answered() {
+				t.Errorf("rejected %v answered %v", c.Rejected(), c.Answered())
+			}
+			verifyAll(t, s)
+		})
 	}
-	callID := end.Pending[0].Call.CallID
-	// The user answers the cut-off call themselves; the tools are put
-	// away so the next turn is an answer.
-	cfg.Tools = nil
-	if err := a.SetConfig(cfg); err != nil {
-		t.Fatal(err)
-	}
-	answer := agentturn.Output(openresponses.NewFunctionCallOutput(callID, "I ran it myself")).WithBy(agentsession.ByHuman)
-	if _, err := a.Resume(context.Background(), answer); err != nil {
-		t.Fatal(err)
-	}
-	c := callsOf(t, s)["wait"]
-	if c == nil || c.Dispatch == nil || c.Output == nil {
-		t.Fatalf("call = %+v", c)
-	}
-	if len(c.Decisions) != 0 {
-		t.Errorf("decisions = %+v, want none", c.Decisions)
-	}
-	dispatches := 0
-	for _, e := range s.Path(s.Leaf()) {
-		if _, ok := e.(*agentsession.DispatchEntry); ok {
-			dispatches++
-		}
-	}
-	if dispatches != 1 {
-		t.Errorf("dispatches = %d, want 1", dispatches)
-	}
-	if c.Rejected() {
-		t.Error("a call that reached its tool is recorded as rejected")
-	}
-	verifyAll(t, s)
 }
