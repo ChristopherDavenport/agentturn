@@ -81,7 +81,10 @@ versions may break the API.
   before the refusal's output is pending as the new `PendingRejected`
   rather than as never started: it takes only an output, an approval
   returns `ErrCallAnswered`, and `session.ReplayAnswers` answers it
-  with the reject's reason. (#159)
+  with the reject's reason. The session recorder writes the end of a
+  resume that a deferral ends before its first model call as `aborted`
+  with `input_required` as its ref, which is what the format reads of
+  a run holding a call it did not append. (#159)
 - The outputs `Agent.Resume` appends for pending calls carry no
   trigger on their `item_end`, so the session recorder writes no
   `source` on them: their decision says who gave them, and a policy's
@@ -103,7 +106,8 @@ versions may break the API.
   `session.ReplayAnswers` spells them, and the session recorder writes
   a `proceed` whenever a call an earlier run dispatched goes to its
   tool again, with the approval's decider, so a person's approval
-  with no reason is on the record. A driver that gives no reason gets
+  with no reason is on the record; one that names nobody is written
+  with no decider, where it was `policy`. A driver that gives no reason gets
   `run again`, written before the second dispatch. (#166)
 - `session.ReplayAnswers`' doc names `session.AgentOptions` as the
   seed its answers are read against, where it said the context's

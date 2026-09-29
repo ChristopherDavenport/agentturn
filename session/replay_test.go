@@ -325,9 +325,10 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 		want   agentturn.PendingReason
 		answer func(callID string) agentturn.Answer
 		// replayed answers with what ReplayAnswers gives instead, and
-		// block has BeforeToolCall block every call.
+		// block and hold have BeforeToolCall block or defer every call.
 		replayed   bool
 		block      bool
+		hold       bool
 		wantErr    error
 		wantRuns   int
 		wantRecord []string
@@ -358,6 +359,8 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 		// call it refused before the crash is owed that refusal.
 		{name: "never started, replayed, the policy blocks", replay: agenttool.ReplaySafe, want: agentturn.PendingUndispatched,
 			replayed: true, block: true, wantRecord: []string{"reject", "output"}},
+		{name: "never started, replayed, the policy holds", replay: agenttool.ReplaySafe, want: agentturn.PendingUndispatched,
+			replayed: true, hold: true, wantRecord: []string{"hold"}},
 		{name: "rejected, approved", replay: agenttool.ReplaySafe, state: rejected, want: agentturn.PendingRejected,
 			answer: agentturn.Approve, wantErr: agentturn.ErrCallAnswered},
 		{name: "rejected, replayed", replay: agenttool.ReplaySafe, state: rejected, want: agentturn.PendingRejected,
@@ -437,6 +440,11 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 			if tc.block {
 				cfg.BeforeToolCall = func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
 					return &agentturn.ToolDecision{Action: agentturn.Block, Reason: "denied by rm"}, nil
+				}
+			}
+			if tc.hold {
+				cfg.BeforeToolCall = func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+					return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "confirm"}, nil
 				}
 			}
 			a := agentturn.New(cfg, opts...)

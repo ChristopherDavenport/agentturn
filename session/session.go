@@ -160,7 +160,11 @@
 //     phase end, the reason in the
 //     format's terms and the IDs of the run's calls left without an
 //     output. The loop's reasons map onto the format's cascade: done
-//     and input_required as they are, error with the error as ref,
+//     as it is, input_required as it is when the run holds a call its
+//     own response made and, for a resume whose BeforeToolCall
+//     deferred a call an earlier run made, as aborted with
+//     input_required as ref, since the format reads a held call only
+//     in the run that made it, error with the error as ref,
 //     aborted as interrupted with the context error as ref, since the
 //     host asked for the stop, and stopped as stopped when the last
 //     response requested tools, as done when it did not, and, when the
@@ -2921,6 +2925,13 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 	case agentturn.ReasonDone:
 		return agentsession.ReasonDone, ""
 	case agentturn.ReasonInputRequired:
+		if !w.heldInRun() {
+			// A resume whose BeforeToolCall deferred a call that never
+			// started ends before its first model call, holding a call
+			// an earlier run made: the format reads a held call only in
+			// the segment its item is in, and this one as aborted.
+			return agentsession.ReasonAborted, string(e.Reason)
+		}
 		return agentsession.ReasonInputRequired, ""
 	case agentturn.ReasonError:
 		return agentsession.ReasonError, errText(e.Err)
@@ -2969,6 +2980,16 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 		return agentsession.ReasonDone, cause
 	}
 	return string(e.Reason), ""
+}
+
+// heldInRun reports whether a call the run appended is held.
+func (w *writer) heldInRun() bool {
+	for _, id := range w.open {
+		if c := w.calls[id]; c != nil && c.held {
+			return true
+		}
+	}
+	return false
 }
 
 // pendingOnPath reports whether any call the writer knows of is still
