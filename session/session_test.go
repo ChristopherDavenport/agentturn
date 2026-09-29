@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -388,7 +389,7 @@ func TestConfigDelta(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			d := configDelta(base, tc.next, full(tc.next), nil)
+			d := configDelta(base, tc.next, full(tc.next), nil, nil)
 			if !tc.want(d) {
 				t.Errorf("delta = %+v", d)
 			}
@@ -399,6 +400,22 @@ func TestConfigDelta(t *testing.T) {
 			}
 		})
 	}
+	// A replace carries the omitted list whole, a delta nothing when it
+	// did not move: a delta a little larger than the settings is still
+	// the smaller entry under a long list.
+	t.Run("omitted list in force", func(t *testing.T) {
+		prev := agentsession.Settings{Model: "m", Tools: openresponses.Tools{a, b}}
+		for i := range 50 {
+			prev.InstructionsOmitted = append(prev.InstructionsOmitted, agentsession.OmittedPart{ID: fmt.Sprintf("memory/%03d", i), Reason: "budget", Size: 80})
+		}
+		next := agentsession.Settings{Model: "m", Tools: openresponses.Tools{tool("x", ""), tool("y", "")}}
+		if d := configDelta(prev, next, full(next), nil, nil); d == nil || !d.Replace {
+			t.Fatalf("without a list the delta is the larger: %+v", d)
+		}
+		if d := configDelta(prev, next, full(next), nil, prev.InstructionsOmitted); d == nil || d.Replace {
+			t.Errorf("delta = %+v, want a delta, the list unmoved", d)
+		}
+	})
 }
 
 func TestStoreErrorEndsRun(t *testing.T) {

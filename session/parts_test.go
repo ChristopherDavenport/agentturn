@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/ChristopherDavenport/agentsession"
+	"github.com/ChristopherDavenport/agentsession/jsonl"
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
+	"github.com/ChristopherDavenport/agentturn/compact"
 	"github.com/ChristopherDavenport/agentturn/tools/agent"
 	"github.com/ChristopherDavenport/openresponses"
 	"github.com/ChristopherDavenport/openresponses/echo"
@@ -385,14 +388,14 @@ func TestInstructionsPartsSurviveEveryResume(t *testing.T) {
 	}
 }
 
-// TestOmittedPartsStayInForce pins #147 under format 0.8, where the
-// omitted list stays in force until a config changes it: a memory
-// larger than its block, with 474 omissions, pays for the list once and
-// for the part that moved on each write after, rather than repeating
-// the list on every delta, which cost more than the joined string. A
-// list that changes is written, on an entry of its own when nothing
-// else moved; one that empties is written as []; and a resumed
-// recorder, seeded with the list in force, writes nothing for it.
+// TestOmittedPartsStayInForce pins #147: the omitted list stays in
+// force until a config changes it, so a memory larger than its block,
+// with 474 omissions, pays for the list once and for the part that
+// moved on each write after, rather than repeating the list on every
+// delta, which cost more than the joined string. A list that changes
+// is written, on an entry of its own when nothing else moved; one that
+// empties is written as []; and a resumed recorder, seeded with the
+// list in force, writes nothing for it.
 func TestOmittedPartsStayInForce(t *testing.T) {
 	l := &layers{ids: []string{"product", "memory"}, text: map[string]string{"product": strings.Repeat("p", 2000), "memory": "Memory: likes tea"}}
 	for i := range 474 {
@@ -452,7 +455,10 @@ func TestOmittedPartsStayInForce(t *testing.T) {
 			}
 		}},
 		{"the list moves alone", func() { l.omitted = l.omitted[1:] }, false, func(t *testing.T, added []*agentsession.ConfigEntry) {
-			if len(added) != 1 || len(added[0].InstructionsOmitted) != 473 || added[0].InstructionsParts != nil || added[0].Instructions != nil {
+			// A keep counts from the head of the list in force, so the
+			// part after the one dropped is named and the other 472
+			// are one keep.
+			if len(added) != 1 || omittedMember(t, added[0]) != `[{"id":"memory/001","reason":"budget","size":80},{"keep":472}]` || added[0].InstructionsParts != nil || added[0].Instructions != nil {
 				t.Errorf("entry = %+v", added)
 			}
 		}},
@@ -516,4 +522,197 @@ func TestOmittedPartsStayInForce(t *testing.T) {
 	}
 	unsub()
 	verifyAll(t, s)
+}
+
+// TestOmittedDeltaKeepsRuns pins format 0.9 (agentsession #115): a
+// part moving across a memory's budget writes that part and a keep for
+// each run of the list in force around it, not the list again, and the
+// file read back resolves the list whole. A replace discards the list
+// its keeps would count over, so it carries the list whole; a resumed
+// recorder and a fold's checkpoint start from the list the context
+// resolved, so the keeps written after them count over it.
+func TestOmittedDeltaKeepsRuns(t *testing.T) {
+	l := &layers{ids: []string{"product", "memory"}, text: map[string]string{"product": strings.Repeat("p", 2000), "memory": "Memory: likes tea"}}
+	for i := range 400 {
+		l.omitted = append(l.omitted, agentsession.OmittedPart{ID: fmt.Sprintf("memory/%03d", i), Reason: "budget", Size: 80})
+	}
+	listBytes := jsonLen(l.omitted)
+	partsOf := func(context.Context, openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
+		return l.parts(), append([]agentsession.OmittedPart(nil), l.omitted...)
+	}
+	// save puts a new fact under the budget at i, as a memory's save
+	// pushes one out of its block.
+	save := func(i int, id string) func() {
+		return func() {
+			l.omitted = slices.Insert(l.omitted, i, agentsession.OmittedPart{ID: id, Reason: "budget", Size: 80})
+		}
+	}
+	model := "m"
+	cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Instructions: "unrendered",
+		BeforeModelCall: func(_ context.Context, req *openresponses.Request) error {
+			req.Instructions = l.render()
+			req.Model = model
+			return nil
+		}}
+	// written counts the keeps and the parts named whole in a config's
+	// instructions_omitted.
+	written := func(c *agentsession.ConfigEntry) (keeps, whole int) {
+		for _, p := range c.InstructionsOmitted {
+			if p.Keep > 0 {
+				keeps++
+			} else {
+				whole++
+			}
+		}
+		return keeps, whole
+	}
+	// moved wants one delta naming the part that moved, the runs
+	// around it kept, at a tenth of the list or less.
+	moved := func(t *testing.T, added []*agentsession.ConfigEntry) {
+		t.Helper()
+		if len(added) != 1 || added[0].Replace {
+			t.Fatalf("configs = %+v", added)
+		}
+		if keeps, whole := written(added[0]); keeps == 0 || whole != 1 {
+			t.Errorf("omitted = %+v, want keeps around one part", added[0].InstructionsOmitted)
+		}
+		if n := jsonLen(added[0]); n >= listBytes/10 {
+			t.Errorf("one part moving under %d omitted wrote %d bytes, the list is %d", len(l.omitted), n, listBytes)
+		}
+	}
+	// folding folds the transcript every few prompts, recorded by rec.
+	folding := func(rec *Recorder) {
+		cfg.Transform = compact.NewLocal(&echo.Adapter{}, compact.WithBudget(6), compact.WithKeepLast(2), compact.WithEstimator(countItems), compact.WithModel("summariser"), compact.WithOnFold(rec.Fold)).Transform
+	}
+	steps := []struct {
+		name   string
+		change func()
+		resume bool
+		want   func(t *testing.T, added []*agentsession.ConfigEntry)
+	}{
+		{"first", nil, false, func(t *testing.T, added []*agentsession.ConfigEntry) {
+			// The base the hook renders over, then the request sent,
+			// with nothing in force for a keep to count over.
+			if keeps, whole := written(added[len(added)-1]); keeps != 0 || whole != 400 {
+				t.Errorf("first config wrote %d keeps and %d parts", keeps, whole)
+			}
+		}},
+		{"a save", save(200, "memory/new-1"), false, func(t *testing.T, added []*agentsession.ConfigEntry) {
+			moved(t, added)
+			want := `[{"keep":200},{"id":"memory/new-1","reason":"budget","size":80},{"keep":200}]`
+			if got, _ := json.Marshal(added[0].InstructionsOmitted); string(got) != want {
+				t.Errorf("omitted = %s, want %s", got, want)
+			}
+		}},
+		{"a forget", func() { l.omitted = slices.Delete(l.omitted, 3, 4) }, false, func(t *testing.T, added []*agentsession.ConfigEntry) {
+			if len(added) != 1 || jsonLen(added[0]) >= listBytes/10 {
+				t.Errorf("configs = %+v", added)
+			}
+		}},
+		{"a replace", func() { model = ""; save(0, "memory/new-2")() }, false, func(t *testing.T, added []*agentsession.ConfigEntry) {
+			// Clearing the model is a replace, which discards the list
+			// a keep counts over: the list is written whole.
+			if len(added) != 1 || !added[0].Replace {
+				t.Fatalf("configs = %+v", added)
+			}
+			if keeps, whole := written(added[0]); keeps != 0 || whole != len(l.omitted) {
+				t.Errorf("replace wrote %d keeps and %d parts, want the %d parts", keeps, whole, len(l.omitted))
+			}
+		}},
+		{"a save after the replace", func() { model = "m"; save(10, "memory/new-3")() }, false, moved},
+		{"a resume", nil, true, func(t *testing.T, added []*agentsession.ConfigEntry) {
+			if len(added) != 0 {
+				t.Errorf("configs = %+v", added)
+			}
+		}},
+		{"a save after the resume", save(300, "memory/new-4"), false, moved},
+		{"another save", save(len(l.omitted)-1, "memory/new-5"), false, moved},
+	}
+	root := t.TempDir()
+	store, err := jsonl.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	opts := []Option{WithInstructionsParts(partsOf)}
+	rec, s, err := Start(context.Background(), store, agentsession.Header{CWD: root}, opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	folding(rec)
+	a := agentturn.New(cfg)
+	unsub := rec.Attach(a)
+	for _, st := range steps {
+		if st.change != nil {
+			st.change()
+		}
+		if st.resume {
+			unsub()
+			if err := store.Release(s.ID()); err != nil {
+				t.Fatal(err)
+			}
+			rec, s, err = Resume(context.Background(), store, s.ID(), opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			aopts, err := AgentOptions(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			folding(rec)
+			a = agentturn.New(cfg, aopts...)
+			unsub = rec.Attach(a)
+		}
+		seen := len(configs(s))
+		if _, err := a.Prompt(context.Background(), openresponses.UserText(st.name)); err != nil {
+			t.Fatalf("%s: %v", st.name, err)
+		}
+		t.Run(st.name, func(t *testing.T) { st.want(t, configs(s)[seen:]) })
+		cx, err := s.Context()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(cx.InstructionsOmitted(), l.omitted) {
+			t.Errorf("%s: the list in force is not the one the host left out", st.name)
+		}
+	}
+	unsub()
+	verifyAll(t, s)
+	id := s.ID()
+	if err := store.Release(id); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read the file back through a fresh store: the keeps resolve to
+	// the list whole, and a fold's checkpoint holds it whole.
+	store2, err := jsonl.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+	s2, err := store2.Open(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cx, err := s2.Context()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(cx.InstructionsOmitted(), l.omitted) {
+		t.Errorf("read back, %d omitted in force, the host left out %d", len(cx.InstructionsOmitted()), len(l.omitted))
+	}
+	folds := 0
+	for _, e := range s2.Entries() {
+		if c, ok := e.(*agentsession.CompactionEntry); ok {
+			folds++
+			for _, p := range c.Config.InstructionsOmitted {
+				if p.Keep > 0 || p.Unresolved() {
+					t.Errorf("a checkpoint holds %+v", p)
+				}
+			}
+		}
+	}
+	if folds == 0 {
+		t.Errorf("no fold in %q", entryTypes(s2))
+	}
 }
