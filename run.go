@@ -139,8 +139,7 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 		// The context RunContext hands the tools: the caller's values,
 		// cut by the caller's cancellation or a consumer that breaks
 		// out, and not by the run ending.
-		runCtx, runCancel := context.WithCancelCause(context.WithoutCancel(ctx))
-		context.AfterFunc(ctx, func() { runCancel(context.Cause(ctx)) })
+		runCtx, runCancel := linkRunContext(ctx)
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		events := make(chan Event, EventBuffer)
@@ -171,13 +170,18 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 			if stopped {
 				continue
 			}
+			_, isEnd := ev.(*RunEnd)
 			if !yield(ev) {
 				stopped = true
 				cancel()
-				runCancel(context.Canceled)
+				if !isEnd {
+					// Breaking out before the end is an abort; breaking
+					// out on it is not, and work the run started goes on.
+					runCancel(context.Canceled)
+				}
 				continue
 			}
-			if _, isEnd := ev.(*RunEnd); isEnd {
+			if isEnd {
 				stopped = true
 			}
 		}
@@ -264,18 +268,21 @@ func RunIDFromContext(ctx context.Context) string {
 	return id
 }
 
-// RunContext returns the context of the run a tool call or a hook
-// serves: the values of the context the run was started with, the run
-// ID among them, cancelled when the run is aborted, through
-// [Agent.Abort], [Agent.AbortCause] or the cancellation of the context
-// given to Prompt, and not when the batch ends or the run ends by
-// itself. It is what a tool derives background work from that must
+// RunContext returns the context of the run a tool call, a hook, the
+// transform or the model call serves: the values of the context the
+// run was started with, the run ID among them, cancelled when the run
+// is aborted, through [Agent.Abort], [Agent.AbortCause] or the
+// cancellation of the context given to Prompt, and not when the batch
+// ends or the run ends by itself. It is what a tool derives background work from that must
 // outlive its call and not the run's abort: a task that returns at
 // once and reports later, a watcher, a detached child. Once the run
 // has ended, Agent.Abort reaches the agent's next run and not this
 // one, so work that must be stoppable after that keeps a cancel of its
 // own. The transcript and the invoker of the call are not on it. It
-// reports false outside a loop.
+// reports false outside a loop. Each run registers it with the context
+// it was started with until that context ends or the run is aborted,
+// so a host that prompts every run with one long-lived cancellable
+// context keeps one small registration per finished run until then.
 func RunContext(ctx context.Context) (context.Context, bool) {
 	rc, ok := ctx.Value(runContextKey{}).(context.Context)
 	return rc, ok
@@ -292,6 +299,17 @@ func RunContext(ctx context.Context) (context.Context, bool) {
 func Steered(ctx context.Context) <-chan struct{} {
 	ch, _ := ctx.Value(steeredKey{}).(<-chan struct{})
 	return ch
+}
+
+// linkRunContext returns the context RunContext hands a run's tools:
+// the values of ctx, cancelled with ctx's cause when ctx is, or by the
+// cancel returned, and released from ctx once it is cancelled either
+// way.
+func linkRunContext(ctx context.Context) (context.Context, context.CancelCauseFunc) {
+	runCtx, runCancel := context.WithCancelCause(context.WithoutCancel(ctx))
+	stop := context.AfterFunc(ctx, func() { runCancel(context.Cause(ctx)) })
+	context.AfterFunc(runCtx, func() { stop() })
+	return runCtx, runCancel
 }
 
 func (c Config) validate() error {
@@ -479,8 +497,9 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 	// Everything the run calls, transform, hooks, model and tools, can
 	// tell which run it serves.
 	ctx = ContextWithRunID(ctx, r.runID)
-	r.ctx = ctx
 	r.runCtx = ContextWithRunID(r.runCtx, r.runID)
+	ctx = context.WithValue(ctx, runContextKey{}, r.runCtx)
+	r.ctx = ctx
 	end := &RunEnd{RunID: r.runID, Reason: ReasonDone}
 	err := r.loop(ctx, prompts, approved, terminate)
 	var stop *errStop
@@ -1073,7 +1092,6 @@ func (r *runner) toolContext(ctx context.Context, tools agenttool.Set) context.C
 	if r.cfg.ToolElicitor != nil {
 		ctx = agenttool.ContextWithElicitor(ctx, r.cfg.ToolElicitor)
 	}
-	ctx = context.WithValue(ctx, runContextKey{}, r.runCtx)
 	if r.steered != nil {
 		ctx = context.WithValue(ctx, steeredKey{}, r.steered())
 	}

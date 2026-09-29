@@ -418,8 +418,7 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved [
 	// The context a tool's background work derives from: the prompt's
 	// values, cancelled by an abort of this run or by the prompt's own
 	// cancellation, and not by the run ending.
-	runCtx, runCancel := context.WithCancelCause(context.WithoutCancel(ctx))
-	context.AfterFunc(ctx, func() { runCancel(context.Cause(ctx)) })
+	runCtx, runCancel := linkRunContext(ctx)
 	ctx, cancel := context.WithCancelCause(ctx)
 	a.running = true
 	a.cancel = cancel

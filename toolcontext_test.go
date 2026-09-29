@@ -3,6 +3,7 @@ package agentturn
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,25 +77,46 @@ func TestRunContextOutlivesTheBatch(t *testing.T) {
 }
 
 // TestRunContextOfTheLowLevelLoop checks that the low-level loop's run
-// context is cut when the consumer breaks out.
+// context is cut when the consumer breaks out before the run's end,
+// and not when it breaks out on the end, and that a hook sees it too.
 func TestRunContextOfTheLowLevelLoop(t *testing.T) {
-	var rc context.Context
-	grab := agenttool.New("grab", "", func(ctx context.Context, _ echoArgs) (string, error) {
-		rc, _ = RunContext(ctx)
-		return "ok", nil
-	})
-	for ev := range Run(context.Background(), nil, openresponses.Items{openresponses.UserText("go")}, Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{grab}}) {
-		if _, ok := ev.(*ToolEnd); ok {
-			break
-		}
-	}
-	if rc == nil {
-		t.Fatal("no run context on the call")
-	}
-	select {
-	case <-rc.Done():
-	case <-time.After(time.Second):
-		t.Fatal("breaking out did not cut the run context")
+	for _, tc := range []struct {
+		name    string
+		at      func(Event) bool
+		wantCut bool
+	}{
+		{"out before the end", func(ev Event) bool { _, ok := ev.(*ToolEnd); return ok }, true},
+		{"out on the end", func(ev Event) bool { _, ok := ev.(*RunEnd); return ok }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var rc, hookRC context.Context
+			grab := agenttool.New("grab", "", func(ctx context.Context, _ echoArgs) (string, error) {
+				rc, _ = RunContext(ctx)
+				return "ok", nil
+			})
+			cfg := Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{grab},
+				BeforeModelCall: func(ctx context.Context, _ *openresponses.Request) error {
+					hookRC, _ = RunContext(ctx)
+					return nil
+				}}
+			for ev := range Run(context.Background(), nil, openresponses.Items{openresponses.UserText("go")}, cfg) {
+				if tc.at(ev) {
+					break
+				}
+			}
+			if rc == nil || hookRC == nil {
+				t.Fatalf("run context on the call %v, on the hook %v", rc != nil, hookRC != nil)
+			}
+			if tc.wantCut {
+				select {
+				case <-rc.Done():
+				case <-time.After(time.Second):
+					t.Fatal("breaking out did not cut the run context")
+				}
+			} else if rc.Err() != nil {
+				t.Errorf("breaking out on the end cut the run context: %v", rc.Err())
+			}
+		})
 	}
 }
 
@@ -103,19 +125,28 @@ func TestRunContextOfTheLowLevelLoop(t *testing.T) {
 // the run after the batch, and the next batch listens afresh.
 func TestSteeredReachesAWaitingTool(t *testing.T) {
 	waiting := make(chan struct{}, 2)
-	heard := 0
+	heard, batches := 0, 0
 	wait := agenttool.New("wait", "", func(ctx context.Context, _ echoArgs) (string, error) {
 		ch := Steered(ctx)
 		if ch == nil {
 			return "", errors.New("no steer signal")
+		}
+		batches++
+		if batches > 1 {
+			// The steer was drained after the first batch: this one's
+			// signal must be fresh.
+			select {
+			case <-ch:
+				return "", errors.New("the second batch heard the first batch's steer")
+			default:
+				return "fresh", nil
+			}
 		}
 		waiting <- struct{}{}
 		select {
 		case <-ch:
 			heard++
 			return "interrupted by a steer", nil
-		case <-time.After(50 * time.Millisecond):
-			return "waited", nil
 		case <-ctx.Done():
 			return "", ctx.Err()
 		}
@@ -129,8 +160,13 @@ func TestSteeredReachesAWaitingTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if heard != 1 {
-		t.Errorf("the tool heard %d steers, want 1: the second batch must listen afresh", heard)
+	if heard != 1 || batches != 2 {
+		t.Errorf("the tool heard %d steers over %d batches", heard, batches)
+	}
+	for _, item := range end.Items {
+		if out, ok := item.(*openresponses.FunctionCallOutput); ok && strings.HasPrefix(out.Output.Text, "Error") {
+			t.Errorf("a batch failed: %s", out.Output.Text)
+		}
 	}
 	found := false
 	for _, item := range end.Items {

@@ -164,15 +164,15 @@ versions may break the API.
   stream well formed: the streamed parts are emptied at their indices
   and the replacement's other parts are written after them. A message
   the guard kept streams exactly as before. (#108)
-- `agentturn.RunContext(ctx)` returns, on a tool call's or a hook's
-  context, the run's context: the values of the context the run was
+- `agentturn.RunContext(ctx)` returns, on the context of a tool call, a
+  hook, the transform or the model call, the run's context: the values of the context the run was
   started with and the run ID, cancelled by `Agent.Abort`,
   `AbortCause` or the cancellation of the prompt's context, with the
   cause, and not when the batch or the run ends by itself. Background
   work that must outlive its call derives from it, where the call's
   own context ended with the batch and nothing else was on it. The
   low-level `Run` and `Continue` cut it when the caller's context ends
-  or the consumer breaks out. (#125)
+  or the consumer breaks out before the run's end. (#125)
 - `agentturn.Steered(ctx)` returns a channel a steer into the tool's run
   closes, during its batch or before it and not yet drained, so a tool
   that only waits returns early; the steered item joins the run after

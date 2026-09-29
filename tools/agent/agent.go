@@ -248,7 +248,12 @@ func WithRunContext(fn func(ctx context.Context, callID string) context.Context)
 // after any call, and WithSpawn still hands out the child's agent, so
 // a host can steer it or abort it alone. fn is called once, for the
 // run the call started, whatever its reason; a run that could not
-// start is the call's error and fn is not called.
+// start is the call's error and fn is not called. The child's context
+// is the run context with the call on it, so the parent's transcript,
+// its invoker, its tool elicitor and its steer signal, which belong to
+// the batch, do not reach it. A detached child is recorded only
+// through [WithObserver]: the call's tool_end comes while it runs, with
+// no items to copy.
 func WithDetach(fn func(callID string, end *agentturn.RunEnd)) Option {
 	return func(o *options) { o.detach = fn }
 }
