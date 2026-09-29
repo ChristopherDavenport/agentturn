@@ -35,7 +35,8 @@ var (
 	// reports, whose tool does not say it can run again: agenttool's
 	// replay is unknown, or keyed and the key of the dispatch it would
 	// repeat is not known, or keyed and the approval changes the
-	// arguments under that key. Such a call must not run again; answer
+	// arguments under that key, or keeps them under another. Such a
+	// call must not run again; answer
 	// it with [OutcomeUnknown] so the model can check before it asks
 	// again, or, when the host accepts the risk, approve it with
 	// [Answer.WithRunAgain].
@@ -389,9 +390,10 @@ type Answer struct {
 	// is recorded as an anonymous decision rather than guessed at.
 	By string
 	// Reason says why the call was answered so. For an approval it
-	// rides on the ToolDecision as By does, "run again: keyed" for a
-	// call that may have run, for instance, and a session recorder
-	// writes it on the proceed decision. For an output answering a call
+	// rides on the ToolDecision as By does, and a session recorder
+	// writes it on the proceed decision. An approval of a call that may
+	// have run that gives none carries the rule that let it run again:
+	// [RunAgainSafeReason], [RunAgainKeyedReason] or [RunAgainReason]. For an output answering a call
 	// that may have run, it rides on the run's context with
 	// [ContextWithReasons], and a session recorder writes it on the
 	// answer decision before the output: "not run again: replay
@@ -400,9 +402,13 @@ type Answer struct {
 	Reason string
 	// IdempotencyKey, for an approval, is the key the tool receives in
 	// place of the one the loop would give it: the pending call's, for
-	// a call that may have run, and a new one otherwise. A host that
-	// resumes after a restart sets the key of the dispatch the approval
-	// repeats, which a session recorder wrote on it.
+	// a call that may have run, and a new one otherwise. A key names one
+	// operation, so a key other than that of the dispatch the approval
+	// repeats makes the call a new operation: for a keyed call that may
+	// have run, Resume takes one only with new arguments, or with
+	// [Answer.WithRunAgain]. A host that resumes after a restart and
+	// wants the operation repeated leaves it empty, or sets the key of
+	// that dispatch, which a session recorder wrote on it.
 	IdempotencyKey string
 	// RunAgain, for an approval, says the host accepts running a call
 	// that may have run although its tool does not say that is safe.
@@ -412,9 +418,20 @@ type Answer struct {
 	RunAgain bool
 }
 
-// RunAgainReason is the reason an approval built with
-// [Answer.WithRunAgain] carries when it gives none.
-const RunAgainReason = "run again: accepted by the caller"
+// The reasons an approval of a call that may have run carries when it
+// gives none, naming the rule that let it run again.
+const (
+	// RunAgainReason is the reason of an approval built with
+	// [Answer.WithRunAgain].
+	RunAgainReason = "run again: accepted by the caller"
+	// RunAgainSafeReason is the reason of an approval whose tool says
+	// replay is safe.
+	RunAgainSafeReason = "run again: safe"
+	// RunAgainKeyedReason is the reason of an approval whose tool says
+	// replay is keyed, run under the key of the dispatch it repeats or
+	// with new arguments under a new one.
+	RunAgainKeyedReason = "run again: keyed"
+)
 
 // Output answers a pending call with out.
 func Output(out *openresponses.FunctionCallOutput) Answer {
@@ -509,9 +526,14 @@ func (a Answer) WithRunAgain() Answer {
 // ([PendingCall.MayHaveRun]), is ambiguous, and Resume applies
 // agenttool's rule for running it again: it approves the call when
 // its tool's replay for the arguments it would run with is safe, or
-// keyed with a key known and the arguments of the dispatch it repeats
-// or a key the answer chose, and otherwise returns [ErrAmbiguousCall]
-// and runs nothing. [Answer.WithRunAgain] is the only way past it. An
+// keyed and either run with the arguments and under the key of the
+// dispatch it repeats, which must be known, or with new arguments
+// under a key the answer chose, a new operation; otherwise it returns
+// [ErrAmbiguousCall] and runs nothing. [Answer.WithRunAgain] is the
+// only way past it. An approval that passes the rule without a reason
+// of its own carries the rule's, [RunAgainSafeReason] or
+// [RunAgainKeyedReason], which a session recorder writes on the
+// proceed it records for the call. An
 // agent seeded with [WithPending] from a record knows which calls
 // never started, and those are not checked, and which were answered
 // or refused without running: those take an output, and an approval
@@ -586,12 +608,15 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 		}
 		reason := ans.Reason
 		if p.MayHaveRun() {
-			if ans.RunAgain {
-				if reason == "" {
-					reason = RunAgainReason
+			rule := RunAgainReason
+			if !ans.RunAgain {
+				var err error
+				if rule, err = mayRunAgain(ctx, cfg, p, args, key); err != nil {
+					return nil, err
 				}
-			} else if err := mayRunAgain(ctx, cfg, p, ans, args, key); err != nil {
-				return nil, err
+			}
+			if reason == "" {
+				reason = rule
 			}
 		}
 		approved = append(approved, approval{call: p.Call, args: args, note: ans.Note, by: ans.By, reason: reason, key: key, decide: p.Reason == PendingUndispatched})
@@ -607,34 +632,41 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 }
 
 // mayRunAgain applies agenttool's rule for running a call again to an
-// approval of p, which may have run: its tool's replay for args, the
-// arguments it would run with, asked under the call it would run as,
-// must be safe, or keyed with key known. A keyed call run with other
-// arguments than the dispatch it repeats ran with would reuse that
-// dispatch's key for another operation, so it needs a key the answer
-// chose. A call no tool has the name of runs nothing, and the loop
-// refuses it.
-func mayRunAgain(ctx context.Context, cfg Config, p PendingCall, ans Answer, args json.RawMessage, key string) error {
+// approval of p, which may have run, and returns the reason it passed:
+// its tool's replay for args, the arguments it would run with, asked
+// under key, the key it would run under, must be safe, or keyed. A
+// keyed call may run again only under the key of the dispatch it
+// repeats, which must be known: another key is another operation, and
+// the one that may have happened is not deduplicated. It may run with
+// other arguments than that dispatch ran with only under another key,
+// since those arguments are another operation too. A call no tool has
+// the name of runs nothing, and the loop refuses it.
+func mayRunAgain(ctx context.Context, cfg Config, p PendingCall, args json.RawMessage, key string) (string, error) {
 	call := p.Call
 	tool, ok := cfg.tools(ctx).Lookup(call.Name)
 	if !ok {
-		return nil
+		return "", nil
 	}
 	args = orEmpty(args, call.Arguments)
 	ctx = agenttool.WithCall(ctx, agenttool.Call{ID: call.CallID, Args: args, IdempotencyKey: key})
 	switch agenttool.ReplayOf(ctx, tool, args) {
 	case agenttool.ReplaySafe:
-		return nil
+		return RunAgainSafeReason, nil
 	case agenttool.ReplayKeyed:
+		same := sameArgs(args, orEmpty(p.Args, call.Arguments))
 		switch {
 		case key == "":
-			return fmt.Errorf("%w: %q is keyed and the key of the dispatch it repeats is not known", ErrAmbiguousCall, call.CallID)
-		case (ans.IdempotencyKey == "" || ans.IdempotencyKey == p.IdempotencyKey) && !sameArgs(args, orEmpty(p.Args, call.Arguments)):
-			return fmt.Errorf("%w: %q is keyed and would run again with other arguments under the key of the dispatch it repeats", ErrAmbiguousCall, call.CallID)
+			return "", fmt.Errorf("%w: %q is keyed and the key of the dispatch it repeats is not known", ErrAmbiguousCall, call.CallID)
+		case same && p.IdempotencyKey == "":
+			return "", fmt.Errorf("%w: %q is keyed and the key of the dispatch it repeats is not known, so another key would run it as a new operation", ErrAmbiguousCall, call.CallID)
+		case same && key != p.IdempotencyKey:
+			return "", fmt.Errorf("%w: %q is keyed and would run again under another key than the dispatch it repeats, as a new operation", ErrAmbiguousCall, call.CallID)
+		case !same && key == p.IdempotencyKey:
+			return "", fmt.Errorf("%w: %q is keyed and would run again with other arguments under the key of the dispatch it repeats", ErrAmbiguousCall, call.CallID)
 		}
-		return nil
+		return RunAgainKeyedReason, nil
 	}
-	return fmt.Errorf("%w: %q", ErrAmbiguousCall, call.CallID)
+	return "", fmt.Errorf("%w: %q", ErrAmbiguousCall, call.CallID)
 }
 
 // orEmpty is args, else the call's own arguments, an empty object

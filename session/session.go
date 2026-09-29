@@ -722,7 +722,9 @@ type callRecord struct {
 	// one. dispatchRun is the run the last dispatch was written in, ""
 	// for one on the path the writer was seeded from, so a call an
 	// earlier run dispatched and this one runs again gets a dispatch
-	// of its own.
+	// of its own. again holds who approved such a call, when nothing
+	// has been written for the approval yet, so its dispatch writes the
+	// proceed first.
 	held        bool
 	dispatched  bool
 	rejected    bool
@@ -730,6 +732,7 @@ type callRecord struct {
 	answered    bool
 	unknown     bool
 	dispatchRun string
+	again       *string
 	// settledRun is the run whose tool_end ended the call without a
 	// dispatch: the loop refused it itself, for a name no tool has or
 	// arguments that are not an object, or a cut ended it before it
@@ -1092,10 +1095,10 @@ func replayAnswer(ctx context.Context, tools agenttool.Set, p agentturn.PendingC
 	again := agentturn.ApproveWith(id, p.Args).WithIdempotencyKey(p.IdempotencyKey)
 	switch agenttool.ReplayOf(ctx, tool, args) {
 	case agenttool.ReplaySafe:
-		return again.WithReason("run again: safe")
+		return again.WithReason(agentturn.RunAgainSafeReason)
 	case agenttool.ReplayKeyed:
 		if p.IdempotencyKey != "" {
-			return again.WithReason("run again: keyed")
+			return again.WithReason(agentturn.RunAgainKeyedReason)
 		}
 		return agentturn.OutcomeUnknown(id).WithReason("not run again: keyed without a key")
 	}
@@ -2707,10 +2710,14 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 		return nil
 	}
 	d := e.Decision
+	// A call an earlier run dispatched goes to its tool again only on
+	// an approval, which names its decider as a held call's does.
+	again := c.dispatched && c.dispatchRun != w.run
+	c.again = nil
 	by := ""
 	if d != nil {
 		by = d.By
-		if by == "" && !c.held {
+		if by == "" && !c.held && !again {
 			by = agentsession.ByPolicy
 		}
 	}
@@ -2745,7 +2752,10 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 	}
 	// An allowed call is recorded when something was decided about it:
 	// it was held and is now approved, its arguments were rewritten, or
-	// the hook gave a reason, such as the grant that allowed it.
+	// the hook gave a reason, such as the grant that allowed it. A call
+	// an earlier run dispatched is going to its tool again, which is
+	// always a decision; one with no reason is written when it is
+	// dispatched, so a call the loop then refuses has no proceed.
 	reason := decisionReason(d)
 	if rewritten := !sameJSON(e.Args, c.args); c.held || rewritten || reason != "" {
 		dec := agentsession.NewDecision(e.CallID, c.entry, agentsession.VerdictProceed, by)
@@ -2758,10 +2768,16 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 		if _, err := w.append(ctx, dec); err != nil {
 			return err
 		}
+	} else if again {
+		c.again = &by
 	}
 	c.held = false
 	return nil
 }
+
+// agentRunAgain is the reason of the proceed written for a call run
+// again under an approval that gave none.
+const agentRunAgain = "run again"
 
 // toolDispatch writes the call's dispatch: the loop has handed it to
 // its tool, so from here its side effect may have happened. It is
@@ -2778,6 +2794,15 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 	c := w.calls[e.CallID]
 	if c == nil || c.rejected || (c.dispatched && c.dispatchRun == w.run) {
 		return nil
+	}
+	if c.again != nil {
+		// Running a call again is the harness's choice, and the format
+		// says so with a proceed before the dispatch.
+		dec := agentsession.NewDecision(e.CallID, c.entry, agentsession.VerdictProceed, *c.again).WithReason(agentRunAgain)
+		if _, err := w.append(ctx, dec); err != nil {
+			return err
+		}
+		c.again = nil
 	}
 	d := agentsession.NewDispatch(e.CallID, c.entry).WithIdempotencyKey(e.IdempotencyKey)
 	if _, err := w.append(ctx, d); err != nil {

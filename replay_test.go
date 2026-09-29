@@ -81,7 +81,9 @@ func TestLoopMintsIdempotencyKeys(t *testing.T) {
 // rule, whether the agent saw the cut itself or was seeded with what a
 // record says, and a call the loop cannot say about is held to it too;
 // a call run again runs with the arguments it was handed over with; a
-// keyed call run with other arguments needs a key of its own; and
+// keyed call run with other arguments needs a key of its own, and one
+// run under a key of its own needs other arguments (#165); an approval
+// carries the rule that passed it as its reason (#166); and
 // WithRunAgain is the way past the rule.
 func TestResumeAppliesTheReplayRule(t *testing.T) {
 	call := &openresponses.FunctionCall{CallID: "call_1", Name: "act", Arguments: `{"text":"t"}`}
@@ -102,17 +104,37 @@ func TestResumeAppliesTheReplayRule(t *testing.T) {
 		// wantText the text argument, "" for the call's own.
 		wantKey  string
 		wantText string
+		// wantReason, when set, is the reason the approval's decision
+		// carries.
+		wantReason string
 	}{
-		{name: "cut, safe", replay: agenttool.ReplaySafe, cut: true},
-		{name: "cut, keyed", replay: agenttool.ReplayKeyed, cut: true},
+		{name: "cut, safe", replay: agenttool.ReplaySafe, cut: true, wantReason: RunAgainSafeReason},
+		{name: "cut, keyed", replay: agenttool.ReplayKeyed, cut: true, wantReason: RunAgainKeyedReason},
 		{name: "cut, unknown", replay: agenttool.ReplayUnknown, cut: true, wantErr: ErrAmbiguousCall},
 		{name: "seeded aborted, keyed with its key", replay: agenttool.ReplayKeyed,
 			pending: []PendingCall{{Call: call, Reason: PendingAborted, IdempotencyKey: "k1"}}, wantKey: "k1"},
 		{name: "seeded aborted, keyed without a key", replay: agenttool.ReplayKeyed,
 			pending: []PendingCall{{Call: call, Reason: PendingAborted}}, wantErr: ErrAmbiguousCall},
-		{name: "seeded aborted, keyed, the answer's key", replay: agenttool.ReplayKeyed,
+		// #165: a key names one operation, so a keyed call runs again
+		// under the key of the dispatch it repeats and no other, unless
+		// it runs with new arguments or the host accepts the risk.
+		{name: "seeded aborted without a key, keyed, the answer's key", replay: agenttool.ReplayKeyed,
 			pending: []PendingCall{{Call: call, Reason: PendingAborted}},
-			answer:  func(id string) Answer { return Approve(id).WithIdempotencyKey("k2") }, wantKey: "k2"},
+			answer:  func(id string) Answer { return Approve(id).WithIdempotencyKey("k2") }, wantErr: ErrAmbiguousCall},
+		{name: "seeded aborted, keyed, another key", replay: agenttool.ReplayKeyed,
+			pending: []PendingCall{{Call: call, Reason: PendingAborted, IdempotencyKey: "k1"}},
+			answer:  func(id string) Answer { return Approve(id).WithIdempotencyKey("k2") }, wantErr: ErrAmbiguousCall},
+		{name: "seeded aborted, keyed, its own key named", replay: agenttool.ReplayKeyed,
+			pending: []PendingCall{{Call: call, Reason: PendingAborted, IdempotencyKey: "k1"}},
+			answer:  func(id string) Answer { return Approve(id).WithIdempotencyKey("k1") }, wantKey: "k1", wantReason: RunAgainKeyedReason},
+		{name: "seeded aborted, keyed, another key, run again", replay: agenttool.ReplayKeyed,
+			pending: []PendingCall{{Call: call, Reason: PendingAborted, IdempotencyKey: "k1"}},
+			answer:  func(id string) Answer { return Approve(id).WithIdempotencyKey("k2").WithRunAgain() }, wantKey: "k2", wantReason: RunAgainReason},
+		{name: "seeded aborted without a key, keyed, other arguments under a new key", replay: agenttool.ReplayKeyed,
+			pending: []PendingCall{{Call: call, Reason: PendingAborted}},
+			answer: func(id string) Answer {
+				return ApproveWith(id, json.RawMessage(`{"text":"other"}`)).WithIdempotencyKey("k2")
+			}, wantKey: "k2", wantText: "other", wantReason: RunAgainKeyedReason},
 		{name: "seeded aborted, unknown", replay: agenttool.ReplayUnknown,
 			pending: []PendingCall{{Call: call, Reason: PendingAborted, IdempotencyKey: "k1"}}, wantErr: ErrAmbiguousCall},
 		{name: "seeded never started, unknown", replay: agenttool.ReplayUnknown,
@@ -181,6 +203,13 @@ func TestResumeAppliesTheReplayRule(t *testing.T) {
 			if len(pending) != 1 {
 				t.Fatalf("pending = %+v", pending)
 			}
+			var reasons []string
+			a.Subscribe(func(_ context.Context, ev Event) error {
+				if e, ok := ev.(*ToolStart); ok && e.Decision != nil {
+					reasons = append(reasons, e.Decision.Reason)
+				}
+				return nil
+			})
 			first := append([]string(nil), k.keys...)
 			answer := Approve
 			if tc.answer != nil {
@@ -202,6 +231,9 @@ func TestResumeAppliesTheReplayRule(t *testing.T) {
 			}
 			if len(k.keys) != len(first)+1 {
 				t.Fatalf("keys = %q", k.keys)
+			}
+			if tc.wantReason != "" && (len(reasons) == 0 || reasons[0] != tc.wantReason) {
+				t.Errorf("decision reasons %q, want %q", reasons, tc.wantReason)
 			}
 			if text := k.texts[len(k.texts)-1]; tc.wantText != "" && text != tc.wantText {
 				t.Errorf("ran with text %q, want %q", text, tc.wantText)

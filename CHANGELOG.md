@@ -87,6 +87,24 @@ versions may break the API.
   `source` on them: their decision says who gave them, and a policy's
   refusal no longer reads as sent by the person who started the run.
   The run's start and the answers' notes keep the trigger. (#160)
+- Breaking: `Agent.Resume` runs a keyed call that may have run again
+  only under the key of the dispatch it repeats. An answer whose
+  `IdempotencyKey` differs, the same arguments under another key,
+  returns `ErrAmbiguousCall` unless it carries `WithRunAgain`: a key
+  names one operation, and a new key runs the one that may have
+  happened as a new one. New arguments still need a new key. A call
+  whose dispatch carried no key, from a file written before format
+  0.8, is refused under any key the answer names. v0.0.11's note that
+  `Answer.IdempotencyKey` "supplies one after a restart" meant that
+  key, and no other. (#165)
+- An approval of a call that may have run carries the rule that let
+  it run again as its reason when it gives none, the new
+  `RunAgainSafeReason` or `RunAgainKeyedReason`, as
+  `session.ReplayAnswers` spells them, and the session recorder writes
+  a `proceed` whenever a call an earlier run dispatched goes to its
+  tool again, with the approval's decider, so a person's approval
+  with no reason is on the record. A driver that gives no reason gets
+  `run again`, written before the second dispatch. (#166)
 
 ## v0.0.11 - 2026-09-29
 

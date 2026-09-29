@@ -331,6 +331,11 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 		wantErr    error
 		wantRuns   int
 		wantRecord []string
+		// wantKey is the key the call runs again with, "" for k1, and
+		// wantBy and wantReason, when set, what the last decision says.
+		wantKey    string
+		wantBy     string
+		wantReason string
 	}{
 		{name: "held after dispatch, keyed, approved", replay: agenttool.ReplayKeyed, state: hold, want: agentturn.PendingDeferred,
 			answer: func(id string) agentturn.Answer {
@@ -357,6 +362,27 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 			answer: agentturn.Approve, wantErr: agentturn.ErrCallAnswered},
 		{name: "rejected, replayed", replay: agenttool.ReplaySafe, state: rejected, want: agentturn.PendingRejected,
 			replayed: true, wantRecord: []string{"reject", "output"}},
+		// #166: a call an earlier run dispatched runs again on a
+		// decision, which names who approved it and the rule that let
+		// it.
+		{name: "in flight, safe, approved by a person", replay: agenttool.ReplaySafe, state: dispatched("k1"), want: agentturn.PendingAborted,
+			answer:   func(id string) agentturn.Answer { return agentturn.Approve(id).WithBy(agentsession.ByHuman) },
+			wantRuns: 1, wantRecord: []string{"dispatch", "proceed", "dispatch", "output"},
+			wantBy: agentsession.ByHuman, wantReason: agentturn.RunAgainSafeReason},
+		// #165: a keyed call runs again under the key of the dispatch
+		// it repeats; another key is another operation.
+		{name: "in flight, keyed, another key", replay: agenttool.ReplayKeyed, state: dispatched("k1"), want: agentturn.PendingAborted,
+			answer:  func(id string) agentturn.Answer { return agentturn.Approve(id).WithIdempotencyKey("retry-1") },
+			wantErr: agentturn.ErrAmbiguousCall},
+		{name: "in flight without a key, keyed, a key", replay: agenttool.ReplayKeyed, state: dispatched(""), want: agentturn.PendingAborted,
+			answer:  func(id string) agentturn.Answer { return agentturn.Approve(id).WithIdempotencyKey("retry-1") },
+			wantErr: agentturn.ErrAmbiguousCall},
+		{name: "in flight, keyed, another key, run again", replay: agenttool.ReplayKeyed, state: dispatched("k1"), want: agentturn.PendingAborted,
+			answer: func(id string) agentturn.Answer {
+				return agentturn.Approve(id).WithIdempotencyKey("retry-1").WithRunAgain().WithBy(agentsession.ByHuman)
+			},
+			wantRuns: 1, wantKey: "retry-1", wantRecord: []string{"dispatch", "proceed", "dispatch", "output"},
+			wantBy: agentsession.ByHuman, wantReason: agentturn.RunAgainReason},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -433,8 +459,12 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 				}
 				return
 			}
-			if len(keys) != tc.wantRuns || tc.wantRuns > 0 && keys[0] != "k1" {
-				t.Errorf("ran with keys %q, want %d under k1", keys, tc.wantRuns)
+			wantKey := tc.wantKey
+			if wantKey == "" {
+				wantKey = "k1"
+			}
+			if len(keys) != tc.wantRuns || tc.wantRuns > 0 && keys[0] != wantKey {
+				t.Errorf("ran with keys %q, want %d under %s", keys, tc.wantRuns, wantKey)
 			}
 			var record []string
 			var last *agentsession.DecisionEntry
@@ -443,8 +473,8 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 				case *agentsession.DispatchEntry:
 					if e.CallID == call.CallID {
 						record = append(record, "dispatch")
-						if e.IdempotencyKey != "k1" {
-							t.Errorf("dispatch key %q, want k1", e.IdempotencyKey)
+						if e.IdempotencyKey != "k1" && e.IdempotencyKey != wantKey {
+							t.Errorf("dispatch key %q, want k1 or %s", e.IdempotencyKey, wantKey)
 						}
 					}
 				case *agentsession.DecisionEntry:
@@ -463,6 +493,9 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 			// an answered call's is the one on the path already.
 			if want := answers[0]; tc.want == agentturn.PendingDeferred && (last.By != want.By || last.Reason != want.Reason) {
 				t.Errorf("%s by %q for %q, want by %q for %q", last.Verdict, last.By, last.Reason, want.By, want.Reason)
+			}
+			if tc.wantBy != "" && (last.By != tc.wantBy || last.Reason != tc.wantReason) {
+				t.Errorf("%s by %q for %q, want by %q for %q", last.Verdict, last.By, last.Reason, tc.wantBy, tc.wantReason)
 			}
 			verifyAll(t, s2)
 			if err := s2.VerifyRecords(s2.Leaf()); err != nil {
@@ -532,4 +565,80 @@ func TestRebaseSeedsHeldCalls(t *testing.T) {
 		t.Errorf("call = %+v", c)
 	}
 	verifyAll(t, s)
+}
+
+// TestRunAgainIsAlwaysDecided pins the recorder half of #165 and #166
+// for a driver that approves without a reason: a call an earlier run
+// dispatched that goes to its tool again gets a proceed naming who
+// approved it, written before its second dispatch with a reason of
+// the recorder's own, and one the loop then refuses before any
+// dispatch gets none.
+func TestRunAgainIsAlwaysDecided(t *testing.T) {
+	cases := []struct {
+		name       string
+		dispatch   bool
+		wantRecord []string
+	}{
+		{name: "dispatched again", dispatch: true, wantRecord: []string{"dispatch", "proceed", "dispatch", "output"}},
+		{name: "refused before its dispatch", wantRecord: []string{"dispatch", "answer", "output"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := agentsession.NewMemoryStore()
+			s, err := store.Create(ctx, agentsession.Header{Records: agentsession.AllRecords})
+			if err != nil {
+				t.Fatal(err)
+			}
+			call := &openresponses.FunctionCall{CallID: "call_1", Name: "charge", Arguments: `{"text":"t"}`}
+			target, err := store.Append(ctx, s.ID(), &agentsession.ItemEntry{Item: call})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Append(ctx, s.ID(), agentsession.NewDispatch(call.CallID, target).WithIdempotencyKey("k1")); err != nil {
+				t.Fatal(err)
+			}
+			rec, s2, err := Resume(ctx, store, s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			const runID = "run_again"
+			events := []agentturn.Event{
+				&agentturn.RunStart{RunID: runID, Source: agentturn.SourceResume},
+				&agentturn.ToolStart{RunID: runID, CallID: call.CallID, Name: call.Name, Args: json.RawMessage(call.Arguments), Decision: &agentturn.ToolDecision{By: agentsession.ByHuman}},
+			}
+			if tc.dispatch {
+				events = append(events, &agentturn.ToolDispatch{RunID: runID, CallID: call.CallID, Name: call.Name, IdempotencyKey: "k1"},
+					&agentturn.ToolEnd{RunID: runID, CallID: call.CallID, Name: call.Name})
+			} else {
+				events = append(events, &agentturn.ToolEnd{RunID: runID, CallID: call.CallID, Name: call.Name, Err: errors.New("unknown tool")})
+			}
+			events = append(events, &agentturn.ItemEnd{RunID: runID, Item: openresponses.NewFunctionCallOutput(call.CallID, "done")},
+				&agentturn.RunEnd{RunID: runID, Reason: agentturn.ReasonStopped, Cause: agentturn.StopRefused})
+			for _, ev := range events {
+				if err := rec.Handle(ctx, ev); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var record []string
+			for _, e := range s2.Path(s2.Leaf()) {
+				switch e := e.(type) {
+				case *agentsession.DispatchEntry:
+					record = append(record, "dispatch")
+				case *agentsession.DecisionEntry:
+					record = append(record, e.Verdict)
+					if e.Verdict == agentsession.VerdictProceed && (e.By != agentsession.ByHuman || e.Reason == "") {
+						t.Errorf("proceed by %q for %q, want by human with a reason", e.By, e.Reason)
+					}
+				case *agentsession.ItemEntry:
+					if _, ok := e.Item.(*openresponses.FunctionCallOutput); ok {
+						record = append(record, "output")
+					}
+				}
+			}
+			if strings.Join(record, " ") != strings.Join(tc.wantRecord, " ") {
+				t.Errorf("record = %q, want %q", record, tc.wantRecord)
+			}
+		})
+	}
 }
