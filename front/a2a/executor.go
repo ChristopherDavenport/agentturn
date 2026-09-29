@@ -27,18 +27,15 @@ type Executor struct {
 
 	mu      sync.Mutex
 	cancels map[a2a.TaskID]context.CancelFunc
-	// convs holds the lock of each conversation with a task in flight
-	// or waiting, so one context ID runs one task at a time.
-	convs map[string]*convLock
+	// busy holds the context IDs with a task in flight, so one
+	// conversation runs one task at a time.
+	busy map[string]bool
 }
 
-// convLock serialises the tasks of one conversation; waiters counts
-// the tasks holding or waiting for it, so the entry goes when the last
-// one leaves.
-type convLock struct {
-	held    chan struct{}
-	waiters int
-}
+// ErrConversationBusy is the cause of the error a message gets when its
+// context ID already has a task in flight. It is wrapped with
+// a2a.ErrInvalidRequest, which is what a caller across the wire sees.
+var ErrConversationBusy = errors.New("conversation has a task in flight")
 
 var _ a2asrv.AgentExecutor = (*Executor)(nil)
 
@@ -70,14 +67,25 @@ func WithCallerTools(tools ...*openresponses.FunctionTool) Option {
 // defers them included. What it subscribes to that agent is called
 // with every event of the run, synchronously and before the executor
 // relays the event, so a recorder writes a call's dispatch before the
-// tool runs and a subscriber error ends the run with ReasonError,
-// which fails the task. It may replace the agent's configuration with
-// SetConfig, to route Config.ToolRecorder to the conversation's
-// record, and it returns the context the run is prompted with, derived
-// from ctx, which carries whatever the tools and child runs read to
-// attribute their writes, and a detach function the executor calls
-// when the task's run is over; detach may be nil. An error fails the
-// task before the run starts.
+// tool runs, and the loop goes at the pace of the recorder's durable
+// writes and the relay together. A subscriber error ends the run with
+// ReasonError, which fails the task, or with ReasonAborted when the
+// run was being aborted, which cancels it. The function may replace
+// the agent's configuration with SetConfig, to route
+// Config.ToolRecorder to the conversation's record, and it returns the
+// context the run is prompted with, derived from ctx, which carries
+// whatever the tools and child runs read to attribute their writes,
+// and a detach function the executor calls when the task's run is
+// over; detach may be nil. An error, or a nil context, makes the send
+// fail before any task exists: the caller gets the error and nothing
+// was run or stored.
+//
+// The transcript comes from the [ConversationStore], not from the
+// record. After an aborted or failed run the store drops the calls
+// that will never be answered, so the next message is a valid input,
+// while the session keeps them as cut off; seed from the store, as
+// the executor does, and treat the session as the record of what
+// happened rather than as the conversation's source.
 //
 // A host records each conversation as its own session with the
 // session module, which this one does not import:
@@ -104,7 +112,7 @@ func WithRecorderFor(fn RecorderFor) Option {
 
 // New builds an executor for cfg.
 func New(cfg agentturn.Config, opts ...Option) *Executor {
-	e := &Executor{cfg: cfg, cancels: map[a2a.TaskID]context.CancelFunc{}, convs: map[string]*convLock{}}
+	e := &Executor{cfg: cfg, cancels: map[a2a.TaskID]context.CancelFunc{}, busy: map[string]bool{}}
 	for _, opt := range opts {
 		opt(e)
 	}
@@ -133,15 +141,18 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	if err != nil {
 		return fmt.Errorf("%w: %w", a2a.ErrInvalidParams, err)
 	}
-	// The conversation is loaded, run and saved under its lock: a
-	// second task on the same context ID would otherwise run on a
-	// stale transcript, one save would drop the other's turn, and two
-	// recorders would write one record at once.
-	unlock, err := e.lockConversation(ctx, reqCtx.ContextID)
+	// The conversation is loaded, run and saved by one task at a time:
+	// a second task on the same context ID would run on a stale
+	// transcript, one save would drop the other's turn, and two
+	// recorders would write one record at once. The second is refused
+	// rather than made to wait, so a caller is not left holding a task
+	// it cannot see, and a served agent that sends to its own
+	// conversation fails instead of waiting on itself.
+	release, err := e.claim(reqCtx.ContextID)
 	if err != nil {
 		return err
 	}
-	defer unlock()
+	defer release()
 	transcript, err := e.store.Load(ctx, reqCtx.ContextID)
 	if err != nil {
 		return fmt.Errorf("load conversation %q: %w", reqCtx.ContextID, err)
@@ -159,11 +170,14 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	agent := agentturn.New(e.runConfig(slices.Concat(e.callerTools, declared)), agentturn.WithTranscript(transcript))
 	if e.recorderFor != nil {
 		rctx, detach, err := e.recorderFor(runCtx, reqCtx.ContextID, agent)
-		if err != nil {
-			return fmt.Errorf("record conversation %q: %w", reqCtx.ContextID, err)
-		}
 		if detach != nil {
 			defer detach()
+		}
+		if err == nil && rctx == nil {
+			err = errors.New("RecorderFor returned a nil context")
+		}
+		if err != nil {
+			return fmt.Errorf("record conversation %q: %w", reqCtx.ContextID, err)
 		}
 		runCtx = rctx
 	}
@@ -200,36 +214,23 @@ func (e *Executor) track(id a2a.TaskID, cancel context.CancelFunc) func() {
 	}
 }
 
-// lockConversation waits for the conversation's lock, or for ctx, and
-// returns the function that releases it.
-func (e *Executor) lockConversation(ctx context.Context, contextID string) (func(), error) {
+// claim marks the conversation busy and returns the function that
+// frees it, or the error a message on a busy conversation gets.
+func (e *Executor) claim(contextID string) (func(), error) {
 	e.mu.Lock()
-	if e.convs == nil {
-		e.convs = map[string]*convLock{}
+	defer e.mu.Unlock()
+	if e.busy == nil {
+		e.busy = map[string]bool{}
 	}
-	l := e.convs[contextID]
-	if l == nil {
-		l = &convLock{held: make(chan struct{}, 1)}
-		e.convs[contextID] = l
+	if e.busy[contextID] {
+		return nil, a2a.NewError(fmt.Errorf("%w: %w", a2a.ErrInvalidRequest, ErrConversationBusy),
+			fmt.Sprintf("context %q has a task in flight; send again once it has ended", contextID))
 	}
-	l.waiters++
-	e.mu.Unlock()
-	leave := func() {
-		e.mu.Lock()
-		if l.waiters--; l.waiters == 0 {
-			delete(e.convs, contextID)
-		}
-		e.mu.Unlock()
-	}
-	select {
-	case l.held <- struct{}{}:
-	case <-ctx.Done():
-		leave()
-		return nil, ctx.Err()
-	}
+	e.busy[contextID] = true
 	return func() {
-		<-l.held
-		leave()
+		e.mu.Lock()
+		delete(e.busy, contextID)
+		e.mu.Unlock()
 	}, nil
 }
 

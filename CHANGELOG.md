@@ -199,12 +199,20 @@ versions may break the API.
   and returns a context carrying the session ID. What it subscribes
   sees every event in step with the run, so a call's dispatch is
   written before the tool runs and a tool's record lands under its
-  call, and a failure to open the record or to write an event fails the
-  task. `agentturn.Run` runs ahead of its consumer, which a recorder
-  cannot follow. The executor now runs one task per context ID at a
-  time: a second message on a busy context waits for the first rather
-  than running on the transcript it has not saved, which lost one of
-  the two turns. (#141)
+  call, and the loop goes at the pace of those writes. A subscriber
+  error fails the task, or cancels it when the run was being aborted.
+  A record that cannot be opened, or a nil context, fails the send:
+  the caller gets the error and no task exists. `agentturn.Run` runs
+  ahead of its consumer, which a recorder cannot follow. The
+  transcript still comes from the `ConversationStore`, which drops the
+  calls an aborted run left unanswered while the session keeps them.
+  (#141)
+- `front/a2a` runs one task per context ID at a time. A message on a
+  context ID with a task in flight is refused at once with
+  `ErrConversationBusy`, wrapped with `a2a.ErrInvalidRequest`, rather
+  than running on the transcript the first task has not saved, which
+  lost one of the two turns; a served agent whose tool sends to its own
+  conversation gets that error instead of waiting on itself. (#141)
 
 ## v0.0.10 - 2026-09-28
 

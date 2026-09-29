@@ -151,25 +151,34 @@ func TestRecorderForObservesEveryRun(t *testing.T) {
 	}
 }
 
-// TestRecorderForFailures pins that a recorder that cannot open fails
-// the task before the model is called, and one that fails an event
-// fails the task through the run.
+// TestRecorderForFailures pins that a recorder that cannot open, or
+// returns no context, fails the send before any task exists or the
+// model is called, and one that fails an event fails the task through
+// the run.
 func TestRecorderForFailures(t *testing.T) {
 	boom := errors.New("store down")
 	tests := []struct {
 		name string
 		fn   RecorderFor
-		// calls is how many model calls the task makes; wantErr says
-		// the send fails with boom rather than returning a failed task.
+		// calls is how many model calls the task makes; sendErr, when
+		// set, is in the error the send fails with, and otherwise the
+		// send returns a task failed with boom.
 		calls   int
-		wantErr bool
+		sendErr string
 	}{
 		{
 			name: "open",
 			fn: func(context.Context, string, *agentturn.Agent) (context.Context, func(), error) {
 				return nil, nil, boom
 			},
-			wantErr: true,
+			sendErr: boom.Error(),
+		},
+		{
+			name: "nil context",
+			fn: func(context.Context, string, *agentturn.Agent) (context.Context, func(), error) {
+				return nil, nil, nil
+			},
+			sendErr: "nil context",
 		},
 		{
 			name: "event",
@@ -192,15 +201,15 @@ func TestRecorderForFailures(t *testing.T) {
 			res, err := a2asrv.NewHandler(exec).OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: userMessage("hello")})
 			task, _ := res.(*a2a.Task)
 			switch {
-			case tt.wantErr && !errors.Is(err, boom):
-				t.Errorf("err = %v, want %v", err, boom)
-			case !tt.wantErr && (err != nil || task.Status.State != a2a.TaskStateFailed || !strings.Contains(taskText(task), boom.Error())):
+			case tt.sendErr != "" && (err == nil || !strings.Contains(err.Error(), tt.sendErr) || res != nil):
+				t.Errorf("res = %+v, err = %v; want no result and an error with %q", res, err, tt.sendErr)
+			case tt.sendErr == "" && (err != nil || task.Status.State != a2a.TaskStateFailed || !strings.Contains(taskText(task), boom.Error())):
 				t.Errorf("task = %+v, err = %v; want failed with %v", task, err, boom)
 			}
 			if calls != tt.calls {
 				t.Errorf("model calls = %d, want %d", calls, tt.calls)
 			}
-			if tt.wantErr && len(store.conversations) != 0 {
+			if tt.sendErr != "" && len(store.conversations) != 0 {
 				t.Errorf("stored %v after a recorder that did not open", store.conversations)
 			}
 		})
@@ -230,64 +239,84 @@ func (m *blockingModel) CreateStream(ctx context.Context, req openresponses.Requ
 	return m.Adapter.CreateStream(ctx, req, sink)
 }
 
-// TestConversationRunsOneTaskAtATime pins that a second task on a
-// context ID waits for the first rather than running on the transcript
-// the first has not saved yet, so neither the store nor a recorder
-// sees two runs of one conversation at once.
-func TestConversationRunsOneTaskAtATime(t *testing.T) {
+// TestBusyConversationRefusesASecondTask pins that a message on a
+// context ID with a task in flight is refused at once with
+// ErrConversationBusy, and the task in flight completes and saves its
+// turn.
+func TestBusyConversationRefusesASecondTask(t *testing.T) {
 	model := &blockingModel{Adapter: &echo.Adapter{}, entered: make(chan struct{}), release: make(chan struct{})}
 	store := &MemoryStore{}
-	var mu sync.Mutex
-	attached := 0
-	exec := New(agentturn.Config{Model: model}, WithConversationStore(store), WithRecorderFor(func(ctx context.Context, _ string, _ *agentturn.Agent) (context.Context, func(), error) {
-		mu.Lock()
-		attached++
-		mu.Unlock()
-		return ctx, nil, nil
-	}))
+	exec := New(agentturn.Config{Model: model}, WithConversationStore(store))
 	h := a2asrv.NewHandler(exec)
 
-	send := func(text string) <-chan *a2a.Task {
-		out := make(chan *a2a.Task, 1)
-		msg := userMessage(text)
+	first := make(chan *a2a.Task, 1)
+	go func() {
+		msg := userMessage("first")
 		msg.ContextID = "c1"
-		go func() {
-			res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: msg})
-			if err != nil {
-				t.Errorf("OnSendMessage: %v", err)
-			}
-			task, _ := res.(*a2a.Task)
-			out <- task
-		}()
-		return out
-	}
-	first := send("first")
+		res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: msg})
+		if err != nil {
+			t.Errorf("first send: %v", err)
+		}
+		task, _ := res.(*a2a.Task)
+		first <- task
+	}()
 	<-model.entered
-	second := send("second")
-	time.Sleep(50 * time.Millisecond)
-	mu.Lock()
-	waiting := attached == 1
-	mu.Unlock()
-	if !waiting {
-		t.Error("second task started while the first was running")
+	second := userMessage("second")
+	second.ContextID = "c1"
+	res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: second})
+	if !errors.Is(err, ErrConversationBusy) || !errors.Is(err, a2a.ErrInvalidRequest) || res != nil {
+		t.Errorf("second send = %+v, %v; want refused as busy", res, err)
 	}
 	close(model.release)
-	for _, done := range []<-chan *a2a.Task{first, second} {
-		if task := <-done; task == nil || task.Status.State != a2a.TaskStateCompleted {
-			t.Fatalf("task = %+v", task)
-		}
+	if task := <-first; task == nil || task.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("first task = %+v", task)
 	}
-	model.mu.Lock()
-	defer model.mu.Unlock()
-	if !slices.Equal(model.inputs, []int{1, 3}) {
-		t.Errorf("model saw inputs of length %v, want [1 3]", model.inputs)
-	}
-	if tr, _ := store.Load(context.Background(), "c1"); len(tr) != 4 {
-		t.Errorf("stored %d items, want both turns", len(tr))
+	if tr, _ := store.Load(context.Background(), "c1"); len(tr) != 2 {
+		t.Errorf("stored %d items, want the first turn", len(tr))
 	}
 	exec.mu.Lock()
 	defer exec.mu.Unlock()
-	if len(exec.convs) != 0 {
-		t.Errorf("conversation locks left: %d", len(exec.convs))
+	if len(exec.busy) != 0 {
+		t.Errorf("busy conversations left: %v", exec.busy)
+	}
+}
+
+// TestSendToOwnConversationFailsFast pins that a served agent whose
+// tool sends a message to the conversation it is running in gets the
+// busy error back as the tool's failure, rather than waiting on itself.
+func TestSendToOwnConversationFailsFast(t *testing.T) {
+	var h a2asrv.RequestHandler
+	var sendErr error
+	self := agenttool.New("self", "sends to its own conversation", func(ctx context.Context, in struct {
+		Q string `json:"q"`
+	}) (string, error) {
+		msg := userMessage(in.Q)
+		msg.ContextID = "c1"
+		_, sendErr = h.OnSendMessage(ctx, &a2a.MessageSendParams{Message: msg})
+		return "", sendErr
+	})
+	h = a2asrv.NewHandler(New(agentturn.Config{Model: callsEveryTool{}, Tools: []agenttool.Tool{self}}))
+
+	done := make(chan *a2a.Task, 1)
+	go func() {
+		msg := userMessage("go")
+		msg.ContextID = "c1"
+		res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: msg})
+		if err != nil {
+			t.Errorf("send: %v", err)
+		}
+		task, _ := res.(*a2a.Task)
+		done <- task
+	}()
+	select {
+	case task := <-done:
+		if task == nil || task.Status.State != a2a.TaskStateCompleted {
+			t.Errorf("task = %+v", task)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the agent waited on its own conversation")
+	}
+	if !errors.Is(sendErr, ErrConversationBusy) {
+		t.Errorf("the tool's send err = %v, want %v", sendErr, ErrConversationBusy)
 	}
 }
