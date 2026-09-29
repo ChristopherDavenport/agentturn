@@ -418,6 +418,25 @@ type RunEnd struct {
 // EventType returns "run_end".
 func (*RunEnd) EventType() string { return EventRunEnd }
 
+// Answer returns the run's answer: the text of the assistant message
+// that ends Items, and whether there is one with text. A run whose
+// last item is anything else did not answer, whatever it said along
+// the way: text before a call is a preamble, and a guard that refuses
+// the next turn leaves the preamble last among the messages but not
+// last among the items. A message that OutputGuard replaced is the
+// replacement, and an empty one is no answer.
+func (e *RunEnd) Answer() (string, bool) {
+	if len(e.Items) == 0 {
+		return "", false
+	}
+	m, ok := e.Items[len(e.Items)-1].(*openresponses.Message)
+	if !ok || m.Role != openresponses.RoleAssistant {
+		return "", false
+	}
+	text := m.Text()
+	return text, text != ""
+}
+
 // PendingReason says why a call has no output.
 type PendingReason string
 

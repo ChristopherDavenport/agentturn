@@ -281,15 +281,18 @@ it raises and the hooks it calls; the events are defined
    appends any input. They are then facts about the transcript: a
    recorded session rebuilds the request they were part of, which
    injection through the transform cannot give. A hook error ends the
-   run with reason `error`.
+   run with reason `error`, or, marked as a guard's, stops it with cause
+   `guard` before the turn has a `turn_start`.
 3. **Tools of the moment** are resolved and, for a provided list,
    validated. A resume's approved batch resolves them the same way and
    skips the validation.
 4. **The request** is built as the [next section](#the-request) says.
    The before-model-call hook runs on it last. A hook that refuses
-   raises `model_blocked` carrying the request as built and ends the
-   run with reason `error`; no call was made, and the event is what
-   tells a recorder that from one that was made and failed.
+   raises `model_blocked` carrying the request as built, then stops the
+   run with cause `guard` when its error is marked as a guard's and
+   ends it with reason `error` otherwise; no call was made, and the
+   event is what tells a recorder that from one that was made and
+   failed.
 5. **`turn_start`** carries the request exactly as it will be sent and
    the **inputs** of the turn: the items appended since the previous
    turn's response, or since the run started for the first turn. They
@@ -956,7 +959,7 @@ provide a way to chain each, with the fold rule the table gives.
 | hook | when | sees | returns | an error | chain |
 | --- | --- | --- | --- | --- | --- |
 | before turn | turn phase 2 | the working transcript | items to append as facts | fails the run unless marked as a guard's, which stops it with cause `guard` | items appended in order; the first error drops them all |
-| before model call | turn phase 4, last | the finished request | edits it in place | `model_blocked`, then the run fails; marked as a guard's, the run stops with cause `guard` and no `model_blocked` | in order, each seeing what the last left; the first error stops |
+| before model call | turn phase 4, last | the finished request | edits it in place | `model_blocked`, then the run fails; marked as a guard's, the run stops with cause `guard` | in order, each seeing what the last left; the first error stops |
 | output guard | as the stream completes an assistant message | the message | a replacement or none | fails the run | in order, each seeing the last's replacement; the last stands |
 | decision (before tool call) | preflight, per call, model order; a nested call as a batch of one | the call, the tool, the arguments, the batch and index | a decision or none | fails the run; returned to the tool for a nested call | the strictest action wins, block over defer over allow; a block ends the chain, a defer does not; rewritten arguments pass to the hooks after; the first reason and decider of the standing action, the first note; terminate if any set it |
 | after tool call | as each call settles, blocked calls excepted | the call, the result, the error | an override or none | fails the run; returned to the tool for a nested call | — |
@@ -1112,7 +1115,7 @@ of the events.
 | `run_start` | `run` start, with the loop's source as the format's, the trigger joined as `kind:ref`, or whichever is set, as `ref`, and the trigger's kind, ref and source apart as `trigger`; an `env` entry, compared with the last one written members it does not define included, when the host supplies one and it changed; the full initial `config` from the configuration's base request when nothing has been written yet, and a `config` delta from it when the configuration changed since the last run, so the items the new configuration's before-turn hook appends are filed under it |
 | `turn_start` | a `config` delta when the request's settings differ from the path's; the request hash is computed here and written on the response. When the host names the parts the request's instructions are composed of, and they join to the instructions sent, the entries carry `instructions_parts`, a delta naming the parts that moved and each run of unchanged parts as a `keep`, and `instructions_omitted` for what the host left out; parts that do not join are dropped and the string is written, since the record describes what was sent |
 | `model_retry` | a record entry with the attempt, the error, the delay, the failed attempt's model and whether the retry policy revised the request, before the response of the attempt that answers; the revised request's settings are settled with that attempt, so only the attempt that answered is configured on the path. The record entry stays beside the count below, since it says what the count cannot |
-| `model_blocked` | a failed `response` carrying the hook's error and the request hash, so the call that was refused is told from one that was made and failed |
+| `model_blocked` | for an error marked as a guard's, a custom entry in `agentturn:model_blocked` carrying the guard's error, the request hash and the model, since the run stopped rather than failed and a failed `response` would make its end read as a failure; for any other error, a failed `response` carrying the hook's error and the request hash. Either way the call that was refused is told from one that was made and failed |
 | `item_end` | an `item`, with the display flag off for a hidden item. Before a caller-supplied output for a call that was neither dispatched nor rejected, a `reject` decision with the output's text as its reason and the decider the caller named, and `policy` as the decider when the loop refused the call itself in this run, for a name no tool has or arguments that are not an object; before one for a call dispatched in an earlier run, a `proceed` with the decider when one was named |
 | `response_end` | the `response`, with `request_hash` when the input the loop sent is the input the recorded path rebuilds, and none otherwise, and `attempts`, the calls it took, when the retry policy tried it again; so is the failed `response` `run_end` writes for a call left in flight, where an abort during the retry's backoff counts the attempt that was due, since nothing tells it from an abort before that attempt streamed |
 | `tool_start` | a `decision`: `reject` with the reason for a block, `call blocked` when it gave none; `hold` for a defer, with the reason when given; `proceed` for a call that was held, whose arguments were rewritten, with the arguments, or whose decision gave a reason, with the reason. The decider is the decision's, and `policy` for a call nothing was holding whose decision names nobody. A nested call is a record entry instead |

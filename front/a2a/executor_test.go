@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -282,6 +283,77 @@ func TestFailedRun(t *testing.T) {
 	if !errors.Is(err, a2a.ErrInvalidParams) {
 		t.Errorf("bad metadata err = %v", err)
 	}
+}
+
+// TestGuardStopBeforeAnswerFailsTask pins #138: a guard that stops the
+// run before the agent answers fails the task with its error, whichever
+// hook it is on and whatever preamble came before, and one that stops
+// it after an answer completes it with that answer.
+func TestGuardStopBeforeAnswerFailsTask(t *testing.T) {
+	refuse := fmt.Errorf("%w: homework tripwire", agentturn.ErrGuard)
+	onToolOutput := func(_ context.Context, req *openresponses.Request) error {
+		for _, item := range req.Input {
+			if _, ok := item.(*openresponses.FunctionCallOutput); ok {
+				return refuse
+			}
+		}
+		return nil
+	}
+	afterTurn := func(context.Context, agentturn.TurnInfo) (bool, error) { return false, refuse }
+	lookup := agenttool.New("lookup", "", func(context.Context, agenttool.NoArgs) (string, error) { return "found", nil })
+	for _, tc := range []struct {
+		name  string
+		cfg   agentturn.Config
+		state a2a.TaskState
+		text  string
+	}{
+		{"before turn", agentturn.Config{BeforeTurn: func(context.Context, agentturn.TurnStartInfo) (openresponses.Items, error) {
+			return nil, refuse
+		}}, a2a.TaskStateFailed, "homework tripwire"},
+		{"before model call", agentturn.Config{BeforeModelCall: func(context.Context, *openresponses.Request) error {
+			return refuse
+		}}, a2a.TaskStateFailed, "homework tripwire"},
+		{"before model call 2, after a preamble", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, BeforeModelCall: onToolOutput}, a2a.TaskStateFailed, "homework tripwire"},
+		{"after a turn that called tools", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, ShouldStopAfterTurn: afterTurn}, a2a.TaskStateFailed, "homework tripwire"},
+		{"after the answer", agentturn.Config{ShouldStopAfterTurn: afterTurn}, a2a.TaskStateCompleted, "solve x"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			if cfg.Model == nil {
+				cfg.Model = &echo.Adapter{}
+			}
+			cfg.ModelName = "m"
+			task := sendTask(t, a2asrv.NewHandler(New(cfg)), userMessage("solve x"))
+			if task.Status.State != tc.state || !strings.Contains(taskText(task), tc.text) {
+				t.Errorf("task = %s %q, want %s %q", task.Status.State, taskText(task), tc.state, tc.text)
+			}
+		})
+	}
+}
+
+// preamble says something and calls the first tool it is offered, then
+// echoes once a tool has answered.
+type preamble struct{}
+
+func (preamble) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	if _, ok := req.Input[len(req.Input)-1].(*openresponses.FunctionCallOutput); ok {
+		return (&echo.Adapter{}).CreateStream(ctx, req, sink)
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if err := em.Item(openresponses.AssistantText("Let me check.")); err != nil {
+		return err
+	}
+	w, err := em.FunctionCall("", req.Tools[0].(*openresponses.FunctionTool).Name)
+	if err != nil {
+		return err
+	}
+	if err := w.Arguments(`{}`); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
 }
 
 type failing struct{}

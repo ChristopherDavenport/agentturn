@@ -299,6 +299,92 @@ func TestChildInputRequired(t *testing.T) {
 	}
 }
 
+// TestChildGuardStop pins #138: a child a guard stopped before it
+// answered fails the call with the guard's error, named for the agent
+// and wrapping ErrGuard, with its ChildInfo, whichever hook the guard
+// is on and whatever preamble came before, and without asking
+// WithNoAnswer; one a guard stopped after it answered returns the
+// answer.
+func TestChildGuardStop(t *testing.T) {
+	refuse := fmt.Errorf("%w: homework tripwire", agentturn.ErrGuard)
+	onToolOutput := func(_ context.Context, req *openresponses.Request) error {
+		for _, item := range req.Input {
+			if _, ok := item.(*openresponses.FunctionCallOutput); ok {
+				return refuse
+			}
+		}
+		return nil
+	}
+	afterTurn := func(context.Context, agentturn.TurnInfo) (bool, error) { return false, refuse }
+	lookup := agenttool.New("lookup", "", func(context.Context, agenttool.NoArgs) (string, error) { return "found", nil })
+	for _, tc := range []struct {
+		name string
+		cfg  agentturn.Config
+		want string
+	}{
+		{"before turn", agentturn.Config{BeforeTurn: func(context.Context, agentturn.TurnStartInfo) (openresponses.Items, error) {
+			return nil, refuse
+		}}, ""},
+		{"before model call", agentturn.Config{BeforeModelCall: func(context.Context, *openresponses.Request) error {
+			return refuse
+		}}, ""},
+		{"before model call 2, after a preamble", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, BeforeModelCall: onToolOutput}, ""},
+		{"after a turn that called tools", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, ShouldStopAfterTurn: afterTurn}, ""},
+		{"after the answer", agentturn.Config{ShouldStopAfterTurn: afterTurn}, "solve x"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			cfg.Name = "Billing agent"
+			if cfg.Model == nil {
+				cfg.Model = &echo.Adapter{}
+			}
+			noAnswer := WithNoAnswer(func(ChildInfo) (agenttool.Result, error) {
+				t.Error("a guard's stop reached WithNoAnswer")
+				return agenttool.Result{}, nil
+			})
+			res, err := New(cfg, WithToolName("billing"), noAnswer).Execute(context.Background(), agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"solve x"}`)})
+			info, ok := res.Details.(ChildInfo)
+			if !ok || info.Agent != "Billing agent" || info.Cause != agentturn.StopGuard {
+				t.Errorf("details = %+v", res.Details)
+			}
+			if tc.want == "" {
+				if !errors.Is(err, agentturn.ErrGuard) || !strings.HasPrefix(err.Error(), `agent "Billing agent": `) {
+					t.Errorf("err = %v, want the guard's naming the agent", err)
+				}
+				return
+			}
+			if err != nil || res.Output.Text != tc.want {
+				t.Errorf("res = %q, err = %v, want %q", res.Output.Text, err, tc.want)
+			}
+		})
+	}
+}
+
+// preamble says something and calls the first tool it is offered, then
+// echoes once a tool has answered.
+type preamble struct{}
+
+func (preamble) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	if _, ok := req.Input[len(req.Input)-1].(*openresponses.FunctionCallOutput); ok {
+		return (&echo.Adapter{}).CreateStream(ctx, req, sink)
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if err := em.Item(openresponses.AssistantText("Let me check.")); err != nil {
+		return err
+	}
+	w, err := em.FunctionCall("", req.Tools[0].(*openresponses.FunctionTool).Name)
+	if err != nil {
+		return err
+	}
+	if err := w.Arguments(`{}`); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
 func TestChildWithoutAnAnswer(t *testing.T) {
 	// A child that hits its turn budget while still calling tools has no
 	// final message: the parent's model sees an error naming the cause.
@@ -309,12 +395,17 @@ func TestChildWithoutAnAnswer(t *testing.T) {
 	})
 	child := New(agentturn.Config{Name: "explore", Model: &echo.Adapter{}, Tools: []agenttool.Tool{looping}, MaxTurns: 1})
 	res, err := child.Execute(context.Background(), agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"x"}`)})
-	if err == nil || !strings.Contains(err.Error(), "max_turns") || !strings.Contains(err.Error(), "without a final answer") {
+	if err == nil || !strings.Contains(err.Error(), `agent "explore" stopped (max_turns) without a final answer`) {
 		t.Errorf("err = %v", err)
 	}
 	info, ok := res.Details.(ChildInfo)
 	if !ok || info.Reason != agentturn.ReasonStopped || info.Cause != agentturn.StopMaxTurns {
 		t.Errorf("details = %+v", res.Details)
+	}
+	// Text before a call is a preamble, not an answer.
+	child = New(agentturn.Config{Name: "explore", Model: preamble{}, Tools: []agenttool.Tool{looping}, MaxTurns: 1})
+	if res, err := child.Execute(context.Background(), agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"x"}`)}); err == nil || !strings.Contains(err.Error(), "without a final answer") {
+		t.Errorf("preamble: res = %q, err = %v", res.Output.Text, err)
 	}
 	// A terminating tool answered on the child's behalf: its output is
 	// the answer.

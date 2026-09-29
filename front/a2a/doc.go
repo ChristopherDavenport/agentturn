@@ -9,7 +9,11 @@
 // context ID, streams assistant text as artifact chunks, and ends the
 // task from the run's reason: completed, canceled, failed or, when the
 // model called a tool the caller owns, input-required with the pending
-// function_call items on the status message.
+// function_call items on the status message. A run a guard stopped
+// (agentturn.StopGuard) with no answer (agentturn.RunEnd.Answer) fails
+// the task with the guard's error rather than completing it, whichever
+// hook the guard is on, ShouldStopAfterTurn after a turn that only
+// called tools included.
 //
 //	exec := a2a.New(cfg)
 //	handler := a2asrv.NewHandler(exec)

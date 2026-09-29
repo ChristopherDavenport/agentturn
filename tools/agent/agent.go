@@ -47,6 +47,8 @@ type Input struct {
 
 // ChildInfo is the Result.Details of a child run.
 type ChildInfo struct {
+	// Agent is the child's name, its Config.Name.
+	Agent string
 	// RunID is the child's run ID.
 	RunID string
 	// Items are the items the child run appended to its transcript,
@@ -122,13 +124,18 @@ func WithToolName(name string) Option {
 }
 
 // WithNoAnswer sets what the parent's model sees when the child ends
-// without a final assistant message: a run that hit its turn budget
-// or a stop hook still calling tools, or one that finished with an
-// empty message. The default returns an error naming the agent and
-// the cause, so the model knows the child did not answer rather than
+// without an answer (agentturn.RunEnd.Answer): a run that hit its turn
+// budget or a stop hook (agentturn.StopHook) still calling tools, text
+// before a call being no answer, or one that finished with an empty
+// message. The default returns an error naming the agent and the
+// cause, so the model knows the child did not answer rather than
 // reading an empty output as one; a child stopped by a terminating
 // tool result is the exception, whose last output stands as the
-// answer, since the tool answered on the model's behalf.
+// answer, since the tool answered on the model's behalf. A child a
+// guard stopped (agentturn.StopGuard) without an answer is not asked
+// about here, whichever hook the guard is on, ShouldStopAfterTurn
+// included: that is a refusal, and the call fails with the guard's
+// error, which wraps agentturn.ErrGuard.
 func WithNoAnswer(fn func(ChildInfo) (agenttool.Result, error)) Option {
 	return func(o *options) { o.noAnswer = fn }
 }
@@ -412,7 +419,7 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		soFar = append(soFar, m.Text())
 		call.Update(agenttool.Result{
 			Output:  openresponses.FunctionCallOutputData{Text: strings.Join(soFar, "\n\n")},
-			Details: ChildInfo{RunID: e.RunID},
+			Details: ChildInfo{Agent: a.cfg.Name, RunID: e.RunID},
 		})
 		return nil
 	})
@@ -446,7 +453,7 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		}
 		return agenttool.Result{}, fmt.Errorf("agent %s: %w", strconv.Quote(a.cfg.Name), err)
 	}
-	info := ChildInfo{RunID: end.RunID, Items: end.Items, Reason: end.Reason, Cause: end.Cause, Pending: end.Pending}
+	info := ChildInfo{Agent: a.cfg.Name, RunID: end.RunID, Items: end.Items, Reason: end.Reason, Cause: end.Cause, Pending: end.Pending}
 	switch end.Reason {
 	case agentturn.ReasonInputRequired:
 		return agenttool.Result{Details: info}, &InputRequiredError{Agent: a.cfg.Name, RunID: end.RunID, Pending: end.Pending}
@@ -459,7 +466,13 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		}
 		return agenttool.Result{Details: info}, err
 	}
-	text, ok := lastAssistantText(end.Items)
+	text, ok := end.Answer()
+	if !ok && end.Reason == agentturn.ReasonStopped && end.Cause == agentturn.StopGuard {
+		// A guard stopped the child before it answered, at whichever
+		// hook. The parent gets the guard's error, which wraps
+		// ErrGuard, as it gets a failed run's.
+		return agenttool.Result{Details: info}, fmt.Errorf("agent %q: %w", a.cfg.Name, end.Err)
+	}
 	if !ok {
 		res, err := a.opts.noAnswer(info)
 		res.Details = info
@@ -492,7 +505,7 @@ func (a *agentTool) detached(ctx context.Context, call agenttool.Call, child *ag
 		finish()
 		return agenttool.Result{
 			Output:  openresponses.FunctionCallOutputData{Text: fmt.Sprintf("agent %s is working on it in the background as run %s; its answer will follow", strconv.Quote(a.cfg.Name), runID)},
-			Details: ChildInfo{RunID: runID},
+			Details: ChildInfo{Agent: a.cfg.Name, RunID: runID},
 		}, nil
 	}
 	select {
@@ -552,22 +565,13 @@ func defaultNoAnswer(info ChildInfo) (agenttool.Result, error) {
 		}
 	}
 	name := "the agent"
+	if info.Agent != "" {
+		name = fmt.Sprintf("agent %q", info.Agent)
+	}
 	if info.Cause != "" {
 		return agenttool.Result{}, fmt.Errorf("%s stopped (%s) without a final answer", name, info.Cause)
 	}
 	return agenttool.Result{}, errors.New(name + " finished without a final answer")
-}
-
-// lastAssistantText returns the text of the last assistant message,
-// and whether there is one with text.
-func lastAssistantText(items agentturn.Transcript) (string, bool) {
-	for i := len(items) - 1; i >= 0; i-- {
-		if m, ok := items[i].(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant {
-			text := m.Text()
-			return text, text != ""
-		}
-	}
-	return "", false
 }
 
 // lastOutputText returns the text of the last function call output.

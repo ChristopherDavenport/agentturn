@@ -34,6 +34,39 @@ versions may break the API.
   the attempt streamed. The `model_retry` custom entries stay,
   since they carry what a count cannot: each failure, its delay, its
   model and whether `Retry.Revise` changed the request. (#117)
+- A guard that stops a run before the agent answers is reported as a
+  refusal by every consumer in this repository again. Since v0.0.10
+  made a guard at `BeforeTurn` or `BeforeModelCall` a stop rather than
+  a failure, `front/responses` completed an empty response, `front/a2a`
+  completed the task with no message, and `tools/agent` returned an
+  error that named neither the agent nor the guard. A full run over
+  `front/responses` now fails with the guard's error, as a single turn
+  already did; `front/a2a` fails the task with it; and `tools/agent`
+  returns `agent "<name>": <error>`, which wraps `agentturn.ErrGuard`,
+  with the child's `ChildInfo`, and does not ask `WithNoAnswer`.
+  `RunEnd.Answer` is the one test the three share: the run answered
+  when its items end in an assistant message with text. Text before a
+  call is a preamble, not an answer, so a guard that refuses a tool's
+  output on the next turn fails the call rather than completing with
+  "Let me check.". The rule holds for every guard stop, so a
+  `ShouldStopAfterTurn` guard after a turn that only called tools is a
+  refusal too, where it used to complete; a stop hook (`StopHook`) or
+  the turn budget there still goes to `WithNoAnswer`. A guard that
+  stops the run after an answer completes with it, or with the
+  `OutputGuard` replacement when it has text; a replacement with no
+  text is no answer, and the guard's error is reported. `tools/agent`
+  takes its answer from `RunEnd.Answer` for every reason, so a child
+  that stopped on its turn budget after a preamble reports no answer
+  instead of returning the preamble. `ChildInfo` gains `Agent`, the
+  child's name, and the default `WithNoAnswer` error names the agent
+  as its documentation said it did. (#138)
+- RFC 0001 describes a guard's refusal at `BeforeModelCall` as the
+  loop does it: `model_blocked` is raised, then the run stops with cause
+  `guard`, and the recorder writes an `agentturn:model_blocked` custom
+  entry rather than a failed response. Turn phase 2 gives the guard case
+  of `BeforeTurn`. The session writer's comment on a run with no
+  response of its own says a guard stop before the first model call
+  reads as aborted. (#140)
 
 ## v0.0.10 - 2026-09-28
 

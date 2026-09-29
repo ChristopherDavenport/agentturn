@@ -118,3 +118,28 @@ func TestQueueCarriesItsTrigger(t *testing.T) {
 		t.Errorf("queued = %+v", got)
 	}
 }
+
+// TestRunEndAnswer pins the answer #138's consumers share: the assistant
+// message that ends the run's items, when it has text.
+func TestRunEndAnswer(t *testing.T) {
+	call := &openresponses.FunctionCall{CallID: "c1", Name: "lookup", Arguments: `{}`}
+	for _, tc := range []struct {
+		name  string
+		items Transcript
+		want  string
+		ok    bool
+	}{
+		{"nothing", nil, "", false},
+		{"an answer", Transcript{openresponses.UserText("q"), openresponses.AssistantText("a")}, "a", true},
+		{"an empty message", Transcript{openresponses.UserText("q"), openresponses.AssistantText("")}, "", false},
+		{"a preamble and a call", Transcript{openresponses.UserText("q"), openresponses.AssistantText("Let me check."), call, openresponses.NewFunctionCallOutput("c1", "found")}, "", false},
+		{"a user message last", Transcript{openresponses.AssistantText("a"), openresponses.UserText("and?")}, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := (&RunEnd{Items: tc.items}).Answer()
+			if got != tc.want || ok != tc.ok {
+				t.Errorf("Answer() = %q, %v, want %q, %v", got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}

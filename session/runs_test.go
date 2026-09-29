@@ -335,7 +335,8 @@ func TestStartOnABaseSeedsTheRecorder(t *testing.T) {
 
 // TestGuardBeforeTheCallIsRecordedAsAStop checks the record of #116: a
 // guard that stops a run before its model call leaves no failed
-// response, and the run end names the guard.
+// response, and the run end names the guard. With no response of its
+// own and nothing answered, the end reads as aborted (#140).
 func TestGuardBeforeTheCallIsRecordedAsAStop(t *testing.T) {
 	store := agentsession.NewMemoryStore()
 	rec, s, err := Start(context.Background(), store, agentsession.Header{})
@@ -366,7 +367,7 @@ func TestGuardBeforeTheCallIsRecordedAsAStop(t *testing.T) {
 		t.Errorf("model_blocked = %+v", mb)
 	}
 	runs := runsOf(t, s)
-	if len(runs) != 1 || runs[0].End == nil || !strings.HasPrefix(runs[0].End.Ref, "guard: ") {
+	if len(runs) != 1 || runs[0].End == nil || runs[0].End.Reason != agentsession.ReasonAborted || !strings.HasPrefix(runs[0].End.Ref, "guard: ") {
 		t.Errorf("run end = %+v", runs[0].End)
 	}
 	if err := s.VerifyRecords(s.Leaf()); err != nil {

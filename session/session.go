@@ -2442,21 +2442,24 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 		}
 		switch {
 		case w.responses == 0:
-			// A resume whose approved batch terminated, or a refusal on
-			// Resume: the segment has no response of its own. The format
+			// A resume whose approved batch terminated, a refusal on
+			// Resume, or a guard's stop before the run's first model
+			// call: the segment has no response of its own. The format
 			// reads it as stopped when it answered a call an earlier
 			// run's model call made and left nothing on the path
 			// pending, and as aborted otherwise.
 			//
-			// The loop reaches only the stopped side. Resume refuses a
+			// A resume reaches only the stopped side: Resume refuses a
 			// partial answer, so a run of its that stops without calling
-			// the model has answered every call that was pending. The
-			// aborted side is for a host driving agentturn.Run itself
-			// through Handle, which ends a run where it likes. The
-			// format's stopped step asks one further thing that is not
-			// checked here, that the path's last response is the one
-			// whose calls are being answered; no arrangement of the
-			// loop's events can break that, since a call without an
+			// the model has answered every call that was pending. A
+			// guard at BeforeTurn or BeforeModelCall that stops a run
+			// before its first model call, having answered nothing,
+			// reaches the aborted side, and so does a host driving
+			// agentturn.Run itself through Handle, which ends a run where
+			// it likes. The format's stopped step asks one further thing
+			// that is not checked here, that the path's last response is
+			// the one whose calls are being answered; no arrangement of
+			// the loop's events can break that, since a call without an
 			// output keeps the model from being called again.
 			if w.answeredCall && !w.pendingOnPath() {
 				return agentsession.ReasonStopped, cause
