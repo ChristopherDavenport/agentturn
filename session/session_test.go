@@ -381,8 +381,24 @@ func TestConfigDelta(t *testing.T) {
 		{"last tool redefined", with(a, tool("b", "changed")), func(d *agentsession.ConfigEntry) bool {
 			return !d.Replace && names(d.ToolsAdded) == "b" && len(d.ToolsRemoved) == 0
 		}},
-		{"first tool redefined needs replace", with(tool("a", "changed"), b), func(d *agentsession.ConfigEntry) bool { return d.Replace }},
-		{"tool inserted first needs replace", with(c, a, b), func(d *agentsession.ConfigEntry) bool { return d.Replace }},
+		{"first tool redefined adds the tools after it", with(tool("a", "changed"), b), func(d *agentsession.ConfigEntry) bool {
+			return !d.Replace && names(d.ToolsAdded) == "a b" && len(d.ToolsRemoved) == 0
+		}},
+		{"tool inserted first adds the tools after it", with(c, a, b), func(d *agentsession.ConfigEntry) bool {
+			return !d.Replace && names(d.ToolsAdded) == "c a b" && len(d.ToolsRemoved) == 0
+		}},
+		{"tool inserted mid-list adds the tools after it", with(a, c, b), func(d *agentsession.ConfigEntry) bool {
+			return !d.Replace && names(d.ToolsAdded) == "c b" && len(d.ToolsRemoved) == 0
+		}},
+		{"tools reordered adds the one moved", with(b, a), func(d *agentsession.ConfigEntry) bool {
+			return !d.Replace && names(d.ToolsAdded) == "a" && len(d.ToolsRemoved) == 0
+		}},
+		{"first tool removed", with(b), func(d *agentsession.ConfigEntry) bool {
+			return !d.Replace && len(d.ToolsAdded) == 0 && strings.Join(d.ToolsRemoved, " ") == "a"
+		}},
+		{"tool removed and one inserted in its place", with(c, b), func(d *agentsession.ConfigEntry) bool {
+			return !d.Replace && names(d.ToolsAdded) == "c b" && strings.Join(d.ToolsRemoved, " ") == "a"
+		}},
 		{"every tool replaced is still a delta when smaller", with(tool("x", ""), tool("y", "")), func(d *agentsession.ConfigEntry) bool {
 			return !d.Replace && names(d.ToolsAdded) == "x y" && strings.Join(d.ToolsRemoved, " ") == "a b"
 		}},

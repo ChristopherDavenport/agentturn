@@ -3041,9 +3041,10 @@ func (w *writer) append(ctx context.Context, e agentsession.Entry) (string, erro
 
 // configDelta returns the config entry that takes prev to next, nil when
 // they are equal, or full (a replace entry) when the change cannot be
-// expressed as a delta: a model being cleared, a tool list change that
-// a delta would not replay in the request's order, or a delta that
-// would be larger than the replacement. parts, when set, are the parts
+// expressed as a delta: a model being cleared, or a delta that would be
+// larger than the replacement. A tool list change is always a delta
+// that replays in the request's order (see toolDelta), however much of
+// the list it names. parts, when set, are the parts
 // next's instructions are composed of, and the instructions change is
 // written as the parts that moved; otherwise it is the joined string,
 // and parts on the path whose join is unchanged are left in place.
@@ -3067,9 +3068,9 @@ func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntr
 	d := &agentsession.ConfigEntry{}
 	if !equalJSON(prev.Tools, next.Tools) {
 		d.ToolsAdded, d.ToolsRemoved = toolDelta(prev.Tools, next.Tools)
-		// Replay appends added tools after the kept ones, so a delta
-		// stands only when that yields the request's tool order; the
-		// hash of the stored path depends on it.
+		// Replay appends added tools after the kept ones, and the hash
+		// of the stored path depends on the request's tool order;
+		// toolDelta adds enough to reproduce it, and this guards that.
 		if !equalJSON(prev.Apply(d).Tools, next.Tools) {
 			return full
 		}
@@ -3122,23 +3123,33 @@ func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntr
 	return d
 }
 
-// toolDelta returns the tools of next that prev lacks or defines
-// differently, in next's order, and the names of prev's tools that next
-// lacks, in prev's order. A tool whose definition changed under the
-// same name is in added: replay removes the old definition by name
-// before appending the new one.
+// toolDelta returns the tools a delta from prev to next adds, in next's
+// order, and the names of prev's tools that next lacks, in prev's
+// order. Replay removes each added tool by name and appends it after
+// the tools kept, so added is every tool of next from the first one
+// that does not already stand where replay leaves it: a tool that is
+// new, defined differently under the same name, or kept out of prev's
+// order. A tool inserted mid-list is added with the tools that follow
+// it, and a tool moved to the end is added alone.
 func toolDelta(prev, next openresponses.Tools) (added openresponses.Tools, removed []string) {
-	before := make(map[string]openresponses.Tool, len(prev))
-	for _, t := range prev {
-		before[agentsession.ToolName(t)] = t
+	at := make(map[string]int, len(prev))
+	for i, t := range prev {
+		at[agentsession.ToolName(t)] = i
 	}
 	after := make(map[string]bool, len(next))
+	last, moved := -1, false
 	for _, t := range next {
 		name := agentsession.ToolName(t)
 		after[name] = true
-		if old, ok := before[name]; !ok || !equalJSON(old, t) {
-			added = append(added, t)
+		if !moved {
+			i, ok := at[name]
+			if ok && i > last && equalJSON(prev[i], t) {
+				last = i
+				continue
+			}
+			moved = true
 		}
+		added = append(added, t)
 	}
 	for _, t := range prev {
 		if name := agentsession.ToolName(t); !after[name] {
