@@ -71,6 +71,49 @@ versions may break the API.
   the last output of a call whose result set `Terminate`, where
   both fronts completed with no answer: an empty response, or a task
   with no message. (#163)
+- Breaking: `Agent.Resume` puts an approval of a call pending as
+  `PendingUndispatched` to `Config.BeforeToolCall`, since nothing has
+  decided it, and a Block or a Defer applies as it would in a run: a
+  deferred call ends the run with `input_required`. A call that never
+  started used to run with the hook skipped, so `session.ReplayAnswers`
+  followed by a resume ran, after a restart, exactly the calls the
+  policy had not yet allowed. A call a record refused and stopped
+  before the refusal's output is pending as the new `PendingRejected`
+  rather than as never started: it takes only an output, an approval
+  returns `ErrCallAnswered`, and `session.ReplayAnswers` answers it
+  with the reject's reason. The session recorder writes the end of a
+  resume that a deferral ends before its first model call as `aborted`
+  with `input_required` as its ref, which is what the format reads of
+  a run holding a call it did not append. (#159)
+- The outputs `Agent.Resume` appends for pending calls carry no
+  trigger on their `item_end`, so the session recorder writes no
+  `source` on them: their decision says who gave them, and a policy's
+  refusal no longer reads as sent by the person who started the run.
+  The run's start and the answers' notes keep the trigger. (#160)
+- Breaking: `Agent.Resume` runs a keyed call that may have run again
+  only under the key of the dispatch it repeats. An answer whose
+  `IdempotencyKey` differs, the same arguments under another key,
+  returns `ErrAmbiguousCall` unless it carries `WithRunAgain`: a key
+  names one operation, and a new key runs the one that may have
+  happened as a new one. New arguments still need a new key. A call
+  whose dispatch carried no key, from a file written before format
+  0.8, is refused under any key the answer names. v0.0.11's note that
+  `Answer.IdempotencyKey` "supplies one after a restart" meant that
+  key, and no other. (#165)
+- An approval of a call that may have run carries the rule that let
+  it run again as its reason when it gives none, the new
+  `RunAgainSafeReason` or `RunAgainKeyedReason`, as
+  `session.ReplayAnswers` spells them, and the session recorder writes
+  a `proceed` whenever a call an earlier run dispatched goes to its
+  tool again, with the approval's decider, so a person's approval
+  with no reason is on the record; one that names nobody is written
+  with no decider, where it was `policy`. A driver that gives no reason gets
+  `run again`, written before the second dispatch. (#166)
+- `session.ReplayAnswers`' doc names `session.AgentOptions` as the
+  seed its answers are read against, where it said the context's
+  items, under which a never-started call's approval is held to the
+  replay rule and refused; the package doc resumes a session with
+  both. (#167)
 
 ## v0.0.11 - 2026-09-29
 

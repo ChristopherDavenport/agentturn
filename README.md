@@ -180,10 +180,12 @@ accepts the risk. A tool without `WithReplay` reads as unknown, so an
 approval of it after a cut is refused. After a restart,
 `session.AgentOptions` seeds the agent with the context and with what
 the record says of each pending call, so a call that never started is
-approved as it is, a call held after its dispatch is held to the rule
-when approved, and a call answered before the crash wrote its output
-takes that output alone; `session.ReplayAnswers` applies the rule to
-the calls nobody holds:
+approved without the rule and put to `BeforeToolCall`, since nothing
+decided it, a call held after its dispatch is held to the rule when
+approved, and a call answered or refused before the crash wrote its
+output takes that output alone; `session.ReplayAnswers` applies the
+rule to the calls nobody holds, and is read against an agent seeded
+this way:
 
 ```go
 rec, s, _ := session.Resume(ctx, store, id)

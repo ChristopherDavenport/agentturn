@@ -21,7 +21,17 @@
 //
 // [Start] creates the session and [Resume] reopens one; both return
 // the recorder and the session, and the caller keeps the store, which
-// [Recorder.Store] also returns, for Sync, Release and Close.
+// [Recorder.Store] also returns, for Sync, Release and Close. A host
+// resuming after a restart seeds the agent with [AgentOptions], which
+// says what the record knows of each pending call, and answers the
+// calls nobody holds with [ReplayAnswers]:
+//
+//	rec, s, _ := session.Resume(ctx, store, id)
+//	opts, _ := session.AgentOptions(s)
+//	agent := agentturn.New(cfg, opts...)
+//	defer rec.Attach(agent)()
+//	answers, _ := session.ReplayAnswers(ctx, s, cfg.ResolveTools(ctx))
+//	end, err := agent.Resume(ctx, answers...) // with the held calls' answers
 //
 // The package is named session, not agentsession, because a consumer
 // imports both side by side: agentsession to open a store, session to
@@ -77,8 +87,10 @@
 //     response ID, and an item the caller marked with agentturn.Hidden
 //     carries visible false, the format's word for an item that is part
 //     of the model context and that a renderer should hide. An item the
-//     run was prompted with carries the run's trigger as its source, and
-//     a queued input the trigger it was queued with, Extra and all. An
+//     run was prompted with carries the run's trigger as its source,
+//     other than an output Agent.Resume appends for a pending call,
+//     whose decision says who gave it, and a queued input the trigger
+//     it was queued with, Extra and all. An
 //     item the filter in force would hide from the model, an app-only
 //     extension item, is written as a custom entry
 //     instead so the path rebuilds exactly the input that was sent. A
@@ -113,10 +125,14 @@
 //     ToolDecision.By, which Answer.By sets for an approval, and policy
 //     for a hook's decision about a call nothing was holding; an answer
 //     that names nobody is written with no by, since a policy engine
-//     answers through Resume as often as a person does. An approval's
-//     Answer.Reason is the proceed's reason, which is how a call run
-//     again after a restart says why: [ReplayAnswers] gives "run again:
-//     safe" or "run again: keyed".
+//     answers through Resume as often as a person does. A call an
+//     earlier run dispatched that goes to its tool again always gets a
+//     proceed, since running it again is a decision, with no by when
+//     the approval names nobody. An approval's Answer.Reason is the
+//     proceed's reason, which is how a call run again after a restart
+//     says why: Agent.Resume and [ReplayAnswers] give "run again: safe"
+//     or "run again: keyed" when the answer gives none, and a driver
+//     that gives none gets "run again", written before the dispatch.
 //   - tool_dispatch: the call's dispatch, written as the loop hands the
 //     call to its tool and not before, so a call the cut reached first,
 //     one waiting for a slot in the bound or its turn in a serial batch,
@@ -144,7 +160,11 @@
 //     phase end, the reason in the
 //     format's terms and the IDs of the run's calls left without an
 //     output. The loop's reasons map onto the format's cascade: done
-//     and input_required as they are, error with the error as ref,
+//     as it is, input_required as it is when the run holds a call its
+//     own response made and, for a resume whose BeforeToolCall
+//     deferred a call an earlier run made, as aborted with
+//     input_required as ref, since the format reads a held call only
+//     in the run that made it, error with the error as ref,
 //     aborted as interrupted with the context error as ref, since the
 //     host asked for the stop, and stopped as stopped when the last
 //     response requested tools, as done when it did not, and, when the
@@ -722,7 +742,9 @@ type callRecord struct {
 	// one. dispatchRun is the run the last dispatch was written in, ""
 	// for one on the path the writer was seeded from, so a call an
 	// earlier run dispatched and this one runs again gets a dispatch
-	// of its own.
+	// of its own. again holds who approved such a call, when nothing
+	// has been written for the approval yet, so its dispatch writes the
+	// proceed first.
 	held        bool
 	dispatched  bool
 	rejected    bool
@@ -730,6 +752,7 @@ type callRecord struct {
 	answered    bool
 	unknown     bool
 	dispatchRun string
+	again       *string
 	// settledRun is the run whose tool_end ended the call without a
 	// dispatch: the loop refused it itself, for a name no tool has or
 	// arguments that are not an object, or a cut ended it before it
@@ -925,6 +948,8 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // may have run and is [agentturn.PendingAborted]; one an answer
 // decision ended before its output was written is
 // [agentturn.PendingAnswered], owed that output and nothing else; one
+// a reject decision refused before its output was written is
+// [agentturn.PendingRejected], owed that refusal and nothing else; one
 // with no dispatch, when the header promises dispatch records, never
 // started and is [agentturn.PendingUndispatched]; and one the file
 // cannot say about is [agentturn.PendingUnknown]. A call that may have
@@ -954,6 +979,11 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 			p.Reason = agentturn.PendingAnswered
 		case agentsession.CallNeverStarted:
 			p.Reason = agentturn.PendingUndispatched
+		}
+		if (p.Reason == agentturn.PendingUndispatched || p.Reason == agentturn.PendingUnknown) && c.Rejected() {
+			// A reject ended the call before its tool, and the record
+			// stopped before the refusal's output.
+			p.Reason = agentturn.PendingRejected
 		}
 		var args string
 		switch {
@@ -991,7 +1021,11 @@ func AgentOptions(s *agentsession.Session) ([]agentturn.Option, error) {
 // ReplayAnswers applies agenttool's rule for running a call again to
 // the calls pending at the session's leaf, and returns an answer for
 // each that is not held, by policy, in the order of the path. A call
-// that never started is approved. A call that may have run, in flight
+// that never started is approved, and Agent.Resume puts that approval
+// to the agent's BeforeToolCall, since nothing has decided the call:
+// the policy still rules on it. A call a reject decision refused
+// before its output was written is answered with the reject's reason
+// as its output, the refusal it is owed. A call that may have run, in flight
 // when the record stopped or one the file cannot say about, is
 // ambiguous: it is approved when its tool, looked up in tools by name,
 // says replay is safe for the arguments its last dispatch ran with,
@@ -1009,8 +1043,11 @@ func AgentOptions(s *agentsession.Session) ([]agentturn.Option, error) {
 // dispatch included; [Pending] lists it as deferred.
 //
 // The answers are what a host passes to Agent.Resume after [Resume],
-// with its own for the held calls, once the agent is seeded with the
-// context's items.
+// with its own for the held calls, once the agent is seeded with
+// [AgentOptions]. They are read against what the record says of each
+// call: an agent seeded with the context's items alone reads every
+// pending call as one that may have run, and holds the approval of a
+// call that never started to the replay rule.
 func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agenttool.Tool) ([]agentturn.Answer, error) {
 	pending, err := Pending(s)
 	if err != nil {
@@ -1028,12 +1065,38 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 			ans = agentturn.Approve(id)
 		case agentturn.PendingAnswered:
 			ans = agentturn.OutcomeUnknown(id)
+		case agentturn.PendingRejected:
+			reason, err := refusal(s, id)
+			if err != nil {
+				return nil, err
+			}
+			ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Output: openresponses.FunctionCallOutputData{Text: reason}})
 		default:
 			ans = replayAnswer(ctx, set, p)
 		}
 		out = append(out, ans.WithBy(agentsession.ByPolicy))
 	}
 	return out, nil
+}
+
+// refusal is the reason of the last reject decision the session's
+// path holds for the call.
+func refusal(s *agentsession.Session, callID string) (string, error) {
+	calls, err := s.PendingCalls(s.Leaf())
+	if err != nil {
+		return "", fmt.Errorf("session: pending calls at leaf: %w", err)
+	}
+	for _, c := range calls {
+		if c.Call.CallID != callID {
+			continue
+		}
+		for i := len(c.Decisions) - 1; i >= 0; i-- {
+			if c.Decisions[i].Verdict == agentsession.VerdictReject {
+				return c.Decisions[i].Reason, nil
+			}
+		}
+	}
+	return "", nil
 }
 
 // replayAnswer is the answer to one call that may have run.
@@ -1055,10 +1118,10 @@ func replayAnswer(ctx context.Context, tools agenttool.Set, p agentturn.PendingC
 	again := agentturn.ApproveWith(id, p.Args).WithIdempotencyKey(p.IdempotencyKey)
 	switch agenttool.ReplayOf(ctx, tool, args) {
 	case agenttool.ReplaySafe:
-		return again.WithReason("run again: safe")
+		return again.WithReason(agentturn.RunAgainSafeReason)
 	case agenttool.ReplayKeyed:
 		if p.IdempotencyKey != "" {
-			return again.WithReason("run again: keyed")
+			return again.WithReason(agentturn.RunAgainKeyedReason)
 		}
 		return agentturn.OutcomeUnknown(id).WithReason("not run again: keyed without a key")
 	}
@@ -2670,10 +2733,14 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 		return nil
 	}
 	d := e.Decision
+	// A call an earlier run dispatched goes to its tool again only on
+	// an approval, which names its decider as a held call's does.
+	again := c.dispatched && c.dispatchRun != w.run
+	c.again = nil
 	by := ""
 	if d != nil {
 		by = d.By
-		if by == "" && !c.held {
+		if by == "" && !c.held && !again {
 			by = agentsession.ByPolicy
 		}
 	}
@@ -2708,7 +2775,10 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 	}
 	// An allowed call is recorded when something was decided about it:
 	// it was held and is now approved, its arguments were rewritten, or
-	// the hook gave a reason, such as the grant that allowed it.
+	// the hook gave a reason, such as the grant that allowed it. A call
+	// an earlier run dispatched is going to its tool again, which is
+	// always a decision; one with no reason is written when it is
+	// dispatched, so a call the loop then refuses has no proceed.
 	reason := decisionReason(d)
 	if rewritten := !sameJSON(e.Args, c.args); c.held || rewritten || reason != "" {
 		dec := agentsession.NewDecision(e.CallID, c.entry, agentsession.VerdictProceed, by)
@@ -2721,10 +2791,16 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 		if _, err := w.append(ctx, dec); err != nil {
 			return err
 		}
+	} else if again {
+		c.again = &by
 	}
 	c.held = false
 	return nil
 }
+
+// agentRunAgain is the reason of the proceed written for a call run
+// again under an approval that gave none.
+const agentRunAgain = "run again"
 
 // toolDispatch writes the call's dispatch: the loop has handed it to
 // its tool, so from here its side effect may have happened. It is
@@ -2741,6 +2817,15 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 	c := w.calls[e.CallID]
 	if c == nil || c.rejected || (c.dispatched && c.dispatchRun == w.run) {
 		return nil
+	}
+	if c.again != nil {
+		// Running a call again is the harness's choice, and the format
+		// says so with a proceed before the dispatch.
+		dec := agentsession.NewDecision(e.CallID, c.entry, agentsession.VerdictProceed, *c.again).WithReason(agentRunAgain)
+		if _, err := w.append(ctx, dec); err != nil {
+			return err
+		}
+		c.again = nil
 	}
 	d := agentsession.NewDispatch(e.CallID, c.entry).WithIdempotencyKey(e.IdempotencyKey)
 	if _, err := w.append(ctx, d); err != nil {
@@ -2840,6 +2925,13 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 	case agentturn.ReasonDone:
 		return agentsession.ReasonDone, ""
 	case agentturn.ReasonInputRequired:
+		if !w.heldInRun() {
+			// A resume whose BeforeToolCall deferred a call that never
+			// started ends before its first model call, holding a call
+			// an earlier run made: the format reads a held call only in
+			// the segment its item is in, and this one as aborted.
+			return agentsession.ReasonAborted, string(e.Reason)
+		}
 		return agentsession.ReasonInputRequired, ""
 	case agentturn.ReasonError:
 		return agentsession.ReasonError, errText(e.Err)
@@ -2888,6 +2980,16 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 		return agentsession.ReasonDone, cause
 	}
 	return string(e.Reason), ""
+}
+
+// heldInRun reports whether a call the run appended is held.
+func (w *writer) heldInRun() bool {
+	for _, id := range w.open {
+		if c := w.calls[id]; c != nil && c.held {
+			return true
+		}
+	}
+	return false
 }
 
 // pendingOnPath reports whether any call the writer knows of is still

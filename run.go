@@ -456,6 +456,10 @@ type runner struct {
 	// runCtx is the context RunContext hands a tool: the run's values,
 	// cancelled on abort and not when the run ends by itself.
 	runCtx context.Context
+	// resuming is set for a run Agent.Resume started, whose leading
+	// outputs answer pending calls rather than carry what the trigger
+	// sent.
+	resuming bool
 
 	// hookMu serialises the tool hooks. A nested call runs on the
 	// goroutine of the tool that made it, so without it two tools of
@@ -556,7 +560,8 @@ func stopped(cause StopCause, err error) error {
 // the call's own when set, note, when set, appended after the batch's
 // outputs, by and reason saying who approved it and why, for the
 // record, and key, when set, as the idempotency key in place of a new
-// one.
+// one. decide is set for a call nothing has decided, one that never
+// started, whose approval BeforeToolCall still rules on.
 type approval struct {
 	call   *openresponses.FunctionCall
 	args   json.RawMessage
@@ -564,6 +569,7 @@ type approval struct {
 	by     string
 	reason string
 	key    string
+	decide bool
 }
 
 // run drives the loop and returns the RunEnd. terminate says the caller
@@ -705,7 +711,20 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 	if err := r.emit(&RunStart{RunID: r.runID, Source: r.source(prompts, approved), Trigger: trigger}); err != nil {
 		return err
 	}
-	if err := r.appendInput(prompts, trigger); err != nil {
+	// The outputs a resume opens with answer pending calls, and their
+	// decisions say who gave them, so the trigger rides only on what
+	// follows them: the notes the caller supplied.
+	answers := 0
+	for r.resuming && answers < len(prompts) {
+		if _, ok := prompts[answers].(*openresponses.FunctionCallOutput); !ok {
+			break
+		}
+		answers++
+	}
+	if err := r.appendItems(prompts[:answers]); err != nil {
+		return err
+	}
+	if err := r.appendInput(prompts[answers:], trigger); err != nil {
 		return err
 	}
 	if len(approved) == 0 && !terminate {
@@ -719,9 +738,15 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 		}
 	}
 	if len(approved) > 0 {
-		results, err := r.approvedBatch(ctx, approved)
+		results, pending, err := r.approvedBatch(ctx, approved)
 		if err != nil {
 			return err
+		}
+		if len(pending) > 0 {
+			// BeforeToolCall deferred a call that never started, as it
+			// would have in the run that made it.
+			r.ending()
+			return stop(ReasonInputRequired, nil)
 		}
 		if cause, ok := terminates(results); ok && !terminate {
 			return stopped(cause, nil)
@@ -1561,13 +1586,19 @@ func (r *runner) collect(batch []*callState) ([]agenttool.Result, []*openrespons
 }
 
 // approvedBatch runs the calls a caller approved on Resume as one
-// batch, before the first turn: preflight without BeforeToolCall, since
-// the caller has decided, then execute and collect as for any batch.
-// The tool events carry Turn 0, the turn of a resume's batch, which
-// runs before the run's first model call.
-func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agenttool.Result, error) {
+// batch, before the first turn: preflight without BeforeToolCall for a
+// call the caller's approval decides, and with it for one that never
+// started, which nothing has decided, then execute and collect as for
+// any batch. The tool events carry Turn 0, the turn of a resume's
+// batch, which runs before the run's first model call. It returns the
+// results and the calls the hook deferred.
+func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agenttool.Result, []*openresponses.FunctionCall, error) {
 	tools := r.cfg.tools(ctx)
 	ctx = r.toolContext(ctx, tools)
+	calls := make([]*openresponses.FunctionCall, len(approved))
+	for i, ap := range approved {
+		calls[i] = ap.call
+	}
 	batch := make([]*callState, len(approved))
 	for i, ap := range approved {
 		p := r.prepare(tools, r.turn, ap.call, ap.args)
@@ -1582,22 +1613,39 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 		if ap.note != "" {
 			p.note = openresponses.UserText(ap.note)
 		}
+		decision := &ToolDecision{Args: ap.args, Note: ap.note, By: ap.by, Reason: ap.reason}
+		if ap.decide && r.cfg.BeforeToolCall != nil {
+			d, err := r.beforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: r.turn, Call: ap.call, Tool: p.tool, Args: p.args, Batch: calls, Index: i})
+			if err != nil {
+				return nil, nil, r.failBatch(ctx, batch, fmt.Errorf("agentturn: before-tool-call hook: %w", err))
+			}
+			if d != nil {
+				r.decide(p, d)
+				decision = d
+			}
+		}
 		batch[i] = p
-		if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args, Decision: &ToolDecision{Args: ap.args, Note: ap.note, By: ap.by, Reason: ap.reason}}); err != nil {
-			return nil, r.failBatch(ctx, batch, err)
+		if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args, Decision: decision}); err != nil {
+			return nil, nil, r.failBatch(ctx, batch, err)
+		}
+		if p.deferred {
+			p.settled, p.ended = true, true
+			if err := r.emit(&ToolEnd{RunID: r.runID, Turn: r.turn, CallID: p.call.CallID, Name: p.call.Name, Deferred: true, Reason: decision.Reason}); err != nil {
+				return nil, nil, r.failBatch(ctx, batch, err)
+			}
+			continue
 		}
 		if err := r.check(ctx, p); err != nil {
-			return nil, r.failBatch(ctx, batch, err)
+			return nil, nil, r.failBatch(ctx, batch, err)
 		}
 	}
 	if ctx.Err() != nil {
-		return nil, r.abortBatch(ctx, batch, context.Cause(ctx))
+		return nil, nil, r.abortBatch(ctx, batch, context.Cause(ctx))
 	}
 	if err := r.execute(ctx, batch); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	results, _, err := r.collect(batch)
-	return results, err
+	return r.collect(batch)
 }
 
 // preflight resolves the tool, checks the arguments and runs
@@ -1616,29 +1664,7 @@ func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openr
 			return nil, fmt.Errorf("agentturn: before-tool-call hook: %w", err)
 		}
 		if decision != nil {
-			if decision.Args != nil {
-				p.args = decision.Args
-			}
-			if decision.Note != "" && decision.Action == Allow {
-				p.note = openresponses.DeveloperText(decision.Note)
-			}
-			p.terminate = decision.Terminate
-			switch decision.Action {
-			case Block:
-				reason := decision.Reason
-				if reason == "" {
-					reason = "call blocked"
-				}
-				p.blocked = true
-				p.err = errors.New(reason)
-				p.reason = reason
-			case Defer:
-				p.deferred = true
-				if r.deferred == nil {
-					r.deferred = map[string]bool{}
-				}
-				r.deferred[call.CallID] = true
-			}
+			r.decide(p, decision)
 		}
 	}
 	if err := r.emit(&ToolStart{RunID: r.runID, Turn: r.turn, CallID: call.CallID, Name: call.Name, Args: p.args, Decision: decision}); err != nil {
@@ -1649,6 +1675,35 @@ func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openr
 		return p, r.emit(&ToolEnd{RunID: r.runID, Turn: r.turn, CallID: call.CallID, Name: call.Name, Deferred: true, Reason: decision.Reason})
 	}
 	return p, r.check(ctx, p)
+}
+
+// decide applies BeforeToolCall's decision to a call: its arguments,
+// its note for an allowed call, its terminate hint, and a Block or a
+// Defer.
+func (r *runner) decide(p *callState, decision *ToolDecision) {
+	if decision.Args != nil {
+		p.args = decision.Args
+	}
+	if decision.Note != "" && decision.Action == Allow {
+		p.note = openresponses.DeveloperText(decision.Note)
+	}
+	p.terminate = decision.Terminate
+	switch decision.Action {
+	case Block:
+		reason := decision.Reason
+		if reason == "" {
+			reason = "call blocked"
+		}
+		p.blocked = true
+		p.err = errors.New(reason)
+		p.reason = reason
+	case Defer:
+		p.deferred = true
+		if r.deferred == nil {
+			r.deferred = map[string]bool{}
+		}
+		r.deferred[p.call.CallID] = true
+	}
 }
 
 // prepare starts the state of a call: the tool with its name, if any,

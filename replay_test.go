@@ -81,7 +81,9 @@ func TestLoopMintsIdempotencyKeys(t *testing.T) {
 // rule, whether the agent saw the cut itself or was seeded with what a
 // record says, and a call the loop cannot say about is held to it too;
 // a call run again runs with the arguments it was handed over with; a
-// keyed call run with other arguments needs a key of its own; and
+// keyed call run with other arguments needs a key of its own, and one
+// run under a key of its own needs other arguments (#165); an approval
+// carries the rule that passed it as its reason (#166); and
 // WithRunAgain is the way past the rule.
 func TestResumeAppliesTheReplayRule(t *testing.T) {
 	call := &openresponses.FunctionCall{CallID: "call_1", Name: "act", Arguments: `{"text":"t"}`}
@@ -102,17 +104,37 @@ func TestResumeAppliesTheReplayRule(t *testing.T) {
 		// wantText the text argument, "" for the call's own.
 		wantKey  string
 		wantText string
+		// wantReason, when set, is the reason the approval's decision
+		// carries.
+		wantReason string
 	}{
-		{name: "cut, safe", replay: agenttool.ReplaySafe, cut: true},
-		{name: "cut, keyed", replay: agenttool.ReplayKeyed, cut: true},
+		{name: "cut, safe", replay: agenttool.ReplaySafe, cut: true, wantReason: RunAgainSafeReason},
+		{name: "cut, keyed", replay: agenttool.ReplayKeyed, cut: true, wantReason: RunAgainKeyedReason},
 		{name: "cut, unknown", replay: agenttool.ReplayUnknown, cut: true, wantErr: ErrAmbiguousCall},
 		{name: "seeded aborted, keyed with its key", replay: agenttool.ReplayKeyed,
 			pending: []PendingCall{{Call: call, Reason: PendingAborted, IdempotencyKey: "k1"}}, wantKey: "k1"},
 		{name: "seeded aborted, keyed without a key", replay: agenttool.ReplayKeyed,
 			pending: []PendingCall{{Call: call, Reason: PendingAborted}}, wantErr: ErrAmbiguousCall},
-		{name: "seeded aborted, keyed, the answer's key", replay: agenttool.ReplayKeyed,
+		// #165: a key names one operation, so a keyed call runs again
+		// under the key of the dispatch it repeats and no other, unless
+		// it runs with new arguments or the host accepts the risk.
+		{name: "seeded aborted without a key, keyed, the answer's key", replay: agenttool.ReplayKeyed,
 			pending: []PendingCall{{Call: call, Reason: PendingAborted}},
-			answer:  func(id string) Answer { return Approve(id).WithIdempotencyKey("k2") }, wantKey: "k2"},
+			answer:  func(id string) Answer { return Approve(id).WithIdempotencyKey("k2") }, wantErr: ErrAmbiguousCall},
+		{name: "seeded aborted, keyed, another key", replay: agenttool.ReplayKeyed,
+			pending: []PendingCall{{Call: call, Reason: PendingAborted, IdempotencyKey: "k1"}},
+			answer:  func(id string) Answer { return Approve(id).WithIdempotencyKey("k2") }, wantErr: ErrAmbiguousCall},
+		{name: "seeded aborted, keyed, its own key named", replay: agenttool.ReplayKeyed,
+			pending: []PendingCall{{Call: call, Reason: PendingAborted, IdempotencyKey: "k1"}},
+			answer:  func(id string) Answer { return Approve(id).WithIdempotencyKey("k1") }, wantKey: "k1", wantReason: RunAgainKeyedReason},
+		{name: "seeded aborted, keyed, another key, run again", replay: agenttool.ReplayKeyed,
+			pending: []PendingCall{{Call: call, Reason: PendingAborted, IdempotencyKey: "k1"}},
+			answer:  func(id string) Answer { return Approve(id).WithIdempotencyKey("k2").WithRunAgain() }, wantKey: "k2", wantReason: RunAgainReason},
+		{name: "seeded aborted without a key, keyed, other arguments under a new key", replay: agenttool.ReplayKeyed,
+			pending: []PendingCall{{Call: call, Reason: PendingAborted}},
+			answer: func(id string) Answer {
+				return ApproveWith(id, json.RawMessage(`{"text":"other"}`)).WithIdempotencyKey("k2")
+			}, wantKey: "k2", wantText: "other", wantReason: RunAgainKeyedReason},
 		{name: "seeded aborted, unknown", replay: agenttool.ReplayUnknown,
 			pending: []PendingCall{{Call: call, Reason: PendingAborted, IdempotencyKey: "k1"}}, wantErr: ErrAmbiguousCall},
 		{name: "seeded never started, unknown", replay: agenttool.ReplayUnknown,
@@ -181,6 +203,13 @@ func TestResumeAppliesTheReplayRule(t *testing.T) {
 			if len(pending) != 1 {
 				t.Fatalf("pending = %+v", pending)
 			}
+			var reasons []string
+			a.Subscribe(func(_ context.Context, ev Event) error {
+				if e, ok := ev.(*ToolStart); ok && e.Decision != nil {
+					reasons = append(reasons, e.Decision.Reason)
+				}
+				return nil
+			})
 			first := append([]string(nil), k.keys...)
 			answer := Approve
 			if tc.answer != nil {
@@ -202,6 +231,9 @@ func TestResumeAppliesTheReplayRule(t *testing.T) {
 			}
 			if len(k.keys) != len(first)+1 {
 				t.Fatalf("keys = %q", k.keys)
+			}
+			if tc.wantReason != "" && (len(reasons) == 0 || reasons[0] != tc.wantReason) {
+				t.Errorf("decision reasons %q, want %q", reasons, tc.wantReason)
 			}
 			if text := k.texts[len(k.texts)-1]; tc.wantText != "" && text != tc.wantText {
 				t.Errorf("ran with text %q, want %q", text, tc.wantText)
@@ -353,5 +385,65 @@ func TestSameArgs(t *testing.T) {
 		if got := sameArgs(json.RawMessage(tc.a), json.RawMessage(tc.b)); got != tc.want {
 			t.Errorf("sameArgs(%s, %s) = %v", tc.a, tc.b, got)
 		}
+	}
+}
+
+// TestResumePutsNeverStartedCallsToTheHook pins #159: nothing decided
+// a call that never started, so its approval goes through
+// BeforeToolCall, and a Block or a Defer applies as it would in a run;
+// a held call's approval is the decision and skips the hook; and a
+// call a record refused before its output takes only that output.
+func TestResumePutsNeverStartedCallsToTheHook(t *testing.T) {
+	call := &openresponses.FunctionCall{CallID: "call_1", Name: "act", Arguments: `{"text":"t"}`}
+	cases := []struct {
+		name     string
+		reason   PendingReason
+		decision *ToolDecision
+		wantErr  error
+		// wantHook says BeforeToolCall was asked; wantRuns is how many
+		// times the tool ran; wantEnd the reason the run ended with.
+		wantHook bool
+		wantRuns int
+		wantEnd  Reason
+	}{
+		{name: "never started, allowed", reason: PendingUndispatched, wantHook: true, wantRuns: 1, wantEnd: ReasonDone},
+		{name: "never started, blocked", reason: PendingUndispatched, decision: &ToolDecision{Action: Block, Reason: "denied by rm"},
+			wantHook: true, wantEnd: ReasonDone},
+		{name: "never started, deferred", reason: PendingUndispatched, decision: &ToolDecision{Action: Defer},
+			wantHook: true, wantEnd: ReasonInputRequired},
+		{name: "held", reason: PendingDeferred, decision: &ToolDecision{Action: Block}, wantRuns: 1, wantEnd: ReasonDone},
+		{name: "rejected", reason: PendingRejected, wantErr: ErrCallAnswered},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			k := &keyedTool{}
+			asked := false
+			a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{k.tool(agenttool.ReplayUnknown)},
+				BeforeToolCall: func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
+					asked = info.Call.CallID == call.CallID
+					return tc.decision, nil
+				}},
+				WithTranscript(Transcript{openresponses.UserText("go"), call}),
+				WithPending([]PendingCall{{Call: call, Reason: tc.reason}}))
+			end, err := a.Resume(context.Background(), Approve(call.CallID))
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("resume: err = %v, want %v", err, tc.wantErr)
+			}
+			if asked != tc.wantHook || len(k.keys) != tc.wantRuns {
+				t.Errorf("hook asked %v, ran %d; want %v, %d", asked, len(k.keys), tc.wantHook, tc.wantRuns)
+			}
+			if tc.wantErr != nil {
+				if _, err := a.Resume(context.Background(), Output(&openresponses.FunctionCallOutput{CallID: call.CallID, Output: openresponses.FunctionCallOutputData{Text: "denied"}})); err != nil {
+					t.Fatalf("its output: %v", err)
+				}
+				return
+			}
+			if end.Reason != tc.wantEnd {
+				t.Errorf("end = %+v, want %s", end, tc.wantEnd)
+			}
+			if tc.wantEnd == ReasonInputRequired && (len(end.Pending) != 1 || end.Pending[0].Reason != PendingDeferred) {
+				t.Errorf("pending = %+v, want it deferred", end.Pending)
+			}
+		})
 	}
 }
