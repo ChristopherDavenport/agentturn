@@ -105,6 +105,11 @@ versions may break the API.
   tool again, with the approval's decider, so a person's approval
   with no reason is on the record. A driver that gives no reason gets
   `run again`, written before the second dispatch. (#166)
+- `session.ReplayAnswers`' doc names `session.AgentOptions` as the
+  seed its answers are read against, where it said the context's
+  items, under which a never-started call's approval is held to the
+  replay rule and refused; the package doc resumes a session with
+  both. (#167)
 
 ## v0.0.11 - 2026-09-29
 

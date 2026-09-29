@@ -21,7 +21,17 @@
 //
 // [Start] creates the session and [Resume] reopens one; both return
 // the recorder and the session, and the caller keeps the store, which
-// [Recorder.Store] also returns, for Sync, Release and Close.
+// [Recorder.Store] also returns, for Sync, Release and Close. A host
+// resuming after a restart seeds the agent with [AgentOptions], which
+// says what the record knows of each pending call, and answers the
+// calls nobody holds with [ReplayAnswers]:
+//
+//	rec, s, _ := session.Resume(ctx, store, id)
+//	opts, _ := session.AgentOptions(s)
+//	agent := agentturn.New(cfg, opts...)
+//	defer rec.Attach(agent)()
+//	answers, _ := session.ReplayAnswers(ctx, s, cfg.ResolveTools(ctx))
+//	end, err := agent.Resume(ctx, answers...) // with the held calls' answers
 //
 // The package is named session, not agentsession, because a consumer
 // imports both side by side: agentsession to open a store, session to
@@ -77,8 +87,10 @@
 //     response ID, and an item the caller marked with agentturn.Hidden
 //     carries visible false, the format's word for an item that is part
 //     of the model context and that a renderer should hide. An item the
-//     run was prompted with carries the run's trigger as its source, and
-//     a queued input the trigger it was queued with, Extra and all. An
+//     run was prompted with carries the run's trigger as its source,
+//     other than an output Agent.Resume appends for a pending call,
+//     whose decision says who gave it, and a queued input the trigger
+//     it was queued with, Extra and all. An
 //     item the filter in force would hide from the model, an app-only
 //     extension item, is written as a custom entry
 //     instead so the path rebuilds exactly the input that was sent. A
@@ -113,10 +125,14 @@
 //     ToolDecision.By, which Answer.By sets for an approval, and policy
 //     for a hook's decision about a call nothing was holding; an answer
 //     that names nobody is written with no by, since a policy engine
-//     answers through Resume as often as a person does. An approval's
-//     Answer.Reason is the proceed's reason, which is how a call run
-//     again after a restart says why: [ReplayAnswers] gives "run again:
-//     safe" or "run again: keyed".
+//     answers through Resume as often as a person does. A call an
+//     earlier run dispatched that goes to its tool again always gets a
+//     proceed, since running it again is a decision, with no by when
+//     the approval names nobody. An approval's Answer.Reason is the
+//     proceed's reason, which is how a call run again after a restart
+//     says why: Agent.Resume and [ReplayAnswers] give "run again: safe"
+//     or "run again: keyed" when the answer gives none, and a driver
+//     that gives none gets "run again", written before the dispatch.
 //   - tool_dispatch: the call's dispatch, written as the loop hands the
 //     call to its tool and not before, so a call the cut reached first,
 //     one waiting for a slot in the bound or its turn in a serial batch,
@@ -1023,8 +1039,11 @@ func AgentOptions(s *agentsession.Session) ([]agentturn.Option, error) {
 // dispatch included; [Pending] lists it as deferred.
 //
 // The answers are what a host passes to Agent.Resume after [Resume],
-// with its own for the held calls, once the agent is seeded with the
-// context's items.
+// with its own for the held calls, once the agent is seeded with
+// [AgentOptions]. They are read against what the record says of each
+// call: an agent seeded with the context's items alone reads every
+// pending call as one that may have run, and holds the approval of a
+// call that never started to the replay rule.
 func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agenttool.Tool) ([]agentturn.Answer, error) {
 	pending, err := Pending(s)
 	if err != nil {
