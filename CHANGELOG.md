@@ -24,9 +24,14 @@ versions may break the API.
   rewrite the instructions takes its parts from what they left; parts
   that do not join to the instructions sent are dropped and the string
   is written, as without the option, so a product's composition never
-  fails the run. Omitted parts are written on every config entry while
-  there are any, and on an entry of their own when only they changed.
-  It applies to the recorder's own session. Without the option nothing
+  fails the run; so are parts the format refuses, one with no ID or two
+  sharing one, and an omitted part with no ID is dropped. Omitted
+  parts are written on every config entry while there are any, and on
+  an entry of their own when only they changed; the format cannot say
+  the list emptied, so a reader keeps the last one written. A session
+  recorded before the option was set has the joined string on its
+  path, and its first entry under the option carries every part's
+  text, once. It applies to the recorder's own session. Without the option nothing
   changes. RFC 0001 draft 0.2 resolves its open question on
   instructions as parts. (#114, #121, #129, #90)
 

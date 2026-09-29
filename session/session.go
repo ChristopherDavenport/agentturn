@@ -534,10 +534,16 @@ func WithEnv(fn func(context.Context) (*agentsession.EnvEntry, error)) Option {
 // them, equal the request's instructions; otherwise the entry carries
 // the string as it does without this option, since the record must
 // describe what the model was sent and must not fail the run over how
-// a product composed it. The omitted parts are written on every config
+// a product composed it; so are parts the format refuses, one with no
+// ID or two sharing one. The omitted parts are written on every config
 // entry while they are non-empty, and on an entry of their own when
-// they change and the settings do not. It applies to the recorder's
-// own session; a child run's session keeps the string.
+// they change and the settings do not. The format has no way to say
+// that nothing is omitted any more, so a list that empties is not
+// written and a reader keeps the last one. A session written before
+// the option was set has the joined string on its path, and the first
+// entry under the option carries the text of every part, once. It
+// applies to the recorder's own session; a child run's session keeps
+// the string.
 func WithInstructionsParts(fn func(req openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart)) Option {
 	return func(r *Recorder) { r.parts = fn }
 }
@@ -1366,10 +1372,13 @@ func (w *writer) settle(ctx context.Context, req openresponses.Request) error {
 }
 
 // instructionParts asks the host for the parts of req's instructions
-// and what it left out, and returns them when the parts join to the
-// instructions the request carries. Parts that do not are dropped, and
-// the omitted parts with them, since they describe a composition that
-// is not the one sent.
+// and what it left out, and returns them when the format can hold them
+// and the parts join to the instructions the request carries. Parts
+// that do not join, or that the format refuses, a part with no ID or
+// two with one, are dropped, and the omitted parts with them, since
+// they describe a composition that is not the one sent or cannot be
+// written; an omitted part with no ID is dropped alone. The record
+// falls back to the string rather than fail the run.
 func (w *writer) instructionParts(req openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
 	if w != w.rec.root || w.rec.parts == nil {
 		return nil, nil
@@ -1378,7 +1387,20 @@ func (w *writer) instructionParts(req openresponses.Request) ([]agentsession.Ins
 	if len(parts) == 0 || agentsession.JoinInstructions(parts) != req.Instructions {
 		return nil, nil
 	}
-	return parts, omitted
+	seen := make(map[string]bool, len(parts))
+	for _, p := range parts {
+		if p.ID == "" || seen[p.ID] {
+			return nil, nil
+		}
+		seen[p.ID] = true
+	}
+	var named []agentsession.OmittedPart
+	for _, o := range omitted {
+		if o.ID != "" {
+			named = append(named, o)
+		}
+	}
+	return parts, named
 }
 
 // omittedBody encodes omitted parts for comparison, nil for none.

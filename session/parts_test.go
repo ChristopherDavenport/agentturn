@@ -30,20 +30,40 @@ func (l *layers) parts() []agentsession.InstructionPart {
 
 func (l *layers) render() string { return agentsession.JoinInstructions(l.parts()) }
 
+// step is one prompt of an instructions parts case.
+type step struct {
+	// change runs before the prompt; nil changes nothing.
+	change func(*layers)
+	// want describes the config entries the prompt adds.
+	want func(t *testing.T, added []*agentsession.ConfigEntry)
+}
+
+// stringSteps are the prompts of a case whose parts the recorder
+// cannot use: the entries carry the string and nothing omitted.
+var stringSteps = []step{{
+	want: func(t *testing.T, added []*agentsession.ConfigEntry) {
+		if len(added) != 1 || added[0].Instructions == nil || len(added[0].InstructionsParts) != 0 || len(added[0].InstructionsOmitted) != 0 {
+			t.Errorf("first config = %+v", added)
+		}
+	},
+}, {
+	change: func(l *layers) { l.text["memory"] += "Likes Bristol" },
+	want: func(t *testing.T, added []*agentsession.ConfigEntry) {
+		if len(added) != 1 || added[0].Instructions == nil || len(added[0].InstructionsParts) != 0 {
+			t.Errorf("delta = %+v", added)
+		}
+	},
+}}
+
 func TestInstructionsPartsAreRecorded(t *testing.T) {
 	big := func(s string) string { return strings.Repeat(s, 4000) }
-	type step struct {
-		// change runs before the prompt; nil changes nothing.
-		change func(*layers)
-		// want describes the config entries the prompt adds.
-		want func(t *testing.T, added []*agentsession.ConfigEntry)
-	}
 	cases := []struct {
 		name string
-		// wrong makes the parts the host names disagree with the
-		// request, so the recorder falls back to the string.
-		wrong bool
-		steps []step
+		// mangle, when set, spoils what the host names: parts that do
+		// not join, or that the format refuses, so the recorder falls
+		// back to the string rather than fail the run.
+		mangle func([]agentsession.InstructionPart, []agentsession.OmittedPart) ([]agentsession.InstructionPart, []agentsession.OmittedPart)
+		steps  []step
 	}{{
 		name: "a memory write is a delta naming the one part",
 		steps: []step{{
@@ -95,19 +115,28 @@ func TestInstructionsPartsAreRecorded(t *testing.T) {
 			},
 		}},
 	}, {
-		name:  "parts that do not join fall back to the string",
-		wrong: true,
+		name: "parts that do not join fall back to the string",
+		mangle: func(p []agentsession.InstructionPart, o []agentsession.OmittedPart) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
+			return p[:2], o
+		},
+		steps: stringSteps,
+	}, {
+		name: "parts the format refuses fall back to the string",
+		mangle: func(p []agentsession.InstructionPart, o []agentsession.OmittedPart) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
+			// They join, but two share an ID.
+			p[1].ID = p[0].ID
+			return p, o
+		},
+		steps: stringSteps,
+	}, {
+		name: "an omitted part with no ID is dropped alone",
+		mangle: func(p []agentsession.InstructionPart, o []agentsession.OmittedPart) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
+			return p, append(o, agentsession.OmittedPart{Reason: "nameless"})
+		},
 		steps: []step{{
 			want: func(t *testing.T, added []*agentsession.ConfigEntry) {
-				if len(added) != 1 || added[0].Instructions == nil || len(added[0].InstructionsParts) != 0 || len(added[0].InstructionsOmitted) != 0 {
+				if len(added) != 1 || len(added[0].InstructionsParts) != 3 || len(added[0].InstructionsOmitted) != 1 {
 					t.Errorf("first config = %+v", added)
-				}
-			},
-		}, {
-			change: func(l *layers) { l.text["memory"] += "Likes Bristol" },
-			want: func(t *testing.T, added []*agentsession.ConfigEntry) {
-				if len(added) != 1 || added[0].Instructions == nil || len(added[0].InstructionsParts) != 0 {
-					t.Errorf("delta = %+v", added)
 				}
 			},
 		}},
@@ -120,11 +149,11 @@ func TestInstructionsPartsAreRecorded(t *testing.T) {
 				omitted: []agentsession.OmittedPart{{ID: "skills", Reason: "out of scope", Size: 12}},
 			}
 			partsOf := func(req openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
-				parts := l.parts()
-				if tc.wrong {
-					parts = parts[:2]
+				parts, omitted := l.parts(), append([]agentsession.OmittedPart(nil), l.omitted...)
+				if tc.mangle != nil {
+					return tc.mangle(parts, omitted)
 				}
-				return parts, l.omitted
+				return parts, omitted
 			}
 			store := agentsession.NewMemoryStore()
 			rec, s, err := Start(context.Background(), store, agentsession.Header{}, WithInstructionsParts(partsOf))
