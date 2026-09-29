@@ -27,8 +27,9 @@
 // task, its text streamed as the sender's was, and the record holds
 // both runs. Without the option, or when it declines, a terminating
 // stop with no answer completes the task with the text of the last
-// function_call_output, the answer the tools gave on the model's
-// behalf, as tools/agent reports the same stop.
+// output of a call whose result set Terminate, the answer the tools
+// gave on the model's behalf; a sibling's output, or a blocked or
+// failed call's, is not taken for it.
 //
 //	exec := a2a.New(cfg)
 //	handler := a2asrv.NewHandler(exec)

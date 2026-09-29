@@ -61,9 +61,10 @@
 // response's. A receiver that hands off again is asked about in turn,
 // with nothing counting the handoffs but the function. Without the
 // option, or when it declines, a terminating stop with no answer
-// completes with the text of the last function_call_output as an
-// assistant message, the answer the tools gave on the model's behalf,
-// as tools/agent reports the same stop.
+// completes with the text of the last output of a call whose result
+// set Terminate as an assistant message, the answer the tools gave on
+// the model's behalf; a sibling's output, or a blocked or failed
+// call's, is not taken for it.
 package responses
 
 import (
@@ -81,7 +82,7 @@ type Adapter struct {
 	cfg                 agentturn.Config
 	requestInstructions bool
 	toolItems           bool
-	handoff             func(context.Context, *agentturn.RunEnd) (agentturn.Config, bool)
+	handoff             func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool)
 }
 
 var _ openresponses.Adapter = (*Adapter)(nil)
@@ -107,14 +108,16 @@ func WithToolItems() Option {
 // StopPartialTerminate. A configuration it returns continues the same
 // transcript within the same response, under the request's model and
 // instructions as the adapter's own configuration is; false ends the
-// response as it would without the option. fn finds the destination
-// in end.Items, the terminating call and its output; a host that
-// routes on a result's Details, which the model never sees, reads them
-// from a ToolEnd event its tool or a subscriber kept. It is asked again each time a run it started stops the same way, so
-// a pair of agents that hand back and forth runs until fn declines or
-// the request's context ends; a host that wants a bound counts on a
-// value it puts on that context.
-func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd) (agentturn.Config, bool)) Option {
+// response as it would without the option. fn is given the run's end
+// and the tool_end events of the batch that stopped it, in completion
+// order, calls a tool made with agentturn.Invoke left out: the
+// destination is in a result's Details, which the model never sees,
+// or in end.Items, the terminating call and its output. It is asked
+// again each time a run it started stops the same way, so a pair of
+// agents that hand back and forth runs until fn declines or the
+// request's context ends; a host that wants a bound counts on a value
+// it puts on that context.
+func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*agentturn.ToolEnd) (agentturn.Config, bool)) Option {
 	return func(a *Adapter) { a.handoff = fn }
 }
 
@@ -179,12 +182,13 @@ func (a *Adapter) fullRun(ctx context.Context, req openresponses.Request, transc
 	cfg := a.perRequest(a.cfg, req)
 	var usage openresponses.Usage
 	var end *agentturn.RunEnd
+	var results []*agentturn.ToolEnd
 	for {
 		var err error
-		if end, err = a.relayRun(ctx, transcript, cfg, rl, &usage); err != nil {
+		if end, results, err = a.relayRun(ctx, transcript, cfg, rl, &usage); err != nil {
 			return err
 		}
-		next, ok := a.handsOff(ctx, end)
+		next, ok := a.handsOff(ctx, end, results)
 		if !ok {
 			break
 		}
@@ -216,7 +220,7 @@ func (a *Adapter) fullRun(ctx context.Context, req openresponses.Request, transc
 		// model's behalf. Its text is the answer, as tools/agent has
 		// it; without it the response would complete empty.
 		if _, ok := end.Answer(); terminated(end) && !ok {
-			if text, ok := lastOutputText(end.Items); ok {
+			if text, ok := terminatingText(end.Items, results); ok {
 				if err := rl.end(openresponses.AssistantText(text)); err != nil {
 					return err
 				}
@@ -240,31 +244,38 @@ func (a *Adapter) fullRun(ctx context.Context, req openresponses.Request, transc
 }
 
 // relayRun runs cfg over transcript, relaying its items and adding its
-// usage, and returns its end.
-func (a *Adapter) relayRun(ctx context.Context, transcript agentturn.Transcript, cfg agentturn.Config, rl *relay, usage *openresponses.Usage) (*agentturn.RunEnd, error) {
+// usage, and returns its end and the tool_end events of its last batch.
+func (a *Adapter) relayRun(ctx context.Context, transcript agentturn.Transcript, cfg agentturn.Config, rl *relay, usage *openresponses.Usage) (*agentturn.RunEnd, []*agentturn.ToolEnd, error) {
 	var end *agentturn.RunEnd
+	var results []*agentturn.ToolEnd
 	for ev := range agentturn.Continue(ctx, transcript, cfg) {
 		switch e := ev.(type) {
+		case *agentturn.TurnStart:
+			results = nil
+		case *agentturn.ToolEnd:
+			if e.Parent == "" {
+				results = append(results, e)
+			}
 		case *agentturn.ItemStart:
 			if _, ok := e.Item.(*openresponses.FunctionCallOutput); ok || !a.emits(e.Item) {
 				continue
 			}
 			if err := rl.start(e.Item); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		case *agentturn.ItemUpdate:
 			if !a.emits(e.Item) {
 				continue
 			}
 			if err := rl.update(e.Stream); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		case *agentturn.ItemEnd:
 			if !a.emits(e.Item) {
 				continue
 			}
 			if err := rl.end(e.Item); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		case *agentturn.TurnEnd:
 			if e.Response != nil && e.Response.Usage != nil {
@@ -275,18 +286,18 @@ func (a *Adapter) relayRun(ctx context.Context, transcript agentturn.Transcript,
 		}
 	}
 	if end == nil {
-		return nil, errors.New("responses: run produced no run_end")
+		return nil, nil, errors.New("responses: run produced no run_end")
 	}
-	return end, nil
+	return end, results, nil
 }
 
 // handsOff asks WithHandoff for the next configuration when end is a
 // terminating stop.
-func (a *Adapter) handsOff(ctx context.Context, end *agentturn.RunEnd) (agentturn.Config, bool) {
+func (a *Adapter) handsOff(ctx context.Context, end *agentturn.RunEnd, results []*agentturn.ToolEnd) (agentturn.Config, bool) {
 	if a.handoff == nil || !terminated(end) {
 		return agentturn.Config{}, false
 	}
-	return a.handoff(ctx, end)
+	return a.handoff(ctx, end, results)
 }
 
 // perRequest returns cfg under the request's model and instructions.
@@ -301,11 +312,20 @@ func terminated(end *agentturn.RunEnd) bool {
 	return end.Reason == agentturn.ReasonStopped && (end.Cause == agentturn.StopTerminate || end.Cause == agentturn.StopPartialTerminate)
 }
 
-// lastOutputText returns the text of the last function call output.
-func lastOutputText(items agentturn.Transcript) (string, bool) {
+// terminatingText returns the text of the last output in items of a
+// call whose result set Terminate. A sibling that did not, and a call
+// blocked or failed, whose output is the reason or the error, is not
+// the tools' answer.
+func terminatingText(items agentturn.Transcript, results []*agentturn.ToolEnd) (string, bool) {
+	answered := map[string]bool{}
+	for _, res := range results {
+		if res.Result.Terminate && !res.Blocked && res.Err == nil {
+			answered[res.CallID] = true
+		}
+	}
 	for i := len(items) - 1; i >= 0; i-- {
-		if out, ok := items[i].(*openresponses.FunctionCallOutput); ok {
-			return out.Output.Text, out.Output.Text != ""
+		if out, ok := items[i].(*openresponses.FunctionCallOutput); ok && answered[out.CallID] && out.Output.Text != "" {
+			return out.Output.Text, true
 		}
 	}
 	return "", false

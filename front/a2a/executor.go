@@ -24,7 +24,7 @@ type Executor struct {
 	chunkSize   int
 	callerTools []*openresponses.FunctionTool
 	recorderFor RecorderFor
-	handoff     func(context.Context, *agentturn.RunEnd) (agentturn.Config, bool)
+	handoff     func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool)
 
 	mu      sync.Mutex
 	cancels map[a2a.TaskID]context.CancelFunc
@@ -124,17 +124,20 @@ func WithRecorderFor(fn RecorderFor) Option {
 // offered under it as under the executor's own configuration, and a
 // ToolRecorder or ToolElicitor the configuration leaves nil is kept
 // from the agent's, where a recorder put its own. false ends the task
-// as it would without the option. fn finds the destination in
-// end.Items, the terminating call and its output. It is asked again
-// each time a run it started stops the same way, so a pair of agents
+// as it would without the option. fn is given the run's end and the
+// tool_end events of the batch that stopped it, in completion order,
+// calls a tool made with agentturn.Invoke left out: the destination is
+// in a result's Details, which the model never sees, or in end.Items,
+// the terminating call and its output. It is asked again each time a run it started stops the same way, so a pair of agents
 // that hand back and forth runs until fn declines or the task is
 // canceled; a host that wants a bound counts on a value it puts on the
 // context RecorderFor returns, which fn is given.
 //
 // Without the option, or when it declines, a terminating stop with no
-// answer completes the task with the text of the last
-// function_call_output, as tools/agent reports the same stop.
-func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd) (agentturn.Config, bool)) Option {
+// answer completes the task with the text of the last output of a
+// call whose result set Terminate, as tools/agent reports the same
+// stop.
+func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*agentturn.ToolEnd) (agentturn.Config, bool)) Option {
 	return func(e *Executor) { e.handoff = fn }
 }
 
@@ -267,8 +270,10 @@ func (e *Executor) claim(contextID string) (func(), error) {
 type outcome struct {
 	// end is the last run's end; items holds what every run appended,
 	// the sender's and each receiver's after a handoff.
-	end      *agentturn.RunEnd
-	items    openresponses.Items
+	end   *agentturn.RunEnd
+	items openresponses.Items
+	// results are the tool_end events of the last run's last batch.
+	results  []*agentturn.ToolEnd
 	lastText string
 	// writeErr is the first failure to write an event to the queue; it
 	// aborted the run.
@@ -291,6 +296,12 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 	}
 	unsubscribe := agent.Subscribe(func(_ context.Context, ev agentturn.Event) error {
 		switch ev := ev.(type) {
+		case *agentturn.RunStart, *agentturn.TurnStart:
+			out.results = nil
+		case *agentturn.ToolEnd:
+			if ev.Parent == "" {
+				out.results = append(out.results, ev)
+			}
 		case *agentturn.ItemStart:
 			if m, ok := ev.Item.(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant {
 				writer = newArtifactWriter(q, reqCtx, e.chunkSize)
@@ -335,7 +346,7 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 		if out.writeErr != nil || e.handoff == nil || !terminated(end) {
 			return out
 		}
-		next, ok := e.handoff(runCtx, end)
+		next, ok := e.handoff(runCtx, end, out.results)
 		if !ok {
 			return out
 		}
@@ -360,11 +371,20 @@ func terminated(end *agentturn.RunEnd) bool {
 	return end.Reason == agentturn.ReasonStopped && (end.Cause == agentturn.StopTerminate || end.Cause == agentturn.StopPartialTerminate)
 }
 
-// lastOutputText returns the text of the last function call output.
-func lastOutputText(items openresponses.Items) (string, bool) {
+// terminatingText returns the text of the last output in items of a
+// call whose result set Terminate. A sibling that did not, and a call
+// blocked or failed, whose output is the reason or the error, is not
+// the tools' answer.
+func terminatingText(items openresponses.Items, results []*agentturn.ToolEnd) (string, bool) {
+	answered := map[string]bool{}
+	for _, res := range results {
+		if res.Result.Terminate && !res.Blocked && res.Err == nil {
+			answered[res.CallID] = true
+		}
+	}
 	for i := len(items) - 1; i >= 0; i-- {
-		if out, ok := items[i].(*openresponses.FunctionCallOutput); ok {
-			return out.Output.Text, out.Output.Text != ""
+		if out, ok := items[i].(*openresponses.FunctionCallOutput); ok && answered[out.CallID] && out.Output.Text != "" {
+			return out.Output.Text, true
 		}
 	}
 	return "", false
@@ -407,7 +427,7 @@ func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, 
 		if _, ok := out.end.Answer(); terminated(out.end) && !ok {
 			// A terminating result nobody handed off from answered on
 			// the model's behalf; text before its call was a preamble.
-			if t, ok := lastOutputText(out.end.Items); ok {
+			if t, ok := terminatingText(out.end.Items, out.results); ok {
 				text = t
 			}
 		}

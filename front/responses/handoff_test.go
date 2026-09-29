@@ -12,11 +12,11 @@ import (
 	"github.com/ChristopherDavenport/openresponses/streamtest"
 )
 
-// transfer is a handoff tool: it answers on the model's behalf and ends
-// the run.
+// transfer is a handoff tool: it answers on the model's behalf, names
+// the destination in Details, and ends the run.
 var transfer = agenttool.NewFunc("transfer_to_billing", "hands the conversation to billing", json.RawMessage(`{"type":"object"}`),
 	func(context.Context, agenttool.Call) (agenttool.Result, error) {
-		return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: "transferred"}, Terminate: true}, nil
+		return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: "transferred"}, Terminate: true, Details: "billing"}, nil
 	})
 
 // TestTerminatingStop pins #163: an agent whose only tool terminates
@@ -31,22 +31,29 @@ func TestTerminatingStop(t *testing.T) {
 	}}
 	for _, tc := range []struct {
 		name    string
-		handoff func(context.Context, *agentturn.RunEnd) (agentturn.Config, bool)
+		handoff func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool)
 		want    string
 		asked   int
 	}{
 		{"no handoff", nil, "transferred", 0},
-		{"declined", func(context.Context, *agentturn.RunEnd) (agentturn.Config, bool) { return agentturn.Config{}, false }, "transferred", 1},
-		{"handed off", func(context.Context, *agentturn.RunEnd) (agentturn.Config, bool) { return billing, true }, "Tool result: transferred", 1},
+		{"declined", func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool) {
+			return agentturn.Config{}, false
+		}, "transferred", 1},
+		{"handed off", func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool) {
+			return billing, true
+		}, "Tool result: transferred", 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var ends []*agentturn.RunEnd
 			billed = nil
 			var opts []Option
 			if tc.handoff != nil {
-				opts = append(opts, WithHandoff(func(ctx context.Context, end *agentturn.RunEnd) (agentturn.Config, bool) {
+				opts = append(opts, WithHandoff(func(ctx context.Context, end *agentturn.RunEnd, results []*agentturn.ToolEnd) (agentturn.Config, bool) {
 					ends = append(ends, end)
-					return tc.handoff(ctx, end)
+					if len(results) != 1 || results[0].Result.Details != "billing" {
+						t.Errorf("handoff given results %v, want the transfer's with its details", results)
+					}
+					return tc.handoff(ctx, end, results)
 				}))
 			}
 			a := New(agentturn.Config{Model: preamble{}, ModelName: "m", Instructions: "You are triage.", Tools: []agenttool.Tool{transfer}}, opts...)

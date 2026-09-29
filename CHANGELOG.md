@@ -58,15 +58,17 @@ versions may break the API.
   it on `RunEnd.Err` and in the record. (#164)
 - `front/responses.WithHandoff` and `front/a2a.WithHandoff` take a
   handoff within the request that made it. A run that stops on
-  `StopTerminate` or `StopPartialTerminate` asks the function for the
-  receiver's configuration, and the transcript continues under it in
+  `StopTerminate` or `StopPartialTerminate` asks the function, given
+  the run's end and the `ToolEnd` events of the batch that stopped it,
+  whose `Details` name the destination, for the receiver's
+  configuration, and the transcript continues under it in
   the same response or task, the receiver's items relayed as the
   sender's were. `front/a2a` sets it on the task's agent and continues
   that agent, so `WithRecorderFor` records the switch and the
   receiver's run, and a `ToolRecorder` or `ToolElicitor` the new
   configuration leaves nil is kept from the agent's. Without the
   option, a terminating stop with no answer completes with the text of
-  the last `function_call_output`, as `tools/agent` reports it, where
+  the last output of a call whose result set `Terminate`, where
   both fronts completed with no answer: an empty response, or a task
   with no message. (#163)
 
