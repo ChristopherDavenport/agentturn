@@ -191,6 +191,60 @@ func TestModelRetryIsRecorded(t *testing.T) {
 	}
 }
 
+// TestResponseCarriesAttempts pins the recorder's half of agentsession
+// #93: the response entry of a call Retry tried again carries the
+// calls it took, the one that answered or failed last included, and a
+// call that took one leaves the member off.
+func TestResponseCarriesAttempts(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fails int32
+		// prompts is how many prompts the case sends; the fails fall on
+		// the first.
+		prompts int
+		failed  bool
+		want    []int
+	}{
+		{name: "no retry", fails: 0, prompts: 1, want: []int{0}},
+		{name: "two failures then an answer", fails: 2, prompts: 1, want: []int{3}},
+		{name: "the count is per call", fails: 1, prompts: 2, want: []int{2, 0}},
+		{name: "retries exhausted", fails: 5, prompts: 1, failed: true, want: []int{3}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var n atomic.Int32
+			n.Store(tc.fails)
+			a := agentturn.New(agentturn.Config{Model: flaky{fails: &n}, ModelName: "a", Retry: agentturn.Retry{
+				MaxAttempts: 3,
+				Backoff:     func(int, error) time.Duration { return 0 },
+			}})
+			defer rec.Attach(a)()
+			for i := range tc.prompts {
+				if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); (err != nil) != tc.failed {
+					t.Fatalf("prompt %d: %v", i, err)
+				}
+			}
+			var got []int
+			for _, e := range s.Entries() {
+				if r, ok := e.(*agentsession.ResponseEntry); ok {
+					got = append(got, r.Attempts)
+					if (r.Status == openresponses.ResponseStatusFailed) != tc.failed {
+						t.Errorf("response status = %s", r.Status)
+					}
+				}
+			}
+			if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Errorf("attempts = %v, want %v", got, tc.want)
+			}
+			verifyAll(t, s)
+		})
+	}
+}
+
 // TestSetConfigSettlesBeforeTheRunsItems pins #109: a configuration
 // set between runs is on the path before the items its BeforeTurn
 // appends, and neither an unchanged configuration nor one whose hook

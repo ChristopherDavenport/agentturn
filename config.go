@@ -176,7 +176,10 @@ type Config struct {
 	// session recorder wraps one with session.Recorder.Elicitor so the
 	// question and the answer are written under the call. nil leaves an
 	// elicitor already on the run's context in place, and a tool with
-	// none asks nobody.
+	// none asks nobody: an agent run from inside a tool served by
+	// agenttool's mcpserver, whose call context carries the elicitor
+	// that asks the MCP client, then puts its tools' questions to that
+	// client.
 	ToolElicitor agenttool.Elicitor
 	// MaxTurns stops a run after this many turns with ReasonStopped;
 	// zero means no limit.

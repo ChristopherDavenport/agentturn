@@ -237,7 +237,8 @@ cfg.Retry = agentturn.Retry{MaxAttempts: 4}
 `Retry.Revise` may change the request the next attempt sends, which is
 how a fallback chain lives in the loop rather than under it: the
 switch is on the `model_retry` event and a recorder writes it as a
-config delta, so the path names the model that answered.
+config delta, so the path names the model that answered, and the
+response entry says in `attempts` how many calls the turn took.
 
 ```go
 cfg.Retry = agentturn.Retry{MaxAttempts: 4, Revise: func(attempt int, req *openresponses.Request, err error) *openresponses.Request {

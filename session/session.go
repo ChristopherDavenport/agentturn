@@ -99,9 +99,11 @@
 //     stops the call.
 //   - response_end: the response entry with status, usage, error and the
 //     request hash, after the items it produced and before any tool
-//     output of the turn.
+//     output of the turn; for a call Retry tried again, attempts, the
+//     calls it took with the one that answered.
 //   - run_end: a response entry with status failed, the error, the
-//     request hash and the ID of the response the stream had named,
+//     request hash, attempts as on response_end, and the ID of the
+//     response the stream had named,
 //     when a call was still in flight because the model failed or the
 //     run was aborted before the stream produced a response; the ID
 //     names the response the call was cut out of and lets the context
@@ -393,8 +395,11 @@ type NestedCall struct {
 // ModelRetryNS is the namespace of the custom entry written for each
 // failed attempt of a model call that [agentturn.Retry] tries again.
 // Its data is a [ModelRetry]. It is appended where the next entry
-// goes, before the response of the attempt that answered, so a reader
-// counting the calls a turn took counts these and adds one. It lands
+// goes, before the response of the attempt that answered, whose
+// response entry carries the count as attempts, so a reader counting
+// calls reads that and needs no knowledge of this namespace; the entry
+// is what the count cannot say, each failure, its delay and its model,
+// and whether Retry.Revise changed the request. It lands
 // before the config entry of the turn, which is written with the first
 // entry of the attempt that answers, so only that attempt's settings
 // are on the path; on a fresh session with no configuration to settle
@@ -571,6 +576,10 @@ type writer struct {
 	attempt []byte
 	// attemptModel is the model that request named.
 	attemptModel string
+	// retries is the number of attempts of the call in flight that
+	// failed and were tried again, so its response entry says how many
+	// calls it took.
+	retries int
 	// inbox lists, in the order they were accepted, the inputs that no
 	// item has drained yet: the ones the agent holds, which a queued
 	// event reported or Requeue handed back, and the ones a resumed or
@@ -676,7 +685,10 @@ func WithoutChildSessions() Option {
 // WithEnv sets a function the recorder calls once per run, on
 // run_start, for the environment the run works in: the working
 // directory, the version control state, file hashes, tool versions,
-// the workspace. The entry is written when it differs from the last
+// the workspace, with whatever tells one file system from another, a
+// container's host or instance, inside it through
+// agentsession.Workspace.SetMember rather than beside it, where the
+// format's substitution rule does not look. The entry is written when it differs from the last
 // one written, or found on the path by [Resume], so a run in an
 // unchanged environment adds nothing; a nil entry writes nothing. The
 // recorder gathers nothing itself: what the host knows about its
@@ -693,8 +705,8 @@ func WithEnv(fn func(context.Context) (*agentsession.EnvEntry, error)) Option {
 // recorder's config entries carry instructions_parts and
 // instructions_omitted rather than one string: a change to one layer,
 // a memory block or a skill catalogue, is then a delta naming that
-// part, the others carried by their hashes, rather than the whole
-// prompt again. fn is called with the canonical request whenever the
+// part, each run of unchanged parts around it a keep, rather than the
+// whole prompt again. fn is called with the canonical request whenever the
 // recorder settles the settings, which is with the request about to be
 // sent, after BeforeModelCall has rewritten it, so a product that edits
 // its instructions in a hook takes its parts from what the hook left.
@@ -1156,6 +1168,19 @@ func (r *Recorder) RecordFunc() agenttool.RecordFunc {
 // A nil fn answers every question with agenttool.ActionCancel, since
 // nobody was asked, and records that. A failure to write the entry is
 // returned to the tool as the harness failing to ask.
+//
+// An agent run from inside a tool served by agenttool's mcpserver
+// finds the elicitor that asks the MCP client on the call's context,
+// not on its configuration; to record those questions, wrap that one
+// and put it on the context the run is prompted with:
+//
+//	served, _ := agenttool.ElicitorFrom(ctx)
+//	ctx = agenttool.ContextWithElicitor(ctx, rec.Elicitor("user", served))
+//
+// The served elicitor belongs to one call, so a configuration built
+// once cannot name it as ToolElicitor. When the client offers no
+// elicitation served is nil, and each question is recorded as
+// cancelled.
 func (r *Recorder) Elicitor(by string, fn agenttool.Elicitor) agenttool.Elicitor {
 	return func(ctx context.Context, q agenttool.Elicitation) (agenttool.Answer, error) {
 		ans := agenttool.Answer{Action: agenttool.ActionCancel}
@@ -1192,7 +1217,7 @@ func (w *writer) reset() {
 	w.env = nil
 	w.omitted = nil
 	w.base = nil
-	w.attempt, w.attemptModel = nil, ""
+	w.attempt, w.attemptModel, w.retries = nil, "", 0
 	w.parents = map[string]string{}
 }
 
@@ -1831,12 +1856,22 @@ func (w *writer) turnStart(ctx context.Context, e *agentturn.TurnStart) error {
 	if w.attempt, err = json.Marshal(req); err != nil {
 		return fmt.Errorf("session: encode request: %w", err)
 	}
-	w.attemptModel = req.Model
+	w.attemptModel, w.retries = req.Model, 0
 	w.inFlight = true
 	w.pending = hash
 	w.started = w.rec.now()
 	w.inFlightID = ""
 	return nil
+}
+
+// attempts is the attempts member of the response entry of the call in
+// flight: the calls it took, itself included, or zero for one, which
+// the format reads as one.
+func (w *writer) attempts() int {
+	if w.retries == 0 {
+		return 0
+	}
+	return w.retries + 1
 }
 
 // retry takes the settings and the hash of the request the next
@@ -1868,7 +1903,7 @@ func (w *writer) retry(ctx context.Context, e *agentturn.ModelRetry) error {
 	if _, err := w.append(ctx, &agentsession.CustomEntry{NS: ModelRetryNS, Data: raw}); err != nil {
 		return err
 	}
-	w.attempt, w.attemptModel = next, req.Model
+	w.attempt, w.attemptModel, w.retries = next, req.Model, e.Attempt
 	w.settleReq = &req
 	w.inFlight = true
 	w.pending = hash
@@ -2320,8 +2355,9 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 		Error:       resp.Error,
 		RequestHash: w.pending,
 		LatencyMS:   w.latency(),
+		Attempts:    w.attempts(),
 	}
-	w.inFlight, w.pending, w.started, w.inFlightID = false, "", time.Time{}, ""
+	w.inFlight, w.pending, w.started, w.inFlightID, w.retries = false, "", time.Time{}, "", 0
 	w.responses++
 	w.lastCalls = len(resp.FunctionCalls()) > 0
 	_, err := w.append(ctx, entry)
@@ -2340,8 +2376,8 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 // reason in the format's terms and the run's calls left open.
 func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
 	hash, inFlight, responseID := w.pending, w.inFlight, w.inFlightID
-	latency := w.latency()
-	w.inFlight, w.pending, w.started, w.inFlightID = false, "", time.Time{}, ""
+	latency, attempts := w.latency(), w.attempts()
+	w.inFlight, w.pending, w.started, w.inFlightID, w.retries = false, "", time.Time{}, "", 0
 	if inFlight {
 		w.responses++
 		w.lastCalls = false
@@ -2351,6 +2387,7 @@ func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
 			Error:       errorPayload(e.Err),
 			RequestHash: hash,
 			LatencyMS:   latency,
+			Attempts:    attempts,
 		}
 		if _, err := w.append(ctx, entry); err != nil {
 			return err

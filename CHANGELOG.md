@@ -5,6 +5,28 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Requires `agenttool` v0.0.10 and `agentsession` v0.0.10, up from
+  v0.0.9. The session recorder writes `agentsession/0.7`, which adds
+  optional members only; a 0.5 or 0.6 session reads as it stands, and
+  v0.0.9 of agentsession refuses a 0.7 file. An instructions delta under
+  `session.WithInstructionsParts` now writes each run of unchanged parts
+  as one `keep` rather than naming every part by hash, so a memory
+  write under many layers costs the part that moved. A tool served by
+  agenttool's `mcpserver` finds an elicitor that asks the MCP client on
+  its call's context; an agent run inside one puts its tools' questions
+  there when `Config.ToolElicitor` is nil, and `Recorder.Elicitor`
+  documents how to record them.
+- The response entry of a model call that `Config.Retry` tried again
+  carries `attempts`, the calls it took with the one that answered, so
+  an exporter's `llm_call_count` counts the retries without knowing the
+  `agentturn:model_retry` namespace; so does the failed response
+  `run_end` writes for a call whose retries ran out. A call that took
+  one leaves the member off. The `model_retry` custom entries stay,
+  since they carry what a count cannot: each failure, its delay, its
+  model and whether `Retry.Revise` changed the request. (#117)
+
 ## v0.0.10 - 2026-09-28
 
 - Requires `agenttool` v0.0.9 and `agentsession` v0.0.9, up from
