@@ -314,3 +314,72 @@ func TestInstructionsPartsReachChildSessions(t *testing.T) {
 		})
 	}
 }
+
+// TestInstructionsPartsSurviveEveryResume checks that a stateless host,
+// which resumes the session for every turn under a hook that renders
+// its parts into the request, pays nothing per resume for an unchanged
+// composition: the base request its configuration names is not what
+// the parts stand for, so settling it at run start would replace them
+// with a string that was never sent and turn start would write every
+// part again. A path that recorded no base is held to the same.
+func TestInstructionsPartsSurviveEveryResume(t *testing.T) {
+	l := &layers{ids: []string{"product", "memory"}, text: map[string]string{"product": strings.Repeat("p", 5000), "memory": "Memory:"}}
+	partsOf := func(context.Context, openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
+		return l.parts(), nil
+	}
+	cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Instructions: "unrendered",
+		BeforeModelCall: func(_ context.Context, req *openresponses.Request) error {
+			req.Instructions = l.render()
+			return nil
+		}}
+	for _, unrecorded := range []bool{false, true} {
+		name := "recorded base"
+		if unrecorded {
+			name = "no recorded base"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{}, WithInstructionsParts(partsOf))
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := agentturn.New(cfg)
+			var unsub func()
+			if unrecorded {
+				unsub = a.Subscribe(rec.Handle)
+			} else {
+				unsub = rec.Attach(a)
+			}
+			if _, err := a.Prompt(context.Background(), openresponses.UserText("one")); err != nil {
+				t.Fatal(err)
+			}
+			unsub()
+			for i := range 3 {
+				rec, s, err = Resume(context.Background(), store, s.ID(), WithInstructionsParts(partsOf))
+				if err != nil {
+					t.Fatal(err)
+				}
+				cx, err := s.Context()
+				if err != nil {
+					t.Fatal(err)
+				}
+				b := agentturn.New(cfg, agentturn.WithTranscript(cx.Items))
+				before, from := jsonLen(configs(s)), len(s.Entries())
+				unsub := rec.Attach(b)
+				if _, err := b.Prompt(context.Background(), openresponses.UserText("again")); err != nil {
+					t.Fatal(err)
+				}
+				unsub()
+				if n := jsonLen(configs(s)) - before; n > 0 {
+					t.Errorf("resume %d wrote %d bytes of config for an unchanged composition", i+1, n)
+				}
+				for _, e := range s.Entries()[from:] {
+					if c, ok := e.(*agentsession.ConfigEntry); ok && c.Instructions != nil {
+						t.Errorf("resume %d set the instructions to %q", i+1, *c.Instructions)
+					}
+				}
+			}
+			verifyAll(t, s)
+		})
+	}
+}

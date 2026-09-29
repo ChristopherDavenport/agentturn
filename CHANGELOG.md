@@ -67,15 +67,24 @@ versions may break the API.
   of `BeforeTurn`. The session writer's comment on a run with no
   response of its own says a guard stop before the first model call
   reads as aborted. (#140)
-- The first run of a session recorder seeded from a stored path, by
-  `session.Resume` or by `session.Start` on a header with a `Base`,
-  compares the configuration's base request with the settings in force
-  at the leaf and settles a difference at `run_start`, so a handoff
-  that crosses a process files the receiver's `BeforeTurn` items under
-  the receiver's configuration, as #109 did within one. A product whose
-  `BeforeModelCall` edits the request every turn pays a delta at
-  `run_start` and the edited one at `turn_start` once per resume or
-  fork. (#139)
+- The session recorder's run start entry carries `config_base`
+  (`session.ConfigBaseMember`), the request hash of the configuration's
+  base request, when the recorder knows the configuration. The first
+  run of a recorder seeded from a stored path, by `session.Resume`,
+  `session.Start` on a header with a `Base`, `Recorder.Rebase`,
+  `session.Continue` or a child session reopened under the same call,
+  compares with the base the path's last run start recorded, as a
+  later run compares with the one before, and settles a change at
+  `run_start`. A handoff that crosses a process then files the
+  receiver's `BeforeTurn` items under the receiver's configuration, as
+  #109 did within one, and a configuration that did not change writes
+  nothing there, even when a hook edits the request. A path that
+  recorded no base is compared by its settings at the leaf: a product
+  whose `BeforeModelCall` edits the request pays a delta at `run_start`
+  and the edited one at `turn_start` on its first resume, and
+  instructions on the path composed of parts are not compared with a
+  base the host's parts do not join, so they are not replaced by a
+  string that was never sent. (#139)
 - Breaking: `session.WithInstructionsParts` takes
   `func(ctx, req)` and is called for every session the recorder
   writes, a child run's included, with `ctx` naming that session for
@@ -83,7 +92,10 @@ versions may break the API.
   child's ID on the run's context. A child agent with layers of its
   own records them as parts rather than the joined string; a function
   that returns no parts for a session leaves it the string, as before.
-  A host moves to it by adding the parameter. (#142)
+  A host moves to it by adding the parameter. A function that ignores
+  the context is now asked for every child session too: a child whose
+  instructions are the root's gets the root's parts and omitted list.
+  (#142)
 
 ## v0.0.10 - 2026-09-28
 

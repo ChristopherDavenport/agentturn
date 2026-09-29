@@ -32,17 +32,21 @@
 //   - run_start: a run entry with phase start, the source the loop
 //     reports (input, or resume for a run that answers pending calls),
 //     the [agentturn.Trigger] on the context joined as ref and in its
-//     parts as trigger; then, for the recorder's own session, the env
-//     entry [WithEnv] supplies when it differs from the last one
-//     written, members the library does not define included; then,
-//     when the recorder knows the agent's configuration
-//     ([Recorder.Attach] and [WithConfig] give it one), a full config
-//     entry before the first item, so a root starts with one as the
-//     format recommends, and a delta when the configuration changed
-//     since the last run, or, on the first run after [Resume] or a
-//     [Start] on a based header, when it differs from the settings at
-//     the leaf, so the items a new configuration's BeforeTurn appends
-//     are filed under it.
+//     parts as trigger, and, when the recorder knows the agent's
+//     configuration ([Recorder.Attach] and [WithConfig] give it one),
+//     the hash of its base request as [ConfigBaseMember]; then, for
+//     the recorder's own session, the env entry [WithEnv] supplies
+//     when it differs from the last one written, members the library
+//     does not define included; then, with a configuration, a full
+//     config entry before the first item, so a root starts with one as
+//     the format recommends, and a delta when the configuration
+//     changed since the last run, so the items a new configuration's
+//     BeforeTurn appends are filed under it. A recorder seeded from a
+//     path, by [Resume], a [Start] on a based header,
+//     [Recorder.Rebase], [Continue] or a child session
+//     reopened under the same call, compares its first run with the
+//     base the path's last run start recorded, or, on a path that
+//     recorded none, with the settings at the leaf.
 //   - turn_start: a config entry when the settings in force changed
 //     since the last call (a full one first if none was written, deltas
 //     after, a tool list change as tools_added and tools_removed), so
@@ -346,6 +350,17 @@ type UnplacedFold struct {
 // the fold's, which no path rebuilds.
 const FoldMember = "fold"
 
+// ConfigBaseMember is the member a run start entry carries, beyond
+// those the format defines, when the recorder knows the configuration
+// the run starts under: the request hash of that configuration's
+// canonical base request, its tool provider's tools left out. A
+// recorder seeded from a path compares its first run's configuration
+// with it, as it compares a later run's with the one before, so a
+// configuration that did not change writes nothing at run_start. It
+// is a hash of settings the recorder compares, not of a request that
+// was sent, and Session.Verify never reads it.
+const ConfigBaseMember = "config_base"
+
 // FoldCall names the model call a fold made.
 type FoldCall struct {
 	// RequestHash is the hash, in the format's canonical form, of the
@@ -571,10 +586,12 @@ type writer struct {
 	// written only when it differs.
 	env          []byte
 	envWorkspace *agentsession.Workspace
-	// base is the canonical base request of the configuration the last
-	// run started under, encoded, so a run whose configuration changed
-	// settles it before any of its items.
-	base []byte
+	// base is the request hash of the canonical base request of the
+	// configuration the last run started under, from this writer's run
+	// or the [ConfigBaseMember] of the last run start on a seeded path,
+	// so a run whose configuration changed settles it before any of its
+	// items.
+	base string
 	// attempt is the canonical request of the model call in flight,
 	// encoded when it was reported and before a retry policy could edit
 	// its maps in place, so a retry can say whether Revise changed it.
@@ -1226,7 +1243,7 @@ func (w *writer) reset() {
 	w.calls = map[string]*callRecord{}
 	w.env, w.envWorkspace = nil, nil
 	w.omitted = nil
-	w.base = nil
+	w.base = ""
 	w.attempt, w.attemptModel, w.retries = nil, "", 0
 	w.parents = map[string]string{}
 }
@@ -1249,6 +1266,7 @@ func (w *writer) seed(s *agentsession.Session, owed bool) error {
 	w.values = append(openresponses.Items(nil), cx.Items...)
 	w.custom = make([]bool, len(w.values))
 	w.omitted = omittedBody(cx.InstructionsOmitted())
+	w.base = lastConfigBase(s.Path(s.Leaf()))
 	for _, e := range cx.Entries {
 		if env, ok := e.(*agentsession.EnvEntry); ok {
 			w.env, w.envWorkspace = envBody(env), env.Workspace
@@ -1775,6 +1793,27 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 	if !e.Trigger.IsZero() {
 		start.Trigger = &agentsession.Trigger{Kind: e.Trigger.Kind, Ref: e.Trigger.Ref, Source: e.Trigger.Source}
 	}
+	// The comparison below does not ask a tool provider, which may cost
+	// a round trip or list its tools in another order each time; what
+	// it offers reaches the path at turn_start.
+	var probeReq openresponses.Request
+	var base string
+	if w.cfg != nil {
+		probe := *w.cfg
+		if probe.ToolProvider != nil {
+			probe.ToolProvider, probe.Tools = nil, nil
+		}
+		probeReq = Canonical(probe.BaseRequest(ctx))
+		var err error
+		if base, err = RequestHash(probeReq); err != nil {
+			return fmt.Errorf("session: base request: %w", err)
+		}
+		raw, err := json.Marshal(base)
+		if err != nil {
+			return fmt.Errorf("session: encode base request hash: %w", err)
+		}
+		start.Unknown = map[string]json.RawMessage{ConfigBaseMember: raw}
+	}
 	if _, err := w.append(ctx, start); err != nil {
 		return err
 	}
@@ -1792,46 +1831,62 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 	// appends are filed under it. A configuration that did not change
 	// is left to turn_start, which settles the request as sent: a hook
 	// that edits the request every turn would otherwise be undone here
-	// and redone there on every run. The first run of a writer seeded
-	// from a path, by Resume or by Start on a based header, has no last
-	// configuration to compare with, so its base request is compared
-	// with the settings in force at the leaf: a product whose hook edits
-	// the request pays a delta here once per resume rather than once
-	// per run. The comparison does not ask a tool provider, which may
-	// cost a round trip or list its tools in another order each time;
-	// what it offers reaches the path at turn_start.
-	probe := *w.cfg
-	if probe.ToolProvider != nil {
-		probe.ToolProvider, probe.Tools = nil, nil
-	}
-	probeReq := Canonical(probe.BaseRequest(ctx))
-	base, err := json.Marshal(probeReq)
-	if err != nil {
-		return fmt.Errorf("session: encode base request: %w", err)
-	}
+	// and redone there on every run. A writer seeded from a path, by
+	// Resume, Start on a based header, Rebase, Continue or a child
+	// session reopened under the same call, compares with the base the
+	// path's last run start recorded, as it would with its own. A path
+	// that recorded none, written before the member was or by a
+	// recorder that did not know its configuration, is compared by its
+	// settings at the leaf instead.
 	prev := w.base
 	w.base = base
 	switch {
 	case !w.wroteConfig:
-	case prev != nil && !bytes.Equal(prev, base):
-	case prev == nil && w.differs(probeReq, w.cfg.ToolProvider == nil):
+	case prev != "" && prev != base:
+	case prev == "" && w.differs(ctx, probeReq, w.cfg.ToolProvider == nil):
 	default:
 		return nil
 	}
 	return w.settle(ctx, Canonical(w.cfg.BaseRequest(ctx)))
 }
 
+// lastConfigBase returns the [ConfigBaseMember] of the last run start
+// on path, or "" when that start carries none.
+func lastConfigBase(path []agentsession.Entry) string {
+	for i := len(path) - 1; i >= 0; i-- {
+		run, ok := path[i].(*agentsession.RunEntry)
+		if !ok || !run.IsStart() {
+			continue
+		}
+		var base string
+		if raw, ok := run.Unknown[ConfigBaseMember]; ok {
+			_ = json.Unmarshal(raw, &base)
+		}
+		return base
+	}
+	return ""
+}
+
 // differs reports whether req's settings differ from those in force
 // on the path, the instructions compared as the string and the tools
-// only when tools is set. A request the format cannot hold is left to
-// turn_start, which settles the one sent.
-func (w *writer) differs(req openresponses.Request, tools bool) bool {
+// only when tools is set. Instructions composed of parts on the path
+// are not compared with a base the host's parts do not compose: those
+// parts are rendered into the request by a hook, so the base is not
+// what they stand for, and settling it would replace them with a
+// string that was never sent. A request the format cannot hold is
+// left to turn_start, which settles the one sent.
+func (w *writer) differs(ctx context.Context, req openresponses.Request, tools bool) bool {
 	full, err := agentsession.ConfigFromRequest(req)
 	if err != nil {
 		return false
 	}
 	next, have := agentsession.Settings{}.Apply(full), w.settings
 	have.InstructionsParts = nil
+	if len(w.settings.InstructionsParts) > 0 {
+		if parts, _ := w.instructionParts(ctx, req); len(parts) == 0 {
+			next.Instructions, have.Instructions = "", ""
+		}
+	}
 	if !tools {
 		next.Tools, have.Tools = nil, nil
 	}
