@@ -1276,7 +1276,7 @@ maps onto it as follows:
 | queue mode | `QueueMode`: `QueueSteer`, `QueueFollowUp` |
 | the loop as a model | `front/responses.New(cfg)` → `openresponses.Adapter` |
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
-| the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`; `tools/a2a.New(client, card)` |
+| the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)` |
 | the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `RecordFunc`, `Elicitor`, `Requeue`, `Rebase`; `WithInstructionsParts`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.DispatchKey`, `session.IdempotencyKeyMember` |
 
 Every error the package returns to its caller, sentinel or wrapped,

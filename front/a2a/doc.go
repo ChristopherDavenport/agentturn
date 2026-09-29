@@ -5,11 +5,12 @@
 // A2A be a component of another agent and the reverse.
 //
 // [Executor] implements a2asrv.AgentExecutor. Each message/send runs the
-// loop once with agentturn.Run on the transcript stored for the message's
-// context ID, streams assistant text as artifact chunks, and ends the
-// task from the run's reason: completed, canceled, failed or, when the
-// model called a tool the caller owns, input-required with the pending
-// function_call items on the status message. A run a guard stopped
+// loop once, on an agentturn.Agent seeded with the transcript stored
+// for the message's context ID, streams assistant text as artifact
+// chunks, and ends the task from the run's reason: completed, canceled,
+// failed or, when the model called a tool the caller owns,
+// input-required with the pending function_call items on the status
+// message. A run a guard stopped
 // (agentturn.StopGuard) with no answer (agentturn.RunEnd.Answer) fails
 // the task with the guard's error rather than completing it, whichever
 // hook the guard is on, ShouldStopAfterTurn after a turn that only
@@ -36,4 +37,28 @@
 // package documents for an input-required boundary. A2A's
 // input-required state and agentturn's ReasonInputRequired are the
 // same thing seen from the two sides.
+//
+// # Recording
+//
+// [WithRecorderFor] attaches a record to each conversation: it is
+// handed every task's agent, with the context ID, before the run
+// starts, and subscribes what writes the conversation's session. The
+// subscriber sees every event in step with the run, before the
+// executor relays it, and its failure fails the task; a record that
+// cannot be opened fails the send before any task exists. The
+// transcript still comes from the [ConversationStore], which drops
+// the calls an aborted or failed run left unanswered while the session
+// keeps them as cut off, so the store is the conversation's source and
+// the session its record.
+//
+// # One task per conversation
+//
+// A context ID runs one task at a time, so a conversation's store and
+// its record never see two runs at once. A message on a context ID
+// with a task in flight is refused at once with [ErrConversationBusy],
+// wrapped with a2a.ErrInvalidRequest, rather than queued: the caller
+// sends again once the task has ended, the answers to an
+// input-required task among them, and a served agent whose tool sends
+// to its own conversation gets the error rather than waiting on
+// itself.
 package a2a

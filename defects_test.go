@@ -673,3 +673,52 @@ func TestDrainedResultsSeeTheHook(t *testing.T) {
 		})
 	}
 }
+
+// TestPanicStartingARunReleasesTheAgent pins that a panic while a run
+// starts, from a tool the configuration holds, leaves the agent usable
+// by a caller that recovers it rather than holding its lock for good,
+// whichever call started the run.
+func TestPanicStartingARunReleasesTheAgent(t *testing.T) {
+	tests := []struct {
+		name  string
+		start func(*Agent) error
+	}{
+		{"prompt", func(a *Agent) error {
+			_, err := a.Prompt(context.Background(), openresponses.UserText("hi"))
+			return err
+		}},
+		{"deliver", func(a *Agent) error {
+			_, _, err := a.Deliver(context.Background(), openresponses.UserText("hi"))
+			return err
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{nil}})
+			func() {
+				defer func() {
+					if recover() == nil {
+						t.Fatal("a run with a nil tool did not panic")
+					}
+				}()
+				_ = tt.start(a)
+			}()
+			done := make(chan error, 1)
+			go func() {
+				if err := a.SetConfig(Config{Model: &echo.Adapter{}}); err != nil {
+					done <- err
+					return
+				}
+				done <- tt.start(a)
+			}()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("run after the panic: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("the agent's lock was held after the panic")
+			}
+		})
+	}
+}

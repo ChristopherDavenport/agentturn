@@ -185,6 +185,34 @@ versions may break the API.
   it: a job carries its call with `agenttool.WithCall` for the record
   to name it. The tool elicitor stays off, with the rest of what
   belongs to the batch. (#149)
+- A panic while an `Agent` starts a run, from a nil or misbehaving
+  tool in the configuration, no longer leaves the agent's lock held:
+  a caller that recovers it can fix the configuration and prompt
+  again, where every later call on the agent used to block for good.
+  `Prompt`, `Continue`, `Resume` and `Deliver` all release it.
+- `front/a2a.WithRecorderFor` records the runs a served agent makes.
+  The executor drives each task on an `agentturn.Agent` seeded with the
+  stored conversation, rather than on `agentturn.Run`, and hands that
+  agent, with the task's context ID, to the function before the run
+  starts; a host opens that conversation's session there, points
+  `Config.ToolRecorder` at it with `SetConfig`, attaches the recorder
+  and returns a context carrying the session ID. What it subscribes
+  sees every event in step with the run, so a call's dispatch is
+  written before the tool runs and a tool's record lands under its
+  call, and the loop goes at the pace of those writes. A subscriber
+  error fails the task, or cancels it when the run was being aborted.
+  A record that cannot be opened, or a nil context, fails the send:
+  the caller gets the error and no task exists. `agentturn.Run` runs
+  ahead of its consumer, which a recorder cannot follow. The
+  transcript still comes from the `ConversationStore`, which drops the
+  calls an aborted run left unanswered while the session keeps them.
+  (#141)
+- `front/a2a` runs one task per context ID at a time. A message on a
+  context ID with a task in flight is refused at once with
+  `ErrConversationBusy`, wrapped with `a2a.ErrInvalidRequest`, rather
+  than running on the transcript the first task has not saved, which
+  lost one of the two turns; a served agent whose tool sends to its own
+  conversation gets that error instead of waiting on itself. (#141)
 
 ## v0.0.10 - 2026-09-28
 
