@@ -341,6 +341,112 @@ func TestSetConfigSettlesBeforeTheRunsItems(t *testing.T) {
 	verifyAll(t, s)
 }
 
+// TestSeededWriterSettlesBeforeTheRunsItems pins #139: a writer seeded
+// from a path, by Resume or by Start on a based header, compares its
+// first run's configuration with the settings at the leaf, so a new
+// configuration's BeforeTurn items are filed under it, and an
+// unchanged one writes nothing at run start.
+func TestSeededWriterSettlesBeforeTheRunsItems(t *testing.T) {
+	triage := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Instructions: "triage"}
+	// memory edits its instructions in a hook, so its base request
+	// never matches the leaf: that costs a delta at run start once per
+	// seeding, and the edited request its own at turn start.
+	memory := triage
+	memory.BeforeModelCall = func(_ context.Context, req *openresponses.Request) error {
+		req.Instructions = "triage, with memory"
+		return nil
+	}
+	tooled := triage
+	tooled.Tools = []agenttool.Tool{upper}
+	billing := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Instructions: "billing",
+		BeforeTurn: func(_ context.Context, info agentturn.TurnStartInfo) (openresponses.Items, error) {
+			if info.Turn == 1 {
+				return openresponses.Items{openresponses.DeveloperText("Transferred from triage.")}, nil
+			}
+			return nil, nil
+		}}
+	resume := func(t *testing.T, store agentsession.Store, origin *agentsession.Session) (*Recorder, *agentsession.Session) {
+		rec, s, err := Resume(context.Background(), store, origin.ID())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rec, s
+	}
+	fork := func(t *testing.T, store agentsession.Store, origin *agentsession.Session) (*Recorder, *agentsession.Session) {
+		rec, s, err := Start(context.Background(), store, agentsession.Header{Base: origin.Leaf(), ParentSession: origin.ID()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rec, s
+	}
+	cases := []struct {
+		name        string
+		first, next agentturn.Config
+		seed        func(*testing.T, agentsession.Store, *agentsession.Session) (*Recorder, *agentsession.Session)
+		want        string
+		filedUnder  string
+	}{
+		{"resume under a new configuration", triage, billing, resume, "run config user developer assistant response run", "billing"},
+		{"fork under a new configuration", triage, billing, fork, "run config user developer assistant response run", "billing"},
+		{"resume under the same configuration", triage, triage, resume, "run user assistant response run", ""},
+		{"fork under the same configuration with tools", tooled, tooled, fork, "run user item response dispatch item assistant response run", ""},
+		{"resume under a hook that edits the request", memory, memory, resume, "run config user config assistant response run", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, origin, err := Start(context.Background(), store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := agentturn.New(tc.first)
+			unsub := rec.Attach(a)
+			if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
+				t.Fatal(err)
+			}
+			unsub()
+
+			rec2, s := tc.seed(t, store, origin)
+			cx, err := s.Context()
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := agentturn.New(tc.next, agentturn.WithTranscript(cx.Items))
+			defer rec2.Attach(b)()
+			before := len(s.Entries())
+			if _, err := b.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
+				t.Fatal(err)
+			}
+			var types []string
+			note := ""
+			for _, e := range s.Entries()[before:] {
+				types = append(types, e.EntryType())
+				if it, ok := e.(*agentsession.ItemEntry); ok {
+					if m, ok := it.Item.(*openresponses.Message); ok {
+						types[len(types)-1] = string(m.Role)
+						if m.Role == openresponses.RoleDeveloper {
+							note = e.Base().ID
+						}
+					}
+				}
+			}
+			if got := strings.Join(types, " "); got != tc.want {
+				t.Errorf("seeded run = %q, want %q", got, tc.want)
+			}
+			if tc.filedUnder != "" {
+				at, err := s.ContextAt(note)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if at.Settings.Instructions != tc.filedUnder {
+					t.Errorf("the transfer note is filed under %q, want %q", at.Settings.Instructions, tc.filedUnder)
+				}
+			}
+			verifyAll(t, s)
+		})
+	}
+}
+
 // TestEnvUnknownMembersAreCompared pins #128: an env entry that differs
 // only in a member the library does not define is a change, and one
 // that is the same, unknown members included, writes nothing.

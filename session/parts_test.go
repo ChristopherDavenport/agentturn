@@ -7,7 +7,9 @@ import (
 	"testing"
 
 	"github.com/ChristopherDavenport/agentsession"
+	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
+	"github.com/ChristopherDavenport/agentturn/tools/agent"
 	"github.com/ChristopherDavenport/openresponses"
 	"github.com/ChristopherDavenport/openresponses/echo"
 )
@@ -141,7 +143,7 @@ func TestInstructionsPartsAreRecorded(t *testing.T) {
 				text:    map[string]string{"product": big("p"), "agents_md": big("a"), "memory": "Memory:"},
 				omitted: []agentsession.OmittedPart{{ID: "skills", Reason: "out of scope", Size: 12}},
 			}
-			partsOf := func(req openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
+			partsOf := func(_ context.Context, req openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
 				parts, omitted := l.parts(), append([]agentsession.OmittedPart(nil), l.omitted...)
 				if tc.mangle != nil {
 					return tc.mangle(parts, omitted)
@@ -193,7 +195,7 @@ func TestInstructionsPartsAreRecorded(t *testing.T) {
 // composition and names the moved part by itself afterwards.
 func TestInstructionsPartsSurviveResume(t *testing.T) {
 	l := &layers{ids: []string{"a", "b"}, text: map[string]string{"a": strings.Repeat("a", 3000), "b": "b"}}
-	partsOf := func(openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
+	partsOf := func(context.Context, openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
 		return l.parts(), nil
 	}
 	store := agentsession.NewMemoryStore()
@@ -240,4 +242,75 @@ func TestInstructionsPartsSurviveResume(t *testing.T) {
 		t.Errorf("the delta repeats the unchanged part: %s", raw)
 	}
 	verifyAll(t, s2)
+}
+
+// TestInstructionsPartsReachChildSessions pins #142: the parts function
+// is asked for a child run's session too, with a context naming it, so
+// a child with layers of its own records them rather than the string,
+// whether or not the host put the child's ID on the run's context.
+func TestInstructionsPartsReachChildSessions(t *testing.T) {
+	root := &layers{ids: []string{"product"}, text: map[string]string{"product": "You delegate."}}
+	child := &layers{
+		ids:     []string{"prompt", "memory"},
+		text:    map[string]string{"prompt": strings.Repeat("s", 3000), "memory": "Memory:"},
+		omitted: []agentsession.OmittedPart{{ID: "notes", Reason: "budget", Size: 40}},
+	}
+	for _, tc := range []struct {
+		name     string
+		childCtx bool
+	}{
+		{"with the child's context", true},
+		{"without it", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			var rec *Recorder
+			asked := map[string]bool{}
+			partsOf := func(ctx context.Context, req openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
+				id := SessionIDFromContext(ctx)
+				asked[id] = true
+				if id == rec.SessionID() {
+					return root.parts(), nil
+				}
+				return child.parts(), child.omitted
+			}
+			rec, s, err := Start(context.Background(), store, agentsession.Header{}, WithInstructionsParts(partsOf))
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts := []agent.Option{agent.WithObserver(rec.Observe)}
+			if tc.childCtx {
+				opts = append(opts, agent.WithRunContext(rec.ChildContext))
+			}
+			childCfg := agentturn.Config{Name: "specialist", Description: "remembers", Model: &echo.Adapter{}, ModelName: "m", Instructions: child.render()}
+			specialist := agent.New(childCfg, opts...)
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Instructions: root.render(), Tools: []agenttool.Tool{specialist}})
+			defer rec.Attach(a)()
+			if _, err := a.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
+				t.Fatal(err)
+			}
+			l := links(s)
+			if len(l) != 1 {
+				t.Fatalf("links = %+v", l)
+			}
+			cs, err := store.Open(context.Background(), l[0].Session)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !asked[cs.ID()] || !asked[s.ID()] {
+				t.Errorf("parts asked for %v, want the root %q and the child %q", asked, s.ID(), cs.ID())
+			}
+			for _, sess := range []*agentsession.Session{s, cs} {
+				cfgs := configs(sess)
+				if len(cfgs) == 0 || len(cfgs[0].InstructionsParts) == 0 || cfgs[0].Instructions != nil {
+					t.Errorf("session %s's first config = %+v, want parts", sess.ID(), cfgs)
+				}
+			}
+			if cfgs := configs(cs); len(cfgs) == 0 || len(cfgs[0].InstructionsOmitted) != 1 {
+				t.Errorf("the child's omitted parts = %+v", cfgs)
+			}
+			verifyAll(t, s)
+			verifyAll(t, cs)
+		})
+	}
 }

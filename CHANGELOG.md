@@ -67,6 +67,23 @@ versions may break the API.
   of `BeforeTurn`. The session writer's comment on a run with no
   response of its own says a guard stop before the first model call
   reads as aborted. (#140)
+- The first run of a session recorder seeded from a stored path, by
+  `session.Resume` or by `session.Start` on a header with a `Base`,
+  compares the configuration's base request with the settings in force
+  at the leaf and settles a difference at `run_start`, so a handoff
+  that crosses a process files the receiver's `BeforeTurn` items under
+  the receiver's configuration, as #109 did within one. A product whose
+  `BeforeModelCall` edits the request every turn pays a delta at
+  `run_start` and the edited one at `turn_start` once per resume or
+  fork. (#139)
+- Breaking: `session.WithInstructionsParts` takes
+  `func(ctx, req)` and is called for every session the recorder
+  writes, a child run's included, with `ctx` naming that session for
+  `session.SessionIDFromContext` whether or not the host put the
+  child's ID on the run's context. A child agent with layers of its
+  own records them as parts rather than the joined string; a function
+  that returns no parts for a session leaves it the string, as before.
+  A host moves to it by adding the parameter. (#142)
 
 ## v0.0.10 - 2026-09-28
 
