@@ -2394,6 +2394,8 @@ func (w *writer) instructionParts(ctx context.Context, req openresponses.Request
 	var named []agentsession.OmittedPart
 	for _, o := range omitted {
 		if o.ID != "" {
+			// A keep is the recorder's to write, never the host's.
+			o.Keep = 0
 			named = append(named, o)
 		}
 	}
