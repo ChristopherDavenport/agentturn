@@ -1388,33 +1388,25 @@ func (r *Recorder) EntryOf(ctx context.Context, item openresponses.Item) (string
 	return "", false
 }
 
-// writerOf returns the writer of the run on the context; failing
-// that, the writer of a run of the child session the context names,
-// which a later run under the same call continues; and failing that,
-// the root.
+// writerOf returns the writer of the run on the context, or the root.
 func (r *Recorder) writerOf(ctx context.Context) *writer {
 	if cw, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
 		return cw
-	}
-	if id := SessionIDFromContext(ctx); r.childIDs[id] {
-		for _, cw := range r.runs {
-			if cw.id == id {
-				return cw
-			}
-		}
 	}
 	return r.root
 }
 
 // reopen returns a writer at the leaf of the child session the context
-// names when no run of it is being written, or nil when the context
-// names none of this recorder's children. It is what a record written
-// after a child's run ended, by a job the child started, is filed
-// with. The writer knows the calls on the session's path and the
-// nested calls their tools made, which is all callOn asks, and is
-// dropped after the write: the store keeps the leaf, and a later run
-// of the child seeds a writer of its own from it. The caller holds
-// r.mu, so no live writer of the session appends meanwhile.
+// names, or nil when the context names none of this recorder's
+// children. It is what a record written after a child's run ended, by
+// a job the child started, is filed with, even while a later run of
+// the child is being written: that run's writer knows only the calls
+// pending when it was seeded, and the job's call was answered before.
+// The writer knows every call on the session's path and the nested
+// calls their tools made, which is all callOn asks, and is dropped
+// after the write: the store keeps the leaf, and a later run of the
+// child seeds a writer of its own from it. The caller holds r.mu, so
+// no live writer of the session appends meanwhile.
 func (r *Recorder) reopen(ctx context.Context) (*writer, error) {
 	id := SessionIDFromContext(ctx)
 	if !r.childIDs[id] {

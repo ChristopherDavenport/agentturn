@@ -943,8 +943,15 @@ func TestRecordsNameTheirCall(t *testing.T) {
 // TestChildJobRecordsReachTheChild pins #168: a job a child's tool
 // starts from agentturn.RunContext and that writes after the child's
 // run has ended is filed in the child's session, under the child's
-// call when it names it with agenttool.WithCall, and not at the root.
+// call when it names it with agenttool.WithCall, and not at the root,
+// whether or not a later run of the child is being written by then.
 func TestChildJobRecordsReachTheChild(t *testing.T) {
+	for _, later := range []bool{false, true} {
+		t.Run(fmt.Sprintf("later=%v", later), func(t *testing.T) { testChildJobRecords(t, later) })
+	}
+}
+
+func testChildJobRecords(t *testing.T, later bool) {
 	store := agentsession.NewMemoryStore()
 	rec, s, err := Start(context.Background(), store, agentsession.Header{})
 	if err != nil {
@@ -983,14 +990,31 @@ func TestChildJobRecordsReachTheChild(t *testing.T) {
 	if _, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
 		t.Fatal(err)
 	}
+	rootCalls := callsOf(t, s)
+	childID := agentsession.SubsessionID(s.ID(), rootCalls["specialist"].ID())
+	if later {
+		// A later run of the child, seeded from its leaf as newChild
+		// seeds one, holds only the calls pending there.
+		cs, err := store.Open(context.Background(), childID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec.mu.Lock()
+		w := newWriter(rec, childID)
+		err = w.seed(cs, false)
+		rec.runs["later"] = w
+		rec.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	close(release)
 	for range 3 {
 		if err := <-errs; err != nil {
 			t.Fatal(err)
 		}
 	}
-	rootCalls := callsOf(t, s)
-	cs, err := store.Open(context.Background(), agentsession.SubsessionID(s.ID(), rootCalls["specialist"].ID()))
+	cs, err := store.Open(context.Background(), childID)
 	if err != nil {
 		t.Fatal(err)
 	}
