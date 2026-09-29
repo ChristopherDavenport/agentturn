@@ -135,6 +135,11 @@ func TestResumeAppliesTheReplayRule(t *testing.T) {
 			answer: func(id string) Answer {
 				return ApproveWith(id, json.RawMessage(`{"text":"other"}`)).WithIdempotencyKey("k3")
 			}, wantKey: "k3", wantText: "other"},
+		{name: "seeded aborted, keyed, other arguments under the first key named", replay: agenttool.ReplayKeyed,
+			pending: []PendingCall{{Call: call, Reason: PendingAborted, IdempotencyKey: "k1"}},
+			answer: func(id string) Answer {
+				return ApproveWith(id, json.RawMessage(`{"text":"other"}`)).WithIdempotencyKey("k1")
+			}, wantErr: ErrAmbiguousCall},
 		{name: "cut, keyed, the same arguments respelled", replay: agenttool.ReplayKeyed, cut: true,
 			answer: func(id string) Answer { return ApproveWith(id, json.RawMessage(`{ "text": "go" }`)) }},
 	}
@@ -227,5 +232,65 @@ func TestApprovedCallCutBeforeDispatchIsUndispatched(t *testing.T) {
 	end, _ = a.Resume(context.Background(), Approve(end.Pending[0].Call.CallID))
 	if end.Reason != ReasonAborted || len(end.Pending) != 1 || end.Pending[0].Reason != PendingUndispatched || len(k.keys) != 0 {
 		t.Errorf("end = %+v, pending %+v, ran %d", end, end.Pending, len(k.keys))
+	}
+}
+
+// TestSetTranscriptKeepsWhatTheAgentKnew checks that a held call stays
+// held across SetTranscript, so it is approved as a held call rather
+// than refused as one that may have run, and that SetPending tells a
+// live agent what a record knows of a call it did not.
+func TestSetTranscriptKeepsWhatTheAgentKnew(t *testing.T) {
+	k := &keyedTool{}
+	cfg := Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{k.tool(agenttool.ReplayUnknown)},
+		BeforeToolCall: func(context.Context, ToolCallInfo) (*ToolDecision, error) {
+			return &ToolDecision{Action: Defer}, nil
+		}}
+	a := New(cfg)
+	end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if end.Reason != ReasonInputRequired || len(end.Pending) != 1 {
+		t.Fatalf("end = %+v", end)
+	}
+	if err := a.SetTranscript(a.State().Transcript); err != nil {
+		t.Fatal(err)
+	}
+	if p := a.State().Pending; len(p) != 1 || p[0].Reason != PendingDeferred {
+		t.Fatalf("pending after SetTranscript = %+v", p)
+	}
+	if _, err := a.Resume(context.Background(), Approve(end.Pending[0].Call.CallID)); err != nil || len(k.keys) != 1 {
+		t.Fatalf("resume: err=%v ran %d", err, len(k.keys))
+	}
+
+	// A fresh agent learns it from the record, as after a rebase.
+	b := New(cfg)
+	if err := b.SetTranscript(Transcript{openresponses.UserText("go"), end.Pending[0].Call}); err != nil {
+		t.Fatal(err)
+	}
+	id := end.Pending[0].Call.CallID
+	if _, err := b.Resume(context.Background(), Approve(id)); !errors.Is(err, ErrAmbiguousCall) {
+		t.Fatalf("unseeded: err = %v", err)
+	}
+	if err := b.SetPending([]PendingCall{{Call: end.Pending[0].Call, Reason: PendingDeferred}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Resume(context.Background(), Approve(id)); err != nil || len(k.keys) != 2 {
+		t.Fatalf("seeded: err=%v ran %d", err, len(k.keys))
+	}
+}
+
+// TestSameArgs checks the comparison a keyed approval's arguments get:
+// by JSON value, with numbers as written.
+func TestSameArgs(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{`{"a":1,"b":"x"}`, `{ "b": "x", "a": 1 }`, true},
+		{`{"a":1}`, `{"a":2}`, false},
+		{`{"n":9007199254740993}`, `{"n":9007199254740992}`, false},
+	}
+	for _, tc := range cases {
+		if got := sameArgs(json.RawMessage(tc.a), json.RawMessage(tc.b)); got != tc.want {
+			t.Errorf("sameArgs(%s, %s) = %v", tc.a, tc.b, got)
+		}
 	}
 }

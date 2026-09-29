@@ -122,7 +122,7 @@ versions may break the API.
   known, and otherwise returns `ErrAmbiguousCall` and runs nothing. A
   tool without `WithReplay`, which reads as `ReplayUnknown`, can no
   longer be approved after an abort cut it mid-call, nor after a
-  restart or a `SetTranscript` that seeds its call as unknown; answer
+  restart that seeds its call as unknown; answer
   it with `agentturn.OutcomeUnknown`, or approve it with
   `Answer.WithRunAgain`, the only way past the rule, whose proceed
   carries `agentturn.RunAgainReason`. A keyed call approved with other
@@ -134,7 +134,10 @@ versions may break the API.
   since it did not run, a deferred call approved and cut so included,
   and one that may have run keeps its reason, key and arguments rather
   than reading `PendingUnknown`. `agentturn.WithPending` seeds an agent
-  with what a record says of its pending calls; `session.AgentOptions`
+  with what a record says of its pending calls, and `Agent.SetPending`
+  a live one after `SetTranscript`, which now keeps what the agent knew
+  of a call pending in both transcripts, so a held call stays held
+  across a rebase; `session.AgentOptions`
   gives it and the context's items for a stored session in one call,
   `session.Pending` reads the calls, and `session.ReplayAnswers`
   returns the rule's answer for each call pending at the leaf that is

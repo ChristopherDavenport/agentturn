@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,7 @@ import (
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/openresponses"
+	"github.com/ChristopherDavenport/openresponses/echo"
 )
 
 // TestReplayAfterACrash pins #143, #144 and #145 on the record: a
@@ -259,4 +261,66 @@ func dispatched(key string) func(callID, target string) []agentsession.Entry {
 		}
 		return []agentsession.Entry{d}
 	}
+}
+
+// TestRebaseSeedsHeldCalls checks the flow Rebase documents: after a
+// rewind to a point where a call was held, the agent's new transcript
+// reads the call as unknown until SetPending says what the session
+// knows, and then the call is approved as the held call it is.
+func TestRebaseSeedsHeldCalls(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ran := 0
+	act := agenttool.New("act", "", func(context.Context, echoArgs) (string, error) {
+		ran++
+		return "done", nil
+	})
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{act},
+		BeforeToolCall: func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+			return &agentturn.ToolDecision{Action: agentturn.Defer}, nil
+		}})
+	defer rec.Attach(a)()
+	end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if err != nil || end.Reason != agentturn.ReasonInputRequired {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	heldAt := s.Leaf()
+	id := end.Pending[0].Call.CallID
+	if _, err := a.Resume(context.Background(), agentturn.Output(openresponses.NewFunctionCallOutput(id, "declined"))); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := rec.Rebase(s, heldAt); err != nil {
+		t.Fatal(err)
+	}
+	cx, err := s.Context()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SetTranscript(cx.Items); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Resume(context.Background(), agentturn.Approve(id)); !errors.Is(err, agentturn.ErrAmbiguousCall) {
+		t.Fatalf("before SetPending: err = %v", err)
+	}
+	pending, err := Pending(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SetPending(pending); err != nil {
+		t.Fatal(err)
+	}
+	if p := a.State().Pending; len(p) != 1 || p[0].Reason != agentturn.PendingDeferred {
+		t.Fatalf("pending = %+v", p)
+	}
+	if _, err := a.Resume(context.Background(), agentturn.Approve(id).WithBy(agentsession.ByHuman)); err != nil || ran != 1 {
+		t.Fatalf("resume: err=%v ran %d", err, ran)
+	}
+	if c := callsOf(t, s)["act"]; c == nil || c.Dispatch == nil || c.Output == nil || c.Rejected() {
+		t.Errorf("call = %+v", c)
+	}
+	verifyAll(t, s)
 }

@@ -1081,7 +1081,10 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 // calls of the branch it continues rather than the one it left. It
 // refuses with [ErrRunActive] while a run is being written, and s must
 // be the session the recorder writes. The agent's transcript is the
-// caller's to set, with Agent.SetTranscript from s.Context().Items.
+// caller's to set, with Agent.SetTranscript from s.Context().Items and
+// then Agent.SetPending from [Pending], so a call held on the branch
+// is approved as a held call and one that may have run is held to the
+// replay rule.
 //
 // A rebase appends nothing of its own, with two exceptions the format
 // asks of the writer that continues a path. An entry inside a run, a

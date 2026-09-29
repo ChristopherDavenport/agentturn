@@ -124,14 +124,15 @@ func WithTranscript(t Transcript) Option {
 // an output are pending, and with what key they were handed to their
 // tools, from a record that knows more than the transcript does: a
 // session's dispatch entries tell a call that never started from one
-// that may have run. Each is matched to a pending call by its call ID;
-// one that matches none is ignored, and a pending call it does not
-// list stays [PendingUnknown]. A call it lists as never started, or as
-// deferred, is approved without the replay rule [Agent.Resume] applies
-// to the others. It applies to the transcript [WithTranscript] gives,
-// whichever option comes first, and not to one [Agent.SetTranscript]
-// sets later, whose pending calls read [PendingUnknown]. The session
-// package's AgentOptions gives both options for a stored session.
+// that may have run. Each is matched to a pending call by its call ID,
+// with the same name and arguments; one that matches none is ignored,
+// and a pending call it does not list stays [PendingUnknown]. A call
+// it lists as never started, or as deferred, is approved without the
+// replay rule [Agent.Resume] applies to the others. It applies to the
+// transcript [WithTranscript] gives, whichever option comes first; for
+// one [Agent.SetTranscript] sets later, [Agent.SetPending] does the
+// same. The session package's AgentOptions gives both options for a
+// stored session.
 func WithPending(pending []PendingCall) Option {
 	return func(a *Agent) {
 		a.seeded = append([]PendingCall(nil), pending...)
@@ -148,21 +149,29 @@ func New(cfg Config, opts ...Option) *Agent {
 	return a
 }
 
-// seedPending applies what WithPending gave to the pending calls,
-// keeping the transcript's own call items.
+// seedPending applies what WithPending gave to the pending calls.
 func (a *Agent) seedPending() {
-	byID := make(map[string]PendingCall, len(a.seeded))
-	for _, p := range a.seeded {
+	mergePending(a.pending, a.seeded)
+	a.seeded = nil
+}
+
+// mergePending replaces each of pending with what known says of the
+// same call, matched by call ID and, where known has the call, its name
+// and arguments, keeping the transcript's own call item.
+func mergePending(pending, known []PendingCall) {
+	byID := make(map[string]PendingCall, len(known))
+	for _, p := range known {
 		if p.Call != nil {
 			byID[p.Call.CallID] = p
 		}
 	}
-	a.seeded = nil
-	for i, p := range a.pending {
-		if q, ok := byID[p.Call.CallID]; ok {
-			q.Call = p.Call
-			a.pending[i] = q
+	for i, p := range pending {
+		q, ok := byID[p.Call.CallID]
+		if !ok || q.Call.Name != p.Call.Name || q.Call.Arguments != p.Call.Arguments {
+			continue
 		}
+		q.Call = p.Call
+		pending[i] = q
 	}
 }
 
@@ -202,20 +211,44 @@ func (a *Agent) SetConfig(cfg Config) error {
 // previous model wrote included, whose signatures another provider
 // refuses; a handoff to another provider drops them here.
 // The pending calls are derived from the new transcript as
-// [WithTranscript] derives them, as [PendingUnknown], so an approval
-// of one is held to the replay rule as for any call that may have run,
-// and whatever the old transcript was waiting on is forgotten and whatever the new one is waiting on must
-// be answered through [Agent.Resume]. Queued Steer and FollowUp items
-// are kept and go to the next run on the new transcript; a host that
-// does not want them there reads them from [Agent.State] first.
+// [WithTranscript] derives them, except that a call the agent already
+// had pending, the same call under the same ID, keeps its reason, key
+// and arguments: a held call stays held. Any other is [PendingUnknown],
+// so an approval of it is held to the replay rule as for any call that
+// may have run, until [Agent.SetPending] says what a record knows of
+// it. Whatever the old transcript was waiting on and the new one does
+// not hold is forgotten, and whatever the new one is waiting on must be
+// answered through [Agent.Resume]. Queued Steer and FollowUp items are
+// kept and go to the next run on the new transcript; a host that does
+// not want them there reads them from [Agent.State] first.
 func (a *Agent) SetTranscript(t Transcript) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.running {
 		return ErrRunning
 	}
+	known := a.pending
 	a.transcript = append(Transcript(nil), t...)
 	a.pending = pendingCalls(unansweredCalls(a.transcript), PendingUnknown)
+	mergePending(a.pending, known)
+	return nil
+}
+
+// SetPending says why the calls the transcript leaves without an output
+// are pending, and with what key and arguments they were handed to
+// their tools, as [WithPending] does for a new agent: after
+// [Agent.SetTranscript] to a branch of a session, with what the
+// session package's Pending reads there. Each is matched to a pending
+// call by its call ID, with the same name and arguments, and ignored
+// when it matches none. It returns
+// [ErrRunning] while a run is active.
+func (a *Agent) SetPending(pending []PendingCall) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		return ErrRunning
+	}
+	mergePending(a.pending, pending)
 	return nil
 }
 
@@ -544,7 +577,7 @@ func mayRunAgain(ctx context.Context, cfg Config, p PendingCall, ans Answer, arg
 		switch {
 		case key == "":
 			return fmt.Errorf("%w: %q is keyed and the key it first ran with is not known", ErrAmbiguousCall, call.CallID)
-		case ans.IdempotencyKey == "" && !sameArgs(args, orEmpty(p.Args, call.Arguments)):
+		case (ans.IdempotencyKey == "" || ans.IdempotencyKey == p.IdempotencyKey) && !sameArgs(args, orEmpty(p.Args, call.Arguments)):
 			return fmt.Errorf("%w: %q is keyed and would run again with other arguments under its first key", ErrAmbiguousCall, call.CallID)
 		}
 		return nil
@@ -567,11 +600,22 @@ func orEmpty(args json.RawMessage, own string) json.RawMessage {
 // sameArgs reports whether two argument objects are the same JSON
 // value, whatever their spelling.
 func sameArgs(a, b json.RawMessage) bool {
-	var x, y any
-	if json.Unmarshal(a, &x) != nil || json.Unmarshal(b, &y) != nil {
+	x, errX := decodeNumbers(a)
+	y, errY := decodeNumbers(b)
+	if errX != nil || errY != nil {
 		return bytes.Equal(a, b)
 	}
 	return reflect.DeepEqual(x, y)
+}
+
+// decodeNumbers decodes raw keeping numbers as written, so two integers
+// past float64's precision are not taken for the same one.
+func decodeNumbers(raw json.RawMessage) (any, error) {
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.UseNumber()
+	var v any
+	err := d.Decode(&v)
+	return v, err
 }
 
 // answersPending checks the outputs that open a prompt against the

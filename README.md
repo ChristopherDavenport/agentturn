@@ -191,6 +191,17 @@ answers, _ := session.ReplayAnswers(ctx, s, cfg.ResolveTools(ctx)) // plus the h
 end, err := a.Resume(ctx, answers...)
 ```
 
+A live agent moved to another branch of the session keeps what it
+knew of a call pending in both, and learns the rest from the record:
+
+```go
+_ = rec.Rebase(s, entryID)
+cx, _ := s.Context()
+_ = a.SetTranscript(cx.Items)
+pending, _ := session.Pending(s)
+_ = a.SetPending(pending)
+```
+
 A front whose user has moved on answers them on the way to the
 next message instead: a `Prompt` that opens with an output for each
 pending call is accepted, and the model sees the outputs and the

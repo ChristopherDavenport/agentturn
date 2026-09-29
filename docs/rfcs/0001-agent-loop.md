@@ -717,8 +717,11 @@ the agent refuses to run until they are answered. A host SHOULD seed it
 as well with what a record says of them, the reason, the key and the
 arguments, so only a call that may have run is held to the replay rule
 and one that never started is approved as it is. Replacing the
-transcript re-derives them the same way, as `unknown`: whatever the old
-transcript was waiting on is forgotten.
+transcript re-derives them the same way, except that a call the agent
+already had pending keeps what it knew of it, so a held call stays
+held; the host seeds the rest again from the record. Whatever the old
+transcript was waiting on and the new one does not hold is
+forgotten.
 
 A host resuming a stored session gets the replay rule's answers from
 the record through the recorder's library: a held call is the caller's; one that never
@@ -1205,7 +1208,7 @@ maps onto it as follows:
 | turn limit | `Config.MaxTurns` |
 | retry policy | `Config.Retry{MaxAttempts, Backoff, Retryable, Revise}`; `DefaultBackoff`, `DefaultRetryable` |
 | low-level loop | `Run(ctx, t, prompts, cfg)`, `Continue(ctx, t, cfg)` → `iter.Seq[Event]`; `EventBuffer`; `CanContinue` |
-| agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`, `WithPending`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `State`, `SetConfig`, `SetTranscript`, `Config` |
+| agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`, `WithPending`, `SetPending`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `State`, `SetConfig`, `SetTranscript`, `Config` |
 | refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning`, `ErrAmbiguousCall` |
 | run ID, trigger, transcript on the context | `ContextWithRunID`/`RunIDFromContext`, `ContextWithTrigger`/`TriggerFromContext`, `ContextWithTranscript`/`TranscriptFromContext` |
 | run context, steer signal | `RunContext(ctx)`, `Steered(ctx)` |
