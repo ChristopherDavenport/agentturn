@@ -601,7 +601,9 @@ func (e *Executor) checkDeclared(ctx context.Context, declared []*openresponses.
 // agent's own hook runs first and its block or rewrite is respected.
 // A tool of cfg's own wins over a caller-owned one of the same name,
 // which is then neither offered nor deferred: a receiver of a handoff
-// may hold a name a message declared.
+// may hold a name a message declared. A nested call to a caller-owned
+// tool, one a tool made with agentturn.Invoke, is blocked, since the
+// caller can answer only the calls the model made.
 func (e *Executor) runConfig(cfg agentturn.Config, caller []*openresponses.FunctionTool) agentturn.Config {
 	if len(caller) == 0 {
 		return cfg
@@ -641,6 +643,11 @@ func (e *Executor) runConfig(cfg agentturn.Config, caller []*openresponses.Funct
 		if decision == nil {
 			decision = &agentturn.ToolDecision{}
 		}
+		if nested(ctx, info.Call) {
+			decision.Action = agentturn.Block
+			decision.Reason = fmt.Sprintf("tool %q is owned by the caller, which answers only the calls the model makes", info.Call.Name)
+			return decision, nil
+		}
 		decision.Action = agentturn.Defer
 		return decision, nil
 	}
@@ -659,6 +666,22 @@ func (c *callerTool) Strict() bool                { return c.ft.Strict != nil &&
 
 func (c *callerTool) Execute(context.Context, agenttool.Call) (agenttool.Result, error) {
 	return agenttool.Result{}, fmt.Errorf("tool %q is owned by the caller and cannot run here", c.ft.Name)
+}
+
+// nested reports whether call is a nested one, made by a tool with
+// agentturn.Invoke: the hook's context holds the conversation that
+// produced the batch, and a nested call is not in it.
+func nested(ctx context.Context, call *openresponses.FunctionCall) bool {
+	t, ok := agentturn.TranscriptFromContext(ctx)
+	if !ok {
+		return false
+	}
+	for _, item := range t {
+		if fc, ok := item.(*openresponses.FunctionCall); ok && fc.CallID == call.CallID {
+			return false
+		}
+	}
+	return true
 }
 
 // answeredCalls returns the IDs of the calls in items that have an

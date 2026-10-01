@@ -42,7 +42,10 @@ versions may break the API.
   `human`. Without an elicitor, or on a cancel or a failure to ask, the
   call is refused as before. The session recorder writes a nested call
   allowed with a reason as `proceed`, as it does a model's call, so an
-  approval is on the record with who gave it (#200).
+  approval is on the record with who gave it. Under `front/a2a` a
+  nested call to a caller-owned tool is blocked with a reason rather
+  than deferred, since the caller answers only the model's calls, so
+  no elicitor is asked to run a tool that cannot run there (#200).
 - **The next call of a chain is dispatched only once `AfterToolCall`
   has settled the one before it.** The executor started a serial
   batch's next call, or the next call on the same resource, as soon as

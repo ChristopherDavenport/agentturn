@@ -67,10 +67,11 @@
 // agent's to make, and one is refused as invalid params. Nor may it
 // declare a tool named as one the agent offers, or one the route
 // [WithTransfers] gives takes for a handoff, whose calls the caller
-// would answer in the agent's place. The transcript in the
-// [ConversationStore] holds the unanswered calls in the meantime, which
-// is the invariant the root package documents for an input-required
-// boundary. A2A's
+// would answer in the agent's place. A nested call a tool makes to a
+// caller-owned tool is blocked: the caller answers only the calls the
+// model made. The transcript in the [ConversationStore] holds the
+// unanswered calls in the meantime, which is the invariant the root
+// package documents for an input-required boundary. A2A's
 // input-required state and agentturn's ReasonInputRequired are the
 // same thing seen from the two sides.
 //

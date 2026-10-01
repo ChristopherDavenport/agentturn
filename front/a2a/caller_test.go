@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/ChristopherDavenport/agenttool"
@@ -125,5 +126,34 @@ func TestReceiverToolWinsOverDeclared(t *testing.T) {
 	task := sendTask(t, h, declaring("remote", "I was double charged"))
 	if task.Status.State != a2a.TaskStateCompleted || ran != 1 {
 		t.Errorf("task = %s %q, billing's tool ran %d times; want completed with it run once", task.Status.State, taskText(task), ran)
+	}
+}
+
+// TestNestedCallToCallerToolBlocked pins #200 under front/a2a: a call a
+// tool makes with agentturn.Invoke to a caller-owned tool is blocked
+// with a reason, not deferred, so an elicitor is never asked to run a
+// tool that cannot run here.
+func TestNestedCallToCallerToolBlocked(t *testing.T) {
+	var asked []string
+	var got []string
+	invoker := agenttool.NewFunc("invoker", "invokes the caller's tool", json.RawMessage(`{"type":"object"}`),
+		func(ctx context.Context, _ agenttool.Call) (agenttool.Result, error) {
+			_, err := agentturn.Invoke(ctx, "remote", json.RawMessage(`{}`))
+			got = append(got, err.Error())
+			return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: "done"}}, nil
+		})
+	cfg := agentturn.Config{Model: callsOnce{"invoker"}, Tools: []agenttool.Tool{invoker}, ToolElicitor: func(_ context.Context, q agenttool.Elicitation) (agenttool.Answer, error) {
+		asked = append(asked, q.Message)
+		return agenttool.Answer{Action: agenttool.ActionAccept}, nil
+	}}
+	task := sendTask(t, a2asrv.NewHandler(New(cfg)), declaring("remote", "go"))
+	if task.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("task = %s %q", task.Status.State, taskText(task))
+	}
+	if len(asked) != 0 {
+		t.Errorf("elicitor asked %v, want nothing", asked)
+	}
+	if len(got) != 1 || !strings.Contains(got[0], `tool "remote" is owned by the caller`) {
+		t.Errorf("nested call errors = %v", got)
 	}
 }
