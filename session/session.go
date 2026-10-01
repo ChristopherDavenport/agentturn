@@ -1604,6 +1604,12 @@ func (r *Recorder) Annotate(ctx context.Context, ns string, data any) (string, e
 // parent's. Without [WithEnv], or for a nil entry, it writes nothing;
 // an error from the function or the store is returned, and the run
 // goes on unless the caller fails it.
+//
+// An env entry applies to the dispatches written after it, not to one
+// before. An entry written from AfterToolCall lands after the dispatch
+// of the call that hook ran for, so that call stays under the earlier
+// env, and the move applies from the next dispatch on. So does one a
+// tool writes, since the tool's own dispatch is written before it runs.
 func (r *Recorder) Env(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

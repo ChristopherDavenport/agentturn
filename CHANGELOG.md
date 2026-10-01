@@ -150,7 +150,9 @@ versions may break the API.
   now and writes an env entry when it differs from the one in force, as
   a run's start does; a hook or a tool calls it between calls, and the
   entry lands in the session of the run on the context, as
-  `Annotate`'s does (#187).
+  `Annotate`'s does. The entry applies to the dispatches after it: one
+  written from `AfterToolCall` lands after the dispatch of the call
+  the hook ran for, which stays under the earlier env (#187).
 
 ## v0.0.12 - 2026-09-29
 

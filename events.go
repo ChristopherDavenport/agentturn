@@ -218,9 +218,12 @@ func (*ModelBlocked) EventType() string { return EventModelBlocked }
 // ItemStart announces an item entering the transcript: a prompt or
 // queued message, an assistant item as the stream opens it, or a
 // function call output. For an assistant item the Item is the live
-// accumulated value and fills in as updates arrive, but for a function
-// call the loop gave an ID of its own (see [ItemEnd]), which is a copy
-// carrying that ID; its ItemUpdate events carry the same ID.
+// accumulated value and fills in as updates arrive. A function call the
+// loop gave an ID of its own (see [ItemEnd]) is the exception: its Item
+// is a copy carrying that ID, taken as the call opened, not the live
+// accumulator, so it does not fill in; each of its ItemUpdate events
+// carries a fresh copy with the same ID, and its ItemEnd the completed
+// call.
 //
 // An item the model completes before its attempt commits, a reasoning
 // summary before the first token, is announced here and reaches the
