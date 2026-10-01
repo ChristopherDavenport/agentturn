@@ -770,11 +770,14 @@ func envNodes(entries []agentsession.Entry) string {
 	return strings.Join(nodes, ",")
 }
 
-// TestEnvInAChild pins the review of #187: Env made with the context
-// of a child session whose run has ended is filed in that session, at
-// its leaf, as Annotate's entry is, compared with the env in force
-// there; and a grandchild compares with the env in force in its
-// parent, the child, not with the recorder's own session's.
+// TestEnvInAChild pins the review of #187 and #197: a child's first
+// run start writes the env in force in its parent at that moment, right
+// after the run's start, so the child's file names the workspace it ran
+// in; Env made with the context of a child session whose run has ended
+// is filed in that session, at its leaf, as Annotate's entry is,
+// compared with the child's own env, not with its parent's, which may
+// have moved since; and a grandchild starts under its parent's, the
+// child's, not under the recorder's own session's.
 func TestEnvInAChild(t *testing.T) {
 	ctx := context.Background()
 	node := "node-1"
@@ -814,7 +817,7 @@ func TestEnvInAChild(t *testing.T) {
 		}
 		childID := childOf(t, store, s).ID()
 		jobCtx := ContextWithSessionID(ctx, childID)
-		// Unmoved, the child is under its parent's env.
+		// Unmoved, the child is under its own env, its parent's at its start.
 		if err := rec.Env(jobCtx); err != nil {
 			t.Fatal(err)
 		}
@@ -825,8 +828,11 @@ func TestEnvInAChild(t *testing.T) {
 			}
 		}
 		child := childOf(t, store, s)
-		if got := envNodes(child.Entries()); got != "node-2" {
-			t.Errorf("child env entries = %q, want node-2", got)
+		if got := envNodes(child.Entries()); got != "node-1,node-2" {
+			t.Errorf("child env entries = %q, want node-1,node-2", got)
+		}
+		if first := child.Entries()[1]; !isEnv(first) {
+			t.Errorf("the child's run start is followed by %s, want its env", first.EntryType())
 		}
 		if leaf, _ := child.Entry(child.Leaf()); !isEnv(leaf) {
 			t.Errorf("the child's env is not at its leaf")
@@ -870,15 +876,49 @@ func TestEnvInAChild(t *testing.T) {
 		}
 		child := childOf(t, store, s)
 		grandchild := childOf(t, store, child)
-		if got := envNodes(child.Entries()); got != "node-2" {
-			t.Errorf("child env entries = %q, want node-2", got)
+		if got := envNodes(child.Entries()); got != "node-1,node-2" {
+			t.Errorf("child env entries = %q, want node-1,node-2", got)
 		}
-		if got := envNodes(grandchild.Entries()); got != "" {
-			t.Errorf("grandchild env entries = %q, want none: it is under its parent's", got)
+		if got := envNodes(grandchild.Entries()); got != "node-2" {
+			t.Errorf("grandchild env entries = %q, want node-2: it starts under its parent's", got)
 		}
 		verifyAll(t, s)
 		verifyAll(t, child)
 		verifyAll(t, grandchild)
+	})
+
+	t.Run("a job after its parent moved", func(t *testing.T) {
+		node = "node-1"
+		store := agentsession.NewMemoryStore()
+		rec, s, err := Start(ctx, store, agentsession.Header{}, WithEnv(env))
+		if err != nil {
+			t.Fatal(err)
+		}
+		childCfg := agentturn.Config{Name: "specialist", Description: "notes things", Model: &echo.Adapter{}}
+		specialist := agent.New(childCfg, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{specialist}})
+		defer rec.Attach(a)()
+		if _, err := a.Prompt(ctx, openresponses.UserText("delegate")); err != nil {
+			t.Fatal(err)
+		}
+		// The parent moves, and then the job the child started finds
+		// itself on the parent's node: it moved too.
+		node = "node-2"
+		if err := rec.Env(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := rec.Env(ContextWithSessionID(ctx, childOf(t, store, s).ID())); err != nil {
+			t.Fatal(err)
+		}
+		child := childOf(t, store, s)
+		if got := envNodes(child.Entries()); got != "node-1,node-2" {
+			t.Errorf("child env entries = %q, want node-1,node-2", got)
+		}
+		if got := envNodes(s.Entries()); got != "node-1,node-2" {
+			t.Errorf("root env entries = %q, want node-1,node-2", got)
+		}
+		verifyAll(t, s)
+		verifyAll(t, child)
 	})
 }
 

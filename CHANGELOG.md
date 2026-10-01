@@ -175,6 +175,17 @@ versions may break the API.
   origin through its own store when that store is an
   `agentsession.Reader`, so a held call dispatched there is ended by an
   `answer`. (#192)
+- **A child session names the workspace it starts in.** With
+  `session.WithEnv`, a child's first run start writes, when the child's
+  session holds no env entry, a copy of the env in force in its
+  parent's at that moment. Before, a child got an env entry only from
+  `Recorder.Env` when its workspace moved, so its move was the first
+  env entry of its file, which no reader takes for a substitution, and
+  a job that outlived the child was compared with its parent's env as
+  it is now, so after the parent moved it wrote nothing. RFC 0001 does
+  not inherit an environment through `parent_session`. `Recorder.Env`
+  now compares with the child's own entry. It costs one entry per child
+  session. (#197)
 
 ## v0.0.14 - 2026-10-01
 
