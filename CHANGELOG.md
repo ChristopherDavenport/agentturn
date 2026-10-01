@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.13 - 2026-10-01
 
 - **Requires `agentsession` v0.0.18, up from v0.0.15, and `agenttool`
   v0.0.12, up from v0.0.11. The session recorder writes
