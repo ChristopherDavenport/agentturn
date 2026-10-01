@@ -90,6 +90,13 @@ versions may break the API.
   such response kept one ID and the session recorder failed the run.
   A call's ID is now taken by every call of the attempt, held or not
   (#183).
+- **The recorder compares settings by value.** A config delta is
+  written when the settings a run sends differ from those in force as
+  JSON values, where it compared their encoded bytes: a `cas` store,
+  which keeps a body's canonical bytes, hands a tool's `parameters`
+  back with their keys sorted, so a recorder resumed from one wrote
+  `tools_added` with every tool on its first run in each process. The
+  extra members compare the same way (#176).
 
 ## v0.0.12 - 2026-09-29
 

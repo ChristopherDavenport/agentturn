@@ -367,6 +367,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"sync"
 	"time"
@@ -3464,7 +3465,7 @@ func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntr
 		d.Text = &tc
 	}
 	for k, v := range next.Extra {
-		if p, ok := prev.Extra[k]; !ok || string(p) != string(v) {
+		if p, ok := prev.Extra[k]; !ok || !equalJSON(p, v) {
 			if err := d.SetExtra(k, v); err != nil {
 				// v is raw JSON that already decoded once; it cannot fail
 				// to re-encode, so a full replace is the safe fallback.
@@ -3536,8 +3537,26 @@ func jsonLen(v any) int {
 	return len(data)
 }
 
+// equalJSON reports whether a and b encode to the same JSON value. It
+// compares values, not bytes: an object's members match by name in any
+// order, so a tool whose raw parameters a store hands back with their
+// keys sorted, as a content-addressed one does, is the tool the loop
+// sent.
 func equalJSON(a, b any) bool {
-	da, errA := json.Marshal(a)
-	db, errB := json.Marshal(b)
-	return errA == nil && errB == nil && string(da) == string(db)
+	va, okA := jsonValue(a)
+	vb, okB := jsonValue(b)
+	return okA && okB && reflect.DeepEqual(va, vb)
+}
+
+// jsonValue is v encoded and decoded again as a generic JSON value.
+func jsonValue(v any) (any, bool) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil, false
+	}
+	var out any
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, false
+	}
+	return out, true
 }
