@@ -363,11 +363,15 @@ func itemTypes(items openresponses.Items) []string {
 
 // NewLocal builds a Transform that folds by asking model for a summary
 // with an ordinary call: the items to fold, then the summary prompt as
-// a user message, with no tools. The result is one message carrying
-// the summary (see [WithSummaryItem]). It works against any server,
-// including those that answer 404 to the compaction endpoint. The
-// model is named by [WithModel]; leave it empty to let the server
-// pick its default. [WithRequest] edits the rest of the request.
+// a user message, with no tools. The reasoning items among the items
+// to fold are left out of the request: their content is encrypted for
+// the model that produced them, which a summariser cannot read, and a
+// provider refuses one another model produced. The result is one
+// message carrying the summary (see [WithSummaryItem]). It works
+// against any server, including those that answer 404 to the
+// compaction endpoint. The model is named by [WithModel]; leave it
+// empty to let the server pick its default. [WithRequest] edits the
+// rest of the request.
 //
 // The summary request's MaxOutputTokens is half the budget, at most
 // [DefaultSummaryMaxOutputTokens], unless [WithRequest] sets it
@@ -470,7 +474,7 @@ func (t *Transform) summarize(ctx context.Context, model openresponses.Streamer,
 	store := false
 	req := openresponses.Request{
 		Model: t.model,
-		Input: append(append(openresponses.Items(nil), input...), openresponses.UserText(t.prompt)),
+		Input: append(withoutReasoning(input), openresponses.UserText(t.prompt)),
 		Store: &store,
 	}
 	if limit := min(t.budget/2, DefaultSummaryMaxOutputTokens); limit > 0 {
@@ -513,6 +517,20 @@ func (t *Transform) summarize(ctx context.Context, model openresponses.Streamer,
 	}
 	f.output, f.summary = openresponses.Items{item}, item
 	return f, nil
+}
+
+// withoutReasoning returns a copy of items without its reasoning
+// items. Their content is encrypted for the model that produced them,
+// so a summariser reads nothing in them, and a provider refuses one
+// another model produced, which the summary model often is.
+func withoutReasoning(items openresponses.Items) openresponses.Items {
+	out := make(openresponses.Items, 0, len(items)+1)
+	for _, item := range items {
+		if _, ok := item.(*openresponses.ReasoningItem); !ok {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func newTransform(opts []Option) *Transform {

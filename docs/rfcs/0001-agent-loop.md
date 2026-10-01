@@ -1287,10 +1287,13 @@ An agent stands in four places inside another system:
   reasoning item carries a signature its own provider issued; a
   handoff that changes the model MUST leave them out of the receiver's
   requests. The loop owns that rule (#91): it leaves out of each
-  request the reasoning items another model name produced, as the
-  request procedure says, so a configuration replaced between runs
+  turn's request the reasoning items another model name produced, as
+  the request procedure says, so a configuration replaced between runs
   needs nothing more, and the transcript and the record keep the
-  items. A front that rebuilds a conversation the loop has not seen,
+  items. The rule covers the loop's own requests; a transform that
+  calls a model of its own, as a local fold calls one for a summary,
+  owns what it sends, and the reference fold sends no reasoning item
+  at all, since a summariser cannot read one. A front that rebuilds a conversation the loop has not seen,
   from a store or from a caller's input, attributes its reasoning items
   by the handoffs the conversation took, those before the first to the
   configuration it started under and those after each to the
@@ -1535,7 +1538,7 @@ module and is listed in the changelog as one.
   switch per implementation. An interface both satisfy is proposed.
 - **The handoff** (#96). The fourth composition is the cheapest and
   the least documented. The loop now leaves another model's reasoning
-  items out of each request (#91); that omission, like every route
+  items out of each turn's request (#91); that omission, like every route
   that trims the history mid-path, costs the responses after it their
   request hash, which is the format's question (agentsession#56).
 - **A second execution under one call** (#87). A child tool builds a

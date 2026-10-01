@@ -1055,3 +1055,49 @@ func TestFoldOutputAndPinnedAreDisjoint(t *testing.T) {
 		}
 	}
 }
+
+// TestLocalSummaryLeavesOutReasoning pins #91 for the summary request:
+// the reasoning items among the items to fold are not sent, since a
+// summariser cannot read them and a provider refuses another model's,
+// whether they are the transcript's own or another model's.
+func TestLocalSummaryLeavesOutReasoning(t *testing.T) {
+	reasoning := func(sig string) *openresponses.ReasoningItem {
+		return &openresponses.ReasoningItem{Summary: openresponses.Contents{}, EncryptedContent: sig}
+	}
+	cases := []struct {
+		name  string
+		items agentturn.Transcript
+		want  int // items in the summary request, the prompt included
+	}{
+		{"none", agentturn.Transcript{openresponses.UserText("a"), openresponses.AssistantText("b"), openresponses.UserText("c")}, 3},
+		{"one", agentturn.Transcript{openresponses.UserText("a"), reasoning("sig:x"), openresponses.AssistantText("b"), openresponses.UserText("c")}, 3},
+		{"two models'", agentturn.Transcript{openresponses.UserText("a"), reasoning("sig:x"), openresponses.AssistantText("b"), reasoning("sig:y"), openresponses.AssistantText("d"), openresponses.UserText("c")}, 4},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &summarizer{reply: "Said things."}
+			var folds []Fold
+			tr := NewLocal(s, WithBudget(1), WithKeepLast(1), WithEstimator(count), WithMinFold(0),
+				WithOnFold(func(_ context.Context, f Fold) error { folds = append(folds, f); return nil }))
+			out, err := tr.Transform(context.Background(), tc.items)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(s.reqs) != 1 || len(folds) != 1 || folds[0].Err != nil {
+				t.Fatalf("summary calls = %d, folds = %+v", len(s.reqs), folds)
+			}
+			input := s.reqs[0].Input
+			for _, item := range input {
+				if _, ok := item.(*openresponses.ReasoningItem); ok {
+					t.Errorf("summary request carries reasoning %+v", item)
+				}
+			}
+			if len(input) != tc.want {
+				t.Errorf("summary request = %d items, want %d", len(input), tc.want)
+			}
+			if len(out) != 2 || out[1] != tc.items[len(tc.items)-1] {
+				t.Errorf("out = %v", out)
+			}
+		})
+	}
+}
