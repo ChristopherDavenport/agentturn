@@ -151,6 +151,15 @@ versions may break the API.
   recorder now reads a call with no dispatch on its path and one
   elsewhere in the session as one that may have run, as `Pending` does,
   and RFC 0001 asks. (#193)
+- **After a rebase, `session.ReplayAnswers` answers a call that
+  completed on the branch left with the output it returned there.** A
+  call whose only dispatch is on that branch may have run, and was held
+  to its tool's replay rule, so a tool that could not say a second run
+  was safe was answered "outcome unknown" although the session held its
+  output, and a keyed one ran again. It is now answered with that
+  output, by policy, with the reason "ran on a branch the rebase left",
+  which the recorder writes behind an `answer`; a call cut there before
+  its output is held to the replay rule as before. (#195)
 
 ## v0.0.14 - 2026-10-01
 

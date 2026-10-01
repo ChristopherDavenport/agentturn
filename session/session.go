@@ -1050,6 +1050,28 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // items, so the agent's Resume knows which calls never started;
 // [AgentOptions] gives both.
 func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
+	pending, err := pendingCalls(s)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]agentturn.PendingCall, len(pending))
+	for i, p := range pending {
+		out[i] = p.PendingCall
+	}
+	return out, nil
+}
+
+// pendingCall is a call pending at the leaf as [Pending] reads it, with
+// the output it has on the branch of the dispatch Pending found off the
+// path, when it has one there: it ran there, and that is what it
+// returned.
+type pendingCall struct {
+	agentturn.PendingCall
+	ranOff *openresponses.FunctionCallOutput
+}
+
+// pendingCalls is [Pending] with the output each call has off the path.
+func pendingCalls(s *agentsession.Session) ([]pendingCall, error) {
 	if s.Leaf() == "" {
 		return nil, nil
 	}
@@ -1057,9 +1079,9 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 	if err != nil {
 		return nil, fmt.Errorf("session: pending calls at leaf: %w", err)
 	}
-	var out []agentturn.PendingCall
+	var out []pendingCall
 	for _, c := range calls {
-		p := agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingUnknown}
+		p := pendingCall{PendingCall: agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingUnknown}}
 		state := c.State(s.Header())
 		switch state {
 		case agentsession.CallHeld:
@@ -1079,9 +1101,11 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 		var off *agentsession.Call
 		if len(c.Dispatches) == 0 && (state == agentsession.CallHeld || state == agentsession.CallNeverStarted || state == agentsession.CallUnknown) {
 			if ds := s.Dispatches(c.Entry.ID); len(ds) > 0 {
-				if off, err = callAt(s, ds[len(ds)-1], c.Entry.ID); err != nil {
+				d := ds[len(ds)-1]
+				if off, err = callAt(s, d, c.Entry.ID); err != nil {
 					return nil, err
 				}
+				p.ranOff = outputAfter(s, d, c.Entry.ID)
 				if state == agentsession.CallHeld {
 					p.Dispatched = true
 				} else {
@@ -1109,6 +1133,28 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// outputAfter is the output of the call held by the entry callEntry
+// on a branch through its dispatch d, the last such the session holds,
+// or nil when no branch through d holds one.
+func outputAfter(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry string) *openresponses.FunctionCallOutput {
+	var out *openresponses.FunctionCallOutput
+	for _, e := range s.Entries() {
+		ie, ok := e.(*agentsession.ItemEntry)
+		if !ok {
+			continue
+		}
+		if o, ok := ie.Item.(*openresponses.FunctionCallOutput); !ok || o.CallID != d.CallID {
+			continue
+		}
+		for _, c := range agentsession.Calls(s.Path(ie.ID)) {
+			if c.Entry.ID == callEntry && c.Output == ie && slices.Contains(c.Dispatches, d) {
+				out = ie.Item.(*openresponses.FunctionCallOutput)
+			}
+		}
+	}
+	return out
 }
 
 // callAt is the call held by the entry callEntry as the path to the
@@ -1185,7 +1231,11 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // [agentturn.OutcomeUnknown] otherwise, including when no tool has its
 // name, with a reason saying which: "not run again: no tool", "not run
 // again: keyed without a key" or "not run again: replay unknown". A
-// recorder writes that answer as an answer decision before the
+// call that may have run because its only dispatch is on a branch a
+// rebase left, and that completed there, ran: it is answered with the
+// output that branch holds, with the reason "ran on a branch the
+// rebase left", and its tool is not asked. A
+// recorder writes either answer as an answer decision before the
 // output. A call an answer ended before its output was written gets
 // [agentturn.OutcomeUnknown] as that output, since the record holds
 // the answer and not the output it gave. A held call is waiting for
@@ -1199,7 +1249,7 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // pending call as one that may have run, and holds the approval of a
 // call that never started to the replay rule.
 func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agenttool.Tool) ([]agentturn.Answer, error) {
-	pending, err := Pending(s)
+	pending, err := pendingCalls(s)
 	if err != nil {
 		return nil, err
 	}
@@ -1222,12 +1272,23 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 			}
 			ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Output: openresponses.FunctionCallOutputData{Text: reason}})
 		default:
-			ans = replayAnswer(ctx, set, p)
+			if p.ranOff != nil {
+				// The call ran on the branch its dispatch is on, and the
+				// session holds what it returned: that is its outcome.
+				ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Status: p.ranOff.Status, Output: p.ranOff.Output}).WithReason(ranOffReason)
+				break
+			}
+			ans = replayAnswer(ctx, set, p.PendingCall)
 		}
 		out = append(out, ans.WithBy(agentsession.ByPolicy))
 	}
 	return out, nil
 }
+
+// ranOffReason is the reason of the answer [ReplayAnswers] gives a
+// call with no dispatch on the path that completed on the branch its
+// dispatch is on.
+const ranOffReason = "ran on a branch the rebase left"
 
 // refusal is the reason of the last reject decision the session's
 // path holds for the call.

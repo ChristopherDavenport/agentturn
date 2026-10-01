@@ -695,36 +695,52 @@ func TestRunAgainIsAlwaysDecided(t *testing.T) {
 	}
 }
 
-// TestRebaseBeforeADispatch pins #185: a rebase to the entry before a
-// call's dispatch leaves the call on the path with no dispatch, and its
-// dispatch, key and output on the branch it left. The call may have
-// run, so Pending reads it as aborted with that dispatch's key, and the
-// replay rule runs a keyed call again under the first key and answers
-// one whose replay is unknown with the outcome unknown. The record
-// says which: a proceed before the keyed call's second dispatch, and
-// an answer, which format 0.10 lets the dispatch on the other branch
-// stand behind, before the unknown one's output.
+// TestRebaseBeforeADispatch pins #185 and #195: a rebase to the entry
+// before a call's dispatch leaves the call on the path with no
+// dispatch, and its dispatch and key on the branch it left. The call
+// may have run, so Pending reads it as aborted with that dispatch's
+// key. When the branch left holds the call's output, the call ran and
+// the replay answers it with that output, whatever its tool's replay
+// rule. When a crash cut the call there before its output, the replay
+// rule runs a keyed call again under the first key and answers one
+// whose replay is unknown with the outcome unknown. The record says
+// which: a proceed before the keyed call's second dispatch, and an
+// answer, which format 0.10 lets the dispatch on the other branch
+// stand behind, before an output not run again.
 func TestRebaseBeforeADispatch(t *testing.T) {
 	cases := []struct {
 		name   string
 		replay agenttool.Replay
+		// cut has the process die while the tool runs, so the branch
+		// left holds the dispatch and no output.
+		cut bool
 		// runs is how many times the tool ran, each under the first key.
 		runs int
 		// verdict and reason are the decision the new path holds for the
-		// call. A call whose outcome is unknown is answered without
-		// running: an answer, not a reject, since it may have run.
-		verdict, reason string
+		// call, and output the output it ends with. A call whose
+		// outcome is unknown is answered without running: an answer,
+		// not a reject, since it may have run.
+		verdict, reason, output string
 	}{
-		{"keyed runs again under the first key", agenttool.ReplayKeyed, 2, agentsession.VerdictProceed, agentturn.RunAgainKeyedReason},
-		{"unknown is not run again", agenttool.ReplayUnknown, 1, agentsession.VerdictAnswer, "not run again: replay unknown"},
+		{"keyed, completed, answered with its output", agenttool.ReplayKeyed, false, 1, agentsession.VerdictAnswer, ranOffReason, "charged"},
+		{"unknown, completed, answered with its output", agenttool.ReplayUnknown, false, 1, agentsession.VerdictAnswer, ranOffReason, "charged"},
+		{"keyed, cut, runs again under the first key", agenttool.ReplayKeyed, true, 2, agentsession.VerdictProceed, agentturn.RunAgainKeyedReason, "charged"},
+		{"unknown, cut, is not run again", agenttool.ReplayUnknown, true, 1, agentsession.VerdictAnswer, "not run again: replay unknown", "Error: outcome unknown"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			var keys []string
+			var crash func()
 			charge := agenttool.New("charge", "", func(ctx context.Context, _ echoArgs) (string, error) {
 				call, _ := agenttool.CallFrom(ctx)
 				keys = append(keys, call.IdempotencyKey)
+				if crash != nil {
+					// The process dies once the dispatch is durable:
+					// nothing more of the run reaches the record.
+					crash()
+					crash = nil
+				}
 				return "charged", nil
 			}, agenttool.WithReplay(func(context.Context, json.RawMessage) agenttool.Replay { return tc.replay }))
 			tools := []agenttool.Tool{charge}
@@ -735,16 +751,24 @@ func TestRebaseBeforeADispatch(t *testing.T) {
 			}
 			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: tools})
 			unsub := rec.Attach(a)
+			if tc.cut {
+				crash = unsub
+			}
 			if end, err := a.Prompt(ctx, openresponses.UserText("go")); err != nil || end.Reason != agentturn.ReasonDone {
 				t.Fatalf("prompt: err=%v end=%+v", err, end)
 			}
 			unsub()
 			c := callsOf(t, s)["charge"]
-			if c == nil || c.Dispatch == nil || c.Output == nil || len(keys) != 1 || keys[0] == "" || c.Dispatch.IdempotencyKey != keys[0] {
+			if c == nil || c.Dispatch == nil || (c.Output == nil) != tc.cut || len(keys) != 1 || keys[0] == "" || c.Dispatch.IdempotencyKey != keys[0] {
 				t.Fatalf("call = %+v, keys %q", c, keys)
 			}
 			first := keys[0]
 
+			// A restart, then the rebase.
+			rec, s, err = Resume(ctx, store, s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
 			if err := rec.Rebase(s, c.Dispatch.Parent); err != nil {
 				t.Fatal(err)
 			}
@@ -777,8 +801,8 @@ func TestRebaseBeforeADispatch(t *testing.T) {
 				}
 			}
 			c = callsOf(t, s)["charge"]
-			if c == nil || c.Output == nil {
-				t.Fatalf("call on the new path = %+v", c)
+			if c == nil || c.Output == nil || !strings.HasPrefix(c.Output.Item.(*openresponses.FunctionCallOutput).Output.Text, tc.output) {
+				t.Fatalf("call on the new path = %+v, want output %q", c, tc.output)
 			}
 			if len(c.Decisions) != 1 || c.Decisions[0].Verdict != tc.verdict || !strings.HasPrefix(c.Decisions[0].Reason, tc.reason) {
 				for _, d := range c.Decisions {
