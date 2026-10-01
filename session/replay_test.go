@@ -1161,3 +1161,68 @@ func TestForkReadsItsOrigin(t *testing.T) {
 		})
 	}
 }
+
+// TestRanOffNeedsItsToolsOutput pins the review of #195: a call whose
+// only dispatch is on a branch a rebase left is answered with the
+// output that branch holds only when its tool wrote it. An output an
+// answer decision put there, an outcome unknown a host gave after a
+// crash, is not what the call returned, and the call is held to the
+// replay rule: a keyed one runs again under its key.
+func TestRanOffNeedsItsToolsOutput(t *testing.T) {
+	cases := []struct {
+		name string
+		// answered has an answer decision before the branch's output.
+		answered bool
+		// want is the output the answer carries, "" for an approval.
+		want string
+	}{
+		{name: "the tool's output", want: "charged"},
+		{name: "an answer's output", answered: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := agentsession.NewMemoryStore()
+			s, err := store.Create(ctx, agentsession.Header{Records: agentsession.AllRecords})
+			if err != nil {
+				t.Fatal(err)
+			}
+			call := &openresponses.FunctionCall{CallID: "call_1", Name: "charge", Arguments: `{"text":"t"}`}
+			target, err := store.Append(ctx, s.ID(), &agentsession.ItemEntry{Item: call})
+			if err != nil {
+				t.Fatal(err)
+			}
+			branch := []agentsession.Entry{agentsession.NewDispatch(call.CallID, target).WithIdempotencyKey("k1")}
+			out := "charged"
+			if tc.answered {
+				branch = append(branch, agentsession.NewDecision(call.CallID, target, agentsession.VerdictAnswer, agentsession.ByHuman))
+				out = "outcome unknown"
+			}
+			branch = append(branch, &agentsession.ItemEntry{Item: openresponses.NewFunctionCallOutput(call.CallID, out)})
+			for _, e := range branch {
+				if _, err := store.Append(ctx, s.ID(), e); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.Branch(target); err != nil {
+				t.Fatal(err)
+			}
+			keyed := agenttool.New("charge", "", func(context.Context, echoArgs) (string, error) { return "", nil },
+				agenttool.WithReplay(func(context.Context, json.RawMessage) agenttool.Replay { return agenttool.ReplayKeyed }))
+			answers, err := ReplayAnswers(ctx, s, []agenttool.Tool{keyed})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(answers) != 1 {
+				t.Fatalf("answers = %+v", answers)
+			}
+			got := ""
+			if o := answers[0].Output; o != nil {
+				got = o.Output.Text
+			}
+			if got != tc.want || tc.want == "" && answers[0].IdempotencyKey != "k1" {
+				t.Errorf("answer = %+v, want output %q or an approval under k1", answers[0], tc.want)
+			}
+		})
+	}
+}

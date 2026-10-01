@@ -1308,7 +1308,9 @@ func pendingCalls(ctx context.Context, s *agentsession.Session, opts []ReadOptio
 
 // outputAfter is the output of the call held by the entry callEntry
 // on a branch through its dispatch d, the last such the session holds,
-// or nil when no branch through d holds one.
+// or nil when no branch through d holds one. An output an answer
+// decision put there is not what the call returned but what someone
+// said of it, an outcome unknown among them, and is passed over.
 func outputAfter(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry string) *openresponses.FunctionCallOutput {
 	var out *openresponses.FunctionCallOutput
 	for _, e := range s.Entries() {
@@ -1320,7 +1322,7 @@ func outputAfter(s *agentsession.Session, d *agentsession.DispatchEntry, callEnt
 			continue
 		}
 		for _, c := range agentsession.Calls(s.Path(ie.ID)) {
-			if c.Entry.ID == callEntry && c.Output == ie && slices.Contains(c.Dispatches, d) {
+			if c.Entry.ID == callEntry && c.Output == ie && slices.Contains(c.Dispatches, d) && !c.Answered() {
 				out = ie.Item.(*openresponses.FunctionCallOutput)
 			}
 		}
@@ -1499,9 +1501,11 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // name, with a reason saying which: "not run again: no tool", "not run
 // again: keyed without a key" or "not run again: replay unknown". A
 // call that may have run because its only dispatch is on a branch a
-// rebase left, and that completed there, ran: it is answered with the
-// output that branch holds, with the reason "ran on a branch the
-// rebase left", and its tool is not asked; with [WithOrigins], so is a
+// rebase left, and that its tool completed there, ran: it is answered
+// with the output that branch holds, with the reason "ran on a branch
+// the rebase left", and its tool is not asked; an output an answer put
+// there, which says what someone made of the call rather than what it
+// returned, leaves the call to the rule above. With [WithOrigins], so is a
 // call in a fork's prefix that completed in the session the fork was
 // made from, with the reason "ran in the session this one forks". A
 // recorder writes either answer as an answer decision before the

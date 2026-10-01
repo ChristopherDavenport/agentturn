@@ -169,8 +169,10 @@ versions may break the API.
   was safe was answered "outcome unknown" although the session held its
   output, and a keyed one ran again. It is now answered with that
   output, by policy, with the reason "ran on a branch the rebase left",
-  which the recorder writes behind an `answer`; a call cut there before
-  its output is held to the replay rule as before. (#195)
+  which the recorder writes behind an `answer`. A call cut there before
+  its output is held to the replay rule as before, and so is one whose
+  output there an `answer` decision put, an outcome unknown a host gave,
+  which is not what the call returned. (#195)
 - **`session.WithOrigins` reads a fork's origin.** A fork made at a
   call holds the call in its prefix and its dispatch in the session it
   was made from, so `Pending` read the call as unknown with no key, and
