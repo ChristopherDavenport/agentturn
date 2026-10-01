@@ -222,8 +222,13 @@ versions may break the API.
   in `session.UnhashedNS` (`agentturn:unhashed`) whose data, a
   `session.Unhashed`, gives the reason and the first item at which the
   two inputs part, by index, type, ID and call ID, as sent and as
-  recorded. It writes another only when the cause changes or after a
-  response that carried a hash. No format change. (#92)
+  recorded. It writes another only when the cause changes, its reason
+  or the recorded item where the inputs part, or after a response that
+  carried a hash, so a transform that keeps a window of the transcript
+  writes one; a recorder seeded by `Resume` or `Rebase` takes up the
+  cause the path last named. A response whose stream never named it,
+  whose items then read as its input, gets one with a reason of its
+  own. No format change. (#92)
 
 ## v0.0.14 - 2026-10-01
 

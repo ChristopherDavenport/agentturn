@@ -535,12 +535,16 @@ func unhashedOf(t *testing.T, s *agentsession.Session) []Unhashed {
 // TestUnhashedSaysWhyOnce pins #92: a run of responses the recorder
 // leaves without a hash for one cause is preceded by one UnhashedNS
 // entry naming it, at the first; another is written when the cause
-// changes, or when hashing resumed and the input diverges again.
+// changes, or when hashing resumed and the input diverges again. A
+// window of the transcript is one cause though it sends another item
+// first at every turn, and a recorder resumed in a new process takes
+// up the cause the path last named.
 func TestUnhashedSaysWhyOnce(t *testing.T) {
 	const (
 		none   = ""
 		front  = "front"
 		behind = "behind"
+		window = "window"
 	)
 	cases := []struct {
 		name string
@@ -550,11 +554,17 @@ func TestUnhashedSaysWhyOnce(t *testing.T) {
 		// names, in order: an item added behind the transcript stands
 		// further on at every turn, and is the same cause.
 		want []int
+		// restart, when not zero, is the prompt before which the
+		// process restarts and resumes the session.
+		restart int
 	}{
 		{name: "one cause, once", modes: []string{none, front, front, front}, want: []int{0}},
 		{name: "hashing resumes, then diverges again", modes: []string{front, front, none, front}, want: []int{0, 0}},
 		{name: "the cause changes", modes: []string{front, behind, behind}, want: []int{0, 3}},
 		{name: "never diverges", modes: []string{none, none}},
+		{name: "a window", modes: []string{none, window, window, window}, want: []int{0}},
+		{name: "a restart keeps the cause", modes: []string{front, front, front}, want: []int{0}, restart: 2},
+		{name: "a restart after a hashed response", modes: []string{front, none, front}, want: []int{0, 0}, restart: 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -571,13 +581,31 @@ func TestUnhashedSaysWhyOnce(t *testing.T) {
 					return append(agentturn.Transcript{openresponses.DeveloperText("the time is now")}, t...), nil
 				case behind:
 					return append(append(agentturn.Transcript(nil), t...), openresponses.DeveloperText("the time is now")), nil
+				case window:
+					if len(t) > 2 {
+						return append(agentturn.Transcript(nil), t[len(t)-2:]...), nil
+					}
 				}
 				return t, nil
 			}
-			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Transform: transform})
-			defer rec.Attach(a)()
+			cfg := agentturn.Config{Model: &echo.Adapter{}, Transform: transform}
+			a := agentturn.New(cfg)
+			unsub := rec.Attach(a)
+			defer func() { unsub() }()
 			unhashed := 0
 			for i, m := range tc.modes {
+				if i > 0 && i == tc.restart {
+					unsub()
+					if rec, s, err = Resume(ctx, store, s.ID()); err != nil {
+						t.Fatal(err)
+					}
+					opts, err := AgentOptions(s)
+					if err != nil {
+						t.Fatal(err)
+					}
+					a = agentturn.New(cfg, opts...)
+					unsub = rec.Attach(a)
+				}
 				mode = m
 				if _, err := a.Prompt(ctx, openresponses.UserText(fmt.Sprint("prompt ", i))); err != nil {
 					t.Fatal(err)

@@ -595,9 +595,13 @@ const ModelCallIDMember = "agentturn:model_call_id"
 // model's reasoning out of the request. Its data is an [Unhashed]. It
 // is written before the first response entry left without a hash for
 // that cause, and again only when the cause changes, its reason or the
-// items it names, or after a response that carried a hash, so each response with no hash that
-// follows one has the cause it names. It never contributes an item,
-// and Session.Verify never reads it.
+// item the path rebuilds where the inputs part, or after a response
+// that carried a hash, so each response with no hash that follows one
+// has the cause it names; a recorder seeded from a path, by [Resume] or
+// [Recorder.Rebase], takes up the cause the path last named. A
+// response whose stream never named it, whose items then read as its
+// input, gets one too, with a reason of its own. It never contributes
+// an item, and Session.Verify never reads it.
 const UnhashedNS = "agentturn:unhashed"
 
 // Unhashed is the data of an [UnhashedNS] custom entry.
@@ -625,6 +629,10 @@ type UnhashedItem struct {
 // unhashedReason is the reason of an [Unhashed] for a request whose
 // input differs from the input the path rebuilds.
 const unhashedReason = "the request's input differs from the input the recorded path rebuilds"
+
+// unnamedReason is the reason of an [Unhashed] for a response whose
+// stream never named it, so its items read as its input.
+const unnamedReason = "the response named no ID, so the items it produced read as its input"
 
 // ResponseIDMember is the member of a custom entry, beside the item
 // that is its data, naming the response that produced the item: a
@@ -2232,10 +2240,24 @@ func (w *writer) seed(ctx context.Context, s *agentsession.Session, owed bool) e
 	w.base = lastConfigBase(s.Path(s.Leaf()))
 	// The env in force is the last on the path, one a compaction left
 	// out of the context included: an env entry contributes nothing to
-	// it, and still says where the calls after it ran.
+	// it, and still says where the calls after it ran. So is the cause
+	// the last unhashed entry named, until a response with a hash.
 	for _, e := range s.Path(s.Leaf()) {
-		if env, ok := e.(*agentsession.EnvEntry); ok {
-			w.env = env
+		switch v := e.(type) {
+		case *agentsession.EnvEntry:
+			w.env = v
+		case *agentsession.ResponseEntry:
+			if v.RequestHash != "" {
+				w.noted = nil
+			}
+		case *agentsession.CustomEntry:
+			if v.NS != UnhashedNS {
+				continue
+			}
+			var why Unhashed
+			if json.Unmarshal(v.Data, &why) == nil {
+				w.noted = &why
+			}
 		}
 	}
 	if owed {
@@ -3200,19 +3222,17 @@ func unhashedItem(item openresponses.Item) *UnhashedItem {
 // response about to be written has no hash, unless the last one written
 // names the same cause with no hashed response since. A response with
 // a hash, why nil, ends the run of that cause. The cause is the reason
-// and the items it names, not where they stand: a transform that adds
-// an item behind the transcript adds it further on at every turn.
+// and the item the path rebuilds where the inputs part, not where it
+// stands or what the request sent there: a transform that adds an item
+// behind the transcript adds it further on at every turn, and one that
+// keeps a window of it sends another item first at every turn.
 func (w *writer) noteUnhashed(ctx context.Context, why *Unhashed) error {
 	if why == nil {
 		w.noted = nil
 		return nil
 	}
-	if w.noted != nil {
-		was, now := *w.noted, *why
-		was.Index, now.Index = 0, 0
-		if equalJSON(was, now) {
-			return nil
-		}
+	if w.noted != nil && w.noted.Reason == why.Reason && equalJSON(w.noted.Recorded, why.Recorded) {
+		return nil
 	}
 	raw, err := json.Marshal(why)
 	if err != nil {
@@ -3814,6 +3834,9 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 		// path, so the items just written read as its input, and the
 		// record cannot rebuild its request.
 		entry.RequestHash = ""
+		if err := w.noteUnhashed(ctx, &Unhashed{Reason: unnamedReason}); err != nil {
+			return err
+		}
 	} else if err := w.noteUnhashed(ctx, w.unhashed); err != nil {
 		return err
 	}
@@ -3888,7 +3911,9 @@ func (w *writer) endInFlight(ctx context.Context, cause error) error {
 		// read as its input, and the record cannot rebuild its
 		// request.
 		hash = ""
-	} else if err := w.noteUnhashed(ctx, unhashed); err != nil {
+		unhashed = &Unhashed{Reason: unnamedReason}
+	}
+	if err := w.noteUnhashed(ctx, unhashed); err != nil {
 		return err
 	}
 	w.responses++
