@@ -301,11 +301,23 @@ func (*ItemEnd) EventType() string { return EventItemEnd }
 // soon as the stream ends and before any tool of the turn runs. Its
 // output items have all been delivered with item_end. A response that
 // failed is delivered here too, before the run ends with the error, so
-// a recorder can write it.
+// a recorder can write it, and so is one a [Config.OutputGuard]
+// withheld a message of, with Withheld set.
 type ResponseEnd struct {
 	RunID    string
 	Turn     int
 	Response *openresponses.Response
+	// Withheld says OutputGuard withheld a message of the response,
+	// which stops the run with [StopGuard]. Response is then the
+	// loop's account of it, not the server's: incomplete with
+	// content_filter, no error, the response ID and usage the stream
+	// gave, the usage of the whole response when its terminal event
+	// arrived, since the loop reads the rest of the stream for it, and
+	// as output the items the transcript took from it, without the
+	// withheld message or anything after it. No turn_end follows; the
+	// outputs closing its calls and the run_end do. A server's own
+	// content_filter response is not withheld.
+	Withheld bool
 }
 
 // EventType returns "response_end".
@@ -443,11 +455,17 @@ const (
 	// turn_start; from BeforeModelCall, the request it refused is on a
 	// model_blocked. From OutputGuard, the message it ruled on is not
 	// appended and has no item_end, though its deltas went out as
-	// item_update, and the turn has no response_end or turn_end. A
-	// function call the withheld response completed before the message
-	// is answered with a [WithheldCallOutput] output, with its item_end
+	// item_update; the turn's response_end has Withheld set and no
+	// turn_end follows, and RunEnd.Withheld is set. A function call the
+	// withheld response added to the transcript before the message is
+	// answered with a [WithheldCallOutput] output, with its item_end
 	// and no tool events, before the run ends, so RunEnd.Pending is
-	// empty and the next prompt goes ahead.
+	// empty and the next prompt goes ahead. A call is added once a
+	// message or a call of the response has opened with
+	// output_item.added; on a stream that sends output_item.done alone
+	// the calls before the message are still held when the guard
+	// rules, and are dropped with it, in no item_end and not in the
+	// transcript.
 	StopGuard StopCause = "guard"
 	// StopTerminate: every result of the batch set Terminate, so the
 	// tools answered on the model's behalf.
@@ -490,6 +508,12 @@ type RunEnd struct {
 	// and ReasonStopped. The transcript is a valid input again once
 	// each has an output, which Agent.Resume appends.
 	Pending []PendingCall
+	// Withheld says the run ended because [Config.OutputGuard]
+	// withheld a message, with Reason ReasonStopped and Cause
+	// StopGuard: the model's last word was kept from the transcript,
+	// so whatever message Items end with was said before it and is no
+	// answer, and Answer reports none.
+	Withheld bool
 }
 
 // EventType returns "run_end".
@@ -501,9 +525,11 @@ func (*RunEnd) EventType() string { return EventRunEnd }
 // the way: text before a call is a preamble, and a guard that refuses
 // the next turn leaves the preamble last among the messages but not
 // last among the items. A message that OutputGuard replaced is the
-// replacement, and an empty one is no answer.
+// replacement, and an empty one is no answer. A run whose message
+// OutputGuard withheld (Withheld) did not answer either, though a
+// message the same response spoke before it may end Items.
 func (e *RunEnd) Answer() (string, bool) {
-	if len(e.Items) == 0 {
+	if e.Withheld || len(e.Items) == 0 {
 		return "", false
 	}
 	m, ok := e.Items[len(e.Items)-1].(*openresponses.Message)

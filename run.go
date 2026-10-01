@@ -590,6 +590,9 @@ type errStop struct {
 	reason Reason
 	cause  StopCause
 	err    error
+	// withheld says OutputGuard withheld a message of the response in
+	// flight, which is what stopped the run.
+	withheld bool
 }
 
 func (e *errStop) Error() string {
@@ -654,6 +657,7 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 		end.Reason = stop.reason
 		end.Cause = stop.cause
 		end.Err = stop.err
+		end.Withheld = stop.withheld
 	case ctx.Err() != nil:
 		end.Reason = ReasonAborted
 		end.Err = context.Cause(ctx)
@@ -1038,9 +1042,16 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 		var halt *errStop
 		if errors.As(err, &halt) {
 			// OutputGuard stopped the run: a policy, not a failure to
-			// retry or wrap. The calls the withheld response made
-			// before the message are closed, so the transcript is a
-			// valid input for the next run.
+			// retry or wrap. The withheld response goes on record
+			// with what the transcript took from it, and the calls it
+			// made before the message are closed, so the transcript is
+			// a valid input for the next run.
+			if halt.withheld && resp != nil {
+				resp.Output = openresponses.Items(r.transcript[start:]).Clone()
+				if err := r.emit(&ResponseEnd{RunID: r.runID, Turn: r.turn, Response: resp, Withheld: true}); err != nil {
+					return nil, err
+				}
+			}
 			if err := r.closeWithheld(r.transcript[start:]); err != nil {
 				return nil, err
 			}
@@ -1108,14 +1119,32 @@ func sleep(ctx context.Context, d time.Duration) error {
 // policy sees the transport or wire error itself.
 func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *openresponses.Response, committed bool, err error) {
 	var acc openresponses.Accumulator
+	var halt *errStop
 	r.held, r.callIDs = nil, nil
 	for ev, err := range openresponses.Events(ctx, r.cfg.Model, req) {
+		if halt != nil {
+			// OutputGuard withheld a message: the rest of the response
+			// is read for its usage alone, and nothing of it reaches
+			// the transcript or an event.
+			if err != nil {
+				break
+			}
+			acc.Add(ev)
+			if final, ok := openresponses.TerminalResponse(ev); ok {
+				resp = final
+			}
+			continue
+		}
 		if err != nil {
 			return nil, committed, err
 		}
 		acc.Add(ev)
 		commits, err := r.streamEvent(ev, &acc, committed)
 		committed = committed || commits
+		if stop := (*errStop)(nil); errors.As(err, &stop) && stop.withheld {
+			halt = stop
+			continue
+		}
 		if err != nil {
 			var wire *wireError
 			if errors.As(err, &wire) {
@@ -1129,6 +1158,9 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 		if final, ok := openresponses.TerminalResponse(ev); ok {
 			resp = final
 		}
+	}
+	if halt != nil {
+		return withheldResponse(&acc, resp), true, halt
 	}
 	if resp == nil {
 		return nil, committed, openresponses.ErrTruncatedStream
@@ -1156,6 +1188,27 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 		return nil, true, errors.New("response failed")
 	}
 	return resp, true, nil
+}
+
+// withheldResponse is the response an OutputGuard withheld a message
+// of: the terminal response when the stream sent one, the response as
+// accumulated otherwise, incomplete with content_filter, with its usage
+// and no output, which modelTurn fills with the items the transcript
+// took from it. The withheld message is not on it.
+func withheldResponse(acc *openresponses.Accumulator, final *openresponses.Response) *openresponses.Response {
+	base := final
+	if base == nil {
+		base = acc.Response()
+	}
+	var out openresponses.Response
+	if base != nil {
+		out = *base
+	}
+	out.Status = openresponses.ResponseStatusIncomplete
+	out.IncompleteDetails = &openresponses.IncompleteDetails{Reason: openresponses.IncompleteReasonContentFilter}
+	out.Error = nil
+	out.Output = nil
+	return &out
 }
 
 // streamEvent turns one wire event, already added to acc, into the item
@@ -1217,7 +1270,7 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 				if errors.Is(err, ErrGuard) {
 					// A policy stop: the message is kept from the
 					// transcript and the run ends with the turn.
-					return true, stopped(StopGuard, err)
+					return true, &errStop{reason: ReasonStopped, cause: StopGuard, err: err, withheld: true}
 				}
 				return true, fmt.Errorf("agentturn: output guard: %w", err)
 			}

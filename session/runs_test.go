@@ -404,12 +404,14 @@ func (m *guardedSpeaker) CreateStream(_ context.Context, req openresponses.Reque
 	if err := w.Text(fmt.Sprintf("reply %d", m.calls)); err != nil {
 		return err
 	}
+	em.Response().Usage = &openresponses.Usage{InputTokens: 3, OutputTokens: 2, TotalTokens: 5}
 	return em.Complete()
 }
 
 // TestOutputGuardStopIsRecordedWithheld checks the record of #181: an
 // OutputGuard stop with the model call in flight writes the response
-// incomplete with content_filter and none of the guard's text, a call
+// incomplete with content_filter, the response's usage and none of the
+// guard's text, a call
 // the response made before the message is rejected by policy with the
 // loop's fixed output, and the run end reads aborted, as the format
 // reads a run whose last response is incomplete. The record verifies,
@@ -449,8 +451,11 @@ func TestOutputGuardStopIsRecordedWithheld(t *testing.T) {
 			for _, e := range s.Entries() {
 				switch v := e.(type) {
 				case *agentsession.ResponseEntry:
-					if v.Status != openresponses.ResponseStatusIncomplete || v.Incomplete == nil || v.Incomplete.Reason != openresponses.IncompleteReasonContentFilter || v.Error != nil || v.RequestHash == "" {
+					if v.Status != openresponses.ResponseStatusIncomplete || v.Incomplete == nil || v.Incomplete.Reason != openresponses.IncompleteReasonContentFilter || v.Error != nil || v.RequestHash == "" || v.ResponseID == "" {
 						t.Errorf("response = %+v", v)
+					}
+					if v.Usage == nil || v.Usage.TotalTokens != 5 {
+						t.Errorf("response usage = %+v, want the withheld response's", v.Usage)
 					}
 					raw, err := json.Marshal(v)
 					if err != nil || strings.Contains(string(raw), "secret rule") {
@@ -477,6 +482,79 @@ func TestOutputGuardStopIsRecordedWithheld(t *testing.T) {
 			}
 			verifyAll(t, s)
 		})
+	}
+}
+
+// unnamed answers its first request with a function call and every
+// later one with a message, and sends no response.created or
+// response.in_progress, so no item event names the response.
+type unnamed struct{ calls int }
+
+func (m *unnamed) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.calls++
+	next := sink
+	sink = openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+		switch ev.(type) {
+		case *openresponses.ResponseCreatedEvent, *openresponses.ResponseInProgressEvent:
+			return nil
+		}
+		return next.Send(ev)
+	})
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if m.calls == 1 {
+		fc, err := em.FunctionCall("c1", "upper")
+		if err != nil {
+			return err
+		}
+		if err := fc.Arguments(`{"text":"x"}`); err != nil {
+			return err
+		}
+		if err := fc.Close(); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("ok"); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestUnnamedResponseIsNotWithheld pins the review of #181: the
+// recorder writes a response withheld only on the loop's word, a
+// response_end with Withheld set. An item with no response ID while a
+// call is in flight is a stream that never named its response, and
+// its responses are written as they arrived, completed, with no
+// response invented for them.
+func TestUnnamedResponseIsNotWithheld(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: &unnamed{}, ModelName: "m", Tools: []agenttool.Tool{upper}})
+	defer rec.Attach(a)()
+	if end, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("end = %+v err=%v", end, err)
+	}
+	if got, want := entryTypes(s), "run config item:user item:function_call response dispatch item:function_call_output item:assistant response run"; got != want {
+		t.Errorf("entries = %q, want %q", got, want)
+	}
+	for _, e := range s.Entries() {
+		if v, ok := e.(*agentsession.ResponseEntry); ok && (v.Status != openresponses.ResponseStatusCompleted || v.Incomplete != nil) {
+			t.Errorf("response = %s %+v, want completed", v.Status, v.Incomplete)
+		}
+	}
+	runs := runsOf(t, s)
+	if len(runs) != 1 || runs[0].End == nil || runs[0].End.Reason != agentsession.ReasonDone {
+		t.Errorf("run end = %+v", runs[0].End)
+	}
+	if err := s.VerifyRecords(s.Leaf()); err != nil {
+		t.Errorf("verify records: %v", err)
 	}
 }
 
