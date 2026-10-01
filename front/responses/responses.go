@@ -28,7 +28,8 @@
 //     turn. The function calls the agent ran and their outputs are left
 //     out by default, because a caller that is itself a loop would take
 //     them for calls it has to answer; [WithToolItems] includes them for
-//     callers that want the whole trace.
+//     callers that want the whole trace or send the conversation back,
+//     as [WithStart] needs.
 //
 // When a full run stops because BeforeToolCall deferred calls to the
 // caller (agentturn.ReasonInputRequired), the response completes with
@@ -116,8 +117,13 @@ func WithRequestInstructions() Option {
 }
 
 // WithToolItems includes the function calls the agent executed and
-// their outputs in the response output of a full run, in order. Callers
-// that feed the output back into a loop should leave this off.
+// their outputs in the response output of a full run, in order. A
+// caller that sends the conversation back on its next request, as
+// [WithStart] needs to find a handoff, keeps them: they are the
+// conversation as the agent had it. A caller that runs each
+// function_call in an output, as a loop does, skips the calls the
+// output already answers with a function_call_output; without the
+// option the output holds only the calls it is to run.
 func WithToolItems() Option {
 	return func(a *Adapter) { a.toolItems = true }
 }

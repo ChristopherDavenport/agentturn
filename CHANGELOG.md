@@ -51,6 +51,14 @@ versions may break the API.
   the settling of the call before it in its chain; calls in other
   chains are not held (#196).
 
+- **`front/responses.WithToolItems` no longer tells a caller that
+  sends the output back to leave it off.** Those are the callers
+  `WithStart` serves, and it finds a handoff only in the transfer call
+  the option includes. Its doc now says a caller that sends the
+  conversation back keeps the tool items, and one that runs each
+  `function_call` in an output skips the calls the output already
+  answers. (#191)
+
 ## v0.0.14 - 2026-10-01
 
 - **`compact.WithOnFold` adds a callback rather than replacing the
