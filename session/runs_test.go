@@ -375,6 +375,111 @@ func TestGuardBeforeTheCallIsRecordedAsAStop(t *testing.T) {
 	}
 }
 
+// guardedSpeaker answers its first request with a message, after a
+// function call when call is set, and every later one with a message.
+type guardedSpeaker struct {
+	call  bool
+	calls int
+}
+
+func (m *guardedSpeaker) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.calls++
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if m.calls == 1 && m.call {
+		fc, err := em.FunctionCall("c1", "upper")
+		if err != nil {
+			return err
+		}
+		if err := fc.Arguments(`{"text":"x"}`); err != nil {
+			return err
+		}
+		if err := fc.Close(); err != nil {
+			return err
+		}
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text(fmt.Sprintf("reply %d", m.calls)); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestOutputGuardStopIsRecordedWithheld checks the record of #181: an
+// OutputGuard stop with the model call in flight writes the response
+// incomplete with content_filter and none of the guard's text, a call
+// the response made before the message is rejected by policy with the
+// loop's fixed output, and the run end reads aborted, as the format
+// reads a run whose last response is incomplete. The record verifies,
+// and the next prompt goes ahead.
+func TestOutputGuardStopIsRecordedWithheld(t *testing.T) {
+	cases := []struct {
+		name  string
+		call  bool
+		types string
+	}{
+		{"a message", false, "run config item:user response run"},
+		{"a call then a message", true, "run config item:user item:function_call* response decision item:function_call_output run"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rule := fmt.Errorf("%w: secret rule", agentturn.ErrGuard)
+			a := agentturn.New(agentturn.Config{Model: &guardedSpeaker{call: tc.call}, ModelName: "m", Tools: []agenttool.Tool{upper},
+				OutputGuard: func(_ context.Context, info agentturn.OutputInfo) (*openresponses.Message, error) {
+					if info.Message.Text() == "reply 1" {
+						return nil, rule
+					}
+					return nil, nil
+				}})
+			defer rec.Attach(a)()
+			end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+			if err != nil || end.Reason != agentturn.ReasonStopped || end.Cause != agentturn.StopGuard {
+				t.Fatalf("end = %+v err=%v", end, err)
+			}
+			if got := entryTypes(s); got != tc.types {
+				t.Errorf("entries = %q, want %q", got, tc.types)
+			}
+			for _, e := range s.Entries() {
+				switch v := e.(type) {
+				case *agentsession.ResponseEntry:
+					if v.Status != openresponses.ResponseStatusIncomplete || v.Incomplete == nil || v.Incomplete.Reason != openresponses.IncompleteReasonContentFilter || v.Error != nil || v.RequestHash == "" {
+						t.Errorf("response = %+v", v)
+					}
+					raw, err := json.Marshal(v)
+					if err != nil || strings.Contains(string(raw), "secret rule") {
+						t.Errorf("the response carries the guard's text: %s", raw)
+					}
+				case *agentsession.DecisionEntry:
+					if v.Verdict != agentsession.VerdictReject || v.By != agentsession.ByPolicy || v.Reason != agentturn.WithheldCallOutput {
+						t.Errorf("decision = %+v", v)
+					}
+				}
+			}
+			runs := runsOf(t, s)
+			if len(runs) != 1 || runs[0].End == nil || runs[0].End.Reason != agentsession.ReasonAborted || !strings.HasPrefix(runs[0].End.Ref, "guard: ") {
+				t.Errorf("run end = %+v", runs[0].End)
+			}
+			if err := s.VerifyRecords(s.Leaf()); err != nil {
+				t.Errorf("verify records: %v", err)
+			}
+			if end, err := a.Prompt(context.Background(), openresponses.UserText("again")); err != nil || end.Reason != agentturn.ReasonDone {
+				t.Fatalf("next prompt: end = %+v err=%v", end, err)
+			}
+			if err := s.VerifyRecords(s.Leaf()); err != nil {
+				t.Errorf("verify records after the next prompt: %v", err)
+			}
+			verifyAll(t, s)
+		})
+	}
+}
+
 // countQueued counts the queued entries of s.
 func countQueued(s *agentsession.Session) int {
 	n := 0

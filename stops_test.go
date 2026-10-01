@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/openresponses"
 	"github.com/ChristopherDavenport/openresponses/echo"
 )
@@ -241,5 +242,88 @@ func TestOutputGuardStops(t *testing.T) {
 				t.Errorf("answer=%v assistant item_end=%d turn_end=%d", ok, assistantEnds, turnEnds)
 			}
 		})
+	}
+}
+
+// callThenSpeak answers its first request with a function call and then
+// a message in one response, and every later one with a message.
+type callThenSpeak struct{ calls int }
+
+func (m *callThenSpeak) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.calls++
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if m.calls == 1 {
+		fc, err := em.FunctionCall("c1", "upper")
+		if err != nil {
+			return err
+		}
+		if err := fc.Arguments(`{"text":"x"}`); err != nil {
+			return err
+		}
+		if err := fc.Close(); err != nil {
+			return err
+		}
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text(fmt.Sprintf("reply %d", m.calls)); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestOutputGuardStopClosesTheResponsesCalls pins #181: a call the
+// withheld response completed before the message is answered with
+// WithheldCallOutput, never run and never carrying the guard's text, so
+// the next prompt goes ahead.
+func TestOutputGuardStopClosesTheResponsesCalls(t *testing.T) {
+	rule := fmt.Errorf("%w: secret rule", ErrGuard)
+	ran := 0
+	tool := agenttool.New("upper", "", func(context.Context, struct {
+		Text string `json:"text"`
+	}) (string, error) {
+		ran++
+		return "", nil
+	})
+	model := &callThenSpeak{}
+	a := New(Config{Model: model, Tools: []agenttool.Tool{tool}, OutputGuard: func(_ context.Context, info OutputInfo) (*openresponses.Message, error) {
+		if info.Message.Text() == "reply 1" {
+			return nil, rule
+		}
+		return nil, nil
+	}})
+	var toolEvents int
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		switch ev.(type) {
+		case *ToolStart, *ToolDispatch, *ToolEnd:
+			toolEvents++
+		}
+		return nil
+	})
+	end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if end.Reason != ReasonStopped || end.Cause != StopGuard || !errors.Is(end.Err, rule) {
+		t.Fatalf("end = %s %q %v", end.Reason, end.Cause, end.Err)
+	}
+	if got := itemTypes(a.State().Transcript); got != "user function_call function_call_output" {
+		t.Fatalf("transcript = %s", got)
+	}
+	out := a.State().Transcript[2].(*openresponses.FunctionCallOutput)
+	if out.CallID != "c1" || out.Output.Text != WithheldCallOutput {
+		t.Errorf("output = %+v", out)
+	}
+	if len(end.Pending) != 0 || ran != 0 || toolEvents != 0 {
+		t.Errorf("pending = %v, tool ran %d times, tool events %d", end.Pending, ran, toolEvents)
+	}
+	if got := itemTypes(end.Items); got != "user function_call function_call_output" {
+		t.Errorf("run items = %s", got)
+	}
+	end, err := a.Prompt(context.Background(), openresponses.UserText("again"))
+	if err != nil || end.Reason != ReasonDone {
+		t.Fatalf("next prompt: err = %v, end = %+v", err, end)
+	}
+	if answer, _ := end.Answer(); answer != "reply 2" {
+		t.Errorf("answer = %q", answer)
 	}
 }

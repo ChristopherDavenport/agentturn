@@ -149,7 +149,12 @@ type Config struct {
 	// [ErrGuard] withholds the message and ends the run as a policy
 	// stop: the message is not appended and has no item_end, and the run
 	// ends with ReasonStopped, StopGuard and the error on RunEnd.Err.
-	// Any other error fails the run with ReasonError. A guard that keeps
+	// A function call the same response completed before the message is
+	// in the transcript already; it is never dispatched, and the loop
+	// appends an output with the fixed text [WithheldCallOutput] for it
+	// before the run ends, so the transcript holds no call without an
+	// output and the next prompt goes ahead. The guard's error is never
+	// that output's text. Any other error fails the run with ReasonError. A guard that keeps
 	// or replaces the message and then wants the run to end returns an
 	// error wrapping [ErrGuard] from ShouldStopAfterTurn, which sees the
 	// turn with TurnInfo.Final set.

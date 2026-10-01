@@ -54,9 +54,21 @@ versions may break the API.
   `content_filter`, in a full run and in a single turn, and empties the
   withheld message, whose deltas had gone out, so its done events and
   the response hold none of its text; `front/a2a` rejects the task
-  with `RefusedText`. Any other `OutputGuard` error still fails the
-  run. `StopGuard`, `ErrGuard`, `OutputGuard` and `ChainOutputGuard`
-  say so (#181).
+  with `RefusedText`. A function call the withheld response completed
+  before the message is never dispatched, and the loop answers it with
+  an output carrying the fixed text `agentturn.WithheldCallOutput`,
+  never the guard's error, before the run ends, so the transcript holds
+  no call without an output and the next prompt goes ahead rather than
+  failing with "pending tool calls must be resumed". The session
+  recorder writes the withheld response `incomplete` with
+  `content_filter` and no error, so the guard's text is not on it,
+  before the outputs, writes a policy `reject` for each closed call,
+  and ends the run `aborted`, as the format reads a run whose last
+  response is incomplete; it wrote a `failed` response with
+  `server_error` and the guard's text and a run end `done`, which
+  `VerifyRecords` rejected. Any other `OutputGuard` error still fails
+  the run. `StopGuard`, `ErrGuard`, `OutputGuard` and
+  `ChainOutputGuard` say so (#181).
 - **`front/a2a` keeps withheld text out of a task's artifacts.** Under
   a configuration with an `OutputGuard` the executor writes a message's
   artifact whole at `item_end`, from the message the guard left, rather

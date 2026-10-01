@@ -32,6 +32,15 @@ var (
 	ErrGuard = errors.New("agentturn: guard stopped the run")
 )
 
+// WithheldCallOutput is the text of the output the loop appends for a
+// function call of a response an [Config.OutputGuard] withheld with an
+// error wrapping [ErrGuard]: the call completed in the stream before
+// the message the guard stopped on, and the loop closes it, never
+// having dispatched it, so the transcript holds no call without an
+// output and the next prompt goes ahead. The text is fixed and never
+// the guard's error, which may say what the guard kept from the model.
+const WithheldCallOutput = "Error: not run: the response that made this call was withheld"
+
 // EventBuffer is how many events the loop can run ahead of the consumer
 // of [Run] or [Continue] before it blocks; [Agent] delivers every event
 // synchronously and has no buffer.
@@ -1016,6 +1025,7 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 	if err := r.emit(&TurnStart{RunID: r.runID, Turn: r.turn, Request: req, Inputs: inputs}); err != nil {
 		return nil, err
 	}
+	start := len(r.transcript)
 	for attempt := 1; ; attempt++ {
 		resp, committed, err := r.stream(ctx, req)
 		if err == nil {
@@ -1025,7 +1035,12 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 		var halt *errStop
 		if errors.As(err, &halt) {
 			// OutputGuard stopped the run: a policy, not a failure to
-			// retry or wrap.
+			// retry or wrap. The calls the withheld response made
+			// before the message are closed, so the transcript is a
+			// valid input for the next run.
+			if err := r.closeWithheld(r.transcript[start:]); err != nil {
+				return nil, err
+			}
 			return nil, err
 		}
 		if ctx.Err() != nil {
@@ -1051,6 +1066,17 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 			return nil, stop(ReasonAborted, context.Cause(ctx))
 		}
 	}
+}
+
+// closeWithheld appends a [WithheldCallOutput] for each function call
+// among items, the part of the transcript a withheld response added.
+// Those calls were never dispatched; nothing else answers them.
+func (r *runner) closeWithheld(items Transcript) error {
+	var outputs openresponses.Items
+	for _, call := range unansweredCalls(items) {
+		outputs = append(outputs, &openresponses.FunctionCallOutput{CallID: call.CallID, Output: openresponses.FunctionCallOutputData{Text: WithheldCallOutput}})
+	}
+	return r.appendItems(outputs)
 }
 
 // sleep waits for d or until ctx is done.

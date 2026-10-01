@@ -440,7 +440,11 @@ const (
 	// turn_start; from BeforeModelCall, the request it refused is on a
 	// model_blocked. From OutputGuard, the message it ruled on is not
 	// appended and has no item_end, though its deltas went out as
-	// item_update, and the turn has no response_end or turn_end.
+	// item_update, and the turn has no response_end or turn_end. A
+	// function call the withheld response completed before the message
+	// is answered with a [WithheldCallOutput] output, with its item_end
+	// and no tool events, before the run ends, so RunEnd.Pending is
+	// empty and the next prompt goes ahead.
 	StopGuard StopCause = "guard"
 	// StopTerminate: every result of the batch set Terminate, so the
 	// tools answered on the model's behalf.

@@ -737,12 +737,14 @@ type writer struct {
 	// last one requested tools, which is what the end reason turns on;
 	// answeredCall says the run wrote an output or a decision, which is
 	// how the format reads a run that answered a call an earlier one's
-	// model call made.
+	// model call made; withheld says an OutputGuard withheld the last
+	// response, written incomplete with content_filter.
 	run          string
 	open         []string
 	responses    int
 	lastCalls    bool
 	answeredCall bool
+	withheld     bool
 }
 
 // inboxItem is one input accepted into a queue and not appended yet.
@@ -2397,6 +2399,7 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 	w.responses = 0
 	w.lastCalls = false
 	w.answeredCall = false
+	w.withheld = false
 	start := agentsession.NewRunStart(e.RunID, string(e.Source), e.Trigger.String())
 	start.Trigger = trigger
 	// The comparison below does not ask a tool provider, which may cost
@@ -2781,6 +2784,16 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 	if item == nil {
 		return nil
 	}
+	if responseID == "" && w.inFlight {
+		// An item that is not the model's while a call is in flight:
+		// the call ended without its response and the run went on,
+		// which only an OutputGuard stop does, closing the calls the
+		// withheld response made before the run ends. The response
+		// goes on the path before the outputs that answer its calls.
+		if err := w.endInFlight(ctx, true, nil); err != nil {
+			return err
+		}
+	}
 	if out, ok := item.(*openresponses.FunctionCallOutput); ok && !w.replay {
 		c := w.calls[out.CallID]
 		switch {
@@ -2838,10 +2851,12 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 			// same shape with the loop as the decider: it refused the
 			// call before any tool, which is a policy's refusal.
 			by := agentturn.DeciderFromContext(ctx, out.CallID)
-			if c.settledRun != "" && c.settledRun == w.run {
+			if c.settledRun != "" && c.settledRun == w.run || w.withheld {
 				// The loop refused it, whoever approved it: a call
 				// the caller approved on resume and the loop then
-				// found no tool for is the loop's reject.
+				// found no tool for is the loop's reject, and so is a
+				// call of a response an OutputGuard withheld, which
+				// the loop closes with agentturn.WithheldCallOutput.
 				by = agentsession.ByPolicy
 			}
 			dec := agentsession.NewDecision(out.CallID, c.entry, agentsession.VerdictReject, by).WithReason(outputText(out))
@@ -3193,6 +3208,7 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 	w.inFlight, w.pending, w.started, w.inFlightID, w.retries = false, "", time.Time{}, "", 0
 	w.responses++
 	w.lastCalls = len(resp.FunctionCalls()) > 0
+	w.withheld = false
 	_, err := w.append(ctx, entry)
 	return err
 }
@@ -3205,26 +3221,17 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 // and why it ended and the context algorithm strips the items it
 // produced rather than reading them as its input; the in-flight state is cleared
 // either way, so a writer reused for a later run cannot attribute its
-// first response to this call. Then the run's end entry, with the
-// reason in the format's terms and the run's calls left open.
+// first response to this call. A call an OutputGuard stopped is
+// written incomplete instead (see [writer.endInFlight]). Then the
+// run's end entry, with the reason in the format's terms and the run's
+// calls left open.
 func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
-	hash, inFlight, responseID := w.pending, w.inFlight, w.inFlightID
-	latency, attempts := w.latency(), w.attempts()
-	w.inFlight, w.pending, w.started, w.inFlightID, w.retries = false, "", time.Time{}, "", 0
-	if inFlight {
-		w.responses++
-		w.lastCalls = false
-		entry := &agentsession.ResponseEntry{
-			ResponseID:  responseID,
-			Status:      openresponses.ResponseStatusFailed,
-			Error:       errorPayload(e.Err),
-			RequestHash: hash,
-			LatencyMS:   latency,
-			Attempts:    attempts,
-		}
-		if _, err := w.append(ctx, entry); err != nil {
-			return err
-		}
+	// Only OutputGuard stops a run with a guard while a call is in
+	// flight: the other guards run before the call or after its
+	// response.
+	withheld := e.Reason == agentturn.ReasonStopped && e.Cause == agentturn.StopGuard
+	if err := w.endInFlight(ctx, withheld, e.Err); err != nil {
+		return err
 	}
 	if w.run == "" {
 		return nil
@@ -3238,6 +3245,41 @@ func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
 	// The end closes the queued entries of the inputs the run did not
 	// append; the ones the agent still holds are written again.
 	return w.endInbox(ctx)
+}
+
+// endInFlight writes the response entry of the call in flight, if any,
+// which ended without its response, and clears the in-flight state.
+// The entry names the call by its request hash and the response ID the
+// stream named. A call the run's OutputGuard withheld is written
+// incomplete with content_filter and no error: the model answered and
+// a policy kept the answer, which is no failure, and the guard's error
+// may say what it kept, so it is not on the response; the run's end
+// carries it. Any other call is written failed with cause, and the
+// context algorithm strips the items it produced.
+func (w *writer) endInFlight(ctx context.Context, withheld bool, cause error) error {
+	hash, inFlight, responseID := w.pending, w.inFlight, w.inFlightID
+	latency, attempts := w.latency(), w.attempts()
+	w.inFlight, w.pending, w.started, w.inFlightID, w.retries = false, "", time.Time{}, "", 0
+	if !inFlight {
+		return nil
+	}
+	w.responses++
+	w.lastCalls = false
+	w.withheld = withheld
+	entry := &agentsession.ResponseEntry{
+		ResponseID:  responseID,
+		Status:      openresponses.ResponseStatusFailed,
+		Error:       errorPayload(cause),
+		RequestHash: hash,
+		LatencyMS:   latency,
+		Attempts:    attempts,
+	}
+	if withheld {
+		entry.Status, entry.Error = openresponses.ResponseStatusIncomplete, nil
+		entry.Incomplete = &openresponses.IncompleteDetails{Reason: openresponses.IncompleteReasonContentFilter}
+	}
+	_, err := w.append(ctx, entry)
+	return err
 }
 
 // endReason maps the loop's reason onto the format's cascade, with the
@@ -3264,6 +3306,11 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 			cause += ": " + e.Err.Error()
 		}
 		switch {
+		case w.withheld:
+			// OutputGuard withheld the last response, written
+			// incomplete, which the format reads as aborted whatever its
+			// calls: the run did not finish what the model began.
+			return agentsession.ReasonAborted, cause
 		case w.responses == 0:
 			// A resume whose approved batch terminated, a refusal on
 			// Resume, or a guard's stop before the run's first model
