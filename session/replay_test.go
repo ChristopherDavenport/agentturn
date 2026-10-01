@@ -873,3 +873,102 @@ func TestHeldRewriteSurvivesARestart(t *testing.T) {
 		})
 	}
 }
+
+// TestHeldCallDispatchedOnAnotherBranch pins #193: a held call that was
+// approved, dispatched and completed, and then rebased to its hold, may
+// have run on the branch the rebase left. A recorder seeded from the
+// hold, after a restart, ends it without running with an answer, never
+// with a reject, which would say it never reached its tool; whether an
+// output answers it or a hook blocks it.
+func TestHeldCallDispatchedOnAnotherBranch(t *testing.T) {
+	cases := []struct {
+		name string
+		// decision, when set, is what BeforeToolCall said; nil answers
+		// the call with an output through the loop.
+		decision   *agentturn.ToolDecision
+		wantRecord []string
+	}{
+		{name: "answered with an output", wantRecord: []string{"hold", "answer", "output"}},
+		{name: "blocked", decision: &agentturn.ToolDecision{Action: agentturn.Block, Reason: "denied by rm"},
+			wantRecord: []string{"hold", "answer", "output"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := agentsession.NewMemoryStore()
+			s, err := store.Create(ctx, agentsession.Header{Records: agentsession.AllRecords})
+			if err != nil {
+				t.Fatal(err)
+			}
+			call := &openresponses.FunctionCall{CallID: "call_1", Name: "notify", Arguments: `{"text":"t"}`}
+			target, err := store.Append(ctx, s.ID(), &agentsession.ItemEntry{Item: call, ResponseID: "resp_1"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Append(ctx, s.ID(), &agentsession.ResponseEntry{ResponseID: "resp_1", Status: openresponses.ResponseStatusCompleted}); err != nil {
+				t.Fatal(err)
+			}
+			held, err := store.Append(ctx, s.ID(), agentsession.NewDecision(call.CallID, target, agentsession.VerdictHold, agentsession.ByPolicy).WithReason("approval required"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range []agentsession.Entry{
+				agentsession.NewDecision(call.CallID, target, agentsession.VerdictProceed, agentsession.ByHuman),
+				agentsession.NewDispatch(call.CallID, target).WithIdempotencyKey("k1"),
+				&agentsession.ItemEntry{Item: openresponses.NewFunctionCallOutput(call.CallID, "sent")},
+			} {
+				if _, err := store.Append(ctx, s.ID(), e); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.Branch(held); err != nil {
+				t.Fatal(err)
+			}
+
+			rec, s2, err := Resume(ctx, store, s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			pending, err := Pending(s2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(pending) != 1 || pending[0].Reason != agentturn.PendingDeferred || !pending[0].Dispatched {
+				t.Fatalf("pending = %+v, want deferred and dispatched", pending)
+			}
+			const runID = "run_answer"
+			events := []agentturn.Event{&agentturn.RunStart{RunID: runID, Source: agentturn.SourceResume}}
+			if tc.decision != nil {
+				events = append(events,
+					&agentturn.ToolStart{RunID: runID, CallID: call.CallID, Name: call.Name, Args: json.RawMessage(call.Arguments), Decision: tc.decision},
+					&agentturn.ToolEnd{RunID: runID, CallID: call.CallID, Name: call.Name})
+			}
+			events = append(events, &agentturn.ItemEnd{RunID: runID, Item: openresponses.NewFunctionCallOutput(call.CallID, "outcome unknown")},
+				&agentturn.RunEnd{RunID: runID, Reason: agentturn.ReasonStopped, Cause: agentturn.StopRefused})
+			for _, ev := range events {
+				if err := rec.Handle(ctx, ev); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var record []string
+			for _, e := range s2.Path(s2.Leaf()) {
+				switch e := e.(type) {
+				case *agentsession.DispatchEntry:
+					record = append(record, "dispatch")
+				case *agentsession.DecisionEntry:
+					record = append(record, e.Verdict)
+				case *agentsession.ItemEntry:
+					if _, ok := e.Item.(*openresponses.FunctionCallOutput); ok {
+						record = append(record, "output")
+					}
+				}
+			}
+			if strings.Join(record, " ") != strings.Join(tc.wantRecord, " ") {
+				t.Errorf("record = %q, want %q", record, tc.wantRecord)
+			}
+			if err := s2.VerifyRecords(s2.Leaf()); err != nil {
+				t.Errorf("verify records: %v", err)
+			}
+		})
+	}
+}

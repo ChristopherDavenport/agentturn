@@ -142,6 +142,16 @@ versions may break the API.
   the first resume after a fold applied before the failed one, whose
   context the compaction shortened (#194).
 
+- **A held call dispatched on a branch a rebase left is ended by an
+  `answer`, not a `reject`.** `session.Pending` read such a call as
+  deferred and dispatched, but the recorder seeded from the same path
+  did not see the dispatch, so an output the host gave it, an
+  `OutcomeUnknown` included, or a `BeforeToolCall` block, was written
+  behind a `reject`, which says the call never reached its tool. The
+  recorder now reads a call with no dispatch on its path and one
+  elsewhere in the session as one that may have run, as `Pending` does,
+  and RFC 0001 asks. (#193)
+
 ## v0.0.14 - 2026-10-01
 
 - **`compact.WithOnFold` adds a callback rather than replacing the

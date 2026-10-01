@@ -106,9 +106,11 @@
 //     refused itself, for a name no tool has or arguments that are not
 //     an object, is the same shape with policy as the decider. An
 //     output the caller wrote for a call that may have run, one an
-//     earlier run dispatched or one a path without dispatch records
-//     cannot say about, such as the [agentturn.OutcomeUnknown] answer
-//     to a call in flight at a crash, is preceded by an answer
+//     earlier run dispatched, one a path without dispatch records
+//     cannot say about, or one with no dispatch on the path and one on
+//     a branch a rebase left, a held one included, such as the
+//     [agentturn.OutcomeUnknown] answer to a call in flight at a crash,
+//     is preceded by an answer
 //     decision, the format's verdict for a call ended without running
 //     again, whose by is Answer.By and whose reason is Answer.Reason;
 //     the absence of a second dispatch says the tool did not run
@@ -817,7 +819,8 @@ type callRecord struct {
 	// path, which is what the format reads as a call that is no longer
 	// pending. unknown marks a call seeded from a path whose header
 	// does not promise dispatch records, which may have run without
-	// one. dispatchRun is the run the last dispatch was written in, ""
+	// one, or from a path that holds no dispatch for a call another
+	// branch dispatched. dispatchRun is the run the last dispatch was written in, ""
 	// for one on the path the writer was seeded from, so a call an
 	// earlier run dispatched and this one runs again gets a dispatch
 	// of its own. again holds who approved such a call, when nothing
@@ -1762,7 +1765,7 @@ func (r *Recorder) reopenID(ctx context.Context, id string) (*writer, error) {
 	w := newWriter(r, id)
 	w.parentID = s.Header().ParentSession
 	for _, c := range calls {
-		w.calls[c.ID()] = callRecordOf(c, s.Header())
+		w.calls[c.ID()] = callRecordOf(c, s)
 	}
 	w.appOnly = appOnlyCalls(s.Path(s.Leaf()))
 	for _, e := range s.Path(s.Leaf()) {
@@ -1923,7 +1926,7 @@ func (w *writer) seed(s *agentsession.Session, owed bool) error {
 		return fmt.Errorf("session: calls at leaf: %w", err)
 	}
 	for _, c := range calls {
-		w.calls[c.ID()] = callRecordOf(c, s.Header())
+		w.calls[c.ID()] = callRecordOf(c, s)
 	}
 	w.appOnly = appOnlyCalls(s.Path(s.Leaf()))
 	return nil
@@ -1947,8 +1950,12 @@ func appOnlyCalls(path []agentsession.Entry) map[string]bool {
 }
 
 // callRecordOf is what the path holds for a call, for a writer seeded
-// from it.
-func callRecordOf(c *agentsession.Call, h agentsession.Header) *callRecord {
+// from it. A call with no dispatch on the path and one on another
+// branch of the session, which a rebase above the dispatch leaves, may
+// have run, as [Pending] reads it, and is unknown to the writer, a
+// held one included: what ends it without running is an answer, since
+// the format keeps reject for a call no dispatch reached.
+func callRecordOf(c *agentsession.Call, s *agentsession.Session) *callRecord {
 	if c.Output != nil {
 		return &callRecord{entry: c.Entry.Base().ID, args: c.Call.Arguments, dispatched: len(c.Dispatches) > 0, answered: true}
 	}
@@ -1959,7 +1966,7 @@ func callRecordOf(c *agentsession.Call, h agentsession.Header) *callRecord {
 	return &callRecord{
 		entry: c.Entry.Base().ID, args: c.Call.Arguments, decided: decided,
 		held: c.Held(), dispatched: len(c.Dispatches) > 0, rejected: c.Rejected(), ended: c.Answered(),
-		unknown: c.State(h) == agentsession.CallUnknown,
+		unknown: c.State(s.Header()) == agentsession.CallUnknown || len(c.Dispatches) == 0 && len(s.Dispatches(c.Entry.ID)) > 0,
 	}
 }
 
@@ -2934,7 +2941,8 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 			// The tool's own output: the dispatch is the record.
 		case c.dispatched || c.unknown:
 			// A call an earlier run dispatched, or one the path
-			// cannot say about, answered now with an output rather
+			// cannot say about, another branch's dispatch of a held
+			// call included, answered now with an output rather
 			// than run again, is answered: a proceed says the call
 			// went on toward its tool, which it did not, and a reject
 			// that it never reached its tool, which may be false. The
