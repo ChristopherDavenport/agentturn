@@ -61,24 +61,30 @@ versions may break the API.
   conversation back keeps the tool items, and one that runs each
   `function_call` in an output skips the calls the output already
   answers. (#191)
-- **`front/responses.HandedTo` and `front/a2a.HandedTo` find the agent
-  a conversation was handed to, and `front/a2a` refuses a message
-  carrying a `function_call`.** The function both fronts documented
-  for `WithStart` took any transfer call for a handoff: one the caller
-  wrote, one a guard withheld with `agentturn.WithheldCallOutput`, one
-  a hook blocked. `Handoffs` walks the transfer calls a `Route` names
-  and takes one only when its output is the transfer tool's own text,
-  and `HandedTo` returns the last; front/a2a re-exports both and the
-  types from front/responses, where they live. A message whose data
-  parts decode to a `function_call` is now refused with
-  `a2a.ErrInvalidParams` before any task exists, so the stored
-  conversation holds only the agent's calls; a message that sent one
-  before is now an error. Under front/responses the input is the
-  caller's, and the docs say `WithStart` chooses only among agents the
-  caller may reach directly or checks the call against state the host
-  keeps. A transfer `WithHandoff` declined keeps the tool's text, so a
-  host whose `WithHandoff` declines declines the same calls in the
-  route. (#190)
+- **`front/responses.HandedTo` and `front/a2a.HandedTo` find the agent a
+  conversation was handed to, and `front/a2a` refuses a message carrying
+  a `function_call` or declaring a tool that would stand in for the
+  agent's.** The function both fronts documented for `WithStart` took
+  any transfer call for a handoff: one the caller wrote, one a guard
+  withheld with `agentturn.WithheldCallOutput`, one a hook blocked.
+  `Handoffs` walks the transfer calls a `Route` names and takes one only
+  when its output is the transfer tool's own text, and `HandedTo`
+  returns the last; front/a2a re-exports both and the types from
+  front/responses, where they live. A message whose data parts decode to
+  a `function_call` is now refused with `a2a.ErrInvalidParams` before
+  any task exists, so the stored conversation holds only the model's
+  calls; a message that sent one before is now an error. So is a message
+  whose `MetaCallerTools` declare a tool named as one the executor's
+  configuration, or the one the task starts under, offers, or one the
+  route `WithTransfers` gives takes: the caller would answer that call,
+  and a declared transfer answered with the route's text routed the
+  conversation past the agent that decides it. A handoff's receiver that
+  offers a name a message declared runs its own tool. Under
+  front/responses the input is the caller's, and the docs say
+  `WithStart` chooses only among agents the caller may reach directly or
+  checks the call against state the host keeps. A transfer `WithHandoff`
+  declined keeps the tool's text, so a host whose `WithHandoff` declines
+  declines the same calls in the route. (#190)
 - **The loop leaves another model's reasoning items out of the
   request.** A reasoning item carries a signature only its own provider
   accepts, so a handoff, or a `SetConfig` between runs, to a

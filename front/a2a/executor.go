@@ -2,6 +2,7 @@ package a2a
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -164,15 +165,19 @@ func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*
 // executor's. It is how the receiver of a handoff answers the
 // conversation's later messages. The executor keeps no configuration
 // between tasks, so the conversation, which holds the transfer call
-// and its output, says who has it. The stored transcript is the
-// executor's own, and a message may not add a function_call to it, so
-// every transfer call fn sees is one the agent made. A host whose
-// handoff tools are named for their destination takes the last one
-// that ran, with [HandedTo]: a call is a handoff only when its output
-// is the transfer tool's own text, so one a guard withheld, a hook
-// blocked or the tool failed on is not. [WithTransfers] starts there
-// too, and leaves out of the receiver's requests the reasoning items
-// another model produced.
+// and its output, says who has it. A host whose handoff tools are
+// named for their destination takes the last one that ran, with
+// [HandedTo]: a call is a handoff only when its output is the
+// transfer tool's own text, so one a guard withheld, a hook blocked or
+// the tool failed on is not.
+//
+// The stored transcript holds only calls the model made, since a
+// message may not carry a function_call, but the caller answers the
+// calls to the tools it declares under [MetaCallerTools], and a
+// declared tool may take any name the agent does not offer. Give the
+// route to [WithTransfers] as well, which refuses a message declaring
+// a tool the route takes, so no transfer's output is the caller's; fn
+// alone cannot tell.
 //
 //	route := func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
 //		name := strings.TrimPrefix(call.Name, "transfer_to_")
@@ -190,11 +195,15 @@ func WithStart(fn func(ctx context.Context, t agentturn.Transcript) (agentturn.C
 // calls route names, as [Handoffs] finds them. A task starts where the
 // last of them left the conversation, as [WithStart] does with
 // [HandedTo]; a WithStart given after it picks the start in its place.
-// And the reasoning items of the stored transcript are attributed, with
-// responses.Attribute, to the agents that had the conversation when
-// they were produced, those before the first transfer to the executor's
-// own configuration, so a request leaves out another model's
-// reasoning, whose signature its provider refuses. Without it the
+// A message that declares a caller-owned tool
+// route takes is refused as invalid params, as is one declaring a
+// tool the agent offers, so a transfer is never answered by the
+// caller. And the reasoning items of the stored transcript are
+// attributed, with responses.Attribute, to the agents that had the
+// conversation when they were produced, those before the first
+// transfer to the executor's own configuration, so a request leaves
+// out another model's reasoning, whose signature its provider
+// refuses. Without it the
 // stored reasoning items are of unknown origin and sent to whichever
 // model runs; the ones produced within a task, the sender's before a
 // [WithHandoff] switch included, are attributed either way.
@@ -279,6 +288,9 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 		if cfg, ok := e.start(runCtx, slices.Concat(transcript, prompts)); ok {
 			start = cfg
 		}
+	}
+	if err := e.checkDeclared(runCtx, declared, start); err != nil {
+		return fmt.Errorf("%w: %w", a2a.ErrInvalidParams, err)
 	}
 	var models agentturn.ReasoningModels
 	if e.route != nil {
@@ -558,31 +570,45 @@ func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, 
 	}
 }
 
+// checkDeclared refuses a tool a message declares that would stand in
+// for one of the agent's: a name the executor's configuration or the
+// one the task starts under offers, whose calls the caller would
+// answer in the agent's place, or one the route takes for a transfer,
+// whose output the caller would write as the transfer tool's.
+func (e *Executor) checkDeclared(ctx context.Context, declared []*openresponses.FunctionTool, start agentturn.Config) error {
+	if len(declared) == 0 {
+		return nil
+	}
+	own := agenttool.Set(slices.Concat(e.cfg.ResolveTools(ctx), start.ResolveTools(ctx)))
+	for i, ft := range declared {
+		if _, ok := own.Lookup(ft.Name); ok {
+			return fmt.Errorf("%s[%d]: tool %q is owned by the agent", MetaCallerTools, i, ft.Name)
+		}
+		if e.route != nil {
+			if _, _, ok := e.route(&openresponses.FunctionCall{Name: ft.Name}); ok {
+				return fmt.Errorf("%s[%d]: tool %q is a handoff the agent makes", MetaCallerTools, i, ft.Name)
+			}
+		}
+	}
+	return nil
+}
+
 // runConfig returns the config for one run: cfg's tools plus the
 // caller-owned ones, offered to the model but never executed here, and
 // a BeforeToolCall that defers every call to a caller-owned tool. The
 // loop then ends the run with ReasonInputRequired and the pending calls
 // on the RunEnd, which is the input-required boundary of the task. The
 // agent's own hook runs first and its block or rewrite is respected.
+// A tool of cfg's own wins over a caller-owned one of the same name,
+// which is then neither offered nor deferred: a receiver of a handoff
+// may hold a name a message declared.
 func (e *Executor) runConfig(cfg agentturn.Config, caller []*openresponses.FunctionTool) agentturn.Config {
 	if len(caller) == 0 {
 		return cfg
 	}
-	owned := make(map[string]bool, len(caller))
 	stubs := make([]agenttool.Tool, 0, len(caller))
 	for _, ft := range caller {
-		owned[ft.Name] = true
-		var opts []agenttool.Option
-		if ft.Strict != nil && *ft.Strict {
-			opts = append(opts, agenttool.WithStrict())
-		}
-		// The stub advertises the caller's tool; the hook below defers
-		// every call to it, so its function runs only if that hook was
-		// bypassed, which is a bug worth an error output.
-		name := ft.Name
-		stubs = append(stubs, agenttool.NewFunc(ft.Name, ft.Description, ft.Parameters, func(context.Context, agenttool.Call) (agenttool.Result, error) {
-			return agenttool.Result{}, fmt.Errorf("tool %q is owned by the caller and cannot run here", name)
-		}, opts...))
+		stubs = append(stubs, &callerTool{ft: ft})
 	}
 	local, provider := cfg.Tools, cfg.ToolProvider
 	cfg.Tools = nil
@@ -591,7 +617,13 @@ func (e *Executor) runConfig(cfg agentturn.Config, caller []*openresponses.Funct
 		if provider != nil {
 			base = provider(ctx)
 		}
-		return slices.Concat(base, stubs)
+		out := slices.Clip(base)
+		for _, t := range stubs {
+			if _, ok := agenttool.Set(base).Lookup(t.Name()); !ok {
+				out = append(out, t)
+			}
+		}
+		return out
 	}
 	before := cfg.BeforeToolCall
 	cfg.BeforeToolCall = func(ctx context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
@@ -603,7 +635,7 @@ func (e *Executor) runConfig(cfg agentturn.Config, caller []*openresponses.Funct
 				return nil, err
 			}
 		}
-		if !owned[info.Call.Name] || (decision != nil && decision.Action == agentturn.Block) {
+		if _, ok := info.Tool.(*callerTool); !ok || (decision != nil && decision.Action == agentturn.Block) {
 			return decision, nil
 		}
 		if decision == nil {
@@ -613,6 +645,20 @@ func (e *Executor) runConfig(cfg agentturn.Config, caller []*openresponses.Funct
 		return decision, nil
 	}
 	return cfg
+}
+
+// callerTool advertises a tool the caller executes. The hook runConfig
+// installs defers every call to it, so Execute runs only if that hook
+// was bypassed, which is a bug worth an error output.
+type callerTool struct{ ft *openresponses.FunctionTool }
+
+func (c *callerTool) Name() string                { return c.ft.Name }
+func (c *callerTool) Description() string         { return c.ft.Description }
+func (c *callerTool) Parameters() json.RawMessage { return c.ft.Parameters }
+func (c *callerTool) Strict() bool                { return c.ft.Strict != nil && *c.ft.Strict }
+
+func (c *callerTool) Execute(context.Context, agenttool.Call) (agenttool.Result, error) {
+	return agenttool.Result{}, fmt.Errorf("tool %q is owned by the caller and cannot run here", c.ft.Name)
 }
 
 // answeredCalls returns the IDs of the calls in items that have an

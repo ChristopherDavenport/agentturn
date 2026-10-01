@@ -64,9 +64,13 @@
 // message for the same task whose data parts are the function_call_output
 // items, one per pending call and nothing else, and the run continues
 // from there. A message never carries a function_call: a call is the
-// agent's to make, and one is refused as invalid params. The transcript in the [ConversationStore] holds the
-// unanswered calls in the meantime, which is the invariant the root
-// package documents for an input-required boundary. A2A's
+// agent's to make, and one is refused as invalid params. Nor may it
+// declare a tool named as one the agent offers, or one the route
+// [WithTransfers] gives takes for a handoff, whose calls the caller
+// would answer in the agent's place. The transcript in the
+// [ConversationStore] holds the unanswered calls in the meantime, which
+// is the invariant the root package documents for an input-required
+// boundary. A2A's
 // input-required state and agentturn's ReasonInputRequired are the
 // same thing seen from the two sides.
 //
