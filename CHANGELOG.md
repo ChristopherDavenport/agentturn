@@ -186,6 +186,18 @@ versions may break the API.
   not inherit an environment through `parent_session`. `Recorder.Env`
   now compares with the child's own entry. It costs one entry per child
   session. (#197)
+- **A model's output item the filter keeps from the model no longer
+  stops the request hashes.** The recorder wrote such an item, an
+  adapter's extension item kept from other adapters by `DefaultFilter`,
+  as an item entry, which the context algorithm contributes, so the
+  path rebuilt an input the request did not carry and every later
+  response went unhashed. It is now a custom entry in the namespace of
+  its type, as an app-only input is, with the response ID in a new
+  `session.ResponseIDMember` member beside it. The new
+  `session.Transcript` is the context's items with those items put back
+  where the loop held them; `AgentOptions` and the recorder's seeding
+  use it, so an agent resumed or rebased holds them as before, and
+  `Rebase` and a `Start` on a base say to seed with it. (#202)
 
 ## v0.0.14 - 2026-10-01
 

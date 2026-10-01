@@ -98,7 +98,10 @@
 //     item, as the format asks. An
 //     item the filter in force would hide from the model, an app-only
 //     extension item, is written as a custom entry
-//     instead so the path rebuilds exactly the input that was sent. A
+//     instead so the path rebuilds exactly the input that was sent; a
+//     model's output item the filter hides names its response in a
+//     [ResponseIDMember] member beside it, and [Transcript] puts it back
+//     in the agent's transcript on a resume. A
 //     function_call_output for a call the path holds no dispatch and no
 //     reject for, one the caller answered through Agent.Resume with an
 //     output of their own, is preceded by a reject decision carrying
@@ -317,8 +320,8 @@
 // The recorder keeps the entry ID and the value of every item it wrote,
 // aligned with the agent's working transcript, and names the entry at
 // the fold's split as first_kept. [Resume] seeds that alignment from
-// the context at the leaf, so an agent resumed from Context.Items
-// records folds too; an agent seeded with a transcript the recorder did
+// the transcript at the leaf, [Transcript], so an agent resumed from it
+// or from Context.Items records folds too; an agent seeded with a transcript the recorder did
 // not write and did not resume from cannot, and Fold returns an error,
 // which fails the turn rather than let the record drift.
 //
@@ -576,6 +579,16 @@ type Elicitation struct {
 // an ID of its own (agentturn.ItemEnd.ModelCallID): the format asks a
 // writer that replaces a repeated ID to keep the native one there.
 const ModelCallIDMember = "agentturn:model_call_id"
+
+// ResponseIDMember is the member of a custom entry, beside the item
+// that is its data, naming the response that produced the item: a
+// model's output item the filter in force kept from the model, such as
+// an adapter's extension item kept from other adapters, which is
+// written as a custom entry in the namespace of its type, as an
+// app-only input is, so the path rebuilds the input that was sent and
+// the requests after it keep their hashes. The context leaves it out
+// and [Transcript] puts it back.
+const ResponseIDMember = "agentturn:response_id"
 
 // ErrRunActive is returned by [Recorder.Rebase] while a run is being
 // written.
@@ -974,7 +987,7 @@ func newWriter(r *Recorder, id string) *writer {
 // A header with a Base forks the session that holds it: the store
 // writes the prefix, and the recorder is seeded from the context at
 // the base, as [Resume] seeds one at the leaf, so an agent seeded with
-// s.Context().Items records requests that carry hashes. A base inside
+// [Transcript](s) records requests that carry hashes. A base inside
 // a run leaves that run open on the fork, as a rewind does, and Start
 // closes it, interrupted, with a ref naming the fork, before it
 // returns; what that run had queued and not appended is closed with
@@ -1012,9 +1025,9 @@ func Start(ctx context.Context, store agentsession.Store, h agentsession.Header,
 // that continues it at its leaf. The recorder starts from the settings
 // in force there, so the first config entry it writes is the delta
 // from them, or nothing when the agent's configuration matches, rather
-// than a full copy on every resume; from the items of the context
-// there, so an agent seeded with Context.Items can record folds and
-// its requests carry hashes; from the calls pending there, so their
+// than a full copy on every resume; from the transcript there,
+// [Transcript], so an agent seeded with it can record folds and its
+// requests carry hashes; from the calls pending there, so their
 // dispatches and decisions anchor to the entries that hold them; and
 // from the last env entry on the path. Child sessions name the
 // header's harness unless [WithHarness] says otherwise.
@@ -1280,9 +1293,9 @@ func callAt(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry st
 // session passes to agentturn.New. [WithOrigins] reads a fork's origin
 // as [Pending] does.
 func AgentOptions(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Option, error) {
-	cx, err := s.Context()
+	items, err := Transcript(s)
 	if err != nil {
-		return nil, fmt.Errorf("session: context at leaf: %w", err)
+		return nil, err
 	}
 	pending, err := Pending(s, opts...)
 	if err != nil {
@@ -1292,7 +1305,49 @@ func AgentOptions(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Opti
 	if err != nil {
 		return nil, err
 	}
-	return []agentturn.Option{agentturn.WithTranscript(cx.Items), agentturn.WithPending(pending), agentturn.WithReservedCallIDs(ids)}, nil
+	return []agentturn.Option{agentturn.WithTranscript(items), agentturn.WithPending(pending), agentturn.WithReservedCallIDs(ids)}, nil
+}
+
+// Transcript returns the agent's transcript at the session's leaf: the
+// context's items, with each output item a model produced that the
+// filter kept from it, which the path holds as a custom entry naming
+// its response ([ResponseIDMember]) and the context leaves out, put
+// back where it was, as the loop held it. It is the transcript
+// [AgentOptions] seeds an agent with, and the one to give
+// Agent.SetTranscript after [Recorder.Rebase] or to seed the agent of
+// a [Start] on a base with; Context.Items differs from it only by
+// those items, which the filter keeps out of every request anyway.
+func Transcript(s *agentsession.Session) (openresponses.Items, error) {
+	cx, err := s.Context()
+	if err != nil {
+		return nil, fmt.Errorf("session: context at leaf: %w", err)
+	}
+	items, _, _ := transcriptOf(cx)
+	return items, nil
+}
+
+// transcriptOf is the transcript of cx, as [Transcript] reads it, with
+// the ID of the entry contributing each item, and whether that entry
+// is a custom entry, outside the context.
+func transcriptOf(cx agentsession.Context) (items openresponses.Items, entries []string, custom []bool) {
+	j := 0
+	for _, e := range cx.Entries {
+		// A compaction contributes its summary and its pins in a row.
+		for ; j < len(cx.ItemEntries) && cx.ItemEntries[j] == e; j++ {
+			items, entries, custom = append(items, cx.Items[j]), append(entries, e.Base().ID), append(custom, false)
+		}
+		c, ok := e.(*agentsession.CustomEntry)
+		if !ok {
+			continue
+		}
+		if _, ok := c.Unknown[ResponseIDMember]; !ok {
+			continue
+		}
+		if item, err := openresponses.UnmarshalItem(c.Data); err == nil && item.ItemType() == c.NS {
+			items, entries, custom = append(items, item), append(entries, c.ID), append(custom, true)
+		}
+	}
+	return items, entries, custom
 }
 
 // CallIDs returns the call ID of every function call in the session,
@@ -1525,7 +1580,7 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 // calls of the branch it continues rather than the one it left. It
 // refuses with [ErrRunActive] while a run is being written, and s must
 // be the session the recorder writes. The agent's transcript is the
-// caller's to set, with Agent.SetTranscript from s.Context().Items and
+// caller's to set, with Agent.SetTranscript from [Transcript] and
 // then Agent.SetPending from [Pending], so a call held on the branch
 // is approved as a held call and one that may have run is held to the
 // replay rule. Rebase reserves every call ID in the session, [CallIDs],
@@ -2065,12 +2120,7 @@ func (w *writer) seed(ctx context.Context, s *agentsession.Session, owed bool) e
 	}
 	w.settings = cx.Settings
 	w.wroteConfig = hasConfig(cx.Entries)
-	w.items = make([]string, len(cx.ItemEntries))
-	for i, e := range cx.ItemEntries {
-		w.items[i] = e.Base().ID
-	}
-	w.values = append(openresponses.Items(nil), cx.Items...)
-	w.custom = make([]bool, len(w.values))
+	w.values, w.items, w.custom = transcriptOf(cx)
 	w.base = lastConfigBase(s.Path(s.Leaf()))
 	for _, e := range cx.Entries {
 		if env, ok := e.(*agentsession.EnvEntry); ok {
@@ -3230,14 +3280,24 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 	var entry agentsession.Entry
 	// An item the filter in force drops never reached the model, so it
 	// is outside the context and outside the item entries; the hidden
-	// mark is about a renderer and adds nothing to it.
-	appOnly := responseID == "" && len(w.filter()(agentturn.Transcript{item})) == 0
+	// mark is about a renderer and adds nothing to it. A model's output
+	// item the filter drops, an adapter's extension item kept from the
+	// others, is the same, and names its response beside it.
+	appOnly := len(w.filter()(agentturn.Transcript{item})) == 0
 	if appOnly {
 		raw, err := json.Marshal(item)
 		if err != nil {
 			return fmt.Errorf("session: encode %s item: %w", item.ItemType(), err)
 		}
-		entry = &agentsession.CustomEntry{NS: item.ItemType(), Data: raw}
+		c := &agentsession.CustomEntry{NS: item.ItemType(), Data: raw}
+		if responseID != "" {
+			id, err := json.Marshal(responseID)
+			if err != nil {
+				return fmt.Errorf("session: encode response ID: %w", err)
+			}
+			c.Unknown = map[string]json.RawMessage{ResponseIDMember: id}
+		}
+		entry = c
 	} else {
 		e := &agentsession.ItemEntry{Item: item, ResponseID: responseID}
 		if hidden {
@@ -3869,6 +3929,11 @@ func foldCall(f compact.Fold) (FoldCall, error) {
 func (w *writer) foldSplitOf(f compact.Fold) (int, bool, error) {
 	if f.First != nil {
 		if f.Split >= 0 && f.Split < len(w.values) && w.values[f.Split] == f.First {
+			return f.Split, true, nil
+		}
+		if f.Split >= 0 && f.Split < len(w.values) && w.custom[f.Split] && equalJSON(w.values[f.Split], f.First) {
+			// A model's output item the filter hid, which the agent
+			// was seeded with from a decoding of its own.
 			return f.Split, true, nil
 		}
 		at, n := -1, 0

@@ -244,6 +244,121 @@ func TestAppOnlyItemsBecomeCustomEntries(t *testing.T) {
 	verifyAll(t, s2)
 }
 
+// rawThenText answers every request with an extension item of its own,
+// one kept from other adapters, and then a message.
+type rawThenText struct{}
+
+func (rawThenText) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	raw := &openresponses.UnknownItem{Type: "hermes:raw", Raw: json.RawMessage(`{"type":"hermes:raw","text":"<tool_call>"}`)}
+	if err := em.Item(raw); err != nil {
+		return err
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("done"); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestFilteredModelOutputKeepsHashes pins #202: a model's output item
+// the filter keeps from the model is written as a custom entry naming
+// its response, as an app-only input is, so the path rebuilds the
+// input that was sent and every response keeps its hash; Transcript
+// puts it back where the loop held it, after a round trip through the
+// store's encoding too, and an agent resumed from AgentOptions goes on
+// hashing. A filter that shows it to the model writes an item entry.
+func TestFilteredModelOutputKeepsHashes(t *testing.T) {
+	cases := []struct {
+		name   string
+		filter func(agentturn.Transcript) agentturn.Transcript
+		// want is the entry each raw item is written as.
+		want string
+	}{
+		{name: "kept from the model", want: "custom"},
+		{name: "shown to the model", filter: agentturn.VisibleFilter("hermes:raw"), want: "item:hermes:raw*"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(ctx, store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := agentturn.Config{Model: rawThenText{}, ModelName: "m", Filter: tc.filter}
+			a := agentturn.New(cfg)
+			unsub := rec.Attach(a)
+			for _, text := range []string{"one", "two"} {
+				if _, err := a.Prompt(ctx, openresponses.UserText(text)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			unsub()
+			var written []string
+			for _, e := range s.Entries() {
+				switch e := e.(type) {
+				case *agentsession.CustomEntry:
+					if e.NS != "hermes:raw" {
+						continue
+					}
+					var id string
+					if err := json.Unmarshal(e.Unknown[ResponseIDMember], &id); err != nil || id == "" {
+						t.Errorf("custom entry names no response: %s", e.Unknown[ResponseIDMember])
+					}
+					written = append(written, "custom")
+				case *agentsession.ItemEntry:
+					if e.Item.ItemType() == "hermes:raw" {
+						written = append(written, "item:hermes:raw*")
+					}
+				}
+			}
+			if strings.Join(written, " ") != tc.want+" "+tc.want {
+				t.Errorf("raw items written as %q, want %s each", written, tc.want)
+			}
+			verifyAll(t, s)
+
+			// The transcript holds every item the loop held, in order,
+			// from the store's encoding as from the session.
+			want := a.State().Transcript
+			read, err := store.Read(ctx, s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, from := range []*agentsession.Session{s, read} {
+				items, err := Transcript(from)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !equalJSON(items, want) {
+					got, _ := json.Marshal(items)
+					t.Errorf("transcript = %s", got)
+				}
+			}
+
+			rec2, s2, err := Resume(ctx, store, s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts, err := AgentOptions(s2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := agentturn.New(cfg, opts...)
+			defer rec2.Attach(b)()
+			if _, err := b.Prompt(ctx, openresponses.UserText("three")); err != nil {
+				t.Fatal(err)
+			}
+			if n := verifyAll(t, s2); n != 3 {
+				t.Errorf("responses verified after resume = %d, want 3", n)
+			}
+		})
+	}
+}
+
 // slowStore delays appends of assistant items so the barrier is
 // observable.
 type slowStore struct {
