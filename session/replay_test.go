@@ -700,16 +700,25 @@ func TestRunAgainIsAlwaysDecided(t *testing.T) {
 // dispatch, key and output on the branch it left. The call may have
 // run, so Pending reads it as aborted with that dispatch's key, and the
 // replay rule runs a keyed call again under the first key and answers
-// one whose replay is unknown with the outcome unknown.
+// one whose replay is unknown with the outcome unknown. The record
+// says which: a proceed before the keyed call's second dispatch, and,
+// until agentsession#157, a reject before the unknown one's output.
 func TestRebaseBeforeADispatch(t *testing.T) {
 	cases := []struct {
 		name   string
 		replay agenttool.Replay
 		// runs is how many times the tool ran, each under the first key.
 		runs int
+		// verdict and reason are the decision the new path holds for the
+		// call. A call whose outcome is unknown is answered without
+		// running, and the format reads an answer after no dispatch on
+		// the path as an error, so the recorder writes a reject, which
+		// says the call never reached its tool; agentsession#157 asks
+		// that the dispatch on the other branch satisfy the answer rule.
+		verdict, reason string
 	}{
-		{"keyed runs again under the first key", agenttool.ReplayKeyed, 2},
-		{"unknown is not run again", agenttool.ReplayUnknown, 1},
+		{"keyed runs again under the first key", agenttool.ReplayKeyed, 2, agentsession.VerdictProceed, agentturn.RunAgainKeyedReason},
+		{"unknown is not run again", agenttool.ReplayUnknown, 1, agentsession.VerdictReject, "Error: outcome unknown: "},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -769,8 +778,15 @@ func TestRebaseBeforeADispatch(t *testing.T) {
 					t.Errorf("keys = %q, want %q each time", keys, first)
 				}
 			}
-			if c := callsOf(t, s)["charge"]; c == nil || c.Output == nil {
-				t.Errorf("call on the new path = %+v", c)
+			c = callsOf(t, s)["charge"]
+			if c == nil || c.Output == nil {
+				t.Fatalf("call on the new path = %+v", c)
+			}
+			if len(c.Decisions) != 1 || c.Decisions[0].Verdict != tc.verdict || !strings.HasPrefix(c.Decisions[0].Reason, tc.reason) {
+				for _, d := range c.Decisions {
+					t.Logf("decision %s by %s: %q", d.Verdict, d.By, d.Reason)
+				}
+				t.Errorf("decisions on the new path = %d, want one %s with reason %q", len(c.Decisions), tc.verdict, tc.reason)
 			}
 			if err := s.VerifyRecords(s.Leaf()); err != nil {
 				t.Errorf("verify records: %v", err)

@@ -2925,6 +2925,17 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 			// no tool has or arguments that are not an object, has the
 			// same shape with the loop as the decider: it refused the
 			// call before any tool, which is a policy's refusal.
+			//
+			// Known gap: a call whose dispatch is on another branch of
+			// the session, after a rebase to an entry between the call
+			// and its dispatch, has this shape too, though it may have
+			// run, and Pending reads it so. Its answer, outcome unknown,
+			// would be an answer decision, but the format checks an
+			// answer against a dispatch on the path alone and refuses
+			// it, and a second dispatch would say the tool was handed
+			// the call again when it was not. The reject stays until
+			// the format lets a dispatch anywhere in the session
+			// satisfy the answer rule (agentsession#157).
 			by := agentturn.DeciderFromContext(ctx, out.CallID)
 			if c.settledRun != "" && c.settledRun == w.run || w.withheld {
 				// The loop refused it, whoever approved it: a call

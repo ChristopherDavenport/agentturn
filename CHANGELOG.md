@@ -149,7 +149,12 @@ versions may break the API.
   anywhere in the session as `PendingAborted`, with the key and the
   arguments of the last such dispatch, so a keyed call runs again under
   its first key and one whose replay is unknown is answered with the
-  outcome unknown; a held call with one is `Dispatched` (#185).
+  outcome unknown; a held call with one is `Dispatched`. Known gap: the
+  recorder writes that outcome-unknown answer after a `reject`, which
+  says the call never reached its tool, since the format checks an
+  `answer` against a dispatch on the path alone;
+  [agentsession#157](https://github.com/ChristopherDavenport/agentsession/issues/157)
+  asks that a dispatch anywhere in the session satisfy it (#185).
 - **An approved deferred call runs the arguments it was held with.** A
   `BeforeToolCall` decision that rewrote a call's arguments and
   deferred it left `PendingCall.Args` nil, and `Approve` ran the
