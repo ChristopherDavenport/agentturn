@@ -107,6 +107,17 @@ versions may break the API.
   arguments of the last such dispatch, so a keyed call runs again under
   its first key and one whose replay is unknown is answered with the
   outcome unknown; a held call with one is `Dispatched` (#185).
+- **An approved deferred call runs the arguments it was held with.** A
+  `BeforeToolCall` decision that rewrote a call's arguments and
+  deferred it left `PendingCall.Args` nil, and `Approve` ran the
+  model's arguments, which nobody had decided on. The pending list now
+  carries the rewritten arguments on `Args` for a deferred call, as it
+  does for a dispatched one, so `Approve` runs what was decided and
+  `ApproveWith` still overrides. The session recorder writes them on
+  the `hold` decision and `session.Pending` gives them back after a
+  restart; a decision that runs other arguments than those in force on
+  the path writes its own, so the path says what ran. The recorder
+  compares arguments as JSON values, its keys in any order (#186).
 
 ## v0.0.12 - 2026-09-29
 

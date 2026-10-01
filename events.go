@@ -575,10 +575,13 @@ type PendingCall struct {
 	// approval of the call through [Agent.Resume] runs it with this
 	// key unless the answer carries its own.
 	IdempotencyKey string
-	// Args are the arguments that hand-off gave the tool, for a call
-	// that may have run, which a decision may have rewritten; nil when
-	// they are the call's own or it was not handed over. An approval
-	// runs it again with them unless the answer carries its own.
+	// Args are the arguments the call runs with when it is approved:
+	// for a call that may have run, those its last hand-off gave the
+	// tool, and for a deferred one, those the decision that held it
+	// rewrote them to, so an approval runs what was decided on. They
+	// are nil when they are the call's own, or the call was neither
+	// handed over nor rewritten. An approval runs the call with them
+	// unless the answer carries its own.
 	Args json.RawMessage
 }
 

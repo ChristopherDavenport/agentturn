@@ -508,8 +508,10 @@ type runner struct {
 	// response, so the next turn_start can name what was appended since.
 	mark int
 	// deferred holds the IDs of the calls a hook handed to the caller
-	// during this run, so the run end can say why they are pending.
-	deferred map[string]bool
+	// during this run, so the run end can say why they are pending,
+	// each with the arguments it was held with, which its decision may
+	// have rewritten.
+	deferred map[string]json.RawMessage
 	// callTools holds the tool each call of this run's batches resolved
 	// to, so a pending call carries the tool a prompt asks about.
 	callTools map[string]agenttool.Tool
@@ -697,10 +699,16 @@ func (r *runner) pending() []PendingCall {
 	for i, call := range calls {
 		before, known := prior[call.CallID]
 		h, dispatched := r.dispatched[call.CallID]
+		held, deferred := r.deferred[call.CallID]
 		p := PendingCall{Call: call, Reason: PendingUnknown, Tool: r.callTools[call.CallID]}
 		switch {
-		case r.deferred[call.CallID]:
+		case deferred:
+			// A decision that rewrote the call's arguments and held it
+			// decided on those, and an approval runs them.
 			p.Reason = PendingDeferred
+			if held != nil && !sameArgs(held, orEmpty(nil, call.Arguments)) {
+				p.Args = held
+			}
 		case dispatched:
 			p.Reason, p.IdempotencyKey = PendingAborted, h.key
 			if !sameArgs(h.args, orEmpty(nil, call.Arguments)) {
@@ -1880,9 +1888,9 @@ func (r *runner) decide(p *callState, decision *ToolDecision) {
 	case Defer:
 		p.deferred = true
 		if r.deferred == nil {
-			r.deferred = map[string]bool{}
+			r.deferred = map[string]json.RawMessage{}
 		}
-		r.deferred[p.call.CallID] = true
+		r.deferred[p.call.CallID] = p.args
 	}
 }
 

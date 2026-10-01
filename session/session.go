@@ -768,8 +768,11 @@ type inboxItem struct {
 type callRecord struct {
 	// entry is the ID of the item entry holding the call.
 	entry string
-	// args are the arguments as the model wrote them.
-	args string
+	// args are the arguments as the model wrote them, and decided those
+	// the last decision on the path that rewrote them gave it, "" when
+	// none did.
+	args    string
+	decided string
 	// held is set while the latest decision is a hold that nothing has
 	// answered; dispatched once a dispatch is written; rejected once a
 	// reject is; ended once an answer decision is, which only the
@@ -1046,6 +1049,10 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 		}
 		var args string
 		switch {
+		case p.Reason == agentturn.PendingDeferred && !p.Dispatched:
+			// A held call runs, when approved, with the arguments the
+			// decision that held it gave it.
+			args = c.Args()
 		case !p.MayHaveRun():
 		case off != nil:
 			p.IdempotencyKey, args = off.IdempotencyKey(), off.DispatchedArgs()
@@ -1054,7 +1061,7 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 		default:
 			args = c.Args()
 		}
-		if args != "" && args != c.Call.Arguments {
+		if args != "" && !sameJSON(json.RawMessage(args), c.Call.Arguments) {
 			p.Args = json.RawMessage(args)
 		}
 		out = append(out, p)
@@ -1814,8 +1821,12 @@ func callRecordOf(c *agentsession.Call, h agentsession.Header) *callRecord {
 	if c.Output != nil {
 		return &callRecord{entry: c.Entry.Base().ID, args: c.Call.Arguments, dispatched: len(c.Dispatches) > 0, answered: true}
 	}
+	decided := c.Args()
+	if sameJSON(json.RawMessage(decided), c.Call.Arguments) {
+		decided = ""
+	}
 	return &callRecord{
-		entry: c.Entry.Base().ID, args: c.Call.Arguments,
+		entry: c.Entry.Base().ID, args: c.Call.Arguments, decided: decided,
 		held: c.Held(), dispatched: len(c.Dispatches) > 0, rejected: c.Rejected(), ended: c.Answered(),
 		unknown: c.State(h) == agentsession.CallUnknown,
 	}
@@ -3000,15 +3011,25 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 		case agentturn.Defer:
 			// The reason is which rule raised the prompt, which is what
 			// an auditor asks of a hold; the model never sees it.
+			// The arguments are those the call is held with, which the
+			// decision may have rewritten, so an approval after a
+			// restart runs what was decided on.
 			hold := agentsession.NewDecision(e.CallID, c.entry, agentsession.VerdictHold, by)
 			if d.Reason != "" {
 				hold.WithReason(d.Reason)
+			}
+			carried := c.carries(e.Args)
+			if carried {
+				hold.WithArgs(e.Args)
 			}
 			if _, err := w.append(ctx, hold); err != nil {
 				return err
 			}
 			w.takeUp(e.CallID)
 			c.held = true
+			if carried {
+				c.decided = string(e.Args)
+			}
 			return nil
 		}
 	}
@@ -3019,10 +3040,11 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 	// always a decision; one with no reason is written when it is
 	// dispatched, so a call the loop then refuses has no proceed.
 	reason := decisionReason(d)
-	if rewritten := !sameJSON(e.Args, c.args); c.held || rewritten || reason != "" {
+	if rewritten := c.carries(e.Args); c.held || rewritten || reason != "" {
 		dec := agentsession.NewDecision(e.CallID, c.entry, agentsession.VerdictProceed, by)
 		if rewritten {
 			dec.WithArgs(e.Args)
+			c.decided = string(e.Args)
 		}
 		if reason != "" {
 			dec.WithReason(reason)
@@ -3088,8 +3110,18 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 	return nil
 }
 
+// carries reports whether a decision that runs or holds the call with
+// args must write them: they are not the model's, or not those an
+// earlier decision on the path put in force, which a decision without
+// arguments would leave in force.
+func (c *callRecord) carries(args json.RawMessage) bool {
+	return !sameJSON(args, c.args) || c.decided != "" && !sameJSON(args, c.decided)
+}
+
 // sameJSON reports whether two argument strings are the same object,
 // an empty string standing for the empty object as the loop reads it.
+// They are compared as values, so a store that hands them back with
+// their keys sorted hands back the same arguments.
 func sameJSON(a json.RawMessage, b string) bool {
 	if len(a) == 0 {
 		a = json.RawMessage("{}")
@@ -3097,11 +3129,12 @@ func sameJSON(a json.RawMessage, b string) bool {
 	if b == "" {
 		b = "{}"
 	}
-	var ca, cb bytes.Buffer
-	if json.Compact(&ca, a) != nil || json.Compact(&cb, []byte(b)) != nil {
+	va, okA := decodeValue(a)
+	vb, okB := decodeValue([]byte(b))
+	if !okA || !okB {
 		return string(a) == b
 	}
-	return ca.String() == cb.String()
+	return reflect.DeepEqual(va, vb)
 }
 
 func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
@@ -3611,8 +3644,17 @@ func jsonValue(v any) (any, bool) {
 	if err != nil {
 		return nil, false
 	}
+	return decodeValue(data)
+}
+
+// decodeValue decodes data as a generic JSON value, keeping numbers as
+// written, so two integers past float64's precision are not taken for
+// the same one.
+func decodeValue(data []byte) (any, bool) {
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.UseNumber()
 	var out any
-	if err := json.Unmarshal(data, &out); err != nil {
+	if err := d.Decode(&out); err != nil || d.More() {
 		return nil, false
 	}
 	return out, true

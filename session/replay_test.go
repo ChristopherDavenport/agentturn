@@ -779,3 +779,83 @@ func TestRebaseBeforeADispatch(t *testing.T) {
 		})
 	}
 }
+
+// TestHeldRewriteSurvivesARestart pins the recorder half of #186: a
+// decision that rewrites a call's arguments and holds it writes them on
+// the hold, Pending gives them back after a restart, and an approval
+// runs them; one that runs other arguments writes those on its proceed,
+// so the path says what ran.
+func TestHeldRewriteSurvivesARestart(t *testing.T) {
+	cases := []struct {
+		name    string
+		answer  func(callID string) agentturn.Answer
+		wantRan string
+	}{
+		{"approve runs the rewrite", agentturn.Approve, "safe"},
+		{"approve with the model's arguments runs them", func(id string) agentturn.Answer {
+			return agentturn.ApproveWith(id, json.RawMessage(`{"text":"go"}`))
+		}, "go"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			var ran []string
+			sh := agenttool.New("sh", "", func(_ context.Context, a echoArgs) (string, error) {
+				ran = append(ran, a.Text)
+				return "ok", nil
+			})
+			tools := []agenttool.Tool{sh}
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(ctx, store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: tools,
+				BeforeToolCall: func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+					return &agentturn.ToolDecision{Action: agentturn.Defer, Args: json.RawMessage(`{"text":"safe"}`), Reason: "confirm"}, nil
+				}})
+			unsub := rec.Attach(a)
+			end, err := a.Prompt(ctx, openresponses.UserText("go"))
+			if err != nil || end.Reason != agentturn.ReasonInputRequired {
+				t.Fatalf("prompt: err=%v end=%+v", err, end)
+			}
+			unsub()
+			c := callsOf(t, s)["sh"]
+			if c == nil || len(c.Decisions) != 1 || c.Decisions[0].Verdict != agentsession.VerdictHold || string(c.Decisions[0].Args) != `{"text":"safe"}` {
+				t.Fatalf("hold = %+v", c)
+			}
+
+			rec2, s2, err := Resume(ctx, store, s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			pending, err := Pending(s2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(pending) != 1 || pending[0].Reason != agentturn.PendingDeferred || string(pending[0].Args) != `{"text":"safe"}` {
+				t.Fatalf("pending = %+v", pending)
+			}
+			opts, err := AgentOptions(s2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: tools}, opts...)
+			defer rec2.Attach(b)()
+			if end, err := b.Resume(ctx, tc.answer(pending[0].Call.CallID).WithBy(agentsession.ByHuman)); err != nil || end.Reason != agentturn.ReasonDone {
+				t.Fatalf("resume: err=%v end=%+v", err, end)
+			}
+			if len(ran) != 1 || ran[0] != tc.wantRan {
+				t.Fatalf("ran = %q, want %q", ran, tc.wantRan)
+			}
+			c = callsOf(t, s2)["sh"]
+			if c == nil || c.DispatchedArgs() != `{"text":"`+tc.wantRan+`"}` {
+				t.Errorf("dispatched args = %s, want the ones that ran", c.DispatchedArgs())
+			}
+			if err := s2.VerifyRecords(s2.Leaf()); err != nil {
+				t.Errorf("verify records: %v", err)
+			}
+			verifyAll(t, s2)
+		})
+	}
+}
