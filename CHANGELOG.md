@@ -196,7 +196,11 @@ versions may break the API.
   it is now, so after the parent moved it wrote nothing. RFC 0001 does
   not inherit an environment through `parent_session`. `Recorder.Env`
   now compares with the child's own entry. It costs one entry per child
-  session. (#197)
+  session. A recorder seeded from a path, by `Resume`, `Rebase` or a
+  child's second run under its call, now takes the last env entry on
+  the whole path, not only in the context, so after a compaction it no
+  longer writes the env again at the next run start, or copies a
+  child's parent's env over the node the child had moved to. (#197)
 - **A model's output item the filter keeps from the model no longer
   stops the request hashes.** The recorder wrote such an item, an
   adapter's extension item kept from other adapters by `DefaultFilter`,

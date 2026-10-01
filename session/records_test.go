@@ -1756,3 +1756,87 @@ func TestFoldedCallIDsStayReserved(t *testing.T) {
 		})
 	}
 }
+
+// TestEnvSurvivesACompaction pins the review of #197: the env in force
+// is the last on the path, one a compaction left out of the context
+// included, so a child reseeded for a second run under its call is
+// under the node it moved to, not its parent's copied in again, and a
+// root resumed after a compaction writes no second copy of its env.
+func TestEnvSurvivesACompaction(t *testing.T) {
+	ctx := context.Background()
+	envOn := func(node string) *agentsession.EnvEntry {
+		e := agentsession.NewEnvEntry("/work")
+		if err := e.SetWorkspace(agentsession.WorkspaceContainer, "sandbox").SetMember("node", node); err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	env := func(context.Context) (*agentsession.EnvEntry, error) { return envOn("node-1"), nil }
+	cases := []struct {
+		name string
+		// child writes the env and the compaction in a child session,
+		// which has moved to node-2; otherwise in the root.
+		child bool
+		want  string
+	}{
+		{name: "a reseeded child", child: true, want: "node-2"},
+		{name: "a resumed root", want: "node-1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(ctx, store, agentsession.Header{}, WithEnv(env))
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, written := s.ID(), envOn("node-1")
+			const callID = "call_x"
+			if tc.child {
+				if err := rec.root.writeEnv(ctx); err != nil {
+					t.Fatal(err)
+				}
+				cs, err := store.Create(ctx, agentsession.Header{ParentSession: s.ID(), ID: agentsession.SubsessionID(s.ID(), callID), SpawnedBy: callID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				id, written = cs.ID(), envOn("node-2")
+			}
+			var kept string
+			for i, e := range []agentsession.Entry{written, &agentsession.ItemEntry{Item: openresponses.UserText("one")}, &agentsession.ItemEntry{Item: openresponses.UserText("two")}} {
+				at, err := store.Append(ctx, id, e)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if i == 2 {
+					kept = at
+				}
+			}
+			if _, err := store.Append(ctx, id, &agentsession.CompactionEntry{FirstKept: kept, Summary: openresponses.UserText("summary")}); err != nil {
+				t.Fatal(err)
+			}
+
+			var w *writer
+			if tc.child {
+				if w, err = rec.newChild(ctx, rec.root, callID, false); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				rec2, _, err := Resume(ctx, store, id, WithEnv(env))
+				if err != nil {
+					t.Fatal(err)
+				}
+				w = rec2.root
+			}
+			if err := w.runStart(ctx, &agentturn.RunStart{RunID: "run_2", Source: agentturn.SourceInput}); err != nil {
+				t.Fatal(err)
+			}
+			got, err := store.Open(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if nodes := envNodes(got.Entries()); nodes != tc.want {
+				t.Errorf("env entries = %q, want %q alone", nodes, tc.want)
+			}
+		})
+	}
+}

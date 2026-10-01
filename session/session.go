@@ -47,14 +47,13 @@
 //     when one names one of the three, and, when the recorder knows
 //     the agent's configuration ([Recorder.Attach] and [WithConfig]
 //     give it one), the hash of its base request as
-//     [ConfigBaseMember]; then, for
-//     the recorder's own session, the env entry [WithEnv] supplies
-//     when it differs from the last one written, members the library
-//     does not define included, and for a child session that holds
-//     none, the env in force in its parent's; then, with a
-//     configuration, a full
-//     config entry before the first item, so a root starts with one as
-//     the format recommends, and a delta when the configuration
+//     [ConfigBaseMember]; then, with [WithEnv], for the recorder's own
+//     session, the env entry it supplies when it differs from the last
+//     one on the path, members the library does not define included,
+//     and for a child session that holds none, a copy of the env in
+//     force in its parent's; then, with a configuration, a full config
+//     entry before the first item, so a root starts with one as the
+//     format recommends, and a delta when the configuration
 //     changed since the last run, so the items a new configuration's
 //     BeforeTurn appends are filed under it. A recorder seeded from a
 //     path, by [Resume], a [Start] on a based header,
@@ -2231,7 +2230,10 @@ func (w *writer) seed(ctx context.Context, s *agentsession.Session, owed bool) e
 	w.wroteConfig = hasConfig(cx.Entries)
 	w.values, w.items, w.custom = transcriptOf(cx)
 	w.base = lastConfigBase(s.Path(s.Leaf()))
-	for _, e := range cx.Entries {
+	// The env in force is the last on the path, one a compaction left
+	// out of the context included: an env entry contributes nothing to
+	// it, and still says where the calls after it ran.
+	for _, e := range s.Path(s.Leaf()) {
 		if env, ok := e.(*agentsession.EnvEntry); ok {
 			w.env = env
 		}
