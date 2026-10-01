@@ -1541,6 +1541,11 @@ type callState struct {
 	// read by the loop after the executor has drained.
 	key        string
 	dispatched bool
+	// after is the call before this one in its chain, whose settling
+	// this one's dispatch waits for, and done is closed once the loop
+	// has settled this call's result, when a later call waits for it.
+	after *callState
+	done  chan struct{}
 }
 
 // toolBatch runs the calls of a turn: preflight in order, execute,
@@ -1702,6 +1707,13 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 		byID[p.call.CallID] = p
 	}
 	exec := r.executor(func(job agenttool.Job) *callState { return byID[job.Call.ID] })
+	for i, before := range chainBefore(exec, jobs) {
+		if before >= 0 {
+			prev := batch[jobIndex[before]]
+			prev.done = make(chan struct{})
+			batch[jobIndex[i]].after = prev
+		}
+	}
 	// The batch has a context of its own, so a failure can stop the
 	// tools, with the failure as the cause a tool reads, and the
 	// executor still be drained: every result it holds is received,
@@ -1717,8 +1729,8 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 	// result goes through it as any other, since the hook is the point
 	// past which nobody sees what a tool returned.
 	hookFailed := false
-	for ev := range exec.Execute(bctx, jobs) {
-		p := batch[jobIndex[ev.Index]]
+	// step handles one event of the batch on the loop's goroutine.
+	step := func(p *callState, ev agenttool.Event) {
 		if failed != nil {
 			if ev.Final && p.dispatchErr != nil {
 				r.markUndispatched(p)
@@ -1726,7 +1738,7 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 			if !ev.Final || isCancellation(ev.Err, bctx) || hookFailed || p.dispatchErr != nil {
 				// Cut, or nothing to end yet: failBatch ends what
 				// has not ended once the drain is over.
-				continue
+				return
 			}
 			// A result of the call's own, before the cancellation
 			// reached it: settled through the hook, and cut if the
@@ -1737,7 +1749,7 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 				p.cut, p.err, p.result = true, serr, agenttool.Result{}
 				_ = r.finish(p)
 			}
-			continue
+			return
 		}
 		var err error
 		if ev.Final {
@@ -1749,7 +1761,7 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 				r.markUndispatched(p)
 				failed = p.dispatchErr
 				cancel(failed)
-				continue
+				return
 			}
 			p.result, p.err = ev.Result, ev.Err
 			p.settled = true
@@ -1763,6 +1775,15 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 		if err != nil {
 			failed = err
 			cancel(err)
+		}
+	}
+	for ev := range exec.Execute(bctx, jobs) {
+		p := batch[jobIndex[ev.Index]]
+		step(p, ev)
+		if ev.Final && p.done != nil {
+			// Settled, or cut: the next call of its chain may be
+			// dispatched.
+			close(p.done)
 		}
 	}
 	// The executor has drained, so every dispatch it made has been
@@ -1827,15 +1848,32 @@ func isCancellation(err error, ctx context.Context) bool {
 // fails on the event stops the job, which the executor completes with
 // that error, so the tool does not run after a dispatch nobody could
 // record.
+//
+// The executor starts a chain's next job once the loop has received
+// the last one's result, before the loop has settled it, so the
+// callback first waits for that: AfterToolCall, and whatever a hook
+// writes there, lands before the next call of the chain is dispatched.
+// The loop's goroutine does the settling and waits on nothing of the
+// job's, so the wait ends; a batch cut off meanwhile ends it with the
+// cancellation, as for a job whose turn never came.
 func (r *runner) executor(find func(agenttool.Job) *callState) agenttool.Executor {
 	return agenttool.Executor{
 		MaxParallel: r.cfg.MaxParallelTools,
 		Sequential:  r.cfg.ToolExecution == ExecSequential,
 		Recorder:    r.cfg.ToolRecorder,
-		OnStart: func(_ context.Context, job agenttool.Job) error {
+		OnStart: func(ctx context.Context, job agenttool.Job) error {
 			p := find(job)
 			if p == nil {
 				return nil
+			}
+			if p.after != nil {
+				select {
+				case <-p.after.done:
+				case <-ctx.Done():
+				}
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 			}
 			err := r.emit(&ToolDispatch{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Parent: p.parent, IdempotencyKey: p.key})
 			// Remembered on the call itself: the executor hands the
@@ -1848,6 +1886,35 @@ func (r *runner) executor(find func(agenttool.Job) *callState) agenttool.Executo
 			return err
 		},
 	}
+}
+
+// chainBefore returns, for each job, the index of the job before it in
+// its chain, or -1 for the first: every job of a serial batch follows
+// the one before it, and otherwise a job follows the last one naming
+// its resource. It is how exec orders a batch.
+func chainBefore(exec agenttool.Executor, jobs []agenttool.Job) []int {
+	serial := exec.Sequential || exec.MaxParallel == 1
+	for _, job := range jobs {
+		serial = serial || (job.Tool != nil && agenttool.IsSequential(job.Tool))
+	}
+	before := make([]int, len(jobs))
+	last := map[string]int{}
+	for i, job := range jobs {
+		before[i] = -1
+		if serial {
+			before[i] = i - 1
+			continue
+		}
+		if job.Tool == nil || agenttool.ResourceOf(job.Tool) == "" {
+			continue
+		}
+		res := agenttool.ResourceOf(job.Tool)
+		if at, ok := last[res]; ok {
+			before[i] = at
+		}
+		last[res] = i
+	}
+	return before
 }
 
 // collect appends the outputs in the model's order, then the notes the

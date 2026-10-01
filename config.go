@@ -242,6 +242,13 @@ type Config struct {
 	// the model sees, not for saving space. One result at a time
 	// reaches it, whichever goroutine finished the call, as for
 	// BeforeToolCall.
+	//
+	// The next call of the call's chain, every later call of a serial
+	// batch or the next call naming the same agenttool.Resource, is not
+	// dispatched until the hook has returned, so state the hook changes
+	// or captures, a checkpoint or a recorded move of the workspace,
+	// falls between the two. A call in another chain may run alongside
+	// it.
 	AfterToolCall func(context.Context, ToolResultInfo) (*ToolOverride, error)
 	// ShouldStopAfterTurn ends the run after a turn even when the model
 	// requested tools: true ends it with ReasonStopped and StopHook. An

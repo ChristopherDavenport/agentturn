@@ -1620,6 +1620,11 @@ func (r *Recorder) Annotate(ctx context.Context, ns string, data any) (string, e
 // of the call that hook ran for, so that call stays under the earlier
 // env, and the move applies from the next dispatch on. So does one a
 // tool writes, since the tool's own dispatch is written before it runs.
+// The loop dispatches the next call of a chain, a serial batch or the
+// calls sharing a resource, only once AfterToolCall has settled the one
+// before it, so that call lands under the entry; a call of another
+// chain may run alongside the hook, and its dispatch may land on
+// either side.
 func (r *Recorder) Env(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

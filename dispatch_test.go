@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/openresponses"
@@ -268,5 +270,94 @@ func TestDistinctDispatchFailuresCutEveryCall(t *testing.T) {
 	}
 	if starts, ends, unpaired := pairing(events); starts != 2 || ends != 2 || len(unpaired) != 0 {
 		t.Errorf("pairing: starts=%d ends=%d unpaired=%v", starts, ends, unpaired)
+	}
+}
+
+// TestChainWaitsForAfterToolCall pins #196: the next call of a chain,
+// a serial batch or calls sharing a resource, is dispatched only once
+// AfterToolCall has settled the call before it, so what the hook
+// records lands between the two. Calls in chains of their own wait for
+// nothing, and a hook that fails cuts the chain rather than hanging it.
+func TestChainWaitsForAfterToolCall(t *testing.T) {
+	cases := []struct {
+		name  string
+		names []string
+		// opts are the options of every tool.
+		opts []agenttool.Option
+		exec ExecutionMode
+		max  int
+		// ordered says each call follows the one before it.
+		ordered bool
+		// fail makes the hook fail on the first call.
+		fail bool
+	}{
+		{name: "sequential", names: []string{"a", "b"}, exec: ExecSequential, ordered: true},
+		{name: "one at a time", names: []string{"a", "b", "c"}, max: 1, ordered: true},
+		{name: "shared resource", names: []string{"a", "b", "c"}, opts: []agenttool.Option{agenttool.WithResource("shell")}, ordered: true},
+		{name: "sequential tool", names: []string{"a", "b"}, opts: []agenttool.Option{agenttool.WithSequential()}, ordered: true},
+		{name: "chains of their own", names: []string{"a", "b"}},
+		{name: "hook fails", names: []string{"a", "b"}, exec: ExecSequential, fail: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var seq []string
+			log := func(s string) {
+				mu.Lock()
+				defer mu.Unlock()
+				seq = append(seq, s)
+			}
+			var tools []agenttool.Tool
+			for _, name := range tc.names {
+				tools = append(tools, agenttool.New(name, "", func(context.Context, echoArgs) (string, error) {
+					log("tool:" + name)
+					return name, nil
+				}, tc.opts...))
+			}
+			after := func(_ context.Context, info ToolResultInfo) (*ToolOverride, error) {
+				log("after:" + info.Call.Name)
+				// Long enough for a call dispatched alongside the hook
+				// to show up inside it.
+				time.Sleep(20 * time.Millisecond)
+				if tc.fail {
+					return nil, errors.New("checkpoint failed")
+				}
+				log("settled:" + info.Call.Name)
+				return nil, nil
+			}
+			a := New(Config{Model: callsNamed{names: tc.names}, Tools: tools, ToolExecution: tc.exec, MaxParallelTools: tc.max, AfterToolCall: after, MaxTurns: 1})
+			a.Subscribe(func(_ context.Context, ev Event) error {
+				if e, ok := ev.(*ToolDispatch); ok {
+					log("dispatch:" + e.Name)
+				}
+				return nil
+			})
+			end, _ := a.Prompt(context.Background(), openresponses.UserText("x"))
+			mu.Lock()
+			got := append([]string(nil), seq...)
+			mu.Unlock()
+			at := func(s string) int { return slices.Index(got, s) }
+			if tc.fail {
+				if end.Reason != ReasonError || at("dispatch:b") >= 0 {
+					t.Errorf("reason=%s, order %v", end.Reason, got)
+				}
+				return
+			}
+			if end.Reason != ReasonStopped && end.Reason != ReasonDone {
+				t.Fatalf("reason=%s err=%v", end.Reason, end.Err)
+			}
+			for i, name := range tc.names {
+				if at("settled:"+name) < 0 {
+					t.Errorf("%s not settled: %v", name, got)
+				}
+				if !tc.ordered || i == 0 {
+					continue
+				}
+				prev := tc.names[i-1]
+				if !(at("settled:"+prev) < at("dispatch:"+name) && at("dispatch:"+name) < at("tool:"+name)) {
+					t.Errorf("%s dispatched before %s settled: %v", name, prev, got)
+				}
+			}
+		})
 	}
 }

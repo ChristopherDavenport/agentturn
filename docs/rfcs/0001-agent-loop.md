@@ -567,7 +567,11 @@ tool serialising the batch, a shared resource serialising its calls,
 cancellation waited for. A `tool_dispatch` is raised as each call is
 handed to its tool, after it has taken a slot in the bound and its turn
 in a serial batch or a resource chain, and before the tool runs; a call
-the cut reaches first never reached a tool and raises none. It is
+the cut reaches first never reached a tool and raises none. Its turn in
+a chain comes once the call before it has been settled, the after-call
+hook included, not merely completed, so what that hook changes or
+records lands before the next call of the chain is dispatched; a call
+of another chain is not held for it. It is
 raised on the call's own goroutine, serialised with the run's events,
 and the executor waits on it, so a recorder has the dispatch durable
 before the side effect. A consumer that fails on it stops the call

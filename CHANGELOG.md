@@ -40,6 +40,16 @@ versions may break the API.
   call is refused as before. The session recorder writes a nested call
   allowed with a reason as `proceed`, as it does a model's call, so an
   approval is on the record with who gave it (#200).
+- **The next call of a chain is dispatched only once `AfterToolCall`
+  has settled the one before it.** The executor started a serial
+  batch's next call, or the next call on the same resource, as soon as
+  the loop received the last one's result, so it was dispatched and
+  ran while the hook for the call before it was still running. A move
+  of the workspace written from the hook with `session.Recorder.Env`
+  landed after the next call's dispatch, and a checkpoint taken there
+  could hold the next call's changes. A call's dispatch now waits for
+  the settling of the call before it in its chain; calls in other
+  chains are not held (#196).
 
 ## v0.0.14 - 2026-10-01
 
