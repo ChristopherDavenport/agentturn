@@ -138,7 +138,9 @@ versions may break the API.
   model's arguments, which nobody had decided on. The pending list now
   carries the rewritten arguments on `Args` for a deferred call, as it
   does for a dispatched one, so `Approve` runs what was decided and
-  `ApproveWith` still overrides. The session recorder writes them on
+  `ApproveWith` still overrides; a resume that fails before its batch,
+  a subscriber refusing its `run_start` say, leaves the call pending
+  with them. The session recorder writes them on
   the `hold` decision and `session.Pending` gives them back after a
   restart; a decision that runs other arguments than those in force on
   the path writes its own, so the path says what ran. The recorder

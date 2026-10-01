@@ -402,6 +402,46 @@ func TestApproveRunsTheDecidedArgs(t *testing.T) {
 	}
 }
 
+// TestDecidedArgsOutliveAFailedResume pins #186 for a resume that
+// fails before its batch: a subscriber that refuses the resume's
+// run_start leaves the call held with the arguments the decision
+// rewrote, and the next Approve runs them, not the model's.
+func TestDecidedArgsOutliveAFailedResume(t *testing.T) {
+	var ran string
+	tool := agenttool.New("upper", "", func(_ context.Context, a echoArgs) (string, error) {
+		ran = a.Text
+		return strings.ToUpper(a.Text), nil
+	})
+	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{tool},
+		BeforeToolCall: func(context.Context, ToolCallInfo) (*ToolDecision, error) {
+			return &ToolDecision{Action: Defer, Args: json.RawMessage(`{"text":"safe"}`)}, nil
+		}})
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil {
+		t.Fatal(err)
+	}
+	id := a.State().Pending[0].Call.CallID
+	unsub := a.Subscribe(func(_ context.Context, ev Event) error {
+		if _, ok := ev.(*RunStart); ok {
+			return errors.New("subscriber down")
+		}
+		return nil
+	})
+	if end, _ := a.Resume(context.Background(), Approve(id)); end.Reason != ReasonError {
+		t.Fatalf("failed resume ended %s", end.Reason)
+	}
+	unsub()
+	p := a.State().Pending[0]
+	if p.Reason != PendingDeferred || string(p.Args) != `{"text":"safe"}` {
+		t.Fatalf("pending after the failed resume = %s args %s", p.Reason, p.Args)
+	}
+	if _, err := a.Resume(context.Background(), Approve(id)); err != nil {
+		t.Fatal(err)
+	}
+	if ran != "safe" {
+		t.Errorf("tool ran with %q, want the decided arguments", ran)
+	}
+}
+
 func TestAgentPromptReturnsRunEnd(t *testing.T) {
 	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)},
 		BeforeToolCall: func(context.Context, ToolCallInfo) (*ToolDecision, error) { return &ToolDecision{Action: Defer}, nil }})

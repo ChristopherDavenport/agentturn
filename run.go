@@ -736,7 +736,10 @@ func (r *runner) pending() []PendingCall {
 		case r.undispatched[call.CallID] || mine[call] || r.approved[call.CallID]:
 			p.Reason = PendingUndispatched
 		case known:
-			p.Reason = before.Reason
+			// As the agent knew it, the arguments a decision held it
+			// with included: a resume that failed before its batch
+			// decided nothing new.
+			p.Reason, p.Dispatched, p.IdempotencyKey, p.Args = before.Reason, before.Dispatched, before.IdempotencyKey, before.Args
 		}
 		if p.Tool == nil {
 			p.Tool = before.Tool
