@@ -1246,6 +1246,36 @@ func TestFailedFoldLeavesATrace(t *testing.T) {
 	}
 }
 
+// TestFailedFoldWithAnUnhashableRequest pins the review of #177: a
+// failed fold whose request the recorder cannot hash is written all the
+// same, without the hash, rather than dropped with the hash's error.
+func TestFailedFoldWithAnUnhashableRequest(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := &openresponses.Request{Model: "small", Tools: openresponses.Tools{openresponses.NewFunctionTool("bad", "", json.RawMessage(`{`))}}
+	if _, err := RequestHash(*req); err == nil {
+		t.Fatal("the request hashes; the test needs one that does not")
+	}
+	if err := rec.Fold(context.Background(), compact.Fold{Err: errors.New("summary model down"), TokensBefore: 5, Attempts: 1, Request: req, ResponseID: "resp_1"}); err != nil {
+		t.Fatalf("fold: %v", err)
+	}
+	entries := s.Entries()
+	last, ok := entries[len(entries)-1].(*agentsession.CustomEntry)
+	if !ok || last.NS != FailedFoldNS {
+		t.Fatalf("entries = %q", entryTypes(s))
+	}
+	var data FailedFold
+	if err := json.Unmarshal(last.Data, &data); err != nil {
+		t.Fatal(err)
+	}
+	if data.Error != "summary model down" || data.RequestHash != "" || data.Model != "small" || data.ResponseID != "resp_1" || data.Attempts != 1 {
+		t.Errorf("failed fold = %+v", data)
+	}
+}
+
 // TestPinnedFoldRebuildsWhatWasSent checks what the record says about
 // a fold that kept items of the folded prefix verbatim. The compaction
 // entry carries them in its pinned member, the context algorithm puts

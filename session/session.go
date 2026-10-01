@@ -3467,10 +3467,10 @@ func errorPayload(err error) *openresponses.ErrorPayload {
 // fold entry for one that failed.
 func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 	if f.Err != nil {
-		call, err := foldCall(f)
-		if err != nil {
-			return err
-		}
+		// A request the recorder cannot hash still went out: the fold
+		// failed all the same, and its entry is written without the
+		// hash rather than not at all.
+		call, _ := foldCall(f)
 		raw, err := json.Marshal(FailedFold{Error: f.Err.Error(), TokensBefore: f.TokensBefore, Attempts: f.Attempts, FoldCall: call, Usage: f.Usage, OutputTypes: f.OutputTypes})
 		if err != nil {
 			return fmt.Errorf("session: encode failed fold: %w", err)
@@ -3524,16 +3524,18 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 
 // foldCall names the model call a fold made: the hash and model of its
 // request, when it has one, and its response ID. The request itself is
-// not kept, as it holds the whole folded prefix.
+// not kept, as it holds the whole folded prefix. When the request
+// cannot be hashed the call is returned without the hash, with the
+// error.
 func foldCall(f compact.Fold) (FoldCall, error) {
 	call := FoldCall{ResponseID: f.ResponseID}
 	if f.Request != nil {
+		call.Model = f.Request.Model
 		hash, err := RequestHash(Canonical(*f.Request))
 		if err != nil {
-			return FoldCall{}, err
+			return call, err
 		}
 		call.RequestHash = hash
-		call.Model = f.Request.Model
 	}
 	return call, nil
 }
