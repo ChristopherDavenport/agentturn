@@ -386,11 +386,12 @@ const FailedFoldNS = "agentturn:compaction_failed"
 
 // FailedFold is the data of a [FailedFoldNS] custom entry. Beyond the
 // error and the estimate that triggered the fold, it carries what the
-// fold's model calls did, as far as they got: how many there were, and
-// for the last one the members a compaction entry's [FoldMember]
-// carries (request_hash, response_id, model), its usage and the types
-// of the items it answered, so a reader can tell a model that answered
-// with no text, or with too much, from a call that never completed.
+// fold's model calls did, as far as they got: how many there were, the
+// usage of them all summed, and for the last one the members a
+// compaction entry's [FoldMember] carries (request_hash, response_id,
+// model) and the types of the items it answered, so a reader can tell
+// a model that answered with no text, or with too much, from a call
+// that never completed.
 type FailedFold struct {
 	Error        string `json:"error"`
 	TokensBefore int    `json:"tokens_before,omitempty"`

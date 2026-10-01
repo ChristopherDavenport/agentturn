@@ -1117,6 +1117,63 @@ func (callingFold) CreateStream(_ context.Context, req openresponses.Request, si
 	return em.Complete()
 }
 
+// bloatingFold answers every summary request with a summary far
+// larger than anything it folds.
+type bloatingFold struct{}
+
+func (bloatingFold) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text(strings.Repeat("and then ", 2000)); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+func TestOversizedFoldProceedsUnfolded(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := compact.NewLocal(bloatingFold{}, compact.WithBudget(40), compact.WithKeepLast(2), compact.WithOnFold(rec.Fold))
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform})
+	defer rec.Attach(a)()
+	for _, text := range []string{"one", "two", "three"} {
+		end, err := a.Prompt(context.Background(), openresponses.UserText(text))
+		if err != nil || end.Reason != agentturn.ReasonDone {
+			t.Fatalf("%s: err=%v end=%+v", text, err, end)
+		}
+	}
+	// The refused fold is on the record, and the turns it did not fold
+	// verify against the path as it is.
+	failed := 0
+	for _, e := range s.Entries() {
+		if c, ok := e.(*agentsession.CustomEntry); ok && c.NS == FailedFoldNS {
+			var data FailedFold
+			if err := json.Unmarshal(c.Data, &data); err != nil || !strings.Contains(data.Error, compact.ErrSummaryTooLarge.Error()) || data.Attempts != 2 {
+				t.Errorf("failed fold = %+v err=%v", data, err)
+			}
+			failed++
+		}
+		if _, ok := e.(*agentsession.CompactionEntry); ok {
+			t.Errorf("an oversized summary was recorded as a compaction")
+		}
+	}
+	if failed == 0 {
+		t.Fatalf("no failed fold recorded: %q", entryTypes(s))
+	}
+	if n := verifyAll(t, s); n != 3 {
+		t.Errorf("responses verified = %d", n)
+	}
+	if err := s.VerifyRecords(s.Leaf()); err != nil {
+		t.Error(err)
+	}
+}
+
 func TestFailedFoldLeavesATrace(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -1125,10 +1182,10 @@ func TestFailedFoldLeavesATrace(t *testing.T) {
 		wantAttempts int
 		wantResponse bool
 		wantTypes    string
-		wantUsage    int // output tokens; 0 for no usage
+		wantUsage    int // output tokens over every call; 0 for no usage
 	}{
 		{"the call fails", failingFold{}, "summary model down", 1, false, "", 0},
-		{"the model answers with a call twice", callingFold{}, "summary response has no text", 2, true, "function_call", 7},
+		{"the model answers with a call twice", callingFold{}, "summary response has no text", 2, true, "function_call", 14},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

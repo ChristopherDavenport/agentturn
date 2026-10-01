@@ -121,8 +121,9 @@ func WithSummaryPrompt(prompt string) Option { return func(t *Transform) { t.pro
 // MaxOutputTokens, Temperature or any other field. A replay tells the
 // fold's call from a turn by its lack of tools and instructions, so
 // leave those empty. The transform sets MaxOutputTokens to half the
-// budget before fn runs, so a summary that runs away is cut by the
-// server; fn may change or clear it. fn runs once per attempt on a
+// budget, at most [DefaultSummaryMaxOutputTokens], before fn runs, so
+// a summary that runs away is cut by the server; fn may change or
+// clear it. fn runs once per attempt on a
 // fresh request; the edited request is the one reported as
 // [Fold.Request]. [New] ignores it.
 func WithRequest(fn func(*openresponses.Request)) Option {
@@ -155,8 +156,10 @@ type Fold struct {
 	Summary openresponses.Item
 	// TokensBefore is the estimate that triggered the fold.
 	TokensBefore int
-	// Usage is what the fold's model call reported, when it did. For a
-	// fold that asked more than once, it is the last call's.
+	// Usage is what the fold's model calls reported, when they did. For
+	// a fold that asked more than once, it is the sum over every call,
+	// whether the fold then succeeded or failed: what the fold cost,
+	// not what its last call did.
 	Usage *openresponses.Usage
 	// ResponseID is the ID of the response the fold's model call
 	// produced, from either endpoint, so a recorder can tie the fold to
@@ -184,8 +187,10 @@ type Fold struct {
 	// it as the fold's own call. nil for [New], whose compaction
 	// request is not a Request.
 	Request *openresponses.Request
-	// Err is set when the fold failed; Transform returns it. A fold cut
-	// off by an abort carries the context error. A failed fold still
+	// Err is set when the fold failed; Transform returns it, save for
+	// [ErrSummaryTooLarge], after which Transform sends the transcript
+	// unfolded and returns no error. A fold cut off by an abort carries
+	// the context error. A failed fold still
 	// reports what its calls did: Usage, ResponseID, OutputTypes,
 	// Attempts and Request, as far as the calls got.
 	Err error
@@ -299,38 +304,78 @@ func itemTypes(items openresponses.Items) []string {
 // model is named by [WithModel]; leave it empty to let the server
 // pick its default. [WithRequest] edits the rest of the request.
 //
-// The summary request's MaxOutputTokens is half the budget unless
-// [WithRequest] sets it otherwise. A summary response with no text,
-// such as one that ends in a function call, and a summary whose
-// estimate is not below that of the items it folds are model errors
-// rather than server ones, so the summary is asked once more before
-// the fold fails with "compact: summary response has no text" or
-// [ErrSummaryTooLarge]; an oversized summary is never applied, since
-// it would grow the request the fold exists to shrink. The fold, failed
-// or not, reports the last call: its usage, response ID, output types
-// and request, and the number of attempts.
+// The summary request's MaxOutputTokens is half the budget, at most
+// [DefaultSummaryMaxOutputTokens], unless [WithRequest] sets it
+// otherwise. A summary response with no text, such as one that ends in
+// a function call, a response the server ended incomplete, such as one
+// cut at MaxOutputTokens, and a summary whose text is estimated at no
+// fewer tokens than the items it folds are model errors rather than
+// server ones, so the summary is asked once more. A second answer with
+// no text fails the fold with "compact: summary response has no text",
+// and a second incomplete one with "compact: summary response is
+// incomplete" and the server's reason. A second oversized one is never
+// applied, since it would grow the request the fold exists to shrink:
+// the fold is reported failed with [ErrSummaryTooLarge] and the
+// transcript is sent unfolded. The summary's size is that of its text,
+// the estimate of its item less that of an item with no text, so the
+// wrapper [WithSummaryItem] puts around every summary does not count
+// against it. The fold, failed or not, reports the last call's response
+// ID, output types and request, the usage of every call summed, and
+// the number of attempts.
 func NewLocal(model openresponses.Streamer, opts ...Option) *Transform {
 	t := newTransform(opts)
 	t.fold = func(ctx context.Context, input openresponses.Items) (folded, error) {
 		f, err := t.summarize(ctx, model, input)
 		f.attempts = 1
-		if errors.Is(err, errNoText) || errors.Is(err, ErrSummaryTooLarge) {
+		if errors.Is(err, errNoText) || errors.Is(err, errIncomplete) || errors.Is(err, ErrSummaryTooLarge) {
+			first := f.usage
 			f, err = t.summarize(ctx, model, input)
 			f.attempts = 2
+			f.usage = addUsage(first, f.usage)
 		}
 		return f, err
 	}
 	return t
 }
 
+// addUsage returns the sum of a and b, nil when both are.
+func addUsage(a, b *openresponses.Usage) *openresponses.Usage {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	return &openresponses.Usage{
+		InputTokens:         a.InputTokens + b.InputTokens,
+		OutputTokens:        a.OutputTokens + b.OutputTokens,
+		TotalTokens:         a.TotalTokens + b.TotalTokens,
+		InputTokensDetails:  openresponses.InputTokensDetails{CachedTokens: a.InputTokensDetails.CachedTokens + b.InputTokensDetails.CachedTokens},
+		OutputTokensDetails: openresponses.OutputTokensDetails{ReasoningTokens: a.OutputTokensDetails.ReasoningTokens + b.OutputTokensDetails.ReasoningTokens},
+	}
+}
+
 // errNoText is the error of a summary response with no text, which
 // [NewLocal] asks again once.
 var errNoText = errors.New("compact: summary response has no text")
 
+// errIncomplete is the error of a summary response the server ended
+// incomplete, such as one cut at MaxOutputTokens, which [NewLocal]
+// asks again once: a summary cut short has lost what it had not yet
+// said.
+var errIncomplete = errors.New("compact: summary response is incomplete")
+
+// DefaultSummaryMaxOutputTokens caps the MaxOutputTokens [NewLocal]
+// sets on a summary request: half the budget, and no more than this.
+const DefaultSummaryMaxOutputTokens = 8192
+
 // ErrSummaryTooLarge is the error of a [NewLocal] fold whose summary,
 // asked twice, was each time estimated at no fewer tokens than the
-// items it was to replace. The error a fold returns wraps it with the
-// two estimates.
+// items it was to replace. Such a fold is reported to [WithOnFold]
+// with this error, wrapped with the two estimates, and the transcript
+// is sent unfolded: Transform returns no error, since a summary that
+// would not shrink the request leaves the request as it was rather
+// than failing the turn.
 var ErrSummaryTooLarge = errors.New("compact: summary is larger than what it folds")
 
 // summarize asks model once for a summary of input.
@@ -341,7 +386,7 @@ func (t *Transform) summarize(ctx context.Context, model openresponses.Streamer,
 		Input: append(append(openresponses.Items(nil), input...), openresponses.UserText(t.prompt)),
 		Store: &store,
 	}
-	if limit := t.budget / 2; limit > 0 {
+	if limit := min(t.budget/2, DefaultSummaryMaxOutputTokens); limit > 0 {
 		req.MaxOutputTokens = &limit
 	}
 	if t.request != nil {
@@ -361,12 +406,22 @@ func (t *Transform) summarize(ctx context.Context, model openresponses.Streamer,
 		}
 		return f, errors.New("compact: summary response failed")
 	}
+	if resp.Status == openresponses.ResponseStatusIncomplete {
+		if resp.IncompleteDetails != nil && resp.IncompleteDetails.Reason != "" {
+			return f, fmt.Errorf("%w: %s", errIncomplete, resp.IncompleteDetails.Reason)
+		}
+		return f, errIncomplete
+	}
 	summary := strings.TrimSpace(resp.OutputText())
 	if summary == "" {
 		return f, errNoText
 	}
 	item := t.summaryItem(summary)
-	if got, folds := t.estimate(openresponses.Items{item}), t.estimate(input); got >= folds {
+	// The summary's own text is weighed, not the wrapper every summary
+	// item carries: a prefix of a few short items would otherwise be
+	// smaller than any summary of it.
+	got := t.estimate(openresponses.Items{item}) - t.estimate(openresponses.Items{t.summaryItem("")})
+	if folds := t.estimate(input); got >= folds {
 		return f, fmt.Errorf("%w: %d tokens for %d", ErrSummaryTooLarge, got, folds)
 	}
 	f.output, f.summary = openresponses.Items{item}, item
@@ -452,6 +507,11 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 			if rerr := t.onFold(ctx, failed); rerr != nil {
 				return nil, fmt.Errorf("compact: on-fold: %w", rerr)
 			}
+		}
+		if errors.Is(err, ErrSummaryTooLarge) {
+			// The summary would not have shrunk the request; it goes
+			// as it was.
+			return view, nil
 		}
 		return nil, err
 	}

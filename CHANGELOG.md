@@ -14,10 +14,12 @@ versions may break the API.
   earlier cannot read it; keep a copy of the store if rolling back may
   be needed.
 - A failed fold reports what its model calls did, as a successful one
-  does: `compact.Fold` carries the last attempt's `Request`,
-  `ResponseID` and `Usage` when the fold failed too, and gains
-  `OutputTypes`, the item types the last call answered, and
-  `Attempts`, the number of calls. `session.FailedFold` writes them as
+  does: `compact.Fold` carries the last attempt's `Request` and
+  `ResponseID` when the fold failed too, and gains `OutputTypes`, the
+  item types the last call answered, and `Attempts`, the number of
+  calls. `Fold.Usage` is the usage of every call summed, for a fold
+  that succeeded on its second call as for one that failed, where it
+  was the last call's alone. `session.FailedFold` writes them as
   `attempts`, `request_hash`, `response_id`, `model`, `usage` and
   `output_types`, all omitted when empty, naming the request by hash
   and model as a compaction entry's `fold` member does rather than
@@ -25,15 +27,23 @@ versions may break the API.
   says whether the model thought and answered nothing, called a tool,
   or never answered, without a replay. The format is unchanged. (#177)
 - `compact.NewLocal` no longer applies a summary that is not smaller
-  than what it folds. A summary whose estimate is not below that of
-  the items it replaces is asked once more, as a summary with no text
-  is, and a second oversized one fails the fold with
-  `compact.ErrSummaryTooLarge` (`compact: summary is larger than what
-  it folds`) rather than growing the request the fold was meant to
-  shrink. The summary request's `MaxOutputTokens` defaults to half the
-  budget, set before `WithRequest` runs so a caller can change or
-  clear it, so a runaway summary is cut by the server rather than paid
-  for. (#178)
+  than what it folds. A summary whose text is estimated at no fewer
+  tokens than the items it replaces is asked once more, as a summary
+  with no text is; the text is weighed without the wrapper every
+  summary item carries, so a short prefix with a terse summary still
+  folds. A second oversized summary is not applied: the fold is
+  reported to `WithOnFold` failed with `compact.ErrSummaryTooLarge`
+  (`compact: summary is larger than what it folds`), which the session
+  recorder writes as `compaction_failed`, and the transcript is sent
+  unfolded with no error, rather than growing the request the fold was
+  meant to shrink or failing the turn. A summary response the server
+  ends `incomplete` is asked once more too, and a second fails the
+  fold with `compact: summary response is incomplete` and the reason,
+  where its partial text was applied. The summary request's
+  `MaxOutputTokens` defaults to half the budget, at most
+  `compact.DefaultSummaryMaxOutputTokens` (8192), set before
+  `WithRequest` runs so a caller can change or clear it, so a runaway
+  summary is cut by the server rather than paid for. (#178)
 - **An `OutputGuard` error wrapping `ErrGuard` is a guard stop.** The
   message the guard was given is not appended and has no `item_end`,
   and the run ends `ReasonStopped` with `StopGuard` and the error on
