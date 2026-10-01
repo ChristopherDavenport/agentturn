@@ -1191,9 +1191,10 @@ func TestFoldWithNoTextBacksOff(t *testing.T) {
 	}
 	model := &reasoningFold{}
 	// Every transcript is over the budget, and each turn grows the
-	// estimate by two: well inside the back-off's margins.
+	// estimate by two: well inside the back-off's margins. The estimate
+	// is no size, so no prefix is too small to fold.
 	over := func(items openresponses.Items) int { return 100 + len(items) }
-	tr := compact.NewLocal(model, compact.WithBudget(100), compact.WithKeepLast(3), compact.WithEstimator(over), compact.WithOnFold(rec.Fold))
+	tr := compact.NewLocal(model, compact.WithBudget(100), compact.WithKeepLast(3), compact.WithEstimator(over), compact.WithMinFold(0), compact.WithOnFold(rec.Fold))
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform})
 	defer rec.Attach(a)()
 	turns := []struct {

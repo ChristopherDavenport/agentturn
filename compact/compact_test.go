@@ -536,10 +536,11 @@ func TestLocalSummaryBackOffMargins(t *testing.T) {
 
 func TestLocalSummaryOfATinyPrefix(t *testing.T) {
 	// A one-word prefix is smaller than any summary item, wrapper and
-	// all; the summary's text is what is weighed, so a terse one folds.
+	// all; the summary's text is what is weighed, so a terse one folds
+	// when the minimum fold allows it.
 	s := &summarizer{reply: "They said hi."}
 	var folds []Fold
-	tr := NewLocal(s, WithBudget(1), WithKeepLast(1),
+	tr := NewLocal(s, WithBudget(1), WithKeepLast(1), WithMinFold(0),
 		WithOnFold(func(_ context.Context, f Fold) error { folds = append(folds, f); return nil }))
 	history := agentturn.Transcript{openresponses.UserText("hi"), openresponses.AssistantText("hello")}
 	out, err := tr.Transform(context.Background(), history)
@@ -551,6 +552,64 @@ func TestLocalSummaryOfATinyPrefix(t *testing.T) {
 	}
 	if len(out) != 2 || out[0] != folds[0].Summary || out[1] != history[1] {
 		t.Errorf("out = %v", out)
+	}
+}
+
+func TestMinFold(t *testing.T) {
+	// A short prompt, then a tool output that alone is over the budget:
+	// the prefix the fold would replace is the one user message.
+	tail := agentturn.Transcript{
+		&openresponses.FunctionCall{CallID: "c", Name: "log", Arguments: "{}"},
+		openresponses.NewFunctionCallOutput("c", strings.Repeat("line\n", 800)),
+	}
+	short := append(agentturn.Transcript{openresponses.UserText("Show the log.")}, tail...)
+	longer := append(items(2), tail...) // a prefix of about 80 tokens
+	cases := []struct {
+		name   string
+		local  bool
+		opts   []Option
+		items  agentturn.Transcript
+		folded bool
+	}{
+		{"a one-message prefix is left", true, nil, short, false},
+		{"a larger prefix folds", true, nil, longer, true},
+		{"zero folds the one message", true, []Option{WithMinFold(0)}, short, true},
+		{"a minimum above the prefix leaves it", true, []Option{WithMinFold(100)}, longer, false},
+		{"the compaction endpoint folds the one message", false, nil, short, true},
+		{"the compaction endpoint with a minimum", false, []Option{WithMinFold(100)}, longer, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var folds []Fold
+			opts := append([]Option{WithBudget(600), WithKeepLast(2),
+				WithOnFold(func(_ context.Context, f Fold) error { folds = append(folds, f); return nil })}, tc.opts...)
+			s := &summarizer{reply: "Asked."}
+			c := &counting{Compactor: &echo.Adapter{}}
+			var tr *Transform
+			if tc.local {
+				tr = NewLocal(s, opts...)
+			} else {
+				tr = New(c, opts...)
+			}
+			out, err := tr.Transform(context.Background(), tc.items)
+			if err != nil {
+				t.Fatal(err)
+			}
+			asked := len(s.reqs) + int(c.calls.Load())
+			if (asked > 0) != tc.folded || (len(folds) > 0) != tc.folded {
+				t.Fatalf("calls = %d, folds = %d, want folded %v", asked, len(folds), tc.folded)
+			}
+			if tc.folded {
+				if folds[0].Err != nil || folds[0].Split != len(tc.items)-2 {
+					t.Errorf("fold = %+v", folds[0])
+				}
+				return
+			}
+			// Left as it was: over budget and sent whole.
+			if len(out) != len(tc.items) || out[0] != tc.items[0] {
+				t.Errorf("out = %v", out)
+			}
+		})
 	}
 }
 

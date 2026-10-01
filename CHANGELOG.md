@@ -113,6 +113,18 @@ versions may break the API.
   call every time used to fail every later turn of the conversation
   before the model was called, adding a `compaction_failed` each time
   (#199).
+- **`compact.WithMinFold(tokens)` leaves a prefix too small to
+  summarise unfolded.** A transcript over budget because of its kept
+  tail, such as a large tool output among the last `WithKeepLast`
+  items, used to fold whatever prefix was left, often one short
+  message: two summary calls, a `compaction_failed` when the summary
+  came back no smaller, and the same again once the prefix grew. A
+  fold whose input is estimated below the minimum is now skipped, and
+  calls and reports nothing, as a call within the budget does.
+  `NewLocal` defaults it to twice the estimate of an empty summary
+  item, about 58 tokens with the default estimator and summary item;
+  `New` defaults it to zero. Pass `WithMinFold(0)` for the old
+  behaviour (#204).
 
 ## v0.0.14 - 2026-10-01
 

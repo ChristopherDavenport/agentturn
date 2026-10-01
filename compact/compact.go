@@ -81,6 +81,25 @@ func WithModel(name string) Option { return func(t *Transform) { t.model = name 
 // cut never separates a function call from its output.
 func WithKeepLast(n int) Option { return func(t *Transform) { t.keepLast = n } }
 
+// WithMinFold sets the estimated token count below which the part of
+// the transcript a fold would replace is left as it is: the call goes
+// over budget, nothing is asked and nothing is reported to [WithOnFold],
+// as for a call within the budget. The part weighed is what the fold
+// would send to be folded, the previous fold's output included. It is
+// for a transcript over budget because of its kept tail, such as a
+// large tool output among the last [WithKeepLast] items, whose prefix
+// is too small for any summary to shrink.
+//
+// For [NewLocal] the default is twice the estimate of the summary item
+// [WithSummaryItem] makes from no text: the summary's wrapper and as
+// much again for its text. A prefix that small would save at most the
+// wrapper's size even when summarised in a word, which is not worth a
+// summary call, and is likely to be refused as no smaller than its
+// summary after a second. For [New] the default is zero, since the
+// size of a compaction item is the server's. Zero folds whatever is
+// over budget.
+func WithMinFold(tokens int) Option { return func(t *Transform) { t.minFold = tokens } }
+
 // WithPin keeps the items fn reports through a fold: whatever part of
 // the folded prefix they were in, they follow the summary in the
 // request, in their order, and the fold that summarised them
@@ -238,6 +257,7 @@ type Transform struct {
 	onFold      []func(context.Context, Fold) error
 	budget      int
 	keepLast    int
+	minFold     int
 	model       string
 	estimate    func(openresponses.Items) int
 	filter      func(agentturn.Transcript) agentturn.Transcript
@@ -266,6 +286,9 @@ type Transform struct {
 // server expands on the next call.
 func New(c Compactor, opts ...Option) *Transform {
 	t := newTransform(opts)
+	if t.minFold < 0 {
+		t.minFold = 0
+	}
 	t.fold = func(ctx context.Context, input openresponses.Items) (folded, error) {
 		resp, err := c.Compact(ctx, openresponses.CompactRequest{Model: t.model, Input: input})
 		if err != nil {
@@ -344,6 +367,9 @@ func itemTypes(items openresponses.Items) []string {
 // the number of attempts.
 func NewLocal(model openresponses.Streamer, opts ...Option) *Transform {
 	t := newTransform(opts)
+	if t.minFold < 0 {
+		t.minFold = 2 * t.estimate(openresponses.Items{t.summaryItem("")})
+	}
 	t.fold = func(ctx context.Context, input openresponses.Items) (folded, error) {
 		f, err := t.summarize(ctx, model, input)
 		f.attempts = 1
@@ -469,6 +495,7 @@ func newTransform(opts []Option) *Transform {
 	t := &Transform{
 		budget:      DefaultBudget,
 		keepLast:    DefaultKeepLast,
+		minFold:     -1,
 		estimate:    Estimate,
 		filter:      agentturn.DefaultFilter,
 		prompt:      DefaultSummaryPrompt,
@@ -508,8 +535,9 @@ func (t *Transform) Last() openresponses.Item {
 }
 
 // Transform returns the transcript to send for this call: unchanged
-// when it fits the budget, otherwise the fold of its older part
-// followed by the recent items.
+// when it fits the budget or when its older part is smaller than
+// [WithMinFold], otherwise the fold of its older part followed by the
+// recent items.
 //
 // A fold that failed with [ErrSummaryTooLarge], [ErrSummaryIncomplete]
 // or [ErrSummaryNoText] sends the transcript unfolded, and the transform remembers it: the
@@ -541,7 +569,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 		input = append(input, t.output...)
 	}
 	input = append(input, t.filter(items[base:split])...)
-	if len(input) == 0 {
+	if len(input) == 0 || t.estimate(input) < t.minFold {
 		t.mu.Unlock()
 		return view, nil
 	}

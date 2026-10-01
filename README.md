@@ -353,6 +353,10 @@ that comes back with no text, cut short or no smaller than what it
 folds is asked once more; a second such answer leaves the transcript
 unfolded for that call, and the transform does not ask about the same
 prefix again until it has grown.
+`WithMinFold(tokens)` leaves a prefix smaller than `tokens` unfolded,
+for a transcript over budget because of its recent tail; `NewLocal`
+defaults it to twice an empty summary item, since a smaller prefix is
+not worth a summary call.
 
 `WithOnFold` reports every fold, applied or failed, with the index at
 which the transcript was split, so a recorder can write it. Each
