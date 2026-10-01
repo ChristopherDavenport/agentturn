@@ -1124,10 +1124,11 @@ func (callingFold) CreateStream(_ context.Context, req openresponses.Request, si
 }
 
 // bloatingFold answers every summary request with a summary far
-// larger than anything it folds.
-type bloatingFold struct{}
+// larger than anything it folds, or, when cut, with one the server
+// ended incomplete at max_output_tokens.
+type bloatingFold struct{ cut bool }
 
-func (bloatingFold) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+func (b bloatingFold) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
 	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
 	w, err := em.Message(openresponses.PhaseFinalAnswer)
 	if err != nil {
@@ -1136,16 +1137,33 @@ func (bloatingFold) CreateStream(_ context.Context, req openresponses.Request, s
 	if err := w.Text(strings.Repeat("and then ", 2000)); err != nil {
 		return err
 	}
+	if b.cut {
+		return em.Incomplete(openresponses.IncompleteReasonMaxOutputTokens)
+	}
 	return em.Complete()
 }
 
-func TestOversizedFoldProceedsUnfolded(t *testing.T) {
+func TestUnappliedFoldProceedsUnfolded(t *testing.T) {
+	cases := []struct {
+		name string
+		cut  bool
+		want error
+	}{
+		{"an oversized summary", false, compact.ErrSummaryTooLarge},
+		{"an incomplete summary", true, compact.ErrSummaryIncomplete},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) { testUnappliedFold(t, bloatingFold{cut: tc.cut}, tc.want) })
+	}
+}
+
+func testUnappliedFold(t *testing.T, model openresponses.Streamer, want error) {
 	store := agentsession.NewMemoryStore()
 	rec, s, err := Start(context.Background(), store, agentsession.Header{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr := compact.NewLocal(bloatingFold{}, compact.WithBudget(40), compact.WithKeepLast(2), compact.WithOnFold(rec.Fold))
+	tr := compact.NewLocal(model, compact.WithBudget(40), compact.WithKeepLast(2), compact.WithOnFold(rec.Fold))
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform})
 	defer rec.Attach(a)()
 	for _, text := range []string{"one", "two", "three"} {
@@ -1160,13 +1178,13 @@ func TestOversizedFoldProceedsUnfolded(t *testing.T) {
 	for _, e := range s.Entries() {
 		if c, ok := e.(*agentsession.CustomEntry); ok && c.NS == FailedFoldNS {
 			var data FailedFold
-			if err := json.Unmarshal(c.Data, &data); err != nil || !strings.Contains(data.Error, compact.ErrSummaryTooLarge.Error()) || data.Attempts != 2 {
+			if err := json.Unmarshal(c.Data, &data); err != nil || !strings.Contains(data.Error, want.Error()) || data.Attempts != 2 {
 				t.Errorf("failed fold = %+v err=%v", data, err)
 			}
 			failed++
 		}
 		if _, ok := e.(*agentsession.CompactionEntry); ok {
-			t.Errorf("an oversized summary was recorded as a compaction")
+			t.Errorf("a summary that was not applied was recorded as a compaction")
 		}
 	}
 	if failed == 0 {

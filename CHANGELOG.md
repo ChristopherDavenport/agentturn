@@ -39,9 +39,20 @@ versions may break the API.
   recorder writes as `compaction_failed`, and the transcript is sent
   unfolded with no error, rather than growing the request the fold was
   meant to shrink or failing the turn. A summary response the server
-  ends `incomplete` is asked once more too, and a second fails the
-  fold with `compact: summary response is incomplete` and the reason,
-  where its partial text was applied. The summary request's
+  ends `incomplete` is asked once more too, where its partial text was
+  applied, and a second is treated the same way: the fold is reported
+  failed with `compact.ErrSummaryIncomplete` (`compact: summary
+  response is incomplete`) wrapped with the server's reason, and the
+  transcript is sent unfolded. A summary with no text twice still fails
+  the turn. After either unfolded send the transform backs off: it
+  remembers the length and hash of the prefix that failed and the
+  estimate that triggered it, and while the transcript still begins
+  with that prefix it does not fold again until the part to fold has
+  grown by `WithKeepLast` items (at least one) or the estimate by a
+  quarter of the budget, rather than spending two summary calls and
+  writing another `compaction_failed` on every later turn. A transcript
+  that does not begin with the failed prefix, another conversation's or
+  a rewound one, folds as usual. The summary request's
   `MaxOutputTokens` defaults to half the budget, at most
   `compact.DefaultSummaryMaxOutputTokens` (8192), set before
   `WithRequest` runs so a caller can change or clear it, so a runaway
