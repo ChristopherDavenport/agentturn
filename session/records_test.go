@@ -716,6 +716,172 @@ func TestEnvBetweenCalls(t *testing.T) {
 	}
 }
 
+// scriptedCalls makes the calls of its script one a turn, in order,
+// and answers once every one has its output.
+type scriptedCalls []struct{ name, args string }
+
+func (m scriptedCalls) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	outputs := 0
+	for _, item := range req.Input {
+		if _, ok := item.(*openresponses.FunctionCallOutput); ok {
+			outputs++
+		}
+	}
+	if outputs < len(m) {
+		w, err := em.FunctionCall("", m[outputs].name)
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(m[outputs].args); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("done"); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// isEnv reports whether e is an env entry.
+func isEnv(e agentsession.Entry) bool {
+	_, ok := e.(*agentsession.EnvEntry)
+	return ok
+}
+
+// envNodes lists the node of each env entry in entries.
+func envNodes(entries []agentsession.Entry) string {
+	var nodes []string
+	for _, e := range entries {
+		if env, ok := e.(*agentsession.EnvEntry); ok {
+			var n string
+			_ = json.Unmarshal(env.Workspace.Unknown["node"], &n)
+			nodes = append(nodes, n)
+		}
+	}
+	return strings.Join(nodes, ",")
+}
+
+// TestEnvInAChild pins the review of #187: Env made with the context
+// of a child session whose run has ended is filed in that session, at
+// its leaf, as Annotate's entry is, compared with the env in force
+// there; and a grandchild compares with the env in force in its
+// parent, the child, not with the recorder's own session's.
+func TestEnvInAChild(t *testing.T) {
+	ctx := context.Background()
+	node := "node-1"
+	env := func(context.Context) (*agentsession.EnvEntry, error) {
+		e := agentsession.NewEnvEntry("/work")
+		if err := e.SetWorkspace(agentsession.WorkspaceContainer, "sandbox").SetMember("node", node); err != nil {
+			return nil, err
+		}
+		return e, nil
+	}
+	childOf := func(t *testing.T, store agentsession.Store, s *agentsession.Session) *agentsession.Session {
+		t.Helper()
+		l := links(s)
+		if len(l) != 1 {
+			t.Fatalf("links = %d", len(l))
+		}
+		child, err := store.Open(ctx, l[0].Session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return child
+	}
+
+	t.Run("after the child's run", func(t *testing.T) {
+		node = "node-1"
+		store := agentsession.NewMemoryStore()
+		rec, s, err := Start(ctx, store, agentsession.Header{}, WithEnv(env))
+		if err != nil {
+			t.Fatal(err)
+		}
+		childCfg := agentturn.Config{Name: "specialist", Description: "notes things", Model: &echo.Adapter{}}
+		specialist := agent.New(childCfg, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{specialist}})
+		defer rec.Attach(a)()
+		if _, err := a.Prompt(ctx, openresponses.UserText("delegate")); err != nil {
+			t.Fatal(err)
+		}
+		childID := childOf(t, store, s).ID()
+		jobCtx := ContextWithSessionID(ctx, childID)
+		// Unmoved, the child is under its parent's env.
+		if err := rec.Env(jobCtx); err != nil {
+			t.Fatal(err)
+		}
+		node = "node-2"
+		for range 2 {
+			if err := rec.Env(jobCtx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		child := childOf(t, store, s)
+		if got := envNodes(child.Entries()); got != "node-2" {
+			t.Errorf("child env entries = %q, want node-2", got)
+		}
+		if leaf, _ := child.Entry(child.Leaf()); !isEnv(leaf) {
+			t.Errorf("the child's env is not at its leaf")
+		}
+		if got := envNodes(s.Entries()); got != "node-1" {
+			t.Errorf("root env entries = %q, want node-1", got)
+		}
+		verifyAll(t, s)
+		verifyAll(t, child)
+	})
+
+	t.Run("a grandchild", func(t *testing.T) {
+		node = "node-1"
+		store := agentsession.NewMemoryStore()
+		rec, s, err := Start(ctx, store, agentsession.Header{}, WithEnv(env))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var envErr error
+		note := agenttool.New("note", "note something", func(ctx context.Context, _ echoArgs) (string, error) {
+			envErr = errors.Join(envErr, rec.Env(ctx))
+			return "noted", nil
+		})
+		move := agenttool.New("move", "move the workspace", func(ctx context.Context, _ agenttool.NoArgs) (string, error) {
+			node = "node-2"
+			envErr = errors.Join(envErr, rec.Env(ctx))
+			return "moved", nil
+		})
+		grandCfg := agentturn.Config{Name: "grand", Description: "notes things", Model: &echo.Adapter{}, Tools: []agenttool.Tool{note}}
+		grand := agent.New(grandCfg, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+		childCfg := agentturn.Config{Name: "specialist", Description: "moves and delegates",
+			Model: scriptedCalls{{"move", `{}`}, {"grand", `{"input":"note it"}`}}, Tools: []agenttool.Tool{move, grand}}
+		specialist := agent.New(childCfg, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{specialist}})
+		defer rec.Attach(a)()
+		if _, err := a.Prompt(ctx, openresponses.UserText("delegate")); err != nil {
+			t.Fatal(err)
+		}
+		if envErr != nil {
+			t.Fatal(envErr)
+		}
+		child := childOf(t, store, s)
+		grandchild := childOf(t, store, child)
+		if got := envNodes(child.Entries()); got != "node-2" {
+			t.Errorf("child env entries = %q, want node-2", got)
+		}
+		if got := envNodes(grandchild.Entries()); got != "" {
+			t.Errorf("grandchild env entries = %q, want none: it is under its parent's", got)
+		}
+		verifyAll(t, s)
+		verifyAll(t, child)
+		verifyAll(t, grandchild)
+	})
+}
+
 func TestFoldCallIsRecorded(t *testing.T) {
 	root := t.TempDir()
 	store, err := jsonl.Open(root)

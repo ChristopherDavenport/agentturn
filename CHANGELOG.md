@@ -171,8 +171,12 @@ versions may break the API.
   start read the move one run late. `Recorder.Env(ctx)` asks `WithEnv`
   now and writes an env entry when it differs from the one in force, as
   a run's start does; a hook or a tool calls it between calls, and the
-  entry lands in the session of the run on the context, as
-  `Annotate`'s does. The entry applies to the dispatches after it: one
+  entry lands where `Annotate`'s does: in the session of the run on the
+  context, or in the child session the context names once that child's
+  run has ended. A child compares it with the env in force in its own
+  session, or with the one in force in its parent's when it has none,
+  and so up the chain, so a grandchild under a child that moved writes
+  none when it has not moved further. The entry applies to the dispatches after it: one
   written from `AfterToolCall` lands after the dispatch of the call
   the hook ran for, which stays under the earlier env (#187).
 

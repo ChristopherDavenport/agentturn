@@ -708,6 +708,12 @@ type writer struct {
 	// written only when it differs.
 	env          []byte
 	envWorkspace *agentsession.Workspace
+	// parent is the writer of the session a child's was created under,
+	// and parentID that session's ID, which is all a writer reopened
+	// from the store knows of it: a child with no env entry of its own
+	// is under the env in force in its parent's.
+	parent   *writer
+	parentID string
 	// base is the request hash of the canonical base request of the
 	// configuration the last run started under, from this writer's run
 	// or the [ConfigBaseMember] of the last run start on a seeded path,
@@ -1595,13 +1601,19 @@ func (r *Recorder) Annotate(ctx context.Context, ns string, data any) (string, e
 // a sandbox rescheduled onto another node, its disk and its shell
 // gone. It is made from a hook or a tool, AfterToolCall after the call
 // that saw the move or the tool that moved, with the context it was
-// given, and between runs with any. The entry is written at the
-// current leaf of the session of the run on the context, as
-// [Recorder.Annotate] files its entry, or else of the recorder's own
-// session. A child session's run compares the entry with the one in
-// force in the recorder's own session, which the child inherits, so a
-// child writes one only when its workspace moved away from its
-// parent's. Without [WithEnv], or for a nil entry, it writes nothing;
+// given, and between runs with any. The entry is written where
+// [Recorder.Annotate] files its entry: at the current leaf of the
+// session of the run on the context; when the context names no run
+// being written, of the child session [SessionIDFromContext] names
+// when that is one of this recorder's, reopened at its leaf, so a job
+// a child started that moves the workspace after the child's run
+// ended records the move in the child; or else of the recorder's own
+// session. It is compared with the env in force in that session: the
+// last on its path, or for a child with none of its own, the one in
+// force in its parent's, which it inherits, and so up to the
+// recorder's own session, so a child or a grandchild writes one only
+// when its workspace moved away from the one it is under. Without
+// [WithEnv], or for a nil entry, it writes nothing;
 // an error from the function or the store is returned, and the run
 // goes on unless the caller fails it.
 //
@@ -1616,11 +1628,60 @@ func (r *Recorder) Env(ctx context.Context) error {
 	if r.env == nil {
 		return nil
 	}
+	ctx = context.WithoutCancel(ctx)
 	w := r.writerOf(ctx)
-	if w != r.root && w.env == nil {
-		w.env, w.envWorkspace = r.root.env, r.root.envWorkspace
+	if w == r.root {
+		cw, err := r.reopen(ctx)
+		if err != nil {
+			return err
+		}
+		if cw != nil {
+			w = cw
+		}
 	}
-	return w.writeEnv(context.WithoutCancel(ctx))
+	have, haveWorkspace, err := r.envInForce(ctx, w)
+	if err != nil {
+		return err
+	}
+	return w.writeEnvOver(ctx, have, haveWorkspace)
+}
+
+// envInForce returns the env in force in w's session: the last one on
+// its path, or for a child with none of its own, the one in force in
+// its parent's, and so up to the recorder's own session.
+func (r *Recorder) envInForce(ctx context.Context, w *writer) ([]byte, *agentsession.Workspace, error) {
+	for depth := 0; w != nil && depth < maxEnvDepth; depth++ {
+		if w.env != nil || w == r.root {
+			return w.env, w.envWorkspace, nil
+		}
+		next := w.parent
+		if next == nil && w.parentID != "" {
+			var err error
+			if next, err = r.writerByID(ctx, w.parentID); err != nil {
+				return nil, nil, err
+			}
+		}
+		w = next
+	}
+	return nil, nil, nil
+}
+
+// maxEnvDepth bounds the walk up a chain of child sessions.
+const maxEnvDepth = 64
+
+// writerByID returns a writer of the session id: the recorder's own,
+// one a run is being written to, or one of its children reopened at
+// its leaf; nil for a session the recorder does not write.
+func (r *Recorder) writerByID(ctx context.Context, id string) (*writer, error) {
+	if id == r.root.id {
+		return r.root, nil
+	}
+	for _, w := range r.runs {
+		if w.id == id {
+			return w, nil
+		}
+	}
+	return r.reopenID(ctx, id)
 }
 
 // EntryOf returns the ID of the entry the recorder wrote for item, the
@@ -1664,7 +1725,13 @@ func (r *Recorder) writerOf(ctx context.Context) *writer {
 // child seeds a writer of its own from it. The caller holds r.mu, so
 // no live writer of the session appends meanwhile.
 func (r *Recorder) reopen(ctx context.Context) (*writer, error) {
-	id := SessionIDFromContext(ctx)
+	return r.reopenID(ctx, SessionIDFromContext(ctx))
+}
+
+// reopenID is reopen for the child session id. The writer knows the
+// env last written on the path and the session's parent, for
+// [Recorder.Env].
+func (r *Recorder) reopenID(ctx context.Context, id string) (*writer, error) {
 	if !r.childIDs[id] {
 		return nil, nil
 	}
@@ -1677,11 +1744,15 @@ func (r *Recorder) reopen(ctx context.Context) (*writer, error) {
 		return nil, fmt.Errorf("session: calls of child session %s: %w", id, err)
 	}
 	w := newWriter(r, id)
+	w.parentID = s.Header().ParentSession
 	for _, c := range calls {
 		w.calls[c.ID()] = callRecordOf(c, s.Header())
 	}
 	w.appOnly = appOnlyCalls(s.Path(s.Leaf()))
 	for _, e := range s.Path(s.Leaf()) {
+		if env, ok := e.(*agentsession.EnvEntry); ok {
+			w.env, w.envWorkspace = envBody(env), env.Workspace
+		}
 		c, ok := e.(*agentsession.CustomEntry)
 		if !ok || c.NS != NestedCallNS {
 			continue
@@ -2124,6 +2195,7 @@ func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, 
 			r.addChild(s.ID())
 			w := newWriter(r, s.ID())
 			w.cwd = parent.cwd
+			w.parent, w.parentID = parent, parent.id
 			if agent.RetryFromContext(ctx) {
 				s.ResetLeaf()
 				return w, nil
@@ -2144,6 +2216,7 @@ func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, 
 	r.addChild(s.ID())
 	w := newWriter(r, s.ID())
 	w.cwd = parent.cwd
+	w.parent, w.parentID = parent, parent.id
 	return w, nil
 }
 
@@ -2511,6 +2584,12 @@ func (w *writer) differs(ctx context.Context, req openresponses.Request, tools b
 // writeEnv asks the host for the environment and writes it when it
 // differs from the last one written.
 func (w *writer) writeEnv(ctx context.Context) error {
+	return w.writeEnvOver(ctx, w.env, w.envWorkspace)
+}
+
+// writeEnvOver asks the host for the environment and writes it when it
+// differs from have and haveWorkspace, the env in force.
+func (w *writer) writeEnvOver(ctx context.Context, have []byte, haveWorkspace *agentsession.Workspace) error {
 	env, err := w.rec.env(ctx)
 	if err != nil {
 		return fmt.Errorf("session: env: %w", err)
@@ -2519,7 +2598,7 @@ func (w *writer) writeEnv(ctx context.Context) error {
 		return nil
 	}
 	data := envBody(env)
-	if w.env != nil && bytes.Equal(data, w.env) && agentsession.SameWorkspace(env.Workspace, w.envWorkspace) {
+	if have != nil && bytes.Equal(data, have) && agentsession.SameWorkspace(env.Workspace, haveWorkspace) {
 		return nil
 	}
 	if _, err := w.append(ctx, env); err != nil {
