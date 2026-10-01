@@ -27,10 +27,10 @@
 // calls nobody holds with [ReplayAnswers]:
 //
 //	rec, s, _ := session.Resume(ctx, store, id)
-//	opts, _ := session.AgentOptions(s)
+//	opts, _ := session.AgentOptions(s, rec.ReadOptions()...)
 //	agent := agentturn.New(cfg, opts...)
 //	defer rec.Attach(agent)()
-//	answers, _ := session.ReplayAnswers(ctx, s, cfg.ResolveTools(ctx))
+//	answers, _ := session.ReplayAnswers(ctx, s, cfg.ResolveTools(ctx), rec.ReadOptions()...)
 //	end, err := agent.Resume(ctx, answers...) // with the held calls' answers
 //
 // The package is named session, not agentsession, because a consumer
@@ -1055,8 +1055,8 @@ func newWriter(r *Recorder, id string) *writer {
 // are the fork's to take up with [Recorder.Requeue]. A call in the
 // prefix has its dispatch, if any, in the session forked: the recorder
 // reads it there when the store is an agentsession.Reader, and a host
-// seeding the fork's agent passes [WithOrigins] to [AgentOptions] and
-// [ReplayAnswers] so they read it too.
+// seeding the fork's agent passes [Recorder.ReadOptions] to
+// [AgentOptions] and [ReplayAnswers] so they read it too.
 func Start(ctx context.Context, store agentsession.Store, h agentsession.Header, opts ...Option) (*Recorder, *agentsession.Session, error) {
 	if h.Records == nil {
 		h.Records = append(append([]string(nil), agentsession.AllRecords...), agentsession.TypeQueued)
@@ -1089,7 +1089,9 @@ func Start(ctx context.Context, store agentsession.Store, h agentsession.Header,
 // [Transcript], so an agent seeded with it can record folds and its
 // requests carry hashes; from the calls pending there, so their
 // dispatches and decisions anchor to the entries that hold them; and
-// from the last env entry on the path. Child sessions name the
+// from the last env entry on the path. [Recorder.ReadOptions] gives
+// [AgentOptions] and [ReplayAnswers] the recorder's reading of a
+// fork's prefix calls. Child sessions name the
 // header's harness unless [WithHarness] says otherwise.
 //
 // A run with no end at the leaf was cut off: the process died inside
@@ -1136,7 +1138,8 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // about it, and it is [agentturn.PendingUnknown] with no key. Given
 // [WithOrigins], Pending reads that session's dispatches for it, and
 // reads a call it finds dispatched there as one dispatched on a branch
-// a rebase left.
+// a rebase left. [Recorder.ReadOptions] gives the options that read a
+// session as the recorder writing it does.
 func Pending(s *agentsession.Session, opts ...ReadOption) ([]agentturn.PendingCall, error) {
 	pending, err := pendingCalls(context.Background(), s, opts)
 	if err != nil {
@@ -1150,8 +1153,10 @@ func Pending(s *agentsession.Session, opts ...ReadOption) ([]agentturn.PendingCa
 }
 
 // ReadOption configures how [Pending], [AgentOptions] and
-// [ReplayAnswers] read a session.
-type ReadOption func(*origins)
+// [ReplayAnswers] read a session. [WithOrigins] makes one.
+type ReadOption struct {
+	apply func(*origins)
+}
 
 // WithOrigins has [Pending], [AgentOptions] and [ReplayAnswers] read a
 // fork's origin through r, the store that holds it: a call in the
@@ -1163,14 +1168,29 @@ type ReadOption func(*origins)
 // does not hold leaves the call as the fork alone reads it; an error
 // reading one is returned.
 func WithOrigins(r agentsession.Reader) ReadOption {
-	return func(o *origins) { o.r = r }
+	return ReadOption{apply: func(o *origins) { o.r = r }}
 }
 
-// origins reads the sessions a fork was made from, each once.
+// ReadOptions returns the options that have [Pending], [AgentOptions]
+// and [ReplayAnswers] read a session as the recorder reads it when it
+// is seeded: [WithOrigins] with the recorder's store, when the store
+// is an agentsession.Reader, and none otherwise.
+func (r *Recorder) ReadOptions() []ReadOption {
+	if rd, ok := r.store.(agentsession.Reader); ok {
+		return []ReadOption{WithOrigins(rd)}
+	}
+	return nil
+}
+
+// origins reads the sessions a fork was made from, each once. lenient
+// takes an origin the reader fails to read as one it does not hold,
+// for a recorder seeding itself, which must not fail to open a session
+// over what it reads beside it.
 type origins struct {
-	ctx  context.Context
-	r    agentsession.Reader
-	read map[string]*agentsession.Session
+	ctx     context.Context
+	r       agentsession.Reader
+	lenient bool
+	read    map[string]*agentsession.Session
 }
 
 // maxOriginDepth bounds the walk up a chain of forks.
@@ -1186,7 +1206,7 @@ func (o *origins) session(id string) (*agentsession.Session, error) {
 		return s, nil
 	}
 	s, err := o.r.Read(o.ctx, id)
-	if errors.Is(err, agentsession.ErrNoSession) {
+	if errors.Is(err, agentsession.ErrNoSession) || err != nil && o.lenient {
 		s, err = nil, nil
 	}
 	if err != nil {
@@ -1237,7 +1257,9 @@ func pendingCalls(ctx context.Context, s *agentsession.Session, opts []ReadOptio
 	}
 	o := &origins{ctx: ctx}
 	for _, opt := range opts {
-		opt(o)
+		if opt.apply != nil {
+			opt.apply(o)
+		}
 	}
 	calls, err := s.PendingCalls(s.Leaf())
 	if err != nil {
@@ -2293,9 +2315,10 @@ func (w *writer) seed(ctx context.Context, s *agentsession.Session, owed bool) e
 // call with no dispatch on the path is looked for off it, on a branch a
 // rebase left and, when the store can read sessions without holding
 // them, in the session a fork was made from, as [WithOrigins] has
-// [Pending] look.
+// [Pending] look; an origin the store fails to read is taken as one it
+// does not hold.
 func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls []*agentsession.Call) error {
-	o := &origins{ctx: ctx}
+	o := &origins{ctx: ctx, lenient: true}
 	o.r, _ = w.rec.store.(agentsession.Reader)
 	for _, c := range calls {
 		off := false

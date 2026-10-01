@@ -1099,7 +1099,7 @@ func TestForkReadsItsOrigin(t *testing.T) {
 			}
 			var opts []ReadOption
 			if tc.origins {
-				opts = append(opts, WithOrigins(store))
+				opts = rec.ReadOptions()
 			}
 			pending, err := Pending(fork, opts...)
 			if err != nil {
@@ -1224,5 +1224,48 @@ func TestRanOffNeedsItsToolsOutput(t *testing.T) {
 				t.Errorf("answer = %+v, want output %q or an approval under k1", answers[0], tc.want)
 			}
 		})
+	}
+}
+
+// unreadable is a store whose Read fails, as a store whose disk does
+// not answer would.
+type unreadable struct{ *agentsession.MemoryStore }
+
+func (unreadable) Read(context.Context, string) (*agentsession.Session, error) {
+	return nil, errors.New("disk on fire")
+}
+
+// TestOriginReadErrors pins the review of #192: a recorder seeding a
+// fork takes an origin its store fails to read as one it does not
+// hold, so Start opens the fork, while an explicit WithOrigins returns
+// the error rather than read the call as the fork alone does.
+func TestOriginReadErrors(t *testing.T) {
+	ctx := context.Background()
+	mem := agentsession.NewMemoryStore()
+	store := unreadable{mem}
+	origin, err := mem.Create(ctx, agentsession.Header{Records: agentsession.AllRecords})
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := &openresponses.FunctionCall{CallID: "call_1", Name: "charge", Arguments: `{}`}
+	target, err := mem.Append(ctx, origin.ID(), &agentsession.ItemEntry{Item: call})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mem.Append(ctx, origin.ID(), agentsession.NewDispatch(call.CallID, target).WithIdempotencyKey("k1")); err != nil {
+		t.Fatal(err)
+	}
+	rec, fork, err := Start(ctx, store, agentsession.Header{Base: target, ParentSession: origin.ID()})
+	if err != nil {
+		t.Fatalf("start on a base whose origin cannot be read: %v", err)
+	}
+	if len(rec.ReadOptions()) != 1 {
+		t.Errorf("read options = %d, want the store's", len(rec.ReadOptions()))
+	}
+	if _, err := Pending(fork, rec.ReadOptions()...); err == nil || !strings.Contains(err.Error(), "disk on fire") {
+		t.Errorf("pending with the origins: err = %v, want the read's", err)
+	}
+	if p, err := Pending(fork); err != nil || len(p) != 1 || p[0].Reason != agentturn.PendingUnknown {
+		t.Errorf("pending alone = %+v, %v", p, err)
 	}
 }

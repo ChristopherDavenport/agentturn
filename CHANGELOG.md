@@ -184,10 +184,15 @@ versions may break the API.
   dispatched on another branch: a keyed call runs again under its key,
   and one that completed there is answered with its output, reason "ran
   in the session this one forks". Without it, or for an origin the
-  reader does not hold, the reading is as before. The recorder reads the
-  origin through its own store when that store is an
-  `agentsession.Reader`, so a held call dispatched there is ended by an
-  `answer`. (#192)
+  reader does not hold, the reading is as before; an error reading one
+  is returned. The recorder reads the origin through its own store when
+  that store is an `agentsession.Reader`, so a held call dispatched
+  there is ended by an `answer`, and takes an origin it fails to read as
+  one it does not hold, so `Start`, `Resume` and `Rebase` do not fail
+  over it. `Recorder.ReadOptions()` returns the options that read as
+  the recorder does. A call of the three functions compiles as before,
+  but code that stores one as a function value of its old type does
+  not. (#192)
 - **A child session names the workspace it starts in.** With
   `session.WithEnv`, a child's first run start writes, when the child's
   session holds no env entry, a copy of the env in force in its
