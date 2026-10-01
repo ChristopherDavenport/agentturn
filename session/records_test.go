@@ -1152,14 +1152,27 @@ func TestOnlyTheAttemptThatAnsweredIsConfigured(t *testing.T) {
 
 // sameIDModel makes, on each turn, one call to upper per ID in turns,
 // then answers with nothing once the turns run out, as a provider that
-// numbers its calls per response does.
+// numbers its calls per response does. With doneOnly it sends each
+// call's output_item.done alone, as a relay that passes on only
+// finished items does.
 type sameIDModel struct {
-	turns [][]string
-	calls int
+	turns    [][]string
+	doneOnly bool
+	calls    int
 }
 
 func (m *sameIDModel) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
 	m.calls++
+	if m.doneOnly {
+		next := sink
+		sink = openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+			switch ev.(type) {
+			case *openresponses.OutputItemAddedEvent, *openresponses.FunctionCallArgumentsDeltaEvent, *openresponses.FunctionCallArgumentsDoneEvent:
+				return nil
+			}
+			return next.Send(ev)
+		})
+	}
 	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
 	if m.calls <= len(m.turns) {
 		for _, id := range m.turns[m.calls-1] {
@@ -1181,14 +1194,17 @@ func (m *sameIDModel) CreateStream(_ context.Context, req openresponses.Request,
 // TestRepeatedCallIDsAreRecorded checks that a model repeating a call
 // ID records a session: the format refuses a function call whose ID is
 // already on the path, and the loop gives such a call an ID of its
-// own before the recorder writes it.
+// own before the recorder writes it, a call the loop holds until its
+// response arrives included.
 func TestRepeatedCallIDsAreRecorded(t *testing.T) {
 	cases := []struct {
-		name  string
-		turns [][]string
+		name     string
+		turns    [][]string
+		doneOnly bool
 	}{
 		{name: "across turns", turns: [][]string{{"call_0"}, {"call_0"}}},
 		{name: "in a response", turns: [][]string{{"call_0", "call_0"}}},
+		{name: "in a response, done only", turns: [][]string{{"c1", "c1"}}, doneOnly: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1197,7 +1213,7 @@ func TestRepeatedCallIDsAreRecorded(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			a := agentturn.New(agentturn.Config{Model: &sameIDModel{turns: tc.turns}, Tools: []agenttool.Tool{upper}})
+			a := agentturn.New(agentturn.Config{Model: &sameIDModel{turns: tc.turns, doneOnly: tc.doneOnly}, Tools: []agenttool.Tool{upper}})
 			defer rec.Attach(a)()
 			if end, err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil || end.Reason != agentturn.ReasonDone {
 				t.Fatalf("prompt: err=%v end=%+v", err, end)

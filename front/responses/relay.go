@@ -162,13 +162,9 @@ func (r *relay) end(item openresponses.Item) error {
 			}
 			r.call = w
 		}
-		if v.CallID != "" {
-			// The loop gives a call whose ID the model repeated one of
-			// its own when the call completes, after the writer opened
-			// under the model's: the done item carries the loop's,
-			// which its output names.
-			r.call.Item().CallID = v.CallID
-		}
+		// The call keeps the ID its output_item.added carried: the loop
+		// decides a call's ID as it opens, and the ID the emitter gave a
+		// call that opened with none is the one the client has seen.
 		if rest, ok := strings.CutPrefix(v.Arguments, r.args.String()); ok && rest != "" {
 			if err := r.call.Arguments(rest); err != nil {
 				return err

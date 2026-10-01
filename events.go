@@ -218,7 +218,9 @@ func (*ModelBlocked) EventType() string { return EventModelBlocked }
 // ItemStart announces an item entering the transcript: a prompt or
 // queued message, an assistant item as the stream opens it, or a
 // function call output. For an assistant item the Item is the live
-// accumulated value and fills in as updates arrive.
+// accumulated value and fills in as updates arrive, but for a function
+// call the loop gave an ID of its own (see [ItemEnd]), which is a copy
+// carrying that ID; its ItemUpdate events carry the same ID.
 //
 // An item the model completes before its attempt commits, a reasoning
 // summary before the first token, is announced here and reaches the
@@ -261,10 +263,10 @@ func (*ItemUpdate) EventType() string { return EventItemUpdate }
 // ItemEnd carries a completed item. For an assistant item it is emitted
 // only after output_item.done; partial items never arrive here. The item
 // is in the transcript when this event is delivered. A function call
-// the model gave no call ID, or one a call in the transcript already
-// has, carries an ID of the loop's own here, the model's with a random
-// suffix, where its ItemStart and ItemUpdate carry the model's, and
-// ModelCallID keeps the model's: a call ID names one call.
+// the model gave no call ID, or one another call already has, carries
+// an ID of the loop's own, the model's with a random suffix, here as on
+// its ItemStart and every ItemUpdate, and ModelCallID keeps the
+// model's: a call ID names one call.
 type ItemEnd struct {
 	RunID string
 	Turn  int

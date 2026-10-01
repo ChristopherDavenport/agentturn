@@ -71,6 +71,25 @@ versions may break the API.
   in the transcript, which `front/a2a`'s store holds and which
   `front/responses`' caller sends back when the adapter is built with
   `WithToolItems` (#180).
+- **A call's ID is decided as it opens.** The loop gives a function
+  call its ID at `output_item.added`, the model's when it names no
+  other call and one of its own when it is empty or taken, so the
+  call's `ItemStart`, every `ItemUpdate` and its `ItemEnd` carry one
+  ID, where v0.0.12 renamed the call only when it completed and its
+  `ItemStart` and `ItemUpdate` carried the model's. A call whose first
+  event is its `output_item.done` is decided then. `ItemEnd.ModelCallID`
+  still holds the model's ID for a call the loop renamed. `front/responses`
+  no longer changes a call's `call_id` at `output_item.done`: the client
+  sees one ID from `output_item.added` through the call's output, and
+  a call the model gave no ID no longer opens under an ID the emitter
+  minted that no output carries (#184).
+- A call whose ID repeats one of a call the attempt holds is renamed.
+  A stream that sends no `output_item.added` for its calls keeps them
+  out of the transcript until its response arrives, and v0.0.12 checked
+  a call's ID against the transcript alone, so two calls `c1` in one
+  such response kept one ID and the session recorder failed the run.
+  A call's ID is now taken by every call of the attempt, held or not
+  (#183).
 
 ## v0.0.12 - 2026-09-29
 

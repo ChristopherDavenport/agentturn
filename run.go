@@ -541,9 +541,10 @@ type runner struct {
 	// are appended when the attempt commits and dropped when it ends
 	// without committing.
 	held []heldItem
-	// callIDs maps the output index of a function call the attempt in
-	// flight completed to the call ID the loop gave it, for a call whose
-	// own ID was empty or named a call the transcript already holds.
+	// callIDs maps the output index of every function call the attempt
+	// in flight opened or completed, the held ones included, to the call
+	// ID the loop decided for it: the model's when it names no other
+	// call, one of the loop's own when it is empty or taken.
 	callIDs map[int]string
 }
 
@@ -1138,6 +1139,12 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 	switch e := ev.(type) {
 	case *openresponses.OutputItemAddedEvent:
 		item := acc.Response().Output[e.OutputIndex]
+		if call, ok := item.(*openresponses.FunctionCall); ok {
+			// The call's ID is decided as it opens, so its item_start,
+			// every item_update and its item_end carry the same one.
+			r.decideCallID(call.CallID, e.OutputIndex)
+			item = r.withCallID(item, e.OutputIndex)
+		}
 		commits := !committed && commitsAttempt(item)
 		if commits {
 			// The answer has started: what the attempt produced on the
@@ -1151,15 +1158,22 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		item := e.Item
 		modelCallID := ""
 		if call, ok := item.(*openresponses.FunctionCall); ok {
-			if unique := r.uniqueCall(call, e.OutputIndex); unique != call {
-				item, modelCallID = unique, call.CallID
+			if _, opened := r.callIDs[e.OutputIndex]; !opened {
+				// A call first seen as it completes, on a stream that
+				// sends no output_item.added for it.
+				r.decideCallID(call.CallID, e.OutputIndex)
+			}
+			if item = r.withCallID(call, e.OutputIndex); item != openresponses.Item(call) {
+				modelCallID = call.CallID
 			}
 		}
 		if m, ok := item.(*openresponses.Message); ok && r.cfg.OutputGuard != nil {
 			// The guard sees the message before anything keeps it.
 			var before openresponses.Items
 			if cur := acc.Response(); cur != nil && e.OutputIndex <= len(cur.Output) {
-				before = append(before, cur.Output[:e.OutputIndex]...)
+				for i, prior := range cur.Output[:e.OutputIndex] {
+					before = append(before, r.withCallID(prior, i))
+				}
 			}
 			replacement, err := r.cfg.OutputGuard(r.ctx, OutputInfo{RunID: r.runID, Turn: r.turn, ResponseID: responseID, Message: m, Output: before})
 			if err != nil {
@@ -1187,38 +1201,67 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		return false, &wireError{err: e.Err()}
 	}
 	if idx, ok := outputIndex(ev); ok {
-		return false, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[idx], Stream: ev, ResponseID: responseID})
+		return false, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: r.withCallID(acc.Response().Output[idx], idx), Stream: ev, ResponseID: responseID})
 	}
 	return false, nil
 }
 
-// uniqueCall returns call, or a copy with a call ID of the loop's own
-// when the model gave none, one a call in the transcript already has,
-// or one the agent or the run's context reserved: a call ID names one
-// call, since an output, a pending list and the session record name the
-// call by it alone. The new ID is the model's, in the alphabet every
-// provider takes, with a random suffix, so it names no call a fold took
-// out of the transcript or another branch of the session holds either.
-// The item_start and item_update events of the call carry the model's
-// ID; its item_end, the transcript, the response the turn acts on and
-// every later request carry the new one.
-func (r *runner) uniqueCall(call *openresponses.FunctionCall, index int) *openresponses.FunctionCall {
-	taken := call.CallID == "" || r.reserved[call.CallID] || r.ctxReserved[call.CallID]
-	for _, item := range r.transcript {
-		if c, ok := item.(*openresponses.FunctionCall); ok && c.CallID == call.CallID {
-			taken = true
-			break
-		}
-	}
-	if !taken {
-		return call
-	}
-	renamed := *call
-	renamed.CallID = openresponses.NewID(callIDPrefix(call.CallID))
+// decideCallID decides the call ID of the function call at index of
+// the attempt in flight, given the ID the model sent, and records it in
+// callIDs: the model's, or one of the loop's own when the model gave
+// none, or gave one a call in the transcript already has, one another
+// call of the attempt took, held or not, or one the agent or the run's
+// context reserved. A call ID names one call, since an output, a
+// pending list and the session record name the call by it alone. The
+// new ID is the model's, in the alphabet every provider takes, with a
+// random suffix, so it names no call a fold took out of the transcript
+// or another branch of the session holds either. A call is decided when
+// it opens, so its item_start, item_update and item_end events, the
+// transcript, the response the turn acts on and every later request
+// carry one ID; a call the stream never opened is decided when it
+// completes.
+func (r *runner) decideCallID(id string, index int) {
 	if r.callIDs == nil {
 		r.callIDs = map[int]string{}
 	}
-	r.callIDs[index] = renamed.CallID
+	if r.callIDTaken(id) {
+		id = openresponses.NewID(callIDPrefix(id))
+	}
+	r.callIDs[index] = id
+}
+
+// callIDTaken reports whether a call the model makes may not keep id.
+// The calls the attempt held are in callIDs, not yet in the transcript.
+func (r *runner) callIDTaken(id string) bool {
+	if id == "" || r.reserved[id] || r.ctxReserved[id] {
+		return true
+	}
+	for _, taken := range r.callIDs {
+		if taken == id {
+			return true
+		}
+	}
+	for _, item := range r.transcript {
+		if c, ok := item.(*openresponses.FunctionCall); ok && c.CallID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// withCallID returns item, or a copy of it with the call ID decided
+// for the function call at index when that is not the one it carries.
+func (r *runner) withCallID(item openresponses.Item, index int) openresponses.Item {
+	call, ok := item.(*openresponses.FunctionCall)
+	if !ok {
+		return item
+	}
+	id, ok := r.callIDs[index]
+	if !ok || id == call.CallID {
+		return item
+	}
+	renamed := *call
+	renamed.CallID = id
 	return &renamed
 }
 
@@ -1248,24 +1291,26 @@ func callIDPrefix(id string) string {
 }
 
 // renameCalls gives the function calls of a response the call IDs
-// uniqueCall gave them when they completed, so the calls the turn runs
-// are the ones the transcript holds.
+// decideCallID gave them, so the calls the turn runs are the ones the
+// transcript holds.
 func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Response {
-	if len(r.callIDs) == 0 {
+	var out *openresponses.Response
+	for index, item := range resp.Output {
+		renamed := r.withCallID(item, index)
+		if renamed == item {
+			continue
+		}
+		if out == nil {
+			copied := *resp
+			copied.Output = append(openresponses.Items(nil), resp.Output...)
+			out = &copied
+		}
+		out.Output[index] = renamed
+	}
+	if out == nil {
 		return resp
 	}
-	out := *resp
-	out.Output = append(openresponses.Items(nil), resp.Output...)
-	for index, id := range r.callIDs {
-		if index < len(out.Output) {
-			if call, ok := out.Output[index].(*openresponses.FunctionCall); ok {
-				renamed := *call
-				renamed.CallID = id
-				out.Output[index] = &renamed
-			}
-		}
-	}
-	return &out
+	return out
 }
 
 // wireError carries an error event off the stream, so the attempt can

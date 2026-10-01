@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -296,6 +297,112 @@ func TestRelayCarriesTheLoopsCallID(t *testing.T) {
 			t.Errorf("output %q answers call %q", out.CallID, call.CallID)
 		}
 	}
+}
+
+// TestCallIDsOnTheWire pins that the caller sees one call ID per call,
+// the one the transcript holds, from its output_item.added through its
+// output_item.done and the function_call_output that answers it: the
+// loop decides the ID as the call opens, so a call that repeats
+// another's ID or carries none streams under the loop's from the
+// start. A model that sends only finished items gets the same.
+func TestCallIDsOnTheWire(t *testing.T) {
+	for _, doneOnly := range []bool{false, true} {
+		t.Run(fmt.Sprintf("done only %t", doneOnly), func(t *testing.T) {
+			m := &oneResponse{ids: []string{"call_0", "call_0", "-"}, doneOnly: doneOnly}
+			a := New(agentturn.Config{Model: m, ModelName: "m", Tools: []agenttool.Tool{upper}}, WithToolItems())
+			sink, err := streamtest.Run(context.Background(), a, request(openresponses.UserText("x")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var added, done, outputs []string
+			for _, ev := range sink.Events() {
+				switch e := ev.(type) {
+				case *openresponses.OutputItemAddedEvent:
+					if call, ok := e.Item.(*openresponses.FunctionCall); ok {
+						added = append(added, call.CallID)
+					}
+				case *openresponses.OutputItemDoneEvent:
+					switch item := e.Item.(type) {
+					case *openresponses.FunctionCall:
+						done = append(done, item.CallID)
+					case *openresponses.FunctionCallOutput:
+						outputs = append(outputs, item.CallID)
+					}
+				}
+			}
+			seen := map[string]bool{}
+			for _, id := range done {
+				if id == "" || seen[id] {
+					t.Errorf("call ID %q empty or repeated", id)
+				}
+				seen[id] = true
+			}
+			if len(done) != 3 || done[0] != "call_0" || !strings.HasPrefix(done[1], "call_0_") {
+				t.Errorf("call IDs %q", done)
+			}
+			if strings.Join(added, " ") != strings.Join(done, " ") || strings.Join(outputs, " ") != strings.Join(done, " ") {
+				t.Errorf("output_item.added %q, output_item.done %q, outputs %q", added, done, outputs)
+			}
+		})
+	}
+}
+
+// oneResponse is a model that calls upper once per ID in ids, then
+// answers once the outputs are in. An ID of "-" is sent empty, as a
+// provider that gives none does. With doneOnly it sends each call's
+// output_item.done alone, as a relay that passes on only finished items
+// does.
+type oneResponse struct {
+	ids      []string
+	doneOnly bool
+}
+
+func (m *oneResponse) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	filter := openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+		var items openresponses.Items
+		switch e := ev.(type) {
+		case *openresponses.OutputItemAddedEvent:
+			if m.doneOnly {
+				return nil
+			}
+			items = openresponses.Items{e.Item}
+		case *openresponses.FunctionCallArgumentsDeltaEvent, *openresponses.FunctionCallArgumentsDoneEvent:
+			if m.doneOnly {
+				return nil
+			}
+		case *openresponses.OutputItemDoneEvent:
+			items = openresponses.Items{e.Item}
+		}
+		if resp, ok := openresponses.TerminalResponse(ev); ok {
+			items = resp.Output
+		}
+		for _, item := range items {
+			if call, ok := item.(*openresponses.FunctionCall); ok && call.CallID == "-" {
+				call.CallID = ""
+			}
+		}
+		return sink.Send(ev)
+	})
+	em := openresponses.NewEmitter(filter, openresponses.NewResponse(req))
+	if _, ok := req.Input[len(req.Input)-1].(*openresponses.FunctionCallOutput); ok {
+		if err := em.Item(openresponses.AssistantText("done")); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	for _, id := range m.ids {
+		w, err := em.FunctionCall(id, "upper")
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(`{"text":"t"}`); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+	}
+	return em.Complete()
 }
 
 // numbering is a model that numbers its calls per response, as some
