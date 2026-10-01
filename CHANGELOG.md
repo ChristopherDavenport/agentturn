@@ -118,6 +118,15 @@ versions may break the API.
   restart; a decision that runs other arguments than those in force on
   the path writes its own, so the path says what ran. The recorder
   compares arguments as JSON values, its keys in any order (#186).
+- **`session.Recorder.Env` records a workspace that moves inside a
+  run.** The recorder asked `WithEnv` at a run's start alone, so a
+  sandbox rescheduled between two calls of one run left the calls after
+  the move under the env entry naming the old one, and the next run's
+  start read the move one run late. `Recorder.Env(ctx)` asks `WithEnv`
+  now and writes an env entry when it differs from the one in force, as
+  a run's start does; a hook or a tool calls it between calls, and the
+  entry lands in the session of the run on the context, as
+  `Annotate`'s does (#187).
 
 ## v0.0.12 - 2026-09-29
 

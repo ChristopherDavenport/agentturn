@@ -834,11 +834,12 @@ func WithoutChildSessions() Option {
 	return func(r *Recorder) { r.children = false }
 }
 
-// WithEnv sets a function the recorder calls once per run, on
-// run_start, for the environment the run works in: the working
-// directory, the version control state, file hashes, tool versions,
-// the workspace, with whatever tells one file system from another, a
-// container's host or instance, inside it through
+// WithEnv sets a function the recorder calls on each run_start, and
+// whenever [Recorder.Env] asks between the calls of a run, for the
+// environment the run works in: the working directory, the version
+// control state, file hashes, tool versions, the workspace, with
+// whatever tells one file system from another, a container's host or
+// instance, inside it through
 // agentsession.Workspace.SetMember rather than beside it, where the
 // format's substitution rule does not look. The entry is written when
 // it differs from the last one written, or found on the path by
@@ -846,9 +847,14 @@ func WithoutChildSessions() Option {
 // unchanged environment adds nothing; a nil entry writes nothing. The
 // recorder gathers nothing itself: what the host knows about its
 // environment is the host's to supply, and the recorder stays free of
-// the file system. An error fails the run. Only the recorder's own
-// session gets env entries; a child session inherits its parent's
-// environment through parent_session.
+// the file system. An error at run_start fails the run. A run's start
+// writes env entries in the recorder's own session alone; a child
+// session inherits its parent's environment through parent_session,
+// and gets an entry of its own only from [Recorder.Env]. A workspace
+// that can move while a run goes on, a sandbox in a pool that
+// reschedules it, is recorded only as far as the host calls
+// [Recorder.Env] when it moves: the start of the next run reads the
+// move one run late.
 func WithEnv(fn func(context.Context) (*agentsession.EnvEntry, error)) Option {
 	return func(r *Recorder) { r.env = fn }
 }
@@ -1578,6 +1584,35 @@ func (r *Recorder) Annotate(ctx context.Context, ns string, data any) (string, e
 		return "", fmt.Errorf("session: encode annotation %s: %w", ns, err)
 	}
 	return w.append(context.WithoutCancel(ctx), &agentsession.CustomEntry{NS: ns, Data: raw, CallID: w.callOn(ctx)})
+}
+
+// Env asks the function [WithEnv] set for the environment now and
+// writes it when it differs from the one in force, as a run's start
+// does, so a workspace that moves between two calls of one run puts
+// the calls after the move under an entry that names where they ran:
+// a sandbox rescheduled onto another node, its disk and its shell
+// gone. It is made from a hook or a tool, AfterToolCall after the call
+// that saw the move or the tool that moved, with the context it was
+// given, and between runs with any. The entry is written at the
+// current leaf of the session of the run on the context, as
+// [Recorder.Annotate] files its entry, or else of the recorder's own
+// session. A child session's run compares the entry with the one in
+// force in the recorder's own session, which the child inherits, so a
+// child writes one only when its workspace moved away from its
+// parent's. Without [WithEnv], or for a nil entry, it writes nothing;
+// an error from the function or the store is returned, and the run
+// goes on unless the caller fails it.
+func (r *Recorder) Env(ctx context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.env == nil {
+		return nil
+	}
+	w := r.writerOf(ctx)
+	if w != r.root && w.env == nil {
+		w.env, w.envWorkspace = r.root.env, r.root.envWorkspace
+	}
+	return w.writeEnv(context.WithoutCancel(ctx))
 }
 
 // EntryOf returns the ID of the entry the recorder wrote for item, the

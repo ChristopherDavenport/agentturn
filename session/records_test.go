@@ -583,6 +583,139 @@ func TestEnvIsWrittenWhenItChanges(t *testing.T) {
 	}
 }
 
+// oneCallATurn calls the tools it is offered one a turn, in order, and
+// answers with text once each has its output.
+type oneCallATurn struct{}
+
+func (oneCallATurn) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	outputs := 0
+	for _, item := range req.Input {
+		if _, ok := item.(*openresponses.FunctionCallOutput); ok {
+			outputs++
+		}
+	}
+	if outputs%len(req.Tools) == 0 {
+		if _, ok := req.Input[len(req.Input)-1].(*openresponses.FunctionCallOutput); ok {
+			w, err := em.Message(openresponses.PhaseFinalAnswer)
+			if err != nil {
+				return err
+			}
+			if err := w.Text("done"); err != nil {
+				return err
+			}
+			if err := w.Close(); err != nil {
+				return err
+			}
+			return em.Complete()
+		}
+	}
+	ft := req.Tools[outputs%len(req.Tools)].(*openresponses.FunctionTool)
+	w, err := em.FunctionCall("", ft.Name)
+	if err != nil {
+		return err
+	}
+	if err := w.Arguments(`{"text":"t"}`); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestEnvBetweenCalls pins #187: a workspace that moves between two
+// calls of one run, reported by Recorder.Env from AfterToolCall, puts
+// the second call under a new env entry, and the next run's start,
+// finding it in force, writes none.
+func TestEnvBetweenCalls(t *testing.T) {
+	cases := []struct {
+		name string
+		// move is the node the first call's AfterToolCall moves the
+		// workspace to.
+		move     string
+		wantEnvs string
+		// wantRecord is the env entries and dispatches on the path.
+		wantRecord string
+	}{
+		{"moved", "node-2", "node-1,node-2", "env:node-1 dispatch:a env:node-2 dispatch:b"},
+		{"not moved", "node-1", "node-1", "env:node-1 dispatch:a dispatch:b"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			node := "node-1"
+			env := func(context.Context) (*agentsession.EnvEntry, error) {
+				e := agentsession.NewEnvEntry("/work")
+				if err := e.SetWorkspace(agentsession.WorkspaceContainer, "sandbox").SetMember("node", node); err != nil {
+					return nil, err
+				}
+				return e, nil
+			}
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(ctx, store, agentsession.Header{}, WithEnv(env))
+			if err != nil {
+				t.Fatal(err)
+			}
+			tool := func(name string) agenttool.Tool {
+				return agenttool.New(name, "", func(context.Context, echoArgs) (string, error) { return "ok", nil })
+			}
+			a := agentturn.New(agentturn.Config{Model: oneCallATurn{}, Tools: []agenttool.Tool{tool("a"), tool("b")},
+				AfterToolCall: func(ctx context.Context, info agentturn.ToolResultInfo) (*agentturn.ToolOverride, error) {
+					if info.Call.Name == "a" {
+						node = tc.move
+						if err := rec.Env(ctx); err != nil {
+							return nil, err
+						}
+					}
+					return nil, nil
+				}})
+			defer rec.Attach(a)()
+			for _, text := range []string{"one", "two"} {
+				if end, err := a.Prompt(ctx, openresponses.UserText(text)); err != nil || end.Reason != agentturn.ReasonDone {
+					t.Fatalf("prompt: err=%v end=%+v", err, end)
+				}
+				if text == "one" {
+					var record []string
+					for _, e := range s.Path(s.Leaf()) {
+						switch e := e.(type) {
+						case *agentsession.EnvEntry:
+							var n string
+							_ = json.Unmarshal(e.Workspace.Unknown["node"], &n)
+							record = append(record, "env:"+n)
+						case *agentsession.DispatchEntry:
+							c := callsOf(t, s)
+							for name, call := range c {
+								if call.ID() == e.CallID {
+									record = append(record, "dispatch:"+name)
+								}
+							}
+						}
+					}
+					if got := strings.Join(record, " "); got != tc.wantRecord {
+						t.Errorf("record = %q, want %q", got, tc.wantRecord)
+					}
+				}
+			}
+			var envs []string
+			for _, e := range s.Entries() {
+				if env, ok := e.(*agentsession.EnvEntry); ok {
+					var n string
+					_ = json.Unmarshal(env.Workspace.Unknown["node"], &n)
+					envs = append(envs, n)
+				}
+			}
+			if got := strings.Join(envs, ","); got != tc.wantEnvs {
+				t.Errorf("env entries = %q, want %q", got, tc.wantEnvs)
+			}
+			if err := s.VerifyRecords(s.Leaf()); err != nil {
+				t.Errorf("verify records: %v", err)
+			}
+			verifyAll(t, s)
+		})
+	}
+}
+
 func TestFoldCallIsRecorded(t *testing.T) {
 	root := t.TempDir()
 	store, err := jsonl.Open(root)
