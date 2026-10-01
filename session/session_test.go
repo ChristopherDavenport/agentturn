@@ -1017,37 +1017,89 @@ func (failingFold) CreateStream(context.Context, openresponses.Request, openresp
 	return errors.New("summary model down")
 }
 
-func TestFailedFoldLeavesATrace(t *testing.T) {
-	store := agentsession.NewMemoryStore()
-	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+// callingFold answers every summary request with a function call and
+// no text, as a thinking model may.
+type callingFold struct{}
+
+func (callingFold) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	em.Response().Usage = &openresponses.Usage{OutputTokens: 7}
+	fc, err := em.FunctionCall("call_1", "upper")
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
-	tr := compact.NewLocal(failingFold{}, compact.WithBudget(4), compact.WithKeepLast(2), compact.WithEstimator(countItems), compact.WithOnFold(rec.Fold))
-	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform})
-	defer rec.Attach(a)()
-	for _, text := range []string{"one", "two"} {
-		if _, err := a.Prompt(context.Background(), openresponses.UserText(text)); err != nil {
-			t.Fatal(err)
-		}
+	if err := fc.Arguments("{}"); err != nil {
+		return err
 	}
-	end, err := a.Prompt(context.Background(), openresponses.UserText("three"))
-	if err == nil || end.Reason != agentturn.ReasonError {
-		t.Fatalf("third prompt: err=%v end=%+v", err, end)
+	if err := fc.Close(); err != nil {
+		return err
 	}
-	// The failed fold is the last entry before the run's end.
-	entries := s.Entries()
-	last, ok := entries[len(entries)-2].(*agentsession.CustomEntry)
-	if !ok || last.NS != FailedFoldNS {
-		t.Fatalf("entry before the end = %+v, entries %q", entries[len(entries)-2], entryTypes(s))
+	return em.Complete()
+}
+
+func TestFailedFoldLeavesATrace(t *testing.T) {
+	cases := []struct {
+		name         string
+		model        openresponses.Streamer
+		wantErr      string
+		wantAttempts int
+		wantResponse bool
+		wantTypes    string
+		wantUsage    int // output tokens; 0 for no usage
+	}{
+		{"the call fails", failingFold{}, "summary model down", 1, false, "", 0},
+		{"the model answers with a call twice", callingFold{}, "summary response has no text", 2, true, "function_call", 7},
 	}
-	var data FailedFold
-	if err := json.Unmarshal(last.Data, &data); err != nil || !strings.Contains(data.Error, "summary model down") || data.TokensBefore != 5 {
-		t.Errorf("failed fold = %+v err=%v", data, err)
-	}
-	// The record still verifies: the fold changed nothing.
-	if n := verifyAll(t, s); n != 2 {
-		t.Errorf("responses verified = %d", n)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tr := compact.NewLocal(tc.model, compact.WithBudget(4), compact.WithKeepLast(2), compact.WithEstimator(countItems), compact.WithModel("small"), compact.WithOnFold(rec.Fold))
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform})
+			defer rec.Attach(a)()
+			for _, text := range []string{"one", "two"} {
+				if _, err := a.Prompt(context.Background(), openresponses.UserText(text)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			end, err := a.Prompt(context.Background(), openresponses.UserText("three"))
+			if err == nil || end.Reason != agentturn.ReasonError {
+				t.Fatalf("third prompt: err=%v end=%+v", err, end)
+			}
+			// The failed fold is the last entry before the run's end.
+			entries := s.Entries()
+			last, ok := entries[len(entries)-2].(*agentsession.CustomEntry)
+			if !ok || last.NS != FailedFoldNS {
+				t.Fatalf("entry before the end = %+v, entries %q", entries[len(entries)-2], entryTypes(s))
+			}
+			var data FailedFold
+			if err := json.Unmarshal(last.Data, &data); err != nil || !strings.Contains(data.Error, tc.wantErr) || data.TokensBefore != 5 {
+				t.Errorf("failed fold = %+v err=%v", data, err)
+			}
+			// What the calls did: the request went out either way and is
+			// named as a successful fold names it; the response members
+			// are there when the model answered.
+			if data.Attempts != tc.wantAttempts || data.RequestHash == "" || data.Model != "small" {
+				t.Errorf("failed fold call = %+v", data)
+			}
+			if (data.ResponseID != "") != tc.wantResponse || strings.Join(data.OutputTypes, ",") != tc.wantTypes {
+				t.Errorf("failed fold response = %q, output types = %q", data.ResponseID, data.OutputTypes)
+			}
+			gotUsage := 0
+			if data.Usage != nil {
+				gotUsage = data.Usage.OutputTokens
+			}
+			if gotUsage != tc.wantUsage {
+				t.Errorf("failed fold usage = %+v, want %d output tokens", data.Usage, tc.wantUsage)
+			}
+			// The record still verifies: the fold changed nothing.
+			if n := verifyAll(t, s); n != 2 {
+				t.Errorf("responses verified = %d", n)
+			}
+		})
 	}
 }
 

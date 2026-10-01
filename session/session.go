@@ -214,8 +214,10 @@
 //     hashes and the pinned items are in the context a resume seeds
 //     from. A fold that failed is
 //     a custom entry in the agentturn:compaction_failed namespace
-//     carrying the error, so an abort or a failure during the fold
-//     leaves a trace.
+//     carrying the error and what the fold's calls did (the number of
+//     attempts, the last one's request hash, response ID, usage and
+//     output item types), so an abort or a failure during the fold
+//     leaves a trace that says what the model answered.
 //   - a child run observed through [Recorder.Observe]: a session of its
 //     own whose ID is derived from the parent's and the call's as the
 //     format recommends, with parent_session, spawned_by and the same
@@ -381,10 +383,20 @@ import (
 // that failed. Its data is a [FailedFold].
 const FailedFoldNS = "agentturn:compaction_failed"
 
-// FailedFold is the data of a [FailedFoldNS] custom entry.
+// FailedFold is the data of a [FailedFoldNS] custom entry. Beyond the
+// error and the estimate that triggered the fold, it carries what the
+// fold's model calls did, as far as they got: how many there were, and
+// for the last one the members a compaction entry's [FoldMember]
+// carries (request_hash, response_id, model), its usage and the types
+// of the items it answered, so a reader can tell a model that answered
+// with no text, or with too much, from a call that never completed.
 type FailedFold struct {
 	Error        string `json:"error"`
 	TokensBefore int    `json:"tokens_before,omitempty"`
+	Attempts     int    `json:"attempts,omitempty"`
+	FoldCall
+	Usage       *openresponses.Usage `json:"usage,omitempty"`
+	OutputTypes []string             `json:"output_types,omitempty"`
 }
 
 // UnplacedFoldNS is the namespace of the custom entry written for a fold
@@ -3208,7 +3220,11 @@ func errorPayload(err error) *openresponses.ErrorPayload {
 // fold entry for one that failed.
 func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 	if f.Err != nil {
-		raw, err := json.Marshal(FailedFold{Error: f.Err.Error(), TokensBefore: f.TokensBefore})
+		call, err := foldCall(f)
+		if err != nil {
+			return err
+		}
+		raw, err := json.Marshal(FailedFold{Error: f.Err.Error(), TokensBefore: f.TokensBefore, Attempts: f.Attempts, FoldCall: call, Usage: f.Usage, OutputTypes: f.OutputTypes})
 		if err != nil {
 			return fmt.Errorf("session: encode failed fold: %w", err)
 		}
@@ -3245,14 +3261,9 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 		Usage:        f.Usage,
 	}
 	if f.Request != nil || f.ResponseID != "" {
-		call := FoldCall{ResponseID: f.ResponseID}
-		if f.Request != nil {
-			hash, err := RequestHash(Canonical(*f.Request))
-			if err != nil {
-				return err
-			}
-			call.RequestHash = hash
-			call.Model = f.Request.Model
+		call, err := foldCall(f)
+		if err != nil {
+			return err
 		}
 		raw, err := json.Marshal(call)
 		if err != nil {
@@ -3262,6 +3273,22 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 	}
 	_, err = w.append(ctx, entry)
 	return err
+}
+
+// foldCall names the model call a fold made: the hash and model of its
+// request, when it has one, and its response ID. The request itself is
+// not kept, as it holds the whole folded prefix.
+func foldCall(f compact.Fold) (FoldCall, error) {
+	call := FoldCall{ResponseID: f.ResponseID}
+	if f.Request != nil {
+		hash, err := RequestHash(Canonical(*f.Request))
+		if err != nil {
+			return FoldCall{}, err
+		}
+		call.RequestHash = hash
+		call.Model = f.Request.Model
+	}
+	return call, nil
 }
 
 // foldSplitOf returns the index into the items the writer wrote at which
