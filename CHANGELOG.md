@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.14 - 2026-10-01
 
 - **`compact.WithOnFold` adds a callback rather than replacing the
   one before it.** Each is called in the order given, and the first
