@@ -214,8 +214,10 @@
 //     hashes and the pinned items are in the context a resume seeds
 //     from. A fold that failed is
 //     a custom entry in the agentturn:compaction_failed namespace
-//     carrying the error, so an abort or a failure during the fold
-//     leaves a trace.
+//     carrying the error and what the fold's calls did (the number of
+//     attempts, the last one's request hash, response ID, usage and
+//     output item types), so an abort or a failure during the fold
+//     leaves a trace that says what the model answered.
 //   - a child run observed through [Recorder.Observe]: a session of its
 //     own whose ID is derived from the parent's and the call's as the
 //     format recommends, with parent_session, spawned_by and the same
@@ -381,10 +383,21 @@ import (
 // that failed. Its data is a [FailedFold].
 const FailedFoldNS = "agentturn:compaction_failed"
 
-// FailedFold is the data of a [FailedFoldNS] custom entry.
+// FailedFold is the data of a [FailedFoldNS] custom entry. Beyond the
+// error and the estimate that triggered the fold, it carries what the
+// fold's model calls did, as far as they got: how many there were, the
+// usage of them all summed, and for the last one the members a
+// compaction entry's [FoldMember] carries (request_hash, response_id,
+// model) and the types of the items it answered, so a reader can tell
+// a model that answered with no text, or with too much, from a call
+// that never completed.
 type FailedFold struct {
 	Error        string `json:"error"`
 	TokensBefore int    `json:"tokens_before,omitempty"`
+	Attempts     int    `json:"attempts,omitempty"`
+	FoldCall
+	Usage       *openresponses.Usage `json:"usage,omitempty"`
+	OutputTypes []string             `json:"output_types,omitempty"`
 }
 
 // UnplacedFoldNS is the namespace of the custom entry written for a fold
@@ -650,6 +663,15 @@ type writer struct {
 	pending    string
 	started    time.Time
 	inFlightID string
+	// unnamed holds, in order, the items the call in flight completed
+	// before its stream named the response: a stream that sends no
+	// response.created or response.in_progress names it first on its
+	// terminal event. Entries are append-only, so each is written once
+	// the ID is known, before the entry of the event that brought it:
+	// the next item event that names the response, the response_end,
+	// or the run's end; an item entry without the ID would read as an
+	// input and leave its response's request unrebuildable.
+	unnamed []unnamedItem
 	// items holds the ID of the entry contributing each item of the
 	// agent's working transcript, in order, so a fold's split index
 	// names the first kept entry; values holds the items themselves and
@@ -695,6 +717,12 @@ type writer struct {
 	// written only when it differs.
 	env          []byte
 	envWorkspace *agentsession.Workspace
+	// parent is the writer of the session a child's was created under,
+	// and parentID that session's ID, which is all a writer reopened
+	// from the store knows of it: a child with no env entry of its own
+	// is under the env in force in its parent's.
+	parent   *writer
+	parentID string
 	// base is the request hash of the canonical base request of the
 	// configuration the last run started under, from this writer's run
 	// or the [ConfigBaseMember] of the last run start on a seeded path,
@@ -724,12 +752,21 @@ type writer struct {
 	// last one requested tools, which is what the end reason turns on;
 	// answeredCall says the run wrote an output or a decision, which is
 	// how the format reads a run that answered a call an earlier one's
-	// model call made.
+	// model call made; withheld says an OutputGuard withheld the last
+	// response, written incomplete with content_filter.
 	run          string
 	open         []string
 	responses    int
 	lastCalls    bool
 	answeredCall bool
+	withheld     bool
+}
+
+// unnamedItem is an item_end of the call in flight that named no
+// response, held until the response is known.
+type unnamedItem struct {
+	item        openresponses.Item
+	modelCallID string
 }
 
 // inboxItem is one input accepted into a queue and not appended yet.
@@ -755,8 +792,11 @@ type inboxItem struct {
 type callRecord struct {
 	// entry is the ID of the item entry holding the call.
 	entry string
-	// args are the arguments as the model wrote them.
-	args string
+	// args are the arguments as the model wrote them, and decided those
+	// the last decision on the path that rewrote them gave it, "" when
+	// none did.
+	args    string
+	decided string
 	// held is set while the latest decision is a hold that nothing has
 	// answered; dispatched once a dispatch is written; rejected once a
 	// reject is; ended once an answer decision is, which only the
@@ -818,11 +858,12 @@ func WithoutChildSessions() Option {
 	return func(r *Recorder) { r.children = false }
 }
 
-// WithEnv sets a function the recorder calls once per run, on
-// run_start, for the environment the run works in: the working
-// directory, the version control state, file hashes, tool versions,
-// the workspace, with whatever tells one file system from another, a
-// container's host or instance, inside it through
+// WithEnv sets a function the recorder calls on each run_start, and
+// whenever [Recorder.Env] asks between the calls of a run, for the
+// environment the run works in: the working directory, the version
+// control state, file hashes, tool versions, the workspace, with
+// whatever tells one file system from another, a container's host or
+// instance, inside it through
 // agentsession.Workspace.SetMember rather than beside it, where the
 // format's substitution rule does not look. The entry is written when
 // it differs from the last one written, or found on the path by
@@ -830,9 +871,14 @@ func WithoutChildSessions() Option {
 // unchanged environment adds nothing; a nil entry writes nothing. The
 // recorder gathers nothing itself: what the host knows about its
 // environment is the host's to supply, and the recorder stays free of
-// the file system. An error fails the run. Only the recorder's own
-// session gets env entries; a child session inherits its parent's
-// environment through parent_session.
+// the file system. An error at run_start fails the run. A run's start
+// writes env entries in the recorder's own session alone; a child
+// session inherits its parent's environment through parent_session,
+// and gets an entry of its own only from [Recorder.Env]. A workspace
+// that can move while a run goes on, a sandbox in a pool that
+// reschedules it, is recorded only as far as the host calls
+// [Recorder.Env] when it moves: the start of the next run reads the
+// move one run late.
 func WithEnv(fn func(context.Context) (*agentsession.EnvEntry, error)) Option {
 	return func(r *Recorder) { r.env = fn }
 }
@@ -970,7 +1016,9 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // lists them, with the reason the record gives each: a call held by a
 // hold decision is [agentturn.PendingDeferred], and Dispatched when
 // the hold follows its dispatch; one in flight when the record stopped
-// may have run and is [agentturn.PendingAborted]; one an answer
+// may have run and is [agentturn.PendingAborted], as is one with no
+// dispatch on the path that has one on a branch a rebase to before it
+// left, a held one of which is Dispatched; one an answer
 // decision ended before its output was written is
 // [agentturn.PendingAnswered], owed that output and nothing else; one
 // a reject decision refused before its output was written is
@@ -979,7 +1027,8 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // started and is [agentturn.PendingUndispatched]; and one the file
 // cannot say about is [agentturn.PendingUnknown]. A call that may have
 // run carries the key of its last dispatch and the arguments that
-// dispatch ran with, the pair a run of it again repeats, and one the
+// dispatch ran with, the pair a run of it again repeats, the last
+// dispatch in the session when none is on the path, and one the
 // file cannot say about the arguments a decision gave it. It is what
 // [agentturn.WithPending] seeds an agent with beside the context's
 // items, so the agent's Resume knows which calls never started;
@@ -995,7 +1044,8 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 	var out []agentturn.PendingCall
 	for _, c := range calls {
 		p := agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingUnknown}
-		switch c.State(s.Header()) {
+		state := c.State(s.Header())
+		switch state {
 		case agentsession.CallHeld:
 			p.Reason, p.Dispatched = agentturn.PendingDeferred, len(c.Dispatches) > 0
 		case agentsession.CallInFlight:
@@ -1007,20 +1057,57 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 		case agentsession.CallNeverStarted:
 			p.Reason = agentturn.PendingUndispatched
 		}
+		// A call with no dispatch on the path may have one on a branch
+		// a rebase left: it was handed to its tool there, so it may
+		// have run, and a run of it again repeats that hand-off.
+		var off *agentsession.Call
+		if len(c.Dispatches) == 0 && (state == agentsession.CallHeld || state == agentsession.CallNeverStarted || state == agentsession.CallUnknown) {
+			if ds := s.Dispatches(c.Entry.ID); len(ds) > 0 {
+				if off, err = callAt(s, ds[len(ds)-1], c.Entry.ID); err != nil {
+					return nil, err
+				}
+				if state == agentsession.CallHeld {
+					p.Dispatched = true
+				} else {
+					p.Reason = agentturn.PendingAborted
+				}
+			}
+		}
 		var args string
 		switch {
+		case p.Reason == agentturn.PendingDeferred && !p.Dispatched:
+			// A held call runs, when approved, with the arguments the
+			// decision that held it gave it.
+			args = c.Args()
 		case !p.MayHaveRun():
+		case off != nil:
+			p.IdempotencyKey, args = off.IdempotencyKey(), off.DispatchedArgs()
 		case len(c.Dispatches) > 0:
 			p.IdempotencyKey, args = c.IdempotencyKey(), c.DispatchedArgs()
 		default:
 			args = c.Args()
 		}
-		if args != "" && args != c.Call.Arguments {
+		if args != "" && !sameJSON(json.RawMessage(args), c.Call.Arguments) {
 			p.Args = json.RawMessage(args)
 		}
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// callAt is the call held by the entry callEntry as the path to the
+// dispatch d reads it, d its last dispatch.
+func callAt(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry string) (*agentsession.Call, error) {
+	calls, err := s.Calls(d.ID)
+	if err != nil {
+		return nil, fmt.Errorf("session: calls at dispatch: %w", err)
+	}
+	for _, c := range calls {
+		if c.Entry.ID == callEntry {
+			return c, nil
+		}
+	}
+	return nil, fmt.Errorf("session: dispatch %s names call entry %s, which is not on its path", d.ID, callEntry)
 }
 
 // AgentOptions returns the options that seed an agent with the
@@ -1503,11 +1590,103 @@ func (r *Recorder) Annotate(ctx context.Context, ns string, data any) (string, e
 	return w.append(context.WithoutCancel(ctx), &agentsession.CustomEntry{NS: ns, Data: raw, CallID: w.callOn(ctx)})
 }
 
+// Env asks the function [WithEnv] set for the environment now and
+// writes it when it differs from the one in force, as a run's start
+// does, so a workspace that moves between two calls of one run puts
+// the calls after the move under an entry that names where they ran:
+// a sandbox rescheduled onto another node, its disk and its shell
+// gone. It is made from a hook or a tool, AfterToolCall after the call
+// that saw the move or the tool that moved, with the context it was
+// given, and between runs with any. The entry is written where
+// [Recorder.Annotate] files its entry: at the current leaf of the
+// session of the run on the context; when the context names no run
+// being written, of the child session [SessionIDFromContext] names
+// when that is one of this recorder's, reopened at its leaf, so a job
+// a child started that moves the workspace after the child's run
+// ended records the move in the child; or else of the recorder's own
+// session. It is compared with the env in force in that session: the
+// last on its path, or for a child with none of its own, the one in
+// force in its parent's, which it inherits, and so up to the
+// recorder's own session, so a child or a grandchild writes one only
+// when its workspace moved away from the one it is under. Without
+// [WithEnv], or for a nil entry, it writes nothing;
+// an error from the function or the store is returned, and the run
+// goes on unless the caller fails it.
+//
+// An env entry applies to the dispatches written after it, not to one
+// before. An entry written from AfterToolCall lands after the dispatch
+// of the call that hook ran for, so that call stays under the earlier
+// env, and the move applies from the next dispatch on. So does one a
+// tool writes, since the tool's own dispatch is written before it runs.
+func (r *Recorder) Env(ctx context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.env == nil {
+		return nil
+	}
+	ctx = context.WithoutCancel(ctx)
+	w := r.writerOf(ctx)
+	if w == r.root {
+		cw, err := r.reopen(ctx)
+		if err != nil {
+			return err
+		}
+		if cw != nil {
+			w = cw
+		}
+	}
+	have, haveWorkspace, err := r.envInForce(ctx, w)
+	if err != nil {
+		return err
+	}
+	return w.writeEnvOver(ctx, have, haveWorkspace)
+}
+
+// envInForce returns the env in force in w's session: the last one on
+// its path, or for a child with none of its own, the one in force in
+// its parent's, and so up to the recorder's own session.
+func (r *Recorder) envInForce(ctx context.Context, w *writer) ([]byte, *agentsession.Workspace, error) {
+	for depth := 0; w != nil && depth < maxEnvDepth; depth++ {
+		if w.env != nil || w == r.root {
+			return w.env, w.envWorkspace, nil
+		}
+		next := w.parent
+		if next == nil && w.parentID != "" {
+			var err error
+			if next, err = r.writerByID(ctx, w.parentID); err != nil {
+				return nil, nil, err
+			}
+		}
+		w = next
+	}
+	return nil, nil, nil
+}
+
+// maxEnvDepth bounds the walk up a chain of child sessions.
+const maxEnvDepth = 64
+
+// writerByID returns a writer of the session id: the recorder's own,
+// one a run is being written to, or one of its children reopened at
+// its leaf; nil for a session the recorder does not write.
+func (r *Recorder) writerByID(ctx context.Context, id string) (*writer, error) {
+	if id == r.root.id {
+		return r.root, nil
+	}
+	for _, w := range r.runs {
+		if w.id == id {
+			return w, nil
+		}
+	}
+	return r.reopenID(ctx, id)
+}
+
 // EntryOf returns the ID of the entry the recorder wrote for item, the
 // value the loop delivered on item_end, in the session of the run on
 // the context, or the recorder's own when the context names none. It
 // is false for an item the recorder did not write there, which
-// includes an item whose item_end has not reached the recorder yet. A
+// includes an item whose item_end has not reached the recorder yet and
+// a model's item held until the stream names its response (see
+// [agentturn.ItemEnd]), written at the latest with the response. A
 // subscriber that marks a checkpoint asks this rather than reading the
 // session's leaf, which moves with every entry: asked on the item's own
 // item_end it needs to run after the recorder, and asked on any later
@@ -1544,7 +1723,13 @@ func (r *Recorder) writerOf(ctx context.Context) *writer {
 // child seeds a writer of its own from it. The caller holds r.mu, so
 // no live writer of the session appends meanwhile.
 func (r *Recorder) reopen(ctx context.Context) (*writer, error) {
-	id := SessionIDFromContext(ctx)
+	return r.reopenID(ctx, SessionIDFromContext(ctx))
+}
+
+// reopenID is reopen for the child session id. The writer knows the
+// env last written on the path and the session's parent, for
+// [Recorder.Env].
+func (r *Recorder) reopenID(ctx context.Context, id string) (*writer, error) {
 	if !r.childIDs[id] {
 		return nil, nil
 	}
@@ -1557,11 +1742,15 @@ func (r *Recorder) reopen(ctx context.Context) (*writer, error) {
 		return nil, fmt.Errorf("session: calls of child session %s: %w", id, err)
 	}
 	w := newWriter(r, id)
+	w.parentID = s.Header().ParentSession
 	for _, c := range calls {
 		w.calls[c.ID()] = callRecordOf(c, s.Header())
 	}
 	w.appOnly = appOnlyCalls(s.Path(s.Leaf()))
 	for _, e := range s.Path(s.Leaf()) {
+		if env, ok := e.(*agentsession.EnvEntry); ok {
+			w.env, w.envWorkspace = envBody(env), env.Workspace
+		}
 		c, ok := e.(*agentsession.CustomEntry)
 		if !ok || c.NS != NestedCallNS {
 			continue
@@ -1663,6 +1852,7 @@ func (w *writer) reset() {
 	w.wroteConfig = false
 	w.settleReq = nil
 	w.inFlight, w.pending, w.started, w.inFlightID = false, "", time.Time{}, ""
+	w.unnamed = nil
 	w.items, w.values, w.custom = nil, nil, nil
 	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = false, 0, nil, nil
 	w.calls = map[string]*callRecord{}
@@ -1744,8 +1934,12 @@ func callRecordOf(c *agentsession.Call, h agentsession.Header) *callRecord {
 	if c.Output != nil {
 		return &callRecord{entry: c.Entry.Base().ID, args: c.Call.Arguments, dispatched: len(c.Dispatches) > 0, answered: true}
 	}
+	decided := c.Args()
+	if sameJSON(json.RawMessage(decided), c.Call.Arguments) {
+		decided = ""
+	}
 	return &callRecord{
-		entry: c.Entry.Base().ID, args: c.Call.Arguments,
+		entry: c.Entry.Base().ID, args: c.Call.Arguments, decided: decided,
 		held: c.Held(), dispatched: len(c.Dispatches) > 0, rejected: c.Rejected(), ended: c.Answered(),
 		unknown: c.State(h) == agentsession.CallUnknown,
 	}
@@ -2000,6 +2194,7 @@ func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, 
 			r.addChild(s.ID())
 			w := newWriter(r, s.ID())
 			w.cwd = parent.cwd
+			w.parent, w.parentID = parent, parent.id
 			if agent.RetryFromContext(ctx) {
 				s.ResetLeaf()
 				return w, nil
@@ -2020,6 +2215,7 @@ func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, 
 	r.addChild(s.ID())
 	w := newWriter(r, s.ID())
 	w.cwd = parent.cwd
+	w.parent, w.parentID = parent, parent.id
 	return w, nil
 }
 
@@ -2108,6 +2304,9 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 		// model, which opens its reasoning item before anything else.
 		if id := streamedResponseID(ev); id != "" {
 			w.inFlightID = id
+			if _, err := w.name(ctx, id); err != nil {
+				return err
+			}
 		}
 	}
 	switch e := ev.(type) {
@@ -2123,6 +2322,14 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 		source, err := sessionTrigger(e.Trigger)
 		if err != nil {
 			return err
+		}
+		if w.inFlight && e.ResponseID == "" && !e.Hidden && source == nil {
+			// The loop appends nothing of its own while a model call
+			// is in flight, so this is the model's, from a stream that
+			// has not named its response yet: it is written once it
+			// has.
+			w.unnamed = append(w.unnamed, unnamedItem{item: e.Item, modelCallID: e.ModelCallID})
+			return nil
 		}
 		return w.item(ctx, e.Item, e.ResponseID, e.Hidden, source, e.ModelCallID)
 	case *agentturn.ResponseEnd:
@@ -2281,6 +2488,7 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 	w.responses = 0
 	w.lastCalls = false
 	w.answeredCall = false
+	w.withheld = false
 	start := agentsession.NewRunStart(e.RunID, string(e.Source), e.Trigger.String())
 	start.Trigger = trigger
 	// The comparison below does not ask a tool provider, which may cost
@@ -2386,6 +2594,12 @@ func (w *writer) differs(ctx context.Context, req openresponses.Request, tools b
 // writeEnv asks the host for the environment and writes it when it
 // differs from the last one written.
 func (w *writer) writeEnv(ctx context.Context) error {
+	return w.writeEnvOver(ctx, w.env, w.envWorkspace)
+}
+
+// writeEnvOver asks the host for the environment and writes it when it
+// differs from have and haveWorkspace, the env in force.
+func (w *writer) writeEnvOver(ctx context.Context, have []byte, haveWorkspace *agentsession.Workspace) error {
 	env, err := w.rec.env(ctx)
 	if err != nil {
 		return fmt.Errorf("session: env: %w", err)
@@ -2394,7 +2608,7 @@ func (w *writer) writeEnv(ctx context.Context) error {
 		return nil
 	}
 	data := envBody(env)
-	if w.env != nil && bytes.Equal(data, w.env) && agentsession.SameWorkspace(env.Workspace, w.envWorkspace) {
+	if have != nil && bytes.Equal(data, have) && agentsession.SameWorkspace(env.Workspace, haveWorkspace) {
 		return nil
 	}
 	if _, err := w.append(ctx, env); err != nil {
@@ -2480,6 +2694,12 @@ func (w *writer) retry(ctx context.Context, e *agentturn.ModelRetry) error {
 	if err != nil {
 		return fmt.Errorf("session: encode model retry: %w", err)
 	}
+	// The loop appends nothing of an attempt it tries again, so this
+	// holds nothing; should it, the items are written as a failed
+	// attempt's are, before the record of its retry.
+	if _, err := w.name(ctx, w.inFlightID); err != nil {
+		return err
+	}
 	// The settle held for the failed attempt stays held: the attempt
 	// that follows replaces it, and only the one that answers is
 	// configured on the path.
@@ -2503,6 +2723,21 @@ func (w *writer) flush(ctx context.Context) error {
 	req := *w.settleReq
 	w.settleReq = nil
 	return w.settle(ctx, req)
+}
+
+// name writes the items held for the call in flight, in order, with
+// responseID, and reports whether it wrote any. An empty responseID
+// writes them as the stream left them, naming no response: a call that
+// ended without ever naming its response.
+func (w *writer) name(ctx context.Context, responseID string) (bool, error) {
+	held := w.unnamed
+	w.unnamed = nil
+	for _, h := range held {
+		if err := w.item(ctx, h.item, responseID, false, nil, h.modelCallID); err != nil {
+			return true, err
+		}
+	}
+	return len(held) > 0, nil
 }
 
 // hash returns the request's hash when its input is what the stored
@@ -2722,10 +2957,12 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 			// same shape with the loop as the decider: it refused the
 			// call before any tool, which is a policy's refusal.
 			by := agentturn.DeciderFromContext(ctx, out.CallID)
-			if c.settledRun != "" && c.settledRun == w.run {
+			if c.settledRun != "" && c.settledRun == w.run || w.withheld {
 				// The loop refused it, whoever approved it: a call
 				// the caller approved on resume and the loop then
-				// found no tool for is the loop's reject.
+				// found no tool for is the loop's reject, and so is a
+				// call of a response an OutputGuard withheld, which
+				// the loop closes with agentturn.WithheldCallOutput.
 				by = agentsession.ByPolicy
 			}
 			dec := agentsession.NewDecision(out.CallID, c.entry, agentsession.VerdictReject, by).WithReason(outputText(out))
@@ -2930,15 +3167,25 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 		case agentturn.Defer:
 			// The reason is which rule raised the prompt, which is what
 			// an auditor asks of a hold; the model never sees it.
+			// The arguments are those the call is held with, which the
+			// decision may have rewritten, so an approval after a
+			// restart runs what was decided on.
 			hold := agentsession.NewDecision(e.CallID, c.entry, agentsession.VerdictHold, by)
 			if d.Reason != "" {
 				hold.WithReason(d.Reason)
+			}
+			carried := c.carries(e.Args)
+			if carried {
+				hold.WithArgs(e.Args)
 			}
 			if _, err := w.append(ctx, hold); err != nil {
 				return err
 			}
 			w.takeUp(e.CallID)
 			c.held = true
+			if carried {
+				c.decided = string(e.Args)
+			}
 			return nil
 		}
 	}
@@ -2949,10 +3196,11 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 	// always a decision; one with no reason is written when it is
 	// dispatched, so a call the loop then refuses has no proceed.
 	reason := decisionReason(d)
-	if rewritten := !sameJSON(e.Args, c.args); c.held || rewritten || reason != "" {
+	if rewritten := c.carries(e.Args); c.held || rewritten || reason != "" {
 		dec := agentsession.NewDecision(e.CallID, c.entry, agentsession.VerdictProceed, by)
 		if rewritten {
 			dec.WithArgs(e.Args)
+			c.decided = string(e.Args)
 		}
 		if reason != "" {
 			dec.WithReason(reason)
@@ -3018,8 +3266,20 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 	return nil
 }
 
+// carries reports whether a decision that runs or holds the call with
+// args must write them: they are not the model's, or not those an
+// earlier decision on the path put in force, which a decision without
+// arguments would leave in force.
+func (c *callRecord) carries(args json.RawMessage) bool {
+	return !sameJSON(args, c.args) || c.decided != "" && !sameJSON(args, c.decided)
+}
+
 // sameJSON reports whether two argument strings are the same object,
 // an empty string standing for the empty object as the loop reads it.
+// They are compared by their canonical form, the one the request hash
+// is taken over, so a store that hands them back with their keys
+// sorted or a number written another way hands back the same
+// arguments.
 func sameJSON(a json.RawMessage, b string) bool {
 	if len(a) == 0 {
 		a = json.RawMessage("{}")
@@ -3027,17 +3287,25 @@ func sameJSON(a json.RawMessage, b string) bool {
 	if b == "" {
 		b = "{}"
 	}
-	var ca, cb bytes.Buffer
-	if json.Compact(&ca, a) != nil || json.Compact(&cb, []byte(b)) != nil {
+	ca, errA := canonicalJSON(a)
+	cb, errB := canonicalJSON([]byte(b))
+	if errA != nil || errB != nil {
 		return string(a) == b
 	}
-	return ca.String() == cb.String()
+	return bytes.Equal(ca, cb)
 }
 
 func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 	resp := e.Response
 	if resp == nil {
 		return errors.New("session: response_end without a response")
+	}
+	// The items the stream completed before it named the response are
+	// its output, written with its ID before it, the withheld
+	// response's included.
+	unnamed, err := w.name(ctx, resp.ID)
+	if err != nil {
+		return err
 	}
 	entry := &agentsession.ResponseEntry{
 		ResponseID:  resp.ID,
@@ -3050,10 +3318,26 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 		LatencyMS:   w.latency(),
 		Attempts:    w.attempts(),
 	}
+	if unnamed && resp.ID == "" {
+		// A response that never named itself has no output on the
+		// path, so the items just written read as its input, and the
+		// record cannot rebuild its request.
+		entry.RequestHash = ""
+	}
 	w.inFlight, w.pending, w.started, w.inFlightID, w.retries = false, "", time.Time{}, "", 0
 	w.responses++
 	w.lastCalls = len(resp.FunctionCalls()) > 0
-	_, err := w.append(ctx, entry)
+	// A response an OutputGuard withheld a message of is incomplete
+	// with content_filter and no error, as the loop gives it, so the
+	// guard's text, which may say what it kept, is not on it; the
+	// run's end carries it. Its calls are closed by the loop with
+	// agentturn.WithheldCallOutput, which the recorder writes as the
+	// policy's rejects, and the run ends aborted.
+	w.withheld = e.Withheld
+	if e.Withheld {
+		w.lastCalls = false
+	}
+	_, err = w.append(ctx, entry)
 	return err
 }
 
@@ -3065,26 +3349,13 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 // and why it ended and the context algorithm strips the items it
 // produced rather than reading them as its input; the in-flight state is cleared
 // either way, so a writer reused for a later run cannot attribute its
-// first response to this call. Then the run's end entry, with the
-// reason in the format's terms and the run's calls left open.
+// first response to this call. A response an OutputGuard withheld a
+// message of has had its response_end, written incomplete. Then the
+// run's end entry, with the reason in the format's terms and the run's
+// calls left open.
 func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
-	hash, inFlight, responseID := w.pending, w.inFlight, w.inFlightID
-	latency, attempts := w.latency(), w.attempts()
-	w.inFlight, w.pending, w.started, w.inFlightID, w.retries = false, "", time.Time{}, "", 0
-	if inFlight {
-		w.responses++
-		w.lastCalls = false
-		entry := &agentsession.ResponseEntry{
-			ResponseID:  responseID,
-			Status:      openresponses.ResponseStatusFailed,
-			Error:       errorPayload(e.Err),
-			RequestHash: hash,
-			LatencyMS:   latency,
-			Attempts:    attempts,
-		}
-		if _, err := w.append(ctx, entry); err != nil {
-			return err
-		}
+	if err := w.endInFlight(ctx, e.Err); err != nil {
+		return err
 	}
 	if w.run == "" {
 		return nil
@@ -3098,6 +3369,45 @@ func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
 	// The end closes the queued entries of the inputs the run did not
 	// append; the ones the agent still holds are written again.
 	return w.endInbox(ctx)
+}
+
+// endInFlight writes the response entry of the call in flight, if any,
+// which ended without its response, and clears the in-flight state.
+// The entry names the call by its request hash and the response ID the
+// stream named, written failed with cause, and the context algorithm
+// strips the items it produced. A response an OutputGuard withheld a
+// message of is not one of these: the loop raises its response_end.
+func (w *writer) endInFlight(ctx context.Context, cause error) error {
+	hash, inFlight, responseID := w.pending, w.inFlight, w.inFlightID
+	latency, attempts := w.latency(), w.attempts()
+	// The items the call completed before it was cut off go first, as
+	// its output, named by the response the stream named, if any.
+	unnamed, err := w.name(ctx, responseID)
+	w.inFlight, w.pending, w.started, w.inFlightID, w.retries = false, "", time.Time{}, "", 0
+	if err != nil {
+		return err
+	}
+	if !inFlight {
+		return nil
+	}
+	if unnamed && responseID == "" {
+		// Cut off before the stream named its response: the items
+		// read as its input, and the record cannot rebuild its
+		// request.
+		hash = ""
+	}
+	w.responses++
+	w.lastCalls = false
+	entry := &agentsession.ResponseEntry{
+		ResponseID:  responseID,
+		Status:      openresponses.ResponseStatusFailed,
+		Error:       errorPayload(cause),
+		RequestHash: hash,
+		LatencyMS:   latency,
+		Attempts:    attempts,
+	}
+	_, err = w.append(ctx, entry)
+	return err
 }
 
 // endReason maps the loop's reason onto the format's cascade, with the
@@ -3124,6 +3434,11 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 			cause += ": " + e.Err.Error()
 		}
 		switch {
+		case w.withheld:
+			// OutputGuard withheld the last response, written
+			// incomplete, which the format reads as aborted whatever its
+			// calls: the run did not finish what the model began.
+			return agentsession.ReasonAborted, cause
 		case w.responses == 0:
 			// A resume whose approved batch terminated, a refusal on
 			// Resume, or a guard's stop before the run's first model
@@ -3208,7 +3523,11 @@ func errorPayload(err error) *openresponses.ErrorPayload {
 // fold entry for one that failed.
 func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 	if f.Err != nil {
-		raw, err := json.Marshal(FailedFold{Error: f.Err.Error(), TokensBefore: f.TokensBefore})
+		// A request the recorder cannot hash still went out: the fold
+		// failed all the same, and its entry is written without the
+		// hash rather than not at all.
+		call, _ := foldCall(f)
+		raw, err := json.Marshal(FailedFold{Error: f.Err.Error(), TokensBefore: f.TokensBefore, Attempts: f.Attempts, FoldCall: call, Usage: f.Usage, OutputTypes: f.OutputTypes})
 		if err != nil {
 			return fmt.Errorf("session: encode failed fold: %w", err)
 		}
@@ -3245,14 +3564,9 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 		Usage:        f.Usage,
 	}
 	if f.Request != nil || f.ResponseID != "" {
-		call := FoldCall{ResponseID: f.ResponseID}
-		if f.Request != nil {
-			hash, err := RequestHash(Canonical(*f.Request))
-			if err != nil {
-				return err
-			}
-			call.RequestHash = hash
-			call.Model = f.Request.Model
+		call, err := foldCall(f)
+		if err != nil {
+			return err
 		}
 		raw, err := json.Marshal(call)
 		if err != nil {
@@ -3262,6 +3576,24 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 	}
 	_, err = w.append(ctx, entry)
 	return err
+}
+
+// foldCall names the model call a fold made: the hash and model of its
+// request, when it has one, and its response ID. The request itself is
+// not kept, as it holds the whole folded prefix. When the request
+// cannot be hashed the call is returned without the hash, with the
+// error.
+func foldCall(f compact.Fold) (FoldCall, error) {
+	call := FoldCall{ResponseID: f.ResponseID}
+	if f.Request != nil {
+		call.Model = f.Request.Model
+		hash, err := RequestHash(Canonical(*f.Request))
+		if err != nil {
+			return call, err
+		}
+		call.RequestHash = hash
+	}
+	return call, nil
 }
 
 // foldSplitOf returns the index into the items the writer wrote at which
@@ -3437,7 +3769,7 @@ func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntr
 		d.Text = &tc
 	}
 	for k, v := range next.Extra {
-		if p, ok := prev.Extra[k]; !ok || string(p) != string(v) {
+		if p, ok := prev.Extra[k]; !ok || !equalJSON(p, v) {
 			if err := d.SetExtra(k, v); err != nil {
 				// v is raw JSON that already decoded once; it cannot fail
 				// to re-encode, so a full replace is the safe fallback.
@@ -3509,8 +3841,24 @@ func jsonLen(v any) int {
 	return len(data)
 }
 
+// equalJSON reports whether a and b encode to the same JSON value. It
+// compares their canonical form, the JCS one the request hash is taken
+// over, not their bytes: an object's members match by name in any
+// order and a number matches however it is written, so a tool whose
+// raw parameters a content-addressed store hands back canonicalised,
+// its keys sorted and a 1.0 written 1, is the tool the loop sent.
 func equalJSON(a, b any) bool {
-	da, errA := json.Marshal(a)
-	db, errB := json.Marshal(b)
-	return errA == nil && errB == nil && string(da) == string(db)
+	ca, okA := canonicalValue(a)
+	cb, okB := canonicalValue(b)
+	return okA && okB && bytes.Equal(ca, cb)
+}
+
+// canonicalValue is v encoded and put in canonical form.
+func canonicalValue(v any) ([]byte, bool) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil, false
+	}
+	out, err := canonicalJSON(data)
+	return out, err == nil
 }

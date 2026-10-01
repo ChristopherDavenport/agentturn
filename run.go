@@ -25,11 +25,21 @@ var (
 	ErrCannotContinue = errors.New("agentturn: transcript must end with a user message or a function call output to continue")
 	// ErrNoPrompt is returned when Run was called with no prompt items.
 	ErrNoPrompt = errors.New("agentturn: no prompt items")
-	// ErrGuard is what a ShouldStopAfterTurn hook wraps to end the run
-	// as a policy stop rather than a failure: ReasonStopped with
-	// StopGuard, the error on RunEnd.Err.
+	// ErrGuard is what a guard wraps to end the run as a policy stop
+	// rather than a failure: ReasonStopped with StopGuard, the error on
+	// RunEnd.Err. BeforeTurn, BeforeModelCall, OutputGuard and
+	// ShouldStopAfterTurn each read it so.
 	ErrGuard = errors.New("agentturn: guard stopped the run")
 )
+
+// WithheldCallOutput is the text of the output the loop appends for a
+// function call of a response an [Config.OutputGuard] withheld with an
+// error wrapping [ErrGuard]: the call completed in the stream before
+// the message the guard stopped on, and the loop closes it, never
+// having dispatched it, so the transcript holds no call without an
+// output and the next prompt goes ahead. The text is fixed and never
+// the guard's error, which may say what the guard kept from the model.
+const WithheldCallOutput = "Error: not run: the response that made this call was withheld"
 
 // EventBuffer is how many events the loop can run ahead of the consumer
 // of [Run] or [Continue] before it blocks; [Agent] delivers every event
@@ -507,8 +517,10 @@ type runner struct {
 	// response, so the next turn_start can name what was appended since.
 	mark int
 	// deferred holds the IDs of the calls a hook handed to the caller
-	// during this run, so the run end can say why they are pending.
-	deferred map[string]bool
+	// during this run, so the run end can say why they are pending,
+	// each with the arguments it was held with, which its decision may
+	// have rewritten.
+	deferred map[string]json.RawMessage
 	// callTools holds the tool each call of this run's batches resolved
 	// to, so a pending call carries the tool a prompt asks about.
 	callTools map[string]agenttool.Tool
@@ -540,9 +552,10 @@ type runner struct {
 	// are appended when the attempt commits and dropped when it ends
 	// without committing.
 	held []heldItem
-	// callIDs maps the output index of a function call the attempt in
-	// flight completed to the call ID the loop gave it, for a call whose
-	// own ID was empty or named a call the transcript already holds.
+	// callIDs maps the output index of every function call the attempt
+	// in flight opened or completed, the held ones included, to the call
+	// ID the loop decided for it: the model's when it names no other
+	// call, one of the loop's own when it is empty or taken.
 	callIDs map[int]string
 }
 
@@ -577,6 +590,9 @@ type errStop struct {
 	reason Reason
 	cause  StopCause
 	err    error
+	// withheld says OutputGuard withheld a message of the response in
+	// flight, which is what stopped the run.
+	withheld bool
 }
 
 func (e *errStop) Error() string {
@@ -641,6 +657,7 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 		end.Reason = stop.reason
 		end.Cause = stop.cause
 		end.Err = stop.err
+		end.Withheld = stop.withheld
 	case ctx.Err() != nil:
 		end.Reason = ReasonAborted
 		end.Err = context.Cause(ctx)
@@ -695,10 +712,16 @@ func (r *runner) pending() []PendingCall {
 	for i, call := range calls {
 		before, known := prior[call.CallID]
 		h, dispatched := r.dispatched[call.CallID]
+		held, deferred := r.deferred[call.CallID]
 		p := PendingCall{Call: call, Reason: PendingUnknown, Tool: r.callTools[call.CallID]}
 		switch {
-		case r.deferred[call.CallID]:
+		case deferred:
+			// A decision that rewrote the call's arguments and held it
+			// decided on those, and an approval runs them.
 			p.Reason = PendingDeferred
+			if held != nil && !sameArgs(held, orEmpty(nil, call.Arguments)) {
+				p.Args = held
+			}
 		case dispatched:
 			p.Reason, p.IdempotencyKey = PendingAborted, h.key
 			if !sameArgs(h.args, orEmpty(nil, call.Arguments)) {
@@ -717,7 +740,10 @@ func (r *runner) pending() []PendingCall {
 		case r.undispatched[call.CallID] || mine[call] || r.approved[call.CallID]:
 			p.Reason = PendingUndispatched
 		case known:
-			p.Reason = before.Reason
+			// As the agent knew it, the arguments a decision held it
+			// with included: a resume that failed before its batch
+			// decided nothing new.
+			p.Reason, p.Dispatched, p.IdempotencyKey, p.Args = before.Reason, before.Dispatched, before.IdempotencyKey, before.Args
 		}
 		if p.Tool == nil {
 			p.Tool = before.Tool
@@ -1006,11 +1032,30 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 	if err := r.emit(&TurnStart{RunID: r.runID, Turn: r.turn, Request: req, Inputs: inputs}); err != nil {
 		return nil, err
 	}
+	start := len(r.transcript)
 	for attempt := 1; ; attempt++ {
 		resp, committed, err := r.stream(ctx, req)
 		if err == nil {
 			r.mark = len(r.transcript)
 			return resp, nil
+		}
+		var halt *errStop
+		if errors.As(err, &halt) {
+			// OutputGuard stopped the run: a policy, not a failure to
+			// retry or wrap. The withheld response goes on record
+			// with what the transcript took from it, and the calls it
+			// made before the message are closed, so the transcript is
+			// a valid input for the next run.
+			if halt.withheld && resp != nil {
+				resp.Output = openresponses.Items(r.transcript[start:]).Clone()
+				if err := r.emit(&ResponseEnd{RunID: r.runID, Turn: r.turn, Response: resp, Withheld: true}); err != nil {
+					return nil, err
+				}
+			}
+			if err := r.closeWithheld(r.transcript[start:]); err != nil {
+				return nil, err
+			}
+			return nil, err
 		}
 		if ctx.Err() != nil {
 			return nil, stop(ReasonAborted, context.Cause(ctx))
@@ -1035,6 +1080,17 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 			return nil, stop(ReasonAborted, context.Cause(ctx))
 		}
 	}
+}
+
+// closeWithheld appends a [WithheldCallOutput] for each function call
+// among items, the part of the transcript a withheld response added.
+// Those calls were never dispatched; nothing else answers them.
+func (r *runner) closeWithheld(items Transcript) error {
+	var outputs openresponses.Items
+	for _, call := range unansweredCalls(items) {
+		outputs = append(outputs, &openresponses.FunctionCallOutput{CallID: call.CallID, Output: openresponses.FunctionCallOutputData{Text: WithheldCallOutput}})
+	}
+	return r.appendItems(outputs)
 }
 
 // sleep waits for d or until ctx is done.
@@ -1063,14 +1119,32 @@ func sleep(ctx context.Context, d time.Duration) error {
 // policy sees the transport or wire error itself.
 func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *openresponses.Response, committed bool, err error) {
 	var acc openresponses.Accumulator
+	var halt *errStop
 	r.held, r.callIDs = nil, nil
 	for ev, err := range openresponses.Events(ctx, r.cfg.Model, req) {
+		if halt != nil {
+			// OutputGuard withheld a message: the rest of the response
+			// is read for its usage alone, and nothing of it reaches
+			// the transcript or an event.
+			if err != nil {
+				break
+			}
+			acc.Add(ev)
+			if final, ok := openresponses.TerminalResponse(ev); ok {
+				resp = final
+			}
+			continue
+		}
 		if err != nil {
 			return nil, committed, err
 		}
 		acc.Add(ev)
 		commits, err := r.streamEvent(ev, &acc, committed)
 		committed = committed || commits
+		if stop := (*errStop)(nil); errors.As(err, &stop) && stop.withheld {
+			halt = stop
+			continue
+		}
 		if err != nil {
 			var wire *wireError
 			if errors.As(err, &wire) {
@@ -1084,6 +1158,9 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 		if final, ok := openresponses.TerminalResponse(ev); ok {
 			resp = final
 		}
+	}
+	if halt != nil {
+		return withheldResponse(&acc, resp), true, halt
 	}
 	if resp == nil {
 		return nil, committed, openresponses.ErrTruncatedStream
@@ -1113,6 +1190,27 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 	return resp, true, nil
 }
 
+// withheldResponse is the response an OutputGuard withheld a message
+// of: the terminal response when the stream sent one, the response as
+// accumulated otherwise, incomplete with content_filter, with its usage
+// and no output, which modelTurn fills with the items the transcript
+// took from it. The withheld message is not on it.
+func withheldResponse(acc *openresponses.Accumulator, final *openresponses.Response) *openresponses.Response {
+	base := final
+	if base == nil {
+		base = acc.Response()
+	}
+	var out openresponses.Response
+	if base != nil {
+		out = *base
+	}
+	out.Status = openresponses.ResponseStatusIncomplete
+	out.IncompleteDetails = &openresponses.IncompleteDetails{Reason: openresponses.IncompleteReasonContentFilter}
+	out.Error = nil
+	out.Output = nil
+	return &out
+}
+
 // streamEvent turns one wire event, already added to acc, into the item
 // events of the turn: item_start when an output item opens, item_end
 // with the transcript append when it is done, item_update for the
@@ -1131,6 +1229,12 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 	switch e := ev.(type) {
 	case *openresponses.OutputItemAddedEvent:
 		item := acc.Response().Output[e.OutputIndex]
+		if call, ok := item.(*openresponses.FunctionCall); ok {
+			// The call's ID is decided as it opens, so its item_start,
+			// every item_update and its item_end carry the same one.
+			r.decideCallID(call.CallID, e.OutputIndex)
+			item = r.withCallID(item, e.OutputIndex)
+		}
 		commits := !committed && commitsAttempt(item)
 		if commits {
 			// The answer has started: what the attempt produced on the
@@ -1144,18 +1248,30 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		item := e.Item
 		modelCallID := ""
 		if call, ok := item.(*openresponses.FunctionCall); ok {
-			if unique := r.uniqueCall(call, e.OutputIndex); unique != call {
-				item, modelCallID = unique, call.CallID
+			if _, opened := r.callIDs[e.OutputIndex]; !opened {
+				// A call first seen as it completes, on a stream that
+				// sends no output_item.added for it.
+				r.decideCallID(call.CallID, e.OutputIndex)
+			}
+			if item = r.withCallID(call, e.OutputIndex); item != openresponses.Item(call) {
+				modelCallID = call.CallID
 			}
 		}
 		if m, ok := item.(*openresponses.Message); ok && r.cfg.OutputGuard != nil {
 			// The guard sees the message before anything keeps it.
 			var before openresponses.Items
 			if cur := acc.Response(); cur != nil && e.OutputIndex <= len(cur.Output) {
-				before = append(before, cur.Output[:e.OutputIndex]...)
+				for i, prior := range cur.Output[:e.OutputIndex] {
+					before = append(before, r.withCallID(prior, i))
+				}
 			}
 			replacement, err := r.cfg.OutputGuard(r.ctx, OutputInfo{RunID: r.runID, Turn: r.turn, ResponseID: responseID, Message: m, Output: before})
 			if err != nil {
+				if errors.Is(err, ErrGuard) {
+					// A policy stop: the message is kept from the
+					// transcript and the run ends with the turn.
+					return true, &errStop{reason: ReasonStopped, cause: StopGuard, err: err, withheld: true}
+				}
 				return true, fmt.Errorf("agentturn: output guard: %w", err)
 			}
 			if replacement != nil {
@@ -1175,38 +1291,67 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		return false, &wireError{err: e.Err()}
 	}
 	if idx, ok := outputIndex(ev); ok {
-		return false, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: acc.Response().Output[idx], Stream: ev, ResponseID: responseID})
+		return false, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: r.withCallID(acc.Response().Output[idx], idx), Stream: ev, ResponseID: responseID})
 	}
 	return false, nil
 }
 
-// uniqueCall returns call, or a copy with a call ID of the loop's own
-// when the model gave none, one a call in the transcript already has,
-// or one the agent or the run's context reserved: a call ID names one
-// call, since an output, a pending list and the session record name the
-// call by it alone. The new ID is the model's, in the alphabet every
-// provider takes, with a random suffix, so it names no call a fold took
-// out of the transcript or another branch of the session holds either.
-// The item_start and item_update events of the call carry the model's
-// ID; its item_end, the transcript, the response the turn acts on and
-// every later request carry the new one.
-func (r *runner) uniqueCall(call *openresponses.FunctionCall, index int) *openresponses.FunctionCall {
-	taken := call.CallID == "" || r.reserved[call.CallID] || r.ctxReserved[call.CallID]
-	for _, item := range r.transcript {
-		if c, ok := item.(*openresponses.FunctionCall); ok && c.CallID == call.CallID {
-			taken = true
-			break
-		}
-	}
-	if !taken {
-		return call
-	}
-	renamed := *call
-	renamed.CallID = openresponses.NewID(callIDPrefix(call.CallID))
+// decideCallID decides the call ID of the function call at index of
+// the attempt in flight, given the ID the model sent, and records it in
+// callIDs: the model's, or one of the loop's own when the model gave
+// none, or gave one a call in the transcript already has, one another
+// call of the attempt took, held or not, or one the agent or the run's
+// context reserved. A call ID names one call, since an output, a
+// pending list and the session record name the call by it alone. The
+// new ID is the model's, in the alphabet every provider takes, with a
+// random suffix, so it names no call a fold took out of the transcript
+// or another branch of the session holds either. A call is decided when
+// it opens, so its item_start, item_update and item_end events, the
+// transcript, the response the turn acts on and every later request
+// carry one ID; a call the stream never opened is decided when it
+// completes.
+func (r *runner) decideCallID(id string, index int) {
 	if r.callIDs == nil {
 		r.callIDs = map[int]string{}
 	}
-	r.callIDs[index] = renamed.CallID
+	if r.callIDTaken(id) {
+		id = openresponses.NewID(callIDPrefix(id))
+	}
+	r.callIDs[index] = id
+}
+
+// callIDTaken reports whether a call the model makes may not keep id.
+// The calls the attempt held are in callIDs, not yet in the transcript.
+func (r *runner) callIDTaken(id string) bool {
+	if id == "" || r.reserved[id] || r.ctxReserved[id] {
+		return true
+	}
+	for _, taken := range r.callIDs {
+		if taken == id {
+			return true
+		}
+	}
+	for _, item := range r.transcript {
+		if c, ok := item.(*openresponses.FunctionCall); ok && c.CallID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// withCallID returns item, or a copy of it with the call ID decided
+// for the function call at index when that is not the one it carries.
+func (r *runner) withCallID(item openresponses.Item, index int) openresponses.Item {
+	call, ok := item.(*openresponses.FunctionCall)
+	if !ok {
+		return item
+	}
+	id, ok := r.callIDs[index]
+	if !ok || id == call.CallID {
+		return item
+	}
+	renamed := *call
+	renamed.CallID = id
 	return &renamed
 }
 
@@ -1236,24 +1381,26 @@ func callIDPrefix(id string) string {
 }
 
 // renameCalls gives the function calls of a response the call IDs
-// uniqueCall gave them when they completed, so the calls the turn runs
-// are the ones the transcript holds.
+// decideCallID gave them, so the calls the turn runs are the ones the
+// transcript holds.
 func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Response {
-	if len(r.callIDs) == 0 {
+	var out *openresponses.Response
+	for index, item := range resp.Output {
+		renamed := r.withCallID(item, index)
+		if renamed == item {
+			continue
+		}
+		if out == nil {
+			copied := *resp
+			copied.Output = append(openresponses.Items(nil), resp.Output...)
+			out = &copied
+		}
+		out.Output[index] = renamed
+	}
+	if out == nil {
 		return resp
 	}
-	out := *resp
-	out.Output = append(openresponses.Items(nil), resp.Output...)
-	for index, id := range r.callIDs {
-		if index < len(out.Output) {
-			if call, ok := out.Output[index].(*openresponses.FunctionCall); ok {
-				renamed := *call
-				renamed.CallID = id
-				out.Output[index] = &renamed
-			}
-		}
-	}
-	return &out
+	return out
 }
 
 // wireError carries an error event off the stream, so the attempt can
@@ -1823,9 +1970,9 @@ func (r *runner) decide(p *callState, decision *ToolDecision) {
 	case Defer:
 		p.deferred = true
 		if r.deferred == nil {
-			r.deferred = map[string]bool{}
+			r.deferred = map[string]json.RawMessage{}
 		}
-		r.deferred[p.call.CallID] = true
+		r.deferred[p.call.CallID] = p.args
 	}
 }
 

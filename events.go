@@ -218,7 +218,12 @@ func (*ModelBlocked) EventType() string { return EventModelBlocked }
 // ItemStart announces an item entering the transcript: a prompt or
 // queued message, an assistant item as the stream opens it, or a
 // function call output. For an assistant item the Item is the live
-// accumulated value and fills in as updates arrive.
+// accumulated value and fills in as updates arrive. A function call the
+// loop gave an ID of its own (see [ItemEnd]) is the exception: its Item
+// is a copy carrying that ID, taken as the call opened, not the live
+// accumulator, so it does not fill in; each of its ItemUpdate events
+// carries a fresh copy with the same ID, and its ItemEnd the completed
+// call.
 //
 // An item the model completes before its attempt commits, a reasoning
 // summary before the first token, is announced here and reaches the
@@ -232,7 +237,9 @@ type ItemStart struct {
 	Turn  int
 	Item  openresponses.Item
 	// ResponseID is the ID of the response streaming the item, and empty
-	// for an item the loop appended itself.
+	// for an item the loop appended itself. It is empty too while the
+	// stream has not named its response, one that sends no
+	// response.created or response.in_progress before its items.
 	ResponseID string
 	// Hidden is set for an item the caller marked with [Hidden]: it is
 	// in the model's context and a renderer should not show it. The
@@ -248,10 +255,12 @@ func (*ItemStart) EventType() string { return EventItemStart }
 // types it would use against a remote server. Item is the accumulated
 // item so far.
 type ItemUpdate struct {
-	RunID      string
-	Turn       int
-	Item       openresponses.Item
-	Stream     openresponses.StreamEvent
+	RunID  string
+	Turn   int
+	Item   openresponses.Item
+	Stream openresponses.StreamEvent
+	// ResponseID is the ID of the response streaming the item, and
+	// empty while the stream has not named its response.
 	ResponseID string
 }
 
@@ -261,16 +270,21 @@ func (*ItemUpdate) EventType() string { return EventItemUpdate }
 // ItemEnd carries a completed item. For an assistant item it is emitted
 // only after output_item.done; partial items never arrive here. The item
 // is in the transcript when this event is delivered. A function call
-// the model gave no call ID, or one a call in the transcript already
-// has, carries an ID of the loop's own here, the model's with a random
-// suffix, where its ItemStart and ItemUpdate carry the model's, and
-// ModelCallID keeps the model's: a call ID names one call.
+// the model gave no call ID, or one another call already has, carries
+// an ID of the loop's own, the model's with a random suffix, here as on
+// its ItemStart and every ItemUpdate, and ModelCallID keeps the
+// model's: a call ID names one call.
 type ItemEnd struct {
 	RunID string
 	Turn  int
 	Item  openresponses.Item
 	// ResponseID is the ID of the response that produced the item, and
-	// empty for an item the loop appended itself.
+	// empty for an item the loop appended itself. It is empty too for a
+	// model's item that completed before the stream named its response,
+	// one that sends no response.created or response.in_progress: the
+	// response's ID arrives on its ResponseEnd. The session recorder
+	// holds such an item while the model call is in flight and writes
+	// it, in order, with the response's ID once the response ends.
 	ResponseID string
 	// Hidden is set for an item the caller marked with [Hidden]: it is
 	// in the model's context and a renderer should not show it. A
@@ -296,11 +310,23 @@ func (*ItemEnd) EventType() string { return EventItemEnd }
 // soon as the stream ends and before any tool of the turn runs. Its
 // output items have all been delivered with item_end. A response that
 // failed is delivered here too, before the run ends with the error, so
-// a recorder can write it.
+// a recorder can write it, and so is one a [Config.OutputGuard]
+// withheld a message of, with Withheld set.
 type ResponseEnd struct {
 	RunID    string
 	Turn     int
 	Response *openresponses.Response
+	// Withheld says OutputGuard withheld a message of the response,
+	// which stops the run with [StopGuard]. Response is then the
+	// loop's account of it, not the server's: incomplete with
+	// content_filter, no error, the response ID and usage the stream
+	// gave, the usage of the whole response when its terminal event
+	// arrived, since the loop reads the rest of the stream for it, and
+	// as output the items the transcript took from it, without the
+	// withheld message or anything after it. No turn_end follows; the
+	// outputs closing its calls and the run_end do. A server's own
+	// content_filter response is not withheld.
+	Withheld bool
 }
 
 // EventType returns "response_end".
@@ -432,10 +458,23 @@ const (
 	StopMaxTurns StopCause = "max_turns"
 	// StopHook: ShouldStopAfterTurn returned true.
 	StopHook StopCause = "hook"
-	// StopGuard: ShouldStopAfterTurn, BeforeTurn or BeforeModelCall
-	// returned an error wrapping [ErrGuard]; the error is on RunEnd.Err.
-	// Stopped before the model call, the turn has no turn_start; from
-	// BeforeModelCall, the request it refused is on a model_blocked.
+	// StopGuard: ShouldStopAfterTurn, BeforeTurn, BeforeModelCall or
+	// OutputGuard returned an error wrapping [ErrGuard]; the error is on
+	// RunEnd.Err. Stopped before the model call, the turn has no
+	// turn_start; from BeforeModelCall, the request it refused is on a
+	// model_blocked. From OutputGuard, the message it ruled on is not
+	// appended and has no item_end, though its deltas went out as
+	// item_update; the turn's response_end has Withheld set and no
+	// turn_end follows, and RunEnd.Withheld is set. A function call the
+	// withheld response added to the transcript before the message is
+	// answered with a [WithheldCallOutput] output, with its item_end
+	// and no tool events, before the run ends, so RunEnd.Pending is
+	// empty and the next prompt goes ahead. A call is added once a
+	// message or a call of the response has opened with
+	// output_item.added; on a stream that sends output_item.done alone
+	// the calls before the message are still held when the guard
+	// rules, and are dropped with it, in no item_end and not in the
+	// transcript.
 	StopGuard StopCause = "guard"
 	// StopTerminate: every result of the batch set Terminate, so the
 	// tools answered on the model's behalf.
@@ -478,6 +517,12 @@ type RunEnd struct {
 	// and ReasonStopped. The transcript is a valid input again once
 	// each has an output, which Agent.Resume appends.
 	Pending []PendingCall
+	// Withheld says the run ended because [Config.OutputGuard]
+	// withheld a message, with Reason ReasonStopped and Cause
+	// StopGuard: the model's last word was kept from the transcript,
+	// so whatever message Items end with was said before it and is no
+	// answer, and Answer reports none.
+	Withheld bool
 }
 
 // EventType returns "run_end".
@@ -489,9 +534,11 @@ func (*RunEnd) EventType() string { return EventRunEnd }
 // the way: text before a call is a preamble, and a guard that refuses
 // the next turn leaves the preamble last among the messages but not
 // last among the items. A message that OutputGuard replaced is the
-// replacement, and an empty one is no answer.
+// replacement, and an empty one is no answer. A run whose message
+// OutputGuard withheld (Withheld) did not answer either, though a
+// message the same response spoke before it may end Items.
 func (e *RunEnd) Answer() (string, bool) {
-	if len(e.Items) == 0 {
+	if e.Withheld || len(e.Items) == 0 {
 		return "", false
 	}
 	m, ok := e.Items[len(e.Items)-1].(*openresponses.Message)
@@ -570,10 +617,13 @@ type PendingCall struct {
 	// approval of the call through [Agent.Resume] runs it with this
 	// key unless the answer carries its own.
 	IdempotencyKey string
-	// Args are the arguments that hand-off gave the tool, for a call
-	// that may have run, which a decision may have rewritten; nil when
-	// they are the call's own or it was not handed over. An approval
-	// runs it again with them unless the answer carries its own.
+	// Args are the arguments the call runs with when it is approved:
+	// for a call that may have run, those its last hand-off gave the
+	// tool, and for a deferred one, those the decision that held it
+	// rewrote them to, so an approval runs what was decided on. They
+	// are nil when they are the call's own, or the call was neither
+	// handed over nor rewritten. An approval runs the call with them
+	// unless the answer carries its own.
 	Args json.RawMessage
 }
 

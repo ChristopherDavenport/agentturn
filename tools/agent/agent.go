@@ -134,8 +134,10 @@ func WithToolName(name string) Option {
 // answer, since the tool answered on the model's behalf. A child a
 // guard stopped (agentturn.StopGuard) without an answer is not asked
 // about here, whichever hook the guard is on, ShouldStopAfterTurn
-// included: that is a refusal, and the call fails with the guard's
-// error, which wraps agentturn.ErrGuard.
+// included, nor one whose OutputGuard withheld a message after a
+// message of the same response it let through
+// (agentturn.RunEnd.Withheld): that is a refusal, and the call fails
+// with the guard's error, which wraps agentturn.ErrGuard.
 func WithNoAnswer(fn func(ChildInfo) (agenttool.Result, error)) Option {
 	return func(o *options) { o.noAnswer = fn }
 }

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ChristopherDavenport/agentsession"
+	"github.com/ChristopherDavenport/agentsession/cas"
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/agentturn/compact"
@@ -392,7 +393,7 @@ func TestConfigDelta(t *testing.T) {
 	}
 	a, b, c := tool("a", "first"), tool("b", "second"), tool("c", "third")
 	base := agentsession.Settings{Model: "m", Instructions: strings.Repeat("be helpful ", 20), Tools: openresponses.Tools{a, b},
-		Extra: map[string]json.RawMessage{"a": json.RawMessage(`1`), "b": json.RawMessage(`2`)}}
+		Extra: map[string]json.RawMessage{"a": json.RawMessage(`1`), "b": json.RawMessage(`{"x":1,"y":2}`)}}
 	// full is what settle would write: the whole of next as a replace.
 	full := func(next agentsession.Settings) *agentsession.ConfigEntry {
 		req, err := next.Request(nil)
@@ -423,6 +424,15 @@ func TestConfigDelta(t *testing.T) {
 		want func(*agentsession.ConfigEntry) bool
 	}{
 		{"equal", base, func(d *agentsession.ConfigEntry) bool { return d == nil }},
+		// A store that keeps a body's canonical bytes hands the tools back
+		// with their parameters' keys sorted: the same tools.
+		{"tool parameters with their keys sorted", with(
+			openresponses.NewFunctionTool("a", "first", json.RawMessage(`{"properties":{"text":{"type":"string"}},"type":"object"}`)), b),
+			func(d *agentsession.ConfigEntry) bool { return d == nil }},
+		{"extra with its keys in another order", agentsession.Settings{Model: "m", Instructions: base.Instructions, Tools: base.Tools,
+			Extra: map[string]json.RawMessage{"a": json.RawMessage(`1`), "b": json.RawMessage(`{"y":2,"x":1}`)}}, func(d *agentsession.ConfigEntry) bool { return d == nil }},
+		{"extra with a number written another way", agentsession.Settings{Model: "m", Instructions: base.Instructions, Tools: base.Tools,
+			Extra: map[string]json.RawMessage{"a": json.RawMessage(`1.0`), "b": json.RawMessage(`{"x":1e0,"y":2}`)}}, func(d *agentsession.ConfigEntry) bool { return d == nil }},
 		{"model", agentsession.Settings{Model: "n", Instructions: base.Instructions, Tools: base.Tools, Extra: base.Extra}, func(d *agentsession.ConfigEntry) bool {
 			return d.Model == "n" && d.Instructions == nil && d.Extra == nil && !d.Replace
 		}},
@@ -704,6 +714,82 @@ func TestResumeContinuesWithoutDuplicateConfig(t *testing.T) {
 	}
 	if _, _, err := Resume(context.Background(), store, "missing"); err == nil {
 		t.Error("resume of a missing session should fail")
+	}
+}
+
+// A recorder resumed in a new process compares the tools in force with
+// the ones its run sends by canonical form: a content-addressed store
+// hands the parameters back with their keys sorted and a 1.0 written 1,
+// and the tools are the same.
+func TestResumedToolsCompareByValue(t *testing.T) {
+	cases := []struct {
+		name string
+		// open returns the store for one process, and a func that ends
+		// it before the next opens.
+		open func(t *testing.T, dir string) (agentsession.Store, func())
+	}{
+		{"memory", func() func(*testing.T, string) (agentsession.Store, func()) {
+			store := agentsession.NewMemoryStore()
+			return func(*testing.T, string) (agentsession.Store, func()) { return store, func() {} }
+		}()},
+		{"cas", func(t *testing.T, dir string) (agentsession.Store, func()) {
+			store, err := cas.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return store, func() {
+				if err := store.Close(); err != nil {
+					t.Error(err)
+				}
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			bounded := agenttool.NewFunc("bounded", "takes a fraction",
+				json.RawMessage(`{"type":"object","properties":{"f":{"type":"number","minimum":0,"maximum":1.0}}}`),
+				func(context.Context, agenttool.Call) (agenttool.Result, error) { return agenttool.Result{}, nil })
+			cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{upper, bounded}}
+			store, done := tc.open(t, dir)
+			rec, s, err := Start(ctx, store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := agentturn.New(cfg)
+			unsub := rec.Attach(a)
+			if _, err := a.Prompt(ctx, openresponses.UserText("x")); err != nil {
+				t.Fatal(err)
+			}
+			unsub()
+			done()
+
+			store, done = tc.open(t, dir)
+			defer done()
+			rec, s, err = Resume(ctx, store, s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := agentturn.New(cfg, agentturn.WithTranscript(a.State().Transcript))
+			unsub = rec.Attach(b)
+			if _, err := b.Prompt(ctx, openresponses.UserText("y")); err != nil {
+				t.Fatal(err)
+			}
+			unsub()
+			var configs int
+			for _, e := range s.Entries() {
+				if _, ok := e.(*agentsession.ConfigEntry); ok {
+					configs++
+				}
+			}
+			if configs != 1 {
+				t.Errorf("config entries = %d, want the first run's alone: %s", configs, entryTypes(s))
+			}
+			if n := verifyAll(t, s); n != 4 {
+				t.Errorf("responses = %d", n)
+			}
+		})
 	}
 }
 
@@ -1017,37 +1103,194 @@ func (failingFold) CreateStream(context.Context, openresponses.Request, openresp
 	return errors.New("summary model down")
 }
 
-func TestFailedFoldLeavesATrace(t *testing.T) {
+// callingFold answers every summary request with a function call and
+// no text, as a thinking model may.
+type callingFold struct{}
+
+func (callingFold) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	em.Response().Usage = &openresponses.Usage{OutputTokens: 7}
+	fc, err := em.FunctionCall("call_1", "upper")
+	if err != nil {
+		return err
+	}
+	if err := fc.Arguments("{}"); err != nil {
+		return err
+	}
+	if err := fc.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// bloatingFold answers every summary request with a summary far
+// larger than anything it folds, or, when cut, with one the server
+// ended incomplete at max_output_tokens.
+type bloatingFold struct{ cut bool }
+
+func (b bloatingFold) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text(strings.Repeat("and then ", 2000)); err != nil {
+		return err
+	}
+	if b.cut {
+		return em.Incomplete(openresponses.IncompleteReasonMaxOutputTokens)
+	}
+	return em.Complete()
+}
+
+func TestUnappliedFoldProceedsUnfolded(t *testing.T) {
+	cases := []struct {
+		name string
+		cut  bool
+		want error
+	}{
+		{"an oversized summary", false, compact.ErrSummaryTooLarge},
+		{"an incomplete summary", true, compact.ErrSummaryIncomplete},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) { testUnappliedFold(t, bloatingFold{cut: tc.cut}, tc.want) })
+	}
+}
+
+func testUnappliedFold(t *testing.T, model openresponses.Streamer, want error) {
 	store := agentsession.NewMemoryStore()
 	rec, s, err := Start(context.Background(), store, agentsession.Header{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr := compact.NewLocal(failingFold{}, compact.WithBudget(4), compact.WithKeepLast(2), compact.WithEstimator(countItems), compact.WithOnFold(rec.Fold))
+	tr := compact.NewLocal(model, compact.WithBudget(40), compact.WithKeepLast(2), compact.WithOnFold(rec.Fold))
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform})
 	defer rec.Attach(a)()
-	for _, text := range []string{"one", "two"} {
-		if _, err := a.Prompt(context.Background(), openresponses.UserText(text)); err != nil {
-			t.Fatal(err)
+	for _, text := range []string{"one", "two", "three"} {
+		end, err := a.Prompt(context.Background(), openresponses.UserText(text))
+		if err != nil || end.Reason != agentturn.ReasonDone {
+			t.Fatalf("%s: err=%v end=%+v", text, err, end)
 		}
 	}
-	end, err := a.Prompt(context.Background(), openresponses.UserText("three"))
-	if err == nil || end.Reason != agentturn.ReasonError {
-		t.Fatalf("third prompt: err=%v end=%+v", err, end)
+	// The refused fold is on the record, and the turns it did not fold
+	// verify against the path as it is.
+	failed := 0
+	for _, e := range s.Entries() {
+		if c, ok := e.(*agentsession.CustomEntry); ok && c.NS == FailedFoldNS {
+			var data FailedFold
+			if err := json.Unmarshal(c.Data, &data); err != nil || !strings.Contains(data.Error, want.Error()) || data.Attempts != 2 {
+				t.Errorf("failed fold = %+v err=%v", data, err)
+			}
+			failed++
+		}
+		if _, ok := e.(*agentsession.CompactionEntry); ok {
+			t.Errorf("a summary that was not applied was recorded as a compaction")
+		}
 	}
-	// The failed fold is the last entry before the run's end.
+	if failed == 0 {
+		t.Fatalf("no failed fold recorded: %q", entryTypes(s))
+	}
+	if n := verifyAll(t, s); n != 3 {
+		t.Errorf("responses verified = %d", n)
+	}
+	if err := s.VerifyRecords(s.Leaf()); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestFailedFoldLeavesATrace(t *testing.T) {
+	cases := []struct {
+		name         string
+		model        openresponses.Streamer
+		wantErr      string
+		wantAttempts int
+		wantResponse bool
+		wantTypes    string
+		wantUsage    int // output tokens over every call; 0 for no usage
+	}{
+		{"the call fails", failingFold{}, "summary model down", 1, false, "", 0},
+		{"the model answers with a call twice", callingFold{}, "summary response has no text", 2, true, "function_call", 14},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tr := compact.NewLocal(tc.model, compact.WithBudget(4), compact.WithKeepLast(2), compact.WithEstimator(countItems), compact.WithModel("small"), compact.WithOnFold(rec.Fold))
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform})
+			defer rec.Attach(a)()
+			for _, text := range []string{"one", "two"} {
+				if _, err := a.Prompt(context.Background(), openresponses.UserText(text)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			end, err := a.Prompt(context.Background(), openresponses.UserText("three"))
+			if err == nil || end.Reason != agentturn.ReasonError {
+				t.Fatalf("third prompt: err=%v end=%+v", err, end)
+			}
+			// The failed fold is the last entry before the run's end.
+			entries := s.Entries()
+			last, ok := entries[len(entries)-2].(*agentsession.CustomEntry)
+			if !ok || last.NS != FailedFoldNS {
+				t.Fatalf("entry before the end = %+v, entries %q", entries[len(entries)-2], entryTypes(s))
+			}
+			var data FailedFold
+			if err := json.Unmarshal(last.Data, &data); err != nil || !strings.Contains(data.Error, tc.wantErr) || data.TokensBefore != 5 {
+				t.Errorf("failed fold = %+v err=%v", data, err)
+			}
+			// What the calls did: the request went out either way and is
+			// named as a successful fold names it; the response members
+			// are there when the model answered.
+			if data.Attempts != tc.wantAttempts || data.RequestHash == "" || data.Model != "small" {
+				t.Errorf("failed fold call = %+v", data)
+			}
+			if (data.ResponseID != "") != tc.wantResponse || strings.Join(data.OutputTypes, ",") != tc.wantTypes {
+				t.Errorf("failed fold response = %q, output types = %q", data.ResponseID, data.OutputTypes)
+			}
+			gotUsage := 0
+			if data.Usage != nil {
+				gotUsage = data.Usage.OutputTokens
+			}
+			if gotUsage != tc.wantUsage {
+				t.Errorf("failed fold usage = %+v, want %d output tokens", data.Usage, tc.wantUsage)
+			}
+			// The record still verifies: the fold changed nothing.
+			if n := verifyAll(t, s); n != 2 {
+				t.Errorf("responses verified = %d", n)
+			}
+		})
+	}
+}
+
+// TestFailedFoldWithAnUnhashableRequest pins the review of #177: a
+// failed fold whose request the recorder cannot hash is written all the
+// same, without the hash, rather than dropped with the hash's error.
+func TestFailedFoldWithAnUnhashableRequest(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := &openresponses.Request{Model: "small", Tools: openresponses.Tools{openresponses.NewFunctionTool("bad", "", json.RawMessage(`{`))}}
+	if _, err := RequestHash(*req); err == nil {
+		t.Fatal("the request hashes; the test needs one that does not")
+	}
+	if err := rec.Fold(context.Background(), compact.Fold{Err: errors.New("summary model down"), TokensBefore: 5, Attempts: 1, Request: req, ResponseID: "resp_1"}); err != nil {
+		t.Fatalf("fold: %v", err)
+	}
 	entries := s.Entries()
-	last, ok := entries[len(entries)-2].(*agentsession.CustomEntry)
+	last, ok := entries[len(entries)-1].(*agentsession.CustomEntry)
 	if !ok || last.NS != FailedFoldNS {
-		t.Fatalf("entry before the end = %+v, entries %q", entries[len(entries)-2], entryTypes(s))
+		t.Fatalf("entries = %q", entryTypes(s))
 	}
 	var data FailedFold
-	if err := json.Unmarshal(last.Data, &data); err != nil || !strings.Contains(data.Error, "summary model down") || data.TokensBefore != 5 {
-		t.Errorf("failed fold = %+v err=%v", data, err)
+	if err := json.Unmarshal(last.Data, &data); err != nil {
+		t.Fatal(err)
 	}
-	// The record still verifies: the fold changed nothing.
-	if n := verifyAll(t, s); n != 2 {
-		t.Errorf("responses verified = %d", n)
+	if data.Error != "summary model down" || data.RequestHash != "" || data.Model != "small" || data.ResponseID != "resp_1" || data.Attempts != 1 {
+		t.Errorf("failed fold = %+v", data)
 	}
 }
 

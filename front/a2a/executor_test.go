@@ -303,6 +303,13 @@ func TestGuardStopBeforeAnswerRejectsTask(t *testing.T) {
 	}
 	afterTurn := func(context.Context, agentturn.TurnInfo) (bool, error) { return false, refuse }
 	lookup := agenttool.New("lookup", "", func(context.Context, agenttool.NoArgs) (string, error) { return "found", nil })
+	// withholdAnswer lets a preamble through and withholds the answer.
+	withholdAnswer := func(_ context.Context, info agentturn.OutputInfo) (*openresponses.Message, error) {
+		if info.Message.Text() == "solve x" {
+			return nil, refuse
+		}
+		return nil, nil
+	}
 	for _, tc := range []struct {
 		name  string
 		cfg   agentturn.Config
@@ -317,6 +324,10 @@ func TestGuardStopBeforeAnswerRejectsTask(t *testing.T) {
 		}}, a2a.TaskStateRejected, RefusedText},
 		{"before model call 2, after a preamble", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, BeforeModelCall: onToolOutput}, a2a.TaskStateRejected, RefusedText},
 		{"after a turn that called tools", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, ShouldStopAfterTurn: afterTurn}, a2a.TaskStateRejected, RefusedText},
+		{"output guard", agentturn.Config{OutputGuard: func(context.Context, agentturn.OutputInfo) (*openresponses.Message, error) {
+			return nil, refuse
+		}}, a2a.TaskStateRejected, RefusedText},
+		{"output guard, after a message of the same response", agentturn.Config{Model: speaksTwice{}, OutputGuard: withholdAnswer}, a2a.TaskStateRejected, RefusedText},
 		{"after the answer", agentturn.Config{ShouldStopAfterTurn: afterTurn}, a2a.TaskStateCompleted, "solve x"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -331,6 +342,55 @@ func TestGuardStopBeforeAnswerRejectsTask(t *testing.T) {
 			}
 			if b, _ := json.Marshal(task); strings.Contains(string(b), reason) {
 				t.Errorf("task carries the guard's reason: %s", b)
+			}
+			for _, a := range task.Artifacts {
+				if tc.state == a2a.TaskStateRejected && strings.Contains(partsText(a.Parts), "solve x") {
+					t.Errorf("a refused task's artifacts hold the answer: %q", partsText(a.Parts))
+				}
+			}
+		})
+	}
+}
+
+// TestOutputGuardKeepsWithheldTextFromArtifacts pins #179: under a
+// configuration with an OutputGuard a message's artifact is written
+// from the message the guard left, so a deny guard's placeholder is in
+// the stored task and the text it withheld is not, however small the
+// chunks; a message the guard kept is in the artifacts whole.
+func TestOutputGuardKeepsWithheldTextFromArtifacts(t *testing.T) {
+	const phone = "650-123-4567"
+	// deny is a guard.Deny-style output guard: a message matching the
+	// pattern is replaced by a placeholder naming the rule.
+	deny := func(_ context.Context, info agentturn.OutputInfo) (*openresponses.Message, error) {
+		if strings.Contains(info.Message.Text(), phone) {
+			return openresponses.AssistantText("Withheld by deny: matched denied pattern"), nil
+		}
+		return nil, nil
+	}
+	for _, tc := range []struct {
+		name string
+		text string
+		want string
+	}{
+		{"withheld", "the customer lives in Palo Alto, phone " + phone, "Withheld by deny: matched denied pattern"},
+		{"kept", "the customer lives in Palo Alto", "the customer lives in Palo Alto"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := a2asrv.NewHandler(New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", OutputGuard: deny}, WithChunkSize(4)))
+			sent := sendTask(t, h, userMessage(tc.text))
+			task, err := h.OnGetTask(context.Background(), &a2a.TaskQueryParams{ID: sent.ID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if task.Status.State != a2a.TaskStateCompleted || task.Status.Message == nil || partsText(task.Status.Message.Parts) != tc.want {
+				t.Errorf("task = %s %q, want completed %q", task.Status.State, taskText(task), tc.want)
+			}
+			var artifacts strings.Builder
+			for _, a := range task.Artifacts {
+				artifacts.WriteString(partsText(a.Parts))
+			}
+			if artifacts.String() != tc.want || len(task.Artifacts) != 1 {
+				t.Errorf("artifacts = %d %q, want one %q", len(task.Artifacts), artifacts.String(), tc.want)
 			}
 		})
 	}
@@ -629,4 +689,27 @@ func TestFailedEventWriteIsReturnedNotCanceled(t *testing.T) {
 	// The zero Executor is usable: track initialises the registry.
 	var zero Executor
 	zero.track("x", func() {})()
+}
+
+// speaksTwice says something and then echoes the input, two messages
+// in one response, so a guard may let the first through and withhold
+// the second.
+type speaksTwice struct{}
+
+func (speaksTwice) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if err := em.Item(openresponses.AssistantText("Let me tell you.")); err != nil {
+		return err
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text(req.Input[len(req.Input)-1].(*openresponses.Message).Text()); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
 }

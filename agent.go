@@ -512,10 +512,13 @@ func OutcomeUnknown(callID string) Answer {
 	return a
 }
 
-// Approve runs the pending call with the arguments the model gave.
+// Approve runs the pending call with the arguments it is pending with,
+// [PendingCall.Args], which a decision that held it or a hand-off it
+// may have run in gave it, else those the model gave.
 func Approve(callID string) Answer { return Answer{CallID: callID} }
 
-// ApproveWith runs the pending call with args in place of the model's.
+// ApproveWith runs the pending call with args in place of the model's
+// and of any [PendingCall.Args].
 func ApproveWith(callID string, args json.RawMessage) Answer {
 	return Answer{CallID: callID, Args: args}
 }

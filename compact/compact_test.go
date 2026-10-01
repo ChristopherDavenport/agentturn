@@ -208,12 +208,17 @@ func (p *probeCompactor) Compact(ctx context.Context, req openresponses.CompactR
 
 // summarizer answers every request with a fixed summary and records
 // what it was asked, except that it answers its first calls requests
-// with a function call and no text.
+// with a function call and no text, the bloat requests after those
+// with the summary repeated a hundred times, and the cut requests
+// after those with the summary ended incomplete at max_output_tokens.
+// Each response reports the request's number as its output tokens.
 type summarizer struct {
 	reqs  []openresponses.Request
 	reply string
 	fail  bool
 	calls int
+	bloat int
+	cut   int
 }
 
 func (s *summarizer) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
@@ -222,6 +227,7 @@ func (s *summarizer) CreateStream(_ context.Context, req openresponses.Request, 
 		return openresponses.ServerError("down", "no summary today")
 	}
 	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	em.Response().Usage = &openresponses.Usage{OutputTokens: len(s.reqs)}
 	if len(s.reqs) <= s.calls {
 		fc, err := em.FunctionCall("call_1", "upper")
 		if err != nil {
@@ -239,8 +245,15 @@ func (s *summarizer) CreateStream(_ context.Context, req openresponses.Request, 
 	if err != nil {
 		return err
 	}
-	if err := w.Text(s.reply); err != nil {
+	reply := s.reply
+	if len(s.reqs) <= s.calls+s.bloat {
+		reply = strings.Repeat(s.reply+" ", 100)
+	}
+	if err := w.Text(reply); err != nil {
 		return err
+	}
+	if len(s.reqs) > s.calls+s.bloat && len(s.reqs) <= s.calls+s.bloat+s.cut {
+		return em.Incomplete(openresponses.IncompleteReasonMaxOutputTokens)
 	}
 	return em.Complete()
 }
@@ -288,18 +301,23 @@ func TestLocalSummaryThroughRun(t *testing.T) {
 
 func TestLocalSummaryRequestAndRetry(t *testing.T) {
 	cases := []struct {
-		name    string
-		calls   int
-		asked   int
-		wantErr string
+		name      string
+		calls     int
+		cut       int
+		asked     int
+		wantErr   string // from Transform
+		wantFold  string // on the reported fold
+		wantTypes string
 	}{
-		{"text on the first call", 0, 1, ""},
-		{"a call without text is asked again", 1, 2, ""},
-		{"no text twice fails the fold", 2, 2, "compact: summary response has no text"},
+		{"text on the first call", 0, 0, 1, "", "", "message"},
+		{"a call without text is asked again", 1, 0, 2, "", "", "message"},
+		{"no text twice fails the turn", 2, 0, 2, "compact: summary response has no text", "compact: summary response has no text", "function_call"},
+		{"an incomplete summary is asked again", 0, 1, 2, "", "", "message"},
+		{"incomplete twice sends the transcript unfolded", 0, 2, 2, "", "compact: summary response is incomplete: max_output_tokens", "message"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s := &summarizer{reply: "They talked about things.", calls: tc.calls}
+			s := &summarizer{reply: "They talked about things.", calls: tc.calls, cut: tc.cut}
 			var folds []Fold
 			tr := NewLocal(s, WithBudget(1), WithKeepLast(1), WithEstimator(count), WithModel("small"),
 				WithRequest(func(req *openresponses.Request) {
@@ -309,7 +327,7 @@ func TestLocalSummaryRequestAndRetry(t *testing.T) {
 					req.Reasoning = openresponses.ReasoningConfig{Effort: openresponses.ReasoningEffortNone}
 				}),
 				WithOnFold(func(_ context.Context, f Fold) error { folds = append(folds, f); return nil }))
-			_, err := tr.Transform(context.Background(), items(4))
+			out, err := tr.Transform(context.Background(), items(4))
 			if tc.wantErr == "" && err != nil || tc.wantErr != "" && (err == nil || err.Error() != tc.wantErr) {
 				t.Fatalf("err = %v, want %q", err, tc.wantErr)
 			}
@@ -324,8 +342,232 @@ func TestLocalSummaryRequestAndRetry(t *testing.T) {
 			if len(folds) != 1 {
 				t.Fatalf("folds = %d", len(folds))
 			}
-			if tc.wantErr == "" && (folds[0].Request == nil || folds[0].Request.Reasoning.Effort != openresponses.ReasoningEffortNone) {
-				t.Errorf("fold request = %+v", folds[0].Request)
+			// Failed or not, the fold reports its last call, and the
+			// usage of every call: the nth response reports n output
+			// tokens.
+			f := folds[0]
+			if tc.wantFold == "" && f.Err != nil || tc.wantFold != "" && (f.Err == nil || f.Err.Error() != tc.wantFold) {
+				t.Errorf("fold err = %v, want %q", f.Err, tc.wantFold)
+			}
+			if tc.wantFold != "" && tc.wantErr == "" {
+				// Not applied: the transcript goes as it was.
+				if !errors.Is(f.Err, ErrSummaryIncomplete) || len(out) != 4 || f.Summary != nil || tr.Last() != nil {
+					t.Errorf("fold err = %v, out = %d items, summary = %v", f.Err, len(out), f.Summary)
+				}
+			}
+			if f.Request == nil || f.Request.Reasoning.Effort != openresponses.ReasoningEffortNone {
+				t.Errorf("fold request = %+v", f.Request)
+			}
+			wantUsage := tc.asked * (tc.asked + 1) / 2
+			if f.Attempts != tc.asked || f.ResponseID == "" || f.Usage == nil || f.Usage.OutputTokens != wantUsage {
+				t.Errorf("fold attempts = %d, response = %q, usage = %+v, want %d output tokens", f.Attempts, f.ResponseID, f.Usage, wantUsage)
+			}
+			if got := strings.Join(f.OutputTypes, ","); got != tc.wantTypes {
+				t.Errorf("fold output types = %q, want %q", got, tc.wantTypes)
+			}
+		})
+	}
+}
+
+func TestLocalSummaryLargerThanItsInput(t *testing.T) {
+	cases := []struct {
+		name    string
+		bloat   int
+		asked   int
+		wantErr bool
+	}{
+		{"a smaller summary is applied", 0, 1, false},
+		{"an oversized summary is asked again", 1, 2, false},
+		{"oversized twice sends the transcript unfolded", 2, 2, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &summarizer{reply: "They talked about things.", bloat: tc.bloat}
+			var folds []Fold
+			tr := NewLocal(s, WithBudget(10), WithKeepLast(1),
+				WithOnFold(func(_ context.Context, f Fold) error { folds = append(folds, f); return nil }))
+			history := items(6)
+			out, err := tr.Transform(context.Background(), history)
+			if len(s.reqs) != tc.asked {
+				t.Fatalf("summary calls = %d, want %d", len(s.reqs), tc.asked)
+			}
+			if len(folds) != 1 || folds[0].Attempts != tc.asked {
+				t.Fatalf("folds = %+v", folds)
+			}
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if Estimate(out[:1]) >= Estimate(history[:5]) {
+					t.Errorf("applied summary of %d tokens for %d", Estimate(out[:1]), Estimate(history[:5]))
+				}
+				return
+			}
+			// The fold is reported failed, and the run goes on with the
+			// transcript as it was.
+			if err != nil || !errors.Is(folds[0].Err, ErrSummaryTooLarge) {
+				t.Errorf("err = %v, fold err = %v", err, folds[0].Err)
+			}
+			if len(out) != len(history) || out[0] != history[0] {
+				t.Errorf("out = %d items, want the %d unfolded", len(out), len(history))
+			}
+			// Nothing was applied: the summary is neither remembered nor
+			// reported as one.
+			if tr.Last() != nil || folds[0].Summary != nil || folds[0].Output != nil {
+				t.Errorf("an oversized summary was applied: last = %v, fold = %+v", tr.Last(), folds[0])
+			}
+			if got := strings.Join(folds[0].OutputTypes, ","); got != "message" || folds[0].ResponseID == "" {
+				t.Errorf("fold output types = %q, response = %q", got, folds[0].ResponseID)
+			}
+		})
+	}
+}
+
+func TestLocalSummaryBacksOffAFailedFold(t *testing.T) {
+	// Twelve items of about 41 tokens each against a budget of 400: the
+	// first turn folds eight of them. Each later turn adds one short
+	// item of 20 tokens, so four of them stay under the token margin of
+	// 100 and only the item margin of four (WithKeepLast) lets a failed
+	// prefix be asked about again.
+	cases := []struct {
+		name    string
+		s       *summarizer
+		want    error // on the folds; nil for a turn that fails
+		wantErr string
+		// summary calls made by the end of each turn
+		calls []int
+	}{
+		{"an oversized summary waits for the prefix to grow",
+			&summarizer{reply: "They talked about things.", bloat: 1000}, ErrSummaryTooLarge, "",
+			[]int{2, 2, 2, 2, 4, 4, 4, 4, 6}},
+		{"an incomplete summary waits for the prefix to grow",
+			&summarizer{reply: "gist", cut: 1000}, ErrSummaryIncomplete, "",
+			[]int{2, 2, 2, 2, 4, 4, 4, 4, 6}},
+		{"a summary with no text fails every turn",
+			&summarizer{reply: "gist", calls: 1000}, nil, "compact: summary response has no text",
+			[]int{2, 4, 6}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var folds []Fold
+			tr := NewLocal(tc.s, WithBudget(400), WithKeepLast(4),
+				WithOnFold(func(_ context.Context, f Fold) error { folds = append(folds, f); return nil }))
+			history := items(12)
+			for turn, want := range tc.calls {
+				out, err := tr.Transform(context.Background(), history)
+				if tc.wantErr != "" {
+					if err == nil || err.Error() != tc.wantErr {
+						t.Fatalf("turn %d: err = %v, want %q", turn+1, err, tc.wantErr)
+					}
+				} else if err != nil || len(out) != len(history) {
+					t.Fatalf("turn %d: err = %v, out = %d items, want the %d unfolded", turn+1, err, len(out), len(history))
+				}
+				if len(tc.s.reqs) != want {
+					t.Fatalf("turn %d: summary calls = %d, want %d", turn+1, len(tc.s.reqs), want)
+				}
+				// Only a fold that was asked is reported.
+				if len(folds) != want/2 {
+					t.Fatalf("turn %d: folds reported = %d, want %d", turn+1, len(folds), want/2)
+				}
+				history = append(history, openresponses.UserText("ok"))
+			}
+			for _, f := range folds {
+				if tc.want != nil && !errors.Is(f.Err, tc.want) {
+					t.Errorf("fold err = %v, want %v", f.Err, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestLocalSummaryBackOffMargins(t *testing.T) {
+	// After a failed fold of twelve items, the next call is asked again
+	// only past one of the two margins, or for another transcript.
+	base := items(12)
+	grown := func(extra ...openresponses.Item) agentturn.Transcript {
+		return append(append(agentturn.Transcript(nil), base...), extra...)
+	}
+	other := items(13)[1:] // the same sizes, opening with the assistant
+	cases := []struct {
+		name  string
+		next  agentturn.Transcript
+		asked bool
+	}{
+		{"the same transcript", base, false},
+		{"one short item more", grown(openresponses.UserText("ok")), false},
+		{"four items more", grown(openresponses.UserText("a"), openresponses.UserText("b"), openresponses.UserText("c"), openresponses.UserText("d")), true},
+		{"a quarter of the budget more", grown(openresponses.UserText(strings.Repeat("long ", 100))), true},
+		{"another conversation", other, true},
+		{"the transcript rewound and changed", append(append(agentturn.Transcript(nil), base[:6]...), items(7)[1:]...), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &summarizer{reply: "They talked about things.", bloat: 1000}
+			tr := NewLocal(s, WithBudget(400), WithKeepLast(4))
+			if _, err := tr.Transform(context.Background(), base); err != nil || len(s.reqs) != 2 {
+				t.Fatalf("err = %v, summary calls = %d", err, len(s.reqs))
+			}
+			if _, err := tr.Transform(context.Background(), tc.next); err != nil {
+				t.Fatal(err)
+			}
+			if asked := len(s.reqs) > 2; asked != tc.asked {
+				t.Errorf("asked again = %v, want %v", asked, tc.asked)
+			}
+		})
+	}
+}
+
+func TestLocalSummaryOfATinyPrefix(t *testing.T) {
+	// A one-word prefix is smaller than any summary item, wrapper and
+	// all; the summary's text is what is weighed, so a terse one folds.
+	s := &summarizer{reply: "They said hi."}
+	var folds []Fold
+	tr := NewLocal(s, WithBudget(1), WithKeepLast(1),
+		WithOnFold(func(_ context.Context, f Fold) error { folds = append(folds, f); return nil }))
+	history := agentturn.Transcript{openresponses.UserText("hi"), openresponses.AssistantText("hello")}
+	out, err := tr.Transform(context.Background(), history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(folds) != 1 || folds[0].Err != nil || folds[0].Summary == nil || len(s.reqs) != 1 {
+		t.Fatalf("folds = %+v, summary calls = %d", folds, len(s.reqs))
+	}
+	if len(out) != 2 || out[0] != folds[0].Summary || out[1] != history[1] {
+		t.Errorf("out = %v", out)
+	}
+}
+
+func TestLocalSummaryOutputLimit(t *testing.T) {
+	cases := []struct {
+		name   string
+		budget int
+		edit   func(*openresponses.Request)
+		want   int // 0 for no limit
+	}{
+		{"half the budget", 1000, nil, 500},
+		{"at most the default cap", 100_000, nil, DefaultSummaryMaxOutputTokens},
+		{"WithRequest sets its own", 1000, func(req *openresponses.Request) { n := 64; req.MaxOutputTokens = &n }, 64},
+		{"WithRequest clears it", 1000, func(req *openresponses.Request) { req.MaxOutputTokens = nil }, 0},
+		{"a budget too small to halve sets none", 1, nil, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &summarizer{reply: "gist"}
+			opts := []Option{WithBudget(tc.budget)}
+			if tc.edit != nil {
+				opts = append(opts, WithRequest(tc.edit))
+			}
+			// The fold itself, so the budget shapes the request whatever
+			// the transcript's size.
+			if _, err := NewLocal(s, opts...).fold(context.Background(), openresponses.Items(items(4))); err != nil {
+				t.Fatal(err)
+			}
+			got := 0
+			if limit := s.reqs[0].MaxOutputTokens; limit != nil {
+				got = *limit
+			}
+			if got != tc.want {
+				t.Errorf("max_output_tokens = %d, want %d", got, tc.want)
 			}
 		})
 	}

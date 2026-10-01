@@ -5,6 +5,217 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- **Requires `agentsession` v0.0.18, up from v0.0.15, and `agenttool`
+  v0.0.12, up from v0.0.11. The session recorder writes
+  `agentsession/0.10`**, and raises a 0.9 file it appends to, after
+  which every 0.9 reader (agentsession v0.0.12 to v0.0.17, and so
+  agentturn v0.0.12) refuses it: upgrade every reader of a store
+  before any writer runs this release. 0.10 lets an `answer` end a call
+  dispatched only on another branch (see #185 below). `VerifyRecords`
+  also checks a run start's `source` against its segment and refuses an
+  empty `call_id`, and the recorder's sessions pass both. A `cas` store
+  a session recorder writes through is migrated to v0.0.16's
+  per-session log on its first writing open, after which agentsession
+  v0.0.15 and earlier cannot read it; keep a copy of the store if
+  rolling back may be needed.
+- **The recorder names a response's items the stream left unnamed.**
+  A stream that sends no `response.created` or `response.in_progress`,
+  a relay passing on only the output items and the terminal event,
+  delivers its items with an empty `ResponseID`, and the session
+  recorder wrote them with no `response_id`: they read as inputs, and
+  the response's request could not be rebuilt from the record. The
+  recorder now holds such an item while the model call is in flight
+  and writes it, in order, with the response's ID once the stream names
+  it: on a later item event, on the response's `response_end`, a
+  withheld one's included, or on the run's end for a call cut off
+  after naming it. A call cut off before the stream ever named its
+  response still writes its items with no `response_id`, and its
+  failed response now carries no `request_hash` rather than one the
+  record cannot rebuild. `Recorder.EntryOf` is false for a held item
+  until it is written. The `ResponseID` docs on `ItemStart`,
+  `ItemUpdate` and `ItemEnd` say when it is empty.
+- A failed fold reports what its model calls did, as a successful one
+  does: `compact.Fold` carries the last attempt's `Request` and
+  `ResponseID` when the fold failed too, and gains `OutputTypes`, the
+  item types the last call answered, and `Attempts`, the number of
+  calls. `Fold.Usage` is the usage of every call summed, for a fold
+  that succeeded on its second call as for one that failed, where it
+  was the last call's alone. `session.FailedFold` writes them as
+  `attempts`, `request_hash`, `response_id`, `model`, `usage` and
+  `output_types`, all omitted when empty, naming the request by hash
+  and model as a compaction entry's `fold` member does rather than
+  keeping the folded prefix again. A record of a fold that failed now
+  says whether the model thought and answered nothing, called a tool,
+  or never answered, without a replay. The format is unchanged. (#177)
+- `compact.NewLocal` no longer applies a summary that is not smaller
+  than what it folds. A summary whose text is estimated at no fewer
+  tokens than the items it replaces is asked once more, as a summary
+  with no text is; the text is weighed without the wrapper every
+  summary item carries, so a short prefix with a terse summary still
+  folds. A second oversized summary is not applied: the fold is
+  reported to `WithOnFold` failed with `compact.ErrSummaryTooLarge`
+  (`compact: summary is larger than what it folds`), which the session
+  recorder writes as `compaction_failed`, and the transcript is sent
+  unfolded with no error, rather than growing the request the fold was
+  meant to shrink or failing the turn. A summary response the server
+  ends `incomplete` is asked once more too, where its partial text was
+  applied, and a second is treated the same way: the fold is reported
+  failed with `compact.ErrSummaryIncomplete` (`compact: summary
+  response is incomplete`) wrapped with the server's reason, and the
+  transcript is sent unfolded. A summary with no text twice still fails
+  the turn. After either unfolded send the transform backs off: it
+  remembers the length and hash of the prefix that failed and the
+  estimate that triggered it, and while the transcript still begins
+  with that prefix it does not fold again until the part to fold has
+  grown by `WithKeepLast` items (at least one) or the estimate by a
+  quarter of the budget, rather than spending two summary calls and
+  writing another `compaction_failed` on every later turn. A transcript
+  that does not begin with the failed prefix, another conversation's or
+  a rewound one, folds as usual. The summary request's
+  `MaxOutputTokens` defaults to half the budget, at most
+  `compact.DefaultSummaryMaxOutputTokens` (8192), set before
+  `WithRequest` runs so a caller can change or clear it, so a runaway
+  summary is cut by the server rather than paid for. (#178)
+- **An `OutputGuard` error wrapping `ErrGuard` is a guard stop.** The
+  message the guard was given is not appended and has no `item_end`,
+  and the run ends `ReasonStopped` with `StopGuard`, the error on
+  `RunEnd.Err` and the new `RunEnd.Withheld` set, as from the other
+  three guard hooks. It failed the run, so `front/responses` answered
+  with `server_error` carrying the guard's text and `front/a2a` failed
+  the task with it. `RunEnd.Answer` reports no answer for a withheld
+  run, though a message the same response spoke before the withheld
+  one ends `Items`, so no consumer takes that preamble for the answer.
+  The loop reads the rest of the withheld response for its usage and
+  raises a `ResponseEnd` with the new `Withheld` set and no `TurnEnd`:
+  the response `incomplete` with `content_filter`, no error, the
+  response ID and the usage of the whole response, and as output the
+  items the transcript took from it, without the withheld message. A
+  function call the response added to the transcript before the
+  message, which it does once a message or a call of the response has
+  opened with `output_item.added`, is never dispatched, and the loop
+  answers it with an output carrying the fixed text
+  `agentturn.WithheldCallOutput`, never the guard's error, after the
+  `ResponseEnd` and before the run ends, so the transcript holds no
+  call without an output and the next prompt goes ahead rather than
+  failing with "pending tool calls must be resumed". On a stream that
+  sends `output_item.done` alone, the calls before the message are
+  still held when the guard rules and are dropped with it. Every front
+  refuses: `front/responses` ends the response incomplete with
+  `content_filter`, in a full run and in a single turn, after an
+  earlier message of the same response or not, and closes the
+  withheld message emptied and incomplete, since its deltas had gone
+  out, so its done events and the response hold none of its text, with
+  `WithToolItems` and a call before the message too; its usage counts
+  the withheld response; a single turn holds the response's function
+  calls until the response completes, so a refused one hands the
+  caller no call to run. `front/a2a` rejects the task with
+  `RefusedText`, and `tools/agent` fails the call with the guard's
+  error. The session recorder writes the withheld response from the
+  loop's `ResponseEnd`, `incomplete` with `content_filter`, its usage
+  and no error, so the guard's text is not on it, before the outputs,
+  writes a policy `reject` for each closed call, and ends the run
+  `aborted`, as the format reads a run whose last response is
+  incomplete; it wrote a `failed` response with `server_error` and the
+  guard's text and a run end `done`, which `VerifyRecords` rejected.
+  Any other `OutputGuard` error still fails the run. `StopGuard`,
+  `ErrGuard`, `OutputGuard` and `ChainOutputGuard` say so (#181).
+- **`front/a2a` keeps withheld text out of a task's artifacts.** Under
+  a configuration with an `OutputGuard` the executor writes a message's
+  artifact whole at `item_end`, from the message the guard left, rather
+  than streaming its deltas. A task keeps its artifacts, so the text a
+  guard replaced was returned by every `tasks/get` for as long as the
+  task was stored. Without an `OutputGuard` the text streams as before
+  (#179).
+- **The receiver's run after a handoff names it.** Both fronts
+  continue the configuration `WithHandoff` returns under
+  `agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff",
+  Ref: <the sender's Config.Name>})`, so the receiver's `BeforeTurn`
+  context and its `run_start`, and so the record, say why it ran, as
+  for a host that continues the receiver in process. Under a front it
+  read like a user input (#182).
+- **`WithStart` in `front/responses` and `front/a2a`** picks the
+  configuration a request or a task starts under from the conversation
+  so far, the new message last; false keeps the front's own. A handoff
+  lasted only for the request or task that made it, and the
+  conversation's next message went back to the sender, which saw a
+  conversation it had handed off and handed it off again. Neither
+  front keeps state between requests: the host finds the last handoff
+  in the transcript, which `front/a2a`'s store holds and which
+  `front/responses`' caller sends back when the adapter is built with
+  `WithToolItems` (#180).
+- **A call's ID is decided as it opens.** The loop gives a function
+  call its ID at `output_item.added`, the model's when it names no
+  other call and one of its own when it is empty or taken, so the
+  call's `ItemStart`, every `ItemUpdate` and its `ItemEnd` carry one
+  ID, where v0.0.12 renamed the call only when it completed and its
+  `ItemStart` and `ItemUpdate` carried the model's. A call whose first
+  event is its `output_item.done` is decided then. `ItemEnd.ModelCallID`
+  still holds the model's ID for a call the loop renamed. `front/responses`
+  no longer changes a call's `call_id` at `output_item.done`: the client
+  sees one ID from `output_item.added` through the call's output, and
+  a call the model gave no ID no longer opens under an ID the emitter
+  minted that no output carries (#184).
+- A call whose ID repeats one of a call the attempt holds is renamed.
+  A stream that sends no `output_item.added` for its calls keeps them
+  out of the transcript until its response arrives, and v0.0.12 checked
+  a call's ID against the transcript alone, so two calls `c1` in one
+  such response kept one ID and the session recorder failed the run.
+  A call's ID is now taken by every call of the attempt, held or not
+  (#183).
+- **The recorder compares settings by value.** A config delta is
+  written when the settings a run sends differ from those in force in
+  their canonical form, the JCS one the request hash is taken over,
+  where it compared their encoded bytes: a `cas` store, which keeps a
+  body's canonical bytes, hands a tool's `parameters` back with their
+  keys sorted and a `1.0` written `1`, so a recorder resumed from one
+  wrote `tools_added` with every tool on its first run in each process.
+  The extra members compare the same way (#176).
+- **A call dispatched on another branch may have run.** After a
+  `Recorder.Rebase` to an entry between a call and its dispatch, the
+  call is on the new path with no dispatch, and `session.Pending` read
+  it as never started: `ReplayAnswers` approved it and the loop ran it
+  under a new key, so a keyed service ran the operation again.
+  `Pending` now reads a call with no dispatch on the path and one
+  anywhere in the session as `PendingAborted`, with the key and the
+  arguments of the last such dispatch, so a keyed call runs again under
+  its first key and one whose replay is unknown is answered with the
+  outcome unknown; a held call with one is `Dispatched`. The recorder
+  writes that outcome-unknown reply as an `answer`, which format 0.10
+  lets the dispatch on the other branch stand behind, not a `reject`,
+  which would say the call never reached its tool. `Pending` finds the
+  dispatches with agentsession's `Session.Dispatches` (#185).
+- **An approved deferred call runs the arguments it was held with.** A
+  `BeforeToolCall` decision that rewrote a call's arguments and
+  deferred it left `PendingCall.Args` nil, and `Approve` ran the
+  model's arguments, which nobody had decided on. The pending list now
+  carries the rewritten arguments on `Args` for a deferred call, as it
+  does for a dispatched one, so `Approve` runs what was decided and
+  `ApproveWith` still overrides; a resume that fails before its batch,
+  a subscriber refusing its `run_start` say, leaves the call pending
+  with them. The session recorder writes them on
+  the `hold` decision and `session.Pending` gives them back after a
+  restart; a decision that runs other arguments than those in force on
+  the path writes its own, so the path says what ran. The recorder
+  compares arguments by their canonical form, keys in any order and
+  numbers however written (#186).
+- **`session.Recorder.Env` records a workspace that moves inside a
+  run.** The recorder asked `WithEnv` at a run's start alone, so a
+  sandbox rescheduled between two calls of one run left the calls after
+  the move under the env entry naming the old one, and the next run's
+  start read the move one run late. `Recorder.Env(ctx)` asks `WithEnv`
+  now and writes an env entry when it differs from the one in force, as
+  a run's start does; a hook or a tool calls it between calls, and the
+  entry lands where `Annotate`'s does: in the session of the run on the
+  context, or in the child session the context names once that child's
+  run has ended. A child compares it with the env in force in its own
+  session, or with the one in force in its parent's when it has none,
+  and so up the chain, so a grandchild under a child that moved writes
+  none when it has not moved further. The entry applies to the dispatches after it: one
+  written from `AfterToolCall` lands after the dispatch of the call
+  the hook ran for, which stays under the earlier env (#187).
+
 ## v0.0.12 - 2026-09-29
 
 - Requires `agenttool` v0.0.11, up from v0.0.10, and `agentsession`

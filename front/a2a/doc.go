@@ -15,9 +15,18 @@
 // refusal: the task ends rejected, with [RefusedText] as its status
 // message, rather than completed or failed, whichever hook the guard
 // is on, ShouldStopAfterTurn after a turn that only called tools
-// included. The guard's error is not sent, since its text may carry
-// the rule a caller could phrase around; the host has it on
-// RunEnd.Err and in the record.
+// included, and OutputGuard withholding the message it was given,
+// after a message of the same response it let through or not, which
+// is no answer (agentturn.RunEnd.Withheld). The
+// guard's error is not sent, since its text may carry the rule a
+// caller could phrase around; the host has it on RunEnd.Err and in the
+// record.
+//
+// A task keeps its artifacts, so under a configuration with an
+// OutputGuard the executor does not stream a message's text: it writes
+// the message's artifact whole when the message completes, from what
+// the guard left. The original text of a message the guard replaced,
+// or stopped the run on, never enters the task.
 //
 // A run that a terminating tool result stopped
 // (agentturn.StopTerminate or agentturn.StopPartialTerminate) is how a
@@ -25,11 +34,15 @@
 // receiver's configuration, which the executor sets on the task's
 // agent before continuing it, so the receiver answers within the same
 // task, its text streamed as the sender's was, and the record holds
-// both runs. Without the option, or when it declines, a terminating
+// both runs, the receiver's under a trigger of kind "handoff" naming
+// the sender. Without the option, or when it declines, a terminating
 // stop with no answer completes the task with the text of the last
 // output of a call whose result set Terminate, the answer the tools
 // gave on the model's behalf; a sibling's output, or a blocked or
-// failed call's, is not taken for it.
+// failed call's, is not taken for it. The handoff lasts for the task:
+// [WithStart] picks the configuration the conversation's next task
+// starts under, and without it the task starts under the executor's
+// own.
 //
 //	exec := a2a.New(cfg)
 //	handler := a2asrv.NewHandler(exec)

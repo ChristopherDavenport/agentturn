@@ -1256,10 +1256,13 @@ func TestAResponseKeepsWhatTheAttemptHeld(t *testing.T) {
 
 // callIDModel makes, on each turn, one call to upper per ID in turns,
 // then answers with nothing once the turns run out. An ID of "-" is
-// sent empty, as a provider that gives none does.
+// sent empty, as a provider that gives none does. With doneOnly it
+// sends each call's output_item.done alone, as a relay that passes on
+// only finished items does.
 type callIDModel struct {
-	turns [][]string
-	calls int
+	turns    [][]string
+	doneOnly bool
+	calls    int
 }
 
 func (m *callIDModel) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
@@ -1279,6 +1282,12 @@ func (m *callIDModel) CreateStream(_ context.Context, req openresponses.Request,
 			if call, ok := item.(*openresponses.FunctionCall); ok && call.CallID == "-" {
 				call.CallID = ""
 			}
+		}
+		if _, ok := outputIndex(ev); m.doneOnly && ok {
+			return nil
+		}
+		if _, ok := ev.(*openresponses.OutputItemAddedEvent); m.doneOnly && ok {
+			return nil
 		}
 		return sink.Send(ev)
 	})
@@ -1309,13 +1318,16 @@ var longCallID = strings.Repeat("toolu_", 10)
 
 // TestCallIDsNameOneCall pins that a call ID names one call in the
 // transcript: a call whose ID the model left empty or gave an earlier
-// call runs under an ID of the loop's own, which its item_end, its
-// output and the turn's response all carry, and a call with an ID of
-// its own keeps it.
+// call runs under an ID of the loop's own, which its item_start, every
+// item_update, its item_end, its output and the turn's response all
+// carry, and a call with an ID of its own keeps it. A stream that sends
+// a call's output_item.done alone holds the calls until its response
+// arrives, and a call held still takes its ID.
 func TestCallIDsNameOneCall(t *testing.T) {
 	cases := []struct {
-		name  string
-		turns [][]string
+		name     string
+		turns    [][]string
+		doneOnly bool
 		// kept are the IDs the transcript keeps as the model gave them.
 		kept []string
 	}{
@@ -1326,16 +1338,19 @@ func TestCallIDsNameOneCall(t *testing.T) {
 		{name: "repeated outside the alphabet", turns: [][]string{{"call.0:x"}, {"call.0:x"}}, kept: []string{"call.0:x"}},
 		{name: "two that map to one prefix", turns: [][]string{{"call.a", "call:a"}, {"call.a", "call:a"}}, kept: []string{"call.a", "call:a"}},
 		{name: "long", turns: [][]string{{longCallID + "1", longCallID + "2"}, {longCallID + "1", longCallID + "2"}}, kept: []string{longCallID + "1", longCallID + "2"}},
+		{name: "repeated in a response, done only", turns: [][]string{{"c1", "c1"}}, doneOnly: true, kept: []string{"c1"}},
+		{name: "repeated across turns, done only", turns: [][]string{{"c1"}, {"c1", "c1"}}, doneOnly: true, kept: []string{"c1"}},
+		{name: "empty, done only", turns: [][]string{{"-", "-"}}, doneOnly: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := &callIDModel{turns: tc.turns}
+			m := &callIDModel{turns: tc.turns, doneOnly: tc.doneOnly}
 			events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")},
 				Config{Model: m, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}}))
 			if err != nil || end.Reason != ReasonDone {
 				t.Fatalf("err=%v reason=%s", err, end.Reason)
 			}
-			var ids, ended, turned []string
+			var ids, started, ended, turned []string
 			seen := map[string]bool{}
 			for _, item := range end.Items {
 				call, ok := item.(*openresponses.FunctionCall)
@@ -1356,8 +1371,18 @@ func TestCallIDsNameOneCall(t *testing.T) {
 					t.Errorf("output %q names no call", out.CallID)
 				}
 			}
+			open := ""
 			for _, ev := range events {
 				switch e := ev.(type) {
+				case *ItemStart:
+					if call, ok := e.Item.(*openresponses.FunctionCall); ok {
+						open = call.CallID
+						started = append(started, call.CallID)
+					}
+				case *ItemUpdate:
+					if call, ok := e.Item.(*openresponses.FunctionCall); ok && call.CallID != open {
+						t.Errorf("item_update carries %q in a call opened as %q", call.CallID, open)
+					}
 				case *ItemEnd:
 					if call, ok := e.Item.(*openresponses.FunctionCall); ok {
 						ended = append(ended, call.CallID)
@@ -1374,6 +1399,9 @@ func TestCallIDsNameOneCall(t *testing.T) {
 			}
 			if len(ids) != n || strings.Join(ended, " ") != strings.Join(ids, " ") || strings.Join(turned, " ") != strings.Join(ids, " ") {
 				t.Errorf("transcript %q, item_end %q, responses %q", ids, ended, turned)
+			}
+			if want := strings.Join(ids, " "); !tc.doneOnly && strings.Join(started, " ") != want {
+				t.Errorf("item_start %q, item_end %q", started, ended)
 			}
 			for _, id := range tc.kept {
 				if !slices.Contains(ids, id) {

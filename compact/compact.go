@@ -120,9 +120,12 @@ func WithSummaryPrompt(prompt string) Option { return func(t *Transform) { t.pro
 // requests set Reasoning sets the same here, and may set
 // MaxOutputTokens, Temperature or any other field. A replay tells the
 // fold's call from a turn by its lack of tools and instructions, so
-// leave those empty. fn runs once per attempt on a fresh request; the
-// edited request is the one reported as [Fold.Request]. [New] ignores
-// it.
+// leave those empty. The transform sets MaxOutputTokens to half the
+// budget, at most [DefaultSummaryMaxOutputTokens], before fn runs, so
+// a summary that runs away is cut by the server; fn may change or
+// clear it. fn runs once per attempt on a
+// fresh request; the edited request is the one reported as
+// [Fold.Request]. [New] ignores it.
 func WithRequest(fn func(*openresponses.Request)) Option {
 	return func(t *Transform) { t.request = fn }
 }
@@ -153,26 +156,43 @@ type Fold struct {
 	Summary openresponses.Item
 	// TokensBefore is the estimate that triggered the fold.
 	TokensBefore int
-	// Usage is what the fold's model call reported, when it did.
+	// Usage is what the fold's model calls reported, when they did. For
+	// a fold that asked more than once, it is the sum over every call,
+	// whether the fold then succeeded or failed: what the fold cost,
+	// not what its last call did.
 	Usage *openresponses.Usage
 	// ResponseID is the ID of the response the fold's model call
 	// produced, from either endpoint, so a recorder can tie the fold to
 	// a call the server made and a replay can recognise the fold's call
-	// among the run's.
+	// among the run's. For a fold that asked more than once, it is the
+	// last call's.
 	ResponseID string
+	// OutputTypes are the item types of the last call's output, in
+	// order, such as [reasoning function_call] for a summary that ended
+	// in a call: enough to tell a model that answered with something
+	// other than text from a stream that ended early. nil when the call
+	// produced no response.
+	OutputTypes []string
+	// Attempts is the number of model calls the fold made: one, or two
+	// for a [NewLocal] fold that asked again.
+	Attempts int
 	// Pinned are the items of the folded prefix that [WithPin] kept, in
 	// their order. They follow Output on the request and are not part
 	// of it.
 	Pinned openresponses.Items
-	// Request is the request [NewLocal] sent for the fold, as
-	// [WithRequest] left it: the items being folded and the summary
-	// prompt. Its input is no path's context, so a hash of it never
+	// Request is the request [NewLocal] sent for the fold's last
+	// attempt, as [WithRequest] left it: the items being folded and the
+	// summary prompt. A failed fold carries it too. Its input is no path's context, so a hash of it never
 	// rebuilds from a stored path; a recorder that keeps it must mark
 	// it as the fold's own call. nil for [New], whose compaction
 	// request is not a Request.
 	Request *openresponses.Request
-	// Err is set when the fold failed; Transform returns it. A fold cut
-	// off by an abort carries the context error.
+	// Err is set when the fold failed; Transform returns it, save for
+	// [ErrSummaryTooLarge] and [ErrSummaryIncomplete], after which
+	// Transform sends the transcript unfolded and returns no error. A fold cut off by an abort carries
+	// the context error. A failed fold still
+	// reports what its calls did: Usage, ResponseID, OutputTypes,
+	// Attempts and Request, as far as the calls got.
 	Err error
 }
 
@@ -200,7 +220,11 @@ func WithSummaryItem(fn func(summary string) openresponses.Item) Option {
 // Transform compacts transcripts. Its Transform method is the value for
 // agentturn.Config.Transform. It is safe for concurrent use and does
 // not hold its lock across the model call, but it remembers one
-// compacted prefix, so share one per conversation.
+// compacted prefix and one failed fold, so share one per conversation.
+// Both memories are keyed by a hash of the prefix they cover, so a
+// Transform shared between conversations never sends one the other's
+// fold or skips a fold because the other's failed; it only folds more
+// often than one per conversation would, as each forgets the other's.
 type Transform struct {
 	fold        func(ctx context.Context, input openresponses.Items) (folded, error)
 	onFold      func(context.Context, Fold) error
@@ -221,6 +245,12 @@ type Transform struct {
 	prefixHash string
 	output     openresponses.Items
 	last       openresponses.Item
+	// The last fold that failed with an unfolded send: failLen items of
+	// the transcript hashing to failHash, at failTokens. An empty
+	// failHash means none.
+	failLen    int
+	failHash   string
+	failTokens int
 }
 
 // New builds a Transform that folds through c's compaction endpoint.
@@ -231,12 +261,16 @@ func New(c Compactor, opts ...Option) *Transform {
 	t.fold = func(ctx context.Context, input openresponses.Items) (folded, error) {
 		resp, err := c.Compact(ctx, openresponses.CompactRequest{Model: t.model, Input: input})
 		if err != nil {
-			return folded{}, fmt.Errorf("compact: %w", err)
+			return folded{attempts: 1}, fmt.Errorf("compact: %w", err)
 		}
 		if resp == nil || len(resp.Output) == 0 {
-			return folded{}, errors.New("compact: empty compaction response")
+			f := folded{attempts: 1}
+			if resp != nil {
+				f.usage, f.responseID = resp.Usage, resp.ID
+			}
+			return f, errors.New("compact: empty compaction response")
 		}
-		f := folded{output: append(openresponses.Items(nil), resp.Output...), usage: resp.Usage, responseID: resp.ID}
+		f := folded{output: append(openresponses.Items(nil), resp.Output...), usage: resp.Usage, responseID: resp.ID, outputTypes: itemTypes(resp.Output), attempts: 1}
 		for _, item := range f.output {
 			if c, ok := item.(*openresponses.Compaction); ok {
 				f.summary = c
@@ -250,13 +284,26 @@ func New(c Compactor, opts ...Option) *Transform {
 
 // folded is what a fold produced: the items that stand in for the
 // prefix, the one among them a recorder keeps as the summary, the
-// usage of the call that made them, and the call itself.
+// usage of the call that made them, and the call itself. A fold that
+// failed keeps the call's members, so the failure can be reported with
+// what the call answered.
 type folded struct {
-	output     openresponses.Items
-	summary    openresponses.Item
-	usage      *openresponses.Usage
-	responseID string
-	request    *openresponses.Request
+	output      openresponses.Items
+	summary     openresponses.Item
+	usage       *openresponses.Usage
+	responseID  string
+	request     *openresponses.Request
+	outputTypes []string
+	attempts    int
+}
+
+// itemTypes returns the type of each item, in order.
+func itemTypes(items openresponses.Items) []string {
+	out := make([]string, len(items))
+	for i, item := range items {
+		out[i] = item.ItemType()
+	}
+	return out
 }
 
 // NewLocal builds a Transform that folds by asking model for a summary
@@ -267,26 +314,86 @@ type folded struct {
 // model is named by [WithModel]; leave it empty to let the server
 // pick its default. [WithRequest] edits the rest of the request.
 //
-// A summary response with no text, such as one that ends in a function
-// call, is a model error rather than a server one, so the summary is
-// asked once more before the fold fails with "compact: summary response
-// has no text". The fold then reports the call that answered: its
-// usage, response ID and request.
+// The summary request's MaxOutputTokens is half the budget, at most
+// [DefaultSummaryMaxOutputTokens], unless [WithRequest] sets it
+// otherwise. A summary response with no text, such as one that ends in
+// a function call, a response the server ended incomplete, such as one
+// cut at MaxOutputTokens, and a summary whose text is estimated at no
+// fewer tokens than the items it folds are model errors rather than
+// server ones, so the summary is asked once more. A second answer with
+// no text fails the fold, and the turn, with "compact: summary response
+// has no text". A second incomplete or oversized answer is never
+// applied, since a summary cut short has lost part of what it folds and
+// one too large would grow the request the fold exists to shrink: the
+// fold is reported failed with [ErrSummaryIncomplete] and the server's
+// reason, or with [ErrSummaryTooLarge], the transcript is sent unfolded,
+// and the transform backs off from that prefix as
+// [Transform.Transform] describes. The summary's size is that of its text,
+// the estimate of its item less that of an item with no text, so the
+// wrapper [WithSummaryItem] puts around every summary does not count
+// against it. The fold, failed or not, reports the last call's response
+// ID, output types and request, the usage of every call summed, and
+// the number of attempts.
 func NewLocal(model openresponses.Streamer, opts ...Option) *Transform {
 	t := newTransform(opts)
 	t.fold = func(ctx context.Context, input openresponses.Items) (folded, error) {
 		f, err := t.summarize(ctx, model, input)
-		if errors.Is(err, errNoText) {
+		f.attempts = 1
+		if errors.Is(err, errNoText) || errors.Is(err, ErrSummaryIncomplete) || errors.Is(err, ErrSummaryTooLarge) {
+			first := f.usage
 			f, err = t.summarize(ctx, model, input)
+			f.attempts = 2
+			f.usage = addUsage(first, f.usage)
 		}
 		return f, err
 	}
 	return t
 }
 
+// addUsage returns the sum of a and b, nil when both are.
+func addUsage(a, b *openresponses.Usage) *openresponses.Usage {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	return &openresponses.Usage{
+		InputTokens:         a.InputTokens + b.InputTokens,
+		OutputTokens:        a.OutputTokens + b.OutputTokens,
+		TotalTokens:         a.TotalTokens + b.TotalTokens,
+		InputTokensDetails:  openresponses.InputTokensDetails{CachedTokens: a.InputTokensDetails.CachedTokens + b.InputTokensDetails.CachedTokens},
+		OutputTokensDetails: openresponses.OutputTokensDetails{ReasoningTokens: a.OutputTokensDetails.ReasoningTokens + b.OutputTokensDetails.ReasoningTokens},
+	}
+}
+
 // errNoText is the error of a summary response with no text, which
 // [NewLocal] asks again once.
 var errNoText = errors.New("compact: summary response has no text")
+
+// ErrSummaryIncomplete is the error of a [NewLocal] fold whose summary
+// response the server ended incomplete twice, such as one cut at
+// MaxOutputTokens each time: a summary cut short has lost what it had
+// not yet said, so it is never applied. It is wrapped with the server's
+// reason when it gave one. Like [ErrSummaryTooLarge], such a fold is
+// reported to [WithOnFold] with it and the transcript is sent unfolded:
+// Transform returns no error.
+var ErrSummaryIncomplete = errors.New("compact: summary response is incomplete")
+
+// DefaultSummaryMaxOutputTokens caps the MaxOutputTokens [NewLocal]
+// sets on a summary request: half the budget, and no more than this.
+const DefaultSummaryMaxOutputTokens = 8192
+
+// ErrSummaryTooLarge is the error of a [NewLocal] fold whose summary,
+// asked twice, was each time estimated at no fewer tokens than the
+// items it was to replace. Such a fold is reported to [WithOnFold]
+// with this error, wrapped with the two estimates, and the transcript
+// is sent unfolded: Transform returns no error, since a summary that
+// would not shrink the request leaves the request as it was rather
+// than failing the turn.
+//
+// After either error the transform backs off: see [Transform.Transform].
+var ErrSummaryTooLarge = errors.New("compact: summary is larger than what it folds")
 
 // summarize asks model once for a summary of input.
 func (t *Transform) summarize(ctx context.Context, model openresponses.Streamer, input openresponses.Items) (folded, error) {
@@ -296,25 +403,46 @@ func (t *Transform) summarize(ctx context.Context, model openresponses.Streamer,
 		Input: append(append(openresponses.Items(nil), input...), openresponses.UserText(t.prompt)),
 		Store: &store,
 	}
+	if limit := min(t.budget/2, DefaultSummaryMaxOutputTokens); limit > 0 {
+		req.MaxOutputTokens = &limit
+	}
 	if t.request != nil {
 		t.request(&req)
 	}
+	f := folded{request: &req}
 	resp, err := openresponses.CollectStream(ctx, model, req)
+	if resp != nil {
+		f.usage, f.responseID, f.outputTypes = resp.Usage, resp.ID, itemTypes(resp.Output)
+	}
 	if err != nil {
-		return folded{}, fmt.Errorf("compact: summary: %w", err)
+		return f, fmt.Errorf("compact: summary: %w", err)
 	}
 	if resp.Status == openresponses.ResponseStatusFailed {
 		if resp.Error != nil {
-			return folded{}, fmt.Errorf("compact: summary: %w", resp.Error.Err(0))
+			return f, fmt.Errorf("compact: summary: %w", resp.Error.Err(0))
 		}
-		return folded{}, errors.New("compact: summary response failed")
+		return f, errors.New("compact: summary response failed")
+	}
+	if resp.Status == openresponses.ResponseStatusIncomplete {
+		if resp.IncompleteDetails != nil && resp.IncompleteDetails.Reason != "" {
+			return f, fmt.Errorf("%w: %s", ErrSummaryIncomplete, resp.IncompleteDetails.Reason)
+		}
+		return f, ErrSummaryIncomplete
 	}
 	summary := strings.TrimSpace(resp.OutputText())
 	if summary == "" {
-		return folded{}, errNoText
+		return f, errNoText
 	}
 	item := t.summaryItem(summary)
-	return folded{output: openresponses.Items{item}, summary: item, usage: resp.Usage, responseID: resp.ID, request: &req}, nil
+	// The summary's own text is weighed, not the wrapper every summary
+	// item carries: a prefix of a few short items would otherwise be
+	// smaller than any summary of it.
+	got := t.estimate(openresponses.Items{item}) - t.estimate(openresponses.Items{t.summaryItem("")})
+	if folds := t.estimate(input); got >= folds {
+		return f, fmt.Errorf("%w: %d tokens for %d", ErrSummaryTooLarge, got, folds)
+	}
+	f.output, f.summary = openresponses.Items{item}, item
+	return f, nil
 }
 
 func newTransform(opts []Option) *Transform {
@@ -362,6 +490,19 @@ func (t *Transform) Last() openresponses.Item {
 // Transform returns the transcript to send for this call: unchanged
 // when it fits the budget, otherwise the fold of its older part
 // followed by the recent items.
+//
+// A fold that failed with [ErrSummaryTooLarge] or [ErrSummaryIncomplete]
+// sends the transcript unfolded, and the transform remembers it: the
+// length and hash of the prefix it would have folded, and the estimate
+// that triggered it. While a later transcript still begins with that
+// prefix, it is not folded again until the part to fold has grown by
+// at least [WithKeepLast] items (at least one) or the estimate by at
+// least a quarter of the budget: the same prefix would most likely
+// fail the same way, and asking on every turn would cost two summary
+// calls and a failed fold each time. Such a call goes over budget,
+// folds nothing and reports nothing to [WithOnFold]. A transcript that
+// does not begin with the failed prefix, such as another
+// conversation's or one rewound before it, folds as usual.
 func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (agentturn.Transcript, error) {
 	t.mu.Lock()
 	view, base := t.view(items)
@@ -371,7 +512,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 		return view, nil
 	}
 	split := t.split(items)
-	if split <= base {
+	if split <= base || t.backOff(items, split, tokens) {
 		t.mu.Unlock()
 		return view, nil
 	}
@@ -392,9 +533,21 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	f, err := t.fold(ctx, input)
 	if err != nil {
 		if t.onFold != nil {
-			if rerr := t.onFold(ctx, Fold{Split: split, TokensBefore: tokens, Err: err}); rerr != nil {
+			failed := Fold{Split: split, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Err: err}
+			if rerr := t.onFold(ctx, failed); rerr != nil {
 				return nil, fmt.Errorf("compact: on-fold: %w", rerr)
 			}
+		}
+		if errors.Is(err, ErrSummaryTooLarge) || errors.Is(err, ErrSummaryIncomplete) {
+			// The summary would have grown the request or lost part of
+			// what it folds; the request goes as it was, and this
+			// prefix is not asked about again until it has grown.
+			if h := hash(items[:split]); h != "" {
+				t.mu.Lock()
+				t.failLen, t.failHash, t.failTokens = split, h, tokens
+				t.mu.Unlock()
+			}
+			return view, nil
 		}
 		return nil, err
 	}
@@ -424,11 +577,24 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 		// The fold's own output and the pinned items, as locals: the
 		// memory they were written to belongs to the lock that was just
 		// released.
-		if err := t.onFold(ctx, Fold{Split: split, First: first, Output: f.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, Request: f.request}); err != nil {
+		if err := t.onFold(ctx, Fold{Split: split, First: first, Output: f.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request}); err != nil {
 			return nil, fmt.Errorf("compact: on-fold: %w", err)
 		}
 	}
 	return out, nil
+}
+
+// backOff reports whether a fold of items at split is skipped because
+// a fold of the same transcript failed with an unfolded send and the
+// transcript has not grown enough since. Called with the lock held.
+func (t *Transform) backOff(items agentturn.Transcript, split, tokens int) bool {
+	if t.failHash == "" || len(items) < t.failLen {
+		return false
+	}
+	if split >= t.failLen+max(t.keepLast, 1) || tokens >= t.failTokens+max(t.budget/4, 1) {
+		return false
+	}
+	return hash(items[:t.failLen]) == t.failHash
 }
 
 // pinned returns the items of the folded prefix that the pin keeps, in

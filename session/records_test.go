@@ -583,6 +583,305 @@ func TestEnvIsWrittenWhenItChanges(t *testing.T) {
 	}
 }
 
+// oneCallATurn calls the tools it is offered one a turn, in order, and
+// answers with text once each has its output.
+type oneCallATurn struct{}
+
+func (oneCallATurn) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	outputs := 0
+	for _, item := range req.Input {
+		if _, ok := item.(*openresponses.FunctionCallOutput); ok {
+			outputs++
+		}
+	}
+	if outputs%len(req.Tools) == 0 {
+		if _, ok := req.Input[len(req.Input)-1].(*openresponses.FunctionCallOutput); ok {
+			w, err := em.Message(openresponses.PhaseFinalAnswer)
+			if err != nil {
+				return err
+			}
+			if err := w.Text("done"); err != nil {
+				return err
+			}
+			if err := w.Close(); err != nil {
+				return err
+			}
+			return em.Complete()
+		}
+	}
+	ft := req.Tools[outputs%len(req.Tools)].(*openresponses.FunctionTool)
+	w, err := em.FunctionCall("", ft.Name)
+	if err != nil {
+		return err
+	}
+	if err := w.Arguments(`{"text":"t"}`); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestEnvBetweenCalls pins #187: a workspace that moves between two
+// calls of one run, reported by Recorder.Env from AfterToolCall, puts
+// the second call under a new env entry, and the next run's start,
+// finding it in force, writes none.
+func TestEnvBetweenCalls(t *testing.T) {
+	cases := []struct {
+		name string
+		// move is the node the first call's AfterToolCall moves the
+		// workspace to.
+		move     string
+		wantEnvs string
+		// wantRecord is the env entries and dispatches on the path.
+		wantRecord string
+	}{
+		{"moved", "node-2", "node-1,node-2", "env:node-1 dispatch:a env:node-2 dispatch:b"},
+		{"not moved", "node-1", "node-1", "env:node-1 dispatch:a dispatch:b"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			node := "node-1"
+			env := func(context.Context) (*agentsession.EnvEntry, error) {
+				e := agentsession.NewEnvEntry("/work")
+				if err := e.SetWorkspace(agentsession.WorkspaceContainer, "sandbox").SetMember("node", node); err != nil {
+					return nil, err
+				}
+				return e, nil
+			}
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(ctx, store, agentsession.Header{}, WithEnv(env))
+			if err != nil {
+				t.Fatal(err)
+			}
+			tool := func(name string) agenttool.Tool {
+				return agenttool.New(name, "", func(context.Context, echoArgs) (string, error) { return "ok", nil })
+			}
+			a := agentturn.New(agentturn.Config{Model: oneCallATurn{}, Tools: []agenttool.Tool{tool("a"), tool("b")},
+				AfterToolCall: func(ctx context.Context, info agentturn.ToolResultInfo) (*agentturn.ToolOverride, error) {
+					if info.Call.Name == "a" {
+						node = tc.move
+						if err := rec.Env(ctx); err != nil {
+							return nil, err
+						}
+					}
+					return nil, nil
+				}})
+			defer rec.Attach(a)()
+			for _, text := range []string{"one", "two"} {
+				if end, err := a.Prompt(ctx, openresponses.UserText(text)); err != nil || end.Reason != agentturn.ReasonDone {
+					t.Fatalf("prompt: err=%v end=%+v", err, end)
+				}
+				if text == "one" {
+					var record []string
+					for _, e := range s.Path(s.Leaf()) {
+						switch e := e.(type) {
+						case *agentsession.EnvEntry:
+							var n string
+							_ = json.Unmarshal(e.Workspace.Unknown["node"], &n)
+							record = append(record, "env:"+n)
+						case *agentsession.DispatchEntry:
+							c := callsOf(t, s)
+							for name, call := range c {
+								if call.ID() == e.CallID {
+									record = append(record, "dispatch:"+name)
+								}
+							}
+						}
+					}
+					if got := strings.Join(record, " "); got != tc.wantRecord {
+						t.Errorf("record = %q, want %q", got, tc.wantRecord)
+					}
+				}
+			}
+			var envs []string
+			for _, e := range s.Entries() {
+				if env, ok := e.(*agentsession.EnvEntry); ok {
+					var n string
+					_ = json.Unmarshal(env.Workspace.Unknown["node"], &n)
+					envs = append(envs, n)
+				}
+			}
+			if got := strings.Join(envs, ","); got != tc.wantEnvs {
+				t.Errorf("env entries = %q, want %q", got, tc.wantEnvs)
+			}
+			if err := s.VerifyRecords(s.Leaf()); err != nil {
+				t.Errorf("verify records: %v", err)
+			}
+			verifyAll(t, s)
+		})
+	}
+}
+
+// scriptedCalls makes the calls of its script one a turn, in order,
+// and answers once every one has its output.
+type scriptedCalls []struct{ name, args string }
+
+func (m scriptedCalls) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	outputs := 0
+	for _, item := range req.Input {
+		if _, ok := item.(*openresponses.FunctionCallOutput); ok {
+			outputs++
+		}
+	}
+	if outputs < len(m) {
+		w, err := em.FunctionCall("", m[outputs].name)
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(m[outputs].args); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("done"); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// isEnv reports whether e is an env entry.
+func isEnv(e agentsession.Entry) bool {
+	_, ok := e.(*agentsession.EnvEntry)
+	return ok
+}
+
+// envNodes lists the node of each env entry in entries.
+func envNodes(entries []agentsession.Entry) string {
+	var nodes []string
+	for _, e := range entries {
+		if env, ok := e.(*agentsession.EnvEntry); ok {
+			var n string
+			_ = json.Unmarshal(env.Workspace.Unknown["node"], &n)
+			nodes = append(nodes, n)
+		}
+	}
+	return strings.Join(nodes, ",")
+}
+
+// TestEnvInAChild pins the review of #187: Env made with the context
+// of a child session whose run has ended is filed in that session, at
+// its leaf, as Annotate's entry is, compared with the env in force
+// there; and a grandchild compares with the env in force in its
+// parent, the child, not with the recorder's own session's.
+func TestEnvInAChild(t *testing.T) {
+	ctx := context.Background()
+	node := "node-1"
+	env := func(context.Context) (*agentsession.EnvEntry, error) {
+		e := agentsession.NewEnvEntry("/work")
+		if err := e.SetWorkspace(agentsession.WorkspaceContainer, "sandbox").SetMember("node", node); err != nil {
+			return nil, err
+		}
+		return e, nil
+	}
+	childOf := func(t *testing.T, store agentsession.Store, s *agentsession.Session) *agentsession.Session {
+		t.Helper()
+		l := links(s)
+		if len(l) != 1 {
+			t.Fatalf("links = %d", len(l))
+		}
+		child, err := store.Open(ctx, l[0].Session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return child
+	}
+
+	t.Run("after the child's run", func(t *testing.T) {
+		node = "node-1"
+		store := agentsession.NewMemoryStore()
+		rec, s, err := Start(ctx, store, agentsession.Header{}, WithEnv(env))
+		if err != nil {
+			t.Fatal(err)
+		}
+		childCfg := agentturn.Config{Name: "specialist", Description: "notes things", Model: &echo.Adapter{}}
+		specialist := agent.New(childCfg, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{specialist}})
+		defer rec.Attach(a)()
+		if _, err := a.Prompt(ctx, openresponses.UserText("delegate")); err != nil {
+			t.Fatal(err)
+		}
+		childID := childOf(t, store, s).ID()
+		jobCtx := ContextWithSessionID(ctx, childID)
+		// Unmoved, the child is under its parent's env.
+		if err := rec.Env(jobCtx); err != nil {
+			t.Fatal(err)
+		}
+		node = "node-2"
+		for range 2 {
+			if err := rec.Env(jobCtx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		child := childOf(t, store, s)
+		if got := envNodes(child.Entries()); got != "node-2" {
+			t.Errorf("child env entries = %q, want node-2", got)
+		}
+		if leaf, _ := child.Entry(child.Leaf()); !isEnv(leaf) {
+			t.Errorf("the child's env is not at its leaf")
+		}
+		if got := envNodes(s.Entries()); got != "node-1" {
+			t.Errorf("root env entries = %q, want node-1", got)
+		}
+		verifyAll(t, s)
+		verifyAll(t, child)
+	})
+
+	t.Run("a grandchild", func(t *testing.T) {
+		node = "node-1"
+		store := agentsession.NewMemoryStore()
+		rec, s, err := Start(ctx, store, agentsession.Header{}, WithEnv(env))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var envErr error
+		note := agenttool.New("note", "note something", func(ctx context.Context, _ echoArgs) (string, error) {
+			envErr = errors.Join(envErr, rec.Env(ctx))
+			return "noted", nil
+		})
+		move := agenttool.New("move", "move the workspace", func(ctx context.Context, _ agenttool.NoArgs) (string, error) {
+			node = "node-2"
+			envErr = errors.Join(envErr, rec.Env(ctx))
+			return "moved", nil
+		})
+		grandCfg := agentturn.Config{Name: "grand", Description: "notes things", Model: &echo.Adapter{}, Tools: []agenttool.Tool{note}}
+		grand := agent.New(grandCfg, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+		childCfg := agentturn.Config{Name: "specialist", Description: "moves and delegates",
+			Model: scriptedCalls{{"move", `{}`}, {"grand", `{"input":"note it"}`}}, Tools: []agenttool.Tool{move, grand}}
+		specialist := agent.New(childCfg, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{specialist}})
+		defer rec.Attach(a)()
+		if _, err := a.Prompt(ctx, openresponses.UserText("delegate")); err != nil {
+			t.Fatal(err)
+		}
+		if envErr != nil {
+			t.Fatal(envErr)
+		}
+		child := childOf(t, store, s)
+		grandchild := childOf(t, store, child)
+		if got := envNodes(child.Entries()); got != "node-2" {
+			t.Errorf("child env entries = %q, want node-2", got)
+		}
+		if got := envNodes(grandchild.Entries()); got != "" {
+			t.Errorf("grandchild env entries = %q, want none: it is under its parent's", got)
+		}
+		verifyAll(t, s)
+		verifyAll(t, child)
+		verifyAll(t, grandchild)
+	})
+}
+
 func TestFoldCallIsRecorded(t *testing.T) {
 	root := t.TempDir()
 	store, err := jsonl.Open(root)
@@ -1152,14 +1451,27 @@ func TestOnlyTheAttemptThatAnsweredIsConfigured(t *testing.T) {
 
 // sameIDModel makes, on each turn, one call to upper per ID in turns,
 // then answers with nothing once the turns run out, as a provider that
-// numbers its calls per response does.
+// numbers its calls per response does. With doneOnly it sends each
+// call's output_item.done alone, as a relay that passes on only
+// finished items does.
 type sameIDModel struct {
-	turns [][]string
-	calls int
+	turns    [][]string
+	doneOnly bool
+	calls    int
 }
 
 func (m *sameIDModel) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
 	m.calls++
+	if m.doneOnly {
+		next := sink
+		sink = openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+			switch ev.(type) {
+			case *openresponses.OutputItemAddedEvent, *openresponses.FunctionCallArgumentsDeltaEvent, *openresponses.FunctionCallArgumentsDoneEvent:
+				return nil
+			}
+			return next.Send(ev)
+		})
+	}
 	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
 	if m.calls <= len(m.turns) {
 		for _, id := range m.turns[m.calls-1] {
@@ -1181,14 +1493,17 @@ func (m *sameIDModel) CreateStream(_ context.Context, req openresponses.Request,
 // TestRepeatedCallIDsAreRecorded checks that a model repeating a call
 // ID records a session: the format refuses a function call whose ID is
 // already on the path, and the loop gives such a call an ID of its
-// own before the recorder writes it.
+// own before the recorder writes it, a call the loop holds until its
+// response arrives included.
 func TestRepeatedCallIDsAreRecorded(t *testing.T) {
 	cases := []struct {
-		name  string
-		turns [][]string
+		name     string
+		turns    [][]string
+		doneOnly bool
 	}{
 		{name: "across turns", turns: [][]string{{"call_0"}, {"call_0"}}},
 		{name: "in a response", turns: [][]string{{"call_0", "call_0"}}},
+		{name: "in a response, done only", turns: [][]string{{"c1", "c1"}}, doneOnly: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1197,7 +1512,7 @@ func TestRepeatedCallIDsAreRecorded(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			a := agentturn.New(agentturn.Config{Model: &sameIDModel{turns: tc.turns}, Tools: []agenttool.Tool{upper}})
+			a := agentturn.New(agentturn.Config{Model: &sameIDModel{turns: tc.turns, doneOnly: tc.doneOnly}, Tools: []agenttool.Tool{upper}})
 			defer rec.Attach(a)()
 			if end, err := a.Prompt(context.Background(), openresponses.UserText("abc")); err != nil || end.Reason != agentturn.ReasonDone {
 				t.Fatalf("prompt: err=%v end=%+v", err, end)

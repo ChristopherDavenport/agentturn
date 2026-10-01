@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/openresponses"
 	"github.com/ChristopherDavenport/openresponses/echo"
 )
@@ -193,6 +194,272 @@ func TestRunEndAnswer(t *testing.T) {
 			got, ok := (&RunEnd{Items: tc.items}).Answer()
 			if got != tc.want || ok != tc.ok {
 				t.Errorf("Answer() = %q, %v, want %q, %v", got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
+// TestOutputGuardStops pins #181: an OutputGuard error wrapping ErrGuard
+// stops the run as a policy stop, with the message it ruled on kept out
+// of the transcript and no item_end for it; any other error still fails
+// the run.
+func TestOutputGuardStops(t *testing.T) {
+	rule := fmt.Errorf("%w: pii rule", ErrGuard)
+	boom := errors.New("boom")
+	for _, tc := range []struct {
+		name   string
+		err    error
+		reason Reason
+		cause  StopCause
+	}{
+		{name: "guard", err: rule, reason: ReasonStopped, cause: StopGuard},
+		{name: "failure", err: boom, reason: ReasonError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New(Config{Model: &echo.Adapter{}, OutputGuard: func(context.Context, OutputInfo) (*openresponses.Message, error) {
+				return nil, tc.err
+			}})
+			var assistantEnds, turnEnds int
+			a.Subscribe(func(_ context.Context, ev Event) error {
+				switch e := ev.(type) {
+				case *ItemEnd:
+					if m, ok := e.Item.(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant {
+						assistantEnds++
+					}
+				case *TurnEnd:
+					turnEnds++
+				}
+				return nil
+			})
+			end, _ := a.Prompt(context.Background(), openresponses.UserText("call 555-0100"))
+			if end.Reason != tc.reason || end.Cause != tc.cause || !errors.Is(end.Err, tc.err) {
+				t.Fatalf("end = %s %q %v", end.Reason, end.Cause, end.Err)
+			}
+			if got := itemTypes(a.State().Transcript); got != "user" {
+				t.Errorf("transcript = %s", got)
+			}
+			if _, ok := end.Answer(); ok || assistantEnds != 0 || turnEnds != 0 {
+				t.Errorf("answer=%v assistant item_end=%d turn_end=%d", ok, assistantEnds, turnEnds)
+			}
+		})
+	}
+}
+
+// callThenSpeak answers its first request with a function call and then
+// a message in one response, and every later one with a message.
+type callThenSpeak struct{ calls int }
+
+func (m *callThenSpeak) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.calls++
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if m.calls == 1 {
+		fc, err := em.FunctionCall("c1", "upper")
+		if err != nil {
+			return err
+		}
+		if err := fc.Arguments(`{"text":"x"}`); err != nil {
+			return err
+		}
+		if err := fc.Close(); err != nil {
+			return err
+		}
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text(fmt.Sprintf("reply %d", m.calls)); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestOutputGuardStopClosesTheResponsesCalls pins #181: a call the
+// withheld response completed before the message is answered with
+// WithheldCallOutput, never run and never carrying the guard's text, so
+// the next prompt goes ahead.
+func TestOutputGuardStopClosesTheResponsesCalls(t *testing.T) {
+	rule := fmt.Errorf("%w: secret rule", ErrGuard)
+	ran := 0
+	tool := agenttool.New("upper", "", func(context.Context, struct {
+		Text string `json:"text"`
+	}) (string, error) {
+		ran++
+		return "", nil
+	})
+	model := &callThenSpeak{}
+	a := New(Config{Model: model, Tools: []agenttool.Tool{tool}, OutputGuard: func(_ context.Context, info OutputInfo) (*openresponses.Message, error) {
+		if info.Message.Text() == "reply 1" {
+			return nil, rule
+		}
+		return nil, nil
+	}})
+	var toolEvents int
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		switch ev.(type) {
+		case *ToolStart, *ToolDispatch, *ToolEnd:
+			toolEvents++
+		}
+		return nil
+	})
+	end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if end.Reason != ReasonStopped || end.Cause != StopGuard || !errors.Is(end.Err, rule) {
+		t.Fatalf("end = %s %q %v", end.Reason, end.Cause, end.Err)
+	}
+	if got := itemTypes(a.State().Transcript); got != "user function_call function_call_output" {
+		t.Fatalf("transcript = %s", got)
+	}
+	out := a.State().Transcript[2].(*openresponses.FunctionCallOutput)
+	if out.CallID != "c1" || out.Output.Text != WithheldCallOutput {
+		t.Errorf("output = %+v", out)
+	}
+	if len(end.Pending) != 0 || ran != 0 || toolEvents != 0 {
+		t.Errorf("pending = %v, tool ran %d times, tool events %d", end.Pending, ran, toolEvents)
+	}
+	if got := itemTypes(end.Items); got != "user function_call function_call_output" {
+		t.Errorf("run items = %s", got)
+	}
+	end, err := a.Prompt(context.Background(), openresponses.UserText("again"))
+	if err != nil || end.Reason != ReasonDone {
+		t.Fatalf("next prompt: err = %v, end = %+v", err, end)
+	}
+	if answer, _ := end.Answer(); answer != "reply 2" {
+		t.Errorf("answer = %q", answer)
+	}
+}
+
+// withholding answers with a function call, a message, or both, before
+// a message an OutputGuard withholds, all in one response with usage.
+// doneOnly sends output_item.done alone for each item, as some
+// servers do.
+type withholding struct {
+	call, preamble, doneOnly bool
+}
+
+func (m withholding) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	if m.doneOnly {
+		next := sink
+		sink = openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+			switch ev.(type) {
+			case *openresponses.ResponseCreatedEvent, *openresponses.ResponseInProgressEvent,
+				*openresponses.OutputItemDoneEvent, *openresponses.ResponseCompletedEvent:
+				return next.Send(ev)
+			}
+			return nil
+		})
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if m.call {
+		fc, err := em.FunctionCall("c1", "upper")
+		if err != nil {
+			return err
+		}
+		if err := fc.Arguments(`{"text":"x"}`); err != nil {
+			return err
+		}
+		if err := fc.Close(); err != nil {
+			return err
+		}
+	}
+	if m.preamble {
+		w, err := em.Message(openresponses.PhaseCommentary)
+		if err != nil {
+			return err
+		}
+		if err := w.Text("Let me tell you."); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("SECRET"); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	em.Response().Usage = &openresponses.Usage{InputTokens: 7, OutputTokens: 5, TotalTokens: 12}
+	return em.Complete()
+}
+
+// TestOutputGuardWithheldResponse pins the record of a withheld
+// response: a response_end with Withheld set, incomplete with
+// content_filter, carrying the usage of the whole response and as
+// output what the transcript took from it, before the outputs closing
+// its calls; a run end with Withheld set and no answer, whatever
+// message the response spoke before the withheld one; and on a stream
+// that sends output_item.done alone, the calls before the message
+// dropped with it.
+func TestOutputGuardWithheldResponse(t *testing.T) {
+	tool := agenttool.New("upper", "", func(context.Context, struct {
+		Text string `json:"text"`
+	}) (string, error) {
+		return "", nil
+	})
+	for _, tc := range []struct {
+		name       string
+		model      withholding
+		output     string
+		transcript string
+		events     string
+	}{
+		{name: "alone", model: withholding{}, output: "", transcript: "user", events: "response_end run_end"},
+		{name: "after a preamble", model: withholding{preamble: true}, output: "assistant", transcript: "user assistant", events: "response_end run_end"},
+		{name: "after a call", model: withholding{call: true}, output: "function_call", transcript: "user function_call function_call_output", events: "response_end item_start item_end run_end"},
+		{name: "after a call and a preamble", model: withholding{call: true, preamble: true}, output: "function_call assistant", transcript: "user function_call assistant function_call_output", events: "response_end item_start item_end run_end"},
+		{name: "done only, after a call", model: withholding{call: true, doneOnly: true}, output: "", transcript: "user", events: "response_end run_end"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New(Config{Model: tc.model, Tools: []agenttool.Tool{tool}, OutputGuard: func(_ context.Context, info OutputInfo) (*openresponses.Message, error) {
+				if info.Message.Text() == "SECRET" {
+					return nil, fmt.Errorf("%w: secret", ErrGuard)
+				}
+				return nil, nil
+			}})
+			var withheld *ResponseEnd
+			var after []string
+			a.Subscribe(func(_ context.Context, ev Event) error {
+				if e, ok := ev.(*ResponseEnd); ok && e.Withheld {
+					withheld = e
+				}
+				if withheld != nil {
+					after = append(after, ev.EventType())
+				}
+				return nil
+			})
+			end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+			if end.Reason != ReasonStopped || end.Cause != StopGuard || !end.Withheld {
+				t.Fatalf("end = %s %q withheld=%v", end.Reason, end.Cause, end.Withheld)
+			}
+			if text, ok := end.Answer(); ok {
+				t.Errorf("Answer() = %q, true, want none", text)
+			}
+			if got := itemTypes(a.State().Transcript); got != tc.transcript {
+				t.Errorf("transcript = %s, want %s", got, tc.transcript)
+			}
+			if withheld == nil {
+				t.Fatal("no withheld response_end")
+			}
+			resp := withheld.Response
+			if resp.Status != openresponses.ResponseStatusIncomplete || resp.IncompleteDetails == nil || resp.IncompleteDetails.Reason != openresponses.IncompleteReasonContentFilter || resp.Error != nil {
+				t.Errorf("response = %s %+v %+v", resp.Status, resp.IncompleteDetails, resp.Error)
+			}
+			if resp.Usage == nil || resp.Usage.TotalTokens != 12 {
+				t.Errorf("usage = %+v, want the whole response's", resp.Usage)
+			}
+			if got := itemTypes(resp.Output); got != tc.output {
+				t.Errorf("response output = %q, want %q", got, tc.output)
+			}
+			if resp.ID == "" {
+				t.Error("response has no ID")
+			}
+			if got := fmt.Sprint(after); got != "["+tc.events+"]" {
+				t.Errorf("events from response_end = %s, want [%s]", got, tc.events)
 			}
 		})
 	}

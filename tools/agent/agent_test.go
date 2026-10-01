@@ -317,6 +317,13 @@ func TestChildGuardStop(t *testing.T) {
 	}
 	afterTurn := func(context.Context, agentturn.TurnInfo) (bool, error) { return false, refuse }
 	lookup := agenttool.New("lookup", "", func(context.Context, agenttool.NoArgs) (string, error) { return "found", nil })
+	// withholdAnswer lets a preamble through and withholds the answer.
+	withholdAnswer := func(_ context.Context, info agentturn.OutputInfo) (*openresponses.Message, error) {
+		if info.Message.Text() == "solve x" {
+			return nil, refuse
+		}
+		return nil, nil
+	}
 	for _, tc := range []struct {
 		name string
 		cfg  agentturn.Config
@@ -330,6 +337,8 @@ func TestChildGuardStop(t *testing.T) {
 		}}, ""},
 		{"before model call 2, after a preamble", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, BeforeModelCall: onToolOutput}, ""},
 		{"after a turn that called tools", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, ShouldStopAfterTurn: afterTurn}, ""},
+		{"output guard", agentturn.Config{OutputGuard: withholdAnswer}, ""},
+		{"output guard, after a message of the same response", agentturn.Config{Model: speaksTwice{}, OutputGuard: withholdAnswer}, ""},
 		{"after the answer", agentturn.Config{ShouldStopAfterTurn: afterTurn}, "solve x"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -619,4 +628,27 @@ func TestChildRunCarriesNoParentTrigger(t *testing.T) {
 			}
 		})
 	}
+}
+
+// speaksTwice says something and then echoes the input, two messages
+// in one response, so a guard may let the first through and withhold
+// the second.
+type speaksTwice struct{}
+
+func (speaksTwice) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if err := em.Item(openresponses.AssistantText("Let me tell you.")); err != nil {
+		return err
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text(req.Input[len(req.Input)-1].(*openresponses.Message).Text()); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
 }
