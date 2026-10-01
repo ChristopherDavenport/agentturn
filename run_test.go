@@ -1476,3 +1476,135 @@ func TestReservedCallIDs(t *testing.T) {
 		})
 	}
 }
+
+// reusedIndexModel makes, on its first turn, one call to upper per
+// entry of calls, each with its own text, and answers with nothing on
+// the next. With atZero it streams every call at output_index 0, one
+// after the other, as Ollama's /v1/responses does, while the response
+// it completes with holds them at their own positions; with noItemIDs
+// the calls carry no item ID.
+type reusedIndexModel struct {
+	calls            []string
+	atZero, noItemID bool
+	turns            int
+}
+
+func (m *reusedIndexModel) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.turns++
+	rewrite := openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+		switch e := ev.(type) {
+		case *openresponses.OutputItemAddedEvent:
+			m.rewriteItem(e.Item)
+			if m.atZero {
+				e.OutputIndex = 0
+			}
+		case *openresponses.OutputItemDoneEvent:
+			m.rewriteItem(e.Item)
+			if m.atZero {
+				e.OutputIndex = 0
+			}
+		case *openresponses.FunctionCallArgumentsDeltaEvent:
+			if m.atZero {
+				e.OutputIndex = 0
+			}
+		case *openresponses.FunctionCallArgumentsDoneEvent:
+			if m.atZero {
+				e.OutputIndex = 0
+			}
+		}
+		if resp, ok := openresponses.TerminalResponse(ev); ok {
+			for _, item := range resp.Output {
+				m.rewriteItem(item)
+			}
+		}
+		return sink.Send(ev)
+	})
+	em := openresponses.NewEmitter(rewrite, openresponses.NewResponse(req))
+	if m.turns == 1 {
+		for i, id := range m.calls {
+			w, err := em.FunctionCall(id, "upper")
+			if err != nil {
+				return err
+			}
+			if err := w.Arguments(fmt.Sprintf(`{"text":"t%d"}`, i)); err != nil {
+				return err
+			}
+			if err := w.Close(); err != nil {
+				return err
+			}
+		}
+	}
+	return em.Complete()
+}
+
+func (m *reusedIndexModel) rewriteItem(item openresponses.Item) {
+	if call, ok := item.(*openresponses.FunctionCall); ok && m.noItemID {
+		call.ID = ""
+	}
+}
+
+// TestCallsAtOneOutputIndex pins that a call ID is decided per call
+// even on a stream that opens every call at output_index 0: each call
+// is dispatched under its own ID and answered with its own output, as
+// it is on a stream that keeps the indexes apart.
+func TestCallsAtOneOutputIndex(t *testing.T) {
+	cases := []struct {
+		name     string
+		calls    []string
+		atZero   bool
+		noItemID bool
+	}{
+		{name: "own indexes", calls: []string{"call_a", "call_b"}},
+		{name: "own indexes, no item IDs", calls: []string{"call_a", "call_b"}, noItemID: true},
+		{name: "one index", calls: []string{"call_a", "call_b"}, atZero: true},
+		{name: "one index, three calls", calls: []string{"call_a", "call_b", "call_c"}, atZero: true},
+		{name: "one index, one call ID", calls: []string{"call_a", "call_a"}, atZero: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &reusedIndexModel{calls: tc.calls, atZero: tc.atZero, noItemID: tc.noItemID}
+			events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")},
+				Config{Model: m, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}}))
+			if err != nil || end.Reason != ReasonDone {
+				t.Fatalf("err=%v reason=%s", err, end.Reason)
+			}
+			// args is each call's arguments by the ID the transcript
+			// gives it, and outputs each output's text by its call.
+			args, outputs := map[string]string{}, map[string]string{}
+			for _, item := range end.Items {
+				switch it := item.(type) {
+				case *openresponses.FunctionCall:
+					if _, ok := args[it.CallID]; ok {
+						t.Errorf("call ID %q names two calls", it.CallID)
+					}
+					args[it.CallID] = it.Arguments
+				case *openresponses.FunctionCallOutput:
+					outputs[it.CallID] = it.Output.String()
+				}
+			}
+			if len(args) != len(tc.calls) {
+				t.Fatalf("calls %v, want %d", args, len(tc.calls))
+			}
+			for id, a := range args {
+				var in echoArgs
+				if err := json.Unmarshal([]byte(a), &in); err != nil {
+					t.Fatal(err)
+				}
+				if want := strings.ToUpper(in.Text); outputs[id] != want {
+					t.Errorf("output of %s (%s) = %q, want %q", id, a, outputs[id], want)
+				}
+			}
+			dispatched := map[string]int{}
+			for _, ev := range events {
+				if e, ok := ev.(*ToolDispatch); ok {
+					dispatched[e.CallID]++
+				}
+			}
+			for id := range args {
+				if dispatched[id] != 1 {
+					t.Errorf("%s dispatched %d times: %v", id, dispatched[id], dispatched)
+				}
+			}
+		})
+	}
+}

@@ -13,6 +13,14 @@ versions may break the API.
   v0.0.15 or earlier wrote: on such a store, stop every writer, take a
   copy, run it, then upgrade readers and writers together, as its
   changelog says.
+- **A call streamed at the output index of an earlier call runs under
+  its own ID.** The loop kept the ID it decided for a call by output
+  index, so a stream that opens every call at index 0, as Ollama
+  0.23's `/v1/responses` does for parallel calls, ran two calls under
+  the second's ID, with one call's output given to the other; under a
+  session recorder the run failed at the second output. A call is now
+  known by its item ID when it has one, and by its output index only
+  when it has none (#198).
 
 ## v0.0.14 - 2026-10-01
 

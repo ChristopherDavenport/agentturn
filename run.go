@@ -555,8 +555,13 @@ type runner struct {
 	// callIDs maps the output index of every function call the attempt
 	// in flight opened or completed, the held ones included, to the call
 	// ID the loop decided for it: the model's when it names no other
-	// call, one of the loop's own when it is empty or taken.
-	callIDs map[int]string
+	// call, one of the loop's own when it is empty or taken. callItems
+	// maps the item ID of each such call that has one to the same ID,
+	// and names the call when it has one: a stream that opens a second
+	// call at the index of the first, as Ollama's does, gives each its
+	// own.
+	callIDs   map[int]string
+	callItems map[string]string
 }
 
 // heldItem is a completed item waiting for its attempt to commit.
@@ -1120,7 +1125,7 @@ func sleep(ctx context.Context, d time.Duration) error {
 func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *openresponses.Response, committed bool, err error) {
 	var acc openresponses.Accumulator
 	var halt *errStop
-	r.held, r.callIDs = nil, nil
+	r.held, r.callIDs, r.callItems = nil, nil, nil
 	for ev, err := range openresponses.Events(ctx, r.cfg.Model, req) {
 		if halt != nil {
 			// OutputGuard withheld a message: the rest of the response
@@ -1232,7 +1237,7 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		if call, ok := item.(*openresponses.FunctionCall); ok {
 			// The call's ID is decided as it opens, so its item_start,
 			// every item_update and its item_end carry the same one.
-			r.decideCallID(call.CallID, e.OutputIndex)
+			r.decideCallID(call, e.OutputIndex)
 			item = r.withCallID(item, e.OutputIndex)
 		}
 		commits := !committed && commitsAttempt(item)
@@ -1248,10 +1253,10 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		item := e.Item
 		modelCallID := ""
 		if call, ok := item.(*openresponses.FunctionCall); ok {
-			if _, opened := r.callIDs[e.OutputIndex]; !opened {
+			if _, opened := r.decidedCallID(call, e.OutputIndex); !opened {
 				// A call first seen as it completes, on a stream that
 				// sends no output_item.added for it.
-				r.decideCallID(call.CallID, e.OutputIndex)
+				r.decideCallID(call, e.OutputIndex)
 			}
 			if item = r.withCallID(call, e.OutputIndex); item != openresponses.Item(call) {
 				modelCallID = call.CallID
@@ -1298,7 +1303,7 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 
 // decideCallID decides the call ID of the function call at index of
 // the attempt in flight, given the ID the model sent, and records it in
-// callIDs: the model's, or one of the loop's own when the model gave
+// callIDs and, when the call has an item ID, callItems: the model's, or one of the loop's own when the model gave
 // none, or gave one a call in the transcript already has, one another
 // call of the attempt took, held or not, or one the agent or the run's
 // context reserved. A call ID names one call, since an output, a
@@ -1310,14 +1315,29 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 // transcript, the response the turn acts on and every later request
 // carry one ID; a call the stream never opened is decided when it
 // completes.
-func (r *runner) decideCallID(id string, index int) {
+func (r *runner) decideCallID(call *openresponses.FunctionCall, index int) {
 	if r.callIDs == nil {
-		r.callIDs = map[int]string{}
+		r.callIDs, r.callItems = map[int]string{}, map[string]string{}
 	}
+	id := call.CallID
 	if r.callIDTaken(id) {
 		id = openresponses.NewID(callIDPrefix(id))
 	}
 	r.callIDs[index] = id
+	if call.ID != "" {
+		r.callItems[call.ID] = id
+	}
+}
+
+// decidedCallID returns the call ID decided for call, found by its item
+// ID when it has one and by index, its output index, when it has none.
+func (r *runner) decidedCallID(call *openresponses.FunctionCall, index int) (string, bool) {
+	if call.ID != "" {
+		id, ok := r.callItems[call.ID]
+		return id, ok
+	}
+	id, ok := r.callIDs[index]
+	return id, ok
 }
 
 // callIDTaken reports whether a call the model makes may not keep id.
@@ -1346,7 +1366,7 @@ func (r *runner) withCallID(item openresponses.Item, index int) openresponses.It
 	if !ok {
 		return item
 	}
-	id, ok := r.callIDs[index]
+	id, ok := r.decidedCallID(call, index)
 	if !ok || id == call.CallID {
 		return item
 	}
