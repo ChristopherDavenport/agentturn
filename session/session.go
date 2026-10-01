@@ -1344,9 +1344,12 @@ func callAt(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry st
 // take the ID of one a compaction folded out of the context or another
 // branch holds, which the format refuses. It is what a host resuming a
 // session passes to agentturn.New. [WithOrigins] reads a fork's origin
-// as [Pending] does.
+// as [Pending] does. The transcript is [Transcript]'s, its reasoning
+// items attributed as [TranscriptModels] attributes them, so the loop
+// leaves another model's out of each request after a resume, as it
+// does for the items its own runs produced.
 func AgentOptions(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Option, error) {
-	items, err := Transcript(s)
+	items, models, err := TranscriptModels(s)
 	if err != nil {
 		return nil, err
 	}
@@ -1358,7 +1361,7 @@ func AgentOptions(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Opti
 	if err != nil {
 		return nil, err
 	}
-	return []agentturn.Option{agentturn.WithTranscript(items), agentturn.WithPending(pending), agentturn.WithReservedCallIDs(ids)}, nil
+	return []agentturn.Option{agentturn.WithTranscript(items), agentturn.WithReasoningModels(models), agentturn.WithPending(pending), agentturn.WithReservedCallIDs(ids)}, nil
 }
 
 // Transcript returns the agent's transcript at the session's leaf: the
@@ -1377,6 +1380,56 @@ func Transcript(s *agentsession.Session) (openresponses.Items, error) {
 	}
 	items, _, _ := transcriptOf(cx)
 	return items, nil
+}
+
+// TranscriptModels returns [Transcript]'s transcript and which model
+// produced each of its reasoning items, keyed to those very items: the
+// model of the settings in force on the path when the response that
+// produced the item was written, which is the request's model, the
+// Config.ModelName the loop compares. A reasoning item no response
+// produced, or one whose response ran under no recorded model, is left
+// out, and the loop sends it to every model. A host seeding an agent
+// by hand gives both, the transcript to Agent.SetTranscript or
+// agentturn.WithTranscript and the models to
+// agentturn.WithReasoningModels or agentturn.ContextWithReasoningModels;
+// attribution holds an item by identity, so models attributes no other
+// copy of the transcript.
+func TranscriptModels(s *agentsession.Session) (openresponses.Items, agentturn.ReasoningModels, error) {
+	cx, err := s.Context()
+	if err != nil {
+		return nil, nil, fmt.Errorf("session: context at leaf: %w", err)
+	}
+	items, entries, _ := transcriptOf(cx)
+	// The settings a response's items were written under are the ones
+	// its request carried: the recorder settles them before the
+	// response's first item.
+	produced := map[string]string{}
+	var settings agentsession.Settings
+	for _, e := range s.Path(s.Leaf()) {
+		switch v := e.(type) {
+		case *agentsession.ConfigEntry:
+			settings = settings.Apply(v)
+		case *agentsession.ItemEntry:
+			if _, ok := v.Item.(*openresponses.ReasoningItem); ok && v.ResponseID != "" {
+				produced[v.ID] = settings.Model
+			}
+		case *agentsession.CustomEntry:
+			if _, ok := v.Unknown[ResponseIDMember]; ok && v.NS == openresponses.ItemTypeReasoning {
+				produced[v.ID] = settings.Model
+			}
+		}
+	}
+	models := agentturn.ReasoningModels{}
+	for i, item := range items {
+		r, ok := item.(*openresponses.ReasoningItem)
+		if !ok {
+			continue
+		}
+		if model := produced[entries[i]]; model != "" {
+			models[r] = model
+		}
+	}
+	return items, models, nil
 }
 
 // transcriptOf is the transcript of cx, as [Transcript] reads it, with
@@ -1633,7 +1686,9 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 // calls of the branch it continues rather than the one it left. It
 // refuses with [ErrRunActive] while a run is being written, and s must
 // be the session the recorder writes. The agent's transcript is the
-// caller's to set, with Agent.SetTranscript from [Transcript] and
+// caller's to set, with Agent.SetTranscript from [Transcript], or from
+// [TranscriptModels] with its models on the next run's context through
+// agentturn.ContextWithReasoningModels, and
 // then Agent.SetPending from [Pending], so a call held on the branch
 // is approved as a held call and one that may have run is held to the
 // replay rule. Rebase reserves every call ID in the session, [CallIDs],

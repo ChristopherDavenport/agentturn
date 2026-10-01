@@ -96,6 +96,17 @@ versions may break the API.
   request hash, since the format cannot describe an omission from the
   middle of the history (agentsession#56). An empty `ModelName` names
   no model, so nothing changes for a host that sets none. (#91)
+- **A resumed session knows which model produced its reasoning.**
+  `session.AgentOptions` now gives `WithReasoningModels`, attributing
+  each reasoning item on the path to the model the recorded settings
+  named when its response was written, the request's `ModelName`, so
+  after a restart a request to another model leaves the earlier model's
+  reasoning out as a live agent does, and keeps its own. The new
+  `session.TranscriptModels` returns the transcript and that
+  attribution keyed to the same items, for a host that seeds an agent
+  by hand, after `Recorder.Rebase` for one. A reasoning item no
+  response produced, or one written under no recorded model, stays
+  unattributed and is sent to every model. (#91)
 
 - **A fold no longer keeps a function call output while folding its
   call when another item sits between them.** The split used to move
