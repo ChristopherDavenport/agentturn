@@ -239,7 +239,9 @@ func (a *Agent) Config() Config { return a.cfg }
 // out the ones a model with another [Config.ModelName] produced, which
 // the agent attributed as its runs went (see [ReasoningModels]). The
 // transcript and a record of it keep them, and a configuration that
-// switches back to that model is sent them again. A session recorder
+// switches back to that model is sent them again. A configuration with
+// an empty ModelName names no model, so nothing is attributed to it
+// and nothing is left out of its requests. A session recorder
 // cannot write a request that leaves items out of the middle of its
 // history, so the responses after such a change carry no request hash.
 func (a *Agent) SetConfig(cfg Config) error {

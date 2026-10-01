@@ -282,7 +282,7 @@ func TestReasoningAcrossHandoff(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		billing   string // billing's ModelName
-		start     string // "transfers", "start" or ""
+		start     string // "transfers", "start", "both" or ""
 		caller    bool   // the next request carries a caller tool: one turn
 		handedOff []string
 		next      []string
@@ -291,6 +291,7 @@ func TestReasoningAcrossHandoff(t *testing.T) {
 		{"another model, one turn", "other-2", "transfers", true, []string{}, []string{}},
 		{"same model", "reasoner-1", "transfers", false, []string{"sig:reasoner-1"}, []string{"sig:reasoner-1"}},
 		{"WithStart alone", "other-2", "start", false, []string{}, []string{"sig:reasoner-1"}},
+		{"WithStart before WithTransfers", "other-2", "both", false, []string{}, []string{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var seen [][]string
@@ -304,10 +305,13 @@ func TestReasoningAcrossHandoff(t *testing.T) {
 			switch tc.start {
 			case "transfers":
 				opts = append(opts, WithTransfers(route(billing)))
-			case "start":
+			case "start", "both":
 				opts = append(opts, WithStart(func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
 					return HandedTo(t, route(billing))
 				}))
+				if tc.start == "both" {
+					opts = append(opts, WithTransfers(route(billing)))
+				}
 			}
 			a := New(agentturn.Config{Name: "triage", Model: thinksThenTransfers{}, ModelName: "reasoner-1", Tools: []agenttool.Tool{transfer}}, opts...)
 			first := request(openresponses.UserText("I was double charged"))

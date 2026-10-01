@@ -220,10 +220,10 @@ type Fold struct {
 	Pinned openresponses.Items
 	// Request is the request [NewLocal] sent for the fold's last
 	// attempt, as [WithRequest] left it: the items being folded and the
-	// summary prompt. A failed fold carries it too. Its input is no path's context, so a hash of it never
-	// rebuilds from a stored path; a recorder that keeps it must mark
-	// it as the fold's own call. nil for [New], whose compaction
-	// request is not a Request.
+	// summary prompt. A failed fold carries it too. Its input is no
+	// path's context, so a hash of it never rebuilds from a stored
+	// path; a recorder that keeps it must mark it as the fold's own
+	// call. nil for [New], whose compaction request is not a Request.
 	Request *openresponses.Request
 	// PrefixHash is the [PrefixHash] of the transcript's first Split
 	// items when the fold failed and the transform backs off from that
@@ -235,8 +235,9 @@ type Fold struct {
 	// [ErrSummaryTooLarge], [ErrSummaryIncomplete] and
 	// [ErrSummaryNoText], after which Transform sends the transcript
 	// unfolded and returns no error. A fold cut off by an abort carries
-	// the context error. A failed fold still reports what its calls did: Usage, ResponseID, OutputTypes,
-	// Attempts and Request, as far as the calls got.
+	// the context error. A failed fold still reports what its calls
+	// did: Usage, ResponseID, OutputTypes, Attempts and Request, as far
+	// as the calls got.
 	Err error
 }
 
@@ -583,9 +584,9 @@ func (t *Transform) Last() openresponses.Item {
 // recent items.
 //
 // A fold that failed with [ErrSummaryTooLarge], [ErrSummaryIncomplete]
-// or [ErrSummaryNoText] sends the transcript unfolded, and the transform remembers it: the
-// length and hash of the prefix it would have folded, and the estimate
-// that triggered it. While a later transcript still begins with that
+// or [ErrSummaryNoText] sends the transcript unfolded, and the
+// transform remembers it: the length and hash of the prefix it would
+// have folded, and the estimate that triggered it. While a later transcript still begins with that
 // prefix, it is not folded again until the part to fold has grown by
 // at least [WithKeepLast] items (at least one) or the estimate by at
 // least a quarter of the budget: the same prefix would most likely

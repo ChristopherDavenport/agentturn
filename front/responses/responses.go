@@ -199,10 +199,11 @@ func WithStart(fn func(ctx context.Context, t agentturn.Transcript) (agentturn.C
 }
 
 // WithTransfers says the conversation's handoffs are the transfer
-// calls route names, as [Handoffs] finds them. A request starts where
-// the last of them left the conversation, as [WithStart] does with
-// [HandedTo]; a WithStart given after it picks the start in its place.
-// And the reasoning items of the input are attributed, with
+// calls route names, as [Handoffs] finds them. Without [WithStart] a
+// request starts where the last of them left the conversation, as
+// WithStart does with [HandedTo]; with it, WithStart picks the start,
+// in whichever order the two are given, and the rest of this option
+// applies all the same. And the reasoning items of the input are attributed, with
 // [Attribute], to the agents that had the conversation when they were
 // produced, those before the first transfer to the adapter's own
 // configuration, so a request leaves out another model's reasoning,
@@ -215,9 +216,6 @@ func WithStart(fn func(ctx context.Context, t agentturn.Transcript) (agentturn.C
 func WithTransfers(route Route) Option {
 	return func(a *Adapter) {
 		a.route = route
-		a.start = func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
-			return HandedTo(t, route)
-		}
 	}
 }
 
@@ -261,8 +259,13 @@ func (a *Adapter) CreateStream(ctx context.Context, req openresponses.Request, s
 		return openresponses.InvalidRequest(openresponses.CodeInvalidValue, "input must end with a user message or a function_call_output", "input")
 	}
 	base := a.cfg
-	if a.start != nil {
+	switch {
+	case a.start != nil:
 		if cfg, ok := a.start(ctx, append(agentturn.Transcript(nil), transcript...)); ok {
+			base = cfg
+		}
+	case a.route != nil:
+		if cfg, ok := HandedTo(transcript, a.route); ok {
 			base = cfg
 		}
 	}

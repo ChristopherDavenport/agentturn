@@ -192,10 +192,11 @@ func WithStart(fn func(ctx context.Context, t agentturn.Transcript) (agentturn.C
 }
 
 // WithTransfers says the conversation's handoffs are the transfer
-// calls route names, as [Handoffs] finds them. A task starts where the
-// last of them left the conversation, as [WithStart] does with
-// [HandedTo]; a WithStart given after it picks the start in its place.
-// A message that declares a caller-owned tool
+// calls route names, as [Handoffs] finds them. Without [WithStart] a
+// task starts where the last of them left the conversation, as
+// WithStart does with [HandedTo]; with it, WithStart picks the start,
+// in whichever order the two are given, and the rest of this option
+// applies all the same. A message that declares a caller-owned tool
 // route takes is refused as invalid params, as is one declaring a
 // tool the agent offers, so a transfer is never answered by the
 // caller. And the reasoning items of the stored transcript are
@@ -210,9 +211,6 @@ func WithStart(fn func(ctx context.Context, t agentturn.Transcript) (agentturn.C
 func WithTransfers(route Route) Option {
 	return func(e *Executor) {
 		e.route = route
-		e.start = func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
-			return HandedTo(t, route)
-		}
 	}
 }
 
@@ -284,8 +282,13 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	defer e.track(reqCtx.TaskID, cancel)()
 	caller := slices.Concat(e.callerTools, declared)
 	start := e.cfg
-	if e.start != nil {
+	switch {
+	case e.start != nil:
 		if cfg, ok := e.start(runCtx, slices.Concat(transcript, prompts)); ok {
+			start = cfg
+		}
+	case e.route != nil:
+		if cfg, ok := HandedTo(transcript, e.route); ok {
 			start = cfg
 		}
 	}

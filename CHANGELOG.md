@@ -101,12 +101,12 @@ versions may break the API.
   `WithReasoningModels` and `ContextWithReasoningModels` give it for a
   transcript the loop has not seen. Both fronts attribute the items
   their in-process handoffs pass on, and their new `WithTransfers(route)`
-  starts where the last transfer left the conversation, as `WithStart`
-  with `HandedTo` does, and attributes a caller's input or a stored
-  transcript by the handoffs it took, with `front/responses.Attribute`.
-  A `compact.NewLocal` fold leaves every reasoning item out of its
-  summary request: a summariser cannot read one, and the summary
-  model's provider refuses another model's.
+  attributes a caller's input or a stored transcript by the handoffs
+  it took, with `front/responses.Attribute`, and, unless `WithStart` is
+  given too, starts where the last transfer left the conversation, as
+  `WithStart` with `HandedTo` does. A `compact.NewLocal` fold leaves
+  every reasoning item out of its summary request: a summariser cannot
+  read one, and the summary model's provider refuses another model's.
   A session recorder writes the responses after such a request with no
   request hash, since the format cannot describe an omission from the
   middle of the history (agentsession#56). An empty `ModelName` names
