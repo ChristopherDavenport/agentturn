@@ -97,10 +97,10 @@
 //     item, as the format asks. An
 //     item the filter in force would hide from the model, an app-only
 //     extension item, is written as a custom entry
-//     instead so the path rebuilds exactly the input that was sent; a
-//     model's output item the filter hides names its response in a
-//     [ResponseIDMember] member beside it, and [Transcript] puts it back
-//     in the agent's transcript on a resume. A
+//     instead so the path rebuilds exactly the input that was sent,
+//     marked with a [ResponseIDMember] member naming the response that
+//     produced it, if any, and [Transcript] puts it back in the agent's
+//     transcript on a resume. A
 //     function_call_output for a call the path holds no dispatch and no
 //     reject for, one the caller answered through Agent.Resume with an
 //     output of their own, is preceded by a reject decision carrying
@@ -635,13 +635,16 @@ const unhashedReason = "the request's input differs from the input the recorded 
 const unnamedReason = "the response named no ID, so the items it produced read as its input"
 
 // ResponseIDMember is the member of a custom entry, beside the item
-// that is its data, naming the response that produced the item: a
-// model's output item the filter in force kept from the model, such as
-// an adapter's extension item kept from other adapters, which is
-// written as a custom entry in the namespace of its type, as an
-// app-only input is, so the path rebuilds the input that was sent and
-// the requests after it keep their hashes. The context leaves it out
-// and [Transcript] puts it back.
+// that is its data, that marks an item of the agent's transcript the
+// filter in force kept from the model, written as a custom entry in the
+// namespace of its type so the path rebuilds the input that was sent
+// and the requests after it keep their hashes: an app-only input, or a
+// model's output item, such as an adapter's extension item kept from
+// other adapters. Its value names the response that produced the item,
+// "" for an input or for an output whose stream never named its
+// response. The context leaves the item out and [Transcript] puts it
+// back; an entry written before the member was, by v0.0.14 or earlier,
+// is not put back.
 const ResponseIDMember = "agentturn:response_id"
 
 // ErrRunActive is returned by [Recorder.Rebase] while a run is being
@@ -1396,14 +1399,17 @@ func AgentOptions(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Opti
 }
 
 // Transcript returns the agent's transcript at the session's leaf: the
-// context's items, with each output item a model produced that the
-// filter kept from it, which the path holds as a custom entry naming
-// its response ([ResponseIDMember]) and the context leaves out, put
-// back where it was, as the loop held it. It is the transcript
+// context's items, with each item the filter kept from the model, an
+// app-only input or a model's output, which the path holds as a custom
+// entry marked with [ResponseIDMember] and the context leaves out, put
+// back where it was, as the loop held it, so a transform that reads the
+// whole transcript, compact's among them, sees after a resume what it
+// saw before. It is the transcript
 // [AgentOptions] seeds an agent with, and the one to give
 // Agent.SetTranscript after [Recorder.Rebase] or to seed the agent of
 // a [Start] on a base with; Context.Items differs from it only by
-// those items, which the filter keeps out of every request anyway.
+// those items, which the filter keeps out of every request anyway. Each
+// call decodes those items afresh.
 func Transcript(s *agentsession.Session) (openresponses.Items, error) {
 	cx, err := s.Context()
 	if err != nil {
@@ -2087,7 +2093,27 @@ func (r *Recorder) EntryOf(ctx context.Context, item openresponses.Item) (string
 			return w.items[i], true
 		}
 	}
+	if i := w.customCopy(item); i >= 0 {
+		return w.items[i], true
+	}
 	return "", false
+}
+
+// customCopy is the index of the one item the writer holds as a custom
+// entry that equals item, or -1. [Transcript] decodes such an item
+// afresh at each call, so the agent seeded with it holds a copy of the
+// writer's, which is the same item by value alone.
+func (w *writer) customCopy(item openresponses.Item) int {
+	at := -1
+	for i, v := range w.values {
+		if w.custom[i] && equalJSON(v, item) {
+			if at >= 0 {
+				return -1
+			}
+			at = i
+		}
+	}
+	return at
 }
 
 // writerOf returns the writer of the run on the context, or the root.
@@ -3511,15 +3537,11 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		if err != nil {
 			return fmt.Errorf("session: encode %s item: %w", item.ItemType(), err)
 		}
-		c := &agentsession.CustomEntry{NS: item.ItemType(), Data: raw}
-		if responseID != "" {
-			id, err := json.Marshal(responseID)
-			if err != nil {
-				return fmt.Errorf("session: encode response ID: %w", err)
-			}
-			c.Unknown = map[string]json.RawMessage{ResponseIDMember: id}
+		id, err := json.Marshal(responseID)
+		if err != nil {
+			return fmt.Errorf("session: encode response ID: %w", err)
 		}
-		entry = c
+		entry = &agentsession.CustomEntry{NS: item.ItemType(), Data: raw, EntryBase: agentsession.EntryBase{Unknown: map[string]json.RawMessage{ResponseIDMember: id}}}
 	} else {
 		e := &agentsession.ItemEntry{Item: item, ResponseID: responseID}
 		if hidden {
@@ -4163,8 +4185,8 @@ func (w *writer) foldSplitOf(f compact.Fold) (int, bool, error) {
 			return f.Split, true, nil
 		}
 		if f.Split >= 0 && f.Split < len(w.values) && w.custom[f.Split] && equalJSON(w.values[f.Split], f.First) {
-			// A model's output item the filter hid, which the agent
-			// was seeded with from a decoding of its own.
+			// An item the filter hid, which the agent was seeded with
+			// from a decoding of its own.
 			return f.Split, true, nil
 		}
 		at, n := -1, 0
@@ -4172,6 +4194,10 @@ func (w *writer) foldSplitOf(f compact.Fold) (int, bool, error) {
 			if v == f.First {
 				at, n = i, n+1
 			}
+		}
+		if n == 0 {
+			at = w.customCopy(f.First)
+			return at, at >= 0, nil
 		}
 		return at, n == 1, nil
 	}

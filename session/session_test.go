@@ -359,6 +359,123 @@ func TestFilteredModelOutputKeepsHashes(t *testing.T) {
 	}
 }
 
+// idless answers as rawThenText does with a response that has no ID,
+// so nothing names the response its items belong to.
+type idless struct{}
+
+func (idless) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	return rawThenText{}.CreateStream(ctx, req, openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+		switch e := ev.(type) {
+		case *openresponses.ResponseCreatedEvent, *openresponses.ResponseInProgressEvent:
+			return nil
+		case *openresponses.ResponseCompletedEvent:
+			e.Response.ID = ""
+		}
+		return sink.Send(ev)
+	}))
+}
+
+// TestTranscriptRestoresWhatTheFilterHid pins the review of #202: every
+// item the filter kept from the model is marked as the transcript's,
+// an app-only input and a model's output whose stream never named its
+// response included, and Transcript puts it back where the loop held
+// it, so a resumed agent holds what the live one did; EntryOf finds the
+// entry of such an item from the copy Transcript gave the agent.
+func TestTranscriptRestoresWhatTheFilterHid(t *testing.T) {
+	note := func() openresponses.Item {
+		return &openresponses.UnknownItem{Type: "agentturn:note", Raw: json.RawMessage(`{"type":"agentturn:note","text":"ui marker"}`)}
+	}
+	cases := []struct {
+		name   string
+		model  agentturn.Model
+		prompt openresponses.Items
+		// hid is the type of the item the filter kept from the model,
+		// and responseID the member its entry carries.
+		hid        string
+		responseID string
+	}{
+		{name: "an app-only input", model: &echo.Adapter{}, prompt: openresponses.Items{note(), openresponses.UserText("hi")}, hid: "agentturn:note"},
+		{name: "an unnamed model output", model: idless{}, prompt: openresponses.Items{openresponses.UserText("hi")}, hid: "hermes:raw"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(ctx, store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := agentturn.New(agentturn.Config{Model: tc.model, ModelName: "m"})
+			unsub := rec.Attach(a)
+			_, _ = a.Prompt(ctx, tc.prompt...)
+			unsub()
+			var marked *agentsession.CustomEntry
+			for _, e := range s.Entries() {
+				if c, ok := e.(*agentsession.CustomEntry); ok && c.NS == tc.hid {
+					marked = c
+				}
+			}
+			var id *string
+			if marked != nil {
+				_ = json.Unmarshal(marked.Unknown[ResponseIDMember], &id)
+			}
+			if id == nil || *id != tc.responseID {
+				t.Fatalf("custom entry %+v, want %s marked with response %q", marked, tc.hid, tc.responseID)
+			}
+			items, err := Transcript(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var restored openresponses.Item
+			for _, item := range items {
+				if item.ItemType() == tc.hid {
+					restored = item
+				}
+			}
+			if restored == nil {
+				t.Fatalf("transcript has no %s", tc.hid)
+			}
+			if !equalJSON(items, a.State().Transcript) {
+				t.Errorf("transcript differs from the agent's")
+			}
+
+			rec2, s2, err := Resume(ctx, store, s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if at, ok := rec2.EntryOf(ctx, restored); !ok || at != marked.ID {
+				t.Errorf("EntryOf the restored copy = %q %v, want %s", at, ok, marked.ID)
+			}
+			// A fold that keeps from the copy, at an index a transform
+			// before it shifted, is placed at its entry.
+			probe := New(store, s.ID())
+			if err := probe.root.seed(ctx, s2, false); err != nil {
+				t.Fatal(err)
+			}
+			if split, placed, err := probe.root.foldSplitOf(compact.Fold{Split: -1, First: restored}); err != nil || !placed || probe.root.items[split] != marked.ID {
+				t.Errorf("fold from the restored copy placed %v at %d, err %v", placed, split, err)
+			}
+			opts, err := AgentOptions(s2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"}, opts...)
+			defer rec2.Attach(b)()
+			if _, err := b.Prompt(ctx, openresponses.UserText("again")); err != nil {
+				t.Fatal(err)
+			}
+			if err := s2.VerifyRecords(s2.Leaf()); err != nil {
+				t.Errorf("verify records: %v", err)
+			}
+			// The resumed run's request is rebuilt from the path.
+			last := s2.Entries()[len(s2.Entries())-2].(*agentsession.ResponseEntry)
+			if err := s2.Verify(last.ID); err != nil {
+				t.Errorf("verify the resumed response: %v", err)
+			}
+		})
+	}
+}
+
 // slowStore delays appends of assistant items so the barrier is
 // observable.
 type slowStore struct {

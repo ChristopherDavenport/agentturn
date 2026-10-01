@@ -214,12 +214,19 @@ versions may break the API.
   as an item entry, which the context algorithm contributes, so the
   path rebuilt an input the request did not carry and every later
   response went unhashed. It is now a custom entry in the namespace of
-  its type, as an app-only input is, with the response ID in a new
-  `session.ResponseIDMember` member beside it. The new
-  `session.Transcript` is the context's items with those items put back
-  where the loop held them; `AgentOptions` and the recorder's seeding
-  use it, so an agent resumed or rebased holds them as before, and
-  `Rebase` and a `Start` on a base say to seed with it. (#202)
+  its type, as an app-only input is. Every such entry, an app-only
+  input's included, now carries a new `session.ResponseIDMember` member
+  beside the item naming the response that produced it, "" for an input
+  or a response that never named itself. The new `session.Transcript`
+  is the context's items with every item so marked put back where the
+  loop held it; `AgentOptions` and the recorder's seeding use it, so an
+  agent resumed or rebased holds them, a model's outputs as before and
+  app-only inputs, which a resume used to drop, now too, so a transform
+  that reads the whole transcript sees what it saw before the restart.
+  `Recorder.EntryOf` and a fold's placement find such an item from the
+  copy `Transcript` decodes. `Rebase` and a `Start` on a base say to
+  seed with it. An app-only input written by v0.0.14 or earlier carries
+  no mark and is not put back. (#202)
 - **The recorder says why it left a request unhashed.** When a
   request's input is not what the recorded path rebuilds, after a
   `Transform` or a `BeforeModelCall` changed it, with a child's seed
