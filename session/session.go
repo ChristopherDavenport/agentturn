@@ -367,7 +367,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"slices"
 	"sync"
 	"time"
@@ -3156,8 +3155,10 @@ func (c *callRecord) carries(args json.RawMessage) bool {
 
 // sameJSON reports whether two argument strings are the same object,
 // an empty string standing for the empty object as the loop reads it.
-// They are compared as values, so a store that hands them back with
-// their keys sorted hands back the same arguments.
+// They are compared by their canonical form, the one the request hash
+// is taken over, so a store that hands them back with their keys
+// sorted or a number written another way hands back the same
+// arguments.
 func sameJSON(a json.RawMessage, b string) bool {
 	if len(a) == 0 {
 		a = json.RawMessage("{}")
@@ -3165,12 +3166,12 @@ func sameJSON(a json.RawMessage, b string) bool {
 	if b == "" {
 		b = "{}"
 	}
-	va, okA := decodeValue(a)
-	vb, okB := decodeValue([]byte(b))
-	if !okA || !okB {
+	ca, errA := canonicalJSON(a)
+	cb, errB := canonicalJSON([]byte(b))
+	if errA != nil || errB != nil {
 		return string(a) == b
 	}
-	return reflect.DeepEqual(va, vb)
+	return bytes.Equal(ca, cb)
 }
 
 func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
@@ -3664,34 +3665,23 @@ func jsonLen(v any) int {
 }
 
 // equalJSON reports whether a and b encode to the same JSON value. It
-// compares values, not bytes: an object's members match by name in any
-// order, so a tool whose raw parameters a store hands back with their
-// keys sorted, as a content-addressed one does, is the tool the loop
-// sent.
+// compares their canonical form, the JCS one the request hash is taken
+// over, not their bytes: an object's members match by name in any
+// order and a number matches however it is written, so a tool whose
+// raw parameters a content-addressed store hands back canonicalised,
+// its keys sorted and a 1.0 written 1, is the tool the loop sent.
 func equalJSON(a, b any) bool {
-	va, okA := jsonValue(a)
-	vb, okB := jsonValue(b)
-	return okA && okB && reflect.DeepEqual(va, vb)
+	ca, okA := canonicalValue(a)
+	cb, okB := canonicalValue(b)
+	return okA && okB && bytes.Equal(ca, cb)
 }
 
-// jsonValue is v encoded and decoded again as a generic JSON value.
-func jsonValue(v any) (any, bool) {
+// canonicalValue is v encoded and put in canonical form.
+func canonicalValue(v any) ([]byte, bool) {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return nil, false
 	}
-	return decodeValue(data)
-}
-
-// decodeValue decodes data as a generic JSON value, keeping numbers as
-// written, so two integers past float64's precision are not taken for
-// the same one.
-func decodeValue(data []byte) (any, bool) {
-	d := json.NewDecoder(bytes.NewReader(data))
-	d.UseNumber()
-	var out any
-	if err := d.Decode(&out); err != nil || d.More() {
-		return nil, false
-	}
-	return out, true
+	out, err := canonicalJSON(data)
+	return out, err == nil
 }

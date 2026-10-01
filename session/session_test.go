@@ -431,6 +431,8 @@ func TestConfigDelta(t *testing.T) {
 			func(d *agentsession.ConfigEntry) bool { return d == nil }},
 		{"extra with its keys in another order", agentsession.Settings{Model: "m", Instructions: base.Instructions, Tools: base.Tools,
 			Extra: map[string]json.RawMessage{"a": json.RawMessage(`1`), "b": json.RawMessage(`{"y":2,"x":1}`)}}, func(d *agentsession.ConfigEntry) bool { return d == nil }},
+		{"extra with a number written another way", agentsession.Settings{Model: "m", Instructions: base.Instructions, Tools: base.Tools,
+			Extra: map[string]json.RawMessage{"a": json.RawMessage(`1.0`), "b": json.RawMessage(`{"x":1e0,"y":2}`)}}, func(d *agentsession.ConfigEntry) bool { return d == nil }},
 		{"model", agentsession.Settings{Model: "n", Instructions: base.Instructions, Tools: base.Tools, Extra: base.Extra}, func(d *agentsession.ConfigEntry) bool {
 			return d.Model == "n" && d.Instructions == nil && d.Extra == nil && !d.Replace
 		}},
@@ -716,8 +718,9 @@ func TestResumeContinuesWithoutDuplicateConfig(t *testing.T) {
 }
 
 // A recorder resumed in a new process compares the tools in force with
-// the ones its run sends by value: a content-addressed store hands the
-// parameters back with their keys sorted, and the tools are the same.
+// the ones its run sends by canonical form: a content-addressed store
+// hands the parameters back with their keys sorted and a 1.0 written 1,
+// and the tools are the same.
 func TestResumedToolsCompareByValue(t *testing.T) {
 	cases := []struct {
 		name string
@@ -745,7 +748,10 @@ func TestResumedToolsCompareByValue(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			dir := t.TempDir()
-			cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{upper}}
+			bounded := agenttool.NewFunc("bounded", "takes a fraction",
+				json.RawMessage(`{"type":"object","properties":{"f":{"type":"number","minimum":0,"maximum":1.0}}}`),
+				func(context.Context, agenttool.Call) (agenttool.Result, error) { return agenttool.Result{}, nil })
+			cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{upper, bounded}}
 			store, done := tc.open(t, dir)
 			rec, s, err := Start(ctx, store, agentsession.Header{})
 			if err != nil {

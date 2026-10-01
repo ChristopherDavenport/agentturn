@@ -101,12 +101,13 @@ versions may break the API.
   A call's ID is now taken by every call of the attempt, held or not
   (#183).
 - **The recorder compares settings by value.** A config delta is
-  written when the settings a run sends differ from those in force as
-  JSON values, where it compared their encoded bytes: a `cas` store,
-  which keeps a body's canonical bytes, hands a tool's `parameters`
-  back with their keys sorted, so a recorder resumed from one wrote
-  `tools_added` with every tool on its first run in each process. The
-  extra members compare the same way (#176).
+  written when the settings a run sends differ from those in force in
+  their canonical form, the JCS one the request hash is taken over,
+  where it compared their encoded bytes: a `cas` store, which keeps a
+  body's canonical bytes, hands a tool's `parameters` back with their
+  keys sorted and a `1.0` written `1`, so a recorder resumed from one
+  wrote `tools_added` with every tool on its first run in each process.
+  The extra members compare the same way (#176).
 - **A call dispatched on another branch may have run.** After a
   `Recorder.Rebase` to an entry between a call and its dispatch, the
   call is on the new path with no dispatch, and `session.Pending` read
@@ -127,7 +128,8 @@ versions may break the API.
   the `hold` decision and `session.Pending` gives them back after a
   restart; a decision that runs other arguments than those in force on
   the path writes its own, so the path says what ran. The recorder
-  compares arguments as JSON values, its keys in any order (#186).
+  compares arguments by their canonical form, keys in any order and
+  numbers however written (#186).
 - **`session.Recorder.Env` records a workspace that moves inside a
   run.** The recorder asked `WithEnv` at a run's start alone, so a
   sandbox rescheduled between two calls of one run left the calls after
