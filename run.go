@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/openresponses"
@@ -2236,8 +2237,9 @@ var ErrNoInvoker = errors.New("agentturn: no loop on the context to invoke a too
 // through the agenttool.Elicitor on ctx, when there is one: an accept
 // runs it and a decline refuses it, and tool_start carries that answer
 // as the decision, by "human". Without an elicitor, or on a cancel or
-// a failure to ask, the deferral refuses the call. Nothing is appended to the transcript, so a nested call costs no
-// items and a Terminate on its result means nothing to the loop.
+// a failure to ask, the deferral refuses the call. Nothing is appended
+// to the transcript, so a nested call costs no items and a Terminate
+// on its result means nothing to the loop.
 //
 // The call it is made under comes from agenttool.CallFrom, which
 // agenttool.New puts on every typed tool's context; a tool that
@@ -2337,7 +2339,7 @@ func (r *runner) askNested(ctx context.Context, name string, args json.RawMessag
 	if !ok {
 		return d
 	}
-	msg := fmt.Sprintf("Allow %s with arguments %s?", name, args)
+	msg := fmt.Sprintf("Allow %s with arguments %s?", name, clip(string(args), maxAskedArgs))
 	if d.Reason != "" {
 		msg += " " + d.Reason
 	}
@@ -2366,6 +2368,22 @@ func (r *runner) askNested(ctx context.Context, name string, args json.RawMessag
 		return d
 	}
 	return &decided
+}
+
+// maxAskedArgs is the most of a nested call's arguments, in bytes, the
+// question about it quotes: a script's call may carry a whole file.
+const maxAskedArgs = 500
+
+// clip returns s cut to at most n bytes on a rune boundary, with an
+// ellipsis when anything was cut.
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "…"
 }
 
 // endNested gives a nested call whose loop-side handling failed, a

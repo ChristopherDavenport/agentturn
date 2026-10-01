@@ -36,8 +36,8 @@ versions may break the API.
   code-execution tool's script could not make a call the user would
   have been asked about. When the invoking tool's context carries an
   `agenttool.Elicitor`, `Config.ToolElicitor` among them, the loop now
-  asks it with a question naming the call, its arguments and the
-  decision's reason; an accept runs the call and a decline refuses it,
+  asks it with a question naming the call, its arguments (the first
+  500 bytes) and the decision's reason; an accept runs the call and a decline refuses it,
   and the nested `tool_start` carries the answer as the decision, by
   `human`. Without an elicitor, or on a cancel or a failure to ask, the
   call is refused as before. The session recorder writes a nested call

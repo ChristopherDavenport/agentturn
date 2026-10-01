@@ -309,3 +309,27 @@ func TestNestedCallsEnterTheHooksOneAtATime(t *testing.T) {
 		t.Errorf("after-tool-call saw %v", after)
 	}
 }
+
+// TestClip pins how much of a deferred nested call's arguments its
+// question quotes: all of them up to the limit, and a cut on a rune
+// boundary with an ellipsis past it.
+func TestClip(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		n    int
+		want string
+	}{
+		{name: "short", in: `{"a":1}`, n: 10, want: `{"a":1}`},
+		{name: "exact", in: "abcde", n: 5, want: "abcde"},
+		{name: "long", in: "abcdefgh", n: 5, want: "abcde…"},
+		{name: "inside a rune", in: "ab日本", n: 4, want: "ab…"},
+		{name: "on a rune boundary", in: "ab日本", n: 5, want: "ab日…"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := clip(tc.in, tc.n); got != tc.want {
+				t.Errorf("clip(%q, %d) = %q, want %q", tc.in, tc.n, got, tc.want)
+			}
+		})
+	}
+}

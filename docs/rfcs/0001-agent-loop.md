@@ -1176,7 +1176,8 @@ as if the model had asked for it under the call in flight:
   nested call cannot be handed to the caller, since it belongs to a
   tool that is running, so a deferred one is put to the user through
   the invoking tool's elicitor when it has one, as a question naming
-  the call, its arguments and the decision's reason, asked on the
+  the call, its arguments, the first 500 bytes of them, and the
+  decision's reason, asked on the
   invoking tool's context so it is filed under that call. An accept
   allows the call and a decline blocks it, with `declined when asked`
   and the reason as the refusal's; either is the decision `tool_start`
