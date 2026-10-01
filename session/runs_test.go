@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ChristopherDavenport/agentsession"
 	"github.com/ChristopherDavenport/agenttool"
@@ -485,21 +487,33 @@ func TestOutputGuardStopIsRecordedWithheld(t *testing.T) {
 	}
 }
 
-// unnamed answers its first request with a function call and every
-// later one with a message, and sends no response.created or
-// response.in_progress, so no item event names the response.
-type unnamed struct{ calls int }
+// nameless passes on its model's stream without response.created or
+// response.in_progress, as a relay that forwards only the output items
+// and the terminal event does, so no item event names the response.
+type nameless struct{ m agentturn.Model }
 
-func (m *unnamed) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
-	m.calls++
-	next := sink
-	sink = openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+func (n nameless) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	return n.m.CreateStream(ctx, req, openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
 		switch ev.(type) {
 		case *openresponses.ResponseCreatedEvent, *openresponses.ResponseInProgressEvent:
 			return nil
 		}
-		return next.Send(ev)
-	})
+		return sink.Send(ev)
+	}))
+}
+
+// unnamed answers its first request with a function call and every
+// later one with a message. Wrapped in nameless, no item event names
+// its response.
+type unnamed struct {
+	calls int
+	// cut ends the first stream with an error after the call, before
+	// its terminal event.
+	cut bool
+}
+
+func (m *unnamed) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.calls++
 	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
 	if m.calls == 1 {
 		fc, err := em.FunctionCall("c1", "upper")
@@ -511,6 +525,9 @@ func (m *unnamed) CreateStream(_ context.Context, req openresponses.Request, sin
 		}
 		if err := fc.Close(); err != nil {
 			return err
+		}
+		if m.cut {
+			return errors.New("connection reset")
 		}
 		return em.Complete()
 	}
@@ -524,37 +541,135 @@ func (m *unnamed) CreateStream(_ context.Context, req openresponses.Request, sin
 	return em.Complete()
 }
 
+// namedByTheirResponses checks that every model item entry names the
+// response entry that follows it, so the context algorithm reads it as
+// that response's output rather than as an input.
+func namedByTheirResponses(t *testing.T, s *agentsession.Session) {
+	t.Helper()
+	var pending []*agentsession.ItemEntry
+	for _, e := range s.Entries() {
+		switch v := e.(type) {
+		case *agentsession.ItemEntry:
+			if isModelOutput(v.Item) {
+				pending = append(pending, v)
+			}
+		case *agentsession.ResponseEntry:
+			for _, it := range pending {
+				if it.ResponseID != v.ResponseID {
+					t.Errorf("%s item %s names response %q, want %q", it.Item.ItemType(), it.ID, it.ResponseID, v.ResponseID)
+				}
+			}
+			pending = nil
+		}
+	}
+	if len(pending) > 0 {
+		t.Errorf("%d model items with no response after them in %q", len(pending), entryTypes(s))
+	}
+}
+
 // TestUnnamedResponseIsNotWithheld pins the review of #181: the
 // recorder writes a response withheld only on the loop's word, a
 // response_end with Withheld set. An item with no response ID while a
-// call is in flight is a stream that never named its response, and
+// call is in flight is a stream that has not named its response, and
 // its responses are written as they arrived, completed, with no
-// response invented for them.
+// response invented for them; each item is written with the ID the
+// response ends with, before it, so the record rebuilds every request.
 func TestUnnamedResponseIsNotWithheld(t *testing.T) {
 	store := agentsession.NewMemoryStore()
 	rec, s, err := Start(context.Background(), store, agentsession.Header{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := agentturn.New(agentturn.Config{Model: &unnamed{}, ModelName: "m", Tools: []agenttool.Tool{upper}})
+	a := agentturn.New(agentturn.Config{Model: nameless{&unnamed{}}, ModelName: "m", Tools: []agenttool.Tool{upper}})
 	defer rec.Attach(a)()
 	if end, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil || end.Reason != agentturn.ReasonDone {
 		t.Fatalf("end = %+v err=%v", end, err)
 	}
-	if got, want := entryTypes(s), "run config item:user item:function_call response dispatch item:function_call_output item:assistant response run"; got != want {
+	if got, want := entryTypes(s), "run config item:user item:function_call* response dispatch item:function_call_output item:assistant* response run"; got != want {
 		t.Errorf("entries = %q, want %q", got, want)
 	}
 	for _, e := range s.Entries() {
-		if v, ok := e.(*agentsession.ResponseEntry); ok && (v.Status != openresponses.ResponseStatusCompleted || v.Incomplete != nil) {
-			t.Errorf("response = %s %+v, want completed", v.Status, v.Incomplete)
+		if v, ok := e.(*agentsession.ResponseEntry); ok && (v.Status != openresponses.ResponseStatusCompleted || v.Incomplete != nil || v.ResponseID == "") {
+			t.Errorf("response = %q %s %+v, want completed and named", v.ResponseID, v.Status, v.Incomplete)
 		}
 	}
 	runs := runsOf(t, s)
 	if len(runs) != 1 || runs[0].End == nil || runs[0].End.Reason != agentsession.ReasonDone {
 		t.Errorf("run end = %+v", runs[0].End)
 	}
-	if err := s.VerifyRecords(s.Leaf()); err != nil {
-		t.Errorf("verify records: %v", err)
+	namedByTheirResponses(t, s)
+	if n := verifyAll(t, s); n != 2 {
+		t.Errorf("responses = %d, want 2", n)
+	}
+}
+
+// TestUnnamedItemsTakeTheirResponsesID pins the other ways a model call
+// whose stream names no response ends: an OutputGuard stop, whose
+// withheld response_end names the response; a call tried again, whose
+// failed attempt left nothing; and a stream cut off before its terminal
+// event, which never names it, so its items name no response and its
+// failed response carries no request hash, since the record cannot
+// rebuild a request whose output it cannot tell from its input.
+func TestUnnamedItemsTakeTheirResponsesID(t *testing.T) {
+	rule := fmt.Errorf("%w: secret rule", agentturn.ErrGuard)
+	for _, tc := range []struct {
+		name     string
+		cfg      agentturn.Config
+		reason   agentturn.Reason
+		types    string
+		again    bool
+		unhashed int
+	}{{
+		name: "withheld",
+		cfg: agentturn.Config{Model: nameless{&guardedSpeaker{call: true}}, Tools: []agenttool.Tool{upper},
+			OutputGuard: func(_ context.Context, info agentturn.OutputInfo) (*openresponses.Message, error) {
+				if info.Message.Text() == "reply 1" {
+					return nil, rule
+				}
+				return nil, nil
+			}},
+		reason: agentturn.ReasonStopped,
+		types:  "run config item:user item:function_call* response decision item:function_call_output run",
+		again:  true,
+	}, {
+		name: "retried",
+		cfg: agentturn.Config{Model: nameless{flaky{fails: func() *atomic.Int32 { var n atomic.Int32; n.Store(1); return &n }()}},
+			Retry: agentturn.Retry{MaxAttempts: 3, Backoff: func(int, error) time.Duration { return 0 }}},
+		reason: agentturn.ReasonDone,
+		types:  "run config item:user custom item:assistant* response run",
+		again:  true,
+	}, {
+		name:     "cut off",
+		cfg:      agentturn.Config{Model: nameless{&unnamed{cut: true}}, Tools: []agenttool.Tool{upper}},
+		reason:   agentturn.ReasonError,
+		types:    "run config item:user item:function_call response run",
+		unhashed: 1,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.cfg.ModelName = "m"
+			a := agentturn.New(tc.cfg)
+			defer rec.Attach(a)()
+			end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+			if end.Reason != tc.reason {
+				t.Fatalf("end = %+v err=%v", end, err)
+			}
+			if got := entryTypes(s); got != tc.types {
+				t.Errorf("entries = %q, want %q", got, tc.types)
+			}
+			namedByTheirResponses(t, s)
+			if tc.again {
+				if end, err := a.Prompt(context.Background(), openresponses.UserText("again")); err != nil || end.Reason != agentturn.ReasonDone {
+					t.Fatalf("next prompt: end = %+v err=%v", end, err)
+				}
+				namedByTheirResponses(t, s)
+			}
+			verifyAllUnhashed(t, s, tc.unhashed)
+		})
 	}
 }
 

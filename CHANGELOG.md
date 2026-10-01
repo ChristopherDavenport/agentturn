@@ -15,6 +15,22 @@ versions may break the API.
   log on its first writing open, after which agentsession v0.0.15 and
   earlier cannot read it; keep a copy of the store if rolling back may
   be needed.
+- **The recorder names a response's items the stream left unnamed.**
+  A stream that sends no `response.created` or `response.in_progress`,
+  a relay passing on only the output items and the terminal event,
+  delivers its items with an empty `ResponseID`, and the session
+  recorder wrote them with no `response_id`: they read as inputs, and
+  the response's request could not be rebuilt from the record. The
+  recorder now holds such an item while the model call is in flight
+  and writes it, in order, with the response's ID once the stream names
+  it: on a later item event, on the response's `response_end`, a
+  withheld one's included, or on the run's end for a call cut off
+  after naming it. A call cut off before the stream ever named its
+  response still writes its items with no `response_id`, and its
+  failed response now carries no `request_hash` rather than one the
+  record cannot rebuild. `Recorder.EntryOf` is false for a held item
+  until it is written. The `ResponseID` docs on `ItemStart`,
+  `ItemUpdate` and `ItemEnd` say when it is empty.
 - A failed fold reports what its model calls did, as a successful one
   does: `compact.Fold` carries the last attempt's `Request` and
   `ResponseID` when the fold failed too, and gains `OutputTypes`, the

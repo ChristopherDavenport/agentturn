@@ -237,7 +237,9 @@ type ItemStart struct {
 	Turn  int
 	Item  openresponses.Item
 	// ResponseID is the ID of the response streaming the item, and empty
-	// for an item the loop appended itself.
+	// for an item the loop appended itself. It is empty too while the
+	// stream has not named its response, one that sends no
+	// response.created or response.in_progress before its items.
 	ResponseID string
 	// Hidden is set for an item the caller marked with [Hidden]: it is
 	// in the model's context and a renderer should not show it. The
@@ -253,10 +255,12 @@ func (*ItemStart) EventType() string { return EventItemStart }
 // types it would use against a remote server. Item is the accumulated
 // item so far.
 type ItemUpdate struct {
-	RunID      string
-	Turn       int
-	Item       openresponses.Item
-	Stream     openresponses.StreamEvent
+	RunID  string
+	Turn   int
+	Item   openresponses.Item
+	Stream openresponses.StreamEvent
+	// ResponseID is the ID of the response streaming the item, and
+	// empty while the stream has not named its response.
 	ResponseID string
 }
 
@@ -275,7 +279,12 @@ type ItemEnd struct {
 	Turn  int
 	Item  openresponses.Item
 	// ResponseID is the ID of the response that produced the item, and
-	// empty for an item the loop appended itself.
+	// empty for an item the loop appended itself. It is empty too for a
+	// model's item that completed before the stream named its response,
+	// one that sends no response.created or response.in_progress: the
+	// response's ID arrives on its ResponseEnd. The session recorder
+	// holds such an item while the model call is in flight and writes
+	// it, in order, with the response's ID once the response ends.
 	ResponseID string
 	// Hidden is set for an item the caller marked with [Hidden]: it is
 	// in the model's context and a renderer should not show it. A

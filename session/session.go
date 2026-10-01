@@ -663,6 +663,15 @@ type writer struct {
 	pending    string
 	started    time.Time
 	inFlightID string
+	// unnamed holds, in order, the items the call in flight completed
+	// before its stream named the response: a stream that sends no
+	// response.created or response.in_progress names it first on its
+	// terminal event. Entries are append-only, so each is written once
+	// the ID is known, before the entry of the event that brought it:
+	// the next item event that names the response, the response_end,
+	// or the run's end; an item entry without the ID would read as an
+	// input and leave its response's request unrebuildable.
+	unnamed []unnamedItem
 	// items holds the ID of the entry contributing each item of the
 	// agent's working transcript, in order, so a fold's split index
 	// names the first kept entry; values holds the items themselves and
@@ -751,6 +760,13 @@ type writer struct {
 	lastCalls    bool
 	answeredCall bool
 	withheld     bool
+}
+
+// unnamedItem is an item_end of the call in flight that named no
+// response, held until the response is known.
+type unnamedItem struct {
+	item        openresponses.Item
+	modelCallID string
 }
 
 // inboxItem is one input accepted into a queue and not appended yet.
@@ -1688,7 +1704,9 @@ func (r *Recorder) writerByID(ctx context.Context, id string) (*writer, error) {
 // value the loop delivered on item_end, in the session of the run on
 // the context, or the recorder's own when the context names none. It
 // is false for an item the recorder did not write there, which
-// includes an item whose item_end has not reached the recorder yet. A
+// includes an item whose item_end has not reached the recorder yet and
+// a model's item held until the stream names its response (see
+// [agentturn.ItemEnd]), written at the latest with the response. A
 // subscriber that marks a checkpoint asks this rather than reading the
 // session's leaf, which moves with every entry: asked on the item's own
 // item_end it needs to run after the recorder, and asked on any later
@@ -1854,6 +1872,7 @@ func (w *writer) reset() {
 	w.wroteConfig = false
 	w.settleReq = nil
 	w.inFlight, w.pending, w.started, w.inFlightID = false, "", time.Time{}, ""
+	w.unnamed = nil
 	w.items, w.values, w.custom = nil, nil, nil
 	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = false, 0, nil, nil
 	w.calls = map[string]*callRecord{}
@@ -2305,6 +2324,9 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 		// model, which opens its reasoning item before anything else.
 		if id := streamedResponseID(ev); id != "" {
 			w.inFlightID = id
+			if _, err := w.name(ctx, id); err != nil {
+				return err
+			}
 		}
 	}
 	switch e := ev.(type) {
@@ -2320,6 +2342,14 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 		source, err := sessionTrigger(e.Trigger)
 		if err != nil {
 			return err
+		}
+		if w.inFlight && e.ResponseID == "" && !e.Hidden && source == nil {
+			// The loop appends nothing of its own while a model call
+			// is in flight, so this is the model's, from a stream that
+			// has not named its response yet: it is written once it
+			// has.
+			w.unnamed = append(w.unnamed, unnamedItem{item: e.Item, modelCallID: e.ModelCallID})
+			return nil
 		}
 		return w.item(ctx, e.Item, e.ResponseID, e.Hidden, source, e.ModelCallID)
 	case *agentturn.ResponseEnd:
@@ -2684,6 +2714,12 @@ func (w *writer) retry(ctx context.Context, e *agentturn.ModelRetry) error {
 	if err != nil {
 		return fmt.Errorf("session: encode model retry: %w", err)
 	}
+	// The loop appends nothing of an attempt it tries again, so this
+	// holds nothing; should it, the items are written as a failed
+	// attempt's are, before the record of its retry.
+	if _, err := w.name(ctx, w.inFlightID); err != nil {
+		return err
+	}
 	// The settle held for the failed attempt stays held: the attempt
 	// that follows replaces it, and only the one that answers is
 	// configured on the path.
@@ -2707,6 +2743,21 @@ func (w *writer) flush(ctx context.Context) error {
 	req := *w.settleReq
 	w.settleReq = nil
 	return w.settle(ctx, req)
+}
+
+// name writes the items held for the call in flight, in order, with
+// responseID, and reports whether it wrote any. An empty responseID
+// writes them as the stream left them, naming no response: a call that
+// ended without ever naming its response.
+func (w *writer) name(ctx context.Context, responseID string) (bool, error) {
+	held := w.unnamed
+	w.unnamed = nil
+	for _, h := range held {
+		if err := w.item(ctx, h.item, responseID, false, nil, h.modelCallID); err != nil {
+			return true, err
+		}
+	}
+	return len(held) > 0, nil
 }
 
 // hash returns the request's hash when its input is what the stored
@@ -3280,6 +3331,13 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 	if resp == nil {
 		return errors.New("session: response_end without a response")
 	}
+	// The items the stream completed before it named the response are
+	// its output, written with its ID before it, the withheld
+	// response's included.
+	unnamed, err := w.name(ctx, resp.ID)
+	if err != nil {
+		return err
+	}
 	entry := &agentsession.ResponseEntry{
 		ResponseID:  resp.ID,
 		Model:       resp.Model,
@@ -3290,6 +3348,12 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 		RequestHash: w.pending,
 		LatencyMS:   w.latency(),
 		Attempts:    w.attempts(),
+	}
+	if unnamed && resp.ID == "" {
+		// A response that never named itself has no output on the
+		// path, so the items just written read as its input, and the
+		// record cannot rebuild its request.
+		entry.RequestHash = ""
 	}
 	w.inFlight, w.pending, w.started, w.inFlightID, w.retries = false, "", time.Time{}, "", 0
 	w.responses++
@@ -3304,7 +3368,7 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 	if e.Withheld {
 		w.lastCalls = false
 	}
-	_, err := w.append(ctx, entry)
+	_, err = w.append(ctx, entry)
 	return err
 }
 
@@ -3347,9 +3411,21 @@ func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
 func (w *writer) endInFlight(ctx context.Context, cause error) error {
 	hash, inFlight, responseID := w.pending, w.inFlight, w.inFlightID
 	latency, attempts := w.latency(), w.attempts()
+	// The items the call completed before it was cut off go first, as
+	// its output, named by the response the stream named, if any.
+	unnamed, err := w.name(ctx, responseID)
 	w.inFlight, w.pending, w.started, w.inFlightID, w.retries = false, "", time.Time{}, "", 0
+	if err != nil {
+		return err
+	}
 	if !inFlight {
 		return nil
+	}
+	if unnamed && responseID == "" {
+		// Cut off before the stream named its response: the items
+		// read as its input, and the record cannot rebuild its
+		// request.
+		hash = ""
 	}
 	w.responses++
 	w.lastCalls = false
@@ -3361,7 +3437,7 @@ func (w *writer) endInFlight(ctx context.Context, cause error) error {
 		LatencyMS:   latency,
 		Attempts:    attempts,
 	}
-	_, err := w.append(ctx, entry)
+	_, err = w.append(ctx, entry)
 	return err
 }
 
