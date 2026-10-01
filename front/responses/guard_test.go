@@ -155,9 +155,10 @@ func TestRelayReplacementIsWellFormed(t *testing.T) {
 	}
 }
 
-// TestGuardStopBeforeAnswerIsARefusal pins #138 and #164: a full run a
-// guard stopped before the model answered, whichever hook the guard is
-// on, and a single turn BeforeModelCall refused as a guard, end the
+// TestGuardStopBeforeAnswerIsARefusal pins #138, #164 and #181: a full
+// run a guard stopped before the model answered, whichever hook the
+// guard is on, OutputGuard included, and a single turn BeforeModelCall
+// or OutputGuard refused as a guard, end the
 // response incomplete with reason content_filter over HTTP, collected
 // and streamed, and the guard's reason reaches the caller in no form.
 // A run a guard stopped after the answer completes with it, or with the
@@ -174,6 +175,7 @@ func TestGuardStopBeforeAnswerIsARefusal(t *testing.T) {
 		return nil
 	}
 	afterTurn := func(context.Context, agentturn.TurnInfo) (bool, error) { return false, refuse }
+	withhold := func(context.Context, agentturn.OutputInfo) (*openresponses.Message, error) { return nil, refuse }
 	lookup := agenttool.New("lookup", "", func(context.Context, agenttool.NoArgs) (string, error) { return "found", nil })
 	callerTool := openresponses.NewFunctionTool("remote", "caller owned", json.RawMessage(`{"type":"object"}`))
 	for _, tc := range []struct {
@@ -199,6 +201,8 @@ func TestGuardStopBeforeAnswerIsARefusal(t *testing.T) {
 		}}, false, ""},
 		{"before model call 2, after a preamble", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, BeforeModelCall: onToolOutput}, false, ""},
 		{"after a turn that called tools", agentturn.Config{Model: preamble{}, Tools: []agenttool.Tool{lookup}, ShouldStopAfterTurn: afterTurn}, false, ""},
+		{"output guard", agentturn.Config{OutputGuard: withhold}, false, ""},
+		{"output guard, single turn", agentturn.Config{Model: answering{}, OutputGuard: withhold}, true, ""},
 		{"after the answer", agentturn.Config{ShouldStopAfterTurn: afterTurn}, false, "solve x"},
 		{"after the answer, withheld", agentturn.Config{ShouldStopAfterTurn: afterTurn, OutputGuard: func(context.Context, agentturn.OutputInfo) (*openresponses.Message, error) {
 			return openresponses.AssistantText("[withheld]"), nil
@@ -231,6 +235,10 @@ func TestGuardStopBeforeAnswerIsARefusal(t *testing.T) {
 			if tc.want == "" {
 				if resp.Status != openresponses.ResponseStatusIncomplete || resp.IncompleteDetails == nil || resp.IncompleteDetails.Reason != openresponses.IncompleteReasonContentFilter {
 					t.Errorf("collected = %s %+v, want incomplete content_filter", resp.Status, resp.IncompleteDetails)
+				}
+				// A message OutputGuard withheld keeps its place, emptied.
+				if strings.Contains(resp.OutputText(), "solve x") {
+					t.Errorf("collected output holds the refused answer: %q", resp.OutputText())
 				}
 			} else if resp.Status != openresponses.ResponseStatusCompleted || resp.OutputText() != tc.want {
 				t.Errorf("collected = %s %q, want completed %q", resp.Status, resp.OutputText(), tc.want)
@@ -269,6 +277,15 @@ func post(t *testing.T, base string, req openresponses.Request) (int, string) {
 		t.Fatal(err)
 	}
 	return res.StatusCode, string(out)
+}
+
+// answering is the echo model offered no tools, so it answers in text
+// whatever the caller declares.
+type answering struct{}
+
+func (answering) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	req.Tools = nil
+	return (&echo.Adapter{}).CreateStream(ctx, req, sink)
 }
 
 // preamble says something and calls the first tool it is offered, then

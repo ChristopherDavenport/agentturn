@@ -206,6 +206,20 @@ func (r *relay) end(item openresponses.Item) error {
 	}
 }
 
+// refuse ends the response incomplete with reason content_filter, the
+// refusal of a guard. A message still open is one OutputGuard withheld
+// after its deltas went out; it is emptied first, so its done events
+// and the response carry none of its text.
+func (r *relay) refuse() error {
+	if r.msg != nil {
+		if err := r.replace(&openresponses.Message{Role: openresponses.RoleAssistant}); err != nil {
+			return err
+		}
+	}
+	r.reset()
+	return r.em.Incomplete(openresponses.IncompleteReasonContentFilter)
+}
+
 // replace puts the content of v in the open message in place of what
 // was streamed, keeping the stream well formed: every part streamed
 // keeps its index and is emptied, the part still open takes the

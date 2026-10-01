@@ -43,10 +43,14 @@
 // streamed, as a single turn does when BeforeModelCall refuses it with
 // an error wrapping agentturn.ErrGuard. That holds whichever hook the
 // guard is on: BeforeTurn or BeforeModelCall, on the first turn or on a
-// later one after text that preceded a call, and ShouldStopAfterTurn
-// after a turn that only called tools. The refused turn adds nothing
-// to the output; what was streamed before the guard stopped the run
-// stays, since a stream cannot take it back. The guard's error reaches
+// later one after text that preceded a call, ShouldStopAfterTurn after
+// a turn that only called tools, and OutputGuard on the message it
+// withholds, in a full run or a single turn. The refused turn adds
+// nothing to the output but the message OutputGuard withheld, which
+// keeps its place emptied, since its output_item.added and deltas have
+// gone out: its done events and the response carry no text. What was
+// streamed before the guard stopped the run stays, since a stream
+// cannot take it back. The guard's error reaches
 // the caller in no form, since its text may carry the rule a caller
 // could phrase around; the host has it on RunEnd.Err and in the
 // record. A run a guard stopped after an answer completes with that
@@ -59,12 +63,18 @@
 // within the same response: the receiver's items are relayed as the
 // sender's were, usage sums both, and the receiver's answer is the
 // response's. A receiver that hands off again is asked about in turn,
-// with nothing counting the handoffs but the function. Without the
+// with nothing counting the handoffs but the function. The receiver's
+// run carries an agentturn.Trigger of kind "handoff" naming the
+// sender. Without the
 // option, or when it declines, a terminating stop with no answer
 // completes with the text of the last output of a call whose result
 // set Terminate as an assistant message, the answer the tools gave on
 // the model's behalf; a sibling's output, or a blocked or failed
 // call's, is not taken for it.
+//
+// The adapter keeps nothing between requests, so the conversation's
+// next request starts under the adapter's configuration again, the
+// sender's, unless [WithStart] picks another from the input.
 package responses
 
 import (
@@ -83,6 +93,7 @@ type Adapter struct {
 	requestInstructions bool
 	toolItems           bool
 	handoff             func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool)
+	start               func(context.Context, agentturn.Transcript) (agentturn.Config, bool)
 }
 
 var _ openresponses.Adapter = (*Adapter)(nil)
@@ -117,8 +128,47 @@ func WithToolItems() Option {
 // agents that hand back and forth runs until fn declines or the
 // request's context ends; a host that wants a bound counts on a value
 // it puts on that context.
+//
+// The receiver's run is continued under
+// agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff",
+// Ref: sender.Name}), the sender being the configuration whose run
+// stopped, so the receiver's BeforeTurn context and its run_start say
+// why it ran, as they do for a host that continues the receiver in
+// process.
+//
+// The handoff lasts for the response. The caller's next request is
+// started by [WithStart], or under the adapter's own configuration
+// without it.
 func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*agentturn.ToolEnd) (agentturn.Config, bool)) Option {
 	return func(a *Adapter) { a.handoff = fn }
+}
+
+// WithStart picks the configuration a request starts under from the
+// conversation, the request's input with the message that opens it
+// last. A configuration it returns is used in place of the adapter's,
+// in both modes and under the request's model and instructions as the
+// adapter's own is; false keeps the adapter's. It is how the receiver
+// of a handoff answers the conversation's later requests: the adapter
+// keeps no state between requests, so the conversation says who has
+// it.
+//
+// The handoff is found in the input only when the caller sends back
+// what the response held, and the transfer call is in a response only
+// under [WithToolItems]. A host whose handoff tools are named for
+// their destination finds the last one:
+//
+//	responses.WithStart(func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
+//		for i := len(t) - 1; i >= 0; i-- {
+//			if call, ok := t[i].(*openresponses.FunctionCall); ok {
+//				if cfg, ok := agents[strings.TrimPrefix(call.Name, "transfer_to_")]; ok {
+//					return cfg, true
+//				}
+//			}
+//		}
+//		return agentturn.Config{}, false
+//	})
+func WithStart(fn func(ctx context.Context, t agentturn.Transcript) (agentturn.Config, bool)) Option {
+	return func(a *Adapter) { a.start = fn }
 }
 
 // New builds an adapter over cfg.
@@ -153,9 +203,6 @@ func (a *Adapter) Compact(ctx context.Context, req openresponses.CompactRequest)
 
 // CreateStream streams the response for req into sink.
 func (a *Adapter) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
-	if a.cfg.Model == nil {
-		return openresponses.ServerError("no_model", "agent has no model")
-	}
 	if req.PreviousResponseID != "" {
 		return openresponses.PreviousResponseNotFound(req.PreviousResponseID)
 	}
@@ -163,29 +210,40 @@ func (a *Adapter) CreateStream(ctx context.Context, req openresponses.Request, s
 	if !agentturn.CanContinue(transcript) {
 		return openresponses.InvalidRequest(openresponses.CodeInvalidValue, "input must end with a user message or a function_call_output", "input")
 	}
+	base := a.cfg
+	if a.start != nil {
+		if cfg, ok := a.start(ctx, append(agentturn.Transcript(nil), transcript...)); ok {
+			base = cfg
+		}
+	}
+	if base.Model == nil {
+		return openresponses.ServerError("no_model", "agent has no model")
+	}
 	callerTools := functionTools(req.Tools)
 	resp := openresponses.NewResponse(req)
-	resp.Model = a.model(req.Model)
-	if a.cfg.Instructions != "" {
-		instructions := a.instructions(req.Instructions)
+	resp.Model = modelName(base, req.Model)
+	if base.Instructions != "" {
+		instructions := a.instructionsFor(base, req.Instructions)
 		resp.Instructions = &instructions
 	}
 	rl := newRelay(sink, resp)
 	if len(callerTools) > 0 {
-		return a.oneTurn(ctx, req, transcript, callerTools, rl)
+		return a.oneTurn(ctx, base, req, transcript, callerTools, rl)
 	}
-	return a.fullRun(ctx, req, transcript, rl)
+	return a.fullRun(ctx, base, req, transcript, rl)
 }
 
-// fullRun lets the agent execute its own tools until it answers.
-func (a *Adapter) fullRun(ctx context.Context, req openresponses.Request, transcript agentturn.Transcript, rl *relay) error {
-	cfg := a.perRequest(a.cfg, req)
+// fullRun lets the agent execute its own tools until it answers,
+// starting under base.
+func (a *Adapter) fullRun(ctx context.Context, base agentturn.Config, req openresponses.Request, transcript agentturn.Transcript, rl *relay) error {
+	cfg := a.perRequest(base, req)
+	runCtx := ctx
 	var usage openresponses.Usage
 	var end *agentturn.RunEnd
 	var results []*agentturn.ToolEnd
 	for {
 		var err error
-		if end, results, err = a.relayRun(ctx, transcript, cfg, rl, &usage); err != nil {
+		if end, results, err = a.relayRun(runCtx, transcript, cfg, rl, &usage); err != nil {
 			return err
 		}
 		next, ok := a.handsOff(ctx, end, results)
@@ -193,6 +251,7 @@ func (a *Adapter) fullRun(ctx context.Context, req openresponses.Request, transc
 			break
 		}
 		transcript = append(transcript, end.Items...)
+		runCtx = agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff", Ref: cfg.Name})
 		cfg = a.perRequest(next, req)
 	}
 	switch end.Reason {
@@ -214,7 +273,7 @@ func (a *Adapter) fullRun(ctx context.Context, req openresponses.Request, transc
 		// completes with what the caller is to see.
 		if _, ok := end.Answer(); end.Cause == agentturn.StopGuard && !ok {
 			rl.em.Response().Usage = &usage
-			return rl.em.Incomplete(openresponses.IncompleteReasonContentFilter)
+			return rl.refuse()
 		}
 		// A terminating result nobody handed off from answered on the
 		// model's behalf. Its text is the answer, as tools/agent has
@@ -331,15 +390,13 @@ func terminatingText(items agentturn.Transcript, results []*agentturn.ToolEnd) (
 	return "", false
 }
 
-// oneTurn calls the model once with the agent's and the caller's tools
-// and re-emits the response; calls are the caller's to run. The request
-// is the same one the loop would send, Config.BaseRequest over the
-// per-request model and instructions, so every Config.Request member
-// reaches the model in both modes.
-func (a *Adapter) oneTurn(ctx context.Context, req openresponses.Request, transcript agentturn.Transcript, callerTools []*openresponses.FunctionTool, rl *relay) error {
-	cfg := a.cfg
-	cfg.ModelName = a.model(req.Model)
-	cfg.Instructions = a.instructions(req.Instructions)
+// oneTurn calls the model of cfg once with the agent's and the
+// caller's tools and re-emits the response; calls are the caller's to
+// run. The request is the same one the loop would send,
+// Config.BaseRequest over the per-request model and instructions, so
+// every Config.Request member reaches the model in both modes.
+func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openresponses.Request, transcript agentturn.Transcript, callerTools []*openresponses.FunctionTool, rl *relay) error {
+	cfg = a.perRequest(cfg, req)
 	if cfg.Reasoning.IsZero() {
 		cfg.Reasoning = req.Reasoning
 	}
@@ -379,14 +436,14 @@ func (a *Adapter) oneTurn(ctx context.Context, req openresponses.Request, transc
 	if cfg.BeforeModelCall != nil {
 		if err := cfg.BeforeModelCall(ctx, &upstream); err != nil {
 			if errors.Is(err, agentturn.ErrGuard) {
-				return rl.em.Incomplete(openresponses.IncompleteReasonContentFilter)
+				return rl.refuse()
 			}
 			return fmt.Errorf("before-model-call hook: %w", err)
 		}
 	}
 	var acc openresponses.Accumulator
 	var final *openresponses.Response
-	for ev, err := range openresponses.Events(ctx, a.cfg.Model, upstream) {
+	for ev, err := range openresponses.Events(ctx, cfg.Model, upstream) {
 		if err != nil {
 			return err
 		}
@@ -404,6 +461,11 @@ func (a *Adapter) oneTurn(ctx context.Context, req openresponses.Request, transc
 				out := acc.Response()
 				replacement, err := cfg.OutputGuard(ctx, agentturn.OutputInfo{Turn: 1, ResponseID: out.ID, Message: m, Output: append(openresponses.Items(nil), out.Output[:e.OutputIndex]...)})
 				if err != nil {
+					if errors.Is(err, agentturn.ErrGuard) {
+						// Withheld and refused, as a full run's guard
+						// stop is; the rest of the stream is not read.
+						return rl.refuse()
+					}
 					return fmt.Errorf("output guard: %w", err)
 				}
 				if replacement != nil {

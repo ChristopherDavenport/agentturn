@@ -34,6 +34,43 @@ versions may break the API.
   budget, set before `WithRequest` runs so a caller can change or
   clear it, so a runaway summary is cut by the server rather than paid
   for. (#178)
+- **An `OutputGuard` error wrapping `ErrGuard` is a guard stop.** The
+  message the guard was given is not appended and has no `item_end`,
+  and the run ends `ReasonStopped` with `StopGuard` and the error on
+  `RunEnd.Err`, as from the other three guard hooks. It failed the
+  run, so `front/responses` answered with `server_error` carrying the
+  guard's text and `front/a2a` failed the task with it. Both fronts now
+  refuse: `front/responses` ends the response incomplete with
+  `content_filter`, in a full run and in a single turn, and empties the
+  withheld message, whose deltas had gone out, so its done events and
+  the response hold none of its text; `front/a2a` rejects the task
+  with `RefusedText`. Any other `OutputGuard` error still fails the
+  run. `StopGuard`, `ErrGuard`, `OutputGuard` and `ChainOutputGuard`
+  say so (#181).
+- **`front/a2a` keeps withheld text out of a task's artifacts.** Under
+  a configuration with an `OutputGuard` the executor writes a message's
+  artifact whole at `item_end`, from the message the guard left, rather
+  than streaming its deltas. A task keeps its artifacts, so the text a
+  guard replaced was returned by every `tasks/get` for as long as the
+  task was stored. Without an `OutputGuard` the text streams as before
+  (#179).
+- **The receiver's run after a handoff names it.** Both fronts
+  continue the configuration `WithHandoff` returns under
+  `agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff",
+  Ref: <the sender's Config.Name>})`, so the receiver's `BeforeTurn`
+  context and its `run_start`, and so the record, say why it ran, as
+  for a host that continues the receiver in process. Under a front it
+  read like a user input (#182).
+- **`WithStart` in `front/responses` and `front/a2a`** picks the
+  configuration a request or a task starts under from the conversation
+  so far, the new message last; false keeps the front's own. A handoff
+  lasted only for the request or task that made it, and the
+  conversation's next message went back to the sender, which saw a
+  conversation it had handed off and handed it off again. Neither
+  front keeps state between requests: the host finds the last handoff
+  in the transcript, which `front/a2a`'s store holds and which
+  `front/responses`' caller sends back when the adapter is built with
+  `WithToolItems` (#180).
 
 ## v0.0.12 - 2026-09-29
 

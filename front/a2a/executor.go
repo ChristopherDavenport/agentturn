@@ -25,6 +25,7 @@ type Executor struct {
 	callerTools []*openresponses.FunctionTool
 	recorderFor RecorderFor
 	handoff     func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool)
+	start       func(context.Context, agentturn.Transcript) (agentturn.Config, bool)
 
 	mu      sync.Mutex
 	cancels map[a2a.TaskID]context.CancelFunc
@@ -128,17 +129,54 @@ func WithRecorderFor(fn RecorderFor) Option {
 // tool_end events of the batch that stopped it, in completion order,
 // calls a tool made with agentturn.Invoke left out: the destination is
 // in a result's Details, which the model never sees, or in end.Items,
-// the terminating call and its output. It is asked again each time a run it started stops the same way, so a pair of agents
-// that hand back and forth runs until fn declines or the task is
-// canceled; a host that wants a bound counts on a value it puts on the
-// context RecorderFor returns, which fn is given.
+// the terminating call and its output. It is asked again each time a
+// run it started stops the same way, so a pair of agents that hand
+// back and forth runs until fn declines or the task is canceled; a
+// host that wants a bound counts on a value it puts on the context
+// RecorderFor returns, which fn is given.
+//
+// The receiver's run is continued under
+// agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff",
+// Ref: sender.Name}), the sender being the configuration whose run
+// stopped, so the receiver's BeforeTurn context and its run_start, and
+// so the record, say why it ran, as they do for a host that continues
+// the receiver in process.
 //
 // Without the option, or when it declines, a terminating stop with no
 // answer completes the task with the text of the last output of a
 // call whose result set Terminate, as tools/agent reports the same
 // stop.
+//
+// The handoff lasts for the task. The conversation's next task is
+// started by [WithStart], or under the executor's own configuration
+// without it.
 func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*agentturn.ToolEnd) (agentturn.Config, bool)) Option {
 	return func(e *Executor) { e.handoff = fn }
+}
+
+// WithStart picks the configuration a task starts under from the
+// conversation: the transcript the [ConversationStore] holds for the
+// task's context ID with the message's items after it. A configuration
+// it returns is used in place of the executor's, with the caller-owned
+// tools offered under it as under the executor's own; false keeps the
+// executor's. It is how the receiver of a handoff answers the
+// conversation's later messages. The executor keeps no configuration
+// between tasks, so the conversation, which holds the transfer call
+// and its output, says who has it. A host whose handoff tools are
+// named for their destination finds the last one:
+//
+//	a2a.WithStart(func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
+//		for i := len(t) - 1; i >= 0; i-- {
+//			if call, ok := t[i].(*openresponses.FunctionCall); ok {
+//				if cfg, ok := agents[strings.TrimPrefix(call.Name, "transfer_to_")]; ok {
+//					return cfg, true
+//				}
+//			}
+//		}
+//		return agentturn.Config{}, false
+//	})
+func WithStart(fn func(ctx context.Context, t agentturn.Transcript) (agentturn.Config, bool)) Option {
+	return func(e *Executor) { e.start = fn }
 }
 
 // New builds an executor for cfg.
@@ -199,7 +237,13 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	runCtx, cancel := context.WithCancel(ctx)
 	defer e.track(reqCtx.TaskID, cancel)()
 	caller := slices.Concat(e.callerTools, declared)
-	agent := agentturn.New(e.runConfig(e.cfg, caller), agentturn.WithTranscript(transcript))
+	start := e.cfg
+	if e.start != nil {
+		if cfg, ok := e.start(runCtx, slices.Concat(transcript, prompts)); ok {
+			start = cfg
+		}
+	}
+	agent := agentturn.New(e.runConfig(start, caller), agentturn.WithTranscript(transcript))
 	if e.recorderFor != nil {
 		rctx, detach, err := e.recorderFor(runCtx, reqCtx.ContextID, agent)
 		if detach != nil {
@@ -282,12 +326,18 @@ type outcome struct {
 
 // relay prompts the agent and streams assistant text into artifacts
 // from a subscriber, after whatever RecorderFor subscribed, and
-// continues it under each configuration WithHandoff returns. A failed
-// write aborts the run through cancel and is reported on the outcome;
-// the run's own end and error are reported alongside.
+// continues it under each configuration WithHandoff returns. Under a
+// configuration with an OutputGuard a message's artifact is written
+// whole from its item_end, the guard's replacement, so text the guard
+// withheld never enters the task's artifacts. A failed write aborts
+// the run through cancel and is reported on the outcome; the run's
+// own end and error are reported alongside.
 func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc, reqCtx *a2asrv.RequestContext, q eventqueue.Queue, agent *agentturn.Agent, prompts openresponses.Items, caller []*openresponses.FunctionTool) outcome {
 	var out outcome
 	var writer *artifactWriter
+	// guarded says the configuration running has an OutputGuard, whose
+	// item_end may carry other text than its deltas did.
+	guarded := agent.Config().OutputGuard != nil
 	fail := func(err error) {
 		if out.writeErr == nil {
 			out.writeErr = err
@@ -307,7 +357,7 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 				writer = newArtifactWriter(q, reqCtx, e.chunkSize)
 			}
 		case *agentturn.ItemUpdate:
-			if writer == nil {
+			if writer == nil || guarded {
 				return nil
 			}
 			var delta string
@@ -325,6 +375,11 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 		case *agentturn.ItemEnd:
 			if m, ok := ev.Item.(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant && writer != nil {
 				out.lastText = m.Text()
+				if guarded {
+					if err := writer.write(ctx, messageText(m)); err != nil {
+						fail(err)
+					}
+				}
 				if err := writer.close(ctx); err != nil {
 					fail(err)
 				}
@@ -359,11 +414,27 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 			cfg.ToolElicitor = prev.ToolElicitor
 		}
 		if err = agent.SetConfig(cfg); err == nil {
-			end, err = agent.Continue(runCtx)
+			guarded = cfg.OutputGuard != nil
+			end, err = agent.Continue(agentturn.ContextWithTrigger(runCtx, agentturn.Trigger{Kind: "handoff", Ref: prev.Name}))
 		} else {
 			end = nil
 		}
 	}
+}
+
+// messageText returns the text and refusal parts of m in order, what
+// its deltas carry when they carry the message whole.
+func messageText(m *openresponses.Message) string {
+	var b strings.Builder
+	for _, part := range m.Content {
+		switch p := part.(type) {
+		case *openresponses.OutputText:
+			b.WriteString(p.Text)
+		case *openresponses.Refusal:
+			b.WriteString(p.Refusal)
+		}
+	}
+	return b.String()
 }
 
 // terminated reports whether a terminating tool result stopped the run.
