@@ -97,6 +97,15 @@ versions may break the API.
   middle of the history (agentsession#56). An empty `ModelName` names
   no model, so nothing changes for a host that sets none. (#91)
 
+- **A fold no longer keeps a function call output while folding its
+  call when another item sits between them.** The split used to move
+  back only while the first kept item was an output, so an extension
+  item an adapter emits after a call, such as a text-call parser's raw
+  item, let the call be folded and its output sent alone, which a
+  Responses or Chat Completions server rejects. The split now moves
+  back to the call of every output the kept tail holds, wherever in
+  the tail it is (#201).
+
 ## v0.0.14 - 2026-10-01
 
 - **`compact.WithOnFold` adds a callback rather than replacing the

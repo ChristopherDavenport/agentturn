@@ -645,18 +645,28 @@ func (t *Transform) join(items agentturn.Transcript, n int) agentturn.Transcript
 }
 
 // split returns the index where the kept tail starts: keepLast items
-// from the end, moved earlier so the tail never opens with a function
-// call output whose call would be left behind.
+// from the end, moved earlier so the tail holds no function call output
+// whose call would be left behind, wherever in the tail the output is.
+// An item between a call and its output, such as an extension item an
+// adapter emits after the call, does not separate them.
 func (t *Transform) split(items agentturn.Transcript) int {
-	split := len(items) - t.keepLast
-	if split < 0 {
-		split = 0
-	}
-	for split > 0 {
-		if _, ok := items[split].(*openresponses.FunctionCallOutput); !ok {
-			break
+	split := max(len(items)-t.keepLast, 0)
+	calls := map[string]int{}
+	for i, item := range items[:split] {
+		if c, ok := item.(*openresponses.FunctionCall); ok {
+			if _, seen := calls[c.CallID]; !seen {
+				calls[c.CallID] = i
+			}
 		}
-		split--
+	}
+	// Walking back from the end, every output met is in the tail, the
+	// ones a move of the split brought into it included.
+	for i := len(items) - 1; i >= split; i-- {
+		if o, ok := items[i].(*openresponses.FunctionCallOutput); ok {
+			if at, ok := calls[o.CallID]; ok && at < split {
+				split = at
+			}
+		}
 	}
 	return split
 }

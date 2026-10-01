@@ -2,6 +2,7 @@ package compact
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
 	"strings"
@@ -142,19 +143,39 @@ func TestTransformError(t *testing.T) {
 }
 
 func TestSplitKeepsCallsWithOutputs(t *testing.T) {
-	tr := New(&echo.Adapter{}, WithKeepLast(3))
+	call := func(id string) openresponses.Item {
+		return &openresponses.FunctionCall{CallID: id, Name: "f", Arguments: "{}"}
+	}
+	output := func(id string) openresponses.Item { return openresponses.NewFunctionCallOutput(id, "o") }
+	ext := &openresponses.UnknownItem{Type: "x:ext", Raw: json.RawMessage(`{"type":"x:ext"}`)}
 	transcript := agentturn.Transcript{
 		openresponses.UserText("u"),
-		&openresponses.FunctionCall{CallID: "c", Name: "f", Arguments: "{}"},
-		openresponses.NewFunctionCallOutput("c", "o"),
+		call("c"),
+		output("c"),
 		openresponses.AssistantText("a"),
 		openresponses.UserText("u2"),
 	}
-	if got := tr.split(transcript); got != 1 {
-		t.Errorf("split = %d, want 1", got)
+	cases := []struct {
+		name     string
+		items    agentturn.Transcript
+		keepLast int
+		want     int
+	}{
+		{"the tail opens with an output", transcript, 3, 1},
+		{"keepLast past the start", transcript, 10, 0},
+		{"no output in the tail", transcript, 2, 3},
+		{"an item between the call and its output", agentturn.Transcript{openresponses.UserText("u"), call("c"), ext, output("c")}, 2, 1},
+		{"an output deeper in the tail", agentturn.Transcript{openresponses.UserText("u"), call("c"), ext, ext, output("c"), openresponses.AssistantText("a")}, 3, 1},
+		{"parallel calls, the first one's output last", agentturn.Transcript{openresponses.UserText("u"), call("a"), call("b"), output("b"), ext, output("a")}, 3, 1},
+		{"a move brings in an output of an earlier call", agentturn.Transcript{openresponses.UserText("u"), call("a"), openresponses.AssistantText("a"), call("b"), output("a"), ext, output("b")}, 1, 1},
+		{"an output whose call is not in the transcript", agentturn.Transcript{openresponses.UserText("u"), ext, output("gone")}, 1, 2},
 	}
-	if got := New(&echo.Adapter{}, WithKeepLast(10)).split(transcript); got != 0 {
-		t.Errorf("split with large keepLast = %d", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := New(&echo.Adapter{}, WithKeepLast(tc.keepLast)).split(tc.items); got != tc.want {
+				t.Errorf("split = %d, want %d", got, tc.want)
+			}
+		})
 	}
 	// Nothing older than the kept tail: no compaction, no call.
 	c := &counting{Compactor: &echo.Adapter{}}
