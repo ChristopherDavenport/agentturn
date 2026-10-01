@@ -228,3 +228,110 @@ func TestHandoffs(t *testing.T) {
 		})
 	}
 }
+
+// thinksThenTransfers answers a user message with a reasoning item
+// signed for the requested model and a call to its first tool, and
+// echoes a function_call_output.
+type thinksThenTransfers struct{}
+
+func (thinksThenTransfers) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	if _, ok := req.Input[len(req.Input)-1].(*openresponses.FunctionCallOutput); ok {
+		return (&echo.Adapter{}).CreateStream(ctx, req, sink)
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if err := em.Item(&openresponses.ReasoningItem{Summary: openresponses.Contents{}, EncryptedContent: "sig:" + req.Model}); err != nil {
+		return err
+	}
+	w, err := em.FunctionCall("", req.Tools[0].(*openresponses.FunctionTool).Name)
+	if err != nil {
+		return err
+	}
+	if err := w.Arguments(`{}`); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// reasoningSigs lists the encrypted content of the reasoning items in
+// items.
+func reasoningSigs(items openresponses.Items) []string {
+	sigs := []string{}
+	for _, item := range items {
+		if r, ok := item.(*openresponses.ReasoningItem); ok {
+			sigs = append(sigs, r.EncryptedContent)
+		}
+	}
+	return sigs
+}
+
+// TestReasoningAcrossHandoff pins #91: the receiver of a handoff on
+// another model is sent none of the sender's reasoning items, within
+// the response that handed off and, under WithTransfers, in the
+// conversation's next request, in both modes; a receiver on the same
+// model is sent them, as is one WithStart alone starts, which cannot
+// tell where the input's reasoning came from.
+func TestReasoningAcrossHandoff(t *testing.T) {
+	route := func(cfg agentturn.Config) Route {
+		return func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+			return cfg, "transferred", call.Name == "transfer_to_billing"
+		}
+	}
+	for _, tc := range []struct {
+		name      string
+		billing   string // billing's ModelName
+		start     string // "transfers", "start" or ""
+		caller    bool   // the next request carries a caller tool: one turn
+		handedOff []string
+		next      []string
+	}{
+		{"another model", "other-2", "transfers", false, []string{}, []string{}},
+		{"another model, one turn", "other-2", "transfers", true, []string{}, []string{}},
+		{"same model", "reasoner-1", "transfers", false, []string{"sig:reasoner-1"}, []string{"sig:reasoner-1"}},
+		{"WithStart alone", "other-2", "start", false, []string{}, []string{"sig:reasoner-1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var seen [][]string
+			billing := agentturn.Config{Name: "billing", Model: &echo.Adapter{}, ModelName: tc.billing, BeforeModelCall: func(_ context.Context, req *openresponses.Request) error {
+				seen = append(seen, reasoningSigs(req.Input))
+				return nil
+			}}
+			opts := []Option{WithToolItems(), WithHandoff(func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool) {
+				return billing, true
+			})}
+			switch tc.start {
+			case "transfers":
+				opts = append(opts, WithTransfers(route(billing)))
+			case "start":
+				opts = append(opts, WithStart(func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
+					return HandedTo(t, route(billing))
+				}))
+			}
+			a := New(agentturn.Config{Name: "triage", Model: thinksThenTransfers{}, ModelName: "reasoner-1", Tools: []agenttool.Tool{transfer}}, opts...)
+			first := request(openresponses.UserText("I was double charged"))
+			sink, err := streamtest.Run(context.Background(), a, first)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(seen) != 1 || !reflect.DeepEqual(seen[0], tc.handedOff) {
+				t.Fatalf("billing's request in the response that handed off carried %v, want %v", seen, tc.handedOff)
+			}
+			if got := reasoningSigs(sink.Response().Output); !reflect.DeepEqual(got, []string{"sig:reasoner-1"}) {
+				t.Errorf("response output's reasoning = %v, want the sender's", got)
+			}
+			seen = nil
+			next := request(append(append(first.Input, sink.Response().Output...), openresponses.UserText("when is the refund"))...)
+			if tc.caller {
+				next.Tools = openresponses.Tools{openresponses.NewFunctionTool("remote", "caller side", json.RawMessage(`{"type":"object"}`))}
+			}
+			if _, err := streamtest.Run(context.Background(), a, next); err != nil {
+				t.Fatal(err)
+			}
+			if len(seen) != 1 || !reflect.DeepEqual(seen[0], tc.next) {
+				t.Errorf("billing's request in the next request carried %v, want %v", seen, tc.next)
+			}
+		})
+	}
+}

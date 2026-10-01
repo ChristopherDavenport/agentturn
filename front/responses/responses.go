@@ -73,7 +73,9 @@
 // response's. A receiver that hands off again is asked about in turn,
 // with nothing counting the handoffs but the function. The receiver's
 // run carries an agentturn.Trigger of kind "handoff" naming the
-// sender. Without the
+// sender, and its requests leave out the reasoning items the sender
+// produced when the two run different models (agentturn.ReasoningModels).
+// Without the
 // option, or when it declines, a terminating stop with no answer
 // completes with the text of the last output of a call whose result
 // set Terminate as an assistant message, the answer the tools gave on
@@ -82,7 +84,9 @@
 //
 // The adapter keeps nothing between requests, so the conversation's
 // next request starts under the adapter's configuration again, the
-// sender's, unless [WithStart] picks another from the input.
+// sender's, unless [WithStart] or [WithTransfers] picks another from
+// the input. The input's reasoning items are the caller's, of unknown
+// origin, and sent as they are unless [WithTransfers] attributes them.
 package responses
 
 import (
@@ -102,6 +106,7 @@ type Adapter struct {
 	toolItems           bool
 	handoff             func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool)
 	start               func(context.Context, agentturn.Transcript) (agentturn.Config, bool)
+	route               Route
 }
 
 var _ openresponses.Adapter = (*Adapter)(nil)
@@ -186,8 +191,34 @@ func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*
 //	responses.WithStart(func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
 //		return responses.HandedTo(t, route)
 //	})
+//
+// [WithTransfers] starts there too, and leaves out of the receiver's
+// requests the reasoning items another model produced.
 func WithStart(fn func(ctx context.Context, t agentturn.Transcript) (agentturn.Config, bool)) Option {
 	return func(a *Adapter) { a.start = fn }
+}
+
+// WithTransfers says the conversation's handoffs are the transfer
+// calls route names, as [Handoffs] finds them. A request starts where
+// the last of them left the conversation, as [WithStart] does with
+// [HandedTo]; a WithStart given after it picks the start in its place.
+// And the reasoning items of the input are attributed, with
+// [Attribute], to the agents that had the conversation when they were
+// produced, those before the first transfer to the adapter's own
+// configuration, so a request leaves out another model's reasoning,
+// whose signature its provider refuses. Without it the input's
+// reasoning items are of unknown origin and sent to whichever model
+// runs; the ones produced within a request are attributed either way.
+//
+// The input is the caller's, and route chooses only among the agents
+// the caller may reach directly, as WithStart does.
+func WithTransfers(route Route) Option {
+	return func(a *Adapter) {
+		a.route = route
+		a.start = func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
+			return HandedTo(t, route)
+		}
+	}
 }
 
 // New builds an adapter over cfg.
@@ -235,6 +266,10 @@ func (a *Adapter) CreateStream(ctx context.Context, req openresponses.Request, s
 			base = cfg
 		}
 	}
+	models := agentturn.ReasoningModels{}
+	if a.route != nil {
+		models = a.attribute(transcript, req)
+	}
 	if base.Model == nil {
 		return openresponses.ServerError("no_model", "agent has no model")
 	}
@@ -247,14 +282,26 @@ func (a *Adapter) CreateStream(ctx context.Context, req openresponses.Request, s
 	}
 	rl := newRelay(sink, resp)
 	if len(callerTools) > 0 {
-		return a.oneTurn(ctx, base, req, transcript, callerTools, rl)
+		return a.oneTurn(ctx, base, req, transcript, models, callerTools, rl)
 	}
-	return a.fullRun(ctx, base, req, transcript, rl)
+	return a.fullRun(ctx, base, req, transcript, models, rl)
+}
+
+// attribute says which model produced each reasoning item of the
+// input, by the handoffs route finds in it, each configuration under
+// the request's model as it runs.
+func (a *Adapter) attribute(transcript agentturn.Transcript, req openresponses.Request) agentturn.ReasoningModels {
+	handoffs := Handoffs(transcript, a.route)
+	for i := range handoffs {
+		handoffs[i].To.ModelName = modelName(handoffs[i].To, req.Model)
+	}
+	return Attribute(transcript, a.perRequest(a.cfg, req), handoffs)
 }
 
 // fullRun lets the agent execute its own tools until it answers,
-// starting under base.
-func (a *Adapter) fullRun(ctx context.Context, base agentturn.Config, req openresponses.Request, transcript agentturn.Transcript, rl *relay) error {
+// starting under base, with models saying which model produced the
+// input's reasoning.
+func (a *Adapter) fullRun(ctx context.Context, base agentturn.Config, req openresponses.Request, transcript agentturn.Transcript, models agentturn.ReasoningModels, rl *relay) error {
 	cfg := a.perRequest(base, req)
 	runCtx := ctx
 	var usage openresponses.Usage
@@ -262,13 +309,16 @@ func (a *Adapter) fullRun(ctx context.Context, base agentturn.Config, req openre
 	var results []*agentturn.ToolEnd
 	for {
 		var err error
-		if end, results, err = a.relayRun(runCtx, transcript, cfg, rl, &usage); err != nil {
+		if end, results, err = a.relayRun(agentturn.ContextWithReasoningModels(runCtx, models), transcript, cfg, rl, &usage); err != nil {
 			return err
 		}
 		next, ok := a.handsOff(ctx, end, results)
 		if !ok {
 			break
 		}
+		// The receiver's requests leave the sender's reasoning out when
+		// it runs another model.
+		models.Attribute(cfg.ModelName, end.Items)
 		transcript = append(transcript, end.Items...)
 		runCtx = agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff", Ref: cfg.Name})
 		cfg = a.perRequest(next, req)
@@ -434,7 +484,7 @@ func terminatingText(items agentturn.Transcript, results []*agentturn.ToolEnd) (
 // run. The request is the same one the loop would send,
 // Config.BaseRequest over the per-request model and instructions, so
 // every Config.Request member reaches the model in both modes.
-func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openresponses.Request, transcript agentturn.Transcript, callerTools []*openresponses.FunctionTool, rl *relay) error {
+func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openresponses.Request, transcript agentturn.Transcript, models agentturn.ReasoningModels, callerTools []*openresponses.FunctionTool, rl *relay) error {
 	cfg = a.perRequest(cfg, req)
 	if cfg.Reasoning.IsZero() {
 		cfg.Reasoning = req.Reasoning
@@ -465,7 +515,7 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 		filter = agentturn.DefaultFilter
 	}
 	upstream := cfg.BaseRequest(ctx)
-	upstream.Input = filter(input)
+	upstream.Input = models.For(cfg.ModelName, filter(input))
 	for _, ct := range callerTools {
 		upstream.Tools = append(upstream.Tools, ct)
 	}

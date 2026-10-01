@@ -119,6 +119,10 @@ type Agent struct {
 	// reserved holds the call IDs a record names beyond the transcript,
 	// which a call the model makes must not take.
 	reserved map[string]bool
+	// reasoning says which model produced the reasoning items of the
+	// transcript it knows, so a run leaves another model's out of its
+	// requests.
+	reasoning ReasoningModels
 }
 
 type subscription struct {
@@ -228,6 +232,16 @@ func (a *Agent) Config() Config { return a.cfg }
 // kept, so anything steered or queued under the old configuration
 // goes to the next run under the new one; a session recorder attached
 // to the agent sees the change as a config delta on the next turn.
+//
+// The transcript is kept too, reasoning items included, and the loop
+// owns what a change of model means for them: a reasoning item carries
+// a signature only its own provider accepts, so each request leaves
+// out the ones a model with another [Config.ModelName] produced, which
+// the agent attributed as its runs went (see [ReasoningModels]). The
+// transcript and a record of it keep them, and a configuration that
+// switches back to that model is sent them again. A session recorder
+// cannot write a request that leaves items out of the middle of its
+// history, so the responses after such a change carry no request hash.
 func (a *Agent) SetConfig(cfg Config) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -245,9 +259,12 @@ func (a *Agent) SetConfig(cfg Config) error {
 // to match with its Rebase: to the entry of the last item kept, for a
 // trim that keeps a prefix, whose responses then carry hashes; a trim
 // from the middle runs as well and leaves the next responses without
-// one. The loop keeps whatever the transcript holds, reasoning items a
-// previous model wrote included, whose signatures another provider
-// refuses; a handoff to another provider drops them here.
+// one. A handoff to another model need not trim the previous model's
+// reasoning items: the loop leaves them out of each request, as
+// [Agent.SetConfig] says, for every item it attributed, which the new
+// transcript keeps when it holds the same item. A transcript rebuilt
+// from elsewhere has no attribution until [WithReasoningModels] or
+// [ContextWithReasoningModels] gives it.
 // The pending calls are derived from the new transcript as
 // [WithTranscript] derives them, except that a call the agent already
 // had pending, the same call under the same ID, keeps its reason, key
@@ -275,6 +292,7 @@ func (a *Agent) SetTranscript(t Transcript) error {
 	}
 	known := a.pending
 	a.transcript = append(Transcript(nil), t...)
+	a.reasoning = a.reasoning.retain(a.transcript)
 	a.pending = pendingCalls(unansweredCalls(a.transcript), PendingUnknown)
 	mergePending(a.pending, known)
 	return nil
@@ -854,6 +872,7 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, approved
 			runCtx:     runCtx,
 			prior:      prior,
 			reserved:   a.reserved,
+			reasoning:  a.reasoning.merged(reasoningFromContext(ctx)),
 			runID:      runID,
 			resuming:   resuming,
 		}
@@ -861,6 +880,7 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, approved
 		cancel(nil)
 
 		a.mu.Lock()
+		a.reasoning = r.reasoning.retain(a.transcript)
 		a.running = false
 		a.closing = false
 		a.cancel, a.runCancel = nil, nil

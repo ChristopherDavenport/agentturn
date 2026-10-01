@@ -308,3 +308,95 @@ func TestMessageRefusesFunctionCall(t *testing.T) {
 		})
 	}
 }
+
+// thinksThenTransfers answers a user message with a reasoning item
+// signed for the requested model and a call to its first tool, and
+// echoes a function_call_output.
+type thinksThenTransfers struct{}
+
+func (thinksThenTransfers) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	if _, ok := req.Input[len(req.Input)-1].(*openresponses.FunctionCallOutput); ok {
+		return (&echo.Adapter{}).CreateStream(ctx, req, sink)
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if err := em.Item(&openresponses.ReasoningItem{Summary: openresponses.Contents{}, EncryptedContent: "sig:" + req.Model}); err != nil {
+		return err
+	}
+	w, err := em.FunctionCall("", req.Tools[0].(*openresponses.FunctionTool).Name)
+	if err != nil {
+		return err
+	}
+	if err := w.Arguments(`{}`); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestReasoningAcrossHandoff pins #91: the receiver of a handoff on
+// another model is sent none of the sender's reasoning items, within
+// the task that handed off and, under WithTransfers, in the
+// conversation's next task, while the store keeps them; a receiver on
+// the same model is sent them, as is one WithStart alone starts, which
+// cannot tell where the stored reasoning came from.
+func TestReasoningAcrossHandoff(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		billing   string // billing's ModelName
+		transfers bool   // WithTransfers rather than WithStart
+		handedOff []string
+		next      []string
+	}{
+		{"another model", "other-2", true, []string{}, []string{}},
+		{"same model", "reasoner-1", true, []string{"sig:reasoner-1"}, []string{"sig:reasoner-1"}},
+		{"WithStart alone", "other-2", false, []string{}, []string{"sig:reasoner-1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var seen [][]string
+			billing := agentturn.Config{Name: "billing", Model: &echo.Adapter{}, ModelName: tc.billing, BeforeModelCall: func(_ context.Context, req *openresponses.Request) error {
+				var sigs []string
+				for _, item := range req.Input {
+					if r, ok := item.(*openresponses.ReasoningItem); ok {
+						sigs = append(sigs, r.EncryptedContent)
+					}
+				}
+				seen = append(seen, append([]string{}, sigs...))
+				return nil
+			}}
+			route := func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+				return billing, "transferred", call.Name == "transfer_to_billing"
+			}
+			store := &MemoryStore{}
+			opts := []Option{WithConversationStore(store), WithHandoff(func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool) {
+				return billing, true
+			})}
+			if tc.transfers {
+				opts = append(opts, WithTransfers(route))
+			} else {
+				opts = append(opts, WithStart(func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
+					return HandedTo(t, route)
+				}))
+			}
+			h := a2asrv.NewHandler(New(agentturn.Config{Name: "triage", Model: thinksThenTransfers{}, ModelName: "reasoner-1", Tools: []agenttool.Tool{transferToBilling}}, opts...))
+			first := sendTask(t, h, userMessage("I was double charged"))
+			if len(seen) != 1 || !reflect.DeepEqual(seen[0], tc.handedOff) {
+				t.Fatalf("billing's request in the task that handed off carried %v, want %v", seen, tc.handedOff)
+			}
+			seen = nil
+			next := userMessage("when is the refund")
+			next.ContextID = first.ContextID
+			if task := sendTask(t, h, next); task.Status.State != a2a.TaskStateCompleted {
+				t.Fatalf("next task = %s", task.Status.State)
+			}
+			if len(seen) != 1 || !reflect.DeepEqual(seen[0], tc.next) {
+				t.Errorf("billing's request in the next task carried %v, want %v", seen, tc.next)
+			}
+			stored, _ := store.Load(context.Background(), first.ContextID)
+			if got := itemTypes(stored); got != "user reasoning function_call function_call_output assistant user assistant" {
+				t.Errorf("stored = %s", got)
+			}
+		})
+	}
+}

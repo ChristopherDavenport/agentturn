@@ -361,7 +361,15 @@ that a recorder holding the transcript and the settings rebuilds it:
    a copy of the list and MUST NOT mutate the items. The working
    transcript is not replaced.
 3. Apply the **filter** to the result, which removes what the model
-   must not see.
+   must not see. Then leave out every reasoning item the loop knows a
+   model under another model name produced: a reasoning item carries a
+   signature only its own provider accepts. The model's own reasoning
+   items stay, since a provider may require them back on a turn that
+   called a tool, and so does one whose producer the loop does not
+   know. The loop learns the producer of each reasoning item a
+   response adds, under the model name in force, and a host gives it
+   the producers of a transcript it rebuilt; the working transcript
+   keeps every item.
 4. Take the request base, set the loop-owned transport members — store
    false, stream true, no stream options, no previous response ID — and
    apply the model
@@ -1274,8 +1282,19 @@ An agent stands in four places inside another system:
   response or task. A transcript holds whatever
   the previous model produced, reasoning items included, and a
   reasoning item carries a signature its own provider issued; a
-  handoff that changes the provider MUST drop them, and which component
-  owns that rule is open (#91). A handoff that trims what the receiver
+  handoff that changes the model MUST leave them out of the receiver's
+  requests. The loop owns that rule (#91): it leaves out of each
+  request the reasoning items another model name produced, as the
+  request procedure says, so a configuration replaced between runs
+  needs nothing more, and the transcript and the record keep the
+  items. A front that rebuilds a conversation the loop has not seen,
+  from a store or from a caller's input, attributes its reasoning items
+  by the handoffs the conversation took, those before the first to the
+  configuration it started under and those after each to the
+  receiver, and gives the loop that attribution; the loop never learns
+  what a handoff is. A recorder cannot write a request that leaves
+  items out of the middle of its history, so the responses after one
+  carry no request hash. A handoff that trims what the receiver
   sees does it once, between runs, by replacing the transcript; a
   recorder moved to the last entry kept keeps every later response
   verifiable when the trim takes a prefix, and a trim from the middle
@@ -1349,6 +1368,7 @@ maps onto it as follows:
 | transcript | `Transcript = openresponses.Items`; `Items` for a fragment |
 | hidden item | `Hidden(item)`, `Unhide(item)`; `Hidden` on the item events |
 | filter | `Config.Filter`; `DefaultFilter`, `VisibleFilter(types…)` |
+| reasoning another model produced | `ReasoningModels` (`Attribute`, `For`); `WithReasoningModels` for an agent, `ContextWithReasoningModels` for `Run` and `Continue` |
 | transform | `Config.Transform`; `compact.New`, `compact.NewLocal` as the reference |
 | configuration | `Config`; `Config.BaseRequest`, `Config.ResolveTools` |
 | tools of the moment | `Config.Tools`, `Config.ToolProvider` |
@@ -1375,6 +1395,7 @@ maps onto it as follows:
 | nested call | `Invoke(ctx, name, args)`; `ErrNoInvoker`; `Parent` on the tool events |
 | queue mode | `QueueMode`: `QueueSteer`, `QueueFollowUp` |
 | the loop as a model | `front/responses.New(cfg)` → `openresponses.Adapter` |
+| handoffs a front takes | `WithHandoff`, `WithStart`, `WithTransfers(route)` in both fronts; `front/responses.Route`, `Handoffs`, `HandedTo`, `Attribute`, re-exported by `front/a2a` but for `Attribute` |
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)` |
 | the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `RecordFunc`, `Elicitor`, `Requeue`, `Rebase`; `WithInstructionsParts`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs` |
@@ -1509,14 +1530,11 @@ module and is listed in the changelog as one.
 - **Input required as an interface** (#84). The child tools' errors
   match one sentinel, and the pending calls are reached by a type
   switch per implementation. An interface both satisfy is proposed.
-- **The handoff** (#96, #91). The fourth composition is the cheapest
-  and the least documented, and a handoff that changes the provider
-  sends the previous model's reasoning items to the new one, which
-  rejects their signatures. The loop is where both configurations are
-  visible at once; whether it drops them, or names the rule and offers
-  the helper, or the item type carries the rule, is open. Every route
-  that trims the history mid-path costs the responses after it their
-  request hash, which is the format's question.
+- **The handoff** (#96). The fourth composition is the cheapest and
+  the least documented. The loop now leaves another model's reasoning
+  items out of each request (#91); that omission, like every route
+  that trims the history mid-path, costs the responses after it their
+  request hash, which is the format's question (agentsession#56).
 - **A second execution under one call** (#87). A child tool builds a
   fresh agent per call while the recorder continues the child session
   at its leaf, so the second run's path rebuilds a context the child

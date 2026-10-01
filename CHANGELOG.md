@@ -76,6 +76,26 @@ versions may break the API.
   keeps. A transfer `WithHandoff` declined keeps the tool's text, so a
   host whose `WithHandoff` declines declines the same calls in the
   route. (#190)
+- **The loop leaves another model's reasoning items out of the
+  request.** A reasoning item carries a signature only its own provider
+  accepts, so a handoff, or a `SetConfig` between runs, to a
+  configuration with another `Config.ModelName` sent the receiver items
+  it refused with a 400. The loop now attributes each reasoning item a
+  response adds to the `ModelName` in force, and each request, after
+  the filter, leaves out the ones another model produced; the model's
+  own stay, as a provider may require them back on a tool-use turn, and
+  so does an item of unknown origin. The transcript and the record keep
+  every item. `ReasoningModels` holds the attribution;
+  `WithReasoningModels` and `ContextWithReasoningModels` give it for a
+  transcript the loop has not seen. Both fronts attribute the items
+  their in-process handoffs pass on, and their new `WithTransfers(route)`
+  starts where the last transfer left the conversation, as `WithStart`
+  with `HandedTo` does, and attributes a caller's input or a stored
+  transcript by the handoffs it took, with `front/responses.Attribute`.
+  A session recorder writes the responses after such a request with no
+  request hash, since the format cannot describe an omission from the
+  middle of the history (agentsession#56). An empty `ModelName` names
+  no model, so nothing changes for a host that sets none. (#91)
 
 ## v0.0.14 - 2026-10-01
 

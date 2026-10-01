@@ -167,6 +167,7 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 				cfg:        cfg,
 				transcript: append(Transcript(nil), t...),
 				runCtx:     runCtx,
+				reasoning:  reasoningFromContext(ctx).merged(nil),
 				// Every event is sent, cancelled or not: the consumer
 				// below drains the channel until the run returns, so a
 				// send never blocks for good, and the events an abort
@@ -545,6 +546,9 @@ type runner struct {
 	// model makes must not take. The agent does not change it while the
 	// run is active. ctxReserved holds those the run's context names.
 	reserved, ctxReserved map[string]bool
+	// reasoning says which model produced the reasoning items of the
+	// transcript it knows, so a request leaves another model's out.
+	reasoning ReasoningModels
 
 	// held are the completed items of the attempt in flight that the
 	// transcript does not have yet, because nothing has committed the
@@ -1007,7 +1011,7 @@ func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponse
 		}
 	}
 	req := r.cfg.baseRequest(tools)
-	req.Input = r.cfg.filter()(input)
+	req.Input = r.reasoning.For(r.cfg.ModelName, r.cfg.filter()(input))
 	if r.cfg.BeforeModelCall != nil {
 		if err := r.cfg.BeforeModelCall(ctx, &req); err != nil {
 			// The call was never made; the request as built is the
@@ -1040,6 +1044,8 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 	start := len(r.transcript)
 	for attempt := 1; ; attempt++ {
 		resp, committed, err := r.stream(ctx, req)
+		// What the attempt kept is this model's, however it ended.
+		r.attribute(r.transcript[start:])
 		if err == nil {
 			r.mark = len(r.transcript)
 			return resp, nil

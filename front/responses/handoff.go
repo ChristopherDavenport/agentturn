@@ -73,3 +73,21 @@ func HandedTo(t agentturn.Transcript, route Route) (agentturn.Config, bool) {
 	}
 	return hs[len(hs)-1].To, true
 }
+
+// Attribute says which model produced each reasoning item of t, from
+// the agents that had the conversation: an item before the first of
+// handoffs is start's, and one after each is that handoff's receiver's,
+// each by its Config.ModelName. handoffs are t's, from [Handoffs]. It
+// is what the loop is given for a transcript it has not seen, so a
+// request leaves out the reasoning another model produced; see
+// agentturn.ReasoningModels.
+func Attribute(t agentturn.Transcript, start agentturn.Config, handoffs []Handoff) agentturn.ReasoningModels {
+	m := agentturn.ReasoningModels{}
+	from, name := 0, start.ModelName
+	for _, h := range handoffs {
+		m.Attribute(name, t[from:h.Output+1])
+		from, name = h.Output+1, h.To.ModelName
+	}
+	m.Attribute(name, t[from:])
+	return m
+}

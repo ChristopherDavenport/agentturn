@@ -10,6 +10,7 @@ import (
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
+	"github.com/ChristopherDavenport/agentturn/front/responses"
 	"github.com/ChristopherDavenport/openresponses"
 	"github.com/a2aproject/a2a-go/a2a"
 	"github.com/a2aproject/a2a-go/a2asrv"
@@ -26,6 +27,7 @@ type Executor struct {
 	recorderFor RecorderFor
 	handoff     func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool)
 	start       func(context.Context, agentturn.Transcript) (agentturn.Config, bool)
+	route       Route
 
 	mu      sync.Mutex
 	cancels map[a2a.TaskID]context.CancelFunc
@@ -168,7 +170,9 @@ func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*
 // handoff tools are named for their destination takes the last one
 // that ran, with [HandedTo]: a call is a handoff only when its output
 // is the transfer tool's own text, so one a guard withheld, a hook
-// blocked or the tool failed on is not.
+// blocked or the tool failed on is not. [WithTransfers] starts there
+// too, and leaves out of the receiver's requests the reasoning items
+// another model produced.
 //
 //	route := func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
 //		name := strings.TrimPrefix(call.Name, "transfer_to_")
@@ -180,6 +184,27 @@ func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*
 //	})
 func WithStart(fn func(ctx context.Context, t agentturn.Transcript) (agentturn.Config, bool)) Option {
 	return func(e *Executor) { e.start = fn }
+}
+
+// WithTransfers says the conversation's handoffs are the transfer
+// calls route names, as [Handoffs] finds them. A task starts where the
+// last of them left the conversation, as [WithStart] does with
+// [HandedTo]; a WithStart given after it picks the start in its place.
+// And the reasoning items of the stored transcript are attributed, with
+// responses.Attribute, to the agents that had the conversation when
+// they were produced, those before the first transfer to the executor's
+// own configuration, so a request leaves out another model's
+// reasoning, whose signature its provider refuses. Without it the
+// stored reasoning items are of unknown origin and sent to whichever
+// model runs; the ones produced within a task, the sender's before a
+// [WithHandoff] switch included, are attributed either way.
+func WithTransfers(route Route) Option {
+	return func(e *Executor) {
+		e.route = route
+		e.start = func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
+			return HandedTo(t, route)
+		}
+	}
 }
 
 // New builds an executor for cfg.
@@ -255,7 +280,11 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 			start = cfg
 		}
 	}
-	agent := agentturn.New(e.runConfig(start, caller), agentturn.WithTranscript(transcript))
+	var models agentturn.ReasoningModels
+	if e.route != nil {
+		models = responses.Attribute(transcript, e.cfg, Handoffs(transcript, e.route))
+	}
+	agent := agentturn.New(e.runConfig(start, caller), agentturn.WithTranscript(transcript), agentturn.WithReasoningModels(models))
 	if e.recorderFor != nil {
 		rctx, detach, err := e.recorderFor(runCtx, reqCtx.ContextID, agent)
 		if detach != nil {
