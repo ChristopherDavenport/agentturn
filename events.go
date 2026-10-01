@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
@@ -529,19 +530,28 @@ type RunEnd struct {
 func (*RunEnd) EventType() string { return EventRunEnd }
 
 // Answer returns the run's answer: the text of the assistant message
-// that ends Items, and whether there is one with text. A run whose
-// last item is anything else did not answer, whatever it said along
-// the way: text before a call is a preamble, and a guard that refuses
-// the next turn leaves the preamble last among the messages but not
-// last among the items. A message that OutputGuard replaced is the
-// replacement, and an empty one is no answer. A run whose message
-// OutputGuard withheld (Withheld) did not answer either, though a
-// message the same response spoke before it may end Items.
+// that ends Items, and whether there is one with text. Extension items
+// after it, whose types are namespaced as [DefaultFilter] tells them,
+// do not count: an adapter may write one once the text is complete. A
+// run whose last other item is anything else did not answer, whatever
+// it said along the way: text before a call is a preamble, and a guard
+// that refuses the next turn leaves the preamble last among the
+// messages but not last among the items. A message that OutputGuard
+// replaced is the replacement, and an empty one is no answer. A run
+// whose message OutputGuard withheld (Withheld) did not answer either,
+// though a message the same response spoke before it may end Items.
 func (e *RunEnd) Answer() (string, bool) {
-	if e.Withheld || len(e.Items) == 0 {
+	if e.Withheld {
 		return "", false
 	}
-	m, ok := e.Items[len(e.Items)-1].(*openresponses.Message)
+	last := len(e.Items) - 1
+	for last >= 0 && (e.Items[last] == nil || strings.Contains(e.Items[last].ItemType(), ":")) {
+		last--
+	}
+	if last < 0 {
+		return "", false
+	}
+	m, ok := e.Items[last].(*openresponses.Message)
 	if !ok || m.Role != openresponses.RoleAssistant {
 		return "", false
 	}

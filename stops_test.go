@@ -2,6 +2,7 @@ package agentturn
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -178,20 +179,28 @@ func TestTriggerExtraRefusedWhereItEnters(t *testing.T) {
 // message that ends the run's items, when it has text.
 func TestRunEndAnswer(t *testing.T) {
 	call := &openresponses.FunctionCall{CallID: "c1", Name: "lookup", Arguments: `{}`}
+	raw := &openresponses.UnknownItem{Type: "hermes:raw", Raw: json.RawMessage(`{"type":"hermes:raw"}`)}
 	for _, tc := range []struct {
 		name  string
 		items Transcript
 		want  string
 		ok    bool
+		// withheld marks the run's message withheld by OutputGuard.
+		withheld bool
 	}{
-		{"nothing", nil, "", false},
-		{"an answer", Transcript{openresponses.UserText("q"), openresponses.AssistantText("a")}, "a", true},
-		{"an empty message", Transcript{openresponses.UserText("q"), openresponses.AssistantText("")}, "", false},
-		{"a preamble and a call", Transcript{openresponses.UserText("q"), openresponses.AssistantText("Let me check."), call, openresponses.NewFunctionCallOutput("c1", "found")}, "", false},
-		{"a user message last", Transcript{openresponses.AssistantText("a"), openresponses.UserText("and?")}, "", false},
+		{"nothing", nil, "", false, false},
+		{"an answer", Transcript{openresponses.UserText("q"), openresponses.AssistantText("a")}, "a", true, false},
+		{"an empty message", Transcript{openresponses.UserText("q"), openresponses.AssistantText("")}, "", false, false},
+		{"a preamble and a call", Transcript{openresponses.UserText("q"), openresponses.AssistantText("Let me check."), call, openresponses.NewFunctionCallOutput("c1", "found")}, "", false, false},
+		{"a user message last", Transcript{openresponses.AssistantText("a"), openresponses.UserText("and?")}, "", false, false},
+		{"an extension item after the answer", Transcript{openresponses.UserText("q"), openresponses.AssistantText("a"), raw}, "a", true, false},
+		{"extension items after the answer", Transcript{openresponses.UserText("q"), openresponses.AssistantText("a"), raw, nil, raw}, "a", true, false},
+		{"an extension item after a call's output", Transcript{openresponses.UserText("q"), call, openresponses.NewFunctionCallOutput("c1", "found"), raw}, "", false, false},
+		{"only extension items", Transcript{raw}, "", false, false},
+		{"an extension item after a withheld answer", Transcript{openresponses.UserText("q"), openresponses.AssistantText("a"), raw}, "", false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := (&RunEnd{Items: tc.items}).Answer()
+			got, ok := (&RunEnd{Items: tc.items, Withheld: tc.withheld}).Answer()
 			if got != tc.want || ok != tc.ok {
 				t.Errorf("Answer() = %q, %v, want %q, %v", got, ok, tc.want, tc.ok)
 			}

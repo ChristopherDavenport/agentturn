@@ -21,6 +21,13 @@ versions may break the API.
   session recorder the run failed at the second output. A call is now
   known by its item ID when it has one, and by its output index only
   when it has none (#198).
+- **`RunEnd.Answer` looks past extension items after the final
+  message.** An adapter that writes a namespaced item once the text is
+  complete, such as a text-call parser's raw text, put it after the
+  assistant message, and every consumer of `Answer`, `front/a2a` and
+  `tools/agent` among them, saw no answer. Trailing items whose type is
+  namespaced, as `DefaultFilter` tells them, are now skipped; a
+  withheld run still has no answer (#203).
 
 ## v0.0.14 - 2026-10-01
 
