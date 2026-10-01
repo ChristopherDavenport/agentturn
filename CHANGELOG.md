@@ -8,7 +8,9 @@ versions may break the API.
 ## Unreleased
 
 - Requires `agenttool` v0.0.12, up from v0.0.11, and `agentsession`
-  v0.0.16, up from v0.0.15. The format is unchanged. A `cas` store a
+  v0.0.17, up from v0.0.15. The format is unchanged; `VerifyRecords`
+  now also checks a run start's `source` against its segment and
+  refuses an empty `call_id`, and the recorder's sessions pass both. A `cas` store a
   session recorder writes through is migrated to v0.0.16's per-session
   log on its first writing open, after which agentsession v0.0.15 and
   earlier cannot read it; keep a copy of the store if rolling back may
