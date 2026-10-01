@@ -2112,9 +2112,12 @@ var ErrNoInvoker = errors.New("agentturn: no loop on the context to invoke a too
 // The result is the one the model would have seen, with the error
 // beside it: a tool that failed, a name no tool has, arguments that are
 // not an object, or a call the hook refused, whose Reason is the error.
-// A hook that defers the call refuses it instead, since a nested call
-// cannot be handed to the caller: it belongs to a tool that is running.
-// Nothing is appended to the transcript, so a nested call costs no
+// A nested call cannot be handed to the caller, since it belongs to a
+// tool that is running, so one the hook defers is put to the user
+// through the agenttool.Elicitor on ctx, when there is one: an accept
+// runs it and a decline refuses it, and tool_start carries that answer
+// as the decision, by "human". Without an elicitor, or on a cancel or
+// a failure to ask, the deferral refuses the call. Nothing is appended to the transcript, so a nested call costs no
 // items and a Terminate on its result means nothing to the loop.
 //
 // The call it is made under comes from agenttool.CallFrom, which
@@ -2162,6 +2165,9 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 			if decision.Args != nil {
 				p.args = decision.Args
 			}
+			if decision.Action == Defer {
+				decision = r.askNested(ctx, name, p.args, decision)
+			}
 			switch decision.Action {
 			case Block, Defer:
 				reason := decision.Reason
@@ -2200,6 +2206,47 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 		return agenttool.Result{}, r.endNested(p, err)
 	}
 	return p.result, p.err
+}
+
+// askNested puts a nested call the hook deferred to the user through
+// the elicitor on ctx, the invoking tool's, so the question is filed
+// under the call that made it. An accept allows the call and a decline
+// blocks it, either decided by the user; with no elicitor, a cancel or
+// a failure to ask, the deferral stands and the call is refused.
+func (r *runner) askNested(ctx context.Context, name string, args json.RawMessage, d *ToolDecision) *ToolDecision {
+	elicit, ok := agenttool.ElicitorFrom(ctx)
+	if !ok {
+		return d
+	}
+	msg := fmt.Sprintf("Allow %s with arguments %s?", name, args)
+	if d.Reason != "" {
+		msg += " " + d.Reason
+	}
+	ans, err := elicit(ctx, agenttool.Elicitation{Message: msg})
+	if err != nil {
+		return d
+	}
+	// An elicitation is a question for the user, so the user decided.
+	decided := *d
+	decided.By = "human"
+	switch ans.Action {
+	case agenttool.ActionAccept:
+		// The reason is the rule that raised the question, as a held
+		// call's is; the record needs one to write the approval.
+		decided.Action = Allow
+		if decided.Reason == "" {
+			decided.Reason = "allowed when asked"
+		}
+	case agenttool.ActionDecline:
+		decided.Action = Block
+		decided.Reason = "declined when asked"
+		if d.Reason != "" {
+			decided.Reason += ": " + d.Reason
+		}
+	default:
+		return d
+	}
+	return &decided
 }
 
 // endNested gives a nested call whose loop-side handling failed, a

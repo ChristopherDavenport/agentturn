@@ -1299,6 +1299,81 @@ func TestNestedCallsAreRecorded(t *testing.T) {
 	verifyAll(t, s)
 }
 
+// TestAskedNestedCallsAreRecorded pins #200's record: a nested call
+// the hook deferred and the user answered through the elicitor has the
+// question under the call that made it, then the answer as its
+// decision, by the user.
+func TestAskedNestedCallsAreRecorded(t *testing.T) {
+	cases := []struct {
+		name    string
+		action  agenttool.Action
+		verdict string
+	}{
+		{name: "accept", action: agenttool.ActionAccept, verdict: agentsession.VerdictProceed},
+		{name: "decline", action: agenttool.ActionDecline, verdict: agentsession.VerdictReject},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			bash := agenttool.New("bash", "runs a command", func(context.Context, echoArgs) (string, error) { return "pushed", nil })
+			eval := agenttool.New("eval", "runs code", func(ctx context.Context, _ echoArgs) (string, error) {
+				_, err := agentturn.Invoke(ctx, "bash", json.RawMessage(`{"text":"git push"}`))
+				if (err == nil) != (tc.action == agenttool.ActionAccept) {
+					t.Errorf("the nested call returned %v", err)
+				}
+				return "ran", nil
+			})
+			policy := func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+				if info.Call.Name == "bash" {
+					return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask bash(git push:*)", By: agentsession.ByPolicy}, nil
+				}
+				return nil, nil
+			}
+			user := func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+				return agenttool.Answer{Action: tc.action}, nil
+			}
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{eval, bash},
+				BeforeToolCall: policy, ToolElicitor: rec.Elicitor(agentsession.ByHuman, user), MaxTurns: 1})
+			defer rec.Attach(a)()
+			if _, err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
+				t.Fatal(err)
+			}
+			var order []string
+			var start *NestedCall
+			for _, e := range s.Entries() {
+				c, ok := e.(*agentsession.CustomEntry)
+				if !ok {
+					continue
+				}
+				switch c.NS {
+				case ElicitationNS:
+					order = append(order, "question")
+				case NestedCallNS:
+					var n NestedCall
+					if err := json.Unmarshal(c.Data, &n); err != nil {
+						t.Fatal(err)
+					}
+					order = append(order, n.Phase)
+					if n.Phase == agentsession.RunStart {
+						start = &n
+					}
+				}
+			}
+			if strings.Join(order, " ") != "question start end" {
+				t.Errorf("entries = %v", order)
+			}
+			if start == nil || start.Verdict != tc.verdict || start.By != agentsession.ByHuman || !strings.Contains(start.Reason, "ask bash(git push:*)") {
+				t.Errorf("start entry = %+v", start)
+			}
+			verifyAll(t, s)
+		})
+	}
+}
+
 // switching answers 429 while the request names the primary model and
 // answers as itself once it names another.
 type switching struct{ primary string }

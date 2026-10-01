@@ -3,6 +3,7 @@ package agentturn
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -138,6 +139,108 @@ func TestInvokeRefusesADeferredCall(t *testing.T) {
 	}
 	if len(end.Pending) != 0 {
 		t.Errorf("a nested call was handed to the caller: %+v", end.Pending)
+	}
+}
+
+// TestInvokeAsksAboutADeferredCall pins #200: a nested call the hook
+// defers is put to the invoking tool's elicitor, under the call that
+// made it, naming the call, its arguments and the reason. An accept
+// runs it and a decline refuses it, either by "human" on its
+// tool_start; a cancel, a failure to ask or no elicitor at all leaves
+// it refused as deferred.
+func TestInvokeAsksAboutADeferredCall(t *testing.T) {
+	cases := []struct {
+		name string
+		// answer is the elicitor's; nil installs none.
+		answer   func() (agenttool.Answer, error)
+		ran      bool
+		errHas   string
+		action   ToolAction
+		by       string
+		noReason bool
+	}{
+		{name: "no elicitor", errHas: "a nested call cannot be deferred to the caller: approval required by read", action: Defer},
+		{name: "accept", answer: func() (agenttool.Answer, error) { return agenttool.Answer{Action: agenttool.ActionAccept}, nil }, ran: true, action: Allow, by: "human"},
+		{name: "accept, no reason", answer: func() (agenttool.Answer, error) { return agenttool.Answer{Action: agenttool.ActionAccept}, nil }, ran: true, action: Allow, by: "human", noReason: true},
+		{name: "decline", answer: func() (agenttool.Answer, error) { return agenttool.Answer{Action: agenttool.ActionDecline}, nil }, errHas: "declined when asked: approval required by read", action: Block, by: "human"},
+		{name: "cancel", answer: func() (agenttool.Answer, error) { return agenttool.Answer{Action: agenttool.ActionCancel}, nil }, errHas: "a nested call cannot be deferred to the caller", action: Defer},
+		{name: "failure to ask", answer: func() (agenttool.Answer, error) { return agenttool.Answer{}, errors.New("no terminal") }, errHas: "a nested call cannot be deferred to the caller", action: Defer},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ran := false
+			read := agenttool.New("read", "reads", func(context.Context, echoArgs) (string, error) {
+				ran = true
+				return "contents", nil
+			})
+			var nestedErr error
+			eval := agenttool.New("eval", "runs code", func(ctx context.Context, _ echoArgs) (string, error) {
+				_, nestedErr = Invoke(ctx, "read", json.RawMessage(`{"text":"go.mod"}`))
+				return "done", nil
+			})
+			reason := "approval required by read"
+			if tc.noReason {
+				reason = ""
+			}
+			defers := func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
+				if info.Call.Name == "read" {
+					return &ToolDecision{Action: Defer, Reason: reason, By: "policy"}, nil
+				}
+				return nil, nil
+			}
+			var asked []agenttool.Elicitation
+			var askedUnder []string
+			cfg := Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{eval, read}, BeforeToolCall: defers, MaxTurns: 1}
+			if tc.answer != nil {
+				cfg.ToolElicitor = func(ctx context.Context, q agenttool.Elicitation) (agenttool.Answer, error) {
+					asked = append(asked, q)
+					call, _ := agenttool.CallFrom(ctx)
+					askedUnder = append(askedUnder, call.ID)
+					return tc.answer()
+				}
+			}
+			events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ran != tc.ran {
+				t.Errorf("the nested read ran: %v", ran)
+			}
+			if (tc.errHas == "") != (nestedErr == nil) || (nestedErr != nil && !strings.Contains(nestedErr.Error(), tc.errHas)) {
+				t.Errorf("the nested call returned %v, want %q", nestedErr, tc.errHas)
+			}
+			if len(end.Pending) != 0 {
+				t.Errorf("a nested call was handed to the caller: %+v", end.Pending)
+			}
+			var decision *ToolDecision
+			evalCall := ""
+			for _, ev := range events {
+				if e, ok := ev.(*ToolStart); ok {
+					if e.Parent == "" {
+						evalCall = e.CallID
+					} else {
+						decision = e.Decision
+					}
+				}
+			}
+			if decision == nil || decision.Action != tc.action || (tc.by != "" && decision.By != tc.by) {
+				t.Fatalf("the nested tool_start carries %+v", decision)
+			}
+			if tc.action == Allow && decision.Reason == "" {
+				t.Error("an approval carries no reason for the record")
+			}
+			if tc.answer == nil {
+				return
+			}
+			if len(asked) != 1 || askedUnder[0] != evalCall {
+				t.Fatalf("asked %d questions under %v, want one under %s", len(asked), askedUnder, evalCall)
+			}
+			for _, want := range []string{"read", `{"text":"go.mod"}`, reason} {
+				if !strings.Contains(asked[0].Message, want) {
+					t.Errorf("question %q does not name %q", asked[0].Message, want)
+				}
+			}
+		})
 	}
 }
 

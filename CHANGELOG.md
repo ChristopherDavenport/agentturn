@@ -28,6 +28,18 @@ versions may break the API.
   `tools/agent` among them, saw no answer. Trailing items whose type is
   namespaced, as `DefaultFilter` tells them, are now skipped; a
   withheld run still has no answer (#203).
+- **`Invoke` asks the user about a nested call the hook defers.** A
+  deferred nested call was always refused, so under an ask policy a
+  code-execution tool's script could not make a call the user would
+  have been asked about. When the invoking tool's context carries an
+  `agenttool.Elicitor`, `Config.ToolElicitor` among them, the loop now
+  asks it with a question naming the call, its arguments and the
+  decision's reason; an accept runs the call and a decline refuses it,
+  and the nested `tool_start` carries the answer as the decision, by
+  `human`. Without an elicitor, or on a cancel or a failure to ask, the
+  call is refused as before. The session recorder writes a nested call
+  allowed with a reason as `proceed`, as it does a model's call, so an
+  approval is on the record with who gave it (#200).
 
 ## v0.0.14 - 2026-10-01
 

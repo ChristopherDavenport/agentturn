@@ -472,7 +472,9 @@ type NestedCall struct {
 	// Args are the arguments the tool ran with, on the start entry.
 	Args json.RawMessage `json:"args,omitempty"`
 	// Verdict, Reason and By are what a hook decided about the call,
-	// in the format's terms, on the start entry.
+	// or the user it deferred the call to through the elicitor, in the
+	// format's terms, on the start entry: proceed for a call allowed
+	// with rewritten arguments or a reason, reject for one refused.
 	Verdict string `json:"verdict,omitempty"`
 	Reason  string `json:"reason,omitempty"`
 	By      string `json:"by,omitempty"`
@@ -3104,7 +3106,9 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 					return ""
 				case e.Decision.Action != agentturn.Allow:
 					return agentsession.VerdictReject
-				case e.Decision.Args != nil:
+				case e.Decision.Args != nil, e.Decision.Reason != "":
+					// Rewritten, or allowed for a reason, a question
+					// the user answered among them.
 					return agentsession.VerdictProceed
 				}
 				return ""

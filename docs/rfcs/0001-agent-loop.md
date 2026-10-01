@@ -1158,11 +1158,19 @@ the loop rather than holding a tool set of its own, where the policy,
 the events and the record would all be absent. The loop runs the call
 as if the model had asked for it under the call in flight:
 
-- the decision hook decides it, seeing a batch of one at index 0; a
-  hook that defers it refuses it instead, since a nested call cannot be
-  handed to the caller: it belongs to a tool that is running, and the
-  error reads `a nested call cannot be deferred to the caller: ` and
-  the reason. The decision's note and terminate hint are ignored;
+- the decision hook decides it, seeing a batch of one at index 0. A
+  nested call cannot be handed to the caller, since it belongs to a
+  tool that is running, so a deferred one is put to the user through
+  the invoking tool's elicitor when it has one, as a question naming
+  the call, its arguments and the decision's reason, asked on the
+  invoking tool's context so it is filed under that call. An accept
+  allows the call and a decline blocks it, with `declined when asked`
+  and the reason as the refusal's; either is the decision `tool_start`
+  carries, by `human`, an accept with the reason, or `allowed when
+  asked` when there was none. Without an elicitor, or on a cancel or a
+  failure to ask, the hook's deferral refuses the call, and the error
+  reads `a nested call cannot be deferred to the caller: ` and the
+  reason. The decision's note and terminate hint are ignored;
 - `tool_start` and `tool_end` are raised with **parent** naming the
   call that made it, serialised with the run's own events;
 - the after-call hook MAY override the result;
