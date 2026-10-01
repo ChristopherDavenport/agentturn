@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -122,12 +123,9 @@ func TestStartAfterHandoff(t *testing.T) {
 	}
 	billing := agentturn.Config{Name: "billing", Model: &echo.Adapter{}, BeforeModelCall: serves("billing")}
 	lastTransfer := func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
-		for i := len(t) - 1; i >= 0; i-- {
-			if call, ok := t[i].(*openresponses.FunctionCall); ok && call.Name == "transfer_to_billing" {
-				return billing, true
-			}
-		}
-		return agentturn.Config{}, false
+		return HandedTo(t, func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+			return billing, "transferred", call.Name == "transfer_to_billing"
+		})
 	}
 	for _, tc := range []struct {
 		name   string
@@ -166,6 +164,66 @@ func TestStartAfterHandoff(t *testing.T) {
 			}
 			if got := sink.Response().OutputText(); !strings.HasSuffix(got, tc.answer) {
 				t.Errorf("answer = %q", got)
+			}
+		})
+	}
+}
+
+// TestHandoffs pins #190: a transfer call is a handoff only when its
+// output is the transfer tool's own text and the route takes it; a call
+// a guard withheld, a hook blocked, a tool failed on, or the route does
+// not reach is not, and the last handoff is the conversation's.
+func TestHandoffs(t *testing.T) {
+	billing := agentturn.Config{Name: "billing"}
+	refunds := agentturn.Config{Name: "refunds"}
+	agents := map[string]agentturn.Config{"billing": billing, "refunds": refunds}
+	route := func(reachable ...string) Route {
+		return func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+			name := strings.TrimPrefix(call.Name, "transfer_to_")
+			if !slices.Contains(reachable, name) {
+				return agentturn.Config{}, "", false
+			}
+			return agents[name], `{"assistant":"` + name + `"}`, true
+		}
+	}
+	call := func(id, to string) *openresponses.FunctionCall {
+		return &openresponses.FunctionCall{CallID: id, Name: "transfer_to_" + to, Arguments: "{}"}
+	}
+	out := func(id, text string) *openresponses.FunctionCallOutput {
+		return &openresponses.FunctionCallOutput{CallID: id, Output: openresponses.FunctionCallOutputData{Text: text}}
+	}
+	user := openresponses.UserText("I was double charged")
+	for _, tc := range []struct {
+		name  string
+		t     agentturn.Transcript
+		route Route
+		want  []string
+		at    []int
+	}{
+		{"transferred", agentturn.Transcript{user, call("c1", "billing"), out("c1", `{"assistant":"billing"}`)}, route("billing"), []string{"billing"}, []int{2}},
+		{"withheld", agentturn.Transcript{user, call("c1", "billing"), out("c1", agentturn.WithheldCallOutput)}, route("billing"), nil, nil},
+		{"blocked", agentturn.Transcript{user, call("c1", "billing"), out("c1", "Error: blocked by policy")}, route("billing"), nil, nil},
+		{"unanswered", agentturn.Transcript{user, call("c1", "billing")}, route("billing"), nil, nil},
+		{"parts", agentturn.Transcript{user, call("c1", "billing"), &openresponses.FunctionCallOutput{CallID: "c1", Output: openresponses.FunctionCallOutputData{Text: `{"assistant":"billing"}`, Parts: openresponses.Contents{&openresponses.InputText{Text: "x"}}}}}, route("billing"), nil, nil},
+		{"output before the call", agentturn.Transcript{user, out("c1", `{"assistant":"billing"}`), call("c1", "billing")}, route("billing"), nil, nil},
+		{"unreachable", agentturn.Transcript{user, call("c1", "refunds"), out("c1", `{"assistant":"refunds"}`)}, route("billing"), nil, nil},
+		{"not a transfer", agentturn.Transcript{user, &openresponses.FunctionCall{CallID: "c1", Name: "lookup"}, out("c1", `{"assistant":"billing"}`)}, route("billing"), nil, nil},
+		{"two handoffs", agentturn.Transcript{user, call("c1", "billing"), out("c1", `{"assistant":"billing"}`), call("c2", "refunds"), out("c2", `{"assistant":"refunds"}`)}, route("billing", "refunds"), []string{"billing", "refunds"}, []int{2, 4}},
+		{"a later one withheld", agentturn.Transcript{user, call("c1", "billing"), out("c1", `{"assistant":"billing"}`), call("c2", "refunds"), out("c2", agentturn.WithheldCallOutput)}, route("billing", "refunds"), []string{"billing"}, []int{2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var names []string
+			var at []int
+			for _, h := range Handoffs(tc.t, tc.route) {
+				names = append(names, h.To.Name)
+				at = append(at, h.Output)
+			}
+			if !reflect.DeepEqual(names, tc.want) || !reflect.DeepEqual(at, tc.at) {
+				t.Errorf("Handoffs = %v at %v, want %v at %v", names, at, tc.want, tc.at)
+			}
+			cfg, ok := HandedTo(tc.t, tc.route)
+			if want := len(tc.want) > 0; ok != want || (ok && cfg.Name != tc.want[len(tc.want)-1]) {
+				t.Errorf("HandedTo = %q %v", cfg.Name, ok)
 			}
 		})
 	}

@@ -168,17 +168,23 @@ func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*
 // The handoff is found in the input only when the caller sends back
 // what the response held, and the transfer call is in a response only
 // under [WithToolItems]. A host whose handoff tools are named for
-// their destination finds the last one:
+// their destination takes the last transfer that ran, with
+// [HandedTo]: a call is a handoff only when its output is the
+// transfer tool's own text, so one a guard withheld, a hook blocked or
+// the tool failed on is not.
 //
+// The input is the caller's, and a caller can write a transfer call
+// and its output as easily as send back the ones a response held. fn
+// chooses only among the agents the caller may reach directly, as
+// route does here, or checks the call against state the host keeps:
+//
+//	route := func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+//		name := strings.TrimPrefix(call.Name, "transfer_to_")
+//		cfg, ok := reachable[name] // the agents any caller may start at
+//		return cfg, transferText(name), ok
+//	}
 //	responses.WithStart(func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
-//		for i := len(t) - 1; i >= 0; i-- {
-//			if call, ok := t[i].(*openresponses.FunctionCall); ok {
-//				if cfg, ok := agents[strings.TrimPrefix(call.Name, "transfer_to_")]; ok {
-//					return cfg, true
-//				}
-//			}
-//		}
-//		return agentturn.Config{}, false
+//		return responses.HandedTo(t, route)
 //	})
 func WithStart(fn func(ctx context.Context, t agentturn.Transcript) (agentturn.Config, bool)) Option {
 	return func(a *Adapter) { a.start = fn }

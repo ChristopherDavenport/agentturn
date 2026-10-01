@@ -58,6 +58,24 @@ versions may break the API.
   conversation back keeps the tool items, and one that runs each
   `function_call` in an output skips the calls the output already
   answers. (#191)
+- **`front/responses.HandedTo` and `front/a2a.HandedTo` find the agent
+  a conversation was handed to, and `front/a2a` refuses a message
+  carrying a `function_call`.** The function both fronts documented
+  for `WithStart` took any transfer call for a handoff: one the caller
+  wrote, one a guard withheld with `agentturn.WithheldCallOutput`, one
+  a hook blocked. `Handoffs` walks the transfer calls a `Route` names
+  and takes one only when its output is the transfer tool's own text,
+  and `HandedTo` returns the last; front/a2a re-exports both and the
+  types from front/responses, where they live. A message whose data
+  parts decode to a `function_call` is now refused with
+  `a2a.ErrInvalidParams` before any task exists, so the stored
+  conversation holds only the agent's calls; a message that sent one
+  before is now an error. Under front/responses the input is the
+  caller's, and the docs say `WithStart` chooses only among agents the
+  caller may reach directly or checks the call against state the host
+  keeps. A transfer `WithHandoff` declined keeps the tool's text, so a
+  host whose `WithHandoff` declines declines the same calls in the
+  route. (#190)
 
 ## v0.0.14 - 2026-10-01
 

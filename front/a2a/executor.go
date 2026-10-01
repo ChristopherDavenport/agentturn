@@ -162,18 +162,21 @@ func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*
 // executor's. It is how the receiver of a handoff answers the
 // conversation's later messages. The executor keeps no configuration
 // between tasks, so the conversation, which holds the transfer call
-// and its output, says who has it. A host whose handoff tools are
-// named for their destination finds the last one:
+// and its output, says who has it. The stored transcript is the
+// executor's own, and a message may not add a function_call to it, so
+// every transfer call fn sees is one the agent made. A host whose
+// handoff tools are named for their destination takes the last one
+// that ran, with [HandedTo]: a call is a handoff only when its output
+// is the transfer tool's own text, so one a guard withheld, a hook
+// blocked or the tool failed on is not.
 //
+//	route := func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+//		name := strings.TrimPrefix(call.Name, "transfer_to_")
+//		cfg, ok := agents[name]
+//		return cfg, transferText(name), ok
+//	}
 //	a2a.WithStart(func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
-//		for i := len(t) - 1; i >= 0; i-- {
-//			if call, ok := t[i].(*openresponses.FunctionCall); ok {
-//				if cfg, ok := agents[strings.TrimPrefix(call.Name, "transfer_to_")]; ok {
-//					return cfg, true
-//				}
-//			}
-//		}
-//		return agentturn.Config{}, false
+//		return a2a.HandedTo(t, route)
 //	})
 func WithStart(fn func(ctx context.Context, t agentturn.Transcript) (agentturn.Config, bool)) Option {
 	return func(e *Executor) { e.start = fn }
@@ -205,6 +208,15 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	}
 	if len(prompts) == 0 {
 		return fmt.Errorf("%w: message has no usable parts", a2a.ErrInvalidParams)
+	}
+	for i, item := range prompts {
+		// A call is the agent's to make. One a caller wrote would sit in
+		// the stored conversation as the agent's, a transfer WithStart
+		// reads as a handoff among them; only an output answering a
+		// pending call has a use in a message.
+		if _, ok := item.(*openresponses.FunctionCall); ok {
+			return fmt.Errorf("%w: item %d is a function_call; a message may carry function_call_output items answering pending calls, never a call", a2a.ErrInvalidParams, i)
+		}
 	}
 	declared, err := callerTools(reqCtx.Message)
 	if err != nil {

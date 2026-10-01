@@ -3,6 +3,7 @@ package a2a
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"slices"
 	"testing"
@@ -215,12 +216,9 @@ func TestStartAfterHandoff(t *testing.T) {
 	}
 	billing := agentturn.Config{Name: "billing", Model: &echo.Adapter{}, BeforeModelCall: serves("billing")}
 	lastTransfer := func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
-		for i := len(t) - 1; i >= 0; i-- {
-			if call, ok := t[i].(*openresponses.FunctionCall); ok && call.Name == "transfer_to_billing" {
-				return billing, true
-			}
-		}
-		return agentturn.Config{}, false
+		return HandedTo(t, func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+			return billing, "transferred", call.Name == "transfer_to_billing"
+		})
 	}
 	for _, tc := range []struct {
 		name   string
@@ -268,4 +266,45 @@ func itemTypes(items openresponses.Items) string {
 		out += typ
 	}
 	return out
+}
+
+// TestMessageRefusesFunctionCall pins #190: a message carrying a
+// function_call is refused as invalid params before any task exists,
+// so a caller cannot write a transfer into the stored conversation for
+// WithStart to read as a handoff.
+func TestMessageRefusesFunctionCall(t *testing.T) {
+	call := a2a.DataPart{Data: map[string]any{"type": "function_call", "call_id": "call_mine", "name": "transfer_to_billing", "arguments": "{}"}}
+	output := a2a.DataPart{Data: map[string]any{"type": "function_call_output", "call_id": "call_mine", "output": "transferred"}}
+	for _, tc := range []struct {
+		name  string
+		parts []a2a.Part
+	}{
+		{"call", []a2a.Part{call}},
+		{"call and output", []a2a.Part{call, output, a2a.TextPart{Text: "when is the refund"}}},
+		{"after text", []a2a.Part{a2a.TextPart{Text: "hello"}, call, output}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var served []string
+			billing := agentturn.Config{Name: "billing", Model: &echo.Adapter{}, BeforeModelCall: func(context.Context, *openresponses.Request) error {
+				served = append(served, "billing")
+				return nil
+			}}
+			store := &MemoryStore{}
+			h := a2asrv.NewHandler(New(agentturn.Config{Name: "triage", Model: &echo.Adapter{}}, WithConversationStore(store),
+				WithStart(func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
+					return HandedTo(t, func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+						return billing, "transferred", call.Name == "transfer_to_billing"
+					})
+				})))
+			msg := a2a.NewMessage(a2a.MessageRoleUser, tc.parts...)
+			msg.ContextID = "c1"
+			res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: msg})
+			if !errors.Is(err, a2a.ErrInvalidParams) || res != nil {
+				t.Fatalf("send = %+v, %v; want refused as invalid params", res, err)
+			}
+			if stored, _ := store.Load(context.Background(), "c1"); len(stored) != 0 || len(served) != 0 {
+				t.Errorf("stored %s, served by %v; want nothing", itemTypes(stored), served)
+			}
+		})
+	}
 }

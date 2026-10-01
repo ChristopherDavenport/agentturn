@@ -60,7 +60,8 @@
 // function_call items as data parts. The caller answers by sending a
 // message for the same task whose data parts are the function_call_output
 // items, one per pending call and nothing else, and the run continues
-// from there. The transcript in the [ConversationStore] holds the
+// from there. A message never carries a function_call: a call is the
+// agent's to make, and one is refused as invalid params. The transcript in the [ConversationStore] holds the
 // unanswered calls in the meantime, which is the invariant the root
 // package documents for an input-required boundary. A2A's
 // input-required state and agentturn's ReasonInputRequired are the
