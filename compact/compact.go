@@ -196,16 +196,24 @@ type Fold struct {
 	Err error
 }
 
-// WithOnFold sets a function called after every fold attempt, from the
+// WithOnFold adds a function called after every fold attempt, from the
 // goroutine that called Transform and before Transform returns, with
-// the fold that was applied or the failure. An error it returns fails
+// the fold that was applied or the failure. Each WithOnFold adds one
+// more, and they are called in the order they were given, so a
+// recorder and a product's own counter both hear every fold. An error
+// one returns ends the calling: the ones after it are not called for
+// that fold. An error it returns fails
 // the Transform and so the turn, the way a subscriber's error fails a
 // run, so a recorder that could not write the fold stops the run
 // rather than letting the record drift from the request. A fold
 // discarded because another caller folded the same transcript meanwhile
 // is not reported. A recorder registers here; see agentturn/session.
 func WithOnFold(fn func(context.Context, Fold) error) Option {
-	return func(t *Transform) { t.onFold = fn }
+	return func(t *Transform) {
+		if fn != nil {
+			t.onFold = append(t.onFold, fn)
+		}
+	}
 }
 
 // WithSummaryItem sets how [NewLocal] turns the summary text into the
@@ -227,7 +235,7 @@ func WithSummaryItem(fn func(summary string) openresponses.Item) Option {
 // often than one per conversation would, as each forgets the other's.
 type Transform struct {
 	fold        func(ctx context.Context, input openresponses.Items) (folded, error)
-	onFold      func(context.Context, Fold) error
+	onFold      []func(context.Context, Fold) error
 	budget      int
 	keepLast    int
 	model       string
@@ -532,11 +540,9 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	// serialise on the network.
 	f, err := t.fold(ctx, input)
 	if err != nil {
-		if t.onFold != nil {
-			failed := Fold{Split: split, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Err: err}
-			if rerr := t.onFold(ctx, failed); rerr != nil {
-				return nil, fmt.Errorf("compact: on-fold: %w", rerr)
-			}
+		failed := Fold{Split: split, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Err: err}
+		if rerr := t.report(ctx, failed); rerr != nil {
+			return nil, rerr
 		}
 		if errors.Is(err, ErrSummaryTooLarge) || errors.Is(err, ErrSummaryIncomplete) {
 			// The summary would have grown the request or lost part of
@@ -573,15 +579,23 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	}
 	out := t.join(items, split)
 	t.mu.Unlock()
-	if t.onFold != nil {
-		// The fold's own output and the pinned items, as locals: the
-		// memory they were written to belongs to the lock that was just
-		// released.
-		if err := t.onFold(ctx, Fold{Split: split, First: first, Output: f.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request}); err != nil {
-			return nil, fmt.Errorf("compact: on-fold: %w", err)
-		}
+	// The fold's own output and the pinned items, as locals: the memory
+	// they were written to belongs to the lock that was just released.
+	if err := t.report(ctx, Fold{Split: split, First: first, Output: f.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request}); err != nil {
+		return nil, err
 	}
 	return out, nil
+}
+
+// report calls each [WithOnFold] function with f in order, stopping at
+// the first error.
+func (t *Transform) report(ctx context.Context, f Fold) error {
+	for _, fn := range t.onFold {
+		if err := fn(ctx, f); err != nil {
+			return fmt.Errorf("compact: on-fold: %w", err)
+		}
+	}
+	return nil
 }
 
 // backOff reports whether a fold of items at split is skipped because

@@ -3,6 +3,7 @@ package compact
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -702,6 +703,45 @@ func TestOnFoldReportsEveryAttempt(t *testing.T) {
 	}
 	if len(folds) != 1 || folds[0].Summary == nil || folds[0].Summary.ItemType() != openresponses.ItemTypeCompaction {
 		t.Errorf("endpoint fold = %+v", folds)
+	}
+}
+
+// TestOnFoldAdds is agentkit#38: a product's WithOnFold beside one a
+// kit adds is still called, in order, and an error stops the ones
+// after it.
+func TestOnFoldAdds(t *testing.T) {
+	boom := errors.New("cannot record")
+	for _, tc := range []struct {
+		name    string
+		fail    map[string]bool
+		wantErr bool
+		want    []string
+	}{
+		{"both called in order", nil, false, []string{"product", "kit"}},
+		{"first error stops the rest", map[string]bool{"product": true}, true, []string{"product"}},
+		{"last error fails the fold", map[string]bool{"kit": true}, true, []string{"product", "kit"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls []string
+			on := func(name string) func(context.Context, Fold) error {
+				return func(context.Context, Fold) error {
+					calls = append(calls, name)
+					if tc.fail[name] {
+						return boom
+					}
+					return nil
+				}
+			}
+			tr := NewLocal(&summarizer{reply: "the gist"}, WithBudget(5), WithKeepLast(1), WithEstimator(count),
+				WithOnFold(on("product")), WithOnFold(nil), WithOnFold(on("kit")))
+			_, err := tr.Transform(context.Background(), items(6))
+			if got := errors.Is(err, boom); got != tc.wantErr {
+				t.Errorf("err = %v, want boom: %v", err, tc.wantErr)
+			}
+			if !slices.Equal(calls, tc.want) {
+				t.Errorf("calls = %v, want %v", calls, tc.want)
+			}
+		})
 	}
 }
 
