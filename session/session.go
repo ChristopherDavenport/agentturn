@@ -217,7 +217,9 @@
 //     carrying the error and what the fold's calls did (the number of
 //     attempts, the last one's request hash, response ID, usage and
 //     output item types), so an abort or a failure during the fold
-//     leaves a trace that says what the model answered.
+//     leaves a trace that says what the model answered. One the
+//     transform backs off from also carries its split and prefix hash,
+//     which [CompactOptions] seeds a transform in another process with.
 //   - a child run observed through [Recorder.Observe]: a session of its
 //     own whose ID is derived from the parent's and the call's as the
 //     format recommends, with parent_session, spawned_by and the same
@@ -390,11 +392,20 @@ const FailedFoldNS = "agentturn:compaction_failed"
 // compaction entry's [FoldMember] carries (request_hash, response_id,
 // model) and the types of the items it answered, so a reader can tell
 // a model that answered with no text, or with too much, from a call
-// that never completed.
+// that never completed. For a fold the transform backs off from, it
+// carries the split and the prefix hash the transform remembers, which
+// [LastFailedFold] reads back so a transform in another process backs
+// off too.
 type FailedFold struct {
 	Error        string `json:"error"`
 	TokensBefore int    `json:"tokens_before,omitempty"`
 	Attempts     int    `json:"attempts,omitempty"`
+	// Split is the fold's compact.Fold.Split, and PrefixHash its
+	// compact.Fold.PrefixHash, set only for a fold the transform backs
+	// off from: compact.PrefixHash of the transcript's first Split
+	// items, as the transform was given them.
+	Split      int    `json:"split,omitempty"`
+	PrefixHash string `json:"prefix_hash,omitempty"`
 	FoldCall
 	Usage       *openresponses.Usage `json:"usage,omitempty"`
 	OutputTypes []string             `json:"output_types,omitempty"`
@@ -3536,7 +3547,11 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 		// failed all the same, and its entry is written without the
 		// hash rather than not at all.
 		call, _ := foldCall(f)
-		raw, err := json.Marshal(FailedFold{Error: f.Err.Error(), TokensBefore: f.TokensBefore, Attempts: f.Attempts, FoldCall: call, Usage: f.Usage, OutputTypes: f.OutputTypes})
+		data := FailedFold{Error: f.Err.Error(), TokensBefore: f.TokensBefore, Attempts: f.Attempts, FoldCall: call, Usage: f.Usage, OutputTypes: f.OutputTypes}
+		if f.PrefixHash != "" {
+			data.Split, data.PrefixHash = f.Split, f.PrefixHash
+		}
+		raw, err := json.Marshal(data)
 		if err != nil {
 			return fmt.Errorf("session: encode failed fold: %w", err)
 		}

@@ -100,6 +100,24 @@ func WithKeepLast(n int) Option { return func(t *Transform) { t.keepLast = n } }
 // over budget.
 func WithMinFold(tokens int) Option { return func(t *Transform) { t.minFold = tokens } }
 
+// WithFailedFold seeds the transform with a failed fold it backs off
+// from, as though it had made it: the fold reported with [Fold.Split]
+// split, [Fold.PrefixHash] prefixHash and [Fold.TokensBefore] tokens.
+// A process that restarts, or resumes a conversation in another, passes
+// the last such fold its record holds, so it does not ask again for a
+// summary that already failed; agentturn/session reads it from the
+// record. A transcript that does not begin with that prefix ignores
+// it, and an empty prefixHash or a negative split seeds nothing. The
+// next fold the transform backs off from replaces it, as in one
+// process.
+func WithFailedFold(split int, prefixHash string, tokens int) Option {
+	return func(t *Transform) {
+		if prefixHash != "" && split >= 0 {
+			t.failLen, t.failHash, t.failTokens = split, prefixHash, tokens
+		}
+	}
+}
+
 // WithPin keeps the items fn reports through a fold: whatever part of
 // the folded prefix they were in, they follow the summary in the
 // request, in their order, and the fold that summarised them
@@ -206,6 +224,12 @@ type Fold struct {
 	// it as the fold's own call. nil for [New], whose compaction
 	// request is not a Request.
 	Request *openresponses.Request
+	// PrefixHash is the [PrefixHash] of the transcript's first Split
+	// items when the fold failed and the transform backs off from that
+	// prefix, as [Transform.Transform] describes, and empty otherwise:
+	// with Split and TokensBefore, what [WithFailedFold] takes to back
+	// off in another process.
+	PrefixHash string
 	// Err is set when the fold failed; Transform returns it, save for
 	// [ErrSummaryTooLarge], [ErrSummaryIncomplete] and
 	// [ErrSummaryNoText], after which Transform sends the transcript
@@ -581,22 +605,24 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	f, err := t.fold(ctx, input)
 	if err != nil {
 		failed := Fold{Split: split, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Err: err}
+		if unfolded(err) {
+			failed.PrefixHash = PrefixHash(items[:split])
+		}
 		if rerr := t.report(ctx, failed); rerr != nil {
 			return nil, rerr
 		}
-		if unfolded(err) {
-			// There was no summary, or it would have grown the request
-			// or lost part of what it folds; the request goes as it
-			// was, and this prefix is not asked about again until it
-			// has grown.
-			if h := hash(items[:split]); h != "" {
-				t.mu.Lock()
-				t.failLen, t.failHash, t.failTokens = split, h, tokens
-				t.mu.Unlock()
-			}
-			return view, nil
+		if !unfolded(err) {
+			return nil, err
 		}
-		return nil, err
+		// There was no summary, or it would have grown the request or
+		// lost part of what it folds; the request goes as it was, and
+		// this prefix is not asked about again until it has grown.
+		if failed.PrefixHash != "" {
+			t.mu.Lock()
+			t.failLen, t.failHash, t.failTokens = split, failed.PrefixHash, tokens
+			t.mu.Unlock()
+		}
+		return view, nil
 	}
 
 	t.mu.Lock()
@@ -613,7 +639,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 		first = items[split]
 	}
 	t.prefixLen = split
-	t.prefixHash = hash(items[:split])
+	t.prefixHash = PrefixHash(items[:split])
 	t.output = append(append(openresponses.Items(nil), f.output...), pinned...)
 	if f.summary != nil {
 		t.last = f.summary
@@ -649,7 +675,7 @@ func (t *Transform) backOff(items agentturn.Transcript, split, tokens int) bool 
 	if split >= t.failLen+max(t.keepLast, 1) || tokens >= t.failTokens+max(t.budget/4, 1) {
 		return false
 	}
-	return hash(items[:t.failLen]) == t.failHash
+	return PrefixHash(items[:t.failLen]) == t.failHash
 }
 
 // pinned returns the items of the folded prefix that the pin keeps, in
@@ -671,7 +697,7 @@ func (t *Transform) pinned(prefix agentturn.Transcript) openresponses.Items {
 // view returns the transcript with the remembered fold applied, and how
 // many items it covers; zero when the memory no longer matches.
 func (t *Transform) view(items agentturn.Transcript) (agentturn.Transcript, int) {
-	if t.prefixHash != "" && t.prefixLen > 0 && len(items) >= t.prefixLen && hash(items[:t.prefixLen]) == t.prefixHash {
+	if t.prefixHash != "" && t.prefixLen > 0 && len(items) >= t.prefixLen && PrefixHash(items[:t.prefixLen]) == t.prefixHash {
 		return t.join(items, t.prefixLen), t.prefixLen
 	}
 	t.prefixLen, t.prefixHash, t.output = 0, "", nil
@@ -712,9 +738,15 @@ func (t *Transform) split(items agentturn.Transcript) int {
 	return split
 }
 
-// hash identifies a prefix; an empty result means no memory, never a
-// match.
-func hash(items agentturn.Transcript) string {
+// PrefixHash identifies a prefix of a transcript, the way the transform
+// recognises a transcript it folded or failed to fold: the SHA-256, in
+// lowercase hex, of the JSON array encoding/json makes of the items,
+// each as openresponses marshals it. It is empty, which never matches,
+// when the items do not marshal. It is what [Fold.PrefixHash] reports
+// and [WithFailedFold] takes, so a session record keeps it; a change to
+// an item's encoding in a later openresponses only makes a remembered
+// prefix not match, and the transcript is folded as usual.
+func PrefixHash(items agentturn.Transcript) string {
 	data, err := json.Marshal(items)
 	if err != nil {
 		return ""

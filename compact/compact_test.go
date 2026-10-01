@@ -534,6 +534,82 @@ func TestLocalSummaryBackOffMargins(t *testing.T) {
 	}
 }
 
+func TestFailedFoldSeedsAnotherTransform(t *testing.T) {
+	// A fold of twelve items fails in one transform; another, seeded
+	// with what it reported, backs off as the first would have.
+	base := items(12)
+	s := &summarizer{reply: "They talked about things.", bloat: 1000}
+	var failed Fold
+	first := NewLocal(s, WithBudget(400), WithKeepLast(4),
+		WithOnFold(func(_ context.Context, f Fold) error { failed = f; return nil }))
+	if _, err := first.Transform(context.Background(), base); err != nil || !errors.Is(failed.Err, ErrSummaryTooLarge) {
+		t.Fatalf("err = %v, fold = %+v", err, failed)
+	}
+	if failed.PrefixHash == "" || failed.PrefixHash != PrefixHash(base[:failed.Split]) {
+		t.Fatalf("fold prefix hash = %q for split %d", failed.PrefixHash, failed.Split)
+	}
+	seed := WithFailedFold(failed.Split, failed.PrefixHash, failed.TokensBefore)
+	grown := func(extra ...openresponses.Item) agentturn.Transcript {
+		return append(append(agentturn.Transcript(nil), base...), extra...)
+	}
+	cases := []struct {
+		name  string
+		seed  Option
+		next  agentturn.Transcript
+		asked bool
+	}{
+		{"the same transcript", seed, base, false},
+		{"one short item more", seed, grown(openresponses.UserText("ok")), false},
+		{"four items more", seed, grown(openresponses.UserText("a"), openresponses.UserText("b"), openresponses.UserText("c"), openresponses.UserText("d")), true},
+		{"another conversation", seed, items(13)[1:], true},
+		{"no seed", nil, base, true},
+		{"an empty hash", WithFailedFold(failed.Split, "", failed.TokensBefore), base, true},
+		{"a negative split", WithFailedFold(-1, failed.PrefixHash, failed.TokensBefore), base, true},
+		{"a split past the transcript", WithFailedFold(len(base)+1, failed.PrefixHash, failed.TokensBefore), base, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &summarizer{reply: "They talked about things.", bloat: 1000}
+			opts := []Option{WithBudget(400), WithKeepLast(4)}
+			if tc.seed != nil {
+				opts = append(opts, tc.seed)
+			}
+			if _, err := NewLocal(s, opts...).Transform(context.Background(), tc.next); err != nil {
+				t.Fatal(err)
+			}
+			if asked := len(s.reqs) > 0; asked != tc.asked {
+				t.Errorf("asked = %v, want %v", asked, tc.asked)
+			}
+		})
+	}
+}
+
+func TestFoldPrefixHash(t *testing.T) {
+	// Only a fold the transform backs off from carries the hash.
+	cases := []struct {
+		name string
+		s    *summarizer
+		want bool
+	}{
+		{"applied", &summarizer{reply: "gist"}, false},
+		{"the call fails", &summarizer{fail: true}, false},
+		{"no text", &summarizer{calls: 1000}, true},
+		{"incomplete", &summarizer{reply: "gist", cut: 1000}, true},
+		{"too large", &summarizer{reply: "They talked about things.", bloat: 1000}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var folds []Fold
+			tr := NewLocal(tc.s, WithBudget(400), WithKeepLast(4),
+				WithOnFold(func(_ context.Context, f Fold) error { folds = append(folds, f); return nil }))
+			_, _ = tr.Transform(context.Background(), items(12))
+			if len(folds) != 1 || (folds[0].PrefixHash != "") != tc.want {
+				t.Fatalf("folds = %+v", folds)
+			}
+		})
+	}
+}
+
 func TestLocalSummaryOfATinyPrefix(t *testing.T) {
 	// A one-word prefix is smaller than any summary item, wrapper and
 	// all; the summary's text is what is weighed, so a terse one folds

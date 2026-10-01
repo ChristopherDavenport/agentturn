@@ -356,7 +356,9 @@ prefix again until it has grown.
 `WithMinFold(tokens)` leaves a prefix smaller than `tokens` unfolded,
 for a transcript over budget because of its recent tail; `NewLocal`
 defaults it to twice an empty summary item, since a smaller prefix is
-not worth a summary call.
+not worth a summary call. After a restart, `session.CompactOptions(s)`
+seeds a transform with the last fold the record says it backed off
+from, so a new process does not ask again for a summary that failed.
 
 `WithOnFold` reports every fold, applied or failed, with the index at
 which the transcript was split, so a recorder can write it. Each

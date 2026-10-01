@@ -125,6 +125,22 @@ versions may break the API.
   item, about 58 tokens with the default estimator and summary item;
   `New` defaults it to zero. Pass `WithMinFold(0)` for the old
   behaviour (#204).
+- **The back-off after a failed fold survives a restart.** The memory
+  of a fold that failed with an unfolded send lived only in the
+  `Transform`, so a process that restarted, or resumed the session in
+  another, asked again for the summary that had failed: two summary
+  calls and another `compaction_failed` on every firing of a scheduled
+  routine or every restart of a crash loop. `compact.Fold` now reports
+  `PrefixHash` for such a fold, `compact.PrefixHash` says what it
+  hashes, and `compact.WithFailedFold(split, prefixHash, tokens)` seeds
+  a transform with one. The recorder writes `split` and `prefix_hash`
+  on the `agentturn:compaction_failed` entry, `session.LastFailedFold`
+  reads the last one on the path back, and `session.CompactOptions`
+  returns the option a host resuming a session passes to
+  `compact.NewLocal`, as `session.AgentOptions` is for the agent. A
+  transcript that no longer begins with the prefix ignores it; so does
+  the first resume after a fold applied before the failed one, whose
+  context the compaction shortened (#194).
 
 ## v0.0.14 - 2026-10-01
 

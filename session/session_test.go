@@ -1322,6 +1322,11 @@ func TestFailedFoldLeavesATrace(t *testing.T) {
 			if data.Attempts != tc.wantAttempts || data.RequestHash == "" || data.Model != "small" {
 				t.Errorf("failed fold call = %+v", data)
 			}
+			// Only a fold the transform backs off from, one that left the
+			// run going, carries what a restart backs off with.
+			if backsOff := tc.wantReason == agentturn.ReasonDone; (data.PrefixHash != "") != backsOff || (data.Split != 0) != backsOff {
+				t.Errorf("failed fold split = %d, prefix hash = %q", data.Split, data.PrefixHash)
+			}
 			if (data.ResponseID != "") != tc.wantResponse || strings.Join(data.OutputTypes, ",") != tc.wantTypes {
 				t.Errorf("failed fold response = %q, output types = %q", data.ResponseID, data.OutputTypes)
 			}
