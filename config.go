@@ -502,8 +502,9 @@ type OutputInfo struct {
 	// Message is the message as the model produced it.
 	Message *openresponses.Message
 	// Output holds the items of the response that precede the message,
-	// in output order: a reasoning item, a message the model spoke
-	// before this one. Do not mutate them.
+	// in the order they opened, which is output order on a stream that
+	// gives each item an index of its own: a reasoning item, a message
+	// the model spoke before this one. Do not mutate them.
 	Output openresponses.Items
 }
 

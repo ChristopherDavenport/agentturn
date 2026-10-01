@@ -556,16 +556,34 @@ type runner struct {
 	// are appended when the attempt commits and dropped when it ends
 	// without committing.
 	held []heldItem
-	// callIDs maps the output index of every function call the attempt
-	// in flight opened or completed, the held ones included, to the call
-	// ID the loop decided for it: the model's when it names no other
-	// call, one of the loop's own when it is empty or taken. callItems
-	// maps the item ID of each such call that has one to the same ID,
-	// and names the call when it has one: a stream that opens a second
-	// call at the index of the first, as Ollama's does, gives each its
-	// own.
-	callIDs   map[int]string
+	// callAt maps the output index of every function call the attempt
+	// in flight opened or completed, the held ones included, to the
+	// last call there and the call ID the loop decided for it: the
+	// model's when it names no other call, one of the loop's own when
+	// it is empty or taken. callItems maps the item ID of each such
+	// call that has one to the same ID, and names the call when it has
+	// one: a stream that opens a second call at the index of the first,
+	// as Ollama's does, gives each its own. decided holds every ID
+	// decided in the attempt, which a later call may not take.
+	callAt    map[int]callSlot
 	callItems map[string]string
+	decided   map[string]bool
+	// opened are the items of the attempt in flight in the order they
+	// opened, each with its output index and, once it is done, the item
+	// as completed, so the guard sees an earlier item a stream that
+	// reuses an index no longer holds there.
+	opened []openedItem
+}
+
+// callSlot is the last function call opened at an output index: the
+// call ID decided for it and the item ID it carried, "" for none.
+type callSlot struct{ id, itemID string }
+
+// openedItem is an item of the attempt in flight: its output index,
+// and the item as completed once it is done.
+type openedItem struct {
+	index int
+	done  openresponses.Item
 }
 
 // heldItem is a completed item waiting for its attempt to commit.
@@ -1131,7 +1149,7 @@ func sleep(ctx context.Context, d time.Duration) error {
 func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *openresponses.Response, committed bool, err error) {
 	var acc openresponses.Accumulator
 	var halt *errStop
-	r.held, r.callIDs, r.callItems = nil, nil, nil
+	r.held, r.callAt, r.callItems, r.decided, r.opened = nil, nil, nil, nil, nil
 	for ev, err := range openresponses.Events(ctx, r.cfg.Model, req) {
 		if halt != nil {
 			// OutputGuard withheld a message: the rest of the response
@@ -1240,6 +1258,7 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 	switch e := ev.(type) {
 	case *openresponses.OutputItemAddedEvent:
 		item := acc.Response().Output[e.OutputIndex]
+		r.opened = append(r.opened, openedItem{index: e.OutputIndex})
 		if call, ok := item.(*openresponses.FunctionCall); ok {
 			// The call's ID is decided as it opens, so its item_start,
 			// every item_update and its item_end carry the same one.
@@ -1259,21 +1278,33 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		item := e.Item
 		modelCallID := ""
 		if call, ok := item.(*openresponses.FunctionCall); ok {
-			if _, opened := r.decidedCallID(call, e.OutputIndex); !opened {
+			if id, opened := r.decidedCallID(call, e.OutputIndex); !opened {
 				// A call first seen as it completes, on a stream that
 				// sends no output_item.added for it.
 				r.decideCallID(call, e.OutputIndex)
+			} else if call.ID != "" && r.callAt[e.OutputIndex].itemID == "" {
+				// Opened with no item ID and done with one: the ID
+				// names it from here, in the response the turn acts on
+				// among the rest.
+				r.callAt[e.OutputIndex] = callSlot{id: id, itemID: call.ID}
+				r.callItems[call.ID] = id
 			}
 			if item = r.withCallID(call, e.OutputIndex); item != openresponses.Item(call) {
 				modelCallID = call.CallID
 			}
 		}
+		self := r.openedAt(e.OutputIndex)
 		if m, ok := item.(*openresponses.Message); ok && r.cfg.OutputGuard != nil {
-			// The guard sees the message before anything keeps it.
+			// The guard sees the message before anything keeps it,
+			// after the items that opened before it.
 			var before openresponses.Items
-			if cur := acc.Response(); cur != nil && e.OutputIndex <= len(cur.Output) {
-				for i, prior := range cur.Output[:e.OutputIndex] {
-					before = append(before, r.withCallID(prior, i))
+			cur := acc.Response()
+			for _, prior := range r.opened[:self] {
+				switch {
+				case prior.done != nil:
+					before = append(before, prior.done)
+				case cur != nil && prior.index < len(cur.Output):
+					before = append(before, r.withCallID(cur.Output[prior.index], prior.index))
 				}
 			}
 			replacement, err := r.cfg.OutputGuard(r.ctx, OutputInfo{RunID: r.runID, Turn: r.turn, ResponseID: responseID, Message: m, Output: before})
@@ -1289,6 +1320,7 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 				item = replacement
 			}
 		}
+		r.opened[self].done = item
 		if !committed {
 			// Nothing commits the attempt yet, so the item waits: a
 			// failure now is retried and leaves no trace.
@@ -1309,8 +1341,9 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 
 // decideCallID decides the call ID of the function call at index of
 // the attempt in flight, given the ID the model sent, and records it in
-// callIDs and, when the call has an item ID, callItems: the model's, or one of the loop's own when the model gave
-// none, or gave one a call in the transcript already has, one another
+// callAt, decided and, when the call has an item ID, callItems: the
+// model's, or one of the loop's own when the model gave none, or gave
+// one a call in the transcript already has, one another
 // call of the attempt took, held or not, or one the agent or the run's
 // context reserved. A call ID names one call, since an output, a
 // pending list and the session record name the call by it alone. The
@@ -1322,40 +1355,41 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 // carry one ID; a call the stream never opened is decided when it
 // completes.
 func (r *runner) decideCallID(call *openresponses.FunctionCall, index int) {
-	if r.callIDs == nil {
-		r.callIDs, r.callItems = map[int]string{}, map[string]string{}
+	if r.callAt == nil {
+		r.callAt, r.callItems, r.decided = map[int]callSlot{}, map[string]string{}, map[string]bool{}
 	}
 	id := call.CallID
 	if r.callIDTaken(id) {
 		id = openresponses.NewID(callIDPrefix(id))
 	}
-	r.callIDs[index] = id
+	r.callAt[index] = callSlot{id: id, itemID: call.ID}
+	r.decided[id] = true
 	if call.ID != "" {
 		r.callItems[call.ID] = id
 	}
 }
 
-// decidedCallID returns the call ID decided for call, found by its item
-// ID when it has one and by index, its output index, when it has none.
+// decidedCallID returns the call ID decided for call: by its item ID
+// when that names a call of the attempt, and otherwise by index, its
+// output index, when the last call opened there carried no item ID or
+// call carries none, which is the same call on a stream that sends the
+// item ID on one of its events alone.
 func (r *runner) decidedCallID(call *openresponses.FunctionCall, index int) (string, bool) {
-	if call.ID != "" {
-		id, ok := r.callItems[call.ID]
-		return id, ok
+	if id, ok := r.callItems[call.ID]; ok && call.ID != "" {
+		return id, true
 	}
-	id, ok := r.callIDs[index]
-	return id, ok
+	slot, ok := r.callAt[index]
+	if !ok || (call.ID != "" && slot.itemID != "") {
+		return "", false
+	}
+	return slot.id, true
 }
 
 // callIDTaken reports whether a call the model makes may not keep id.
-// The calls the attempt held are in callIDs, not yet in the transcript.
+// The calls the attempt held are in decided, not yet in the transcript.
 func (r *runner) callIDTaken(id string) bool {
-	if id == "" || r.reserved[id] || r.ctxReserved[id] {
+	if id == "" || r.reserved[id] || r.ctxReserved[id] || r.decided[id] {
 		return true
-	}
-	for _, taken := range r.callIDs {
-		if taken == id {
-			return true
-		}
 	}
 	for _, item := range r.transcript {
 		if c, ok := item.(*openresponses.FunctionCall); ok && c.CallID == id {
@@ -1404,6 +1438,18 @@ func callIDPrefix(id string) string {
 		return '_'
 	}, id)
 	return prefix[:min(len(prefix), maxCallIDPrefix)]
+}
+
+// openedAt returns the position in opened of the item that last opened
+// at index, adding one for an item the stream never opened.
+func (r *runner) openedAt(index int) int {
+	for i := len(r.opened) - 1; i >= 0; i-- {
+		if r.opened[i].index == index && r.opened[i].done == nil {
+			return i
+		}
+	}
+	r.opened = append(r.opened, openedItem{index: index})
+	return len(r.opened) - 1
 }
 
 // renameCalls gives the function calls of a response the call IDs

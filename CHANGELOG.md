@@ -19,8 +19,11 @@ versions may break the API.
   0.23's `/v1/responses` does for parallel calls, ran two calls under
   the second's ID, with one call's output given to the other; under a
   session recorder the run failed at the second output. A call is now
-  known by its item ID when it has one, and by its output index only
-  when it has none (#198).
+  known by its item ID, and by its output index when the event naming
+  it carries none, so a call opened without an item ID and completed
+  with one keeps the ID it opened with. The output guard sees every
+  item that opened before the message, a call an index no longer
+  holds among them (#198).
 - **`RunEnd.Answer` looks past extension items after the final
   message.** An adapter that writes a namespaced item once the text is
   complete, such as a text-call parser's raw text, put it after the

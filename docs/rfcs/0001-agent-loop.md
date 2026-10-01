@@ -980,9 +980,11 @@ A conforming loop holds these over every run, however it ends:
   every later request carry the new one, so a consumer sees one ID for
   the call from the moment it opens and the provider is sent the ID
   the record holds. The `item_end` keeps the model's ID beside the
-  item. A call is known by its item ID when it has one and by its
-  output index when it has none, so a stream that opens a second call
-  at the output index of the first still gives each its own ID. The
+  item. A call is known by its item ID, and by its output index when
+  the event naming it carries none, so a stream that opens a second
+  call at the output index of the first still gives each its own ID,
+  and a call opened without an item ID and completed with one keeps
+  the ID it opened with. The
   IDs a transcript held stay
   reserved when `SetTranscript` replaces it. A host that seeds the
   loop with less than a whole session, a context after a fold or a

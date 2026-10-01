@@ -1481,28 +1481,50 @@ func TestReservedCallIDs(t *testing.T) {
 // entry of calls, each with its own text, and answers with nothing on
 // the next. With atZero it streams every call at output_index 0, one
 // after the other, as Ollama's /v1/responses does, while the response
-// it completes with holds them at their own positions; with noItemIDs
-// the calls carry no item ID.
+// it completes with holds them at their own positions. noID says where
+// the calls carry no item ID: on output_item.added, on
+// output_item.done, in the response, or a combination. A say ends the
+// first turn with a message holding it, after the calls.
 type reusedIndexModel struct {
-	calls            []string
-	atZero, noItemID bool
-	turns            int
+	calls  []string
+	say    string
+	atZero bool
+	noID   idPlaces
+	turns  int
 }
+
+// idPlaces names the events of a stream a call's item ID is left off.
+type idPlaces struct{ added, done, response bool }
 
 func (m *reusedIndexModel) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
 	m.turns++
+	// strip returns item, or a copy with no item ID when off is set, so
+	// the emitter's own item keeps its ID for the next event.
+	strip := func(item openresponses.Item, off bool) openresponses.Item {
+		call, ok := item.(*openresponses.FunctionCall)
+		if !ok || !off {
+			return item
+		}
+		bare := *call
+		bare.ID = ""
+		return &bare
+	}
 	rewrite := openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
 		switch e := ev.(type) {
 		case *openresponses.OutputItemAddedEvent:
-			m.rewriteItem(e.Item)
+			copied := *e
+			copied.Item = strip(e.Item, m.noID.added)
 			if m.atZero {
-				e.OutputIndex = 0
+				copied.OutputIndex = 0
 			}
+			ev = &copied
 		case *openresponses.OutputItemDoneEvent:
-			m.rewriteItem(e.Item)
+			copied := *e
+			copied.Item = strip(e.Item, m.noID.done)
 			if m.atZero {
-				e.OutputIndex = 0
+				copied.OutputIndex = 0
 			}
+			ev = &copied
 		case *openresponses.FunctionCallArgumentsDeltaEvent:
 			if m.atZero {
 				e.OutputIndex = 0
@@ -1511,10 +1533,26 @@ func (m *reusedIndexModel) CreateStream(_ context.Context, req openresponses.Req
 			if m.atZero {
 				e.OutputIndex = 0
 			}
+		case *openresponses.ContentPartAddedEvent:
+			if m.atZero {
+				e.OutputIndex = 0
+			}
+		case *openresponses.ContentPartDoneEvent:
+			if m.atZero {
+				e.OutputIndex = 0
+			}
+		case *openresponses.OutputTextDeltaEvent:
+			if m.atZero {
+				e.OutputIndex = 0
+			}
+		case *openresponses.OutputTextDoneEvent:
+			if m.atZero {
+				e.OutputIndex = 0
+			}
 		}
 		if resp, ok := openresponses.TerminalResponse(ev); ok {
-			for _, item := range resp.Output {
-				m.rewriteItem(item)
+			for i, item := range resp.Output {
+				resp.Output[i] = strip(item, m.noID.response)
 			}
 		}
 		return sink.Send(ev)
@@ -1533,14 +1571,20 @@ func (m *reusedIndexModel) CreateStream(_ context.Context, req openresponses.Req
 				return err
 			}
 		}
+		if m.say != "" {
+			w, err := em.Message(openresponses.PhaseFinalAnswer)
+			if err != nil {
+				return err
+			}
+			if err := w.Text(m.say); err != nil {
+				return err
+			}
+			if err := w.Close(); err != nil {
+				return err
+			}
+		}
 	}
 	return em.Complete()
-}
-
-func (m *reusedIndexModel) rewriteItem(item openresponses.Item) {
-	if call, ok := item.(*openresponses.FunctionCall); ok && m.noItemID {
-		call.ID = ""
-	}
 }
 
 // TestCallsAtOneOutputIndex pins that a call ID is decided per call
@@ -1548,21 +1592,27 @@ func (m *reusedIndexModel) rewriteItem(item openresponses.Item) {
 // is dispatched under its own ID and answered with its own output, as
 // it is on a stream that keeps the indexes apart.
 func TestCallsAtOneOutputIndex(t *testing.T) {
+	all := idPlaces{added: true, done: true, response: true}
 	cases := []struct {
-		name     string
-		calls    []string
-		atZero   bool
-		noItemID bool
+		name   string
+		calls  []string
+		atZero bool
+		noID   idPlaces
 	}{
 		{name: "own indexes", calls: []string{"call_a", "call_b"}},
-		{name: "own indexes, no item IDs", calls: []string{"call_a", "call_b"}, noItemID: true},
+		{name: "own indexes, no item IDs", calls: []string{"call_a", "call_b"}, noID: all},
+		{name: "own indexes, item IDs on done alone", calls: []string{"call_a", "call_b"}, noID: idPlaces{added: true}},
+		{name: "own indexes, item IDs on added alone", calls: []string{"call_a", "call_b"}, noID: idPlaces{done: true}},
+		{name: "own indexes, item IDs in the response alone", calls: []string{"call_a", "call_b"}, noID: idPlaces{added: true, done: true}},
 		{name: "one index", calls: []string{"call_a", "call_b"}, atZero: true},
 		{name: "one index, three calls", calls: []string{"call_a", "call_b", "call_c"}, atZero: true},
 		{name: "one index, one call ID", calls: []string{"call_a", "call_a"}, atZero: true},
+		{name: "one index, item IDs on done alone", calls: []string{"call_a", "call_b"}, atZero: true, noID: idPlaces{added: true}},
+		{name: "one index, one call ID, item IDs on done alone", calls: []string{"call_a", "call_a"}, atZero: true, noID: idPlaces{added: true}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := &reusedIndexModel{calls: tc.calls, atZero: tc.atZero, noItemID: tc.noItemID}
+			m := &reusedIndexModel{calls: tc.calls, atZero: tc.atZero, noID: tc.noID}
 			events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")},
 				Config{Model: m, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}}))
 			if err != nil || end.Reason != ReasonDone {
@@ -1594,16 +1644,75 @@ func TestCallsAtOneOutputIndex(t *testing.T) {
 					t.Errorf("output of %s (%s) = %q, want %q", id, a, outputs[id], want)
 				}
 			}
+			// A consumer sees one ID for a call from the moment it
+			// opens, and a call whose ID no other call took keeps it.
+			var started, ended, order []string
 			dispatched := map[string]int{}
 			for _, ev := range events {
-				if e, ok := ev.(*ToolDispatch); ok {
+				switch e := ev.(type) {
+				case *ItemStart:
+					if call, ok := e.Item.(*openresponses.FunctionCall); ok {
+						started = append(started, call.CallID)
+					}
+				case *ItemEnd:
+					if call, ok := e.Item.(*openresponses.FunctionCall); ok {
+						ended = append(ended, call.CallID)
+					}
+				case *ToolDispatch:
 					dispatched[e.CallID]++
 				}
+			}
+			for _, item := range end.Items {
+				if call, ok := item.(*openresponses.FunctionCall); ok {
+					order = append(order, call.CallID)
+				}
+			}
+			if !slices.Equal(started, ended) || !slices.Equal(ended, order) {
+				t.Errorf("item_start %v, item_end %v, transcript %v", started, ended, order)
+			}
+			if unique := len(slices.Compact(slices.Sorted(slices.Values(tc.calls)))) == len(tc.calls); unique && !slices.Equal(order, tc.calls) {
+				t.Errorf("calls renamed: %v, model's %v", order, tc.calls)
 			}
 			for id := range args {
 				if dispatched[id] != 1 {
 					t.Errorf("%s dispatched %d times: %v", id, dispatched[id], dispatched)
 				}
+			}
+		})
+	}
+}
+
+// TestGuardSeesCallsAtOneOutputIndex pins that OutputGuard sees every
+// item that opened before the message, each call under the ID the loop
+// decided, on a stream that opens them all at output_index 0 as on one
+// that keeps the indexes apart.
+func TestGuardSeesCallsAtOneOutputIndex(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		atZero bool
+	}{
+		{name: "own indexes"},
+		{name: "one index", atZero: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &reusedIndexModel{calls: []string{"call_a", "call_b"}, say: "checking", atZero: tc.atZero}
+			var saw []string
+			guard := func(_ context.Context, info OutputInfo) (*openresponses.Message, error) {
+				for _, item := range info.Output {
+					if call, ok := item.(*openresponses.FunctionCall); ok {
+						saw = append(saw, call.CallID+" "+call.Arguments)
+					}
+				}
+				return nil, nil
+			}
+			_, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")},
+				Config{Model: m, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}, OutputGuard: guard}))
+			if err != nil || end.Reason != ReasonDone {
+				t.Fatalf("err=%v reason=%s", err, end.Reason)
+			}
+			want := []string{`call_a {"text":"t0"}`, `call_b {"text":"t1"}`}
+			if !slices.Equal(saw, want) {
+				t.Errorf("the guard saw %q, want %q", saw, want)
 			}
 		})
 	}
