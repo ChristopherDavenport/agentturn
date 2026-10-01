@@ -147,9 +147,10 @@ versions may break the API.
   came back no smaller, and the same again once the prefix grew. A
   fold whose input is estimated below the minimum is now skipped, and
   calls and reports nothing, as a call within the budget does.
-  `NewLocal` defaults it to twice the estimate of an empty summary
-  item, about 58 tokens with the default estimator and summary item;
-  `New` defaults it to zero. Pass `WithMinFold(0)` for the old
+  `NewLocal` defaults it to the larger of an eighth of the budget and
+  twice the estimate of an empty summary item, about 58 tokens with the
+  default estimator and summary item, computed after the other
+  options; `New` defaults it to zero. Pass `WithMinFold(0)` for the old
   behaviour (#204).
 - **The back-off after a failed fold survives a restart.** The memory
   of a fold that failed with an unfolded send lived only in the

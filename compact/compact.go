@@ -90,14 +90,15 @@ func WithKeepLast(n int) Option { return func(t *Transform) { t.keepLast = n } }
 // large tool output among the last [WithKeepLast] items, whose prefix
 // is too small for any summary to shrink.
 //
-// For [NewLocal] the default is twice the estimate of the summary item
-// [WithSummaryItem] makes from no text: the summary's wrapper and as
-// much again for its text. A prefix that small would save at most the
-// wrapper's size even when summarised in a word, which is not worth a
-// summary call, and is likely to be refused as no smaller than its
-// summary after a second. For [New] the default is zero, since the
-// size of a compaction item is the server's. Zero folds whatever is
-// over budget.
+// For [NewLocal] the default is the larger of an eighth of the budget
+// and twice the estimate of the summary item [WithSummaryItem] makes
+// from no text, the summary's wrapper and as much again for its text,
+// both as the other options leave them. A prefix that small saves
+// little even when summarised in a word, which is not worth a summary
+// call, and a few short items are likely to be refused as no smaller
+// than their summary after a second call, which is a failed fold. For
+// [New] the default is zero, since the size of a compaction item is
+// the server's. Zero folds whatever is over budget.
 func WithMinFold(tokens int) Option { return func(t *Transform) { t.minFold = tokens } }
 
 // WithFailedFold seeds the transform with a failed fold it backs off
@@ -396,7 +397,7 @@ func itemTypes(items openresponses.Items) []string {
 func NewLocal(model openresponses.Streamer, opts ...Option) *Transform {
 	t := newTransform(opts)
 	if t.minFold < 0 {
-		t.minFold = 2 * t.estimate(openresponses.Items{t.summaryItem("")})
+		t.minFold = max(2*t.estimate(openresponses.Items{t.summaryItem("")}), t.budget/8)
 	}
 	t.fold = func(ctx context.Context, input openresponses.Items) (folded, error) {
 		f, err := t.summarize(ctx, model, input)

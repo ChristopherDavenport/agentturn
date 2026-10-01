@@ -640,6 +640,11 @@ func TestMinFold(t *testing.T) {
 	}
 	short := append(agentturn.Transcript{openresponses.UserText("Show the log.")}, tail...)
 	longer := append(items(2), tail...) // a prefix of about 80 tokens
+	// The same prefix before a tail over a budget of 1600, whose eighth
+	// is above it.
+	longTail := append(items(2),
+		&openresponses.FunctionCall{CallID: "c", Name: "log", Arguments: "{}"},
+		openresponses.NewFunctionCallOutput("c", strings.Repeat("line\n", 1800)))
 	cases := []struct {
 		name   string
 		local  bool
@@ -649,6 +654,8 @@ func TestMinFold(t *testing.T) {
 	}{
 		{"a one-message prefix is left", true, nil, short, false},
 		{"a larger prefix folds", true, nil, longer, true},
+		{"an eighth of a larger budget leaves it", true, []Option{WithBudget(1600)}, longTail, false},
+		{"zero under the larger budget folds it", true, []Option{WithBudget(1600), WithMinFold(0)}, longTail, true},
 		{"zero folds the one message", true, []Option{WithMinFold(0)}, short, true},
 		{"a minimum above the prefix leaves it", true, []Option{WithMinFold(100)}, longer, false},
 		{"the compaction endpoint folds the one message", false, nil, short, true},
