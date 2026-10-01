@@ -198,6 +198,17 @@ versions may break the API.
   where the loop held them; `AgentOptions` and the recorder's seeding
   use it, so an agent resumed or rebased holds them as before, and
   `Rebase` and a `Start` on a base say to seed with it. (#202)
+- **The recorder says why it left a request unhashed.** When a
+  request's input is not what the recorded path rebuilds, after a
+  `Transform` or a `BeforeModelCall` changed it, with a child's seed
+  transcript, or with items the loop left out, its response is written
+  without a hash, which read on disk like a harness that never hashed.
+  Before the first such response the recorder now writes a custom entry
+  in `session.UnhashedNS` (`agentturn:unhashed`) whose data, a
+  `session.Unhashed`, gives the reason and the first item at which the
+  two inputs part, by index, type, ID and call ID, as sent and as
+  recorded. It writes another only when the cause changes or after a
+  response that carried a hash. No format change. (#92)
 
 ## v0.0.14 - 2026-10-01
 

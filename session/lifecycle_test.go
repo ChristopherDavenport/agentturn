@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -214,12 +216,16 @@ func TestFilterFollowsSetConfig(t *testing.T) {
 	if _, err := a.Prompt(context.Background(), note(), openresponses.UserText("two")); err != nil {
 		t.Fatal(err)
 	}
-	if got := entryTypes(s); got != "run config custom item:user item:assistant* response run run item:agentturn:note item:user item:assistant* response run" {
+	if got := entryTypes(s); got != "run config custom item:user item:assistant* response run run item:agentturn:note item:user item:assistant* custom response run" {
 		t.Errorf("entries = %q", got)
 	}
 	// The second request carries the first note too, which the path
 	// holds only as a custom entry, so that response is honestly
-	// written without a hash rather than with one that mismatches.
+	// written without a hash rather than with one that mismatches, and
+	// the entry before it says so, naming the note.
+	if why := unhashedOf(t, s); len(why) != 1 || why[0].Index != 0 || why[0].Sent == nil || why[0].Sent.Type != "agentturn:note" {
+		t.Errorf("unhashed = %+v, want one naming the first note", why)
+	}
 	if n := verifyAllUnhashed(t, s, 1); n != 2 || hashed(s) != 1 {
 		t.Errorf("responses = %d hashed = %d", n, hashed(s))
 	}
@@ -433,6 +439,9 @@ func TestUnrecordedTransformOmitsHash(t *testing.T) {
 	if n := verifyAllUnhashed(t, s, 1); n != 1 || hashed(s) != 0 {
 		t.Errorf("responses = %d hashed = %d", n, hashed(s))
 	}
+	if why := unhashedOf(t, s); len(why) != 1 || why[0].Index != 1 || why[0].Sent == nil || why[0].Sent.Type != openresponses.ItemTypeMessage || why[0].Recorded != nil {
+		t.Errorf("unhashed = %+v, want one naming the injected message", why)
+	}
 	// So does a BeforeModelCall that edits the input, and a seeded
 	// child whose transcript the recorder never wrote; a hook that
 	// edits a setting keeps the hash.
@@ -446,8 +455,8 @@ func TestUnrecordedTransformOmitsHash(t *testing.T) {
 	if _, err := b.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
 		t.Fatal(err)
 	}
-	if hashed(s2) != 0 {
-		t.Error("a request with injected input carried a hash")
+	if hashed(s2) != 0 || len(unhashedOf(t, s2)) != 1 {
+		t.Error("a request with injected input carried a hash, or no reason it has none")
 	}
 	store3 := agentsession.NewMemoryStore()
 	rec3, s3, _ := Start(context.Background(), store3, agentsession.Header{})
@@ -475,6 +484,9 @@ func TestUnrecordedTransformOmitsHash(t *testing.T) {
 	if n := verifyAllUnhashed(t, cs, 1); n != 1 || hashed(cs) != 0 {
 		t.Errorf("seeded child responses = %d hashed = %d", n, hashed(cs))
 	}
+	if why := unhashedOf(t, cs); len(why) != 1 || why[0].Index != 0 || why[0].Sent == nil {
+		t.Errorf("seeded child unhashed = %+v, want one naming the seed", why)
+	}
 	// A blocked call under an unrecorded transform is likewise
 	// written without a hash.
 	store4 := agentsession.NewMemoryStore()
@@ -484,5 +496,107 @@ func TestUnrecordedTransformOmitsHash(t *testing.T) {
 	_, _ = d.Prompt(context.Background(), openresponses.UserText("x"))
 	if n := verifyAllUnhashed(t, s4, 1); n != 1 || hashed(s4) != 0 {
 		t.Errorf("blocked responses = %d hashed = %d", n, hashed(s4))
+	}
+	if len(unhashedOf(t, s4)) != 1 {
+		t.Error("a blocked call with no hash says not why")
+	}
+}
+
+// unhashedOf returns the data of the session's UnhashedNS entries, in
+// order, checking that each is followed by a response with no hash.
+func unhashedOf(t *testing.T, s *agentsession.Session) []Unhashed {
+	t.Helper()
+	var out []Unhashed
+	for _, e := range s.Entries() {
+		c, ok := e.(*agentsession.CustomEntry)
+		if !ok || c.NS != UnhashedNS {
+			continue
+		}
+		var why Unhashed
+		if err := json.Unmarshal(c.Data, &why); err != nil {
+			t.Fatal(err)
+		}
+		if why.Reason == "" {
+			t.Errorf("unhashed entry gives no reason: %s", c.Data)
+		}
+		next := s.Children(c.ID)
+		if len(next) != 1 {
+			t.Errorf("unhashed entry %s is followed by %d entries", c.ID, len(next))
+		} else if resp, _ := s.Entry(next[0]); resp == nil || resp.EntryType() != agentsession.TypeResponse && !(resp.EntryType() == agentsession.TypeCustom && resp.(*agentsession.CustomEntry).NS == ModelBlockedNS) {
+			t.Errorf("unhashed entry %s is followed by %s, want the response it explains", c.ID, resp.EntryType())
+		} else if r, ok := resp.(*agentsession.ResponseEntry); ok && r.RequestHash != "" {
+			t.Errorf("unhashed entry %s explains a response with a hash", c.ID)
+		}
+		out = append(out, why)
+	}
+	return out
+}
+
+// TestUnhashedSaysWhyOnce pins #92: a run of responses the recorder
+// leaves without a hash for one cause is preceded by one UnhashedNS
+// entry naming it, at the first; another is written when the cause
+// changes, or when hashing resumed and the input diverges again.
+func TestUnhashedSaysWhyOnce(t *testing.T) {
+	const (
+		none   = ""
+		front  = "front"
+		behind = "behind"
+	)
+	cases := []struct {
+		name string
+		// modes is how the transform changes the input on each prompt.
+		modes []string
+		// want is the index of the first differing item each entry
+		// names, in order: an item added behind the transcript stands
+		// further on at every turn, and is the same cause.
+		want []int
+	}{
+		{name: "one cause, once", modes: []string{none, front, front, front}, want: []int{0}},
+		{name: "hashing resumes, then diverges again", modes: []string{front, front, none, front}, want: []int{0, 0}},
+		{name: "the cause changes", modes: []string{front, behind, behind}, want: []int{0, 3}},
+		{name: "never diverges", modes: []string{none, none}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(ctx, store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			mode := none
+			transform := func(_ context.Context, t agentturn.Transcript) (agentturn.Transcript, error) {
+				switch mode {
+				case front:
+					return append(agentturn.Transcript{openresponses.DeveloperText("the time is now")}, t...), nil
+				case behind:
+					return append(append(agentturn.Transcript(nil), t...), openresponses.DeveloperText("the time is now")), nil
+				}
+				return t, nil
+			}
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Transform: transform})
+			defer rec.Attach(a)()
+			unhashed := 0
+			for i, m := range tc.modes {
+				mode = m
+				if _, err := a.Prompt(ctx, openresponses.UserText(fmt.Sprint("prompt ", i))); err != nil {
+					t.Fatal(err)
+				}
+				if m != none {
+					unhashed++
+				}
+			}
+			verifyAllUnhashed(t, s, unhashed)
+			var got []int
+			for _, why := range unhashedOf(t, s) {
+				if why.Reason != unhashedReason {
+					t.Errorf("reason %q", why.Reason)
+				}
+				got = append(got, why.Index)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("unhashed entries name items %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

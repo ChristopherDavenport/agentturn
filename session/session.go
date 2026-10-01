@@ -309,7 +309,14 @@
 // a hash, and Session.Verify reports it with agentsession.ErrNoHash
 // rather than as a mismatch. A host that gates on the record therefore
 // tells "nothing was checked" from "checked and correct" with
-// errors.Is and not with err == nil. For the compact transform,
+// errors.Is and not with err == nil. The record says why: before the
+// first response it leaves without a hash for a cause, the recorder
+// writes a custom entry in the [UnhashedNS] namespace naming the
+// reason and the first item at which the request's input and the one
+// the path rebuilds part, and writes another only when the cause
+// changes or after a response that carried a hash, so a reader tells a
+// recorder that declined from one that never hashed, and knows from
+// which response on. For the compact transform,
 // [Recorder.Fold] writes the
 // compaction entry that describes the change, so its requests keep
 // their hashes:
@@ -580,6 +587,46 @@ type Elicitation struct {
 // writer that replaces a repeated ID to keep the native one there.
 const ModelCallIDMember = "agentturn:model_call_id"
 
+// UnhashedNS is the namespace of the custom entry written when the
+// recorder declines to hash a request because its input is not what
+// the recorded path rebuilds: a Transform or a BeforeModelCall changed
+// it in a way the record does not describe, it carries items the
+// recorder never wrote, such as a child's seed transcript, or it
+// leaves out items the path holds, such as the loop leaving another
+// model's reasoning out of the request. Its data is an [Unhashed]. It
+// is written before the first response entry left without a hash for
+// that cause, and again only when the cause changes, its reason or the
+// items it names, or after a response that carried a hash, so each response with no hash that
+// follows one has the cause it names. It never contributes an item,
+// and Session.Verify never reads it.
+const UnhashedNS = "agentturn:unhashed"
+
+// Unhashed is the data of an [UnhashedNS] custom entry.
+type Unhashed struct {
+	// Reason says why the request was not hashed.
+	Reason string `json:"reason"`
+	// Index is the position, in the request's input, of the first item
+	// that differs from the input the path rebuilds.
+	Index int `json:"index"`
+	// Sent names the item the request carries at Index, and Recorded
+	// the one the path rebuilds there; either is nil where its input
+	// ends before Index.
+	Sent     *UnhashedItem `json:"sent,omitempty"`
+	Recorded *UnhashedItem `json:"recorded,omitempty"`
+}
+
+// UnhashedItem names an item of an [Unhashed] by its type and, where
+// it has them, its ID and its call ID.
+type UnhashedItem struct {
+	Type   string `json:"type"`
+	ID     string `json:"id,omitempty"`
+	CallID string `json:"call_id,omitempty"`
+}
+
+// unhashedReason is the reason of an [Unhashed] for a request whose
+// input differs from the input the path rebuilds.
+const unhashedReason = "the request's input differs from the input the recorded path rebuilds"
+
 // ResponseIDMember is the member of a custom entry, beside the item
 // that is its data, naming the response that produced the item: a
 // model's output item the filter in force kept from the model, such as
@@ -693,6 +740,12 @@ type writer struct {
 	pending    string
 	started    time.Time
 	inFlightID string
+	// unhashed is why the request in flight has no hash, nil when it
+	// has one; noted is the cause the last [UnhashedNS] entry named,
+	// nil once a response carried a hash, so the entry is written once
+	// for each run of responses with no hash for one cause.
+	unhashed *Unhashed
+	noted    *Unhashed
 	// unnamed holds, in order, the items the call in flight completed
 	// before its stream named the response: a stream that sends no
 	// response.created or response.in_progress names it first on its
@@ -2098,6 +2151,7 @@ func (w *writer) reset() {
 	w.wroteConfig = false
 	w.settleReq = nil
 	w.inFlight, w.pending, w.started, w.inFlightID = false, "", time.Time{}, ""
+	w.unhashed, w.noted = nil, nil
 	w.unnamed = nil
 	w.items, w.values, w.custom = nil, nil, nil
 	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = false, 0, nil, nil
@@ -2946,7 +3000,7 @@ func (w *writer) turnStart(ctx context.Context, e *agentturn.TurnStart) error {
 		return err
 	}
 	req := Canonical(e.Request)
-	hash, err := w.hash(req)
+	hash, unhashed, err := w.hash(req)
 	if err != nil {
 		return err
 	}
@@ -2956,7 +3010,7 @@ func (w *writer) turnStart(ctx context.Context, e *agentturn.TurnStart) error {
 	}
 	w.attemptModel, w.retries = req.Model, 0
 	w.inFlight = true
-	w.pending = hash
+	w.pending, w.unhashed = hash, unhashed
 	w.started = w.rec.now()
 	w.inFlightID = ""
 	return nil
@@ -2981,7 +3035,7 @@ func (w *writer) attempts() int {
 // that answered.
 func (w *writer) retry(ctx context.Context, e *agentturn.ModelRetry) error {
 	req := Canonical(e.Request)
-	hash, err := w.hash(req)
+	hash, unhashed, err := w.hash(req)
 	if err != nil {
 		return err
 	}
@@ -3012,7 +3066,7 @@ func (w *writer) retry(ctx context.Context, e *agentturn.ModelRetry) error {
 	w.attempt, w.attemptModel, w.retries = next, req.Model, e.Attempt
 	w.settleReq = &req
 	w.inFlight = true
-	w.pending = hash
+	w.pending, w.unhashed = hash, unhashed
 	w.started = w.rec.now()
 	w.inFlightID = ""
 	return nil
@@ -3044,13 +3098,74 @@ func (w *writer) name(ctx context.Context, responseID string) (bool, error) {
 }
 
 // hash returns the request's hash when its input is what the stored
-// path rebuilds, "" otherwise.
-func (w *writer) hash(req openresponses.Request) (string, error) {
+// path rebuilds, and otherwise "" and why not.
+func (w *writer) hash(req openresponses.Request) (string, *Unhashed, error) {
 	expected, ok := w.expectedInput()
-	if !ok || !equalJSON(expected, req.Input) {
-		return "", nil
+	if !ok {
+		return "", &Unhashed{Reason: "the last fold recorded keeps more items than the recorder holds"}, nil
 	}
-	return RequestHash(req)
+	if !equalJSON(expected, req.Input) {
+		return "", divergence(req.Input, expected), nil
+	}
+	hash, err := RequestHash(req)
+	return hash, nil, err
+}
+
+// divergence names the first item at which sent, a request's input,
+// differs from recorded, the input the path rebuilds.
+func divergence(sent, recorded openresponses.Items) *Unhashed {
+	why := &Unhashed{Reason: unhashedReason}
+	for why.Index < len(sent) && why.Index < len(recorded) && equalJSON(sent[why.Index], recorded[why.Index]) {
+		why.Index++
+	}
+	if why.Index < len(sent) {
+		why.Sent = unhashedItem(sent[why.Index])
+	}
+	if why.Index < len(recorded) {
+		why.Recorded = unhashedItem(recorded[why.Index])
+	}
+	return why
+}
+
+// unhashedItem names item by its type and the IDs it carries.
+func unhashedItem(item openresponses.Item) *UnhashedItem {
+	out := &UnhashedItem{}
+	if raw, err := json.Marshal(item); err == nil {
+		_ = json.Unmarshal(raw, out)
+	}
+	if item != nil {
+		out.Type = item.ItemType()
+	}
+	return out
+}
+
+// noteUnhashed writes the [UnhashedNS] entry for why, the cause a
+// response about to be written has no hash, unless the last one written
+// names the same cause with no hashed response since. A response with
+// a hash, why nil, ends the run of that cause. The cause is the reason
+// and the items it names, not where they stand: a transform that adds
+// an item behind the transcript adds it further on at every turn.
+func (w *writer) noteUnhashed(ctx context.Context, why *Unhashed) error {
+	if why == nil {
+		w.noted = nil
+		return nil
+	}
+	if w.noted != nil {
+		was, now := *w.noted, *why
+		was.Index, now.Index = 0, 0
+		if equalJSON(was, now) {
+			return nil
+		}
+	}
+	raw, err := json.Marshal(why)
+	if err != nil {
+		return fmt.Errorf("session: encode unhashed: %w", err)
+	}
+	if _, err := w.append(ctx, &agentsession.CustomEntry{NS: UnhashedNS, Data: raw}); err != nil {
+		return err
+	}
+	w.noted = why
+	return nil
 }
 
 // expectedInput is the input the stored path rebuilds, as the context
@@ -3082,11 +3197,14 @@ func (w *writer) expectedInput() (openresponses.Items, bool) {
 // made.
 func (w *writer) blocked(ctx context.Context, e *agentturn.ModelBlocked) error {
 	req := Canonical(e.Request)
-	hash, err := w.hash(req)
+	hash, unhashed, err := w.hash(req)
 	if err != nil {
 		return err
 	}
 	if err := w.settle(ctx, req); err != nil {
+		return err
+	}
+	if err := w.noteUnhashed(ctx, unhashed); err != nil {
 		return err
 	}
 	if errors.Is(e.Err, agentturn.ErrGuard) {
@@ -3639,8 +3757,10 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 		// path, so the items just written read as its input, and the
 		// record cannot rebuild its request.
 		entry.RequestHash = ""
+	} else if err := w.noteUnhashed(ctx, w.unhashed); err != nil {
+		return err
 	}
-	w.inFlight, w.pending, w.started, w.inFlightID, w.retries = false, "", time.Time{}, "", 0
+	w.inFlight, w.pending, w.started, w.inFlightID, w.retries, w.unhashed = false, "", time.Time{}, "", 0, nil
 	w.responses++
 	w.lastCalls = len(resp.FunctionCalls()) > 0
 	// A response an OutputGuard withheld a message of is incomplete
@@ -3694,12 +3814,12 @@ func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
 // strips the items it produced. A response an OutputGuard withheld a
 // message of is not one of these: the loop raises its response_end.
 func (w *writer) endInFlight(ctx context.Context, cause error) error {
-	hash, inFlight, responseID := w.pending, w.inFlight, w.inFlightID
+	hash, inFlight, responseID, unhashed := w.pending, w.inFlight, w.inFlightID, w.unhashed
 	latency, attempts := w.latency(), w.attempts()
 	// The items the call completed before it was cut off go first, as
 	// its output, named by the response the stream named, if any.
 	unnamed, err := w.name(ctx, responseID)
-	w.inFlight, w.pending, w.started, w.inFlightID, w.retries = false, "", time.Time{}, "", 0
+	w.inFlight, w.pending, w.started, w.inFlightID, w.retries, w.unhashed = false, "", time.Time{}, "", 0, nil
 	if err != nil {
 		return err
 	}
@@ -3711,6 +3831,8 @@ func (w *writer) endInFlight(ctx context.Context, cause error) error {
 		// read as its input, and the record cannot rebuild its
 		// request.
 		hash = ""
+	} else if err := w.noteUnhashed(ctx, unhashed); err != nil {
+		return err
 	}
 	w.responses++
 	w.lastCalls = false
