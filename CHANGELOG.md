@@ -5,6 +5,15 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- **`compact.WithOnFold` adds a callback rather than replacing the
+  one before it.** Each is called in the order given, and the first
+  error fails the fold without calling the rest. A kit that registers
+  its own recorder no longer silently drops a callback the product
+  passed in the same options (agentkit#38). Code that relied on a later
+  `WithOnFold` replacing an earlier one now gets both called.
+
 ## v0.0.13 - 2026-10-01
 
 - **Requires `agentsession` v0.0.18, up from v0.0.15, and `agenttool`

@@ -352,7 +352,8 @@ can carry the reasoning setting the agent's own requests do; a summary
 that comes back with no text is asked once more before the fold fails.
 
 `WithOnFold` reports every fold, applied or failed, with the index at
-which the transcript was split, so a recorder can write it.
+which the transcript was split, so a recorder can write it. Each
+`WithOnFold` adds a callback, called in order until one errs.
 `WithPin(fn)` keeps the items `fn` reports through a fold: whatever
 part of the folded prefix they were in, they follow the summary in the
 request, so an injected reminder stays the reminder instead of
