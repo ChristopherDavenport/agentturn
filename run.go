@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/openresponses"
@@ -167,6 +168,7 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 				cfg:        cfg,
 				transcript: append(Transcript(nil), t...),
 				runCtx:     runCtx,
+				reasoning:  reasoningFromContext(ctx).merged(nil),
 				// Every event is sent, cancelled or not: the consumer
 				// below drains the channel until the run returns, so a
 				// send never blocks for good, and the events an abort
@@ -545,6 +547,9 @@ type runner struct {
 	// model makes must not take. The agent does not change it while the
 	// run is active. ctxReserved holds those the run's context names.
 	reserved, ctxReserved map[string]bool
+	// reasoning says which model produced the reasoning items of the
+	// transcript it knows, so a request leaves another model's out.
+	reasoning ReasoningModels
 
 	// held are the completed items of the attempt in flight that the
 	// transcript does not have yet, because nothing has committed the
@@ -552,11 +557,34 @@ type runner struct {
 	// are appended when the attempt commits and dropped when it ends
 	// without committing.
 	held []heldItem
-	// callIDs maps the output index of every function call the attempt
-	// in flight opened or completed, the held ones included, to the call
-	// ID the loop decided for it: the model's when it names no other
-	// call, one of the loop's own when it is empty or taken.
-	callIDs map[int]string
+	// callAt maps the output index of every function call the attempt
+	// in flight opened or completed, the held ones included, to the
+	// last call there and the call ID the loop decided for it: the
+	// model's when it names no other call, one of the loop's own when
+	// it is empty or taken. callItems maps the item ID of each such
+	// call that has one to the same ID, and names the call when it has
+	// one: a stream that opens a second call at the index of the first,
+	// as Ollama's does, gives each its own. decided holds every ID
+	// decided in the attempt, which a later call may not take.
+	callAt    map[int]callSlot
+	callItems map[string]string
+	decided   map[string]bool
+	// opened are the items of the attempt in flight in the order they
+	// opened, each with its output index and, once it is done, the item
+	// as completed, so the guard sees an earlier item a stream that
+	// reuses an index no longer holds there.
+	opened []openedItem
+}
+
+// callSlot is the last function call opened at an output index: the
+// call ID decided for it and the item ID it carried, "" for none.
+type callSlot struct{ id, itemID string }
+
+// openedItem is an item of the attempt in flight: its output index,
+// and the item as completed once it is done.
+type openedItem struct {
+	index int
+	done  openresponses.Item
 }
 
 // heldItem is a completed item waiting for its attempt to commit.
@@ -1002,7 +1030,7 @@ func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponse
 		}
 	}
 	req := r.cfg.baseRequest(tools)
-	req.Input = r.cfg.filter()(input)
+	req.Input = r.reasoning.For(r.cfg.ModelName, r.cfg.filter()(input))
 	if r.cfg.BeforeModelCall != nil {
 		if err := r.cfg.BeforeModelCall(ctx, &req); err != nil {
 			// The call was never made; the request as built is the
@@ -1035,6 +1063,8 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 	start := len(r.transcript)
 	for attempt := 1; ; attempt++ {
 		resp, committed, err := r.stream(ctx, req)
+		// What the attempt kept is this model's, however it ended.
+		r.attribute(r.transcript[start:])
 		if err == nil {
 			r.mark = len(r.transcript)
 			return resp, nil
@@ -1120,7 +1150,7 @@ func sleep(ctx context.Context, d time.Duration) error {
 func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *openresponses.Response, committed bool, err error) {
 	var acc openresponses.Accumulator
 	var halt *errStop
-	r.held, r.callIDs = nil, nil
+	r.held, r.callAt, r.callItems, r.decided, r.opened = nil, nil, nil, nil, nil
 	for ev, err := range openresponses.Events(ctx, r.cfg.Model, req) {
 		if halt != nil {
 			// OutputGuard withheld a message: the rest of the response
@@ -1229,10 +1259,11 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 	switch e := ev.(type) {
 	case *openresponses.OutputItemAddedEvent:
 		item := acc.Response().Output[e.OutputIndex]
+		r.opened = append(r.opened, openedItem{index: e.OutputIndex})
 		if call, ok := item.(*openresponses.FunctionCall); ok {
 			// The call's ID is decided as it opens, so its item_start,
 			// every item_update and its item_end carry the same one.
-			r.decideCallID(call.CallID, e.OutputIndex)
+			r.decideCallID(call, e.OutputIndex)
 			item = r.withCallID(item, e.OutputIndex)
 		}
 		commits := !committed && commitsAttempt(item)
@@ -1248,21 +1279,33 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		item := e.Item
 		modelCallID := ""
 		if call, ok := item.(*openresponses.FunctionCall); ok {
-			if _, opened := r.callIDs[e.OutputIndex]; !opened {
+			if id, opened := r.decidedCallID(call, e.OutputIndex); !opened {
 				// A call first seen as it completes, on a stream that
 				// sends no output_item.added for it.
-				r.decideCallID(call.CallID, e.OutputIndex)
+				r.decideCallID(call, e.OutputIndex)
+			} else if call.ID != "" && r.callAt[e.OutputIndex].itemID == "" {
+				// Opened with no item ID and done with one: the ID
+				// names it from here, in the response the turn acts on
+				// among the rest.
+				r.callAt[e.OutputIndex] = callSlot{id: id, itemID: call.ID}
+				r.callItems[call.ID] = id
 			}
 			if item = r.withCallID(call, e.OutputIndex); item != openresponses.Item(call) {
 				modelCallID = call.CallID
 			}
 		}
+		self := r.openedAt(e.OutputIndex)
 		if m, ok := item.(*openresponses.Message); ok && r.cfg.OutputGuard != nil {
-			// The guard sees the message before anything keeps it.
+			// The guard sees the message before anything keeps it,
+			// after the items that opened before it.
 			var before openresponses.Items
-			if cur := acc.Response(); cur != nil && e.OutputIndex <= len(cur.Output) {
-				for i, prior := range cur.Output[:e.OutputIndex] {
-					before = append(before, r.withCallID(prior, i))
+			cur := acc.Response()
+			for _, prior := range r.opened[:self] {
+				switch {
+				case prior.done != nil:
+					before = append(before, prior.done)
+				case cur != nil && prior.index < len(cur.Output):
+					before = append(before, r.withCallID(cur.Output[prior.index], prior.index))
 				}
 			}
 			replacement, err := r.cfg.OutputGuard(r.ctx, OutputInfo{RunID: r.runID, Turn: r.turn, ResponseID: responseID, Message: m, Output: before})
@@ -1278,6 +1321,7 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 				item = replacement
 			}
 		}
+		r.opened[self].done = item
 		if !committed {
 			// Nothing commits the attempt yet, so the item waits: a
 			// failure now is retried and leaves no trace.
@@ -1298,8 +1342,9 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 
 // decideCallID decides the call ID of the function call at index of
 // the attempt in flight, given the ID the model sent, and records it in
-// callIDs: the model's, or one of the loop's own when the model gave
-// none, or gave one a call in the transcript already has, one another
+// callAt, decided and, when the call has an item ID, callItems: the
+// model's, or one of the loop's own when the model gave none, or gave
+// one a call in the transcript already has, one another
 // call of the attempt took, held or not, or one the agent or the run's
 // context reserved. A call ID names one call, since an output, a
 // pending list and the session record name the call by it alone. The
@@ -1310,26 +1355,42 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 // transcript, the response the turn acts on and every later request
 // carry one ID; a call the stream never opened is decided when it
 // completes.
-func (r *runner) decideCallID(id string, index int) {
-	if r.callIDs == nil {
-		r.callIDs = map[int]string{}
+func (r *runner) decideCallID(call *openresponses.FunctionCall, index int) {
+	if r.callAt == nil {
+		r.callAt, r.callItems, r.decided = map[int]callSlot{}, map[string]string{}, map[string]bool{}
 	}
+	id := call.CallID
 	if r.callIDTaken(id) {
 		id = openresponses.NewID(callIDPrefix(id))
 	}
-	r.callIDs[index] = id
+	r.callAt[index] = callSlot{id: id, itemID: call.ID}
+	r.decided[id] = true
+	if call.ID != "" {
+		r.callItems[call.ID] = id
+	}
+}
+
+// decidedCallID returns the call ID decided for call: by its item ID
+// when that names a call of the attempt, and otherwise by index, its
+// output index, when the last call opened there carried no item ID or
+// call carries none, which is the same call on a stream that sends the
+// item ID on one of its events alone.
+func (r *runner) decidedCallID(call *openresponses.FunctionCall, index int) (string, bool) {
+	if id, ok := r.callItems[call.ID]; ok && call.ID != "" {
+		return id, true
+	}
+	slot, ok := r.callAt[index]
+	if !ok || (call.ID != "" && slot.itemID != "") {
+		return "", false
+	}
+	return slot.id, true
 }
 
 // callIDTaken reports whether a call the model makes may not keep id.
-// The calls the attempt held are in callIDs, not yet in the transcript.
+// The calls the attempt held are in decided, not yet in the transcript.
 func (r *runner) callIDTaken(id string) bool {
-	if id == "" || r.reserved[id] || r.ctxReserved[id] {
+	if id == "" || r.reserved[id] || r.ctxReserved[id] || r.decided[id] {
 		return true
-	}
-	for _, taken := range r.callIDs {
-		if taken == id {
-			return true
-		}
 	}
 	for _, item := range r.transcript {
 		if c, ok := item.(*openresponses.FunctionCall); ok && c.CallID == id {
@@ -1346,7 +1407,7 @@ func (r *runner) withCallID(item openresponses.Item, index int) openresponses.It
 	if !ok {
 		return item
 	}
-	id, ok := r.callIDs[index]
+	id, ok := r.decidedCallID(call, index)
 	if !ok || id == call.CallID {
 		return item
 	}
@@ -1378,6 +1439,18 @@ func callIDPrefix(id string) string {
 		return '_'
 	}, id)
 	return prefix[:min(len(prefix), maxCallIDPrefix)]
+}
+
+// openedAt returns the position in opened of the item that last opened
+// at index, adding one for an item the stream never opened.
+func (r *runner) openedAt(index int) int {
+	for i := len(r.opened) - 1; i >= 0; i-- {
+		if r.opened[i].index == index && r.opened[i].done == nil {
+			return i
+		}
+	}
+	r.opened = append(r.opened, openedItem{index: index})
+	return len(r.opened) - 1
 }
 
 // renameCalls gives the function calls of a response the call IDs
@@ -1521,6 +1594,11 @@ type callState struct {
 	// read by the loop after the executor has drained.
 	key        string
 	dispatched bool
+	// after is the call before this one in its chain, whose settling
+	// this one's dispatch waits for, and done is closed once the loop
+	// has settled this call's result, when a later call waits for it.
+	after *callState
+	done  chan struct{}
 }
 
 // toolBatch runs the calls of a turn: preflight in order, execute,
@@ -1682,6 +1760,13 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 		byID[p.call.CallID] = p
 	}
 	exec := r.executor(func(job agenttool.Job) *callState { return byID[job.Call.ID] })
+	for i, before := range chainBefore(exec, jobs) {
+		if before >= 0 {
+			prev := batch[jobIndex[before]]
+			prev.done = make(chan struct{})
+			batch[jobIndex[i]].after = prev
+		}
+	}
 	// The batch has a context of its own, so a failure can stop the
 	// tools, with the failure as the cause a tool reads, and the
 	// executor still be drained: every result it holds is received,
@@ -1697,8 +1782,8 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 	// result goes through it as any other, since the hook is the point
 	// past which nobody sees what a tool returned.
 	hookFailed := false
-	for ev := range exec.Execute(bctx, jobs) {
-		p := batch[jobIndex[ev.Index]]
+	// step handles one event of the batch on the loop's goroutine.
+	step := func(p *callState, ev agenttool.Event) {
 		if failed != nil {
 			if ev.Final && p.dispatchErr != nil {
 				r.markUndispatched(p)
@@ -1706,7 +1791,7 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 			if !ev.Final || isCancellation(ev.Err, bctx) || hookFailed || p.dispatchErr != nil {
 				// Cut, or nothing to end yet: failBatch ends what
 				// has not ended once the drain is over.
-				continue
+				return
 			}
 			// A result of the call's own, before the cancellation
 			// reached it: settled through the hook, and cut if the
@@ -1717,7 +1802,7 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 				p.cut, p.err, p.result = true, serr, agenttool.Result{}
 				_ = r.finish(p)
 			}
-			continue
+			return
 		}
 		var err error
 		if ev.Final {
@@ -1729,7 +1814,7 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 				r.markUndispatched(p)
 				failed = p.dispatchErr
 				cancel(failed)
-				continue
+				return
 			}
 			p.result, p.err = ev.Result, ev.Err
 			p.settled = true
@@ -1743,6 +1828,15 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 		if err != nil {
 			failed = err
 			cancel(err)
+		}
+	}
+	for ev := range exec.Execute(bctx, jobs) {
+		p := batch[jobIndex[ev.Index]]
+		step(p, ev)
+		if ev.Final && p.done != nil {
+			// Settled, or cut: the next call of its chain may be
+			// dispatched.
+			close(p.done)
 		}
 	}
 	// The executor has drained, so every dispatch it made has been
@@ -1807,15 +1901,32 @@ func isCancellation(err error, ctx context.Context) bool {
 // fails on the event stops the job, which the executor completes with
 // that error, so the tool does not run after a dispatch nobody could
 // record.
+//
+// The executor starts a chain's next job once the loop has received
+// the last one's result, before the loop has settled it, so the
+// callback first waits for that: AfterToolCall, and whatever a hook
+// writes there, lands before the next call of the chain is dispatched.
+// The loop's goroutine does the settling and waits on nothing of the
+// job's, so the wait ends; a batch cut off meanwhile ends it with the
+// cancellation, as for a job whose turn never came.
 func (r *runner) executor(find func(agenttool.Job) *callState) agenttool.Executor {
 	return agenttool.Executor{
 		MaxParallel: r.cfg.MaxParallelTools,
 		Sequential:  r.cfg.ToolExecution == ExecSequential,
 		Recorder:    r.cfg.ToolRecorder,
-		OnStart: func(_ context.Context, job agenttool.Job) error {
+		OnStart: func(ctx context.Context, job agenttool.Job) error {
 			p := find(job)
 			if p == nil {
 				return nil
+			}
+			if p.after != nil {
+				select {
+				case <-p.after.done:
+				case <-ctx.Done():
+				}
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 			}
 			err := r.emit(&ToolDispatch{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Parent: p.parent, IdempotencyKey: p.key})
 			// Remembered on the call itself: the executor hands the
@@ -1828,6 +1939,35 @@ func (r *runner) executor(find func(agenttool.Job) *callState) agenttool.Executo
 			return err
 		},
 	}
+}
+
+// chainBefore returns, for each job, the index of the job before it in
+// its chain, or -1 for the first: every job of a serial batch follows
+// the one before it, and otherwise a job follows the last one naming
+// its resource. It is how exec orders a batch.
+func chainBefore(exec agenttool.Executor, jobs []agenttool.Job) []int {
+	serial := exec.Sequential || exec.MaxParallel == 1
+	for _, job := range jobs {
+		serial = serial || (job.Tool != nil && agenttool.IsSequential(job.Tool))
+	}
+	before := make([]int, len(jobs))
+	last := map[string]int{}
+	for i, job := range jobs {
+		before[i] = -1
+		if serial {
+			before[i] = i - 1
+			continue
+		}
+		if job.Tool == nil || agenttool.ResourceOf(job.Tool) == "" {
+			continue
+		}
+		res := agenttool.ResourceOf(job.Tool)
+		if at, ok := last[res]; ok {
+			before[i] = at
+		}
+		last[res] = i
+	}
+	return before
 }
 
 // collect appends the outputs in the model's order, then the notes the
@@ -2092,10 +2232,14 @@ var ErrNoInvoker = errors.New("agentturn: no loop on the context to invoke a too
 // The result is the one the model would have seen, with the error
 // beside it: a tool that failed, a name no tool has, arguments that are
 // not an object, or a call the hook refused, whose Reason is the error.
-// A hook that defers the call refuses it instead, since a nested call
-// cannot be handed to the caller: it belongs to a tool that is running.
-// Nothing is appended to the transcript, so a nested call costs no
-// items and a Terminate on its result means nothing to the loop.
+// A nested call cannot be handed to the caller, since it belongs to a
+// tool that is running, so one the hook defers is put to the user
+// through the agenttool.Elicitor on ctx, when there is one: an accept
+// runs it and a decline refuses it, and tool_start carries that answer
+// as the decision, by "human". Without an elicitor, or on a cancel or
+// a failure to ask, the deferral refuses the call. Nothing is appended
+// to the transcript, so a nested call costs no items and a Terminate
+// on its result means nothing to the loop.
 //
 // The call it is made under comes from agenttool.CallFrom, which
 // agenttool.New puts on every typed tool's context; a tool that
@@ -2142,6 +2286,9 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 			if decision.Args != nil {
 				p.args = decision.Args
 			}
+			if decision.Action == Defer {
+				decision = r.askNested(ctx, name, p.args, decision)
+			}
 			switch decision.Action {
 			case Block, Defer:
 				reason := decision.Reason
@@ -2180,6 +2327,63 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 		return agenttool.Result{}, r.endNested(p, err)
 	}
 	return p.result, p.err
+}
+
+// askNested puts a nested call the hook deferred to the user through
+// the elicitor on ctx, the invoking tool's, so the question is filed
+// under the call that made it. An accept allows the call and a decline
+// blocks it, either decided by the user; with no elicitor, a cancel or
+// a failure to ask, the deferral stands and the call is refused.
+func (r *runner) askNested(ctx context.Context, name string, args json.RawMessage, d *ToolDecision) *ToolDecision {
+	elicit, ok := agenttool.ElicitorFrom(ctx)
+	if !ok {
+		return d
+	}
+	msg := fmt.Sprintf("Allow %s with arguments %s?", name, clip(string(args), maxAskedArgs))
+	if d.Reason != "" {
+		msg += " " + d.Reason
+	}
+	ans, err := elicit(ctx, agenttool.Elicitation{Message: msg})
+	if err != nil {
+		return d
+	}
+	// An elicitation is a question for the user, so the user decided.
+	decided := *d
+	decided.By = "human"
+	switch ans.Action {
+	case agenttool.ActionAccept:
+		// The reason is the rule that raised the question, as a held
+		// call's is; the record needs one to write the approval.
+		decided.Action = Allow
+		if decided.Reason == "" {
+			decided.Reason = "allowed when asked"
+		}
+	case agenttool.ActionDecline:
+		decided.Action = Block
+		decided.Reason = "declined when asked"
+		if d.Reason != "" {
+			decided.Reason += ": " + d.Reason
+		}
+	default:
+		return d
+	}
+	return &decided
+}
+
+// maxAskedArgs is the most of a nested call's arguments, in bytes, the
+// question about it quotes: a script's call may carry a whole file.
+const maxAskedArgs = 500
+
+// clip returns s cut to at most n bytes on a rune boundary, with an
+// ellipsis when anything was cut.
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "…"
 }
 
 // endNested gives a nested call whose loop-side handling failed, a

@@ -770,11 +770,14 @@ func envNodes(entries []agentsession.Entry) string {
 	return strings.Join(nodes, ",")
 }
 
-// TestEnvInAChild pins the review of #187: Env made with the context
-// of a child session whose run has ended is filed in that session, at
-// its leaf, as Annotate's entry is, compared with the env in force
-// there; and a grandchild compares with the env in force in its
-// parent, the child, not with the recorder's own session's.
+// TestEnvInAChild pins the review of #187 and #197: a child's first
+// run start writes the env in force in its parent at that moment, right
+// after the run's start, so the child's file names the workspace it ran
+// in; Env made with the context of a child session whose run has ended
+// is filed in that session, at its leaf, as Annotate's entry is,
+// compared with the child's own env, not with its parent's, which may
+// have moved since; and a grandchild starts under its parent's, the
+// child's, not under the recorder's own session's.
 func TestEnvInAChild(t *testing.T) {
 	ctx := context.Background()
 	node := "node-1"
@@ -814,7 +817,7 @@ func TestEnvInAChild(t *testing.T) {
 		}
 		childID := childOf(t, store, s).ID()
 		jobCtx := ContextWithSessionID(ctx, childID)
-		// Unmoved, the child is under its parent's env.
+		// Unmoved, the child is under its own env, its parent's at its start.
 		if err := rec.Env(jobCtx); err != nil {
 			t.Fatal(err)
 		}
@@ -825,8 +828,11 @@ func TestEnvInAChild(t *testing.T) {
 			}
 		}
 		child := childOf(t, store, s)
-		if got := envNodes(child.Entries()); got != "node-2" {
-			t.Errorf("child env entries = %q, want node-2", got)
+		if got := envNodes(child.Entries()); got != "node-1,node-2" {
+			t.Errorf("child env entries = %q, want node-1,node-2", got)
+		}
+		if first := child.Entries()[1]; !isEnv(first) {
+			t.Errorf("the child's run start is followed by %s, want its env", first.EntryType())
 		}
 		if leaf, _ := child.Entry(child.Leaf()); !isEnv(leaf) {
 			t.Errorf("the child's env is not at its leaf")
@@ -870,15 +876,49 @@ func TestEnvInAChild(t *testing.T) {
 		}
 		child := childOf(t, store, s)
 		grandchild := childOf(t, store, child)
-		if got := envNodes(child.Entries()); got != "node-2" {
-			t.Errorf("child env entries = %q, want node-2", got)
+		if got := envNodes(child.Entries()); got != "node-1,node-2" {
+			t.Errorf("child env entries = %q, want node-1,node-2", got)
 		}
-		if got := envNodes(grandchild.Entries()); got != "" {
-			t.Errorf("grandchild env entries = %q, want none: it is under its parent's", got)
+		if got := envNodes(grandchild.Entries()); got != "node-2" {
+			t.Errorf("grandchild env entries = %q, want node-2: it starts under its parent's", got)
 		}
 		verifyAll(t, s)
 		verifyAll(t, child)
 		verifyAll(t, grandchild)
+	})
+
+	t.Run("a job after its parent moved", func(t *testing.T) {
+		node = "node-1"
+		store := agentsession.NewMemoryStore()
+		rec, s, err := Start(ctx, store, agentsession.Header{}, WithEnv(env))
+		if err != nil {
+			t.Fatal(err)
+		}
+		childCfg := agentturn.Config{Name: "specialist", Description: "notes things", Model: &echo.Adapter{}}
+		specialist := agent.New(childCfg, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{specialist}})
+		defer rec.Attach(a)()
+		if _, err := a.Prompt(ctx, openresponses.UserText("delegate")); err != nil {
+			t.Fatal(err)
+		}
+		// The parent moves, and then the job the child started finds
+		// itself on the parent's node: it moved too.
+		node = "node-2"
+		if err := rec.Env(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := rec.Env(ContextWithSessionID(ctx, childOf(t, store, s).ID())); err != nil {
+			t.Fatal(err)
+		}
+		child := childOf(t, store, s)
+		if got := envNodes(child.Entries()); got != "node-1,node-2" {
+			t.Errorf("child env entries = %q, want node-1,node-2", got)
+		}
+		if got := envNodes(s.Entries()); got != "node-1,node-2" {
+			t.Errorf("root env entries = %q, want node-1,node-2", got)
+		}
+		verifyAll(t, s)
+		verifyAll(t, child)
 	})
 }
 
@@ -1299,6 +1339,81 @@ func TestNestedCallsAreRecorded(t *testing.T) {
 	verifyAll(t, s)
 }
 
+// TestAskedNestedCallsAreRecorded pins #200's record: a nested call
+// the hook deferred and the user answered through the elicitor has the
+// question under the call that made it, then the answer as its
+// decision, by the user.
+func TestAskedNestedCallsAreRecorded(t *testing.T) {
+	cases := []struct {
+		name    string
+		action  agenttool.Action
+		verdict string
+	}{
+		{name: "accept", action: agenttool.ActionAccept, verdict: agentsession.VerdictProceed},
+		{name: "decline", action: agenttool.ActionDecline, verdict: agentsession.VerdictReject},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			bash := agenttool.New("bash", "runs a command", func(context.Context, echoArgs) (string, error) { return "pushed", nil })
+			eval := agenttool.New("eval", "runs code", func(ctx context.Context, _ echoArgs) (string, error) {
+				_, err := agentturn.Invoke(ctx, "bash", json.RawMessage(`{"text":"git push"}`))
+				if (err == nil) != (tc.action == agenttool.ActionAccept) {
+					t.Errorf("the nested call returned %v", err)
+				}
+				return "ran", nil
+			})
+			policy := func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+				if info.Call.Name == "bash" {
+					return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask bash(git push:*)", By: agentsession.ByPolicy}, nil
+				}
+				return nil, nil
+			}
+			user := func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+				return agenttool.Answer{Action: tc.action}, nil
+			}
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{eval, bash},
+				BeforeToolCall: policy, ToolElicitor: rec.Elicitor(agentsession.ByHuman, user), MaxTurns: 1})
+			defer rec.Attach(a)()
+			if _, err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
+				t.Fatal(err)
+			}
+			var order []string
+			var start *NestedCall
+			for _, e := range s.Entries() {
+				c, ok := e.(*agentsession.CustomEntry)
+				if !ok {
+					continue
+				}
+				switch c.NS {
+				case ElicitationNS:
+					order = append(order, "question")
+				case NestedCallNS:
+					var n NestedCall
+					if err := json.Unmarshal(c.Data, &n); err != nil {
+						t.Fatal(err)
+					}
+					order = append(order, n.Phase)
+					if n.Phase == agentsession.RunStart {
+						start = &n
+					}
+				}
+			}
+			if strings.Join(order, " ") != "question start end" {
+				t.Errorf("entries = %v", order)
+			}
+			if start == nil || start.Verdict != tc.verdict || start.By != agentsession.ByHuman || !strings.Contains(start.Reason, "ask bash(git push:*)") {
+				t.Errorf("start entry = %+v", start)
+			}
+			verifyAll(t, s)
+		})
+	}
+}
+
 // switching answers 429 while the request names the primary model and
 // answers as itself once it names another.
 type switching struct{ primary string }
@@ -1637,6 +1752,90 @@ func TestFoldedCallIDsStayReserved(t *testing.T) {
 			}
 			if renamed != 3 {
 				t.Errorf("%d calls keep the model's ID, want the three after the first", renamed)
+			}
+		})
+	}
+}
+
+// TestEnvSurvivesACompaction pins the review of #197: the env in force
+// is the last on the path, one a compaction left out of the context
+// included, so a child reseeded for a second run under its call is
+// under the node it moved to, not its parent's copied in again, and a
+// root resumed after a compaction writes no second copy of its env.
+func TestEnvSurvivesACompaction(t *testing.T) {
+	ctx := context.Background()
+	envOn := func(node string) *agentsession.EnvEntry {
+		e := agentsession.NewEnvEntry("/work")
+		if err := e.SetWorkspace(agentsession.WorkspaceContainer, "sandbox").SetMember("node", node); err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	env := func(context.Context) (*agentsession.EnvEntry, error) { return envOn("node-1"), nil }
+	cases := []struct {
+		name string
+		// child writes the env and the compaction in a child session,
+		// which has moved to node-2; otherwise in the root.
+		child bool
+		want  string
+	}{
+		{name: "a reseeded child", child: true, want: "node-2"},
+		{name: "a resumed root", want: "node-1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(ctx, store, agentsession.Header{}, WithEnv(env))
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, written := s.ID(), envOn("node-1")
+			const callID = "call_x"
+			if tc.child {
+				if err := rec.root.writeEnv(ctx); err != nil {
+					t.Fatal(err)
+				}
+				cs, err := store.Create(ctx, agentsession.Header{ParentSession: s.ID(), ID: agentsession.SubsessionID(s.ID(), callID), SpawnedBy: callID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				id, written = cs.ID(), envOn("node-2")
+			}
+			var kept string
+			for i, e := range []agentsession.Entry{written, &agentsession.ItemEntry{Item: openresponses.UserText("one")}, &agentsession.ItemEntry{Item: openresponses.UserText("two")}} {
+				at, err := store.Append(ctx, id, e)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if i == 2 {
+					kept = at
+				}
+			}
+			if _, err := store.Append(ctx, id, &agentsession.CompactionEntry{FirstKept: kept, Summary: openresponses.UserText("summary")}); err != nil {
+				t.Fatal(err)
+			}
+
+			var w *writer
+			if tc.child {
+				if w, err = rec.newChild(ctx, rec.root, callID, false); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				rec2, _, err := Resume(ctx, store, id, WithEnv(env))
+				if err != nil {
+					t.Fatal(err)
+				}
+				w = rec2.root
+			}
+			if err := w.runStart(ctx, &agentturn.RunStart{RunID: "run_2", Source: agentturn.SourceInput}); err != nil {
+				t.Fatal(err)
+			}
+			got, err := store.Open(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if nodes := envNodes(got.Entries()); nodes != tc.want {
+				t.Errorf("env entries = %q, want %q alone", nodes, tc.want)
 			}
 		})
 	}

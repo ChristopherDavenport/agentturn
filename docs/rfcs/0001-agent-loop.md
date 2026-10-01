@@ -361,7 +361,15 @@ that a recorder holding the transcript and the settings rebuilds it:
    a copy of the list and MUST NOT mutate the items. The working
    transcript is not replaced.
 3. Apply the **filter** to the result, which removes what the model
-   must not see.
+   must not see. Then leave out every reasoning item the loop knows a
+   model under another model name produced: a reasoning item carries a
+   signature only its own provider accepts. The model's own reasoning
+   items stay, since a provider may require them back on a turn that
+   called a tool, and so does one whose producer the loop does not
+   know. The loop learns the producer of each reasoning item a
+   response adds, under the model name in force, and a host gives it
+   the producers of a transcript it rebuilt; the working transcript
+   keeps every item.
 4. Take the request base, set the loop-owned transport members — store
    false, stream true, no stream options, no previous response ID — and
    apply the model
@@ -567,7 +575,11 @@ tool serialising the batch, a shared resource serialising its calls,
 cancellation waited for. A `tool_dispatch` is raised as each call is
 handed to its tool, after it has taken a slot in the bound and its turn
 in a serial batch or a resource chain, and before the tool runs; a call
-the cut reaches first never reached a tool and raises none. It is
+the cut reaches first never reached a tool and raises none. Its turn in
+a chain comes once the call before it has been settled, the after-call
+hook included, not merely completed, so what that hook changes or
+records lands before the next call of the chain is dispatched; a call
+of another chain is not held for it. It is
 raised on the call's own goroutine, serialised with the run's events,
 and the executor waits on it, so a recorder has the dispatch durable
 before the side effect. A consumer that fails on it stops the call
@@ -968,7 +980,12 @@ A conforming loop holds these over every run, however it ends:
   every later request carry the new one, so a consumer sees one ID for
   the call from the moment it opens and the provider is sent the ID
   the record holds. The `item_end` keeps the model's ID beside the
-  item. The IDs a transcript held stay
+  item. A call is known by its item ID, and by its output index when
+  the event naming it carries none, so a stream that opens a second
+  call at the output index of the first still gives each its own ID,
+  and a call opened without an item ID and completed with one keeps
+  the ID it opened with. The
+  IDs a transcript held stay
   reserved when `SetTranscript` replaces it. A host that seeds the
   loop with less than a whole session, a context after a fold or a
   trim, a branch after a rewind or a fork, or a child session reopened
@@ -1155,11 +1172,20 @@ the loop rather than holding a tool set of its own, where the policy,
 the events and the record would all be absent. The loop runs the call
 as if the model had asked for it under the call in flight:
 
-- the decision hook decides it, seeing a batch of one at index 0; a
-  hook that defers it refuses it instead, since a nested call cannot be
-  handed to the caller: it belongs to a tool that is running, and the
-  error reads `a nested call cannot be deferred to the caller: ` and
-  the reason. The decision's note and terminate hint are ignored;
+- the decision hook decides it, seeing a batch of one at index 0. A
+  nested call cannot be handed to the caller, since it belongs to a
+  tool that is running, so a deferred one is put to the user through
+  the invoking tool's elicitor when it has one, as a question naming
+  the call, its arguments, the first 500 bytes of them, and the
+  decision's reason, asked on the
+  invoking tool's context so it is filed under that call. An accept
+  allows the call and a decline blocks it, with `declined when asked`
+  and the reason as the refusal's; either is the decision `tool_start`
+  carries, by `human`, an accept with the reason, or `allowed when
+  asked` when there was none. Without an elicitor, or on a cancel or a
+  failure to ask, the hook's deferral refuses the call, and the error
+  reads `a nested call cannot be deferred to the caller: ` and the
+  reason. The decision's note and terminate hint are ignored;
 - `tool_start` and `tool_end` are raised with **parent** naming the
   call that made it, serialised with the run's own events;
 - the after-call hook MAY override the result;
@@ -1259,8 +1285,22 @@ An agent stands in four places inside another system:
   response or task. A transcript holds whatever
   the previous model produced, reasoning items included, and a
   reasoning item carries a signature its own provider issued; a
-  handoff that changes the provider MUST drop them, and which component
-  owns that rule is open (#91). A handoff that trims what the receiver
+  handoff that changes the model MUST leave them out of the receiver's
+  requests. The loop owns that rule (#91): it leaves out of each
+  turn's request the reasoning items another model name produced, as
+  the request procedure says, so a configuration replaced between runs
+  needs nothing more, and the transcript and the record keep the
+  items. The rule covers the loop's own requests; a transform that
+  calls a model of its own, as a local fold calls one for a summary,
+  owns what it sends, and the reference fold sends no reasoning item
+  at all, since a summariser cannot read one. A front that rebuilds a conversation the loop has not seen,
+  from a store or from a caller's input, attributes its reasoning items
+  by the handoffs the conversation took, those before the first to the
+  configuration it started under and those after each to the
+  receiver, and gives the loop that attribution; the loop never learns
+  what a handoff is. A recorder cannot write a request that leaves
+  items out of the middle of its history, so the responses after one
+  carry no request hash. A handoff that trims what the receiver
   sees does it once, between runs, by replacing the transcript; a
   recorder moved to the last entry kept keeps every later response
   verifiable when the trim takes a prefix, and a trim from the middle
@@ -1295,7 +1335,7 @@ of the events.
 | `turn_end` | nothing of its own |
 | `run_end` | first, when a `turn_start` had no `response_end`, a failed `response` carrying the run's error; then `run` end, its `pending` list naming the run's calls left without an output, an earlier run's call the run wrote a decision or a `dispatch` for among them, with the reason mapped onto the format's cascade: `done`, `input_required` and `error` as themselves, the error's text as `ref`; `aborted` as `interrupted` with the error's text, since the host asked; `stopped` as `aborted` when the last `response_end` was marked withheld, since the format reads a run whose last response is incomplete so, as `stopped` when the last response made calls, as `done` when it made none, and for a run with no response of its own as `stopped` when it answered a pending call and left none, `aborted` otherwise, with the cause as `ref`, and for a guard's stop the cause followed by the guard's error |
 | a record a tool writes while it runs, a question it asks the user | a record entry at the leaf, its `call_id` naming the call on the tool's context when the session holds it, or the nearest call up a nested call's chain that it holds |
-| a fold the transform reports | a `compaction` naming what was kept and what was pinned, or a record entry for a fold that failed |
+| a fold the transform reports | a `compaction` naming what was kept and what was pinned, or a record entry for a fold that failed, carrying, for one the transform backs off from, the split and the hash of the prefix it would have folded, so a transform seeded from the record in another process backs off from the same prefix |
 | `queued` | a `queued` entry with the item, the mode and the trigger, its richer facts included, before anything appends the item; the item entry that drains it names it in `queued_from` with the trigger as `source`. A run end closes the entries of the inputs it did not append, and the recorder writes them again after it, since the agent still holds them; so does a rewind. The loop's follow-up mode is spelled `follow_up` and the format's `followup`; a writer maps the one onto the other |
 
 Three rules follow from the writing discipline of that format and are
@@ -1334,6 +1374,7 @@ maps onto it as follows:
 | transcript | `Transcript = openresponses.Items`; `Items` for a fragment |
 | hidden item | `Hidden(item)`, `Unhide(item)`; `Hidden` on the item events |
 | filter | `Config.Filter`; `DefaultFilter`, `VisibleFilter(types…)` |
+| reasoning another model produced | `ReasoningModels` (`Attribute`, `For`); `WithReasoningModels` for an agent, `ContextWithReasoningModels` for `Run` and `Continue` |
 | transform | `Config.Transform`; `compact.New`, `compact.NewLocal` as the reference |
 | configuration | `Config`; `Config.BaseRequest`, `Config.ResolveTools` |
 | tools of the moment | `Config.Tools`, `Config.ToolProvider` |
@@ -1360,9 +1401,10 @@ maps onto it as follows:
 | nested call | `Invoke(ctx, name, args)`; `ErrNoInvoker`; `Parent` on the tool events |
 | queue mode | `QueueMode`: `QueueSteer`, `QueueFollowUp` |
 | the loop as a model | `front/responses.New(cfg)` → `openresponses.Adapter` |
+| handoffs a front takes | `WithHandoff`, `WithStart`, `WithTransfers(route)` in both fronts; `front/responses.Route`, `Handoffs`, `HandedTo`, `Attribute`, re-exported by `front/a2a` but for `Attribute` |
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)` |
-| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `RecordFunc`, `Elicitor`, `Requeue`, `Rebase`; `WithInstructionsParts`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs` |
+| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `RecordFunc`, `Elicitor`, `Requeue`, `Rebase`; `WithInstructionsParts`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`; the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
 
 Every error the package returns to its caller, sentinel or wrapped,
 begins with `agentturn:`; the error texts a call's output carries,
@@ -1494,14 +1536,11 @@ module and is listed in the changelog as one.
 - **Input required as an interface** (#84). The child tools' errors
   match one sentinel, and the pending calls are reached by a type
   switch per implementation. An interface both satisfy is proposed.
-- **The handoff** (#96, #91). The fourth composition is the cheapest
-  and the least documented, and a handoff that changes the provider
-  sends the previous model's reasoning items to the new one, which
-  rejects their signatures. The loop is where both configurations are
-  visible at once; whether it drops them, or names the rule and offers
-  the helper, or the item type carries the rule, is open. Every route
-  that trims the history mid-path costs the responses after it their
-  request hash, which is the format's question.
+- **The handoff** (#96). The fourth composition is the cheapest and
+  the least documented. The loop now leaves another model's reasoning
+  items out of each turn's request (#91); that omission, like every route
+  that trims the history mid-path, costs the responses after it their
+  request hash, which is the format's question (agentsession#56).
 - **A second execution under one call** (#87). A child tool builds a
   fresh agent per call while the recorder continues the child session
   at its leaf, so the second run's path rebuilds a context the child

@@ -35,14 +35,17 @@
 // agent before continuing it, so the receiver answers within the same
 // task, its text streamed as the sender's was, and the record holds
 // both runs, the receiver's under a trigger of kind "handoff" naming
-// the sender. Without the option, or when it declines, a terminating
-// stop with no answer completes the task with the text of the last
-// output of a call whose result set Terminate, the answer the tools
-// gave on the model's behalf; a sibling's output, or a blocked or
-// failed call's, is not taken for it. The handoff lasts for the task:
-// [WithStart] picks the configuration the conversation's next task
-// starts under, and without it the task starts under the executor's
-// own.
+// the sender. The agent attributes each reasoning item to the model
+// that produced it, so the receiver's requests leave out the sender's
+// when the two run different models (agentturn.ReasoningModels).
+// Without the option, or when it declines, a terminating stop with no
+// answer completes the task with the text of the last output of a call
+// whose result set Terminate, the answer the tools gave on the model's
+// behalf; a sibling's output, or a blocked or failed call's, is not
+// taken for it. The handoff lasts for the task: [WithStart] or
+// [WithTransfers] picks the configuration the conversation's next task
+// starts under, and without either the task starts under the
+// executor's own.
 //
 //	exec := a2a.New(cfg)
 //	handler := a2asrv.NewHandler(exec)
@@ -60,7 +63,13 @@
 // function_call items as data parts. The caller answers by sending a
 // message for the same task whose data parts are the function_call_output
 // items, one per pending call and nothing else, and the run continues
-// from there. The transcript in the [ConversationStore] holds the
+// from there. A message never carries a function_call: a call is the
+// agent's to make, and one is refused as invalid params. Nor may it
+// declare a tool named as one the agent offers, or one the route
+// [WithTransfers] gives takes for a handoff, whose calls the caller
+// would answer in the agent's place. A nested call a tool makes to a
+// caller-owned tool is blocked: the caller answers only the calls the
+// model made. The transcript in the [ConversationStore] holds the
 // unanswered calls in the meantime, which is the invariant the root
 // package documents for an input-required boundary. A2A's
 // input-required state and agentturn's ReasonInputRequired are the

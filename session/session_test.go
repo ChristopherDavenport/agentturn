@@ -244,6 +244,238 @@ func TestAppOnlyItemsBecomeCustomEntries(t *testing.T) {
 	verifyAll(t, s2)
 }
 
+// rawThenText answers every request with an extension item of its own,
+// one kept from other adapters, and then a message.
+type rawThenText struct{}
+
+func (rawThenText) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	raw := &openresponses.UnknownItem{Type: "hermes:raw", Raw: json.RawMessage(`{"type":"hermes:raw","text":"<tool_call>"}`)}
+	if err := em.Item(raw); err != nil {
+		return err
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("done"); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestFilteredModelOutputKeepsHashes pins #202: a model's output item
+// the filter keeps from the model is written as a custom entry naming
+// its response, as an app-only input is, so the path rebuilds the
+// input that was sent and every response keeps its hash; Transcript
+// puts it back where the loop held it, after a round trip through the
+// store's encoding too, and an agent resumed from AgentOptions goes on
+// hashing. A filter that shows it to the model writes an item entry.
+func TestFilteredModelOutputKeepsHashes(t *testing.T) {
+	cases := []struct {
+		name   string
+		filter func(agentturn.Transcript) agentturn.Transcript
+		// want is the entry each raw item is written as.
+		want string
+	}{
+		{name: "kept from the model", want: "custom"},
+		{name: "shown to the model", filter: agentturn.VisibleFilter("hermes:raw"), want: "item:hermes:raw*"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(ctx, store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := agentturn.Config{Model: rawThenText{}, ModelName: "m", Filter: tc.filter}
+			a := agentturn.New(cfg)
+			unsub := rec.Attach(a)
+			for _, text := range []string{"one", "two"} {
+				if _, err := a.Prompt(ctx, openresponses.UserText(text)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			unsub()
+			var written []string
+			for _, e := range s.Entries() {
+				switch e := e.(type) {
+				case *agentsession.CustomEntry:
+					if e.NS != "hermes:raw" {
+						continue
+					}
+					var id string
+					if err := json.Unmarshal(e.Unknown[ResponseIDMember], &id); err != nil || id == "" {
+						t.Errorf("custom entry names no response: %s", e.Unknown[ResponseIDMember])
+					}
+					written = append(written, "custom")
+				case *agentsession.ItemEntry:
+					if e.Item.ItemType() == "hermes:raw" {
+						written = append(written, "item:hermes:raw*")
+					}
+				}
+			}
+			if strings.Join(written, " ") != tc.want+" "+tc.want {
+				t.Errorf("raw items written as %q, want %s each", written, tc.want)
+			}
+			verifyAll(t, s)
+
+			// The transcript holds every item the loop held, in order,
+			// from the store's encoding as from the session.
+			want := a.State().Transcript
+			read, err := store.Read(ctx, s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, from := range []*agentsession.Session{s, read} {
+				items, err := Transcript(from)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !equalJSON(items, want) {
+					got, _ := json.Marshal(items)
+					t.Errorf("transcript = %s", got)
+				}
+			}
+
+			rec2, s2, err := Resume(ctx, store, s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts, err := AgentOptions(s2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := agentturn.New(cfg, opts...)
+			defer rec2.Attach(b)()
+			if _, err := b.Prompt(ctx, openresponses.UserText("three")); err != nil {
+				t.Fatal(err)
+			}
+			if n := verifyAll(t, s2); n != 3 {
+				t.Errorf("responses verified after resume = %d, want 3", n)
+			}
+		})
+	}
+}
+
+// idless answers as rawThenText does with a response that has no ID,
+// so nothing names the response its items belong to.
+type idless struct{}
+
+func (idless) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	return rawThenText{}.CreateStream(ctx, req, openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+		switch e := ev.(type) {
+		case *openresponses.ResponseCreatedEvent, *openresponses.ResponseInProgressEvent:
+			return nil
+		case *openresponses.ResponseCompletedEvent:
+			e.Response.ID = ""
+		}
+		return sink.Send(ev)
+	}))
+}
+
+// TestTranscriptRestoresWhatTheFilterHid pins the review of #202: every
+// item the filter kept from the model is marked as the transcript's,
+// an app-only input and a model's output whose stream never named its
+// response included, and Transcript puts it back where the loop held
+// it, so a resumed agent holds what the live one did; EntryOf finds the
+// entry of such an item from the copy Transcript gave the agent.
+func TestTranscriptRestoresWhatTheFilterHid(t *testing.T) {
+	note := func() openresponses.Item {
+		return &openresponses.UnknownItem{Type: "agentturn:note", Raw: json.RawMessage(`{"type":"agentturn:note","text":"ui marker"}`)}
+	}
+	cases := []struct {
+		name   string
+		model  agentturn.Model
+		prompt openresponses.Items
+		// hid is the type of the item the filter kept from the model,
+		// and responseID the member its entry carries.
+		hid        string
+		responseID string
+	}{
+		{name: "an app-only input", model: &echo.Adapter{}, prompt: openresponses.Items{note(), openresponses.UserText("hi")}, hid: "agentturn:note"},
+		{name: "an unnamed model output", model: idless{}, prompt: openresponses.Items{openresponses.UserText("hi")}, hid: "hermes:raw"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(ctx, store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := agentturn.New(agentturn.Config{Model: tc.model, ModelName: "m"})
+			unsub := rec.Attach(a)
+			_, _ = a.Prompt(ctx, tc.prompt...)
+			unsub()
+			var marked *agentsession.CustomEntry
+			for _, e := range s.Entries() {
+				if c, ok := e.(*agentsession.CustomEntry); ok && c.NS == tc.hid {
+					marked = c
+				}
+			}
+			var id *string
+			if marked != nil {
+				_ = json.Unmarshal(marked.Unknown[ResponseIDMember], &id)
+			}
+			if id == nil || *id != tc.responseID {
+				t.Fatalf("custom entry %+v, want %s marked with response %q", marked, tc.hid, tc.responseID)
+			}
+			items, err := Transcript(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var restored openresponses.Item
+			for _, item := range items {
+				if item.ItemType() == tc.hid {
+					restored = item
+				}
+			}
+			if restored == nil {
+				t.Fatalf("transcript has no %s", tc.hid)
+			}
+			if !equalJSON(items, a.State().Transcript) {
+				t.Errorf("transcript differs from the agent's")
+			}
+
+			rec2, s2, err := Resume(ctx, store, s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if at, ok := rec2.EntryOf(ctx, restored); !ok || at != marked.ID {
+				t.Errorf("EntryOf the restored copy = %q %v, want %s", at, ok, marked.ID)
+			}
+			// A fold that keeps from the copy, at an index a transform
+			// before it shifted, is placed at its entry.
+			probe := New(store, s.ID())
+			if err := probe.root.seed(ctx, s2, false); err != nil {
+				t.Fatal(err)
+			}
+			if split, placed, err := probe.root.foldSplitOf(compact.Fold{Split: -1, First: restored}); err != nil || !placed || probe.root.items[split] != marked.ID {
+				t.Errorf("fold from the restored copy placed %v at %d, err %v", placed, split, err)
+			}
+			opts, err := AgentOptions(s2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"}, opts...)
+			defer rec2.Attach(b)()
+			if _, err := b.Prompt(ctx, openresponses.UserText("again")); err != nil {
+				t.Fatal(err)
+			}
+			if err := s2.VerifyRecords(s2.Leaf()); err != nil {
+				t.Errorf("verify records: %v", err)
+			}
+			// The resumed run's request is rebuilt from the path.
+			last := s2.Entries()[len(s2.Entries())-2].(*agentsession.ResponseEntry)
+			if err := s2.Verify(last.ID); err != nil {
+				t.Errorf("verify the resumed response: %v", err)
+			}
+		})
+	}
+}
+
 // slowStore delays appends of assistant items so the barrier is
 // observable.
 type slowStore struct {
@@ -1143,17 +1375,86 @@ func (b bloatingFold) CreateStream(_ context.Context, req openresponses.Request,
 	return em.Complete()
 }
 
+// reasoningFold answers every summary request with a reasoning item
+// alone, as a thinking model does that reasons to its output cap and is
+// reported complete, and counts the requests.
+type reasoningFold struct{ calls int }
+
+func (r *reasoningFold) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	r.calls++
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Reasoning()
+	if err != nil {
+		return err
+	}
+	if err := w.Text("Let me think about what to keep."); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
 func TestUnappliedFoldProceedsUnfolded(t *testing.T) {
 	cases := []struct {
-		name string
-		cut  bool
-		want error
+		name  string
+		model openresponses.Streamer
+		want  error
 	}{
-		{"an oversized summary", false, compact.ErrSummaryTooLarge},
-		{"an incomplete summary", true, compact.ErrSummaryIncomplete},
+		{"an oversized summary", bloatingFold{}, compact.ErrSummaryTooLarge},
+		{"an incomplete summary", bloatingFold{cut: true}, compact.ErrSummaryIncomplete},
+		{"a summary with no text", callingFold{}, compact.ErrSummaryNoText},
+		{"a summary of reasoning alone", &reasoningFold{}, compact.ErrSummaryNoText},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) { testUnappliedFold(t, bloatingFold{cut: tc.cut}, tc.want) })
+		t.Run(tc.name, func(t *testing.T) { testUnappliedFold(t, tc.model, tc.want) })
+	}
+}
+
+// TestFoldWithNoTextBacksOff pins #199: a model that answers every
+// summary request with reasoning alone does not fail the turns past the
+// budget, and the turn after the failed fold asks for no summary.
+func TestFoldWithNoTextBacksOff(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &reasoningFold{}
+	// Every transcript is over the budget, and each turn grows the
+	// estimate by two: well inside the back-off's margins. The estimate
+	// is no size, so no prefix is too small to fold.
+	over := func(items openresponses.Items) int { return 100 + len(items) }
+	tr := compact.NewLocal(model, compact.WithBudget(100), compact.WithKeepLast(3), compact.WithEstimator(over), compact.WithMinFold(0), compact.WithOnFold(rec.Fold))
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform})
+	defer rec.Attach(a)()
+	turns := []struct {
+		text      string
+		summaries int // summary calls by the end of the turn
+	}{
+		{"one", 0},   // nothing older than the kept tail
+		{"two", 0},   // still nothing
+		{"three", 2}, // folds two items, gets no text twice
+		{"four", 2},  // backs off
+	}
+	for _, turn := range turns {
+		end, err := a.Prompt(context.Background(), openresponses.UserText(turn.text))
+		if err != nil || end.Reason != agentturn.ReasonDone {
+			t.Fatalf("%s: err=%v end=%+v", turn.text, err, end)
+		}
+		if model.calls != turn.summaries {
+			t.Fatalf("%s: summary calls = %d, want %d", turn.text, model.calls, turn.summaries)
+		}
+	}
+	failed := 0
+	for _, e := range s.Entries() {
+		if c, ok := e.(*agentsession.CustomEntry); ok && c.NS == FailedFoldNS {
+			failed++
+		}
+	}
+	if failed != 1 {
+		t.Errorf("failed folds recorded = %d: %q", failed, entryTypes(s))
 	}
 }
 
@@ -1207,9 +1508,10 @@ func TestFailedFoldLeavesATrace(t *testing.T) {
 		wantResponse bool
 		wantTypes    string
 		wantUsage    int // output tokens over every call; 0 for no usage
+		wantReason   agentturn.Reason
 	}{
-		{"the call fails", failingFold{}, "summary model down", 1, false, "", 0},
-		{"the model answers with a call twice", callingFold{}, "summary response has no text", 2, true, "function_call", 14},
+		{"the call fails", failingFold{}, "summary model down", 1, false, "", 0, agentturn.ReasonError},
+		{"the model answers with a call twice", callingFold{}, "summary response has no text", 2, true, "function_call", 14, agentturn.ReasonDone},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1227,14 +1529,20 @@ func TestFailedFoldLeavesATrace(t *testing.T) {
 				}
 			}
 			end, err := a.Prompt(context.Background(), openresponses.UserText("three"))
-			if err == nil || end.Reason != agentturn.ReasonError {
+			if (err != nil) != (tc.wantReason == agentturn.ReasonError) || end.Reason != tc.wantReason {
 				t.Fatalf("third prompt: err=%v end=%+v", err, end)
 			}
-			// The failed fold is the last entry before the run's end.
+			// The failed fold is the last entry before the run's end when
+			// it failed the run, and before the call it left unfolded
+			// otherwise.
 			entries := s.Entries()
-			last, ok := entries[len(entries)-2].(*agentsession.CustomEntry)
+			at := len(entries) - 2
+			if tc.wantReason != agentturn.ReasonError {
+				at = len(entries) - 4
+			}
+			last, ok := entries[at].(*agentsession.CustomEntry)
 			if !ok || last.NS != FailedFoldNS {
-				t.Fatalf("entry before the end = %+v, entries %q", entries[len(entries)-2], entryTypes(s))
+				t.Fatalf("entry %d = %+v, entries %q", at, entries[at], entryTypes(s))
 			}
 			var data FailedFold
 			if err := json.Unmarshal(last.Data, &data); err != nil || !strings.Contains(data.Error, tc.wantErr) || data.TokensBefore != 5 {
@@ -1245,6 +1553,11 @@ func TestFailedFoldLeavesATrace(t *testing.T) {
 			// are there when the model answered.
 			if data.Attempts != tc.wantAttempts || data.RequestHash == "" || data.Model != "small" {
 				t.Errorf("failed fold call = %+v", data)
+			}
+			// Only a fold the transform backs off from, one that left the
+			// run going, carries what a restart backs off with.
+			if backsOff := tc.wantReason == agentturn.ReasonDone; (data.PrefixHash != "") != backsOff || (data.Split != 0) != backsOff {
+				t.Errorf("failed fold split = %d, prefix hash = %q", data.Split, data.PrefixHash)
 			}
 			if (data.ResponseID != "") != tc.wantResponse || strings.Join(data.OutputTypes, ",") != tc.wantTypes {
 				t.Errorf("failed fold response = %q, output types = %q", data.ResponseID, data.OutputTypes)
@@ -1257,7 +1570,11 @@ func TestFailedFoldLeavesATrace(t *testing.T) {
 				t.Errorf("failed fold usage = %+v, want %d output tokens", data.Usage, tc.wantUsage)
 			}
 			// The record still verifies: the fold changed nothing.
-			if n := verifyAll(t, s); n != 2 {
+			want := 2
+			if tc.wantReason != agentturn.ReasonError {
+				want = 3
+			}
+			if n := verifyAll(t, s); n != want {
 				t.Errorf("responses verified = %d", n)
 			}
 		})

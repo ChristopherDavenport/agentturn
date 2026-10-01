@@ -609,7 +609,8 @@ func TestUnnamedResponseIsNotWithheld(t *testing.T) {
 // failed attempt left nothing; and a stream cut off before its terminal
 // event, which never names it, so its items name no response and its
 // failed response carries no request hash, since the record cannot
-// rebuild a request whose output it cannot tell from its input.
+// rebuild a request whose output it cannot tell from its input, and an
+// unhashed entry before it says so.
 func TestUnnamedItemsTakeTheirResponsesID(t *testing.T) {
 	rule := fmt.Errorf("%w: secret rule", agentturn.ErrGuard)
 	for _, tc := range []struct {
@@ -642,7 +643,7 @@ func TestUnnamedItemsTakeTheirResponsesID(t *testing.T) {
 		name:     "cut off",
 		cfg:      agentturn.Config{Model: nameless{&unnamed{cut: true}}, Tools: []agenttool.Tool{upper}},
 		reason:   agentturn.ReasonError,
-		types:    "run config item:user item:function_call response run",
+		types:    "run config item:user item:function_call custom response run",
 		unhashed: 1,
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -669,6 +670,10 @@ func TestUnnamedItemsTakeTheirResponsesID(t *testing.T) {
 				namedByTheirResponses(t, s)
 			}
 			verifyAllUnhashed(t, s, tc.unhashed)
+			// The response left unhashed says why.
+			if why := unhashedOf(t, s); len(why) != tc.unhashed || tc.unhashed > 0 && why[0].Reason != unnamedReason {
+				t.Errorf("unhashed = %+v, want %d naming the unnamed response", why, tc.unhashed)
+			}
 		})
 	}
 }

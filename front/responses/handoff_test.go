@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -122,12 +123,9 @@ func TestStartAfterHandoff(t *testing.T) {
 	}
 	billing := agentturn.Config{Name: "billing", Model: &echo.Adapter{}, BeforeModelCall: serves("billing")}
 	lastTransfer := func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
-		for i := len(t) - 1; i >= 0; i-- {
-			if call, ok := t[i].(*openresponses.FunctionCall); ok && call.Name == "transfer_to_billing" {
-				return billing, true
-			}
-		}
-		return agentturn.Config{}, false
+		return HandedTo(t, func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+			return billing, "transferred", call.Name == "transfer_to_billing"
+		})
 	}
 	for _, tc := range []struct {
 		name   string
@@ -166,6 +164,177 @@ func TestStartAfterHandoff(t *testing.T) {
 			}
 			if got := sink.Response().OutputText(); !strings.HasSuffix(got, tc.answer) {
 				t.Errorf("answer = %q", got)
+			}
+		})
+	}
+}
+
+// TestHandoffs pins #190: a transfer call is a handoff only when its
+// output is the transfer tool's own text and the route takes it; a call
+// a guard withheld, a hook blocked, a tool failed on, or the route does
+// not reach is not, and the last handoff is the conversation's.
+func TestHandoffs(t *testing.T) {
+	billing := agentturn.Config{Name: "billing"}
+	refunds := agentturn.Config{Name: "refunds"}
+	agents := map[string]agentturn.Config{"billing": billing, "refunds": refunds}
+	route := func(reachable ...string) Route {
+		return func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+			name := strings.TrimPrefix(call.Name, "transfer_to_")
+			if !slices.Contains(reachable, name) {
+				return agentturn.Config{}, "", false
+			}
+			return agents[name], `{"assistant":"` + name + `"}`, true
+		}
+	}
+	call := func(id, to string) *openresponses.FunctionCall {
+		return &openresponses.FunctionCall{CallID: id, Name: "transfer_to_" + to, Arguments: "{}"}
+	}
+	out := func(id, text string) *openresponses.FunctionCallOutput {
+		return &openresponses.FunctionCallOutput{CallID: id, Output: openresponses.FunctionCallOutputData{Text: text}}
+	}
+	user := openresponses.UserText("I was double charged")
+	for _, tc := range []struct {
+		name  string
+		t     agentturn.Transcript
+		route Route
+		want  []string
+		at    []int
+	}{
+		{"transferred", agentturn.Transcript{user, call("c1", "billing"), out("c1", `{"assistant":"billing"}`)}, route("billing"), []string{"billing"}, []int{2}},
+		{"withheld", agentturn.Transcript{user, call("c1", "billing"), out("c1", agentturn.WithheldCallOutput)}, route("billing"), nil, nil},
+		{"blocked", agentturn.Transcript{user, call("c1", "billing"), out("c1", "Error: blocked by policy")}, route("billing"), nil, nil},
+		{"unanswered", agentturn.Transcript{user, call("c1", "billing")}, route("billing"), nil, nil},
+		{"parts", agentturn.Transcript{user, call("c1", "billing"), &openresponses.FunctionCallOutput{CallID: "c1", Output: openresponses.FunctionCallOutputData{Text: `{"assistant":"billing"}`, Parts: openresponses.Contents{&openresponses.InputText{Text: "x"}}}}}, route("billing"), nil, nil},
+		{"output before the call", agentturn.Transcript{user, out("c1", `{"assistant":"billing"}`), call("c1", "billing")}, route("billing"), nil, nil},
+		{"unreachable", agentturn.Transcript{user, call("c1", "refunds"), out("c1", `{"assistant":"refunds"}`)}, route("billing"), nil, nil},
+		{"not a transfer", agentturn.Transcript{user, &openresponses.FunctionCall{CallID: "c1", Name: "lookup"}, out("c1", `{"assistant":"billing"}`)}, route("billing"), nil, nil},
+		{"two handoffs", agentturn.Transcript{user, call("c1", "billing"), out("c1", `{"assistant":"billing"}`), call("c2", "refunds"), out("c2", `{"assistant":"refunds"}`)}, route("billing", "refunds"), []string{"billing", "refunds"}, []int{2, 4}},
+		{"a later one withheld", agentturn.Transcript{user, call("c1", "billing"), out("c1", `{"assistant":"billing"}`), call("c2", "refunds"), out("c2", agentturn.WithheldCallOutput)}, route("billing", "refunds"), []string{"billing"}, []int{2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var names []string
+			var at []int
+			for _, h := range Handoffs(tc.t, tc.route) {
+				names = append(names, h.To.Name)
+				at = append(at, h.Output)
+			}
+			if !reflect.DeepEqual(names, tc.want) || !reflect.DeepEqual(at, tc.at) {
+				t.Errorf("Handoffs = %v at %v, want %v at %v", names, at, tc.want, tc.at)
+			}
+			cfg, ok := HandedTo(tc.t, tc.route)
+			if want := len(tc.want) > 0; ok != want || (ok && cfg.Name != tc.want[len(tc.want)-1]) {
+				t.Errorf("HandedTo = %q %v", cfg.Name, ok)
+			}
+		})
+	}
+}
+
+// thinksThenTransfers answers a user message with a reasoning item
+// signed for the requested model and a call to its first tool, and
+// echoes a function_call_output.
+type thinksThenTransfers struct{}
+
+func (thinksThenTransfers) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	if _, ok := req.Input[len(req.Input)-1].(*openresponses.FunctionCallOutput); ok {
+		return (&echo.Adapter{}).CreateStream(ctx, req, sink)
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if err := em.Item(&openresponses.ReasoningItem{Summary: openresponses.Contents{}, EncryptedContent: "sig:" + req.Model}); err != nil {
+		return err
+	}
+	w, err := em.FunctionCall("", req.Tools[0].(*openresponses.FunctionTool).Name)
+	if err != nil {
+		return err
+	}
+	if err := w.Arguments(`{}`); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// reasoningSigs lists the encrypted content of the reasoning items in
+// items.
+func reasoningSigs(items openresponses.Items) []string {
+	sigs := []string{}
+	for _, item := range items {
+		if r, ok := item.(*openresponses.ReasoningItem); ok {
+			sigs = append(sigs, r.EncryptedContent)
+		}
+	}
+	return sigs
+}
+
+// TestReasoningAcrossHandoff pins #91: the receiver of a handoff on
+// another model is sent none of the sender's reasoning items, within
+// the response that handed off and, under WithTransfers, in the
+// conversation's next request, in both modes; a receiver on the same
+// model is sent them, as is one WithStart alone starts, which cannot
+// tell where the input's reasoning came from.
+func TestReasoningAcrossHandoff(t *testing.T) {
+	route := func(cfg agentturn.Config) Route {
+		return func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+			return cfg, "transferred", call.Name == "transfer_to_billing"
+		}
+	}
+	for _, tc := range []struct {
+		name      string
+		billing   string // billing's ModelName
+		start     string // "transfers", "start", "both" or ""
+		caller    bool   // the next request carries a caller tool: one turn
+		handedOff []string
+		next      []string
+	}{
+		{"another model", "other-2", "transfers", false, []string{}, []string{}},
+		{"another model, one turn", "other-2", "transfers", true, []string{}, []string{}},
+		{"same model", "reasoner-1", "transfers", false, []string{"sig:reasoner-1"}, []string{"sig:reasoner-1"}},
+		{"WithStart alone", "other-2", "start", false, []string{}, []string{"sig:reasoner-1"}},
+		{"WithStart before WithTransfers", "other-2", "both", false, []string{}, []string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var seen [][]string
+			billing := agentturn.Config{Name: "billing", Model: &echo.Adapter{}, ModelName: tc.billing, BeforeModelCall: func(_ context.Context, req *openresponses.Request) error {
+				seen = append(seen, reasoningSigs(req.Input))
+				return nil
+			}}
+			opts := []Option{WithToolItems(), WithHandoff(func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool) {
+				return billing, true
+			})}
+			switch tc.start {
+			case "transfers":
+				opts = append(opts, WithTransfers(route(billing)))
+			case "start", "both":
+				opts = append(opts, WithStart(func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
+					return HandedTo(t, route(billing))
+				}))
+				if tc.start == "both" {
+					opts = append(opts, WithTransfers(route(billing)))
+				}
+			}
+			a := New(agentturn.Config{Name: "triage", Model: thinksThenTransfers{}, ModelName: "reasoner-1", Tools: []agenttool.Tool{transfer}}, opts...)
+			first := request(openresponses.UserText("I was double charged"))
+			sink, err := streamtest.Run(context.Background(), a, first)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(seen) != 1 || !reflect.DeepEqual(seen[0], tc.handedOff) {
+				t.Fatalf("billing's request in the response that handed off carried %v, want %v", seen, tc.handedOff)
+			}
+			if got := reasoningSigs(sink.Response().Output); !reflect.DeepEqual(got, []string{"sig:reasoner-1"}) {
+				t.Errorf("response output's reasoning = %v, want the sender's", got)
+			}
+			seen = nil
+			next := request(append(append(first.Input, sink.Response().Output...), openresponses.UserText("when is the refund"))...)
+			if tc.caller {
+				next.Tools = openresponses.Tools{openresponses.NewFunctionTool("remote", "caller side", json.RawMessage(`{"type":"object"}`))}
+			}
+			if _, err := streamtest.Run(context.Background(), a, next); err != nil {
+				t.Fatal(err)
+			}
+			if len(seen) != 1 || !reflect.DeepEqual(seen[0], tc.next) {
+				t.Errorf("billing's request in the next request carried %v, want %v", seen, tc.next)
 			}
 		})
 	}

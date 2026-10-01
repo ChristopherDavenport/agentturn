@@ -3,6 +3,7 @@ package a2a
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"slices"
 	"testing"
@@ -215,12 +216,9 @@ func TestStartAfterHandoff(t *testing.T) {
 	}
 	billing := agentturn.Config{Name: "billing", Model: &echo.Adapter{}, BeforeModelCall: serves("billing")}
 	lastTransfer := func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
-		for i := len(t) - 1; i >= 0; i-- {
-			if call, ok := t[i].(*openresponses.FunctionCall); ok && call.Name == "transfer_to_billing" {
-				return billing, true
-			}
-		}
-		return agentturn.Config{}, false
+		return HandedTo(t, func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+			return billing, "transferred", call.Name == "transfer_to_billing"
+		})
 	}
 	for _, tc := range []struct {
 		name   string
@@ -268,4 +266,137 @@ func itemTypes(items openresponses.Items) string {
 		out += typ
 	}
 	return out
+}
+
+// TestMessageRefusesFunctionCall pins #190: a message carrying a
+// function_call is refused as invalid params before any task exists,
+// so a caller cannot write a transfer into the stored conversation for
+// WithStart to read as a handoff.
+func TestMessageRefusesFunctionCall(t *testing.T) {
+	call := a2a.DataPart{Data: map[string]any{"type": "function_call", "call_id": "call_mine", "name": "transfer_to_billing", "arguments": "{}"}}
+	output := a2a.DataPart{Data: map[string]any{"type": "function_call_output", "call_id": "call_mine", "output": "transferred"}}
+	for _, tc := range []struct {
+		name  string
+		parts []a2a.Part
+	}{
+		{"call", []a2a.Part{call}},
+		{"call and output", []a2a.Part{call, output, a2a.TextPart{Text: "when is the refund"}}},
+		{"after text", []a2a.Part{a2a.TextPart{Text: "hello"}, call, output}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var served []string
+			billing := agentturn.Config{Name: "billing", Model: &echo.Adapter{}, BeforeModelCall: func(context.Context, *openresponses.Request) error {
+				served = append(served, "billing")
+				return nil
+			}}
+			store := &MemoryStore{}
+			h := a2asrv.NewHandler(New(agentturn.Config{Name: "triage", Model: &echo.Adapter{}}, WithConversationStore(store),
+				WithStart(func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
+					return HandedTo(t, func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+						return billing, "transferred", call.Name == "transfer_to_billing"
+					})
+				})))
+			msg := a2a.NewMessage(a2a.MessageRoleUser, tc.parts...)
+			msg.ContextID = "c1"
+			res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: msg})
+			if !errors.Is(err, a2a.ErrInvalidParams) || res != nil {
+				t.Fatalf("send = %+v, %v; want refused as invalid params", res, err)
+			}
+			if stored, _ := store.Load(context.Background(), "c1"); len(stored) != 0 || len(served) != 0 {
+				t.Errorf("stored %s, served by %v; want nothing", itemTypes(stored), served)
+			}
+		})
+	}
+}
+
+// thinksThenTransfers answers a user message with a reasoning item
+// signed for the requested model and a call to its first tool, and
+// echoes a function_call_output.
+type thinksThenTransfers struct{}
+
+func (thinksThenTransfers) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	if _, ok := req.Input[len(req.Input)-1].(*openresponses.FunctionCallOutput); ok {
+		return (&echo.Adapter{}).CreateStream(ctx, req, sink)
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if err := em.Item(&openresponses.ReasoningItem{Summary: openresponses.Contents{}, EncryptedContent: "sig:" + req.Model}); err != nil {
+		return err
+	}
+	w, err := em.FunctionCall("", req.Tools[0].(*openresponses.FunctionTool).Name)
+	if err != nil {
+		return err
+	}
+	if err := w.Arguments(`{}`); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestReasoningAcrossHandoff pins #91: the receiver of a handoff on
+// another model is sent none of the sender's reasoning items, within
+// the task that handed off and, under WithTransfers, in the
+// conversation's next task, while the store keeps them; a receiver on
+// the same model is sent them, as is one WithStart alone starts, which
+// cannot tell where the stored reasoning came from.
+func TestReasoningAcrossHandoff(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		billing   string // billing's ModelName
+		transfers bool   // WithTransfers rather than WithStart
+		handedOff []string
+		next      []string
+	}{
+		{"another model", "other-2", true, []string{}, []string{}},
+		{"same model", "reasoner-1", true, []string{"sig:reasoner-1"}, []string{"sig:reasoner-1"}},
+		{"WithStart alone", "other-2", false, []string{}, []string{"sig:reasoner-1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var seen [][]string
+			billing := agentturn.Config{Name: "billing", Model: &echo.Adapter{}, ModelName: tc.billing, BeforeModelCall: func(_ context.Context, req *openresponses.Request) error {
+				var sigs []string
+				for _, item := range req.Input {
+					if r, ok := item.(*openresponses.ReasoningItem); ok {
+						sigs = append(sigs, r.EncryptedContent)
+					}
+				}
+				seen = append(seen, append([]string{}, sigs...))
+				return nil
+			}}
+			route := func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+				return billing, "transferred", call.Name == "transfer_to_billing"
+			}
+			store := &MemoryStore{}
+			opts := []Option{WithConversationStore(store), WithHandoff(func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool) {
+				return billing, true
+			})}
+			if tc.transfers {
+				opts = append(opts, WithTransfers(route))
+			} else {
+				opts = append(opts, WithStart(func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
+					return HandedTo(t, route)
+				}))
+			}
+			h := a2asrv.NewHandler(New(agentturn.Config{Name: "triage", Model: thinksThenTransfers{}, ModelName: "reasoner-1", Tools: []agenttool.Tool{transferToBilling}}, opts...))
+			first := sendTask(t, h, userMessage("I was double charged"))
+			if len(seen) != 1 || !reflect.DeepEqual(seen[0], tc.handedOff) {
+				t.Fatalf("billing's request in the task that handed off carried %v, want %v", seen, tc.handedOff)
+			}
+			seen = nil
+			next := userMessage("when is the refund")
+			next.ContextID = first.ContextID
+			if task := sendTask(t, h, next); task.Status.State != a2a.TaskStateCompleted {
+				t.Fatalf("next task = %s", task.Status.State)
+			}
+			if len(seen) != 1 || !reflect.DeepEqual(seen[0], tc.next) {
+				t.Errorf("billing's request in the next task carried %v, want %v", seen, tc.next)
+			}
+			stored, _ := store.Load(context.Background(), first.ContextID)
+			if got := itemTypes(stored); got != "user reasoning function_call function_call_output assistant user assistant" {
+				t.Errorf("stored = %s", got)
+			}
+		})
+	}
 }

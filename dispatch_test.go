@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/openresponses"
@@ -269,4 +271,230 @@ func TestDistinctDispatchFailuresCutEveryCall(t *testing.T) {
 	if starts, ends, unpaired := pairing(events); starts != 2 || ends != 2 || len(unpaired) != 0 {
 		t.Errorf("pairing: starts=%d ends=%d unpaired=%v", starts, ends, unpaired)
 	}
+}
+
+// TestChainWaitsForAfterToolCall pins #196: the next call of a chain,
+// a serial batch or calls sharing a resource, is dispatched only once
+// AfterToolCall has settled the call before it, so what the hook
+// records lands between the two. Calls in chains of their own wait for
+// nothing, and a hook that fails cuts the chain rather than hanging it.
+func TestChainWaitsForAfterToolCall(t *testing.T) {
+	cases := []struct {
+		name  string
+		names []string
+		// opts are the options of every tool.
+		opts []agenttool.Option
+		exec ExecutionMode
+		max  int
+		// ordered says each call follows the one before it, and
+		// independent that the hook for the first call holds it until
+		// every other call is dispatched, which a call waiting for that
+		// hook never is.
+		ordered, independent bool
+		// fail makes the hook fail on the first call.
+		fail bool
+	}{
+		{name: "sequential", names: []string{"a", "b"}, exec: ExecSequential, ordered: true},
+		{name: "one at a time", names: []string{"a", "b", "c"}, max: 1, ordered: true},
+		{name: "shared resource", names: []string{"a", "b", "c"}, opts: []agenttool.Option{agenttool.WithResource("shell")}, ordered: true},
+		{name: "sequential tool", names: []string{"a", "b"}, opts: []agenttool.Option{agenttool.WithSequential()}, ordered: true},
+		{name: "chains of their own", names: []string{"a", "b", "c"}, independent: true},
+		{name: "shared resource, bounded", names: []string{"a", "b"}, opts: []agenttool.Option{agenttool.WithResource("shell")}, max: 2, ordered: true},
+		{name: "hook fails", names: []string{"a", "b"}, exec: ExecSequential, fail: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var seq []string
+			log := func(s string) {
+				mu.Lock()
+				defer mu.Unlock()
+				seq = append(seq, s)
+			}
+			var tools []agenttool.Tool
+			for _, name := range tc.names {
+				tools = append(tools, agenttool.New(name, "", func(context.Context, echoArgs) (string, error) {
+					log("tool:" + name)
+					return name, nil
+				}, tc.opts...))
+			}
+			dispatched := map[string]chan struct{}{}
+			for _, name := range tc.names {
+				dispatched[name] = make(chan struct{})
+			}
+			after := func(_ context.Context, info ToolResultInfo) (*ToolOverride, error) {
+				log("after:" + info.Call.Name)
+				if tc.independent && info.Call.Name == tc.names[0] {
+					for _, name := range tc.names[1:] {
+						select {
+						case <-dispatched[name]:
+						case <-time.After(5 * time.Second):
+							log("waited for:" + name)
+						}
+					}
+				}
+				// Long enough for a call dispatched alongside the hook
+				// to show up inside it.
+				time.Sleep(20 * time.Millisecond)
+				if tc.fail {
+					return nil, errors.New("checkpoint failed")
+				}
+				log("settled:" + info.Call.Name)
+				return nil, nil
+			}
+			a := New(Config{Model: callsNamed{names: tc.names}, Tools: tools, ToolExecution: tc.exec, MaxParallelTools: tc.max, AfterToolCall: after, MaxTurns: 1})
+			a.Subscribe(func(_ context.Context, ev Event) error {
+				if e, ok := ev.(*ToolDispatch); ok {
+					log("dispatch:" + e.Name)
+					close(dispatched[e.Name])
+				}
+				return nil
+			})
+			end, _ := a.Prompt(context.Background(), openresponses.UserText("x"))
+			mu.Lock()
+			got := append([]string(nil), seq...)
+			mu.Unlock()
+			at := func(s string) int { return slices.Index(got, s) }
+			if tc.fail {
+				if end.Reason != ReasonError || at("dispatch:b") >= 0 {
+					t.Errorf("reason=%s, order %v", end.Reason, got)
+				}
+				return
+			}
+			if end.Reason != ReasonStopped && end.Reason != ReasonDone {
+				t.Fatalf("reason=%s err=%v", end.Reason, end.Err)
+			}
+			for i, name := range tc.names {
+				if at("settled:"+name) < 0 {
+					t.Errorf("%s not settled: %v", name, got)
+				}
+				if at("waited for:"+name) >= 0 {
+					t.Errorf("%s, in a chain of its own, waited for %s's hook: %v", name, tc.names[0], got)
+				}
+				if !tc.ordered || i == 0 {
+					continue
+				}
+				prev := tc.names[i-1]
+				if !(at("settled:"+prev) < at("dispatch:"+name) && at("dispatch:"+name) < at("tool:"+name)) {
+					t.Errorf("%s dispatched before %s settled: %v", name, prev, got)
+				}
+			}
+		})
+	}
+}
+
+// TestChainBeforeMatchesTheExecutor pins chainBefore to the chains
+// agenttool's executor actually runs, which it does not export, so a
+// change there fails here rather than as a dispatch that waits for a
+// call the executor does not order before it. For each pair of calls
+// the earlier one's tool waits for the later one to start: a call in
+// its chain cannot, and must not within a short wait; a call in
+// another chain must, within a long one. A job with no tool never
+// starts, so it is only checked to shift nothing.
+func TestChainBeforeMatchesTheExecutor(t *testing.T) {
+	cases := []struct {
+		name  string
+		kinds []jobKind
+		exec  agenttool.Executor
+	}{
+		{name: "parallel", kinds: []jobKind{kindPlain, kindPlain, kindPlain}},
+		{name: "resources", kinds: []jobKind{kindResX, kindPlain, kindResX, kindResY, kindResY}},
+		{name: "no tool inside a resource chain", kinds: []jobKind{kindResX, kindNone, kindResX}},
+		{name: "bounded", kinds: []jobKind{kindPlain, kindResX, kindPlain, kindResX}, exec: agenttool.Executor{MaxParallel: 2}},
+		{name: "sequential", kinds: []jobKind{kindPlain, kindResX, kindPlain, kindNone}, exec: agenttool.Executor{Sequential: true}},
+		{name: "one at a time", kinds: []jobKind{kindPlain, kindResY, kindPlain}, exec: agenttool.Executor{MaxParallel: 1}},
+		{name: "a sequential tool", kinds: []jobKind{kindPlain, kindSeq, kindResX, kindResX}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := chainBefore(tc.exec, jobsOf(tc.kinds, nil))
+			// chained reports whether i follows p in its chain.
+			chained := func(p, i int) bool {
+				for at := before[i]; at >= 0; at = before[at] {
+					if at == p {
+						return true
+					}
+				}
+				return false
+			}
+			for p := range tc.kinds {
+				for i := p + 1; i < len(tc.kinds); i++ {
+					if tc.kinds[p] == kindNone || tc.kinds[i] == kindNone {
+						continue
+					}
+					wait := 5 * time.Second
+					if chained(p, i) {
+						wait = 50 * time.Millisecond
+					}
+					started := make([]chan struct{}, len(tc.kinds))
+					for j := range started {
+						started[j] = make(chan struct{})
+					}
+					sawStart := false
+					hold := func(j int) {
+						if j != p {
+							return
+						}
+						select {
+						case <-started[i]:
+							sawStart = true
+						case <-time.After(wait):
+						}
+					}
+					exec := tc.exec
+					exec.OnStart = func(_ context.Context, job agenttool.Job) error {
+						var j int
+						fmt.Sscanf(job.Call.ID, "j%d", &j)
+						close(started[j])
+						return nil
+					}
+					for range exec.Execute(context.Background(), jobsOf(tc.kinds, hold)) {
+					}
+					if sawStart == chained(p, i) {
+						t.Errorf("job %d started while job %d ran: %v, want %v; chainBefore %v", i, p, sawStart, !sawStart, before)
+					}
+				}
+			}
+		})
+	}
+}
+
+// jobKind is the tool of a job jobsOf builds.
+type jobKind int
+
+const (
+	kindPlain jobKind = iota // names no resource
+	kindResX                 // on resource x
+	kindResY                 // on resource y
+	kindSeq                  // agenttool.Sequential
+	kindNone                 // no tool at all
+)
+
+// jobsOf builds a batch of one job per kind, named j0, j1 and so on.
+// Each tool calls hold with its index before it returns.
+func jobsOf(kinds []jobKind, hold func(int)) []agenttool.Job {
+	jobs := make([]agenttool.Job, len(kinds))
+	for j, kind := range kinds {
+		var opts []agenttool.Option
+		switch kind {
+		case kindResX:
+			opts = append(opts, agenttool.WithResource("x"))
+		case kindResY:
+			opts = append(opts, agenttool.WithResource("y"))
+		case kindSeq:
+			opts = append(opts, agenttool.WithSequential())
+		}
+		id := fmt.Sprintf("j%d", j)
+		jobs[j].Call = agenttool.Call{ID: id, Args: json.RawMessage(`{}`)}
+		if kind == kindNone {
+			continue
+		}
+		jobs[j].Tool = agenttool.New(id, "", func(context.Context, struct{}) (string, error) {
+			if hold != nil {
+				hold(j)
+			}
+			return "", nil
+		}, opts...)
+	}
+	return jobs
 }

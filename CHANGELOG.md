@@ -5,6 +5,261 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- **Requires `agenttool` v0.0.14, up from v0.0.12, and `agentsession`
+  v0.0.19, up from v0.0.18.** Neither changes what this module does.
+  agentsession v0.0.19 adds `agentsession migrate` for a `cas` store
+  v0.0.15 or earlier wrote: on such a store, stop every writer, take a
+  copy, run it, then upgrade readers and writers together, as its
+  changelog says.
+- **A call streamed at the output index of an earlier call runs under
+  its own ID.** The loop kept the ID it decided for a call by output
+  index, so a stream that opens every call at index 0, as Ollama
+  0.23's `/v1/responses` does for parallel calls, ran two calls under
+  the second's ID, with one call's output given to the other; under a
+  session recorder the run failed at the second output. A call is now
+  known by its item ID, and by its output index when the event naming
+  it carries none, so a call opened without an item ID and completed
+  with one keeps the ID it opened with. The output guard sees every
+  item that opened before the message, a call an index no longer
+  holds among them (#198).
+- **`RunEnd.Answer` looks past extension items after the final
+  message.** An adapter that writes a namespaced item once the text is
+  complete, such as a text-call parser's raw text, put it after the
+  assistant message, and every consumer of `Answer`, `front/a2a` and
+  `tools/agent` among them, saw no answer. Trailing items whose type is
+  namespaced, as `DefaultFilter` tells them, are now skipped; a
+  withheld run still has no answer (#203).
+- **`Invoke` asks the user about a nested call the hook defers.** A
+  deferred nested call was always refused, so under an ask policy a
+  code-execution tool's script could not make a call the user would
+  have been asked about. When the invoking tool's context carries an
+  `agenttool.Elicitor`, `Config.ToolElicitor` among them, the loop now
+  asks it with a question naming the call, its arguments (the first
+  500 bytes) and the decision's reason; an accept runs the call and a decline refuses it,
+  and the nested `tool_start` carries the answer as the decision, by
+  `human`. Without an elicitor, or on a cancel or a failure to ask, the
+  call is refused as before. The session recorder writes a nested call
+  allowed with a reason as `proceed`, as it does a model's call, so an
+  approval is on the record with who gave it. Under `front/a2a` a
+  nested call to a caller-owned tool is blocked with a reason rather
+  than deferred, since the caller answers only the model's calls, so
+  no elicitor is asked to run a tool that cannot run there (#200).
+- **The next call of a chain is dispatched only once `AfterToolCall`
+  has settled the one before it.** The executor started a serial
+  batch's next call, or the next call on the same resource, as soon as
+  the loop received the last one's result, so it was dispatched and
+  ran while the hook for the call before it was still running. A move
+  of the workspace written from the hook with `session.Recorder.Env`
+  landed after the next call's dispatch, and a checkpoint taken there
+  could hold the next call's changes. A call's dispatch now waits for
+  the settling of the call before it in its chain; calls in other
+  chains are not held (#196).
+
+- **`front/responses.WithToolItems` no longer tells a caller that
+  sends the output back to leave it off.** Those are the callers
+  `WithStart` serves, and it finds a handoff only in the transfer call
+  the option includes. Its doc now says a caller that sends the
+  conversation back keeps the tool items, and one that runs each
+  `function_call` in an output skips the calls the output already
+  answers. (#191)
+- **`front/responses.HandedTo` and `front/a2a.HandedTo` find the agent a
+  conversation was handed to, and `front/a2a` refuses a message carrying
+  a `function_call` or declaring a tool that would stand in for the
+  agent's.** The function both fronts documented for `WithStart` took
+  any transfer call for a handoff: one the caller wrote, one a guard
+  withheld with `agentturn.WithheldCallOutput`, one a hook blocked.
+  `Handoffs` walks the transfer calls a `Route` names and takes one only
+  when its output is the transfer tool's own text, and `HandedTo`
+  returns the last; front/a2a re-exports both and the types from
+  front/responses, where they live. A message whose data parts decode to
+  a `function_call` is now refused with `a2a.ErrInvalidParams` before
+  any task exists, so the stored conversation holds only the model's
+  calls; a message that sent one before is now an error. So is a message
+  whose `MetaCallerTools` declare a tool named as one the executor's
+  configuration, or the one the task starts under, offers, or one the
+  route `WithTransfers` gives takes: the caller would answer that call,
+  and a declared transfer answered with the route's text routed the
+  conversation past the agent that decides it. A handoff's receiver that
+  offers a name a message declared runs its own tool. Under
+  front/responses the input is the caller's, and the docs say
+  `WithStart` chooses only among agents the caller may reach directly or
+  checks the call against state the host keeps. A transfer `WithHandoff`
+  declined keeps the tool's text, so a host whose `WithHandoff` declines
+  declines the same calls in the route. (#190)
+- **The loop leaves another model's reasoning items out of the
+  request.** A reasoning item carries a signature only its own provider
+  accepts, so a handoff, or a `SetConfig` between runs, to a
+  configuration with another `Config.ModelName` sent the receiver items
+  it refused with a 400. The loop now attributes each reasoning item a
+  response adds to the `ModelName` in force, and each request, after
+  the filter, leaves out the ones another model produced; the model's
+  own stay, as a provider may require them back on a tool-use turn, and
+  so does an item of unknown origin. The transcript and the record keep
+  every item. `ReasoningModels` holds the attribution;
+  `WithReasoningModels` and `ContextWithReasoningModels` give it for a
+  transcript the loop has not seen. Both fronts attribute the items
+  their in-process handoffs pass on, and their new `WithTransfers(route)`
+  attributes a caller's input or a stored transcript by the handoffs
+  it took, with `front/responses.Attribute`, and, unless `WithStart` is
+  given too, starts where the last transfer left the conversation, as
+  `WithStart` with `HandedTo` does. A `compact.NewLocal` fold leaves
+  every reasoning item out of its summary request: a summariser cannot
+  read one, and the summary model's provider refuses another model's.
+  A session recorder writes the responses after such a request with no
+  request hash, since the format cannot describe an omission from the
+  middle of the history (agentsession#56). An empty `ModelName` names
+  no model, so nothing changes for a host that sets none. (#91)
+- **A resumed session knows which model produced its reasoning.**
+  `session.AgentOptions` now gives `WithReasoningModels`, attributing
+  each reasoning item on the path to the model the recorded settings
+  named when its response was written, the request's `ModelName`, so
+  after a restart a request to another model leaves the earlier model's
+  reasoning out as a live agent does, and keeps its own. The new
+  `session.TranscriptModels` returns the transcript and that
+  attribution keyed to the same items, for a host that seeds an agent
+  by hand, after `Recorder.Rebase` for one. A reasoning item no
+  response produced, or one written under no recorded model, stays
+  unattributed and is sent to every model. (#91)
+
+- **A fold no longer keeps a function call output while folding its
+  call when another item sits between them.** The split used to move
+  back only while the first kept item was an output, so an extension
+  item an adapter emits after a call, such as a text-call parser's raw
+  item, let the call be folded and its output sent alone, which a
+  Responses or Chat Completions server rejects. The split now moves
+  back to the call of every output the kept tail holds, wherever in
+  the tail it is (#201).
+- **A local fold whose summary has no text twice no longer fails the
+  turn.** Like a summary cut short or too large, it is reported failed,
+  now with the exported `compact.ErrSummaryNoText`, the transcript is
+  sent unfolded, and the transform backs off from that prefix. A model
+  that answered a summary request with reasoning alone or a function
+  call every time used to fail every later turn of the conversation
+  before the model was called, adding a `compaction_failed` each time
+  (#199).
+- **`compact.WithMinFold(tokens)` leaves a prefix too small to
+  summarise unfolded.** A transcript over budget because of its kept
+  tail, such as a large tool output among the last `WithKeepLast`
+  items, used to fold whatever prefix was left, often one short
+  message: two summary calls, a `compaction_failed` when the summary
+  came back no smaller, and the same again once the prefix grew. A
+  fold whose input is estimated below the minimum is now skipped, and
+  calls and reports nothing, as a call within the budget does.
+  `NewLocal` defaults it to the larger of an eighth of the budget and
+  twice the estimate of an empty summary item, about 58 tokens with the
+  default estimator and summary item, computed after the other
+  options; `New` defaults it to zero. Pass `WithMinFold(0)` for the old
+  behaviour (#204).
+- **The back-off after a failed fold survives a restart.** The memory
+  of a fold that failed with an unfolded send lived only in the
+  `Transform`, so a process that restarted, or resumed the session in
+  another, asked again for the summary that had failed: two summary
+  calls and another `compaction_failed` on every firing of a scheduled
+  routine or every restart of a crash loop. `compact.Fold` now reports
+  `PrefixHash` for such a fold, `compact.PrefixHash` says what it
+  hashes, and `compact.WithFailedFold(split, prefixHash, tokens)` seeds
+  a transform with one. The recorder writes `split` and `prefix_hash`
+  on the `agentturn:compaction_failed` entry, `session.LastFailedFold`
+  reads the last one on the path back, and `session.CompactOptions`
+  returns the option a host resuming a session passes to
+  `compact.NewLocal`, as `session.AgentOptions` is for the agent. A
+  transcript that no longer begins with the prefix ignores it; so does
+  the first resume after a fold applied before the failed one, whose
+  context the compaction shortened (#194).
+
+- **A held call dispatched on a branch a rebase left is ended by an
+  `answer`, not a `reject`.** `session.Pending` read such a call as
+  deferred and dispatched, but the recorder seeded from the same path
+  did not see the dispatch, so an output the host gave it, an
+  `OutcomeUnknown` included, or a `BeforeToolCall` block, was written
+  behind a `reject`, which says the call never reached its tool. The
+  recorder now reads a call with no dispatch on its path and one
+  elsewhere in the session as one that may have run, as `Pending` does,
+  and RFC 0001 asks. (#193)
+- **After a rebase, `session.ReplayAnswers` answers a call that
+  completed on the branch left with the output it returned there.** A
+  call whose only dispatch is on that branch may have run, and was held
+  to its tool's replay rule, so a tool that could not say a second run
+  was safe was answered "outcome unknown" although the session held its
+  output, and a keyed one ran again. It is now answered with that
+  output, by policy, with the reason "ran on a branch the rebase left",
+  which the recorder writes behind an `answer`. A call cut there before
+  its output is held to the replay rule as before, and so is one whose
+  output there an `answer` decision put, an outcome unknown a host gave,
+  which is not what the call returned. (#195)
+- **`session.WithOrigins` reads a fork's origin.** A fork made at a
+  call holds the call in its prefix and its dispatch in the session it
+  was made from, so `Pending` read the call as unknown with no key, and
+  `ReplayAnswers` answered a keyed one "outcome unknown" where, after a
+  rebase in one session, it runs again under its key. `Pending`,
+  `AgentOptions` and `ReplayAnswers` take `...ReadOption`, and
+  `WithOrigins(r agentsession.Reader)` has them read the origin's
+  dispatches for such a call, up a chain of forks, as for a call
+  dispatched on another branch: a keyed call runs again under its key,
+  and one that completed there is answered with its output, reason "ran
+  in the session this one forks". Without it, or for an origin the
+  reader does not hold, the reading is as before; an error reading one
+  is returned. The recorder reads the origin through its own store when
+  that store is an `agentsession.Reader`, so a held call dispatched
+  there is ended by an `answer`, and takes an origin it fails to read as
+  one it does not hold, so `Start`, `Resume` and `Rebase` do not fail
+  over it. `Recorder.ReadOptions()` returns the options that read as
+  the recorder does. A call of the three functions compiles as before,
+  but code that stores one as a function value of its old type does
+  not. (#192)
+- **A child session names the workspace it starts in.** With
+  `session.WithEnv`, a child's first run start writes, when the child's
+  session holds no env entry, a copy of the env in force in its
+  parent's at that moment. Before, a child got an env entry only from
+  `Recorder.Env` when its workspace moved, so its move was the first
+  env entry of its file, which no reader takes for a substitution, and
+  a job that outlived the child was compared with its parent's env as
+  it is now, so after the parent moved it wrote nothing. RFC 0001 does
+  not inherit an environment through `parent_session`. `Recorder.Env`
+  now compares with the child's own entry. It costs one entry per child
+  session. A recorder seeded from a path, by `Resume`, `Rebase` or a
+  child's second run under its call, now takes the last env entry on
+  the whole path, not only in the context, so after a compaction it no
+  longer writes the env again at the next run start, or copies a
+  child's parent's env over the node the child had moved to. (#197)
+- **A model's output item the filter keeps from the model no longer
+  stops the request hashes.** The recorder wrote such an item, an
+  adapter's extension item kept from other adapters by `DefaultFilter`,
+  as an item entry, which the context algorithm contributes, so the
+  path rebuilt an input the request did not carry and every later
+  response went unhashed. It is now a custom entry in the namespace of
+  its type, as an app-only input is. Every such entry, an app-only
+  input's included, now carries a new `session.ResponseIDMember` member
+  beside the item naming the response that produced it, "" for an input
+  or a response that never named itself. The new `session.Transcript`
+  is the context's items with every item so marked put back where the
+  loop held it; `AgentOptions` and the recorder's seeding use it, so an
+  agent resumed or rebased holds them, a model's outputs as before and
+  app-only inputs, which a resume used to drop, now too, so a transform
+  that reads the whole transcript sees what it saw before the restart.
+  `Recorder.EntryOf` and a fold's placement find such an item from the
+  copy `Transcript` decodes. `Rebase` and a `Start` on a base say to
+  seed with it. An app-only input written by v0.0.14 or earlier carries
+  no mark and is not put back. (#202)
+- **The recorder says why it left a request unhashed.** When a
+  request's input is not what the recorded path rebuilds, after a
+  `Transform` or a `BeforeModelCall` changed it, with a child's seed
+  transcript, or with items the loop left out, its response is written
+  without a hash, which read on disk like a harness that never hashed.
+  Before the first such response the recorder now writes a custom entry
+  in `session.UnhashedNS` (`agentturn:unhashed`) whose data, a
+  `session.Unhashed`, gives the reason and the first item at which the
+  two inputs part, by index, type, ID and call ID, as sent and as
+  recorded. It writes another only when the cause changes, its reason
+  or the recorded item where the inputs part, or after a response that
+  carried a hash, so a transform that keeps a window of the transcript
+  writes one; a recorder seeded by `Resume` or `Rebase` takes up the
+  cause the path last named. A response whose stream never named it,
+  whose items then read as its input, gets one with a reason of its
+  own. No format change. (#92)
+
 ## v0.0.14 - 2026-10-01
 
 - **`compact.WithOnFold` adds a callback rather than replacing the
