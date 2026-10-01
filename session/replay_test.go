@@ -701,8 +701,9 @@ func TestRunAgainIsAlwaysDecided(t *testing.T) {
 // run, so Pending reads it as aborted with that dispatch's key, and the
 // replay rule runs a keyed call again under the first key and answers
 // one whose replay is unknown with the outcome unknown. The record
-// says which: a proceed before the keyed call's second dispatch, and,
-// until agentsession#157, a reject before the unknown one's output.
+// says which: a proceed before the keyed call's second dispatch, and
+// an answer, which format 0.10 lets the dispatch on the other branch
+// stand behind, before the unknown one's output.
 func TestRebaseBeforeADispatch(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -711,14 +712,11 @@ func TestRebaseBeforeADispatch(t *testing.T) {
 		runs int
 		// verdict and reason are the decision the new path holds for the
 		// call. A call whose outcome is unknown is answered without
-		// running, and the format reads an answer after no dispatch on
-		// the path as an error, so the recorder writes a reject, which
-		// says the call never reached its tool; agentsession#157 asks
-		// that the dispatch on the other branch satisfy the answer rule.
+		// running: an answer, not a reject, since it may have run.
 		verdict, reason string
 	}{
 		{"keyed runs again under the first key", agenttool.ReplayKeyed, 2, agentsession.VerdictProceed, agentturn.RunAgainKeyedReason},
-		{"unknown is not run again", agenttool.ReplayUnknown, 1, agentsession.VerdictReject, "Error: outcome unknown: "},
+		{"unknown is not run again", agenttool.ReplayUnknown, 1, agentsession.VerdictAnswer, "not run again: replay unknown"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

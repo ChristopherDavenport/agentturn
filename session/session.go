@@ -1042,7 +1042,6 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 		return nil, fmt.Errorf("session: pending calls at leaf: %w", err)
 	}
 	var out []agentturn.PendingCall
-	var elsewhere map[string]*agentsession.DispatchEntry
 	for _, c := range calls {
 		p := agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingUnknown}
 		state := c.State(s.Header())
@@ -1063,11 +1062,8 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 		// have run, and a run of it again repeats that hand-off.
 		var off *agentsession.Call
 		if len(c.Dispatches) == 0 && (state == agentsession.CallHeld || state == agentsession.CallNeverStarted || state == agentsession.CallUnknown) {
-			if elsewhere == nil {
-				elsewhere = lastDispatches(s)
-			}
-			if d, ok := elsewhere[c.Entry.ID]; ok {
-				if off, err = callAt(s, d, c.Entry.ID); err != nil {
+			if ds := s.Dispatches(c.Entry.ID); len(ds) > 0 {
+				if off, err = callAt(s, ds[len(ds)-1], c.Entry.ID); err != nil {
 					return nil, err
 				}
 				if state == agentsession.CallHeld {
@@ -1097,22 +1093,6 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 		out = append(out, p)
 	}
 	return out, nil
-}
-
-// lastDispatches maps the entry of each function call the session's
-// dispatches name to the last of them in the file, on any branch.
-func lastDispatches(s *agentsession.Session) map[string]*agentsession.DispatchEntry {
-	out := map[string]*agentsession.DispatchEntry{}
-	for _, e := range s.Entries() {
-		if d, ok := e.(*agentsession.DispatchEntry); ok {
-			target := d.Target
-			if id, ok := s.Resolve(target); ok {
-				target = id
-			}
-			out[target] = d
-		}
-	}
-	return out
 }
 
 // callAt is the call held by the entry callEntry as the path to the
@@ -2976,17 +2956,6 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 			// no tool has or arguments that are not an object, has the
 			// same shape with the loop as the decider: it refused the
 			// call before any tool, which is a policy's refusal.
-			//
-			// Known gap: a call whose dispatch is on another branch of
-			// the session, after a rebase to an entry between the call
-			// and its dispatch, has this shape too, though it may have
-			// run, and Pending reads it so. Its answer, outcome unknown,
-			// would be an answer decision, but the format checks an
-			// answer against a dispatch on the path alone and refuses
-			// it, and a second dispatch would say the tool was handed
-			// the call again when it was not. The reject stays until
-			// the format lets a dispatch anywhere in the session
-			// satisfy the answer rule (agentsession#157).
 			by := agentturn.DeciderFromContext(ctx, out.CallID)
 			if c.settledRun != "" && c.settledRun == w.run || w.withheld {
 				// The loop refused it, whoever approved it: a call

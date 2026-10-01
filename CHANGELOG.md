@@ -7,14 +7,19 @@ versions may break the API.
 
 ## Unreleased
 
-- Requires `agenttool` v0.0.12, up from v0.0.11, and `agentsession`
-  v0.0.17, up from v0.0.15. The format is unchanged; `VerifyRecords`
-  now also checks a run start's `source` against its segment and
-  refuses an empty `call_id`, and the recorder's sessions pass both. A `cas` store a
-  session recorder writes through is migrated to v0.0.16's per-session
-  log on its first writing open, after which agentsession v0.0.15 and
-  earlier cannot read it; keep a copy of the store if rolling back may
-  be needed.
+- **Requires `agentsession` v0.0.18, up from v0.0.15, and `agenttool`
+  v0.0.12, up from v0.0.11. The session recorder writes
+  `agentsession/0.10`**, and raises a 0.9 file it appends to, after
+  which every 0.9 reader (agentsession v0.0.12 to v0.0.17, and so
+  agentturn v0.0.12) refuses it: upgrade every reader of a store
+  before any writer runs this release. 0.10 lets an `answer` end a call
+  dispatched only on another branch (see #185 below). `VerifyRecords`
+  also checks a run start's `source` against its segment and refuses an
+  empty `call_id`, and the recorder's sessions pass both. A `cas` store
+  a session recorder writes through is migrated to v0.0.16's
+  per-session log on its first writing open, after which agentsession
+  v0.0.15 and earlier cannot read it; keep a copy of the store if
+  rolling back may be needed.
 - **The recorder names a response's items the stream left unnamed.**
   A stream that sends no `response.created` or `response.in_progress`,
   a relay passing on only the output items and the terminal event,
@@ -176,12 +181,11 @@ versions may break the API.
   anywhere in the session as `PendingAborted`, with the key and the
   arguments of the last such dispatch, so a keyed call runs again under
   its first key and one whose replay is unknown is answered with the
-  outcome unknown; a held call with one is `Dispatched`. Known gap: the
-  recorder writes that outcome-unknown answer after a `reject`, which
-  says the call never reached its tool, since the format checks an
-  `answer` against a dispatch on the path alone;
-  [agentsession#157](https://github.com/ChristopherDavenport/agentsession/issues/157)
-  asks that a dispatch anywhere in the session satisfy it (#185).
+  outcome unknown; a held call with one is `Dispatched`. The recorder
+  writes that outcome-unknown reply as an `answer`, which format 0.10
+  lets the dispatch on the other branch stand behind, not a `reject`,
+  which would say the call never reached its tool. `Pending` finds the
+  dispatches with agentsession's `Session.Dispatches` (#185).
 - **An approved deferred call runs the arguments it was held with.** A
   `BeforeToolCall` decision that rewrote a call's arguments and
   deferred it left `PendingCall.Args` nil, and `Approve` ran the
