@@ -48,29 +48,47 @@ versions may break the API.
   summary is cut by the server rather than paid for. (#178)
 - **An `OutputGuard` error wrapping `ErrGuard` is a guard stop.** The
   message the guard was given is not appended and has no `item_end`,
-  and the run ends `ReasonStopped` with `StopGuard` and the error on
-  `RunEnd.Err`, as from the other three guard hooks. It failed the
-  run, so `front/responses` answered with `server_error` carrying the
-  guard's text and `front/a2a` failed the task with it. Both fronts now
-  refuse: `front/responses` ends the response incomplete with
-  `content_filter`, in a full run and in a single turn, and empties the
-  withheld message, whose deltas had gone out, so its done events and
-  the response hold none of its text; `front/a2a` rejects the task
-  with `RefusedText`. A function call the withheld response completed
-  before the message is never dispatched, and the loop answers it with
-  an output carrying the fixed text `agentturn.WithheldCallOutput`,
-  never the guard's error, before the run ends, so the transcript holds
-  no call without an output and the next prompt goes ahead rather than
-  failing with "pending tool calls must be resumed". The session
-  recorder writes the withheld response `incomplete` with
-  `content_filter` and no error, so the guard's text is not on it,
-  before the outputs, writes a policy `reject` for each closed call,
-  and ends the run `aborted`, as the format reads a run whose last
-  response is incomplete; it wrote a `failed` response with
-  `server_error` and the guard's text and a run end `done`, which
-  `VerifyRecords` rejected. Any other `OutputGuard` error still fails
-  the run. `StopGuard`, `ErrGuard`, `OutputGuard` and
-  `ChainOutputGuard` say so (#181).
+  and the run ends `ReasonStopped` with `StopGuard`, the error on
+  `RunEnd.Err` and the new `RunEnd.Withheld` set, as from the other
+  three guard hooks. It failed the run, so `front/responses` answered
+  with `server_error` carrying the guard's text and `front/a2a` failed
+  the task with it. `RunEnd.Answer` reports no answer for a withheld
+  run, though a message the same response spoke before the withheld
+  one ends `Items`, so no consumer takes that preamble for the answer.
+  The loop reads the rest of the withheld response for its usage and
+  raises a `ResponseEnd` with the new `Withheld` set and no `TurnEnd`:
+  the response `incomplete` with `content_filter`, no error, the
+  response ID and the usage of the whole response, and as output the
+  items the transcript took from it, without the withheld message. A
+  function call the response added to the transcript before the
+  message, which it does once a message or a call of the response has
+  opened with `output_item.added`, is never dispatched, and the loop
+  answers it with an output carrying the fixed text
+  `agentturn.WithheldCallOutput`, never the guard's error, after the
+  `ResponseEnd` and before the run ends, so the transcript holds no
+  call without an output and the next prompt goes ahead rather than
+  failing with "pending tool calls must be resumed". On a stream that
+  sends `output_item.done` alone, the calls before the message are
+  still held when the guard rules and are dropped with it. Every front
+  refuses: `front/responses` ends the response incomplete with
+  `content_filter`, in a full run and in a single turn, after an
+  earlier message of the same response or not, and closes the
+  withheld message emptied and incomplete, since its deltas had gone
+  out, so its done events and the response hold none of its text, with
+  `WithToolItems` and a call before the message too; its usage counts
+  the withheld response; a single turn holds the response's function
+  calls until the response completes, so a refused one hands the
+  caller no call to run. `front/a2a` rejects the task with
+  `RefusedText`, and `tools/agent` fails the call with the guard's
+  error. The session recorder writes the withheld response from the
+  loop's `ResponseEnd`, `incomplete` with `content_filter`, its usage
+  and no error, so the guard's text is not on it, before the outputs,
+  writes a policy `reject` for each closed call, and ends the run
+  `aborted`, as the format reads a run whose last response is
+  incomplete; it wrote a `failed` response with `server_error` and the
+  guard's text and a run end `done`, which `VerifyRecords` rejected.
+  Any other `OutputGuard` error still fails the run. `StopGuard`,
+  `ErrGuard`, `OutputGuard` and `ChainOutputGuard` say so (#181).
 - **`front/a2a` keeps withheld text out of a task's artifacts.** Under
   a configuration with an `OutputGuard` the executor writes a message's
   artifact whole at `item_end`, from the message the guard left, rather

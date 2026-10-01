@@ -13,7 +13,8 @@
 //   - The request carries function tools. The caller owns them, so the
 //     adapter runs exactly one turn: the model sees the agent's tools
 //     and the caller's, and any function call it makes is emitted as an
-//     output item for the caller to run. Nothing is executed, not even a
+//     output item for the caller to run, once the response completes,
+//     with the items that followed it behind it. Nothing is executed, not even a
 //     call to one of the agent's own tools, because a single response
 //     cannot interleave execution with the caller's turn. There is no
 //     run: Transform, BeforeModelCall and OutputGuard run as the loop
@@ -45,12 +46,18 @@
 // guard is on: BeforeTurn or BeforeModelCall, on the first turn or on a
 // later one after text that preceded a call, ShouldStopAfterTurn after
 // a turn that only called tools, and OutputGuard on the message it
-// withholds, in a full run or a single turn. The refused turn adds
-// nothing to the output but the message OutputGuard withheld, which
-// keeps its place emptied, since its output_item.added and deltas have
+// withholds, in a full run or a single turn, after an earlier message
+// of the same response or not. The refused turn adds nothing to the
+// output but the message OutputGuard withheld, which keeps its place
+// emptied and incomplete, since its output_item.added and deltas have
 // gone out: its done events and the response carry no text. What was
 // streamed before the guard stopped the run stays, since a stream
-// cannot take it back. The guard's error reaches
+// cannot take it back: a preamble the response spoke before the
+// withheld message, and under [WithToolItems] a function call it made
+// before it, with the output the loop closed it with,
+// agentturn.WithheldCallOutput. A single turn holds its function calls
+// until the response completes, so a refused one hands the caller no
+// call to run. Usage counts the withheld response. The guard's error reaches
 // the caller in no form, since its text may carry the rule a caller
 // could phrase around; the host has it on RunEnd.Err and in the
 // record. A run a guard stopped after an answer completes with that
@@ -271,7 +278,7 @@ func (a *Adapter) fullRun(ctx context.Context, base agentturn.Config, req openre
 		// failure as a server error a caller retries. One that stopped
 		// it after an answer, which OutputGuard may have replaced,
 		// completes with what the caller is to see.
-		if _, ok := end.Answer(); end.Cause == agentturn.StopGuard && !ok {
+		if _, ok := end.Answer(); end.Cause == agentturn.StopGuard && (!ok || rl.withheld) {
 			rl.em.Response().Usage = &usage
 			return rl.refuse()
 		}
@@ -316,6 +323,11 @@ func (a *Adapter) relayRun(ctx context.Context, transcript agentturn.Transcript,
 				results = append(results, e)
 			}
 		case *agentturn.ItemStart:
+			// A message still open is one OutputGuard withheld: the
+			// loop ends every message it keeps before the next item.
+			if err := rl.withhold(); err != nil {
+				return nil, nil, err
+			}
 			if _, ok := e.Item.(*openresponses.FunctionCallOutput); ok || !a.emits(e.Item) {
 				continue
 			}
@@ -330,17 +342,32 @@ func (a *Adapter) relayRun(ctx context.Context, transcript agentturn.Transcript,
 				return nil, nil, err
 			}
 		case *agentturn.ItemEnd:
+			if _, ok := e.Item.(*openresponses.Message); !ok {
+				// Only the open message itself ends while it is open.
+				if err := rl.withhold(); err != nil {
+					return nil, nil, err
+				}
+			}
 			if !a.emits(e.Item) {
 				continue
 			}
 			if err := rl.end(e.Item); err != nil {
 				return nil, nil, err
 			}
+		case *agentturn.ResponseEnd:
+			// A withheld response has no turn_end, and its tokens were
+			// spent all the same.
+			if e.Withheld && e.Response != nil && e.Response.Usage != nil {
+				addUsage(usage, *e.Response.Usage)
+			}
 		case *agentturn.TurnEnd:
 			if e.Response != nil && e.Response.Usage != nil {
 				addUsage(usage, *e.Response.Usage)
 			}
 		case *agentturn.RunEnd:
+			if err := rl.withhold(); err != nil {
+				return nil, nil, err
+			}
 			end = e
 		}
 	}
@@ -443,14 +470,42 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 	}
 	var acc openresponses.Accumulator
 	var final *openresponses.Response
+	// A function call is the caller's to run, so it reaches the caller
+	// only once the response completes: one a guard refuses hands the
+	// caller nothing to run. From the first call on, every item waits,
+	// in order, behind it.
+	var held []func() error
+	relay := func(op func() error) error {
+		if held != nil {
+			held = append(held, op)
+			return nil
+		}
+		return op()
+	}
+	refused := false
 	for ev, err := range openresponses.Events(ctx, cfg.Model, upstream) {
+		if refused {
+			// The rest of the response is read for its usage alone.
+			if err != nil {
+				break
+			}
+			acc.Add(ev)
+			if r, ok := openresponses.TerminalResponse(ev); ok {
+				final = r
+			}
+			continue
+		}
 		if err != nil {
 			return err
 		}
 		acc.Add(ev)
 		switch e := ev.(type) {
 		case *openresponses.OutputItemAddedEvent:
-			if err := rl.start(acc.Response().Output[e.OutputIndex]); err != nil {
+			item := acc.Response().Output[e.OutputIndex]
+			if _, ok := item.(*openresponses.FunctionCall); ok && held == nil {
+				held = []func() error{}
+			}
+			if err := relay(func() error { return rl.start(item) }); err != nil {
 				return err
 			}
 		case *openresponses.OutputItemDoneEvent:
@@ -463,8 +518,9 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 				if err != nil {
 					if errors.Is(err, agentturn.ErrGuard) {
 						// Withheld and refused, as a full run's guard
-						// stop is; the rest of the stream is not read.
-						return rl.refuse()
+						// stop is, with the calls held dropped.
+						refused = true
+						continue
 					}
 					return fmt.Errorf("output guard: %w", err)
 				}
@@ -472,13 +528,16 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 					item = replacement
 				}
 			}
-			if err := rl.end(item); err != nil {
+			if _, ok := item.(*openresponses.FunctionCall); ok && held == nil {
+				held = []func() error{}
+			}
+			if err := relay(func() error { return rl.end(item) }); err != nil {
 				return err
 			}
 		case *openresponses.ErrorEvent:
 			return e.Err()
 		default:
-			if err := rl.update(ev); err != nil {
+			if err := relay(func() error { return rl.update(ev) }); err != nil {
 				return err
 			}
 		}
@@ -486,8 +545,21 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 			final = r
 		}
 	}
+	if refused {
+		if final != nil {
+			rl.em.Response().Usage = final.Usage
+		}
+		return rl.refuse()
+	}
 	if final == nil {
 		return errors.New("responses: model stream ended without a terminal event")
+	}
+	if final.Status != openresponses.ResponseStatusFailed {
+		for _, op := range held {
+			if err := op(); err != nil {
+				return err
+			}
+		}
 	}
 	switch final.Status {
 	case openresponses.ResponseStatusFailed:

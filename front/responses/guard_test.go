@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -311,4 +312,135 @@ func (preamble) CreateStream(ctx context.Context, req openresponses.Request, sin
 		return err
 	}
 	return em.Complete()
+}
+
+// secretTeller answers in one response with a function call, a
+// message, or both, before a message carrying secret, with usage.
+type secretTeller struct{ call, preamble bool }
+
+const secret = "SECRET-650-123-4567"
+
+func (m secretTeller) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	if _, ok := req.Input[len(req.Input)-1].(*openresponses.FunctionCallOutput); ok && m.call {
+		// Nothing runs a withheld response's call; a turn after it is
+		// a test failure.
+		return errors.New("a withheld response's call was answered")
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if m.call {
+		w, err := em.FunctionCall("c1", "lookup")
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(`{}`); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+	}
+	if m.preamble {
+		w, err := em.Message("")
+		if err != nil {
+			return err
+		}
+		if err := w.Text("Let me tell you."); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+	}
+	w, err := em.Message("")
+	if err != nil {
+		return err
+	}
+	if err := w.Text(secret); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	em.Response().Usage = &openresponses.Usage{InputTokens: 7, OutputTokens: 5, TotalTokens: 12}
+	return em.Complete()
+}
+
+// TestWithheldTextNeverLeaks pins the review of #181: a message
+// OutputGuard withheld reaches no done event and no response, whatever
+// came before it in its response, a function call relayed under
+// WithToolItems or a message the guard let through, and the response
+// is a refusal, not completed with the earlier message as its answer.
+// A single turn hands the caller none of the response's calls. Usage
+// counts the withheld response.
+func TestWithheldTextNeverLeaks(t *testing.T) {
+	guard := func(_ context.Context, info agentturn.OutputInfo) (*openresponses.Message, error) {
+		if strings.Contains(info.Message.Text(), "SECRET") {
+			return nil, fmt.Errorf("%w: pii", agentturn.ErrGuard)
+		}
+		return nil, nil
+	}
+	lookup := agenttool.New("lookup", "", func(context.Context, agenttool.NoArgs) (string, error) { return "found", nil })
+	callerTool := openresponses.NewFunctionTool("remote", "caller owned", json.RawMessage(`{"type":"object"}`))
+	for _, tc := range []struct {
+		name      string
+		model     secretTeller
+		toolItems bool
+		single    bool
+	}{
+		{"call, tool items", secretTeller{call: true}, true, false},
+		{"call", secretTeller{call: true}, false, false},
+		{"preamble", secretTeller{preamble: true}, false, false},
+		{"call and preamble, tool items", secretTeller{call: true, preamble: true}, true, false},
+		{"single turn, call", secretTeller{call: true}, false, true},
+		{"single turn, call and preamble", secretTeller{call: true, preamble: true}, false, true},
+		{"single turn, preamble", secretTeller{preamble: true}, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var opts []Option
+			if tc.toolItems {
+				opts = append(opts, WithToolItems())
+			}
+			a := New(agentturn.Config{Model: tc.model, ModelName: "m", Tools: []agenttool.Tool{lookup}, OutputGuard: guard}, opts...)
+			req := request(openresponses.UserText("x"))
+			if tc.single {
+				req.Tools = openresponses.Tools{callerTool}
+			}
+			sink, err := streamtest.Run(context.Background(), a, req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := streamtest.Validate(sink.Events()); err != nil {
+				t.Fatalf("stream: %v", err)
+			}
+			for _, ev := range sink.Events() {
+				switch e := ev.(type) {
+				case *openresponses.OutputItemDoneEvent:
+					if m, ok := e.Item.(*openresponses.Message); ok && strings.Contains(m.Text(), "SECRET") {
+						t.Errorf("output_item.done carries the withheld text: %q", m.Text())
+					}
+					if _, ok := e.Item.(*openresponses.FunctionCall); ok && tc.single {
+						t.Errorf("a single turn handed the caller a call of a refused response")
+					}
+				case *openresponses.OutputTextDoneEvent:
+					if strings.Contains(e.Text, "SECRET") {
+						t.Errorf("output_text.done carries the withheld text: %q", e.Text)
+					}
+				case *openresponses.ContentPartDoneEvent:
+					if strings.Contains(openresponses.Contents{e.Part}.Text(), "SECRET") {
+						t.Errorf("content_part.done carries the withheld text")
+					}
+				}
+			}
+			resp := sink.Response()
+			if strings.Contains(resp.OutputText(), "SECRET") {
+				t.Errorf("response carries the withheld text: %q", resp.OutputText())
+			}
+			if resp.Status != openresponses.ResponseStatusIncomplete || resp.IncompleteDetails == nil || resp.IncompleteDetails.Reason != openresponses.IncompleteReasonContentFilter {
+				t.Errorf("response = %s %+v, want incomplete content_filter", resp.Status, resp.IncompleteDetails)
+			}
+			if resp.Usage == nil || resp.Usage.TotalTokens != 12 {
+				t.Errorf("usage = %+v, want the withheld response's", resp.Usage)
+			}
+		})
+	}
 }

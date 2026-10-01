@@ -25,6 +25,11 @@ type relay struct {
 	args    strings.Builder // arguments streamed for the open call
 	summary int             // summary parts streamed for the open reasoning item
 	rtext   strings.Builder // reasoning text streamed
+
+	// withheld says a message was withheld: it was still open when
+	// another item started or ended, or the run ended, which the loop
+	// never leaves a message it keeps, and it was closed emptied.
+	withheld bool
 }
 
 func newRelay(sink openresponses.EventSink, resp *openresponses.Response) *relay {
@@ -202,15 +207,31 @@ func (r *relay) end(item openresponses.Item) error {
 	}
 }
 
+// withhold closes the open message, if any, as one OutputGuard
+// withheld after its deltas went out: emptied, so its done events and
+// the response carry none of its text, and incomplete. The loop ends
+// every message it keeps before anything else starts or ends, so a
+// message still open then is withheld; the emitter would otherwise
+// close it with the text it streamed.
+func (r *relay) withhold() error {
+	if r.msg == nil {
+		return nil
+	}
+	if err := r.replace(&openresponses.Message{Role: openresponses.RoleAssistant}); err != nil {
+		return err
+	}
+	r.msg.Item().Status = openresponses.StatusIncomplete
+	err := r.msg.Close()
+	r.reset()
+	r.withheld = true
+	return err
+}
+
 // refuse ends the response incomplete with reason content_filter, the
-// refusal of a guard. A message still open is one OutputGuard withheld
-// after its deltas went out; it is emptied first, so its done events
-// and the response carry none of its text.
+// refusal of a guard, withholding a message still open first.
 func (r *relay) refuse() error {
-	if r.msg != nil {
-		if err := r.replace(&openresponses.Message{Role: openresponses.RoleAssistant}); err != nil {
-			return err
-		}
+	if err := r.withhold(); err != nil {
+		return err
 	}
 	r.reset()
 	return r.em.Incomplete(openresponses.IncompleteReasonContentFilter)

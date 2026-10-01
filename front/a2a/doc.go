@@ -15,7 +15,9 @@
 // refusal: the task ends rejected, with [RefusedText] as its status
 // message, rather than completed or failed, whichever hook the guard
 // is on, ShouldStopAfterTurn after a turn that only called tools
-// included, and OutputGuard withholding the message it was given. The
+// included, and OutputGuard withholding the message it was given,
+// after a message of the same response it let through or not, which
+// is no answer (agentturn.RunEnd.Withheld). The
 // guard's error is not sent, since its text may carry the rule a
 // caller could phrase around; the host has it on RunEnd.Err and in the
 // record.
