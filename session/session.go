@@ -975,7 +975,11 @@ func newWriter(r *Recorder, id string) *writer {
 // closes it, interrupted, with a ref naming the fork, before it
 // returns; what that run had queued and not appended is closed with
 // it, as a rewind leaves it. Inputs the prefix owes after a run's end
-// are the fork's to take up with [Recorder.Requeue].
+// are the fork's to take up with [Recorder.Requeue]. A call in the
+// prefix has its dispatch, if any, in the session forked: the recorder
+// reads it there when the store is an agentsession.Reader, and a host
+// seeding the fork's agent passes [WithOrigins] to [AgentOptions] and
+// [ReplayAnswers] so they read it too.
 func Start(ctx context.Context, store agentsession.Store, h agentsession.Header, opts ...Option) (*Recorder, *agentsession.Session, error) {
 	if h.Records == nil {
 		h.Records = append(append([]string(nil), agentsession.AllRecords...), agentsession.TypeQueued)
@@ -993,7 +997,7 @@ func Start(ctx context.Context, store agentsession.Store, h agentsession.Header,
 		if err := r.root.closeOpenRun(ctx, s, agentsession.ReasonInterrupted, "fork at "+s.Header().Base, false); err != nil {
 			return nil, nil, err
 		}
-		if err := r.root.seed(s, true); err != nil {
+		if err := r.root.seed(ctx, s, true); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -1049,8 +1053,15 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // [agentturn.WithPending] seeds an agent with beside the context's
 // items, so the agent's Resume knows which calls never started;
 // [AgentOptions] gives both.
-func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
-	pending, err := pendingCalls(s)
+//
+// A call in a fork's prefix has its dispatch, if any, in the session
+// the fork was made from, which s does not hold: the file cannot say
+// about it, and it is [agentturn.PendingUnknown] with no key. Given
+// [WithOrigins], Pending reads that session's dispatches for it, and
+// reads a call it finds dispatched there as one dispatched on a branch
+// a rebase left.
+func Pending(s *agentsession.Session, opts ...ReadOption) ([]agentturn.PendingCall, error) {
+	pending, err := pendingCalls(context.Background(), s, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -1061,19 +1072,95 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 	return out, nil
 }
 
+// ReadOption configures how [Pending], [AgentOptions] and
+// [ReplayAnswers] read a session.
+type ReadOption func(*origins)
+
+// WithOrigins has [Pending], [AgentOptions] and [ReplayAnswers] read a
+// fork's origin through r, the store that holds it: a call in the
+// fork's prefix with no dispatch on the path is read with the
+// dispatches the session the fork was made from holds for it, and so
+// up a chain of forks, as a call dispatched on a branch a rebase left
+// is read. A keyed call dispatched there runs again under its key, and
+// one that completed there is answered with its output. An origin r
+// does not hold leaves the call as the fork alone reads it; an error
+// reading one is returned.
+func WithOrigins(r agentsession.Reader) ReadOption {
+	return func(o *origins) { o.r = r }
+}
+
+// origins reads the sessions a fork was made from, each once.
+type origins struct {
+	ctx  context.Context
+	r    agentsession.Reader
+	read map[string]*agentsession.Session
+}
+
+// maxOriginDepth bounds the walk up a chain of forks.
+const maxOriginDepth = 64
+
+// session returns the session id through the reader, nil when there is
+// no reader or it holds no such session.
+func (o *origins) session(id string) (*agentsession.Session, error) {
+	if o.r == nil || id == "" {
+		return nil, nil
+	}
+	if s, ok := o.read[id]; ok {
+		return s, nil
+	}
+	s, err := o.r.Read(o.ctx, id)
+	if errors.Is(err, agentsession.ErrNoSession) {
+		s, err = nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("session: read origin %s: %w", id, err)
+	}
+	if o.read == nil {
+		o.read = map[string]*agentsession.Session{}
+	}
+	o.read[id] = s
+	return s, nil
+}
+
+// dispatchOff returns the last dispatch of the call held by the entry
+// callEntry that s holds off its path, which a rebase above it leaves,
+// and the session holding it: s, or for a call in a fork's prefix with
+// none in s, the session the fork was made from, and so up the chain.
+// It returns nil when none of them holds one.
+func (o *origins) dispatchOff(s *agentsession.Session, callEntry string) (*agentsession.Session, *agentsession.DispatchEntry, error) {
+	for depth := 0; s != nil && depth < maxOriginDepth; depth++ {
+		if ds := s.Dispatches(callEntry); len(ds) > 0 {
+			return s, ds[len(ds)-1], nil
+		}
+		if !s.Prefix(callEntry) {
+			break
+		}
+		var err error
+		if s, err = o.session(s.Header().ParentSession); err != nil {
+			return nil, nil, err
+		}
+	}
+	return nil, nil, nil
+}
+
 // pendingCall is a call pending at the leaf as [Pending] reads it, with
 // the output it has on the branch of the dispatch Pending found off the
 // path, when it has one there: it ran there, and that is what it
-// returned.
+// returned. ranWhere says where, as the reason of the answer giving it.
 type pendingCall struct {
 	agentturn.PendingCall
-	ranOff *openresponses.FunctionCallOutput
+	ranOff   *openresponses.FunctionCallOutput
+	ranWhere string
 }
 
 // pendingCalls is [Pending] with the output each call has off the path.
-func pendingCalls(s *agentsession.Session) ([]pendingCall, error) {
+func pendingCalls(ctx context.Context, s *agentsession.Session, opts []ReadOption) ([]pendingCall, error) {
 	if s.Leaf() == "" {
 		return nil, nil
+	}
+	o := &origins{ctx: ctx}
+	for _, opt := range opts {
+		opt(o)
 	}
 	calls, err := s.PendingCalls(s.Leaf())
 	if err != nil {
@@ -1096,16 +1183,23 @@ func pendingCalls(s *agentsession.Session) ([]pendingCall, error) {
 			p.Reason = agentturn.PendingUndispatched
 		}
 		// A call with no dispatch on the path may have one on a branch
-		// a rebase left: it was handed to its tool there, so it may
-		// have run, and a run of it again repeats that hand-off.
+		// a rebase left, or in the session a fork was made from: it was
+		// handed to its tool there, so it may have run, and a run of it
+		// again repeats that hand-off.
 		var off *agentsession.Call
 		if len(c.Dispatches) == 0 && (state == agentsession.CallHeld || state == agentsession.CallNeverStarted || state == agentsession.CallUnknown) {
-			if ds := s.Dispatches(c.Entry.ID); len(ds) > 0 {
-				d := ds[len(ds)-1]
-				if off, err = callAt(s, d, c.Entry.ID); err != nil {
+			at, d, err := o.dispatchOff(s, c.Entry.ID)
+			if err != nil {
+				return nil, err
+			}
+			if d != nil {
+				if off, err = callAt(at, d, c.Entry.ID); err != nil {
 					return nil, err
 				}
-				p.ranOff = outputAfter(s, d, c.Entry.ID)
+				p.ranOff, p.ranWhere = outputAfter(at, d, c.Entry.ID), ranOffReason
+				if at != s {
+					p.ranWhere = ranInOriginReason
+				}
 				if state == agentsession.CallHeld {
 					p.Dispatched = true
 				} else {
@@ -1179,13 +1273,14 @@ func callAt(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry st
 // session as reserved, [CallIDs], so a call the model makes does not
 // take the ID of one a compaction folded out of the context or another
 // branch holds, which the format refuses. It is what a host resuming a
-// session passes to agentturn.New.
-func AgentOptions(s *agentsession.Session) ([]agentturn.Option, error) {
+// session passes to agentturn.New. [WithOrigins] reads a fork's origin
+// as [Pending] does.
+func AgentOptions(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Option, error) {
 	cx, err := s.Context()
 	if err != nil {
 		return nil, fmt.Errorf("session: context at leaf: %w", err)
 	}
-	pending, err := Pending(s)
+	pending, err := Pending(s, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1234,7 +1329,9 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // call that may have run because its only dispatch is on a branch a
 // rebase left, and that completed there, ran: it is answered with the
 // output that branch holds, with the reason "ran on a branch the
-// rebase left", and its tool is not asked. A
+// rebase left", and its tool is not asked; with [WithOrigins], so is a
+// call in a fork's prefix that completed in the session the fork was
+// made from, with the reason "ran in the session this one forks". A
 // recorder writes either answer as an answer decision before the
 // output. A call an answer ended before its output was written gets
 // [agentturn.OutcomeUnknown] as that output, since the record holds
@@ -1248,8 +1345,8 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // call: an agent seeded with the context's items alone reads every
 // pending call as one that may have run, and holds the approval of a
 // call that never started to the replay rule.
-func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agenttool.Tool) ([]agentturn.Answer, error) {
-	pending, err := pendingCalls(s)
+func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agenttool.Tool, opts ...ReadOption) ([]agentturn.Answer, error) {
+	pending, err := pendingCalls(ctx, s, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -1275,7 +1372,7 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 			if p.ranOff != nil {
 				// The call ran on the branch its dispatch is on, and the
 				// session holds what it returned: that is its outcome.
-				ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Status: p.ranOff.Status, Output: p.ranOff.Output}).WithReason(ranOffReason)
+				ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Status: p.ranOff.Status, Output: p.ranOff.Output}).WithReason(p.ranWhere)
 				break
 			}
 			ans = replayAnswer(ctx, set, p.PendingCall)
@@ -1289,6 +1386,11 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 // call with no dispatch on the path that completed on the branch its
 // dispatch is on.
 const ranOffReason = "ran on a branch the rebase left"
+
+// ranInOriginReason is the reason of the answer [ReplayAnswers] gives a
+// call in a fork's prefix that completed in the session the fork was
+// made from.
+const ranInOriginReason = "ran in the session this one forks"
 
 // refusal is the reason of the last reject decision the session's
 // path holds for the call.
@@ -1366,7 +1468,7 @@ func resume(ctx context.Context, s *agentsession.Session, store agentsession.Sto
 	if err := r.root.closeOpenRun(ctx, s, agentsession.ReasonError, "cut off: closed on resume", true); err != nil {
 		return nil, nil, err
 	}
-	if err := r.root.seed(s, true); err != nil {
+	if err := r.root.seed(ctx, s, true); err != nil {
 		return nil, nil, err
 	}
 	return r, s, nil
@@ -1499,7 +1601,7 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 	if err := w.requeue(ctx); err != nil {
 		return err
 	}
-	if err := w.seed(s, false); err != nil {
+	if err := w.seed(ctx, s, false); err != nil {
 		return err
 	}
 	return r.reserve(s)
@@ -1825,8 +1927,8 @@ func (r *Recorder) reopenID(ctx context.Context, id string) (*writer, error) {
 	}
 	w := newWriter(r, id)
 	w.parentID = s.Header().ParentSession
-	for _, c := range calls {
-		w.calls[c.ID()] = callRecordOf(c, s)
+	if err := w.seedCalls(ctx, s, calls); err != nil {
+		return nil, err
 	}
 	w.appOnly = appOnlyCalls(s.Path(s.Leaf()))
 	for _, e := range s.Path(s.Leaf()) {
@@ -1946,7 +2048,7 @@ func (w *writer) reset() {
 }
 
 // seed sets the writer's state from the session at its leaf.
-func (w *writer) seed(s *agentsession.Session, owed bool) error {
+func (w *writer) seed(ctx context.Context, s *agentsession.Session, owed bool) error {
 	if s.Leaf() == "" {
 		return nil
 	}
@@ -1986,10 +2088,32 @@ func (w *writer) seed(s *agentsession.Session, owed bool) error {
 	if err != nil {
 		return fmt.Errorf("session: calls at leaf: %w", err)
 	}
-	for _, c := range calls {
-		w.calls[c.ID()] = callRecordOf(c, s)
+	if err := w.seedCalls(ctx, s, calls); err != nil {
+		return err
 	}
 	w.appOnly = appOnlyCalls(s.Path(s.Leaf()))
+	return nil
+}
+
+// seedCalls records what the path holds for each of calls. A pending
+// call with no dispatch on the path is looked for off it, on a branch a
+// rebase left and, when the store can read sessions without holding
+// them, in the session a fork was made from, as [WithOrigins] has
+// [Pending] look.
+func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls []*agentsession.Call) error {
+	o := &origins{ctx: ctx}
+	o.r, _ = w.rec.store.(agentsession.Reader)
+	for _, c := range calls {
+		off := false
+		if c.Output == nil && len(c.Dispatches) == 0 {
+			_, d, err := o.dispatchOff(s, c.Entry.ID)
+			if err != nil {
+				return err
+			}
+			off = d != nil
+		}
+		w.calls[c.ID()] = callRecordOf(c, s.Header(), off)
+	}
 	return nil
 }
 
@@ -2011,12 +2135,13 @@ func appOnlyCalls(path []agentsession.Entry) map[string]bool {
 }
 
 // callRecordOf is what the path holds for a call, for a writer seeded
-// from it. A call with no dispatch on the path and one on another
-// branch of the session, which a rebase above the dispatch leaves, may
-// have run, as [Pending] reads it, and is unknown to the writer, a
-// held one included: what ends it without running is an answer, since
-// the format keeps reject for a call no dispatch reached.
-func callRecordOf(c *agentsession.Call, s *agentsession.Session) *callRecord {
+// from it. off says the call has no dispatch on the path and one off
+// it, on another branch, which a rebase above the dispatch leaves, or
+// in the session a fork was made from: it may have run, as [Pending]
+// reads it, and is unknown to the writer, a held one included, so what
+// ends it without running is an answer, since the format keeps reject
+// for a call no dispatch reached.
+func callRecordOf(c *agentsession.Call, h agentsession.Header, off bool) *callRecord {
 	if c.Output != nil {
 		return &callRecord{entry: c.Entry.Base().ID, args: c.Call.Arguments, dispatched: len(c.Dispatches) > 0, answered: true}
 	}
@@ -2027,7 +2152,7 @@ func callRecordOf(c *agentsession.Call, s *agentsession.Session) *callRecord {
 	return &callRecord{
 		entry: c.Entry.Base().ID, args: c.Call.Arguments, decided: decided,
 		held: c.Held(), dispatched: len(c.Dispatches) > 0, rejected: c.Rejected(), ended: c.Answered(),
-		unknown: c.State(s.Header()) == agentsession.CallUnknown || len(c.Dispatches) == 0 && len(s.Dispatches(c.Entry.ID)) > 0,
+		unknown: c.State(h) == agentsession.CallUnknown || off,
 	}
 }
 
@@ -2285,7 +2410,7 @@ func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, 
 				s.ResetLeaf()
 				return w, nil
 			}
-			if err := w.seed(s, false); err != nil {
+			if err := w.seed(ctx, s, false); err != nil {
 				return nil, err
 			}
 			return w, nil

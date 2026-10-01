@@ -996,3 +996,168 @@ func TestHeldCallDispatchedOnAnotherBranch(t *testing.T) {
 		})
 	}
 }
+
+// TestForkReadsItsOrigin pins #192: a fork made at a call holds the
+// call in its prefix and its dispatch, if any, in the session it was
+// made from. Pending alone reads such a call as unknown with no key;
+// with WithOrigins it reads the origin's dispatch, through a chain of
+// forks too, so a keyed call cut there runs again under its key and
+// one that completed there is answered with its output, as after a
+// rebase in one session. The recorder seeded at the fork reads the
+// origin through its store, so a held call dispatched there is ended
+// by an answer, not a reject.
+func TestForkReadsItsOrigin(t *testing.T) {
+	cases := []struct {
+		name string
+		// held holds the call before the fork's base, and the origin
+		// approves it after; completed has the origin hold its output.
+		held, completed bool
+		// origins passes WithOrigins, and chain forks the fork again.
+		origins, chain bool
+		// answer, when set, is the host's answer, in place of what
+		// ReplayAnswers gives.
+		answer func(callID string) agentturn.Answer
+		// want is how Pending reads the call, wantKey the key it
+		// carries, runs how many times the tool runs on the fork, and
+		// wantRecord the fork's own entries for the call.
+		want       agentturn.PendingReason
+		wantKey    string
+		runs       int
+		wantReason string
+		wantRecord []string
+	}{
+		{name: "cut, without the origin", want: agentturn.PendingUnknown,
+			wantReason: "not run again: keyed without a key", wantRecord: []string{"answer", "output"}},
+		{name: "cut, keyed, runs again under its key", origins: true, want: agentturn.PendingAborted, wantKey: "k1", runs: 1,
+			wantReason: agentturn.RunAgainKeyedReason, wantRecord: []string{"proceed", "dispatch", "output"}},
+		{name: "completed, answered with its output", origins: true, completed: true, want: agentturn.PendingAborted, wantKey: "k1",
+			wantReason: ranInOriginReason, wantRecord: []string{"answer", "output"}},
+		{name: "completed, a fork of a fork", origins: true, completed: true, chain: true, want: agentturn.PendingAborted, wantKey: "k1",
+			wantReason: ranInOriginReason, wantRecord: []string{"answer", "output"}},
+		{name: "held, answered by a person", origins: true, held: true, completed: true, want: agentturn.PendingDeferred, wantKey: "k1",
+			answer: func(id string) agentturn.Answer {
+				return agentturn.OutcomeUnknown(id).WithBy(agentsession.ByHuman).WithReason("not sent again")
+			},
+			wantReason: "not sent again", wantRecord: []string{"answer", "output"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			var keys []string
+			charge := agenttool.New("charge", "", func(ctx context.Context, _ echoArgs) (string, error) {
+				call, _ := agenttool.CallFrom(ctx)
+				keys = append(keys, call.IdempotencyKey)
+				return "charged again", nil
+			}, agenttool.WithReplay(func(context.Context, json.RawMessage) agenttool.Replay { return agenttool.ReplayKeyed }))
+			tools := []agenttool.Tool{charge}
+
+			store := agentsession.NewMemoryStore()
+			origin, err := store.Create(ctx, agentsession.Header{Records: agentsession.AllRecords})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Append(ctx, origin.ID(), &agentsession.ItemEntry{Item: openresponses.UserText("charge me")}); err != nil {
+				t.Fatal(err)
+			}
+			call := &openresponses.FunctionCall{CallID: "call_1", Name: "charge", Arguments: `{"text":"t"}`}
+			target, err := store.Append(ctx, origin.ID(), &agentsession.ItemEntry{Item: call, ResponseID: "resp_1"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			base, err := store.Append(ctx, origin.ID(), &agentsession.ResponseEntry{ResponseID: "resp_1", Status: openresponses.ResponseStatusCompleted})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var after []agentsession.Entry
+			if tc.held {
+				if base, err = store.Append(ctx, origin.ID(), agentsession.NewDecision(call.CallID, target, agentsession.VerdictHold, agentsession.ByPolicy)); err != nil {
+					t.Fatal(err)
+				}
+				after = append(after, agentsession.NewDecision(call.CallID, target, agentsession.VerdictProceed, agentsession.ByHuman))
+			}
+			after = append(after, agentsession.NewDispatch(call.CallID, target).WithIdempotencyKey("k1"))
+			if tc.completed {
+				after = append(after, &agentsession.ItemEntry{Item: openresponses.NewFunctionCallOutput(call.CallID, "charged")})
+			}
+			for _, e := range after {
+				if _, err := store.Append(ctx, origin.ID(), e); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			parent := origin.ID()
+			if tc.chain {
+				_, mid, err := Start(ctx, store, agentsession.Header{Base: base, ParentSession: parent})
+				if err != nil {
+					t.Fatal(err)
+				}
+				parent = mid.ID()
+			}
+			rec, fork, err := Start(ctx, store, agentsession.Header{Base: base, ParentSession: parent})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var opts []ReadOption
+			if tc.origins {
+				opts = append(opts, WithOrigins(store))
+			}
+			pending, err := Pending(fork, opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(pending) != 1 || pending[0].Reason != tc.want || pending[0].IdempotencyKey != tc.wantKey {
+				t.Fatalf("pending = %+v, want %s under %q", pending, tc.want, tc.wantKey)
+			}
+			var answers []agentturn.Answer
+			if tc.answer != nil {
+				answers = []agentturn.Answer{tc.answer(call.CallID)}
+			} else if answers, err = ReplayAnswers(ctx, fork, tools, opts...); err != nil {
+				t.Fatal(err)
+			}
+			agentOpts, err := AgentOptions(fork, opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: tools}, agentOpts...)
+			defer rec.Attach(a)()
+			if end, err := a.Resume(ctx, answers...); err != nil || end.Reason != agentturn.ReasonDone {
+				t.Fatalf("resume: err=%v end=%+v", err, end)
+			}
+			if len(keys) != tc.runs || tc.runs > 0 && keys[0] != "k1" {
+				t.Errorf("ran under %q, want %d runs under k1", keys, tc.runs)
+			}
+			var record []string
+			var last *agentsession.DecisionEntry
+			for _, e := range fork.Path(fork.Leaf()) {
+				if fork.Prefix(e.Base().ID) {
+					continue
+				}
+				switch e := e.(type) {
+				case *agentsession.DispatchEntry:
+					record = append(record, "dispatch")
+				case *agentsession.DecisionEntry:
+					record = append(record, e.Verdict)
+					last = e
+				case *agentsession.ItemEntry:
+					if out, ok := e.Item.(*openresponses.FunctionCallOutput); ok {
+						record = append(record, "output")
+						if tc.completed && tc.answer == nil && out.Output.Text != "charged" {
+							t.Errorf("output %q, want the one the origin holds", out.Output.Text)
+						}
+					}
+				}
+			}
+			if strings.Join(record, " ") != strings.Join(tc.wantRecord, " ") {
+				t.Errorf("record = %q, want %q", record, tc.wantRecord)
+			}
+			if last == nil || last.Reason != tc.wantReason {
+				t.Errorf("last decision = %+v, want reason %q", last, tc.wantReason)
+			}
+			if err := fork.VerifyRecords(fork.Leaf()); err != nil {
+				t.Errorf("verify records: %v", err)
+			}
+			// The origin's response was written by hand, with no hash.
+			verifyAllUnhashed(t, fork, 1)
+		})
+	}
+}

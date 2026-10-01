@@ -160,6 +160,21 @@ versions may break the API.
   output, by policy, with the reason "ran on a branch the rebase left",
   which the recorder writes behind an `answer`; a call cut there before
   its output is held to the replay rule as before. (#195)
+- **`session.WithOrigins` reads a fork's origin.** A fork made at a
+  call holds the call in its prefix and its dispatch in the session it
+  was made from, so `Pending` read the call as unknown with no key, and
+  `ReplayAnswers` answered a keyed one "outcome unknown" where, after a
+  rebase in one session, it runs again under its key. `Pending`,
+  `AgentOptions` and `ReplayAnswers` take `...ReadOption`, and
+  `WithOrigins(r agentsession.Reader)` has them read the origin's
+  dispatches for such a call, up a chain of forks, as for a call
+  dispatched on another branch: a keyed call runs again under its key,
+  and one that completed there is answered with its output, reason "ran
+  in the session this one forks". Without it, or for an origin the
+  reader does not hold, the reading is as before. The recorder reads the
+  origin through its own store when that store is an
+  `agentsession.Reader`, so a held call dispatched there is ended by an
+  `answer`. (#192)
 
 ## v0.0.14 - 2026-10-01
 

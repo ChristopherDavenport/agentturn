@@ -1001,7 +1001,7 @@ func testChildJobRecords(t *testing.T, later bool) {
 		}
 		rec.mu.Lock()
 		w := newWriter(rec, childID)
-		err = w.seed(cs, false)
+		err = w.seed(context.Background(), cs, false)
 		rec.runs["later"] = w
 		rec.mu.Unlock()
 		if err != nil {
