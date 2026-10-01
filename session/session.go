@@ -983,7 +983,9 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // lists them, with the reason the record gives each: a call held by a
 // hold decision is [agentturn.PendingDeferred], and Dispatched when
 // the hold follows its dispatch; one in flight when the record stopped
-// may have run and is [agentturn.PendingAborted]; one an answer
+// may have run and is [agentturn.PendingAborted], as is one with no
+// dispatch on the path that has one on a branch a rebase to before it
+// left, a held one of which is Dispatched; one an answer
 // decision ended before its output was written is
 // [agentturn.PendingAnswered], owed that output and nothing else; one
 // a reject decision refused before its output was written is
@@ -992,7 +994,8 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // started and is [agentturn.PendingUndispatched]; and one the file
 // cannot say about is [agentturn.PendingUnknown]. A call that may have
 // run carries the key of its last dispatch and the arguments that
-// dispatch ran with, the pair a run of it again repeats, and one the
+// dispatch ran with, the pair a run of it again repeats, the last
+// dispatch in the session when none is on the path, and one the
 // file cannot say about the arguments a decision gave it. It is what
 // [agentturn.WithPending] seeds an agent with beside the context's
 // items, so the agent's Resume knows which calls never started;
@@ -1006,9 +1009,11 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 		return nil, fmt.Errorf("session: pending calls at leaf: %w", err)
 	}
 	var out []agentturn.PendingCall
+	var elsewhere map[string]*agentsession.DispatchEntry
 	for _, c := range calls {
 		p := agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingUnknown}
-		switch c.State(s.Header()) {
+		state := c.State(s.Header())
+		switch state {
 		case agentsession.CallHeld:
 			p.Reason, p.Dispatched = agentturn.PendingDeferred, len(c.Dispatches) > 0
 		case agentsession.CallInFlight:
@@ -1020,9 +1025,30 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 		case agentsession.CallNeverStarted:
 			p.Reason = agentturn.PendingUndispatched
 		}
+		// A call with no dispatch on the path may have one on a branch
+		// a rebase left: it was handed to its tool there, so it may
+		// have run, and a run of it again repeats that hand-off.
+		var off *agentsession.Call
+		if len(c.Dispatches) == 0 && (state == agentsession.CallHeld || state == agentsession.CallNeverStarted || state == agentsession.CallUnknown) {
+			if elsewhere == nil {
+				elsewhere = lastDispatches(s)
+			}
+			if d, ok := elsewhere[c.Entry.ID]; ok {
+				if off, err = callAt(s, d, c.Entry.ID); err != nil {
+					return nil, err
+				}
+				if state == agentsession.CallHeld {
+					p.Dispatched = true
+				} else {
+					p.Reason = agentturn.PendingAborted
+				}
+			}
+		}
 		var args string
 		switch {
 		case !p.MayHaveRun():
+		case off != nil:
+			p.IdempotencyKey, args = off.IdempotencyKey(), off.DispatchedArgs()
 		case len(c.Dispatches) > 0:
 			p.IdempotencyKey, args = c.IdempotencyKey(), c.DispatchedArgs()
 		default:
@@ -1034,6 +1060,37 @@ func Pending(s *agentsession.Session) ([]agentturn.PendingCall, error) {
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// lastDispatches maps the entry of each function call the session's
+// dispatches name to the last of them in the file, on any branch.
+func lastDispatches(s *agentsession.Session) map[string]*agentsession.DispatchEntry {
+	out := map[string]*agentsession.DispatchEntry{}
+	for _, e := range s.Entries() {
+		if d, ok := e.(*agentsession.DispatchEntry); ok {
+			target := d.Target
+			if id, ok := s.Resolve(target); ok {
+				target = id
+			}
+			out[target] = d
+		}
+	}
+	return out
+}
+
+// callAt is the call held by the entry callEntry as the path to the
+// dispatch d reads it, d its last dispatch.
+func callAt(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry string) (*agentsession.Call, error) {
+	calls, err := s.Calls(d.ID)
+	if err != nil {
+		return nil, fmt.Errorf("session: calls at dispatch: %w", err)
+	}
+	for _, c := range calls {
+		if c.Entry.ID == callEntry {
+			return c, nil
+		}
+	}
+	return nil, fmt.Errorf("session: dispatch %s names call entry %s, which is not on its path", d.ID, callEntry)
 }
 
 // AgentOptions returns the options that seed an agent with the

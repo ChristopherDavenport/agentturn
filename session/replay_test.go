@@ -694,3 +694,88 @@ func TestRunAgainIsAlwaysDecided(t *testing.T) {
 		})
 	}
 }
+
+// TestRebaseBeforeADispatch pins #185: a rebase to the entry before a
+// call's dispatch leaves the call on the path with no dispatch, and its
+// dispatch, key and output on the branch it left. The call may have
+// run, so Pending reads it as aborted with that dispatch's key, and the
+// replay rule runs a keyed call again under the first key and answers
+// one whose replay is unknown with the outcome unknown.
+func TestRebaseBeforeADispatch(t *testing.T) {
+	cases := []struct {
+		name   string
+		replay agenttool.Replay
+		// runs is how many times the tool ran, each under the first key.
+		runs int
+	}{
+		{"keyed runs again under the first key", agenttool.ReplayKeyed, 2},
+		{"unknown is not run again", agenttool.ReplayUnknown, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			var keys []string
+			charge := agenttool.New("charge", "", func(ctx context.Context, _ echoArgs) (string, error) {
+				call, _ := agenttool.CallFrom(ctx)
+				keys = append(keys, call.IdempotencyKey)
+				return "charged", nil
+			}, agenttool.WithReplay(func(context.Context, json.RawMessage) agenttool.Replay { return tc.replay }))
+			tools := []agenttool.Tool{charge}
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(ctx, store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: tools})
+			unsub := rec.Attach(a)
+			if end, err := a.Prompt(ctx, openresponses.UserText("go")); err != nil || end.Reason != agentturn.ReasonDone {
+				t.Fatalf("prompt: err=%v end=%+v", err, end)
+			}
+			unsub()
+			c := callsOf(t, s)["charge"]
+			if c == nil || c.Dispatch == nil || c.Output == nil || len(keys) != 1 || keys[0] == "" || c.Dispatch.IdempotencyKey != keys[0] {
+				t.Fatalf("call = %+v, keys %q", c, keys)
+			}
+			first := keys[0]
+
+			if err := rec.Rebase(s, c.Dispatch.Parent); err != nil {
+				t.Fatal(err)
+			}
+			pending, err := Pending(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(pending) != 1 || pending[0].Reason != agentturn.PendingAborted || pending[0].IdempotencyKey != first || pending[0].Args != nil {
+				t.Fatalf("pending = %+v, want aborted under %q", pending, first)
+			}
+			answers, err := ReplayAnswers(ctx, s, tools)
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts, err := AgentOptions(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: tools}, opts...)
+			defer rec.Attach(b)()
+			if end, err := b.Resume(ctx, answers...); err != nil || end.Reason != agentturn.ReasonDone {
+				t.Fatalf("resume: err=%v end=%+v", err, end)
+			}
+			if len(keys) != tc.runs {
+				t.Fatalf("keys = %q, want %d runs", keys, tc.runs)
+			}
+			for _, k := range keys {
+				if k != first {
+					t.Errorf("keys = %q, want %q each time", keys, first)
+				}
+			}
+			if c := callsOf(t, s)["charge"]; c == nil || c.Output == nil {
+				t.Errorf("call on the new path = %+v", c)
+			}
+			if err := s.VerifyRecords(s.Leaf()); err != nil {
+				t.Errorf("verify records: %v", err)
+			}
+			verifyAll(t, s)
+		})
+	}
+}

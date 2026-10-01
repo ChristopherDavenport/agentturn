@@ -97,6 +97,16 @@ versions may break the API.
   back with their keys sorted, so a recorder resumed from one wrote
   `tools_added` with every tool on its first run in each process. The
   extra members compare the same way (#176).
+- **A call dispatched on another branch may have run.** After a
+  `Recorder.Rebase` to an entry between a call and its dispatch, the
+  call is on the new path with no dispatch, and `session.Pending` read
+  it as never started: `ReplayAnswers` approved it and the loop ran it
+  under a new key, so a keyed service ran the operation again.
+  `Pending` now reads a call with no dispatch on the path and one
+  anywhere in the session as `PendingAborted`, with the key and the
+  arguments of the last such dispatch, so a keyed call runs again under
+  its first key and one whose replay is unknown is answered with the
+  outcome unknown; a held call with one is `Dispatched` (#185).
 
 ## v0.0.12 - 2026-09-29
 
