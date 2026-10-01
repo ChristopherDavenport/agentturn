@@ -5,6 +5,15 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- **Requires `agenttool` v0.0.14, up from v0.0.12, and `agentsession`
+  v0.0.19, up from v0.0.18.** Neither changes what this module does.
+  agentsession v0.0.19 adds `agentsession migrate` for a `cas` store
+  v0.0.15 or earlier wrote: on such a store, stop every writer, take a
+  copy, run it, then upgrade readers and writers together, as its
+  changelog says.
+
 ## v0.0.14 - 2026-10-01
 
 - **`compact.WithOnFold` adds a callback rather than replacing the
