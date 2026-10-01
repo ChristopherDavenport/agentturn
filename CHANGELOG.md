@@ -105,6 +105,14 @@ versions may break the API.
   Responses or Chat Completions server rejects. The split now moves
   back to the call of every output the kept tail holds, wherever in
   the tail it is (#201).
+- **A local fold whose summary has no text twice no longer fails the
+  turn.** Like a summary cut short or too large, it is reported failed,
+  now with the exported `compact.ErrSummaryNoText`, the transcript is
+  sent unfolded, and the transform backs off from that prefix. A model
+  that answered a summary request with reasoning alone or a function
+  call every time used to fail every later turn of the conversation
+  before the model was called, adding a `compaction_failed` each time
+  (#199).
 
 ## v0.0.14 - 2026-10-01
 

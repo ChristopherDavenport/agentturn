@@ -333,7 +333,7 @@ func TestLocalSummaryRequestAndRetry(t *testing.T) {
 	}{
 		{"text on the first call", 0, 0, 1, "", "", "message"},
 		{"a call without text is asked again", 1, 0, 2, "", "", "message"},
-		{"no text twice fails the turn", 2, 0, 2, "compact: summary response has no text", "compact: summary response has no text", "function_call"},
+		{"no text twice sends the transcript unfolded", 2, 0, 2, "", "compact: summary response has no text", "function_call"},
 		{"an incomplete summary is asked again", 0, 1, 2, "", "", "message"},
 		{"incomplete twice sends the transcript unfolded", 0, 2, 2, "", "compact: summary response is incomplete: max_output_tokens", "message"},
 	}
@@ -373,7 +373,7 @@ func TestLocalSummaryRequestAndRetry(t *testing.T) {
 			}
 			if tc.wantFold != "" && tc.wantErr == "" {
 				// Not applied: the transcript goes as it was.
-				if !errors.Is(f.Err, ErrSummaryIncomplete) || len(out) != 4 || f.Summary != nil || tr.Last() != nil {
+				if !unfolded(f.Err) || len(out) != 4 || f.Summary != nil || tr.Last() != nil {
 					t.Errorf("fold err = %v, out = %d items, summary = %v", f.Err, len(out), f.Summary)
 				}
 			}
@@ -452,22 +452,21 @@ func TestLocalSummaryBacksOffAFailedFold(t *testing.T) {
 	// 100 and only the item margin of four (WithKeepLast) lets a failed
 	// prefix be asked about again.
 	cases := []struct {
-		name    string
-		s       *summarizer
-		want    error // on the folds; nil for a turn that fails
-		wantErr string
+		name string
+		s    *summarizer
+		want error // on the folds
 		// summary calls made by the end of each turn
 		calls []int
 	}{
 		{"an oversized summary waits for the prefix to grow",
-			&summarizer{reply: "They talked about things.", bloat: 1000}, ErrSummaryTooLarge, "",
+			&summarizer{reply: "They talked about things.", bloat: 1000}, ErrSummaryTooLarge,
 			[]int{2, 2, 2, 2, 4, 4, 4, 4, 6}},
 		{"an incomplete summary waits for the prefix to grow",
-			&summarizer{reply: "gist", cut: 1000}, ErrSummaryIncomplete, "",
+			&summarizer{reply: "gist", cut: 1000}, ErrSummaryIncomplete,
 			[]int{2, 2, 2, 2, 4, 4, 4, 4, 6}},
-		{"a summary with no text fails every turn",
-			&summarizer{reply: "gist", calls: 1000}, nil, "compact: summary response has no text",
-			[]int{2, 4, 6}},
+		{"a summary with no text waits for the prefix to grow",
+			&summarizer{reply: "gist", calls: 1000}, ErrSummaryNoText,
+			[]int{2, 2, 2, 2, 4, 4, 4, 4, 6}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -477,11 +476,7 @@ func TestLocalSummaryBacksOffAFailedFold(t *testing.T) {
 			history := items(12)
 			for turn, want := range tc.calls {
 				out, err := tr.Transform(context.Background(), history)
-				if tc.wantErr != "" {
-					if err == nil || err.Error() != tc.wantErr {
-						t.Fatalf("turn %d: err = %v, want %q", turn+1, err, tc.wantErr)
-					}
-				} else if err != nil || len(out) != len(history) {
+				if err != nil || len(out) != len(history) {
 					t.Fatalf("turn %d: err = %v, out = %d items, want the %d unfolded", turn+1, err, len(out), len(history))
 				}
 				if len(tc.s.reqs) != want {
@@ -494,7 +489,7 @@ func TestLocalSummaryBacksOffAFailedFold(t *testing.T) {
 				history = append(history, openresponses.UserText("ok"))
 			}
 			for _, f := range folds {
-				if tc.want != nil && !errors.Is(f.Err, tc.want) {
+				if !errors.Is(f.Err, tc.want) {
 					t.Errorf("fold err = %v, want %v", f.Err, tc.want)
 				}
 			}

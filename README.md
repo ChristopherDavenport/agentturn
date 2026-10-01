@@ -348,8 +348,11 @@ cfg.Transform = l.Transform
 ```
 
 `WithRequest(fn)` edits the summary request `NewLocal` sends, so it
-can carry the reasoning setting the agent's own requests do; a summary
-that comes back with no text is asked once more before the fold fails.
+can carry the reasoning setting the agent's own requests do. A summary
+that comes back with no text, cut short or no smaller than what it
+folds is asked once more; a second such answer leaves the transcript
+unfolded for that call, and the transform does not ask about the same
+prefix again until it has grown.
 
 `WithOnFold` reports every fold, applied or failed, with the index at
 which the transcript was split, so a recorder can write it. Each

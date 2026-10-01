@@ -1143,17 +1143,85 @@ func (b bloatingFold) CreateStream(_ context.Context, req openresponses.Request,
 	return em.Complete()
 }
 
+// reasoningFold answers every summary request with a reasoning item
+// alone, as a thinking model does that reasons to its output cap and is
+// reported complete, and counts the requests.
+type reasoningFold struct{ calls int }
+
+func (r *reasoningFold) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	r.calls++
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Reasoning()
+	if err != nil {
+		return err
+	}
+	if err := w.Text("Let me think about what to keep."); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
 func TestUnappliedFoldProceedsUnfolded(t *testing.T) {
 	cases := []struct {
-		name string
-		cut  bool
-		want error
+		name  string
+		model openresponses.Streamer
+		want  error
 	}{
-		{"an oversized summary", false, compact.ErrSummaryTooLarge},
-		{"an incomplete summary", true, compact.ErrSummaryIncomplete},
+		{"an oversized summary", bloatingFold{}, compact.ErrSummaryTooLarge},
+		{"an incomplete summary", bloatingFold{cut: true}, compact.ErrSummaryIncomplete},
+		{"a summary with no text", callingFold{}, compact.ErrSummaryNoText},
+		{"a summary of reasoning alone", &reasoningFold{}, compact.ErrSummaryNoText},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) { testUnappliedFold(t, bloatingFold{cut: tc.cut}, tc.want) })
+		t.Run(tc.name, func(t *testing.T) { testUnappliedFold(t, tc.model, tc.want) })
+	}
+}
+
+// TestFoldWithNoTextBacksOff pins #199: a model that answers every
+// summary request with reasoning alone does not fail the turns past the
+// budget, and the turn after the failed fold asks for no summary.
+func TestFoldWithNoTextBacksOff(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &reasoningFold{}
+	// Every transcript is over the budget, and each turn grows the
+	// estimate by two: well inside the back-off's margins.
+	over := func(items openresponses.Items) int { return 100 + len(items) }
+	tr := compact.NewLocal(model, compact.WithBudget(100), compact.WithKeepLast(3), compact.WithEstimator(over), compact.WithOnFold(rec.Fold))
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform})
+	defer rec.Attach(a)()
+	turns := []struct {
+		text      string
+		summaries int // summary calls by the end of the turn
+	}{
+		{"one", 0},   // nothing older than the kept tail
+		{"two", 0},   // still nothing
+		{"three", 2}, // folds two items, gets no text twice
+		{"four", 2},  // backs off
+	}
+	for _, turn := range turns {
+		end, err := a.Prompt(context.Background(), openresponses.UserText(turn.text))
+		if err != nil || end.Reason != agentturn.ReasonDone {
+			t.Fatalf("%s: err=%v end=%+v", turn.text, err, end)
+		}
+		if model.calls != turn.summaries {
+			t.Fatalf("%s: summary calls = %d, want %d", turn.text, model.calls, turn.summaries)
+		}
+	}
+	failed := 0
+	for _, e := range s.Entries() {
+		if c, ok := e.(*agentsession.CustomEntry); ok && c.NS == FailedFoldNS {
+			failed++
+		}
+	}
+	if failed != 1 {
+		t.Errorf("failed folds recorded = %d: %q", failed, entryTypes(s))
 	}
 }
 
@@ -1207,9 +1275,10 @@ func TestFailedFoldLeavesATrace(t *testing.T) {
 		wantResponse bool
 		wantTypes    string
 		wantUsage    int // output tokens over every call; 0 for no usage
+		wantReason   agentturn.Reason
 	}{
-		{"the call fails", failingFold{}, "summary model down", 1, false, "", 0},
-		{"the model answers with a call twice", callingFold{}, "summary response has no text", 2, true, "function_call", 14},
+		{"the call fails", failingFold{}, "summary model down", 1, false, "", 0, agentturn.ReasonError},
+		{"the model answers with a call twice", callingFold{}, "summary response has no text", 2, true, "function_call", 14, agentturn.ReasonDone},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1227,14 +1296,20 @@ func TestFailedFoldLeavesATrace(t *testing.T) {
 				}
 			}
 			end, err := a.Prompt(context.Background(), openresponses.UserText("three"))
-			if err == nil || end.Reason != agentturn.ReasonError {
+			if (err != nil) != (tc.wantReason == agentturn.ReasonError) || end.Reason != tc.wantReason {
 				t.Fatalf("third prompt: err=%v end=%+v", err, end)
 			}
-			// The failed fold is the last entry before the run's end.
+			// The failed fold is the last entry before the run's end when
+			// it failed the run, and before the call it left unfolded
+			// otherwise.
 			entries := s.Entries()
-			last, ok := entries[len(entries)-2].(*agentsession.CustomEntry)
+			at := len(entries) - 2
+			if tc.wantReason != agentturn.ReasonError {
+				at = len(entries) - 4
+			}
+			last, ok := entries[at].(*agentsession.CustomEntry)
 			if !ok || last.NS != FailedFoldNS {
-				t.Fatalf("entry before the end = %+v, entries %q", entries[len(entries)-2], entryTypes(s))
+				t.Fatalf("entry %d = %+v, entries %q", at, entries[at], entryTypes(s))
 			}
 			var data FailedFold
 			if err := json.Unmarshal(last.Data, &data); err != nil || !strings.Contains(data.Error, tc.wantErr) || data.TokensBefore != 5 {
@@ -1257,7 +1332,11 @@ func TestFailedFoldLeavesATrace(t *testing.T) {
 				t.Errorf("failed fold usage = %+v, want %d output tokens", data.Usage, tc.wantUsage)
 			}
 			// The record still verifies: the fold changed nothing.
-			if n := verifyAll(t, s); n != 2 {
+			want := 2
+			if tc.wantReason != agentturn.ReasonError {
+				want = 3
+			}
+			if n := verifyAll(t, s); n != want {
 				t.Errorf("responses verified = %d", n)
 			}
 		})

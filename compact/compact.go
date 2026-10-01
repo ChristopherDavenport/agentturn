@@ -188,10 +188,10 @@ type Fold struct {
 	// request is not a Request.
 	Request *openresponses.Request
 	// Err is set when the fold failed; Transform returns it, save for
-	// [ErrSummaryTooLarge] and [ErrSummaryIncomplete], after which
-	// Transform sends the transcript unfolded and returns no error. A fold cut off by an abort carries
-	// the context error. A failed fold still
-	// reports what its calls did: Usage, ResponseID, OutputTypes,
+	// [ErrSummaryTooLarge], [ErrSummaryIncomplete] and
+	// [ErrSummaryNoText], after which Transform sends the transcript
+	// unfolded and returns no error. A fold cut off by an abort carries
+	// the context error. A failed fold still reports what its calls did: Usage, ResponseID, OutputTypes,
 	// Attempts and Request, as far as the calls got.
 	Err error
 }
@@ -325,18 +325,18 @@ func itemTypes(items openresponses.Items) []string {
 // The summary request's MaxOutputTokens is half the budget, at most
 // [DefaultSummaryMaxOutputTokens], unless [WithRequest] sets it
 // otherwise. A summary response with no text, such as one that ends in
-// a function call, a response the server ended incomplete, such as one
-// cut at MaxOutputTokens, and a summary whose text is estimated at no
-// fewer tokens than the items it folds are model errors rather than
-// server ones, so the summary is asked once more. A second answer with
-// no text fails the fold, and the turn, with "compact: summary response
-// has no text". A second incomplete or oversized answer is never
-// applied, since a summary cut short has lost part of what it folds and
-// one too large would grow the request the fold exists to shrink: the
-// fold is reported failed with [ErrSummaryIncomplete] and the server's
-// reason, or with [ErrSummaryTooLarge], the transcript is sent unfolded,
-// and the transform backs off from that prefix as
-// [Transform.Transform] describes. The summary's size is that of its text,
+// a function call or in reasoning alone, a response the server ended
+// incomplete, such as one cut at MaxOutputTokens, and a summary whose
+// text is estimated at no fewer tokens than the items it folds are
+// model errors rather than server ones, so the summary is asked once
+// more. A second such answer is never applied, since there is nothing
+// to apply, a summary cut short has lost part of what it folds and one
+// too large would grow the request the fold exists to shrink: the fold
+// is reported failed with [ErrSummaryNoText], with
+// [ErrSummaryIncomplete] and the server's reason, or with
+// [ErrSummaryTooLarge], the transcript is sent unfolded, and the
+// transform backs off from that prefix as [Transform.Transform]
+// describes. The summary's size is that of its text,
 // the estimate of its item less that of an item with no text, so the
 // wrapper [WithSummaryItem] puts around every summary does not count
 // against it. The fold, failed or not, reports the last call's response
@@ -347,7 +347,7 @@ func NewLocal(model openresponses.Streamer, opts ...Option) *Transform {
 	t.fold = func(ctx context.Context, input openresponses.Items) (folded, error) {
 		f, err := t.summarize(ctx, model, input)
 		f.attempts = 1
-		if errors.Is(err, errNoText) || errors.Is(err, ErrSummaryIncomplete) || errors.Is(err, ErrSummaryTooLarge) {
+		if unfolded(err) {
 			first := f.usage
 			f, err = t.summarize(ctx, model, input)
 			f.attempts = 2
@@ -375,9 +375,13 @@ func addUsage(a, b *openresponses.Usage) *openresponses.Usage {
 	}
 }
 
-// errNoText is the error of a summary response with no text, which
-// [NewLocal] asks again once.
-var errNoText = errors.New("compact: summary response has no text")
+// ErrSummaryNoText is the error of a [NewLocal] fold whose summary
+// response had no text twice, such as one that ended in a function
+// call or in reasoning alone each time. Like [ErrSummaryTooLarge], such
+// a fold is reported to [WithOnFold] with it and the transcript is sent
+// unfolded: Transform returns no error, so a model that will not
+// summarise a prefix does not fail every turn of the conversation.
+var ErrSummaryNoText = errors.New("compact: summary response has no text")
 
 // ErrSummaryIncomplete is the error of a [NewLocal] fold whose summary
 // response the server ended incomplete twice, such as one cut at
@@ -400,8 +404,16 @@ const DefaultSummaryMaxOutputTokens = 8192
 // would not shrink the request leaves the request as it was rather
 // than failing the turn.
 //
-// After either error the transform backs off: see [Transform.Transform].
+// After any of the three errors the transform backs off: see
+// [Transform.Transform].
 var ErrSummaryTooLarge = errors.New("compact: summary is larger than what it folds")
+
+// unfolded reports whether err is the error of a summary that was asked
+// for and not applied: one [NewLocal] asks again and, after a second,
+// sends the transcript unfolded and backs off from.
+func unfolded(err error) bool {
+	return errors.Is(err, ErrSummaryNoText) || errors.Is(err, ErrSummaryIncomplete) || errors.Is(err, ErrSummaryTooLarge)
+}
 
 // summarize asks model once for a summary of input.
 func (t *Transform) summarize(ctx context.Context, model openresponses.Streamer, input openresponses.Items) (folded, error) {
@@ -439,7 +451,7 @@ func (t *Transform) summarize(ctx context.Context, model openresponses.Streamer,
 	}
 	summary := strings.TrimSpace(resp.OutputText())
 	if summary == "" {
-		return f, errNoText
+		return f, ErrSummaryNoText
 	}
 	item := t.summaryItem(summary)
 	// The summary's own text is weighed, not the wrapper every summary
@@ -499,8 +511,8 @@ func (t *Transform) Last() openresponses.Item {
 // when it fits the budget, otherwise the fold of its older part
 // followed by the recent items.
 //
-// A fold that failed with [ErrSummaryTooLarge] or [ErrSummaryIncomplete]
-// sends the transcript unfolded, and the transform remembers it: the
+// A fold that failed with [ErrSummaryTooLarge], [ErrSummaryIncomplete]
+// or [ErrSummaryNoText] sends the transcript unfolded, and the transform remembers it: the
 // length and hash of the prefix it would have folded, and the estimate
 // that triggered it. While a later transcript still begins with that
 // prefix, it is not folded again until the part to fold has grown by
@@ -544,10 +556,11 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 		if rerr := t.report(ctx, failed); rerr != nil {
 			return nil, rerr
 		}
-		if errors.Is(err, ErrSummaryTooLarge) || errors.Is(err, ErrSummaryIncomplete) {
-			// The summary would have grown the request or lost part of
-			// what it folds; the request goes as it was, and this
-			// prefix is not asked about again until it has grown.
+		if unfolded(err) {
+			// There was no summary, or it would have grown the request
+			// or lost part of what it folds; the request goes as it
+			// was, and this prefix is not asked about again until it
+			// has grown.
 			if h := hash(items[:split]); h != "" {
 				t.mu.Lock()
 				t.failLen, t.failHash, t.failTokens = split, h, tokens
