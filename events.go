@@ -432,10 +432,13 @@ const (
 	StopMaxTurns StopCause = "max_turns"
 	// StopHook: ShouldStopAfterTurn returned true.
 	StopHook StopCause = "hook"
-	// StopGuard: ShouldStopAfterTurn, BeforeTurn or BeforeModelCall
-	// returned an error wrapping [ErrGuard]; the error is on RunEnd.Err.
-	// Stopped before the model call, the turn has no turn_start; from
-	// BeforeModelCall, the request it refused is on a model_blocked.
+	// StopGuard: ShouldStopAfterTurn, BeforeTurn, BeforeModelCall or
+	// OutputGuard returned an error wrapping [ErrGuard]; the error is on
+	// RunEnd.Err. Stopped before the model call, the turn has no
+	// turn_start; from BeforeModelCall, the request it refused is on a
+	// model_blocked. From OutputGuard, the message it ruled on is not
+	// appended and has no item_end, though its deltas went out as
+	// item_update, and the turn has no response_end or turn_end.
 	StopGuard StopCause = "guard"
 	// StopTerminate: every result of the batch set Terminate, so the
 	// tools answered on the model's behalf.

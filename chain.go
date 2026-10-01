@@ -241,7 +241,8 @@ func (d *ToolDecision) merge(next *ToolDecision) {
 // hands that replacement to the next. The last replacement is what
 // reaches the transcript, and a chain in which no guard replaced
 // anything keeps the model's own message. The first error stops the
-// chain and fails the turn.
+// chain and is returned, so one wrapping [ErrGuard] stops the run as a
+// policy and any other fails it.
 func ChainOutputGuard(fns ...func(context.Context, OutputInfo) (*openresponses.Message, error)) func(context.Context, OutputInfo) (*openresponses.Message, error) {
 	var kept []func(context.Context, OutputInfo) (*openresponses.Message, error)
 	for _, fn := range fns {

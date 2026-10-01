@@ -197,3 +197,49 @@ func TestRunEndAnswer(t *testing.T) {
 		})
 	}
 }
+
+// TestOutputGuardStops pins #181: an OutputGuard error wrapping ErrGuard
+// stops the run as a policy stop, with the message it ruled on kept out
+// of the transcript and no item_end for it; any other error still fails
+// the run.
+func TestOutputGuardStops(t *testing.T) {
+	rule := fmt.Errorf("%w: pii rule", ErrGuard)
+	boom := errors.New("boom")
+	for _, tc := range []struct {
+		name   string
+		err    error
+		reason Reason
+		cause  StopCause
+	}{
+		{name: "guard", err: rule, reason: ReasonStopped, cause: StopGuard},
+		{name: "failure", err: boom, reason: ReasonError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New(Config{Model: &echo.Adapter{}, OutputGuard: func(context.Context, OutputInfo) (*openresponses.Message, error) {
+				return nil, tc.err
+			}})
+			var assistantEnds, turnEnds int
+			a.Subscribe(func(_ context.Context, ev Event) error {
+				switch e := ev.(type) {
+				case *ItemEnd:
+					if m, ok := e.Item.(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant {
+						assistantEnds++
+					}
+				case *TurnEnd:
+					turnEnds++
+				}
+				return nil
+			})
+			end, _ := a.Prompt(context.Background(), openresponses.UserText("call 555-0100"))
+			if end.Reason != tc.reason || end.Cause != tc.cause || !errors.Is(end.Err, tc.err) {
+				t.Fatalf("end = %s %q %v", end.Reason, end.Cause, end.Err)
+			}
+			if got := itemTypes(a.State().Transcript); got != "user" {
+				t.Errorf("transcript = %s", got)
+			}
+			if _, ok := end.Answer(); ok || assistantEnds != 0 || turnEnds != 0 {
+				t.Errorf("answer=%v assistant item_end=%d turn_end=%d", ok, assistantEnds, turnEnds)
+			}
+		})
+	}
+}

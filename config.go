@@ -145,9 +145,14 @@ type Config struct {
 	// Function calls, reasoning and every other output item never reach
 	// it, so a replay still has what it needs. A message the model
 	// speaks before a function call reaches it too, with nothing yet
-	// saying a call follows; see [OutputInfo]. A guard that also wants
-	// to end the run returns an error wrapping [ErrGuard] from
-	// ShouldStopAfterTurn, which sees the turn with TurnInfo.Final set.
+	// saying a call follows; see [OutputInfo]. An error wrapping
+	// [ErrGuard] withholds the message and ends the run as a policy
+	// stop: the message is not appended and has no item_end, and the run
+	// ends with ReasonStopped, StopGuard and the error on RunEnd.Err.
+	// Any other error fails the run with ReasonError. A guard that keeps
+	// or replaces the message and then wants the run to end returns an
+	// error wrapping [ErrGuard] from ShouldStopAfterTurn, which sees the
+	// turn with TurnInfo.Final set.
 	// Several guards are joined with [ChainOutputGuard], each seeing
 	// what the one before it left.
 	OutputGuard func(context.Context, OutputInfo) (*openresponses.Message, error)

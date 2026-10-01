@@ -25,9 +25,10 @@ var (
 	ErrCannotContinue = errors.New("agentturn: transcript must end with a user message or a function call output to continue")
 	// ErrNoPrompt is returned when Run was called with no prompt items.
 	ErrNoPrompt = errors.New("agentturn: no prompt items")
-	// ErrGuard is what a ShouldStopAfterTurn hook wraps to end the run
-	// as a policy stop rather than a failure: ReasonStopped with
-	// StopGuard, the error on RunEnd.Err.
+	// ErrGuard is what a guard wraps to end the run as a policy stop
+	// rather than a failure: ReasonStopped with StopGuard, the error on
+	// RunEnd.Err. BeforeTurn, BeforeModelCall, OutputGuard and
+	// ShouldStopAfterTurn each read it so.
 	ErrGuard = errors.New("agentturn: guard stopped the run")
 )
 
@@ -1012,6 +1013,12 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 			r.mark = len(r.transcript)
 			return resp, nil
 		}
+		var halt *errStop
+		if errors.As(err, &halt) {
+			// OutputGuard stopped the run: a policy, not a failure to
+			// retry or wrap.
+			return nil, err
+		}
 		if ctx.Err() != nil {
 			return nil, stop(ReasonAborted, context.Cause(ctx))
 		}
@@ -1156,6 +1163,11 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 			}
 			replacement, err := r.cfg.OutputGuard(r.ctx, OutputInfo{RunID: r.runID, Turn: r.turn, ResponseID: responseID, Message: m, Output: before})
 			if err != nil {
+				if errors.Is(err, ErrGuard) {
+					// A policy stop: the message is kept from the
+					// transcript and the run ends with the turn.
+					return true, stopped(StopGuard, err)
+				}
 				return true, fmt.Errorf("agentturn: output guard: %w", err)
 			}
 			if replacement != nil {
