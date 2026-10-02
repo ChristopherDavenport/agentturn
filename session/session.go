@@ -100,8 +100,8 @@
 //     extension item, is written as a custom entry
 //     instead so the path rebuilds exactly the input that was sent,
 //     marked with a [ResponseIDMember] member naming the response that
-//     produced it, if any, and [Transcript] puts it back in the agent's
-//     transcript on a resume. A
+//     produced it, if any, which [MarkedItem] decodes, and [Transcript]
+//     puts it back in the agent's transcript on a resume. A
 //     function_call_output for a call the path holds no dispatch and no
 //     reject for, one the caller answered through Agent.Resume with an
 //     output of their own, is preceded by a reject decision carrying
@@ -653,6 +653,30 @@ const unnamedReason = "the response named no ID, so the items it produced read a
 // back; an entry written before the member was, by v0.0.14 or earlier,
 // is not put back.
 const ResponseIDMember = "agentturn:response_id"
+
+// MarkedItem decodes a custom entry written for an item of the agent's
+// transcript the filter kept from the model, an app-only input or a
+// model output item, marked with [ResponseIDMember]: the item, the ID
+// of the response that produced it, "" for an input or an output whose
+// stream never named its response, and true; or false for any other
+// entry, one without the member, one whose data does not decode as an
+// item and one whose item is not of the entry's namespace included,
+// which the transcript leaves out as it does today. [Transcript] and a
+// replay that rebuilds a response's output from the path share this
+// rule.
+func MarkedItem(c *agentsession.CustomEntry) (openresponses.Item, string, bool) {
+	raw, ok := c.Unknown[ResponseIDMember]
+	if !ok {
+		return nil, "", false
+	}
+	item, err := openresponses.UnmarshalItem(c.Data)
+	if err != nil || item.ItemType() != c.NS {
+		return nil, "", false
+	}
+	var id string
+	_ = json.Unmarshal(raw, &id)
+	return item, id, true
+}
 
 // ErrRunActive is returned by [Recorder.Rebase] while a run is being
 // written.
@@ -1521,7 +1545,7 @@ func TranscriptModels(s *agentsession.Session) (openresponses.Items, agentturn.R
 				produced[v.ID] = settings.Model
 			}
 		case *agentsession.CustomEntry:
-			if _, ok := v.Unknown[ResponseIDMember]; ok && v.NS == openresponses.ItemTypeReasoning {
+			if _, _, ok := MarkedItem(v); ok && v.NS == openresponses.ItemTypeReasoning {
 				produced[v.ID] = settings.Model
 			}
 		}
@@ -1541,7 +1565,7 @@ func TranscriptModels(s *agentsession.Session) (openresponses.Items, agentturn.R
 
 // transcriptOf is the transcript of cx, as [Transcript] reads it, with
 // the ID of the entry contributing each item, and whether that entry
-// is a custom entry, outside the context.
+// is a custom entry, outside the context, one [MarkedItem] decodes.
 func transcriptOf(cx agentsession.Context) (items openresponses.Items, entries []string, custom []bool) {
 	j := 0
 	for _, e := range cx.Entries {
@@ -1553,10 +1577,7 @@ func transcriptOf(cx agentsession.Context) (items openresponses.Items, entries [
 		if !ok {
 			continue
 		}
-		if _, ok := c.Unknown[ResponseIDMember]; !ok {
-			continue
-		}
-		if item, err := openresponses.UnmarshalItem(c.Data); err == nil && item.ItemType() == c.NS {
+		if item, _, ok := MarkedItem(c); ok {
 			items, entries, custom = append(items, item), append(entries, c.ID), append(custom, true)
 		}
 	}
