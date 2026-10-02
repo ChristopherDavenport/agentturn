@@ -1153,7 +1153,7 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // a rebase left. [Recorder.ReadOptions] gives the options that read a
 // session as the recorder writing it does.
 func Pending(s *agentsession.Session, opts ...ReadOption) ([]agentturn.PendingCall, error) {
-	pending, err := pendingCalls(context.Background(), s, opts)
+	pending, err := pendingCalls(s, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -1165,9 +1165,19 @@ func Pending(s *agentsession.Session, opts ...ReadOption) ([]agentturn.PendingCa
 }
 
 // ReadOption configures how [Pending], [AgentOptions] and
-// [ReplayAnswers] read a session. [WithOrigins] makes one.
+// [ReplayAnswers] read a session. [WithOrigins] and [WithContext] make
+// one.
 type ReadOption struct {
 	apply func(*origins)
+}
+
+// WithContext has [Pending] and [AgentOptions] read a fork's origins
+// under ctx, so a deadline or a cancellation on it ends the reads;
+// without it they read under context.Background(). [ReplayAnswers]
+// takes a context of its own and reads under that one whatever this
+// option says.
+func WithContext(ctx context.Context) ReadOption {
+	return ReadOption{apply: func(o *origins) { o.ctx = ctx }}
 }
 
 // WithOrigins has [Pending], [AgentOptions] and [ReplayAnswers] read a
@@ -1186,7 +1196,9 @@ func WithOrigins(r agentsession.Reader) ReadOption {
 // ReadOptions returns the options that have [Pending], [AgentOptions]
 // and [ReplayAnswers] read a session as the recorder reads it when it
 // is seeded: [WithOrigins] with the recorder's store, when the store
-// is an agentsession.Reader, and none otherwise.
+// is an agentsession.Reader, and none otherwise. A caller with a
+// deadline on the reads, a request handler for one, adds
+// [WithContext] beside them.
 func (r *Recorder) ReadOptions() []ReadOption {
 	if rd, ok := r.store.(agentsession.Reader); ok {
 		return []ReadOption{WithOrigins(rd)}
@@ -1263,11 +1275,14 @@ type pendingCall struct {
 }
 
 // pendingCalls is [Pending] with the output each call has off the path.
-func pendingCalls(ctx context.Context, s *agentsession.Session, opts []ReadOption) ([]pendingCall, error) {
+// The origins are read under the context the last [WithContext] in
+// opts gives, which [ReplayAnswers] appends its own as, and under
+// context.Background() without one.
+func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]pendingCall, error) {
 	if s.Leaf() == "" {
 		return nil, nil
 	}
-	o := &origins{ctx: ctx}
+	o := &origins{ctx: context.Background()}
 	for _, opt := range opts {
 		if opt.apply != nil {
 			opt.apply(o)
@@ -1559,7 +1574,7 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // pending call as one that may have run, and holds the approval of a
 // call that never started to the replay rule.
 func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agenttool.Tool, opts ...ReadOption) ([]agentturn.Answer, error) {
-	pending, err := pendingCalls(ctx, s, opts)
+	pending, err := pendingCalls(s, append(slices.Clone(opts), WithContext(ctx)))
 	if err != nil {
 		return nil, err
 	}
