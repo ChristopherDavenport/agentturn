@@ -146,3 +146,96 @@ func itemRoles(items openresponses.Items) string {
 	}
 	return out
 }
+
+// TestSessionOfNamesWhereARecordGoes pins #158: SessionOf names the
+// session a record made with a context is written to, for a child
+// built with WithObserver alone as for one wired with ChildContext:
+// the child's during its run, when Annotate lands there with the
+// call's ID; the child's after its run ended, when a job the child
+// started writes with the run's context, which the recorder remembers
+// for the run; and the recorder's own for a context with no run.
+func TestSessionOfNamesWhereARecordGoes(t *testing.T) {
+	cases := []struct {
+		name  string
+		wired bool
+	}{
+		{"with ChildContext", true},
+		{"with WithObserver alone", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(ctx, store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var jobCtx context.Context
+			var during, fromContext, noteCall string
+			note := agenttool.New("note", "note something", func(ctx context.Context, _ echoArgs) (string, error) {
+				jobCtx = ctx
+				call, _ := agenttool.CallFrom(ctx)
+				noteCall = call.ID
+				during = rec.SessionOf(ctx)
+				fromContext = SessionIDFromContext(ctx)
+				_, err := rec.Annotate(ctx, "test:manifest", map[string]string{"render": "r1"})
+				return "noted", err
+			})
+			childCfg := agentturn.Config{Name: "helper", Description: "notes", Model: scriptedCalls{{"note", `{"text":"t"}`}}, Tools: []agenttool.Tool{note}}
+			opts := []agent.Option{agent.WithObserver(rec.Observe)}
+			if tc.wired {
+				opts = append(opts, agent.WithRunContext(rec.ChildContext))
+			}
+			helper := agent.New(childCfg, opts...)
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{helper}})
+			defer rec.Attach(a)()
+			if _, err := a.Prompt(ctx, openresponses.UserText("delegate")); err != nil {
+				t.Fatal(err)
+			}
+			l := links(s)
+			if len(l) != 1 {
+				t.Fatalf("links = %+v", l)
+			}
+			childID := l[0].Session
+			if during != childID {
+				t.Errorf("SessionOf during the child's run = %q, want the child's %q", during, childID)
+			}
+			if want := map[bool]string{true: childID, false: ""}[tc.wired]; fromContext != want {
+				t.Errorf("SessionIDFromContext in the child = %q, want %q", fromContext, want)
+			}
+			// The run is over: the recorder remembers which session
+			// it wrote, and a late job's record goes there too.
+			if got := rec.SessionOf(jobCtx); got != childID {
+				t.Errorf("SessionOf after the child's run = %q, want the child's %q", got, childID)
+			}
+			if got := rec.SessionOf(ctx); got != rec.SessionID() {
+				t.Errorf("SessionOf with no run = %q, want the recorder's own %q", got, rec.SessionID())
+			}
+			if _, err := rec.Annotate(jobCtx, "test:job", map[string]string{"state": "done"}); err != nil {
+				t.Fatal(err)
+			}
+			child, err := store.Open(ctx, childID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := map[string]string{}
+			for _, e := range child.Entries() {
+				if c, ok := e.(*agentsession.CustomEntry); ok {
+					got[c.NS] = c.CallID
+				}
+			}
+			for _, ns := range []string{"test:manifest", "test:job"} {
+				if callID, ok := got[ns]; !ok || callID != noteCall {
+					t.Errorf("%s in the child: present=%v call_id=%q, want call %q", ns, ok, callID, noteCall)
+				}
+			}
+			for _, e := range s.Entries() {
+				if c, ok := e.(*agentsession.CustomEntry); ok {
+					t.Errorf("%s was filed at the root", c.NS)
+				}
+			}
+			verifyAll(t, s)
+			verifyAll(t, child)
+		})
+	}
+}

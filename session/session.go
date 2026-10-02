@@ -294,7 +294,11 @@
 //
 // The host does the same for its own runs with
 // [ContextWithSessionID](ctx, rec.SessionID()); [SessionIDFromContext]
-// reads whichever is in force.
+// reads whichever is in force. [Recorder.SessionOf] answers for any
+// context, a child built with WithObserver alone included: the session
+// a record made with the context is written to, the run's while it is
+// written, the child's after its run ended, and what the context names
+// or the recorder's own otherwise.
 //
 // # Request hashes and compaction
 //
@@ -716,6 +720,12 @@ type Recorder struct {
 	// written.
 	runs    map[string]*writer
 	rootRun string
+	// ended maps the ID of each child run whose writer was released to
+	// the ID of its session, so a record a job the child started
+	// writes after the run ended, with the run's context, is filed in
+	// the child's session whether or not the host put the session's ID
+	// on that context.
+	ended map[string]string
 	// childIDs holds the ID of every child session the recorder has
 	// written, so a record naming one by [SessionIDFromContext] after
 	// its run ended is filed there rather than at the root.
@@ -1037,6 +1047,7 @@ func New(store agentsession.Store, sessionID string, opts ...Option) *Recorder {
 		children: true,
 		now:      time.Now,
 		runs:     map[string]*writer{},
+		ended:    map[string]string{},
 	}
 	r.root = newWriter(r, sessionID)
 	for _, opt := range opts {
@@ -1966,11 +1977,14 @@ func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) int {
 }
 
 // Annotate appends a custom entry in namespace ns carrying data,
-// encoded as JSON, at the current leaf of the session of the run on
-// the context; when the context names no run it is writing, of the
-// child session [SessionIDFromContext] names when that is one of this
-// recorder's, reopened at its leaf, or else of the recorder's own
-// session; and returns the entry's ID, which a
+// encoded as JSON, at the current leaf of the session
+// [Recorder.SessionOf] names for the context: the session of the run
+// on the context while the recorder writes it; after a child run has
+// ended, that child's session, reopened at its leaf, so a job the
+// child started files what it writes where the child's run is; else
+// the child session [SessionIDFromContext] names when that is one of
+// this recorder's; or else the recorder's own session. It returns the
+// entry's ID, which a
 // checkpoint or a rewind can branch to. It never contributes an item
 // or a setting, so the context and the request hashes are untouched.
 // Made with the context of a tool call, from inside the tool, the
@@ -2008,12 +2022,11 @@ func (r *Recorder) Annotate(ctx context.Context, ns string, data any) (string, e
 // that saw the move or the tool that moved, with the context it was
 // given, and between runs with any. The entry is written where
 // [Recorder.Annotate] files its entry: at the current leaf of the
-// session of the run on the context; when the context names no run
-// being written, of the child session [SessionIDFromContext] names
-// when that is one of this recorder's, reopened at its leaf, so a job
-// a child started that moves the workspace after the child's run
-// ended records the move in the child; or else of the recorder's own
-// session. It is compared with the env in force in that session: the
+// session [Recorder.SessionOf] names for the context, the session of
+// the run on it, a child's after its run ended included, reopened at
+// its leaf, so a job a child started that moves the workspace after
+// the child's run ended records the move in the child; or else of the
+// recorder's own session. It is compared with the env in force in that session: the
 // last on its path, the one a child's first run start copied from its
 // parent's included, so a job a child started that outlives it is
 // compared with where the child ran, not where its parent is now; or,
@@ -2148,19 +2161,55 @@ func (r *Recorder) writerOf(ctx context.Context) *writer {
 	return r.root
 }
 
-// reopen returns a writer at the leaf of the child session the context
-// names, or nil when the context names none of this recorder's
-// children. It is what a record written after a child's run ended, by
-// a job the child started, is filed with, even while a later run of
-// the child is being written: that run's writer knows only the calls
-// pending when it was seeded, and the job's call was answered before.
-// The writer knows every call on the session's path and the nested
-// calls their tools made, which is all callOn asks, and is dropped
-// after the write: the store keeps the leaf, and a later run of the
-// child seeds a writer of its own from it. The caller holds r.mu, so
-// no live writer of the session appends meanwhile.
+// reopen returns a writer at the leaf of the child session a record
+// made with the context is filed in, as [Recorder.SessionOf] resolves
+// it, or nil when that is the recorder's own. It is what a record
+// written after a child's run ended, by a job the child started, is
+// filed with, even while a later run of the child is being written:
+// that run's writer knows only the calls pending when it was seeded,
+// and the job's call was answered before. The writer knows every call
+// on the session's path and the nested calls their tools made, which
+// is all callOn asks, and is dropped after the write: the store keeps
+// the leaf, and a later run of the child seeds a writer of its own
+// from it. The caller holds r.mu, so no live writer of the session
+// appends meanwhile.
 func (r *Recorder) reopen(ctx context.Context) (*writer, error) {
-	return r.reopenID(ctx, SessionIDFromContext(ctx))
+	id := r.sessionOf(ctx)
+	if id == r.root.id {
+		return nil, nil
+	}
+	return r.reopenID(ctx, id)
+}
+
+// SessionOf returns the ID of the session a record made with ctx is
+// written to, the one [Recorder.Annotate], [Recorder.RecordFunc] and
+// [Recorder.Env] write: the session of the run on ctx while the
+// recorder writes it, a child's or its own; after a child run has
+// ended, that child's session, which the recorder remembers for the
+// run; else the child session [ChildContext] put on ctx when it is one
+// of this recorder's; else the recorder's own. It is what a layer that
+// keys its own state by session, a memory manifest for one, reads
+// inside a hook or a tool of a child built with agent.WithObserver
+// alone, which [SessionIDFromContext] says nothing about.
+func (r *Recorder) SessionOf(ctx context.Context) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sessionOf(ctx)
+}
+
+// sessionOf is [Recorder.SessionOf] with r.mu held.
+func (r *Recorder) sessionOf(ctx context.Context) string {
+	runID := agentturn.RunIDFromContext(ctx)
+	if w, ok := r.runs[runID]; ok {
+		return w.id
+	}
+	if id, ok := r.ended[runID]; ok {
+		return id
+	}
+	if id := SessionIDFromContext(ctx); r.childIDs[id] {
+		return id
+	}
+	return r.root.id
 }
 
 // reopenID is reopen for the child session id. The writer knows the
@@ -2222,11 +2271,14 @@ func (w *writer) callOn(ctx context.Context) string {
 //
 // A record written from agentturn.RunContext after the run it names
 // has ended, by a background job that outlived it, finds no run being
-// written. It is filed at the leaf of the child session the context
-// names, when [Recorder.ChildContext] named one of this recorder's
-// children there, and of the recorder's own session otherwise, after
-// whatever that session holds by then, a later run's entries included;
-// its call_id names the job's call when that session holds it. A job
+// written. It is filed at the leaf of the session [Recorder.SessionOf]
+// names for the context: a child's when the run was a child's, which
+// the recorder remembers for the run whether or not
+// [Recorder.ChildContext] named the session on the context, else the
+// one [SessionIDFromContext] names when that is one of this recorder's
+// children, and the recorder's own session otherwise, after whatever
+// that session holds by then, a later run's entries included; its
+// call_id names the job's call when that session holds it. A job
 // in a child names its call with agenttool.WithCall(rc, call): the
 // child's run context carries the parent's call, which the child's
 // session does not hold, so a record without it names no call.
@@ -2448,7 +2500,11 @@ func ContextWithSessionID(ctx context.Context, sessionID string) context.Context
 // attributes its writes to a session reads, beside
 // agentturn.RunIDFromContext: inside a child run it names the child's
 // session, which the recorder creates and the host never otherwise
-// sees.
+// sees. It knows only what was put on the context: for a child built
+// without [Recorder.ChildContext] it is "", while the recorder writes
+// that child's session all the same. [Recorder.SessionOf] is the
+// complete answer, the session a record made with the context goes
+// to, whichever way the child was built.
 func SessionIDFromContext(ctx context.Context) string {
 	id, _ := ctx.Value(sessionIDKey{}).(string)
 	return id
@@ -2611,12 +2667,20 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 		return
 	}
 	if err := w.handle(ctx, ev); err != nil {
-		delete(r.runs, runID(ev))
+		r.release(runID(ev), w)
 		return
 	}
 	if _, end := ev.(*agentturn.RunEnd); end && w.detached {
-		delete(r.runs, runID(ev))
+		r.release(runID(ev), w)
 	}
+}
+
+// release drops the writer of the child run runID and remembers which
+// session the run was written to, for [Recorder.SessionOf] and for a
+// record made with the run's context after its end.
+func (r *Recorder) release(runID string, w *writer) {
+	delete(r.runs, runID)
+	r.ended[runID] = w.id
 }
 
 // Fold records a fold of the compact transform; register it with
@@ -4261,7 +4325,7 @@ func (w *writer) child(ctx context.Context, callID string, info agent.ChildInfo)
 		if running && cw.run != "" {
 			cw.detached = true
 		} else {
-			delete(r.runs, info.RunID)
+			r.release(info.RunID, cw)
 		}
 		return w.link(ctx, cw.id, callID)
 	}
