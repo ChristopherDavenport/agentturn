@@ -462,13 +462,16 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 			return out
 		}
 		prev := agent.Config()
+		// The receiver inherits what the sender's configuration holds
+		// before the run's hook is built, so the hook's fallback
+		// elicitor is the inherited one.
+		if next.ToolRecorder == nil {
+			next.ToolRecorder = prev.ToolRecorder
+		}
+		if next.ToolElicitor == nil {
+			next.ToolElicitor = prev.ToolElicitor
+		}
 		cfg := e.runConfig(next, caller)
-		if cfg.ToolRecorder == nil {
-			cfg.ToolRecorder = prev.ToolRecorder
-		}
-		if cfg.ToolElicitor == nil {
-			cfg.ToolElicitor = prev.ToolElicitor
-		}
 		if err = agent.SetConfig(cfg); err == nil {
 			guarded = cfg.OutputGuard != nil
 			end, err = agent.Continue(agentturn.ContextWithTrigger(runCtx, agentturn.Trigger{Kind: "handoff", Ref: prev.Name}))
@@ -518,10 +521,12 @@ func terminatingText(items openresponses.Items, results []*agentturn.ToolEnd) (s
 }
 
 // persist stores the conversation after a run: everything the run
-// appended. A deferred call stays unanswered on purpose, since the
-// caller answers it on the next message; after an abort or a failure
-// the calls that will never be answered are dropped so the next message
-// is a valid input.
+// appended. A call deferred to the caller stays unanswered on purpose,
+// since the caller answers it on the next message; a held call to one
+// of the agent's own tools was answered within the run, by the
+// elicitor or a refusal, so none is left pending. After an abort or a
+// failure the calls that will never be answered are dropped so the
+// next message is a valid input.
 func (e *Executor) persist(ctx context.Context, contextID string, transcript agentturn.Transcript, out outcome) error {
 	next := append(transcript, out.items...)
 	switch out.end.Reason {
@@ -607,30 +612,49 @@ func (e *Executor) checkDeclared(ctx context.Context, declared []*openresponses.
 // may hold a name a message declared. A nested call to a caller-owned
 // tool, one a tool made with agentturn.Invoke, is blocked, since the
 // caller can answer only the calls the model made.
+//
+// The caller answers only calls to the tools it owns. A call to one of
+// cfg's own tools that cfg's hook defers is a question for the serving
+// side, and is put to cfg.ToolElicitor with agentturn.Ask, as the loop
+// puts a nested call the hook deferred: the person's accept runs the
+// call and their decline refuses it, both by "human", and without an
+// elicitor, or with no answer, the call is refused with a reason that
+// says it cannot be handed to the caller. The hook therefore never
+// returns Defer for a tool of cfg's own, so no such call is pending
+// when the run ends, and the caller is never shown one (issue #209). A
+// nested call to one of cfg's own tools that the hook defers is left
+// to the loop, which asks the same elicitor and refuses the call the
+// same way without one. The elicitor is read from the hook's context,
+// where the loop puts the running configuration's, so one inherited
+// across a handoff is seen; cfg's own is the fallback.
 func (e *Executor) runConfig(cfg agentturn.Config, caller []*openresponses.FunctionTool) agentturn.Config {
-	if len(caller) == 0 {
+	if len(caller) == 0 && cfg.BeforeToolCall == nil {
+		// No caller-owned tool to defer to, and no hook to hold a
+		// call of the agent's own.
 		return cfg
 	}
-	stubs := make([]agenttool.Tool, 0, len(caller))
-	for _, ft := range caller {
-		stubs = append(stubs, &callerTool{ft: ft})
-	}
-	local, provider := cfg.Tools, cfg.ToolProvider
-	cfg.Tools = nil
-	cfg.ToolProvider = func(ctx context.Context) []agenttool.Tool {
-		base := local
-		if provider != nil {
-			base = provider(ctx)
+	if len(caller) > 0 {
+		stubs := make([]agenttool.Tool, 0, len(caller))
+		for _, ft := range caller {
+			stubs = append(stubs, &callerTool{ft: ft})
 		}
-		out := slices.Clip(base)
-		for _, t := range stubs {
-			if _, ok := agenttool.Set(base).Lookup(t.Name()); !ok {
-				out = append(out, t)
+		local, provider := cfg.Tools, cfg.ToolProvider
+		cfg.Tools = nil
+		cfg.ToolProvider = func(ctx context.Context) []agenttool.Tool {
+			base := local
+			if provider != nil {
+				base = provider(ctx)
 			}
+			out := slices.Clip(base)
+			for _, t := range stubs {
+				if _, ok := agenttool.Set(base).Lookup(t.Name()); !ok {
+					out = append(out, t)
+				}
+			}
+			return out
 		}
-		return out
 	}
-	before := cfg.BeforeToolCall
+	before, elicitor := cfg.BeforeToolCall, cfg.ToolElicitor
 	cfg.BeforeToolCall = func(ctx context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
 		var decision *agentturn.ToolDecision
 		if before != nil {
@@ -640,13 +664,19 @@ func (e *Executor) runConfig(cfg agentturn.Config, caller []*openresponses.Funct
 				return nil, err
 			}
 		}
-		if _, ok := info.Tool.(*callerTool); !ok || (decision != nil && decision.Action == agentturn.Block) {
+		if _, ok := info.Tool.(*callerTool); !ok {
+			if decision == nil || decision.Action != agentturn.Defer || info.Parent != "" {
+				return decision, nil
+			}
+			return askHeld(ctx, info, decision, elicitor), nil
+		}
+		if decision != nil && decision.Action == agentturn.Block {
 			return decision, nil
 		}
 		if decision == nil {
 			decision = &agentturn.ToolDecision{}
 		}
-		if nested(ctx, info.Call) {
+		if info.Parent != "" {
 			decision.Action = agentturn.Block
 			decision.Reason = fmt.Sprintf("tool %q is owned by the caller, which answers only the calls the model makes", info.Call.Name)
 			return decision, nil
@@ -655,6 +685,32 @@ func (e *Executor) runConfig(cfg agentturn.Config, caller []*openresponses.Funct
 		return decision, nil
 	}
 	return cfg
+}
+
+// askHeld puts a call to one of the agent's own tools that its hook
+// deferred to the elicitor on ctx, or to fallback when ctx carries
+// none, and returns the decision the answer makes. With no elicitor,
+// or no answer, the deferral becomes a Block that says why: the call
+// is the agent's own and cannot be handed to the caller.
+func askHeld(ctx context.Context, info agentturn.ToolCallInfo, decision *agentturn.ToolDecision, fallback agenttool.Elicitor) *agentturn.ToolDecision {
+	if _, ok := agenttool.ElicitorFrom(ctx); !ok && fallback != nil {
+		ctx = agenttool.ContextWithElicitor(ctx, fallback)
+	}
+	args := info.Args
+	if decision.Args != nil {
+		args = decision.Args
+	}
+	if d, ok := agentturn.Ask(ctx, agentturn.AskedCall{Parent: info.Parent, CallID: info.Call.CallID, Name: info.Call.Name, Args: args, Decision: decision}); ok {
+		return d
+	}
+	reason := decision.Reason
+	if reason == "" {
+		reason = "call blocked"
+	}
+	refused := *decision
+	refused.Action = agentturn.Block
+	refused.Reason = "a call to the agent's own tool cannot be handed to the caller: " + reason
+	return &refused
 }
 
 // callerTool advertises a tool the caller executes. The hook runConfig
@@ -669,22 +725,6 @@ func (c *callerTool) Strict() bool                { return c.ft.Strict != nil &&
 
 func (c *callerTool) Execute(context.Context, agenttool.Call) (agenttool.Result, error) {
 	return agenttool.Result{}, fmt.Errorf("tool %q is owned by the caller and cannot run here", c.ft.Name)
-}
-
-// nested reports whether call is a nested one, made by a tool with
-// agentturn.Invoke: the hook's context holds the conversation that
-// produced the batch, and a nested call is not in it.
-func nested(ctx context.Context, call *openresponses.FunctionCall) bool {
-	t, ok := agentturn.TranscriptFromContext(ctx)
-	if !ok {
-		return false
-	}
-	for _, item := range t {
-		if fc, ok := item.(*openresponses.FunctionCall); ok && fc.CallID == call.CallID {
-			return false
-		}
-	}
-	return true
 }
 
 // answeredCalls returns the IDs of the calls in items that have an
