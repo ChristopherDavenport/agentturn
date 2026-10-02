@@ -1,4 +1,10 @@
 GO ?= go
+# front/acp requires Go 1.27 and every other module 1.25. auto has the
+# go command fetch the toolchain a module's go.mod names when the one
+# running is older, so a 1.25 job builds the rest at 1.25 and front/acp
+# at 1.27 rather than refusing it. It overrides the environment because
+# actions/setup-go sets GOTOOLCHAIN=local for every later step.
+export GOTOOLCHAIN := auto
 STATICCHECK ?= $(GO) run honnef.co/go/tools/cmd/staticcheck@latest
 GOVULNCHECK ?= $(GO) run golang.org/x/vuln/cmd/govulncheck@latest
 # Nested modules with their own go.mod, so their dependencies stay out of

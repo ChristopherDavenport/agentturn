@@ -8,12 +8,6 @@ on:
 permissions:
   contents: read
 
-# front/acp requires Go 1.27 and every other module 1.25. With auto, a
-# job on an older Go builds that module with the toolchain its go.mod
-# names, rather than refusing it, and the rest at the job's version.
-env:
-  GOTOOLCHAIN: auto
-
 jobs:
   test:
     name: Test (Go ${{ matrix.go }})
