@@ -1313,6 +1313,57 @@ func TestOriginReadErrors(t *testing.T) {
 	}
 }
 
+// looping is a store that answers every read of one session with
+// another, so the chain of forks above a fork never reaches a session
+// with no parent.
+type looping struct {
+	*agentsession.MemoryStore
+	id string
+	as *agentsession.Session
+}
+
+func (l looping) Read(ctx context.Context, id string) (*agentsession.Session, error) {
+	if id == l.id {
+		return l.as, nil
+	}
+	return l.MemoryStore.Read(ctx, id)
+}
+
+// TestOriginChainThatDoesNotEnd pins the mapping of
+// agentsession.ErrOriginChain: Pending with the origins returns it,
+// where a recorder seeding a fork takes it as no dispatch found and
+// Start opens the fork.
+func TestOriginChainThatDoesNotEnd(t *testing.T) {
+	ctx := context.Background()
+	mem := agentsession.NewMemoryStore()
+	origin, err := mem.Create(ctx, agentsession.Header{Records: agentsession.AllRecords})
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := &openresponses.FunctionCall{CallID: "call_1", Name: "charge", Arguments: `{}`}
+	target, err := mem.Append(ctx, origin.ID(), &agentsession.ItemEntry{Item: call})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, first, err := Start(ctx, mem, agentsession.Header{Base: target, ParentSession: origin.ID()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The origin reads as the first fork, which names the origin as its
+	// parent: the walk goes round.
+	store := looping{MemoryStore: mem, id: origin.ID(), as: first}
+	rec, fork, err := Start(ctx, store, agentsession.Header{Base: target, ParentSession: origin.ID()})
+	if err != nil {
+		t.Fatalf("start on a base whose origins do not end: %v", err)
+	}
+	if _, err := Pending(fork, rec.ReadOptions()...); !errors.Is(err, agentsession.ErrOriginChain) {
+		t.Errorf("pending with the origins: err = %v, want ErrOriginChain", err)
+	}
+	if p, err := Pending(fork); err != nil || len(p) != 1 || p[0].Reason != agentturn.PendingUnknown {
+		t.Errorf("pending alone = %+v, %v", p, err)
+	}
+}
+
 // deadlined is a store whose Read answers with the context's error once
 // the context is done, as a store on a slow disk or a network does.
 type deadlined struct{ *agentsession.MemoryStore }

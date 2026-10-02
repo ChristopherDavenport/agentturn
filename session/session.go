@@ -1315,7 +1315,8 @@ func WithContext(ctx context.Context) ReadOption {
 // is read. A keyed call dispatched there runs again under its key, and
 // one that completed there is answered with its output. An origin r
 // does not hold leaves the call as the fork alone reads it; an error
-// reading one is returned.
+// reading one is returned, and so is [agentsession.ErrOriginChain] for
+// a chain of forks that does not end.
 func WithOrigins(r agentsession.Reader) ReadOption {
 	return ReadOption{apply: func(o *origins) { o.r = r }}
 }
@@ -1333,62 +1334,34 @@ func (r *Recorder) ReadOptions() []ReadOption {
 	return nil
 }
 
-// origins reads the sessions a fork was made from, each once. lenient
-// takes an origin the reader fails to read as one it does not hold,
-// for a recorder seeding itself, which must not fail to open a session
-// over what it reads beside it.
+// origins reads the sessions a fork was made from. lenient takes an
+// origin the reader fails to read, or a chain of forks that does not
+// end, as no dispatch found, for a recorder seeding itself, which must
+// not fail to open a session over what it reads beside it.
 type origins struct {
 	ctx     context.Context
 	r       agentsession.Reader
 	lenient bool
-	read    map[string]*agentsession.Session
-}
-
-// maxOriginDepth bounds the walk up a chain of forks.
-const maxOriginDepth = 64
-
-// session returns the session id through the reader, nil when there is
-// no reader or it holds no such session.
-func (o *origins) session(id string) (*agentsession.Session, error) {
-	if o.r == nil || id == "" {
-		return nil, nil
-	}
-	if s, ok := o.read[id]; ok {
-		return s, nil
-	}
-	s, err := o.r.Read(o.ctx, id)
-	if errors.Is(err, agentsession.ErrNoSession) || err != nil && o.lenient {
-		s, err = nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("session: read origin %s: %w", id, err)
-	}
-	if o.read == nil {
-		o.read = map[string]*agentsession.Session{}
-	}
-	o.read[id] = s
-	return s, nil
 }
 
 // dispatchOff returns the last dispatch of the call held by the entry
 // callEntry that s holds off its path, which a rebase above it leaves,
 // and the session holding it: s, or for a call in a fork's prefix with
-// none in s, the session the fork was made from, and so up the chain.
-// It returns nil when none of them holds one.
+// none in s, the session the fork was made from, and so up the chain,
+// as [agentsession.OriginDispatches] walks it. It returns nil when none
+// of them holds one.
 func (o *origins) dispatchOff(s *agentsession.Session, callEntry string) (*agentsession.Session, *agentsession.DispatchEntry, error) {
-	for depth := 0; s != nil && depth < maxOriginDepth; depth++ {
-		if ds := s.Dispatches(callEntry); len(ds) > 0 {
-			return s, ds[len(ds)-1], nil
+	at, ds, err := agentsession.OriginDispatches(o.ctx, o.r, s, callEntry)
+	if err != nil {
+		if o.lenient {
+			return nil, nil, nil
 		}
-		if !s.Prefix(callEntry) {
-			break
-		}
-		var err error
-		if s, err = o.session(s.Header().ParentSession); err != nil {
-			return nil, nil, err
-		}
+		return nil, nil, fmt.Errorf("session: %w", err)
 	}
-	return nil, nil, nil
+	if len(ds) == 0 {
+		return nil, nil, nil
+	}
+	return at, ds[len(ds)-1], nil
 }
 
 // pendingCalls is [Pending], with the entry each call's Ran was read
