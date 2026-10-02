@@ -320,7 +320,10 @@ func (*ItemEnd) EventType() string { return EventItemEnd }
 // output items have all been delivered with item_end. A response that
 // failed is delivered here too, before the run ends with the error, so
 // a recorder can write it, and so is one a [Config.OutputGuard]
-// withheld a message of, with Withheld set.
+// withheld a message of, with Withheld set. The response's function
+// calls are the items the transcript holds, the same values item_end
+// delivered, so a consumer that edits one edits the transcript: treat
+// every item an event carries as read-only, as the transcript is.
 type ResponseEnd struct {
 	RunID    string
 	Turn     int
@@ -446,7 +449,8 @@ type ToolEnd struct {
 func (*ToolEnd) EventType() string { return EventToolEnd }
 
 // TurnEnd closes a turn with the folded response, usage included, and
-// the tool results in the model's order.
+// the tool results in the model's order. The response is the one
+// [ResponseEnd] carried, its items shared with the transcript.
 type TurnEnd struct {
 	RunID       string
 	Turn        int
@@ -707,7 +711,13 @@ const (
 type Queued struct {
 	RunID string
 	Item  openresponses.Item
-	Mode  QueueMode
+	// Mode is the queue the item joined. An item handed in with
+	// [Agent.Deliver] joins the steer queue and is reported with
+	// QueueSteer; the turn that drains it tells it apart as
+	// [InputDeliver] in [TurnStartInfo.Inputs] and [TurnStart.Arrived],
+	// since how an item arrived is a fact about the turn, and the queue
+	// it waited in a fact about the agent.
+	Mode QueueMode
 	// Hidden is set for an item the caller marked with [Hidden].
 	Hidden bool
 	// Trigger is what brought the item in, from the context given to
