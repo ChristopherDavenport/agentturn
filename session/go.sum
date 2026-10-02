@@ -4,3 +4,5 @@ github.com/ChristopherDavenport/agenttool v0.0.14 h1:GAhNs7ZRyjBOthSf9t5e0Jn6yC+
 github.com/ChristopherDavenport/agenttool v0.0.14/go.mod h1:7XGX4PGUU01SxN/H94FYTZ9QhKyM8YNBYyJW1tBYY30=
 github.com/ChristopherDavenport/openresponses v0.0.12 h1:Cg4gYqf1ZMVQhYRmD94f068OLUQEv4rIK/9bl8EBUA4=
 github.com/ChristopherDavenport/openresponses v0.0.12/go.mod h1:oZT6GCySXw3+vL5LzrJrRI5qagBumqvwDZdp6Kr++a8=
+github.com/ChristopherDavenport/openresponses v0.0.13 h1:eXyvrTKN6JgmLjzQ5dUsiM8re2oN9fVjDg6SSwzo4vs=
+github.com/ChristopherDavenport/openresponses v0.0.13/go.mod h1:oZT6GCySXw3+vL5LzrJrRI5qagBumqvwDZdp6Kr++a8=
