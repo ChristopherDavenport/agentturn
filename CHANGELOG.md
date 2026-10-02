@@ -188,6 +188,21 @@ versions may break the API.
   between runs (#96). `front/a2a.WithRecorderFor`'s doc says a host
   whose hooks record verdicts of their own puts its recorder on the
   run's context beside the session ID (agentkit#74).
+- **The loop asks the executor which call a call follows.** The loop
+  kept a copy of the grouping `agenttool.Executor` runs a batch in, to
+  have each call's dispatch wait for the one before it in its chain,
+  and a test that pinned the copy; it now reads `Executor.Chains` with
+  the executor that runs the batch, so the two cannot drift
+  (agenttool#66).
+- **`session` reads a call's origin dispatches through
+  `agentsession.OriginDispatches`.** The walk up a fork's origins, its
+  depth bound and its cache of the sessions read are gone. A chain of
+  forks that does not end is now an error from `Pending`,
+  `AgentOptions` and `ReplayAnswers` with the origins, wrapping
+  `agentsession.ErrOriginChain`, where it was silently taken as no
+  dispatch found after 64; a recorder seeding itself still takes it,
+  and an origin it cannot read, as none found. Each call in a fork's
+  prefix reads its origins again rather than sharing one read.
 
 ## v0.0.15 - 2026-10-01
 
