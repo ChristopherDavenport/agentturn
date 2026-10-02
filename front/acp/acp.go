@@ -7,8 +7,11 @@ import (
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
+	"github.com/ChristopherDavenport/openresponses"
 	acpgo "github.com/ironpark/acp-go"
 	"github.com/ironpark/acp-go/acp1"
+	"github.com/ironpark/acp-go/acp2"
+	"github.com/ironpark/acp-go/router"
 )
 
 // Session describes the ACP session an agent is built for.
@@ -21,23 +24,51 @@ type Session struct {
 }
 
 // NewSessionFunc builds the agent of one ACP session. The agent is used
-// for that session alone, and only by the server, one prompt at a time.
-// A host that records the session attaches its recorder here.
+// for that session alone, and only by the server. A host that records
+// the session attaches its recorder here.
 type NewSessionFunc func(ctx context.Context, s Session) (*agentturn.Agent, error)
 
-// ToolKindFunc names the ACP tool kind of a call, so a client can pick
-// an icon or a layout: one of the acp1.ToolKind constants, such as
-// acp1.ToolKindRead, acp1.ToolKindEdit or acp1.ToolKindExecute. tool is
-// nil when no tool of the agent's configuration has the name.
-type ToolKindFunc func(name string, tool agenttool.Tool) acp1.ToolKind
+// ToolKind is the ACP tool kind of a call, which a client uses to pick
+// an icon or a layout. The values are the protocol's, the same in v1 and
+// v2.
+type ToolKind string
 
-// Server serves agentturn agents over ACP v1. Its sessions live in
-// memory and are shared by every connection it serves.
+// Tool kinds.
+const (
+	ToolKindRead    ToolKind = "read"
+	ToolKindEdit    ToolKind = "edit"
+	ToolKindDelete  ToolKind = "delete"
+	ToolKindMove    ToolKind = "move"
+	ToolKindSearch  ToolKind = "search"
+	ToolKindExecute ToolKind = "execute"
+	ToolKindThink   ToolKind = "think"
+	ToolKindFetch   ToolKind = "fetch"
+	ToolKindOther   ToolKind = "other"
+)
+
+// ToolKindFunc names the kind of a call. tool is nil when no tool of the
+// agent's configuration has the name.
+type ToolKindFunc func(name string, tool agenttool.Tool) ToolKind
+
+// DefaultToolKind reports read for a tool annotated read-only and other
+// for everything else.
+func DefaultToolKind(_ string, tool agenttool.Tool) ToolKind {
+	if a, ok := tool.(agenttool.Annotated); ok && a.Annotations().ReadOnly {
+		return ToolKindRead
+	}
+	return ToolKindOther
+}
+
+// Server serves agentturn agents over ACP v1 and v2. Its sessions live
+// in memory and are shared by every connection of the same protocol
+// version it serves.
 type Server struct {
 	newSession NewSessionFunc
-	info       *acp1.Implementation
+	name       string
+	version    string
 	kind       ToolKindFunc
-	sessions   *acp1.SessionManager[*session]
+	v1         *acp1.SessionManager[*session]
+	v2         *acp2.SessionManager[*session]
 }
 
 // Option configures a [Server].
@@ -46,7 +77,7 @@ type Option func(*Server)
 // WithInfo names the agent to clients in the initialize response.
 func WithInfo(name, version string) Option {
 	return func(s *Server) {
-		s.info = &acp1.Implementation{Name: name, Version: version}
+		s.name, s.version = name, version
 	}
 }
 
@@ -59,22 +90,22 @@ func WithToolKind(fn ToolKindFunc) Option {
 	}
 }
 
-// DefaultToolKind reports read for a tool annotated read-only and other
-// for everything else.
-func DefaultToolKind(_ string, tool agenttool.Tool) acp1.ToolKind {
-	if a, ok := tool.(agenttool.Annotated); ok && a.Annotations().ReadOnly {
-		return acp1.ToolKindRead
-	}
-	return acp1.ToolKindOther
-}
-
 // New returns a server whose sessions are built by newSession.
 func New(newSession NewSessionFunc, opts ...Option) *Server {
-	s := &Server{newSession: newSession, kind: DefaultToolKind}
+	s := &Server{newSession: newSession, name: "agentturn", kind: DefaultToolKind}
 	for _, opt := range opts {
 		opt(s)
 	}
-	s.sessions = acp1.NewSessionManager(acp1.NewMemoryStore[*session](), s.create)
+	s.v1 = acp1.NewSessionManager(acp1.NewMemoryStore[*session](), func(ctx context.Context, params *acp1.NewSessionRequest) (acp1.SessionID, *session, error) {
+		id := acp1.GenerateSessionID()
+		sess, err := s.create(ctx, string(id), params.Cwd)
+		return id, sess, err
+	})
+	s.v2 = acp2.NewSessionManager(acp2.NewMemoryStore[*session](), func(ctx context.Context, params *acp2.NewSessionRequest) (acp2.SessionID, *session, error) {
+		id := acp2.GenerateSessionID()
+		sess, err := s.create(ctx, string(id), string(params.Cwd))
+		return id, sess, err
+	})
 	return s
 }
 
@@ -82,37 +113,44 @@ func New(newSession NewSessionFunc, opts ...Option) *Server {
 // returned no agent and no error.
 var ErrNoAgent = errors.New("front/acp: the session function returned no agent")
 
-func (s *Server) create(ctx context.Context, params *acp1.NewSessionRequest) (acp1.SessionID, *session, error) {
-	id := acp1.GenerateSessionID()
-	a, err := s.newSession(ctx, Session{ID: string(id), Cwd: params.Cwd})
+func (s *Server) create(ctx context.Context, id, cwd string) (*session, error) {
+	a, err := s.newSession(ctx, Session{ID: id, Cwd: cwd})
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	if a == nil {
-		return "", nil, ErrNoAgent
+		return nil, ErrNoAgent
 	}
-	return id, &session{agent: a}, nil
+	return &session{agent: a, cwd: cwd}, nil
 }
 
-// Agent returns the ACP agent of one connection, the constructor
-// acp1.NewAgentSideConnection takes.
-func (s *Server) Agent(c *acp1.AgentSideConnection) acp1.Agent {
-	return &connection{SessionManager: s.sessions, server: s, client: c}
-}
-
-// Serve runs one ACP connection over transport until it ends.
+// Serve runs one ACP connection over transport until it ends, speaking
+// whichever of v1 and v2 the client's initialize asks for.
 func (s *Server) Serve(ctx context.Context, transport acpgo.Transport, opts ...acpgo.Option) error {
-	return acp1.NewAgentSideConnection(s.Agent, transport, opts...).Start(ctx)
+	return router.New(opts...).WithV1(s.AgentV1).WithV2(s.AgentV2).Serve(ctx, transport)
 }
 
-// session is the state of one ACP session: its agent and the tool calls
+// session is the state of one ACP session: its agent, the tool calls
 // already reported to the client, so a call reported pending and later
-// approved is updated rather than announced twice.
+// approved is updated rather than announced twice, and, in v2, the
+// prompts waiting for their message to be inserted.
 type session struct {
 	agent *agentturn.Agent
+	cwd   string
 
 	mu       sync.Mutex
 	reported map[string]bool
+	waiting  map[openresponses.Item]*waiter
+
+	// turnMu makes joining a v2 turn and steering into it one step, and
+	// deciding that the turn may end another, so a prompt cannot join a
+	// turn after it has looked at the queue for the last time.
+	turnMu sync.Mutex
+}
+
+// SessionInfo describes the session in a v2 session/list.
+func (s *session) SessionInfo() acp2.SessionInfo {
+	return acp2.SessionInfo{Cwd: acp2.AbsolutePath(s.cwd)}
 }
 
 // seen says whether the call has been reported.
@@ -134,32 +172,29 @@ func (s *session) report(callID string) (already bool) {
 	return already
 }
 
-// connection is the agent side of one ACP connection. The embedded
-// manager answers session/new, session/cancel, session/resume,
-// session/close and session/delete.
-type connection struct {
-	*acp1.SessionManager[*session]
-	server *Server
-	client *acp1.AgentSideConnection
+// waiter is a v2 prompt waiting for its message to enter the
+// transcript.
+type waiter struct {
+	id      acp2.MessageID
+	content []acp2.ContentBlock
+	done    chan struct{}
 }
 
-func (c *connection) Initialize(context.Context, *acp1.InitializeRequest) (*acp1.InitializeResponse, error) {
-	caps := acp1.CapabilitiesOf(c)
-	caps.PromptCapabilities = &acp1.PromptCapabilities{Image: new(true), EmbeddedContext: new(true)}
-	return &acp1.InitializeResponse{
-		ProtocolVersion:   acp1.ProtocolVersion,
-		AgentCapabilities: caps,
-		AgentInfo:         c.server.info,
-	}, nil
-}
-
-func (c *connection) Prompt(ctx context.Context, params *acp1.PromptRequest) (*acp1.PromptResponse, error) {
-	msg, err := message(params.Prompt)
-	if err != nil {
-		return nil, acpgo.InvalidParams(err.Error())
+// expect registers w to be released when item is inserted.
+func (s *session) expect(item openresponses.Item, w *waiter) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.waiting == nil {
+		s.waiting = map[openresponses.Item]*waiter{}
 	}
-	return c.RunTurnResponse(ctx, params.SessionID, func(ctx context.Context, s *session) (*acp1.PromptResponse, error) {
-		t := newTurn(c.server, s, acp1.NewSessionStream(c.client, params.SessionID))
-		return t.run(ctx, msg)
-	})
+	s.waiting[item] = w
+}
+
+// take returns and forgets the waiter for item, nil when there is none.
+func (s *session) take(item openresponses.Item) *waiter {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w := s.waiting[item]
+	delete(s.waiting, item)
+	return w
 }

@@ -2,27 +2,18 @@ package acp
 
 import (
 	"context"
-	"encoding/json/jsontext"
 	"errors"
 	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/openresponses"
-	"github.com/ironpark/acp-go/acp1"
 )
-
-// permissionOptions are the choices every request offers. There is no
-// "always": the front keeps no rules, and a host that wants them puts
-// a policy in BeforeToolCall.
-var permissionOptions = []acp1.PermissionOption{
-	acp1.NewPermissionOption(acp1.PermissionOptionKindAllowOnce, "Allow"),
-	acp1.NewPermissionOption(acp1.PermissionOptionKindRejectOnce, "Reject"),
-}
 
 // ask puts each deferred call to the client and returns the answers to
 // resume with. A cancelled turn returns its context's error, leaving the
-// calls pending for the next prompt to close.
+// calls pending for the next prompt to close and marking them cancelled
+// on the client.
 func (t *turn) ask(ctx context.Context, pending []agentturn.PendingCall) ([]agentturn.Answer, error) {
 	answers := make([]agentturn.Answer, 0, len(pending))
 	for _, p := range pending {
@@ -35,7 +26,7 @@ func (t *turn) ask(ctx context.Context, pending []agentturn.PendingCall) ([]agen
 		}
 		allowed, err := t.permit(ctx, p.Call.CallID, p.Call.Name, "", args, reason)
 		if err != nil {
-			t.fail(ctx, pending, NotRunOutput)
+			t.abandon(ctx, pending)
 			return nil, err
 		}
 		if allowed {
@@ -43,42 +34,36 @@ func (t *turn) ask(ctx context.Context, pending []agentturn.PendingCall) ([]agen
 			continue
 		}
 		answers = append(answers, agentturn.Refuse(openresponses.NewFunctionCallOutput(p.Call.CallID, RefusedOutput)).WithBy("human"))
-		if err := t.stream.FailToolCall(ctx, acp1.ToolCallID(p.Call.CallID), acp1.WithToolContent(acp1.ToolText(RefusedOutput))); err != nil {
+		if err := t.sink.update(ctx, p.Call.CallID, "", statusFailed, RefusedOutput, nil); err != nil {
 			return nil, err
 		}
 	}
 	return answers, nil
 }
 
-// fail marks the calls failed with text, for a turn that ends before
-// they were answered. It sends on a context the turn's cancellation does
-// not reach, so the client does not keep them pending.
-func (t *turn) fail(ctx context.Context, pending []agentturn.PendingCall, text string) {
+// abandon marks the calls cancelled as not run, for a turn that ends
+// before they were answered. It sends on a context the turn's
+// cancellation does not reach, so the client does not keep them
+// pending.
+func (t *turn) abandon(ctx context.Context, pending []agentturn.PendingCall) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	for _, p := range pending {
-		_ = t.stream.FailToolCall(ctx, acp1.ToolCallID(p.Call.CallID), acp1.WithToolContent(acp1.ToolText(text)))
+		_ = t.sink.update(ctx, p.Call.CallID, "", statusCancelled, NotRunOutput, nil)
 	}
 }
 
-// permit sends one session/request_permission about a call and reports
-// whether the user allowed it. A call the client has not seen is
-// announced first, so the request names a tool call it can show.
+// permit asks the client whether one call may run. A call the client
+// has not seen is announced first, so the request names a tool call it
+// can show.
 func (t *turn) permit(ctx context.Context, callID, name, parent string, args []byte, reason string) (bool, error) {
+	tool := t.tools[name]
 	if !t.sess.seen(callID) {
 		if err := t.propose(ctx, callID, name, parent, args); err != nil {
 			return false, err
 		}
 	}
-	update := acp1.ToolCallUpdate{
-		ToolCallID: acp1.ToolCallID(callID),
-		Status:     new(acp1.ToolCallStatusPending),
-		RawInput:   jsontext.Value(args),
-	}
-	if reason != "" {
-		update.Content = []acp1.ToolCallContent{acp1.ToolText(reason)}
-	}
-	_, allowed, err := t.on(parent).RequestPermission(ctx, update, permissionOptions...)
+	allowed, err := t.sink.permit(ctx, callID, parent, title(name, tool), t.server.kind(name, tool), args, reason)
 	if err != nil {
 		return false, err
 	}
@@ -89,8 +74,8 @@ func (t *turn) permit(ctx context.Context, callID, name, parent string, args []b
 }
 
 // ErrNoQuestion is returned by [Elicitor] for a question it cannot put
-// to the client: one asked outside a prompt turn of this front, or one
-// that is not about a call, such as an MCP server's form.
+// to the client: one asked outside a turn of this front, or one that is
+// not about a call, such as an MCP server's form.
 var ErrNoQuestion = errors.New("front/acp: the client cannot be asked this question")
 
 // Elicitor is an agenttool.Elicitor for a configuration served by this

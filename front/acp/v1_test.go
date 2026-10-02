@@ -36,7 +36,7 @@ func open(t *testing.T, cfg agentturn.Config, client *acp1test.Client) *acp1.Cli
 	srv := New(func(context.Context, Session) (*agentturn.Agent, error) {
 		return agentturn.New(cfg), nil
 	}, WithInfo("test", "v0"))
-	conn := acp1test.Connect(t, srv.Agent, client)
+	conn := acp1test.Connect(t, srv.AgentV1, client)
 	ctx := context.Background()
 	init, err := conn.Initialize(ctx, &acp1.InitializeRequest{})
 	if err != nil {
@@ -245,7 +245,7 @@ func TestCancelWhileAsking(t *testing.T) {
 	}
 }
 
-func TestMessage(t *testing.T) {
+func TestMessageV1(t *testing.T) {
 	text, err := acp1.NewEmbeddedResourceResource(acp1.TextResourceContents{URI: "file:///a.go", Text: "package a"})
 	if err != nil {
 		t.Fatal(err)
@@ -282,7 +282,7 @@ func TestMessage(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			msg, err := message(tc.in)
+			msg, err := messageV1(tc.in)
 			if tc.err {
 				if err == nil {
 					t.Fatalf("message = %+v, want an error", msg)
@@ -321,7 +321,8 @@ func TestStopReason(t *testing.T) {
 		{agentturn.RunEnd{Reason: agentturn.ReasonStopped, Cause: agentturn.StopTerminate}, acp1.StopReasonEndTurn},
 	}
 	for _, tc := range cases {
-		if got := stopReason(&tc.end); got != tc.want {
+		// v2 spells every one of these the same.
+		if got := acp1.StopReason(stopReason(&tc.end)); got != tc.want {
 			t.Errorf("%s/%s = %q, want %q", tc.end.Reason, tc.end.Cause, got, tc.want)
 		}
 	}
@@ -338,7 +339,7 @@ func TestSessionFunctionFails(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			conn := acp1test.Connect(t, New(tc.fn).Agent, &acp1test.Client{})
+			conn := acp1test.Connect(t, New(tc.fn).AgentV1, &acp1test.Client{})
 			ctx := context.Background()
 			if _, err := conn.Initialize(ctx, &acp1.InitializeRequest{}); err != nil {
 				t.Fatal(err)
@@ -353,13 +354,13 @@ func TestSessionFunctionFails(t *testing.T) {
 func TestDefaultToolKind(t *testing.T) {
 	var runs atomic.Int32
 	readOnly := look(&runs, agenttool.WithAnnotations(agenttool.Annotations{ReadOnly: true}))
-	if got := DefaultToolKind("look", readOnly); got != acp1.ToolKindRead {
+	if got := DefaultToolKind("look", readOnly); got != ToolKindRead {
 		t.Errorf("read-only kind = %q, want read", got)
 	}
-	if got := DefaultToolKind("look", look(&runs)); got != acp1.ToolKindOther {
+	if got := DefaultToolKind("look", look(&runs)); got != ToolKindOther {
 		t.Errorf("kind = %q, want other", got)
 	}
-	if got := DefaultToolKind("gone", nil); got != acp1.ToolKindOther {
+	if got := DefaultToolKind("gone", nil); got != ToolKindOther {
 		t.Errorf("unknown tool kind = %q, want other", got)
 	}
 }

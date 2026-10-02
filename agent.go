@@ -408,12 +408,14 @@ func (a *Agent) Prompt(ctx context.Context, items ...openresponses.Item) (*RunEn
 	return a.run(ctx, items, nil, false, false)
 }
 
-// Continue runs from the transcript as it stands, which must satisfy
-// [CanContinue], and returns as [Agent.Prompt] does.
+// Continue runs from the transcript as it stands, followed by any items
+// steered while the agent was idle or after the last run's final
+// drain, which the run takes before its first model call; together
+// they must satisfy [CanContinue]. It returns as [Agent.Prompt] does.
 func (a *Agent) Continue(ctx context.Context) (*RunEnd, error) {
 	a.mu.Lock()
 	pending := len(a.pending) > 0
-	ok := CanContinue(a.transcript)
+	ok := CanContinue(append(append(Transcript(nil), a.transcript...), unhideAll(queuedItems(a.steer))...))
 	a.mu.Unlock()
 	if pending {
 		return nil, ErrInputRequired

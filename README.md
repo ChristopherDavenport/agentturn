@@ -336,9 +336,11 @@ agent presents itself in every one of these.
 
 A front for a person rather than another agent needs no consume side.
 `front/acp` serves agents over the
-[Agent Client Protocol](https://agentclientprotocol.com) v1, so an
-editor such as Zed or an ACP terminal client can prompt one session at a
-time, watch its tool calls and answer its permission requests.
+[Agent Client Protocol](https://agentclientprotocol.com), v1 and the v2
+draft on one endpoint, so an editor such as Zed or an ACP terminal
+client can prompt a session, watch its tool calls and answer its
+permission requests. Under v2 a prompt sent while the agent works is
+steered into the running turn.
 
 ## Modules
 

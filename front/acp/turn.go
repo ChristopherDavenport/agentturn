@@ -2,17 +2,16 @@ package acp
 
 import (
 	"context"
-	"encoding/json/jsontext"
+	"fmt"
 	"sync"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/openresponses"
-	"github.com/ironpark/acp-go/acp1"
 )
 
-// MetaParent is the _meta key under which a nested call's tool_call and
-// tool_call_update carry the ID of the call whose tool made it.
+// MetaParent is the _meta key under which a nested call's tool call
+// updates carry the ID of the call whose tool made it.
 const MetaParent = "agentturn/parent"
 
 // RefusedOutput is the output a call the user rejected is answered
@@ -23,22 +22,53 @@ const RefusedOutput = "The user rejected this call; it did not run. Wait for the
 // answered with at the session's next prompt, when it did not run.
 const NotRunOutput = "Not run: the turn was cancelled before the user answered."
 
-// turn is one session/prompt: the run, the resumes its permission
-// requests lead to, and the updates they stream.
+// status is a tool call's status in the terms both protocol versions
+// share; v1 has no cancelled and reports failed.
+type status int
+
+const (
+	statusPending status = iota
+	statusRunning
+	statusCompleted
+	statusFailed
+	statusCancelled
+)
+
+// sink is what one protocol version does with the loop's events.
+type sink interface {
+	text(ctx context.Context, messageID, delta string) error
+	thought(ctx context.Context, messageID, delta string) error
+	propose(ctx context.Context, callID, parent, title string, kind ToolKind, args []byte) error
+	update(ctx context.Context, callID, parent string, st status, content string, args []byte) error
+	// permit asks whether a call may run and reports whether it may.
+	permit(ctx context.Context, callID, parent, title string, kind ToolKind, args []byte, reason string) (bool, error)
+	// inserted reports a waiting prompt's message entering the
+	// transcript, and releases its waiter.
+	inserted(ctx context.Context, w *waiter) error
+}
+
+// usage is a turn's usage summed over its responses.
+type usage struct {
+	counted                       bool
+	input, output, total, thought uint64
+	cached                        uint64
+}
+
+// turn is one ACP turn: the runs it drives, the permission requests they
+// lead to, and the updates they stream through its sink.
 type turn struct {
 	server *Server
 	sess   *session
-	stream *acp1.SessionStream
+	sink   sink
 	tools  map[string]agenttool.Tool
 
 	mu      sync.Mutex
 	reasons map[string]string // deferral reasons by call ID
-	usage   acp1.Usage
-	counted bool
+	usage   usage
 }
 
-func newTurn(server *Server, sess *session, stream *acp1.SessionStream) *turn {
-	t := &turn{server: server, sess: sess, stream: stream, tools: map[string]agenttool.Tool{}, reasons: map[string]string{}}
+func newTurn(server *Server, sess *session, out sink) *turn {
+	t := &turn{server: server, sess: sess, sink: out, tools: map[string]agenttool.Tool{}, reasons: map[string]string{}}
 	for _, tool := range sess.agent.Config().Tools {
 		t.tools[tool.Name()] = tool
 	}
@@ -47,15 +77,18 @@ func newTurn(server *Server, sess *session, stream *acp1.SessionStream) *turn {
 
 type turnKey struct{}
 
-// run prompts the session's agent with msg, asks the client about every
-// call the run defers and resumes until the run ends otherwise.
-func (t *turn) run(ctx context.Context, msg *openresponses.Message) (*acp1.PromptResponse, error) {
-	unsubscribe := t.sess.agent.Subscribe(t.observe)
-	defer unsubscribe()
-	ctx = context.WithValue(ctx, turnKey{}, t)
-
-	input := closePending(t.sess.agent.State().Pending)
-	end, err := t.sess.agent.Prompt(ctx, append(input, msg)...)
+// drive runs the agent once, with input as a prompt or, when there is
+// none, as a continuation of what is queued, and then asks the client
+// about every call the run defers and resumes, until the run ends
+// otherwise.
+func (t *turn) drive(ctx context.Context, input openresponses.Items) (*agentturn.RunEnd, error) {
+	var end *agentturn.RunEnd
+	var err error
+	if len(input) > 0 {
+		end, err = t.sess.agent.Prompt(ctx, input...)
+	} else {
+		end, err = t.sess.agent.Continue(ctx)
+	}
 	for err == nil && end.Reason == agentturn.ReasonInputRequired {
 		var answers []agentturn.Answer
 		answers, err = t.ask(ctx, end.Pending)
@@ -64,17 +97,7 @@ func (t *turn) run(ctx context.Context, msg *openresponses.Message) (*acp1.Promp
 		}
 		end, err = t.sess.agent.Resume(ctx, answers...)
 	}
-	if err != nil {
-		return nil, err
-	}
-	resp := &acp1.PromptResponse{StopReason: stopReason(end)}
-	t.mu.Lock()
-	if t.counted {
-		usage := t.usage
-		resp.Usage = &usage
-	}
-	t.mu.Unlock()
-	return resp, nil
+	return end, err
 }
 
 // closePending answers the calls an earlier, cancelled turn left
@@ -97,19 +120,20 @@ func closePending(pending []agentturn.PendingCall) openresponses.Items {
 	return items
 }
 
-func stopReason(end *agentturn.RunEnd) acp1.StopReason {
+// stopReason is the stop reason both protocol versions spell the same.
+func stopReason(end *agentturn.RunEnd) string {
 	switch end.Reason {
 	case agentturn.ReasonAborted:
-		return acp1.StopReasonCancelled
+		return "cancelled"
 	case agentturn.ReasonStopped:
 		switch end.Cause {
 		case agentturn.StopGuard:
-			return acp1.StopReasonRefusal
+			return "refusal"
 		case agentturn.StopMaxTurns:
-			return acp1.StopReasonMaxTurnRequests
+			return "max_turn_requests"
 		}
 	}
-	return acp1.StopReasonEndTurn
+	return "end_turn"
 }
 
 // observe turns the loop's events into session updates. It runs on the
@@ -119,22 +143,25 @@ func (t *turn) observe(ctx context.Context, ev agentturn.Event) error {
 	case *agentturn.ItemUpdate:
 		switch d := e.Stream.(type) {
 		case *openresponses.OutputTextDeltaEvent:
-			return t.stream.SendText(ctx, d.Delta)
+			return t.sink.text(ctx, messageID(e, d.ItemID, d.OutputIndex), d.Delta)
 		case *openresponses.ReasoningDeltaEvent:
-			return t.stream.SendThought(ctx, d.Delta)
+			return t.sink.thought(ctx, messageID(e, d.ItemID, d.OutputIndex), d.Delta)
 		case *openresponses.ReasoningSummaryTextDeltaEvent:
-			return t.stream.SendThought(ctx, d.Delta)
+			return t.sink.thought(ctx, messageID(e, d.ItemID, d.OutputIndex), d.Delta)
+		}
+	case *agentturn.ItemEnd:
+		if w := t.sess.take(e.Item); w != nil {
+			return t.sink.inserted(ctx, w)
 		}
 	case *agentturn.ResponseEnd:
 		t.count(e.Response)
 	case *agentturn.ToolStart:
 		return t.propose(ctx, e.CallID, e.Name, e.Parent, e.Args)
 	case *agentturn.ToolDispatch:
-		return t.on(e.Parent).UpdateToolCallStatus(ctx, acp1.ToolCallID(e.CallID), acp1.ToolCallStatusInProgress)
+		return t.sink.update(ctx, e.CallID, e.Parent, statusRunning, "", nil)
 	case *agentturn.ToolUpdate:
 		if text := e.Partial.Output.String(); text != "" {
-			return t.stream.UpdateToolCallStatus(ctx, acp1.ToolCallID(e.CallID), acp1.ToolCallStatusInProgress,
-				acp1.WithToolContent(acp1.ToolText(text)))
+			return t.sink.update(ctx, e.CallID, "", statusRunning, text, nil)
 		}
 	case *agentturn.ToolEnd:
 		return t.end(ctx, e)
@@ -142,23 +169,27 @@ func (t *turn) observe(ctx context.Context, ev agentturn.Event) error {
 	return nil
 }
 
-// propose reports a decided call as pending: as a new tool_call the
+// messageID names the message a delta belongs to: the item's own ID, or
+// one made from where the item sits when the model gave it none.
+func messageID(e *agentturn.ItemUpdate, itemID string, index int) string {
+	if itemID != "" {
+		return itemID
+	}
+	return fmt.Sprintf("%s-%d-%d", e.RunID, e.Turn, index)
+}
+
+// propose reports a decided call as pending: as a new tool call the
 // first time, and as an update when an approval runs a call the client
 // has already seen.
 func (t *turn) propose(ctx context.Context, callID, name, parent string, args []byte) error {
-	stream := t.on(parent)
-	id := acp1.ToolCallID(callID)
-	raw := acp1.WithRawInput(jsontext.Value(args))
 	if t.sess.report(callID) {
-		return stream.UpdateToolCallStatus(ctx, id, acp1.ToolCallStatusPending, raw)
+		return t.sink.update(ctx, callID, parent, statusPending, "", args)
 	}
 	tool := t.tools[name]
-	return stream.ProposeToolCall(ctx, id, title(name, tool), t.server.kind(name, tool), raw)
+	return t.sink.propose(ctx, callID, parent, title(name, tool), t.server.kind(name, tool), args)
 }
 
 func (t *turn) end(ctx context.Context, e *agentturn.ToolEnd) error {
-	stream := t.on(e.Parent)
-	id := acp1.ToolCallID(e.CallID)
 	if e.Deferred {
 		// It stays pending: the permission request about it follows.
 		t.mu.Lock()
@@ -170,27 +201,11 @@ func (t *turn) end(ctx context.Context, e *agentturn.ToolEnd) error {
 	if out == "" && e.Err != nil {
 		out = e.Err.Error()
 	}
-	var opts []acp1.ToolCallOption
-	if out != "" {
-		opts = append(opts, acp1.WithToolContent(acp1.ToolText(out)))
-	}
+	st := statusCompleted
 	if e.Err != nil || e.Blocked {
-		return stream.FailToolCall(ctx, id, opts...)
+		st = statusFailed
 	}
-	return stream.CompleteToolCall(ctx, id, opts...)
-}
-
-// on returns the stream for a call's updates: a nested call's carry the
-// invoking call's ID under MetaParent.
-func (t *turn) on(parent string) *acp1.SessionStream {
-	if parent == "" {
-		return t.stream
-	}
-	var meta acp1.Meta
-	if err := meta.Set(MetaParent, parent); err != nil {
-		return t.stream
-	}
-	return t.stream.WithMeta(meta)
+	return t.sink.update(ctx, e.CallID, e.Parent, st, out, nil)
 }
 
 // count adds a response's usage to the turn's.
@@ -201,16 +216,19 @@ func (t *turn) count(r *openresponses.Response) {
 	u := r.Usage
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.counted = true
-	t.usage.InputTokens += uint64(u.InputTokens)
-	t.usage.OutputTokens += uint64(u.OutputTokens)
-	t.usage.TotalTokens += uint64(u.TotalTokens)
-	if n := u.OutputTokensDetails.ReasoningTokens; n > 0 {
-		t.usage.ThoughtTokens = new(t.usage.GetThoughtTokens() + uint64(n))
-	}
-	if n := u.InputTokensDetails.CachedTokens; n > 0 {
-		t.usage.CachedReadTokens = new(t.usage.GetCachedReadTokens() + uint64(n))
-	}
+	t.usage.counted = true
+	t.usage.input += uint64(u.InputTokens)
+	t.usage.output += uint64(u.OutputTokens)
+	t.usage.total += uint64(u.TotalTokens)
+	t.usage.thought += uint64(u.OutputTokensDetails.ReasoningTokens)
+	t.usage.cached += uint64(u.InputTokensDetails.CachedTokens)
+}
+
+// summed returns the turn's usage so far.
+func (t *turn) summed() usage {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.usage
 }
 
 // title is the tool's annotated title, or its name.
@@ -221,4 +239,12 @@ func title(name string, tool agenttool.Tool) string {
 		}
 	}
 	return name
+}
+
+// optionalCount is n as an optional count, nil for zero.
+func optionalCount(n uint64) *uint64 {
+	if n == 0 {
+		return nil
+	}
+	return &n
 }
