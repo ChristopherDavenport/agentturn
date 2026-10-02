@@ -194,11 +194,12 @@ versions may break the API.
   and a test that pinned the copy; it now reads `Executor.Chains` with
   the executor that runs the batch, so the two cannot drift
   (agenttool#66).
-- **`session` reads a call's origin dispatches through
-  `agentsession.OriginDispatches`.** The walk up a fork's origins, its
+- **Changed: `session` reads a call's origin dispatches through
+  `agentsession.OriginDispatches`, and `Pending` can now fail on a
+  chain of forks.** The walk up a fork's origins, its
   depth bound and its cache of the sessions read are gone. A chain of
-  forks that does not end is now an error from `Pending`,
-  `AgentOptions` and `ReplayAnswers` with the origins, wrapping
+  forks that does not end, a `parent_session` cycle, is now an error
+  from `Pending`, `AgentOptions` and `ReplayAnswers` with the origins, wrapping
   `agentsession.ErrOriginChain`, where it was silently taken as no
   dispatch found after 64; a recorder seeding itself still takes it,
   and an origin it cannot read, as none found. Each call in a fork's
