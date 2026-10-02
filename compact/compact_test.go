@@ -497,6 +497,51 @@ func TestLocalSummaryBacksOffAFailedFold(t *testing.T) {
 	}
 }
 
+func TestWithBackOffOff(t *testing.T) {
+	// With the back-off off, the prefix whose fold failed is asked about
+	// again on the very next call, a seeded failed fold notwithstanding,
+	// and the failed fold is still reported with its hash.
+	base := items(12)
+	cases := []struct {
+		name  string
+		opts  []Option
+		asked bool
+	}{
+		{"on by default", nil, false},
+		{"on", []Option{WithBackOff(true)}, false},
+		{"off", []Option{WithBackOff(false)}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &summarizer{reply: "They talked about things.", bloat: 1000}
+			var folds []Fold
+			opts := append([]Option{WithBudget(400), WithKeepLast(4), WithOnFold(func(_ context.Context, f Fold) error { folds = append(folds, f); return nil })}, tc.opts...)
+			tr := NewLocal(s, opts...)
+			if _, err := tr.Transform(context.Background(), base); err != nil || len(s.reqs) != 2 {
+				t.Fatalf("err = %v, summary calls = %d", err, len(s.reqs))
+			}
+			if len(folds) != 1 || folds[0].PrefixHash == "" {
+				t.Fatalf("folds = %+v, want one with a prefix hash", folds)
+			}
+			if _, err := tr.Transform(context.Background(), base); err != nil {
+				t.Fatal(err)
+			}
+			if asked := len(s.reqs) > 2; asked != tc.asked {
+				t.Errorf("asked again = %v, want %v", asked, tc.asked)
+			}
+			// A seeded failed fold is ignored the same way.
+			s2 := &summarizer{reply: "They talked about things.", bloat: 1000}
+			seeded := NewLocal(s2, append(append([]Option{}, opts[:2]...), append(tc.opts, WithFailedFold(folds[0].Split, folds[0].PrefixHash, folds[0].TokensBefore))...)...)
+			if _, err := seeded.Transform(context.Background(), base); err != nil {
+				t.Fatal(err)
+			}
+			if asked := len(s2.reqs) > 0; asked != tc.asked {
+				t.Errorf("seeded: asked = %v, want %v", asked, tc.asked)
+			}
+		})
+	}
+}
+
 func TestLocalSummaryBackOffMargins(t *testing.T) {
 	// After a failed fold of twelve items, the next call is asked again
 	// only past one of the two margins, or for another transcript.
