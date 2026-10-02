@@ -12,17 +12,22 @@ import (
 	"github.com/ChristopherDavenport/openresponses/echo"
 )
 
-// TestFailedFoldSurvivesARestart pins #194: the back-off after a failed
-// fold is on the record, and a transform seeded from a resumed session
-// does not ask again for the summary that failed.
+// TestFailedFoldSurvivesARestart pins #194 and agenteval#48: the
+// back-off after a failed fold is on the record, and a transform seeded
+// from a resumed session, through CompactOptions of the session or of
+// the recorder Resume seeded from it, does not ask again for the
+// summary that failed.
 func TestFailedFoldSurvivesARestart(t *testing.T) {
 	cases := []struct {
-		name      string
-		seed      bool
+		name string
+		// seed is what seeds the transform after the restart: the
+		// session's CompactOptions, the recorder's, or nothing.
+		seed      string
 		summaries int // summary calls after the restart
 	}{
-		{"seeded from the record", true, 0},
-		{"not seeded", false, 2},
+		{"seeded from the session", "session", 0},
+		{"seeded from the recorder", "recorder", 0},
+		{"not seeded", "", 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -42,6 +47,9 @@ func TestFailedFoldSurvivesARestart(t *testing.T) {
 			opts := []compact.Option{compact.WithBudget(100), compact.WithKeepLast(3), compact.WithEstimator(over), compact.WithMinFold(0)}
 			if f, err := LastFailedFold(s); err != nil || f != nil {
 				t.Fatalf("before any fold: %+v, %v", f, err)
+			}
+			if opts := rec.CompactOptions(); opts != nil {
+				t.Fatalf("a fresh session's recorder seeds %d options", len(opts))
 			}
 			model := &reasoningFold{}
 			tr := compact.NewLocal(model, append(opts, compact.WithOnFold(rec.Fold))...)
@@ -79,10 +87,17 @@ func TestFailedFoldSurvivesARestart(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if tc.seed {
+			switch tc.seed {
+			case "session":
 				copts, err := CompactOptions(s2)
 				if err != nil || len(copts) != 1 {
 					t.Fatalf("compact options = %d, %v", len(copts), err)
+				}
+				opts = append(opts, copts...)
+			case "recorder":
+				copts := rec2.CompactOptions()
+				if len(copts) != 1 {
+					t.Fatalf("the recorder's compact options = %d", len(copts))
 				}
 				opts = append(opts, copts...)
 			}

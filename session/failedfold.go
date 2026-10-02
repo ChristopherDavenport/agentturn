@@ -39,7 +39,8 @@ func LastFailedFold(s *agentsession.Session) (*FailedFold, error) {
 // another process, does not ask again for a summary that failed. It is
 // what a host resuming a session passes to compact.New or
 // compact.NewLocal beside its own options, as [AgentOptions] is for
-// agentturn.New. The fold's prefix is the transcript the transform was
+// agentturn.New; a host handed the recorder rather than the session
+// asks [Recorder.CompactOptions]. The fold's prefix is the transcript the transform was
 // given when it failed; one a compaction before it shortened is not
 // the context a resume rebuilds, so it is not matched, and the
 // transform asks once more and remembers that.

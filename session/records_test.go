@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -757,6 +758,16 @@ func isEnv(e agentsession.Entry) bool {
 	return ok
 }
 
+// envOn is the env entry of a sandbox on node, the node a member of
+// the workspace, where the format's substitution rule looks.
+func envOn(node string) *agentsession.EnvEntry {
+	e := agentsession.NewEnvEntry("/work")
+	if err := e.SetWorkspace(agentsession.WorkspaceContainer, "sandbox").SetMember("node", node); err != nil {
+		panic(err)
+	}
+	return e
+}
+
 // envNodes lists the node of each env entry in entries.
 func envNodes(entries []agentsession.Entry) string {
 	var nodes []string
@@ -922,6 +933,130 @@ func TestEnvInAChild(t *testing.T) {
 	})
 }
 
+// nodeKey carries, on a tool call's context, the node a child's own
+// sandbox is on, as a host that gives a sub-agent a container of its
+// own puts the sandbox on the call's context.
+type nodeKey struct{}
+
+// onNode runs its tool with the node on the call's context.
+type onNode struct {
+	agenttool.Tool
+	node string
+}
+
+func (o onNode) Execute(ctx context.Context, call agenttool.Call) (agenttool.Result, error) {
+	return o.Tool.Execute(context.WithValue(ctx, nodeKey{}, o.node), call)
+}
+
+// TestChildWithItsOwnWorkspace pins #214: a child's first run start
+// asks the WithEnv function with the child's context, so a child the
+// host gave a sandbox of its own starts under it, its first dispatch
+// is filed where it ran and a later Recorder.Env that finds it there
+// writes nothing; a child the function returns nil for is where its
+// parent is, and starts under a copy of its parent's env as before; an
+// error from the function at the child's start ends the child's
+// record there, since an observer cannot fail the child's run.
+func TestChildWithItsOwnWorkspace(t *testing.T) {
+	boom := errors.New("sandbox gone")
+	cases := []struct {
+		name string
+		// childNode is what the env function returns for the child's
+		// context, "" for nil.
+		childNode string
+		err       error
+		// wantChild is the child's env entries, and wantFirst whether
+		// its first entry after the run start is an env.
+		wantChild string
+		wantFirst bool
+	}{
+		{name: "a sandbox of its own", childNode: "node-9", wantChild: "node-9", wantFirst: true},
+		{name: "where its parent is", wantChild: "node-1", wantFirst: true},
+		{name: "the function fails", err: boom},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			var asked []string
+			// later is set once the child's run is over, when a job
+			// of the child's finds itself on node-9.
+			later := false
+			env := func(ctx context.Context) (*agentsession.EnvEntry, error) {
+				node, own := ctx.Value(nodeKey{}).(string)
+				asked = append(asked, node)
+				switch {
+				case !own:
+					return envOn("node-1"), nil
+				case tc.err != nil:
+					return nil, tc.err
+				case later:
+					return envOn("node-9"), nil
+				case tc.childNode == "":
+					return nil, nil
+				}
+				return envOn(tc.childNode), nil
+			}
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(ctx, store, agentsession.Header{}, WithEnv(env))
+			if err != nil {
+				t.Fatal(err)
+			}
+			childCfg := agentturn.Config{Name: "specialist", Description: "builds in its own sandbox", Model: scriptedCalls{{"upper", `{"text":"t"}`}}, Tools: []agenttool.Tool{upper}}
+			specialist := agent.New(childCfg, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{onNode{specialist, "node-9"}}})
+			defer rec.Attach(a)()
+			if _, err := a.Prompt(ctx, openresponses.UserText("delegate")); err != nil {
+				t.Fatal(err)
+			}
+			if len(asked) < 2 || asked[1] != "node-9" {
+				t.Fatalf("the env function was asked with %q, want the child's context second", asked)
+			}
+			child, err := store.Open(ctx, agentsession.SubsessionID(s.ID(), links(s)[0].CallID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := envNodes(child.Entries()); got != tc.wantChild {
+				t.Errorf("child env entries = %q, want %q", got, tc.wantChild)
+			}
+			if tc.wantFirst {
+				if first := child.Entries()[1]; !isEnv(first) {
+					t.Errorf("the child's run start is followed by %s, want its env", first.EntryType())
+				}
+				// The dispatch is filed under the env the child ran in.
+				types := strings.Fields(entryTypes(child))
+				if !slices.Contains(types, "dispatch") || slices.Index(types, "env") > slices.Index(types, "dispatch") {
+					t.Errorf("child entries = %q, want the env before the dispatch", entryTypes(child))
+				}
+				verifyAll(t, child)
+			}
+			if got := envNodes(s.Entries()); got != "node-1" {
+				t.Errorf("root env entries = %q, want node-1", got)
+			}
+			verifyAll(t, s)
+			if tc.err != nil {
+				return
+			}
+			// A job the child started finds itself on node-9: nothing
+			// is written for a child that started there, and a move
+			// for one that started where its parent is.
+			later = true
+			if err := rec.Env(context.WithValue(ContextWithSessionID(ctx, child.ID()), nodeKey{}, "node-9")); err != nil {
+				t.Fatal(err)
+			}
+			child, err = store.Open(ctx, child.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "node-9"
+			if tc.childNode == "" {
+				want = "node-1,node-9"
+			}
+			if got := envNodes(child.Entries()); got != want {
+				t.Errorf("child env entries after Env = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestFoldCallIsRecorded(t *testing.T) {
 	root := t.TempDir()
 	store, err := jsonl.Open(root)
@@ -1041,13 +1176,20 @@ func TestChildSessionIDIsDerivedFromTheCall(t *testing.T) {
 		t.Errorf("replayed child header = %+v", h)
 	}
 
-	// A second run under the same call continues the child session at
-	// its leaf rather than minting a second session or starting a new
-	// root: a subagent that is messaged again answers from its own
-	// context, so its run belongs after the one before it.
+	// A second Execute under the same call opens a new root in the
+	// child session rather than minting a second session or continuing
+	// at the leaf (#87): tools/agent builds a fresh agent for each
+	// Execute whose request is the new input alone, which holds
+	// nothing of the path the leaf rebuilds, so every response on
+	// either root carries a hash. A host marking the context with
+	// ContextWithRetry itself changes nothing.
 	call := agenttool.Call{ID: "call_again", Args: json.RawMessage(`{"input":"hi"}`)}
-	for range 2 {
-		if _, err := observed.Execute(context.Background(), call); err != nil {
+	for i := range 2 {
+		ctx := context.Background()
+		if i == 1 {
+			ctx = agent.ContextWithRetry(ctx)
+		}
+		if _, err := observed.Execute(ctx, call); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1055,47 +1197,128 @@ func TestChildSessionIDIsDerivedFromTheCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := roots(again); n != 1 {
-		t.Errorf("second run under one call opened %d roots in %q", n, entryTypes(again))
+	if n := roots(again); n != 2 {
+		t.Errorf("second run under one call opened %d roots in %q, want 2", n, entryTypes(again))
 	}
-	if n := len(runsOf(t, again)); n != 2 {
-		t.Errorf("runs on the child session = %d", n)
+	if n := len(runsOf(t, again)); n != 1 {
+		t.Errorf("runs on the path at the child session's leaf = %d, want the second alone", n)
 	}
-	// Both runs hold a response. Only the first carries a hash: the
-	// child session accumulates both runs, so the path rebuilds a
-	// context of every item under this call, while tools/agent builds a
-	// fresh agent for each Execute whose request is the new input
-	// alone. The record and the request disagree and the recorder
-	// declines a hash it cannot stand behind, which is the honest
-	// outcome of a gap that is not the recorder's: whether a second
-	// execution under one call ID should seed the child from its own
-	// recorded context, or open a new root, is open. Pinned here so a
-	// change to it is seen.
-	if n := verifyAllUnhashed(t, again, 1); n != 2 || hashed(again) != 1 {
-		t.Errorf("child responses = %d hashed = %d", n, hashed(again))
+	if n := verifyAll(t, again); n != 2 {
+		t.Errorf("child responses = %d, want 2, each hashed", n)
 	}
+}
 
-	// A host that means a retry from a clean start says so, and the
-	// leaf is reset as it was before.
-	retryCall := agenttool.Call{ID: "call_retry", Args: json.RawMessage(`{"input":"hi"}`)}
-	for i := range 2 {
-		ctx := context.Background()
-		if i == 1 {
-			ctx = agent.ContextWithRetry(ctx)
-		}
-		if _, err := observed.Execute(ctx, retryCall); err != nil {
-			t.Fatal(err)
-		}
+// TestSecondExecuteOpensANewRoot pins #87 in its realistic shape: the
+// first Execute under a call is cut off inside a tool, leaving the
+// call in flight at the child session's leaf, and a second Execute
+// under the same call ID, as Agent.Resume running the call again
+// makes, opens a new root in the child's session, so every response
+// rebuilds and the leaf owes nothing; a host prompting again the agent
+// it kept through WithSpawn, which holds its context, continues at the
+// leaf.
+func TestSecondExecuteOpensANewRoot(t *testing.T) {
+	cases := []struct {
+		name string
+		// cut cuts the first run off inside its tool call.
+		cut bool
+	}{
+		{name: "the first run cut off", cut: true},
+		{name: "both runs complete"},
 	}
-	retry, err := store.Open(context.Background(), agentsession.SubsessionID(s.ID(), "call_retry"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n := roots(retry); n != 2 {
-		t.Errorf("retried child has %d roots in %q", n, entryTypes(retry))
-	}
-	if n := verifyAll(t, retry); n != 2 {
-		t.Errorf("retried child responses = %d", n)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			first, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			// cutNow is set while the first run is the one running,
+			// so the tool cuts that run alone.
+			cutNow := tc.cut
+			stop := agenttool.New("stop", "cuts the run", func(ctx context.Context, _ agenttool.NoArgs) (string, error) {
+				if cutNow {
+					cancel()
+					<-ctx.Done()
+					return "", ctx.Err()
+				}
+				return "went on", nil
+			})
+			var spawned *agentturn.Agent
+			child := agent.New(agentturn.Config{Name: "worker", Model: scriptedCalls{{"stop", `{}`}}, Tools: []agenttool.Tool{stop}},
+				agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext),
+				agent.WithSpawn(func(_ string, a *agentturn.Agent) { spawned = a }))
+			// The parent is attached so the child has a parent run to
+			// be filed under, as under Agent.Resume.
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{child}})
+			defer rec.Attach(a)()
+			call := agenttool.Call{ID: "call_cut", Args: json.RawMessage(`{"input":"go"}`)}
+			_, err = child.Execute(first, call)
+			cutNow = false
+			if tc.cut != (err != nil) {
+				t.Fatalf("first execute: err=%v, want cut %v", err, tc.cut)
+			}
+			cs, err := store.Open(context.Background(), agentsession.SubsessionID(s.ID(), call.ID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			pending, err := Pending(cs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.cut && (len(pending) != 1 || pending[0].Reason != agentturn.PendingAborted) {
+				t.Fatalf("pending after the cut = %+v, want the stop call in flight", pending)
+			}
+
+			// Run again under the same call ID: a new root.
+			if _, err := child.Execute(context.Background(), call); err != nil {
+				t.Fatal(err)
+			}
+			cs, err = store.Open(context.Background(), cs.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n := roots(cs); n != 2 {
+				t.Errorf("the second execute left %d roots in %q, want 2", n, entryTypes(cs))
+			}
+			if pending, err := Pending(cs); err != nil || len(pending) != 0 {
+				t.Errorf("pending at the leaf after the second execute = %+v, %v; want none", pending, err)
+			}
+			// Each complete run makes two model calls, the one that
+			// calls stop and the one that answers; the cut run made
+			// one.
+			want := 4
+			if tc.cut {
+				want = 3
+			}
+			if n := verifyAll(t, cs); n != want {
+				t.Errorf("child responses = %d, want %d, each hashed", n, want)
+			}
+
+			// The host prompts the agent it kept: that one holds its
+			// context, and its run continues at the leaf.
+			if spawned == nil {
+				t.Fatal("WithSpawn gave no agent")
+			}
+			if _, err := spawned.Prompt(context.Background(), openresponses.UserText("and then?")); err != nil {
+				t.Fatal(err)
+			}
+			cs, err = store.Open(context.Background(), cs.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n := roots(cs); n != 2 {
+				t.Errorf("the host's prompt left %d roots in %q, want still 2", n, entryTypes(cs))
+			}
+			if n := len(runsOf(t, cs)); n != 2 {
+				t.Errorf("runs on the path at the leaf = %d, want the second execute's and the host's", n)
+			}
+			if n := verifyAll(t, cs); n != want+1 {
+				t.Errorf("child responses = %d, want %d, each hashed", n, want+1)
+			}
+			verifyAll(t, s)
+		})
 	}
 }
 
@@ -1764,13 +1987,6 @@ func TestFoldedCallIDsStayReserved(t *testing.T) {
 // root resumed after a compaction writes no second copy of its env.
 func TestEnvSurvivesACompaction(t *testing.T) {
 	ctx := context.Background()
-	envOn := func(node string) *agentsession.EnvEntry {
-		e := agentsession.NewEnvEntry("/work")
-		if err := e.SetWorkspace(agentsession.WorkspaceContainer, "sandbox").SetMember("node", node); err != nil {
-			t.Fatal(err)
-		}
-		return e
-	}
 	env := func(context.Context) (*agentsession.EnvEntry, error) { return envOn("node-1"), nil }
 	cases := []struct {
 		name string

@@ -359,6 +359,82 @@ func TestFilteredModelOutputKeepsHashes(t *testing.T) {
 	}
 }
 
+// TestMarkedItemDecodesAKeptOutputItem pins agenteval#50: MarkedItem
+// decodes the custom entry written for a model output item the filter
+// kept from the model, the item and the response that produced it, as
+// transcriptOf reads it, and reports false for any other custom entry:
+// a plain annotation, a marked entry whose data is not an item, and
+// one whose item is not of the entry's namespace.
+func TestMarkedItemDecodesAKeptOutputItem(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: rawThenText{}, ModelName: "m"})
+	unsub := rec.Attach(a)
+	if _, err := a.Prompt(ctx, openresponses.UserText("one")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rec.Annotate(ctx, "test:plain", map[string]string{"a": "b"}); err != nil {
+		t.Fatal(err)
+	}
+	unsub()
+	var marked, plain *agentsession.CustomEntry
+	var responseID string
+	for _, e := range s.Entries() {
+		switch e := e.(type) {
+		case *agentsession.CustomEntry:
+			switch e.NS {
+			case "hermes:raw":
+				marked = e
+			case "test:plain":
+				plain = e
+			}
+		case *agentsession.ResponseEntry:
+			responseID = e.ResponseID
+		}
+	}
+	if marked == nil || plain == nil || responseID == "" {
+		t.Fatalf("entries = %q", entryTypes(s))
+	}
+	mark := marked.Unknown[ResponseIDMember]
+	cases := []struct {
+		name  string
+		entry *agentsession.CustomEntry
+		// wantType is the type of the item decoded, "" for false.
+		wantType string
+	}{
+		{name: "a kept output item", entry: marked, wantType: "hermes:raw"},
+		{name: "a plain annotation", entry: plain},
+		{name: "marked, not an item", entry: &agentsession.CustomEntry{NS: "hermes:raw", Data: json.RawMessage(`{"text":"no type"}`), EntryBase: agentsession.EntryBase{Unknown: map[string]json.RawMessage{ResponseIDMember: mark}}}},
+		{name: "marked, another namespace", entry: &agentsession.CustomEntry{NS: "other:ns", Data: marked.Data, EntryBase: agentsession.EntryBase{Unknown: map[string]json.RawMessage{ResponseIDMember: mark}}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			item, id, ok := MarkedItem(tc.entry)
+			if ok != (tc.wantType != "") {
+				t.Fatalf("MarkedItem = %v, %q, %v; want ok %v", item, id, ok, tc.wantType != "")
+			}
+			if !ok {
+				return
+			}
+			if item.ItemType() != tc.wantType || id != responseID {
+				t.Errorf("MarkedItem = %s item from response %q, want %s from %q", item.ItemType(), id, tc.wantType, responseID)
+			}
+			// The same item Transcript puts back.
+			items, err := Transcript(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.ContainsFunc(items, func(it openresponses.Item) bool { return equalJSON(it, item) }) {
+				t.Errorf("Transcript does not hold the decoded item")
+			}
+		})
+	}
+}
+
 // idless answers as rawThenText does with a response that has no ID,
 // so nothing names the response its items belong to.
 type idless struct{}
