@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/openresponses"
@@ -2234,10 +2233,13 @@ var ErrNoInvoker = errors.New("agentturn: no loop on the context to invoke a too
 // not an object, or a call the hook refused, whose Reason is the error.
 // A nested call cannot be handed to the caller, since it belongs to a
 // tool that is running, so one the hook defers is put to the user
-// through the agenttool.Elicitor on ctx, when there is one: an accept
-// runs it and a decline refuses it, and tool_start carries that answer
-// as the decision, by "human". Without an elicitor, or on a cancel or
-// a failure to ask, the deferral refuses the call. Nothing is appended
+// through the agenttool.Elicitor on ctx, when there is one, with [Ask]:
+// the question names the call, and the elicitor's context carries it
+// as an [AskedCall], its ID, name, whole arguments and the deferral,
+// for [AskedCallFrom]. An accept runs it and a decline refuses it, and
+// tool_start carries that answer as the decision, by "human". Without
+// an elicitor, or on a cancel or a failure to ask, the deferral
+// refuses the call. Nothing is appended
 // to the transcript, so a nested call costs no items and a Terminate
 // on its result means nothing to the loop.
 //
@@ -2287,7 +2289,13 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 				p.args = decision.Args
 			}
 			if decision.Action == Defer {
-				decision = r.askNested(ctx, name, p.args, decision)
+				// A nested call cannot be handed to the caller, so the
+				// user is asked through the invoking tool's elicitor;
+				// without one, or with no answer, the deferral stands
+				// and refuses the call below.
+				if d, ok := Ask(ctx, AskedCall{Parent: parent, CallID: call.CallID, Name: name, Args: p.args, Decision: decision}); ok {
+					decision = d
+				}
 			}
 			switch decision.Action {
 			case Block, Defer:
@@ -2327,63 +2335,6 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 		return agenttool.Result{}, r.endNested(p, err)
 	}
 	return p.result, p.err
-}
-
-// askNested puts a nested call the hook deferred to the user through
-// the elicitor on ctx, the invoking tool's, so the question is filed
-// under the call that made it. An accept allows the call and a decline
-// blocks it, either decided by the user; with no elicitor, a cancel or
-// a failure to ask, the deferral stands and the call is refused.
-func (r *runner) askNested(ctx context.Context, name string, args json.RawMessage, d *ToolDecision) *ToolDecision {
-	elicit, ok := agenttool.ElicitorFrom(ctx)
-	if !ok {
-		return d
-	}
-	msg := fmt.Sprintf("Allow %s with arguments %s?", name, clip(string(args), maxAskedArgs))
-	if d.Reason != "" {
-		msg += " " + d.Reason
-	}
-	ans, err := elicit(ctx, agenttool.Elicitation{Message: msg})
-	if err != nil {
-		return d
-	}
-	// An elicitation is a question for the user, so the user decided.
-	decided := *d
-	decided.By = "human"
-	switch ans.Action {
-	case agenttool.ActionAccept:
-		// The reason is the rule that raised the question, as a held
-		// call's is; the record needs one to write the approval.
-		decided.Action = Allow
-		if decided.Reason == "" {
-			decided.Reason = "allowed when asked"
-		}
-	case agenttool.ActionDecline:
-		decided.Action = Block
-		decided.Reason = "declined when asked"
-		if d.Reason != "" {
-			decided.Reason += ": " + d.Reason
-		}
-	default:
-		return d
-	}
-	return &decided
-}
-
-// maxAskedArgs is the most of a nested call's arguments, in bytes, the
-// question about it quotes: a script's call may carry a whole file.
-const maxAskedArgs = 500
-
-// clip returns s cut to at most n bytes on a rune boundary, with an
-// ellipsis when anything was cut.
-func clip(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	for n > 0 && !utf8.RuneStart(s[n]) {
-		n--
-	}
-	return s[:n] + "…"
 }
 
 // endNested gives a nested call whose loop-side handling failed, a

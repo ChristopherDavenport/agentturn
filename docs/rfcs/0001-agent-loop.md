@@ -1181,7 +1181,11 @@ as if the model had asked for it under the call in flight:
   the invoking tool's elicitor when it has one, as a question naming
   the call, its arguments, the first 500 bytes of them, and the
   decision's reason, asked on the
-  invoking tool's context so it is filed under that call. An accept
+  invoking tool's context so it is filed under that call, with the
+  call it asks about on that context as data, its parent, ID, name,
+  whole arguments and the deferral, so a front that answers for
+  longer than the one call can make a rule of it without parsing the
+  question. An accept
   allows the call and a decline blocks it, with `declined when asked`
   and the reason as the refusal's; either is the decision `tool_start`
   carries, by `human`, an accept with the reason, or `allowed when
