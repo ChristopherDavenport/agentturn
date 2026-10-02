@@ -652,3 +652,40 @@ func (speaksTwice) CreateStream(_ context.Context, req openresponses.Request, si
 	}
 	return em.Complete()
 }
+
+// TestExecuteMarksItsRunAsStartingAfresh pins #87: every run Execute
+// starts carries the ContextWithRetry mark, on the run's context the
+// child's tools see and on the observer's, since the child is a fresh
+// agent that holds nothing of an earlier run under the call; a run
+// the host starts on the agent WithSpawn handed out, with a context
+// of its own, carries none.
+func TestExecuteMarksItsRunAsStartingAfresh(t *testing.T) {
+	var inTool []bool
+	note := agenttool.New("note", "note something", func(ctx context.Context, _ struct{}) (string, error) {
+		inTool = append(inTool, RetryFromContext(ctx))
+		return "noted", nil
+	})
+	var observed []bool
+	var handle *agentturn.Agent
+	child := New(agentturn.Config{Name: "helper", Model: &echo.Adapter{}, Tools: []agenttool.Tool{note}},
+		WithObserver(func(ctx context.Context, ev agentturn.Event) {
+			if _, ok := ev.(*agentturn.RunStart); ok {
+				observed = append(observed, RetryFromContext(ctx))
+			}
+		}),
+		WithSpawn(func(_ string, a *agentturn.Agent) { handle = a }))
+	for range 2 {
+		if _, err := child.Execute(context.Background(), agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"go"}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := handle.Prompt(context.Background(), openresponses.UserText("and then?")); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(observed) != "[true true false]" {
+		t.Errorf("runs observed as starting afresh = %v, want both executes and not the host's prompt", observed)
+	}
+	if fmt.Sprint(inTool) != "[true true false]" {
+		t.Errorf("runs the child's tool saw as starting afresh = %v, want both executes and not the host's prompt", inTool)
+	}
+}

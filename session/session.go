@@ -281,10 +281,16 @@
 // so the same function serves every level of nesting: a child's child
 // is linked from the child's session. The child's session inherits the
 // parent's working directory, so a store that buckets sessions by
-// directory files it with its parent, and a second run under the same
-// call continues it at its leaf rather than starting a new root, since
-// a subagent that is messaged again answers from its own context;
-// agent.ContextWithRetry says the other thing.
+// directory files it with its parent. A second run under the same call
+// is written where the run's context says: a run marked with
+// agent.ContextWithRetry, which tools/agent puts on every run its
+// Execute starts, since each builds a fresh agent that holds nothing of
+// an earlier run, opens a new root in the child's session, so a
+// cut-off call run again through Agent.Resume rebuilds every response
+// and leaves the first attempt's open call off the leaf; a run that is
+// not marked, a host prompting again the agent it kept through
+// agent.WithSpawn, continues the session at its leaf, since a subagent
+// that is messaged again answers from its own context.
 //
 // [Recorder.ChildContext] puts the child's session ID on the context
 // the child run is given, so a layer inside the child that attributes
@@ -2781,12 +2787,18 @@ func (r *Recorder) Fold(ctx context.Context, f compact.Fold) error {
 // session's ID is derived from the parent's and the call's, so a
 // reader can compute it from the parent's link alone.
 //
-// A second run under the same call continues the existing session from
-// its leaf: a subagent that is messaged again answers from its own
-// context, so its run belongs after the one before it, with the
-// hashes that follow from that. A host that means a retry from a clean
-// start says so with agent.ContextWithRetry, and the leaf is reset as
-// for a fresh child.
+// A second run under the same call goes where its context says. One
+// marked with agent.ContextWithRetry starts a new root in the existing
+// session, the leaf reset as for a fresh child: tools/agent marks
+// every run its Execute starts, since each builds a fresh agent whose
+// request is the new input alone, which holds nothing of the path the
+// leaf rebuilds, so a cut-off call run again rebuilds every response
+// and the first attempt's open call is not at the leaf (#87). One not
+// marked, a host prompting again the agent it kept through
+// agent.WithSpawn, continues the session from its leaf: a subagent
+// that is messaged again answers from its own context, so its run
+// belongs after the one before it, with the hashes that follow from
+// that.
 //
 // live says the child is written from its events, so the header
 // promises the record entries; a child replayed from its items

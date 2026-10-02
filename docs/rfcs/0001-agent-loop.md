@@ -1541,12 +1541,18 @@ module and is listed in the changelog as one.
   items out of each turn's request (#91); that omission, like every route
   that trims the history mid-path, costs the responses after it their
   request hash, which is the format's question (agentsession#56).
-- **A second execution under one call** (#87). A child tool builds a
-  fresh agent per call while the recorder continues the child session
-  at its leaf, so the second run's path rebuilds a context the child
-  did not read and its response cannot be hashed. Seeding the second
-  execution from the recorded context, or opening a new root, are the
-  two coherent answers.
+- **A second execution under one call** (#87, resolved). A child tool
+  builds a fresh agent per call while the recorder continued the child
+  session at its leaf, so the second run's path rebuilt a context the
+  child did not read and its response could not be hashed. Of the two
+  coherent answers, seeding the second execution from the recorded
+  context or opening a new root, the second is taken: `tools/agent`
+  marks every run its `Execute` starts with `ContextWithRetry`, and
+  the recorder opens a new root in the call's session for it, so every
+  response rebuilds and the earlier attempt's open call is off the
+  leaf. A run a host starts on an agent it kept through `WithSpawn` is
+  unmarked and continues at the leaf, since that agent holds its
+  context.
 - **A fold identifying itself** (#88). The local fold's summary request
   is a request with no tools and no instructions, and a replay tells a
   fold from a turn by that shape. A marker on the context the fold
