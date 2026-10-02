@@ -761,6 +761,7 @@ func (r *runner) pending() []PendingCall {
 			// answered and is left as a cut leaves one; a resume that
 			// failed before its batch leaves it held.
 			p.Reason, p.Dispatched, p.IdempotencyKey, p.Args = before.Reason, before.Dispatched, before.IdempotencyKey, before.Args
+			p.Ran, p.RanWhere = before.Ran, before.RanWhere
 			if before.Reason == PendingDeferred && r.approved[call.CallID] {
 				p.Reason, p.Dispatched = PendingAborted, false
 			}
@@ -771,6 +772,7 @@ func (r *runner) pending() []PendingCall {
 			// with included: a resume that failed before its batch
 			// decided nothing new.
 			p.Reason, p.Dispatched, p.IdempotencyKey, p.Args = before.Reason, before.Dispatched, before.IdempotencyKey, before.Args
+			p.Ran, p.RanWhere = before.Ran, before.RanWhere
 		}
 		if p.Tool == nil {
 			p.Tool = before.Tool

@@ -788,7 +788,13 @@ function call without an output is pending with reason `unknown`, and
 the agent refuses to run until they are answered. A host SHOULD seed it
 as well with what a record says of them, the reason, the key and the
 arguments, so only a call that may have run is held to the replay rule
-and one that never started is approved without it. Replacing the
+and one that never started is approved without it, and the output of
+one that dispatched and completed off the path the agent continues, on
+a branch a rebase left or in the session this one forks, with where it
+ran, so the host answers the call with that output rather than running
+the call again or telling the model its outcome is unknown. The loop
+carries what it was seeded with onto the pending list of a run that
+leaves the call pending, and sets none of it itself. Replacing the
 transcript re-derives them the same way, except that a call the agent
 already had pending keeps what it knew of it, so a held call stays
 held; the host seeds the rest again from the record. Whatever the old
