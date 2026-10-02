@@ -4607,22 +4607,24 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 		}
 		entry.Unknown = map[string]json.RawMessage{FoldMember: raw}
 	}
-	if _, err = w.append(ctx, entry); err != nil {
+	id, err := w.append(ctx, entry)
+	if err != nil {
 		return err
 	}
 	// The checkpoint writes what was in force whole: no entry before it
 	// is named by a later keep, and no part that left force before it by
-	// a later hash, so the settings carry on from what a reader of the
-	// path has, without the histories they replayed.
-	raw, err := json.Marshal(w.settings)
+	// a later hash. The settings carry on from what a reader of the path
+	// has at the checkpoint, which is the library's to say, so they are
+	// read back from the session as the reader builds them.
+	s, err := w.rec.store.Open(context.WithoutCancel(ctx), w.id)
 	if err != nil {
-		return fmt.Errorf("session: encode settings: %w", err)
+		return fmt.Errorf("session: open after fold: %w", err)
 	}
-	var settled agentsession.Settings
-	if err := json.Unmarshal(raw, &settled); err != nil {
-		return fmt.Errorf("session: decode settings: %w", err)
+	cx, err := s.ContextAt(id)
+	if err != nil {
+		return fmt.Errorf("session: context at fold: %w", err)
 	}
-	w.settings = settled
+	w.settings = cx.Settings
 	return nil
 }
 
