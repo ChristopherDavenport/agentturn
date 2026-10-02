@@ -257,7 +257,10 @@
 //     records of a parallel batch say whose each one is. This is how a tool
 //     keeps what its output does not carry, the full bytes of a
 //     truncated result for one, in the session without the recorder
-//     knowing its type. Details for in-process subscribers alone are
+//     knowing its type. A question is two entries, the question before
+//     it is put and the answer after, naming the call it is about when
+//     the asker said, so a run cut while a person was deciding shows
+//     the open question. Details for in-process subscribers alone are
 //     not recorded.
 //
 // # Header
@@ -573,23 +576,59 @@ type ModelBlocked struct {
 // ElicitationNS is the namespace of the custom entry written for a
 // question a tool asked the user mid-call, through the elicitor
 // [Recorder.Elicitor] wraps. Its data is an [Elicitation], and its
-// call_id names the call that asked when the session holds it.
+// call_id names the call that asked when the session holds it: the
+// call on the asking tool's context, the invoking call for a question
+// about a nested call, or, when the context carries no call the
+// session holds, the call the question is about.
+//
+// Each question is two entries: one with phase ask, written before the
+// question is put, so a run cut while a person was deciding shows what
+// it was waiting on, and one with phase answer after it is answered,
+// naming the ask entry in asked. A reader of a cut run that finds an
+// ask under an in-flight call with no answer naming it after it takes
+// the question as still open at the cut. An entry with no phase was
+// written by an earlier release, question and answer in one.
 const ElicitationNS = "agentturn:elicitation"
 
-// Elicitation is the data of an [ElicitationNS] custom entry: the
-// question and what became of it.
+// ElicitationAsk and ElicitationAnswer are the phases of an
+// [Elicitation]: the question as it is put, and the answer once given.
+const (
+	ElicitationAsk    = "ask"
+	ElicitationAnswer = "answer"
+)
+
+// Elicitation is the data of an [ElicitationNS] custom entry: a
+// question as it is put to the user, or what became of it.
 type Elicitation struct {
+	// Phase is [ElicitationAsk] on the entry written before the
+	// question is put and [ElicitationAnswer] on the one written after
+	// it is answered; empty on an entry an earlier release wrote,
+	// which holds question and answer in one.
+	Phase string `json:"phase,omitempty"`
+	// Call is the ID of the call the question is about, when the asker
+	// put one on the context as agentturn.AskedCall: a nested call the
+	// hook deferred, or the model's call a front asks about. Tool is
+	// its name and Parent the call whose tool made it, for a nested
+	// one. All three are empty for a question a tool asks of its own,
+	// which is about the call on the entry's call_id.
+	Call   string `json:"call,omitempty"`
+	Tool   string `json:"tool,omitempty"`
+	Parent string `json:"parent,omitempty"`
+	// Asked, on the answer entry, is the ID of the ask entry it answers.
+	Asked string `json:"asked,omitempty"`
+	// Message, Schema and URL are the question, on both entries.
 	Message string          `json:"message,omitempty"`
 	Schema  json.RawMessage `json:"schema,omitempty"`
 	URL     string          `json:"url,omitempty"`
-	// Action is accept, decline or cancel; empty when Error is set.
+	// Action is accept, decline or cancel, on the answer entry; empty
+	// when Error is set.
 	Action  string          `json:"action,omitempty"`
 	Content json.RawMessage `json:"content,omitempty"`
 	// By is who answered, in the session format's terms; empty when
 	// nobody was asked or the asking failed.
 	By string `json:"by,omitempty"`
 	// Error is the harness's failure to ask, which the tool sees as an
-	// error rather than an answer.
+	// error rather than an answer, on the answer entry.
 	Error string `json:"error,omitempty"`
 }
 
@@ -1624,7 +1663,11 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // safe" or "run again: keyed"; and it is answered with
 // [agentturn.OutcomeUnknown] otherwise, including when no tool has its
 // name, with a reason saying which: "not run again: no tool", "not run
-// again: keyed without a key" or "not run again: replay unknown". A
+// again: keyed without a key" or "not run again: replay unknown"; when
+// the path holds a question asked under the call that nothing
+// answered, an [ElicitationNS] ask with no answer naming it, the call
+// was waiting on a person when the run was cut, and the reason goes on
+// to name the question and the call it was about. A
 // call that may have run because its only dispatch is on a branch a
 // rebase left, and that its tool completed there, ran: it is answered
 // with the output that branch holds, with the reason "ran on a branch
@@ -1677,10 +1720,62 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 				break
 			}
 			ans = replayAnswer(ctx, set, p.PendingCall)
+			if q := openQuestion(s, id); q != nil && ans.Output != nil {
+				// The call was waiting on a person when the run was
+				// cut: the answer says so, and what it asked.
+				ans = ans.WithReason(ans.Reason + "; " + q.openReason())
+			}
 		}
 		out = append(out, ans.WithBy(agentsession.ByPolicy))
 	}
 	return out, nil
+}
+
+// openQuestion is the last question asked under callID on the path to
+// the leaf that nothing answered: an [ElicitationNS] entry with phase
+// ask that no answer entry after it names in asked. It is nil when
+// every question under the call was answered, or none was asked. An
+// entry an earlier release wrote, with no phase, holds its answer.
+func openQuestion(s *agentsession.Session, callID string) *Elicitation {
+	open := map[string]*Elicitation{}
+	var order []string
+	for _, e := range s.Path(s.Leaf()) {
+		c, ok := e.(*agentsession.CustomEntry)
+		if !ok || c.NS != ElicitationNS || c.CallID != callID {
+			continue
+		}
+		var q Elicitation
+		if json.Unmarshal(c.Data, &q) != nil {
+			continue
+		}
+		switch q.Phase {
+		case ElicitationAsk:
+			open[c.ID] = &q
+			order = append(order, c.ID)
+		case ElicitationAnswer:
+			delete(open, q.Asked)
+		}
+	}
+	for i := len(order) - 1; i >= 0; i-- {
+		if q, ok := open[order[i]]; ok {
+			return q
+		}
+	}
+	return nil
+}
+
+// openReason says the question was open when the run was cut, and
+// which call it was about, for the reason of the answer [ReplayAnswers]
+// gives the call it was asked under.
+func (e Elicitation) openReason() string {
+	reason := fmt.Sprintf("a question was open: %q", e.Message)
+	if e.Call != "" {
+		reason += " about call " + e.Call
+		if e.Tool != "" {
+			reason += " (" + e.Tool + ")"
+		}
+	}
+	return reason
 }
 
 // ranOffReason is the reason of the answer [ReplayAnswers] gives a
@@ -2064,6 +2159,14 @@ func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) int {
 // config entry, whatever the order the subscribers were registered in;
 // made during any later event of the turn, after it.
 func (r *Recorder) Annotate(ctx context.Context, ns string, data any) (string, error) {
+	return r.annotate(ctx, ns, data, "")
+}
+
+// annotate is [Recorder.Annotate] with a call to file the entry under
+// when the context carries none the session holds: the call a question
+// is about, for [Recorder.Elicitor], which a front asking about a
+// model's call puts on the context without a call of its own.
+func (r *Recorder) annotate(ctx context.Context, ns string, data any, about string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	w := r.writerOf(ctx)
@@ -2080,7 +2183,11 @@ func (r *Recorder) Annotate(ctx context.Context, ns string, data any) (string, e
 	if err != nil {
 		return "", fmt.Errorf("session: encode annotation %s: %w", ns, err)
 	}
-	return w.append(context.WithoutCancel(ctx), &agentsession.CustomEntry{NS: ns, Data: raw, CallID: w.callOn(ctx)})
+	callID := w.callOn(ctx)
+	if callID == "" && about != "" {
+		callID = w.heldCall(about)
+	}
+	return w.append(context.WithoutCancel(ctx), &agentsession.CustomEntry{NS: ns, Data: raw, CallID: callID})
 }
 
 // Env asks the function [WithEnv] set for the environment now and
@@ -2360,14 +2467,29 @@ func (r *Recorder) RecordFunc() agenttool.RecordFunc {
 }
 
 // Elicitor returns an elicitor that puts each question to fn and
-// writes the question and its answer as an [ElicitationNS] custom
-// entry, under the call that asked, before the answer returns to the
-// tool; by names who answers, in the session format's terms. Set it as
+// writes it as two [ElicitationNS] custom entries under the call that
+// asked: the question, with phase ask, before it is put to fn, and its
+// answer, with phase answer and asked naming the first entry, before
+// the answer returns to the tool; by names who answers, in the session
+// format's terms. A question the loop asks about a nested call, or a
+// front about a model's call, carries that call's ID, tool and parent
+// on both entries, from the agentturn.AskedCall on the context, so
+// consecutive questions are tied to the calls they are about by more
+// than their order; the entries' call_id stays the call on the
+// context, the invoking call for a nested one, and is the call asked
+// about when the context carries none the session holds. A run cut
+// while a person was deciding, the process killed with the question
+// open, leaves the ask and no answer, so a reader of the record knows
+// the in-flight call was waiting on a person and what it asked, and
+// [ReplayAnswers] names the open question in the reason of the answer
+// it gives that call. Set the elicitor as
 // agentturn.Config.ToolElicitor, or install it with
 // agenttool.ContextWithElicitor on the context a run is prompted with.
 // A nil fn answers every question with agenttool.ActionCancel, since
-// nobody was asked, and records that. A failure to write the entry is
-// returned to the tool as the harness failing to ask.
+// nobody was asked, and records that. A failure to write the ask entry
+// is returned to the tool as the harness failing to ask, and fn is not
+// called; a failure to write the answer entry is returned the same
+// way, joined with fn's error if it had one.
 //
 // An agent run from inside a tool served by agenttool's mcpserver
 // finds the elicitor that asks the MCP client on the call's context,
@@ -2383,21 +2505,30 @@ func (r *Recorder) RecordFunc() agenttool.RecordFunc {
 // cancelled.
 func (r *Recorder) Elicitor(by string, fn agenttool.Elicitor) agenttool.Elicitor {
 	return func(ctx context.Context, q agenttool.Elicitation) (agenttool.Answer, error) {
+		data := Elicitation{Phase: ElicitationAsk, Message: q.Message, Schema: q.Schema, URL: q.URL}
+		if about, ok := agentturn.AskedCallFrom(ctx); ok {
+			data.Call, data.Tool, data.Parent = about.CallID, about.Name, about.Parent
+		}
+		// The question is on the record before anyone is asked, so a
+		// run cut while they decide shows what it was waiting on.
+		asked, err := r.annotate(ctx, ElicitationNS, data, data.Call)
+		if err != nil {
+			return agenttool.Answer{}, err
+		}
 		ans := agenttool.Answer{Action: agenttool.ActionCancel}
-		var err error
 		who := ""
 		if fn != nil {
 			ans, err = fn(ctx, q)
 			who = by
 		}
-		data := Elicitation{Message: q.Message, Schema: q.Schema, URL: q.URL}
+		data.Phase, data.Asked = ElicitationAnswer, asked
 		if err != nil {
 			// Nobody answered: the harness failed to ask.
 			data.Error = err.Error()
 		} else {
 			data.Action, data.Content, data.By = string(ans.Action), ans.Content, who
 		}
-		if _, werr := r.Annotate(ctx, ElicitationNS, data); werr != nil {
+		if _, werr := r.annotate(ctx, ElicitationNS, data, data.Call); werr != nil {
 			return agenttool.Answer{}, errors.Join(err, werr)
 		}
 		return ans, err

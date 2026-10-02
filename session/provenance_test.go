@@ -1057,8 +1057,10 @@ func testChildJobRecords(t *testing.T, later bool) {
 
 // TestElicitationIsRecordedUnderTheCall checks that a question a tool
 // asks through the loop's elicitor is written under the call that
-// asked, with the answer and who gave it, before the tool goes on, and
-// that a failure to ask is recorded as such.
+// asked, the question before it is put and the answer, with who gave
+// it, before the tool goes on, that a failure to ask is recorded as
+// such, and that a question a tool asks of its own, with no
+// agentturn.AskedCall on the context, names no call of its own (#213).
 func TestElicitationIsRecordedUnderTheCall(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -1097,9 +1099,9 @@ func TestElicitationIsRecordedUnderTheCall(t *testing.T) {
 					return "", err
 				}
 				answered = ans.Action
-				// The question is on the record before the tool acts on
-				// the answer.
-				if n := len(customs(s, ElicitationNS)); n != 1 {
+				// The question and its answer are on the record before
+				// the tool acts on the answer.
+				if n := len(customs(s, ElicitationNS)); n != 2 {
 					return "", fmt.Errorf("%d elicitation entries while the tool runs", n)
 				}
 				return string(ans.Action), nil
@@ -1110,27 +1112,45 @@ func TestElicitationIsRecordedUnderTheCall(t *testing.T) {
 				t.Fatal(err)
 			}
 			got := customs(s, ElicitationNS)
-			if len(got) != 1 {
+			if len(got) != 2 {
 				t.Fatalf("elicitation entries in %q", entryTypes(s))
 			}
-			var e Elicitation
-			if err := json.Unmarshal(got[0].Data, &e); err != nil {
-				t.Fatal(err)
+			ask, answer := elicitationOf(t, got[0]), elicitationOf(t, got[1])
+			if ask.Phase != ElicitationAsk || ask.Message != tc.want.Message || ask.Action != "" || ask.By != "" || ask.Error != "" || ask.Asked != "" {
+				t.Errorf("ask entry = %+v, want the question alone", ask)
 			}
-			if e.Message != tc.want.Message || e.Action != tc.want.Action || string(e.Content) != string(tc.want.Content) || e.By != tc.want.By || e.Error != tc.want.Error {
-				t.Errorf("entry = %+v, want %+v", e, tc.want)
+			if answer.Phase != ElicitationAnswer || answer.Asked != got[0].ID {
+				t.Errorf("answer entry = %+v, want phase answer naming ask entry %s", answer, got[0].ID)
 			}
-			if got[0].CallID == "" {
-				t.Error("the entry names no call")
+			if answer.Message != tc.want.Message || answer.Action != tc.want.Action || string(answer.Content) != string(tc.want.Content) || answer.By != tc.want.By || answer.Error != tc.want.Error {
+				t.Errorf("answer entry = %+v, want %+v", answer, tc.want)
+			}
+			// The tool asked of its own: the question is about the call
+			// it is filed under and names no other.
+			if ask.Call != "" || ask.Tool != "" || ask.Parent != "" || answer.Call != "" {
+				t.Errorf("a tool's own question names a call: ask %+v, answer %+v", ask, answer)
+			}
+			if got[0].CallID == "" || got[1].CallID != got[0].CallID {
+				t.Errorf("the entries name calls %q and %q, want the asking call on both", got[0].CallID, got[1].CallID)
 			}
 			if tc.want.Error == "" && string(answered) != tc.want.Action {
 				t.Errorf("the tool got %q", answered)
 			}
-			if types := entryTypes(s); !strings.Contains(types, "dispatch custom item:function_call_output") {
+			if types := entryTypes(s); !strings.Contains(types, "dispatch custom custom item:function_call_output") {
 				t.Errorf("entries = %q", types)
 			}
 		})
 	}
+}
+
+// elicitationOf decodes an [ElicitationNS] entry.
+func elicitationOf(t *testing.T, c *agentsession.CustomEntry) Elicitation {
+	t.Helper()
+	var e Elicitation
+	if err := json.Unmarshal(c.Data, &e); err != nil {
+		t.Fatal(err)
+	}
+	return e
 }
 
 // TestEntryOfAfterRebase checks that the items of an agent seeded from
