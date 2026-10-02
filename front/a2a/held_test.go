@@ -288,6 +288,73 @@ func TestAnswerToOwnCallRefused(t *testing.T) {
 	}
 }
 
+// TestDeferredStubSurvivesAReceiverOwningItsName pins that ownership of
+// a pending call is judged by the configuration that made it: triage
+// offered the caller's declared lookup stub and deferred the model's
+// call to it in the batch that also ran the transfer to refunds, which
+// owns a lookup of its own. The next message starts under refunds, yet
+// the pending lookup is the caller's: a message that does not answer it
+// is shown it again, and the caller's answer is taken (review of #209).
+func TestDeferredStubSurvivesAReceiverOwningItsName(t *testing.T) {
+	var ran []string
+	lookup := agenttool.NewFunc("lookup", "looks up", json.RawMessage(`{"type":"object"}`),
+		func(_ context.Context, call agenttool.Call) (agenttool.Result, error) {
+			ran = append(ran, call.ID)
+			return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: "found"}}, nil
+		})
+	refunds := agentturn.Config{Name: "refunds", Model: &echo.Adapter{}, Tools: []agenttool.Tool{lookup}}
+	route := func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+		return refunds, "transferred", call.Name == "transfer_to_refunds_agent"
+	}
+	for _, tc := range []struct {
+		name    string
+		answer  bool
+		want    a2a.TaskState
+		pending int
+	}{
+		{"a message that does not answer it", false, a2a.TaskStateInputRequired, 1},
+		{"the caller's answer", true, a2a.TaskStateCompleted, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ran = nil
+			store := &MemoryStore{}
+			if err := store.Save(context.Background(), "c1", openresponses.Items{
+				openresponses.UserText("look up and transfer me"),
+				&openresponses.FunctionCall{CallID: "call_1", Name: "lookup", Arguments: "{}"},
+				&openresponses.FunctionCall{CallID: "call_2", Name: "transfer_to_refunds_agent", Arguments: "{}"},
+				openresponses.NewFunctionCallOutput("call_2", "transferred"),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			h := a2asrv.NewHandler(New(agentturn.Config{Name: "triage", Model: &echo.Adapter{}}, WithConversationStore(store), WithTransfers(route)))
+			var msg *a2a.Message
+			if tc.answer {
+				msg = a2a.NewMessage(a2a.MessageRoleUser, a2a.DataPart{Data: map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "INV-42"}})
+			} else {
+				msg = a2a.NewMessage(a2a.MessageRoleUser, a2a.TextPart{Text: "any news?"})
+			}
+			msg.ContextID = "c1"
+			res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: msg})
+			if err != nil {
+				t.Fatalf("send: %v", err)
+			}
+			task, _ := res.(*a2a.Task)
+			if task == nil || task.Status.State != tc.want {
+				t.Fatalf("task = %+v, want %s", res, tc.want)
+			}
+			stored, _ := store.Load(context.Background(), "c1")
+			if got := unanswered(stored); len(got) != tc.pending {
+				t.Errorf("stored conversation waits on %d call(s), want %d: %s", len(got), tc.pending, itemTypes(stored))
+			}
+			for _, id := range ran {
+				if id == "call_1" {
+					t.Errorf("the caller's call ran here: %v", ran)
+				}
+			}
+		})
+	}
+}
+
 // TestStaleOwnCallIsClosed pins the other half of #209's guard: a
 // stored conversation holding a pending call to one of the agent's own
 // tools, left by an older release, is not wedged. A message that does

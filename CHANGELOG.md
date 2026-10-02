@@ -19,13 +19,13 @@ versions may break the API.
   both by `human`, and without an elicitor, or on a cancel or a failure
   to ask, the call is refused with a reason saying it cannot be handed
   to the caller. After a `WithHandoff` switch the receiver's hook asks
-  the sender's elicitor when its own configuration has none. An output
-  pending call to one of the agent's own tools that the caller does not
-  own, which only an older release or a seeded store can hold, is
-  dropped when the conversation is loaded, as an aborted run's
+  the sender's elicitor when its own configuration has none. A pending
+  call to a tool the agent owned when it made the call and the caller
+  does not own, which only an older release or a seeded store can hold,
+  is dropped when the conversation is loaded, as an aborted run's
   unanswered calls are, and a message answering it is refused as
-  invalid params; a pending call whose name the caller owns too stays
-  the caller's. The package doc says which calls a caller answers
+  invalid params; a call whose name the caller owns, or that the
+  configuration that made it did not offer, stays the caller's. The package doc says which calls a caller answers
   (#209).
 - **The batch runs the calls the transcript holds, whatever the stream
   knew them by.** The response the turn acts on was renamed by output

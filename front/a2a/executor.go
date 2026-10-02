@@ -279,19 +279,9 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer e.track(reqCtx.TaskID, cancel)()
-	start := e.cfg
-	switch {
-	case e.start != nil:
-		if cfg, ok := e.start(runCtx, slices.Concat(transcript, prompts)); ok {
-			start = cfg
-		}
-	case e.route != nil:
-		if cfg, ok := HandedTo(transcript, e.route); ok {
-			start = cfg
-		}
-	}
+	start := e.startFor(runCtx, slices.Concat(transcript, prompts))
 	caller := slices.Concat(e.callerTools, declared)
-	transcript, closed := e.closeOwnPending(runCtx, transcript, start, caller)
+	transcript, closed := e.closeOwnPending(runCtx, transcript, caller)
 	for _, item := range prompts {
 		if fco, ok := item.(*openresponses.FunctionCallOutput); ok && closed[fco.CallID] != "" {
 			// The message answers a call the caller can never answer,
@@ -631,38 +621,40 @@ func (e *Executor) transfers(name string) bool {
 }
 
 // closeOwnPending drops from t every pending call to a tool the agent
-// owns and the caller does not, and returns the dropped calls by ID
-// with their names. A run no longer leaves such a call pending, since
-// the hook asks the elicitor or refuses it, so one in the store was
-// left by an older release or seeded; the caller cannot answer it, and
-// listing it to the caller again on every message would wedge the
-// conversation, so it is dropped as a call that will never be answered,
-// as [stripUnanswered] drops an aborted run's. A pending call whose
-// name the caller owns as well, through [WithCallerTools] or the
-// message's declaration, is the caller's: a receiver of a handoff that
-// lacks the agent's tool of that name offered the caller's stub, and
-// the model's call to it was deferred to the caller. The agent's tools
-// are resolved once, on the first pending call, since most
-// conversations hold none.
-func (e *Executor) closeOwnPending(ctx context.Context, t agentturn.Transcript, start agentturn.Config, caller []*openresponses.FunctionTool) (agentturn.Transcript, map[string]string) {
-	pending := unanswered(t)
-	if len(pending) == 0 {
-		return t, nil
-	}
+// owned when it made the call and the caller does not own, and returns
+// the dropped calls by ID with their names. A run no longer leaves such
+// a call pending, since the hook asks the elicitor or refuses it, so
+// one in the store was left by an older release or seeded; the caller
+// cannot answer it, and listing it to the caller again on every message
+// would wedge the conversation, so it is dropped as a call that will
+// never be answered, as [stripUnanswered] drops an aborted run's.
+//
+// Ownership is judged by the configuration that made the call, the one
+// the conversation up to that call starts under, as [startFor] picks
+// it, not by the one the next message starts under: a receiver of a
+// handoff may own a name the sender offered as the caller's stub, and
+// the sender's deferred call to it is the caller's. A pending call
+// whose name the caller owns under [WithCallerTools] or the message's
+// declaration is the caller's whatever the agent owns. A transfer the
+// route takes is the agent's under any configuration.
+func (e *Executor) closeOwnPending(ctx context.Context, t agentturn.Transcript, caller []*openresponses.FunctionTool) (agentturn.Transcript, map[string]string) {
+	answered := answeredCalls(t)
 	callers := map[string]bool{}
 	for _, ft := range caller {
 		callers[ft.Name] = true
 	}
-	var own agenttool.Set
 	closed := map[string]string{}
-	for _, fc := range pending {
-		if callers[fc.Name] {
+	for i, item := range t {
+		fc, ok := item.(*openresponses.FunctionCall)
+		if !ok || answered[fc.CallID] || callers[fc.Name] {
 			continue
 		}
-		if own == nil {
-			own = e.ownTools(ctx, start)
+		if e.transfers(fc.Name) {
+			closed[fc.CallID] = fc.Name
+			continue
 		}
-		if _, ok := own.Lookup(fc.Name); ok || e.transfers(fc.Name) {
+		maker := e.startFor(ctx, t[:i])
+		if _, ok := agenttool.Set(maker.ResolveTools(ctx)).Lookup(fc.Name); ok {
 			closed[fc.CallID] = fc.Name
 		}
 	}
@@ -677,6 +669,23 @@ func (e *Executor) closeOwnPending(ctx context.Context, t agentturn.Transcript, 
 		out = append(out, item)
 	}
 	return out, closed
+}
+
+// startFor returns the configuration a task over t starts under:
+// [WithStart]'s choice, else where the last transfer [WithTransfers]'
+// route takes left the conversation, else the executor's own.
+func (e *Executor) startFor(ctx context.Context, t agentturn.Transcript) agentturn.Config {
+	switch {
+	case e.start != nil:
+		if cfg, ok := e.start(ctx, t); ok {
+			return cfg
+		}
+	case e.route != nil:
+		if cfg, ok := HandedTo(t, e.route); ok {
+			return cfg
+		}
+	}
+	return e.cfg
 }
 
 // runConfig returns the config for one run: cfg's tools plus the
@@ -705,9 +714,9 @@ func (e *Executor) closeOwnPending(ctx context.Context, t agentturn.Transcript, 
 // same way without one. The elicitor is read from the hook's context,
 // where the loop puts the running configuration's, so one inherited
 // across a handoff is seen; cfg's own is the fallback. The question is
-// asked from inside the hook, so the batch's preflight, and a nested
-// call another tool of the batch makes meanwhile, wait on the answer as
-// they would on any hook; the deferral this replaces ended the run.
+// asked from inside the hook, before any call of the batch runs, so the
+// batch waits on the answer as it would on any hook; the deferral this
+// replaces ended the run.
 func (e *Executor) runConfig(cfg agentturn.Config, caller []*openresponses.FunctionTool) agentturn.Config {
 	if len(caller) == 0 && cfg.BeforeToolCall == nil {
 		// No caller-owned tool to defer to, and no hook to hold a
