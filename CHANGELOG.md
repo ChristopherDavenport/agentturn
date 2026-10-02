@@ -215,6 +215,29 @@ versions may break the API.
   with `ItemAt` and `Position`, which v0.0.14 adds; the front hands an
   `OutputGuard` the items opened before a message, not those at the
   indexes below the message's.
+- **A model switch, a Plan-to-Act switch or a handoff across models no
+  longer leaves the rest of the session's responses unhashed
+  (agentsession format 0.11).** The loop leaves the reasoning another
+  model produced out of a request, and the record had no way to say so:
+  every response after the switch was written without a `request_hash`
+  and an `agentturn:unhashed` entry, for as long as that reasoning was
+  on the path. The recorder now writes the omit setting,
+  `reasoning: other_models`, in the config entry that changes the model
+  when the context holds reasoning of another, and hashes each later
+  request against the context rebuilt under the rule, so the response
+  verifies and `Session.Verify` has nothing to report; a switch back is
+  covered by the same rule. `Transcript`, `TranscriptModels` and
+  `AgentOptions` still return every item the path holds, the omitted
+  reasoning included, so an agent resumed on a different model than the
+  leaf's keeps what that model may be sent. The `agentturn:unhashed`
+  entry stays for the causes the format cannot describe.
+- **A hand-back names what the path already holds.** An instruction part
+  whose text the path holds, in force or not, is written as its hash, and
+  a run of the omitted list an earlier config entry wrote is a keep
+  carrying `of`, naming that entry, as format 0.11 lets a writer do,
+  where each was repeated whole; the recorder keeps the histories the
+  helpers need, and starts them afresh after a compaction, as the
+  checkpoint does for a reader.
 
 ## v0.0.15 - 2026-10-01
 

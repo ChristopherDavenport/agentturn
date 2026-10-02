@@ -526,7 +526,14 @@ should not have to alias one of them.
 - Computes `request_hash` from the `Request` carried on `turn_start`
   using the RFC's definition (JCS canonical form, SHA-256). The
   implementation is a copy of `agentsession.RequestHash` tested against
-  the same golden vectors, so the two never drift.
+  the same golden vectors, so the two never drift. The hash is of the
+  request the path rebuilds, which since format 0.11 leaves out what
+  the omit setting says: the config entry that changes the model writes
+  `omit: {reasoning: other_models}` when the context holds reasoning
+  another model produced, as the loop leaves it out of the request of
+  its own accord, so a model switch, a Plan-to-Act switch or a handoff
+  across models keeps every later response verifiable. Only a cause the
+  format cannot describe is left to an `agentturn:unhashed` entry.
 - On `tool_end` whose `Details` is a `ChildInfo`, writes a `link` entry
   with `rel: subsession` and the spawning `call_id`. The child's own
   session is written live through `Recorder.Observe`, registered as the

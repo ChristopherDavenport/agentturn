@@ -70,7 +70,18 @@
 //     they are composed of, a delta naming only the parts that moved,
 //     and what the host left out as instructions_omitted when it
 //     changed, since the list stays in force until a config changes
-//     it, each run of parts unchanged in it a keep.
+//     it, each run of parts unchanged in it a keep. A part whose text
+//     the path holds, in force or not, is named by its hash, and a run
+//     of an omitted list an earlier entry wrote is a keep naming that
+//     entry with of, when either is shorter, as format 0.11 lets a
+//     hand-back be; a compaction starts both afresh. A config entry
+//     that changes the model, when the context holds reasoning another
+//     model produced, also carries the omit setting
+//     [agentsession.OmitOtherModels], which says a request leaves that
+//     reasoning out, as the loop does of its own accord. The rule stays
+//     in force, so each request after is hashed against the context
+//     it rebuilds, a model switch, a Plan-to-Act switch or a handoff
+//     across models included, and a switch back is covered too.
 //   - model_retry: a custom entry in the [ModelRetryNS] namespace
 //     saying which attempt failed, why, how long the loop waited and
 //     whether Retry.Revise changed the request; and the settings of the
@@ -647,8 +658,11 @@ const ModelCallIDMember = "agentturn:model_call_id"
 // the recorded path rebuilds: a Transform or a BeforeModelCall changed
 // it in a way the record does not describe, it carries items the
 // recorder never wrote, such as a child's seed transcript, or it
-// leaves out items the path holds, such as the loop leaving another
-// model's reasoning out of the request. Its data is an [Unhashed]. It
+// leaves out items the path holds that no setting of the format
+// describes. The loop leaving another model's reasoning out of the
+// request is described, by the omit setting the recorder writes with
+// the model change, and is not a cause; a host that sends the reasoning
+// the setting says it leaves out, or leaves out more, is. Its data is an [Unhashed]. It
 // is written before the first response entry left without a hash for
 // that cause, and again only when the cause changes, its reason or the
 // item the path rebuilds where the inputs part, or after a response
@@ -864,6 +878,11 @@ type writer struct {
 	items  []string
 	values openresponses.Items
 	custom []bool
+	// models holds, beside each item, the model in force when a
+	// reasoning item a response produced was written, "" for every other
+	// item: what the omit rule [agentsession.OmitOtherModels] compares
+	// with the model of a request.
+	models []string
 	// foldSet says the last fold recorded replaces the first foldSplit
 	// items with foldSummary in the rebuilt context; foldPinned are the
 	// items of the folded prefix that fold kept verbatim, which follow
@@ -1545,9 +1564,14 @@ func AgentOptions(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Opti
 // saw before. It is the transcript
 // [AgentOptions] seeds an agent with, and the one to give
 // Agent.SetTranscript after [Recorder.Rebase] or to seed the agent of
-// a [Start] on a base with; Context.Items differs from it only by
-// those items, which the filter keeps out of every request anyway. Each
-// call decodes those items afresh.
+// a [Start] on a base with; Context.Items differs from it by those
+// items, which the filter keeps out of every request anyway, and by
+// the items the omit setting in force leaves out of a request to the
+// model at the leaf, which a request to another model may hold: the
+// transcript is the whole conversation, and [TranscriptModels] says
+// which model produced each reasoning item so the loop leaves out of
+// a request what that model must not be sent. Each call decodes those
+// items afresh.
 func Transcript(s *agentsession.Session) (openresponses.Items, error) {
 	cx, err := s.Context()
 	if err != nil {
@@ -1575,25 +1599,7 @@ func TranscriptModels(s *agentsession.Session) (openresponses.Items, agentturn.R
 		return nil, nil, fmt.Errorf("session: context at leaf: %w", err)
 	}
 	items, entries, _ := transcriptOf(cx)
-	// The settings a response's items were written under are the ones
-	// its request carried: the recorder settles them before the
-	// response's first item.
-	produced := map[string]string{}
-	var settings agentsession.Settings
-	for _, e := range s.Path(s.Leaf()) {
-		switch v := e.(type) {
-		case *agentsession.ConfigEntry:
-			settings = settings.Apply(v)
-		case *agentsession.ItemEntry:
-			if _, ok := v.Item.(*openresponses.ReasoningItem); ok && v.ResponseID != "" {
-				produced[v.ID] = settings.Model
-			}
-		case *agentsession.CustomEntry:
-			if _, _, ok := MarkedItem(v); ok && v.NS == openresponses.ItemTypeReasoning {
-				produced[v.ID] = settings.Model
-			}
-		}
-	}
+	produced := producedModels(s.Path(s.Leaf()))
 	models := agentturn.ReasoningModels{}
 	for i, item := range items {
 		r, ok := item.(*openresponses.ReasoningItem)
@@ -1607,12 +1613,47 @@ func TranscriptModels(s *agentsession.Session) (openresponses.Items, agentturn.R
 	return items, models, nil
 }
 
+// producedModels returns, for each entry of path that holds a
+// reasoning item a response produced, the model of the settings in
+// force when it was written: the ones its request carried, which the
+// recorder settles before the response's first item. An entry written
+// under no model is left out.
+func producedModels(path []agentsession.Entry) map[string]string {
+	produced := map[string]string{}
+	var settings agentsession.Settings
+	for _, e := range path {
+		switch v := e.(type) {
+		case *agentsession.ConfigEntry:
+			settings = settings.Apply(v)
+		case *agentsession.ItemEntry:
+			if _, ok := v.Item.(*openresponses.ReasoningItem); ok && v.ResponseID != "" && settings.Model != "" {
+				produced[v.ID] = settings.Model
+			}
+		case *agentsession.CustomEntry:
+			if _, _, ok := MarkedItem(v); ok && v.NS == openresponses.ItemTypeReasoning && settings.Model != "" {
+				produced[v.ID] = settings.Model
+			}
+		}
+	}
+	return produced
+}
+
 // transcriptOf is the transcript of cx, as [Transcript] reads it, with
 // the ID of the entry contributing each item, and whether that entry
-// is a custom entry, outside the context, one [MarkedItem] decodes.
+// is a custom entry, outside the context, one [MarkedItem] decodes. The
+// items the omit setting leaves out of a request to the model at the
+// leaf are in it, where the path holds them.
 func transcriptOf(cx agentsession.Context) (items openresponses.Items, entries []string, custom []bool) {
+	omitted := make(map[agentsession.Entry]bool, len(cx.OmittedItems))
+	for _, o := range cx.OmittedItems {
+		omitted[o.Entry] = true
+	}
 	j := 0
 	for _, e := range cx.Entries {
+		if ie, ok := e.(*agentsession.ItemEntry); ok && omitted[e] {
+			items, entries, custom = append(items, ie.Item), append(entries, ie.ID), append(custom, false)
+			continue
+		}
 		// A compaction contributes its summary and its pins in a row.
 		for ; j < len(cx.ItemEntries) && cx.ItemEntries[j] == e; j++ {
 			items, entries, custom = append(items, cx.Items[j]), append(entries, e.Base().ID), append(custom, false)
@@ -2549,7 +2590,7 @@ func (w *writer) reset() {
 	w.inFlight, w.pending, w.started, w.inFlightID = false, "", time.Time{}, ""
 	w.unhashed, w.noted = nil, nil
 	w.unnamed = nil
-	w.items, w.values, w.custom = nil, nil, nil
+	w.items, w.values, w.custom, w.models = nil, nil, nil, nil
 	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = false, 0, nil, nil
 	w.calls = map[string]*callRecord{}
 	// The links written are on the branch left: a call whose child is
@@ -2574,6 +2615,11 @@ func (w *writer) seed(ctx context.Context, s *agentsession.Session, owed bool) e
 	w.settings = cx.Settings
 	w.wroteConfig = hasConfig(cx.Entries)
 	w.values, w.items, w.custom = transcriptOf(cx)
+	produced := producedModels(s.Path(s.Leaf()))
+	w.models = make([]string, len(w.items))
+	for i, id := range w.items {
+		w.models[i] = produced[id]
+	}
 	w.base = lastConfigBase(s.Path(s.Leaf()))
 	// The env in force is the last on the path, one a compaction left
 	// out of the context included: an env entry contributes nothing to
@@ -3357,7 +3403,7 @@ func (w *writer) differs(ctx context.Context, req openresponses.Request, tools b
 		return false
 	}
 	next, have := agentsession.Settings{}.Apply(full), w.settings
-	have.InstructionsParts, have.InstructionsOmitted = nil, nil
+	have.InstructionsParts, have.InstructionsOmitted, have.Omit = nil, nil, agentsession.Omit{}
 	if len(w.settings.InstructionsParts) > 0 {
 		if parts, _ := w.instructionParts(ctx, req); len(parts) == 0 {
 			next.Instructions, have.Instructions = "", ""
@@ -3566,7 +3612,7 @@ func (w *writer) name(ctx context.Context, responseID string) (bool, error) {
 // hash returns the request's hash when its input is what the stored
 // path rebuilds, and otherwise "" and why not.
 func (w *writer) hash(req openresponses.Request) (string, *Unhashed, error) {
-	expected, ok := w.expectedInput()
+	expected, ok := w.expectedInput(req.Model, w.omitFor(req.Model))
 	if !ok {
 		return "", &Unhashed{Reason: "the last fold recorded keeps more items than the recorder holds"}, nil
 	}
@@ -3635,8 +3681,9 @@ func (w *writer) noteUnhashed(ctx context.Context, why *Unhashed) error {
 // expectedInput is the input the stored path rebuilds, as the context
 // algorithm reads it: the summary of the last fold recorded, then the
 // items that fold pinned, then the items written as item entries from
-// the fold's first kept one on.
-func (w *writer) expectedInput() (openresponses.Items, bool) {
+// the fold's first kept one on, less the ones omit leaves out of a
+// request to model.
+func (w *writer) expectedInput(model string, omit agentsession.Omit) (openresponses.Items, bool) {
 	from := 0
 	var out openresponses.Items
 	if w.foldSet {
@@ -3647,12 +3694,53 @@ func (w *writer) expectedInput() (openresponses.Items, bool) {
 		out = append(out, w.foldSummary)
 		out = append(out, w.foldPinned...)
 	}
+	listed := make(map[string]bool, len(omit.Items))
+	for _, id := range omit.Items {
+		listed[id] = true
+	}
 	for i := from; i < len(w.values); i++ {
-		if !w.custom[i] {
-			out = append(out, w.values[i])
+		if w.custom[i] || listed[w.items[i]] || w.leftOut(i, model, omit) {
+			continue
 		}
+		out = append(out, w.values[i])
 	}
 	return out, true
+}
+
+// leftOut reports whether omit's rule leaves the reasoning item at
+// index i out of a request to model: it is one a response produced
+// while another model was in force. A request under no model leaves
+// out nothing, and nor does one for an item written under none.
+func (w *writer) leftOut(i int, model string, omit agentsession.Omit) bool {
+	return omit.Reasoning == agentsession.OmitOtherModels && model != "" && w.models[i] != "" && w.models[i] != model
+}
+
+// omitFor returns the omit setting a request to model is built under.
+// It is the one in force, unless the model is not the one in force and
+// the context holds reasoning another model produced: the config entry
+// that changes the model then also carries the rule that leaves that
+// reasoning out, which the loop does of its own accord, so the request
+// is the one the path rebuilds and keeps its hash. The rule stays in
+// force, since it reads the model each request carries, and a switch
+// back is covered too. settle writes what this returns, so a request is
+// hashed against the context the path will hold when it is sent.
+func (w *writer) omitFor(model string) agentsession.Omit {
+	have := w.settings.Omit
+	if have.Reasoning == agentsession.OmitOtherModels || model == "" || !w.wroteConfig || model == w.settings.Model {
+		return have
+	}
+	from := 0
+	if w.foldSet {
+		from = min(w.foldSplit, len(w.values))
+	}
+	for i := from; i < len(w.values); i++ {
+		if !w.custom[i] && w.models[i] != "" && w.models[i] != model {
+			have.Items = slices.Clone(have.Items)
+			have.Reasoning = agentsession.OmitOtherModels
+			return have
+		}
+	}
+	return have
 }
 
 // blocked records a call BeforeModelCall refused: the settings the
@@ -3706,13 +3794,21 @@ func (w *writer) settle(ctx context.Context, req openresponses.Request) error {
 	// carries only what moved, each run of parts unchanged a keep, and
 	// [] when it emptied.
 	omittedDelta := w.settings.OmittedDelta(omitted)
+	// What a request leaves out of the context is the path's to say,
+	// and it is written with the model change it answers: a delta
+	// carrying the rule, or nothing when it is in force.
+	want := w.omitFor(req.Model)
+	omit, ok := w.settings.OmitDelta(want)
+	if !ok {
+		return fmt.Errorf("session: omit setting %+v is not one config entry", want)
+	}
 	var entry *agentsession.ConfigEntry
 	switch {
 	case !w.wroteConfig:
 		entry = full
 	default:
 		entry = configDelta(w.settings, agentsession.Settings{}.Apply(full), full, parts, omitted)
-		if entry == nil && omittedDelta != nil {
+		if entry == nil && (omittedDelta != nil || omit != nil) {
 			// Nothing in force moved, but what was left out did: the
 			// entry says so and changes no setting.
 			entry = &agentsession.ConfigEntry{}
@@ -3727,9 +3823,23 @@ func (w *writer) settle(ctx context.Context, req openresponses.Request) error {
 		case !entry.Replace:
 			entry.InstructionsOmitted = omittedDelta
 		}
-		if _, err := w.append(ctx, entry); err != nil {
+		// A replace discards the omit with the rest, so it carries what
+		// is wanted whole; a delta carries what moved.
+		if entry.Replace {
+			if !want.IsZero() {
+				kept := agentsession.Omit{Reasoning: want.Reasoning, Items: slices.Clone(want.Items)}
+				entry.Omit = &kept
+			}
+		} else {
+			entry.Omit = omit
+		}
+		id, err := w.append(ctx, entry)
+		if err != nil {
 			return err
 		}
+		// The entry's ID is what a later keep or hash names the lists
+		// and parts it put in force by.
+		entry.ID = id
 		w.settings = w.settings.Apply(entry)
 	}
 	w.wroteConfig = true
@@ -3923,6 +4033,11 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 	w.items = append(w.items, id)
 	w.values = append(w.values, item)
 	w.custom = append(w.custom, appOnly)
+	model := ""
+	if _, ok := item.(*openresponses.ReasoningItem); ok && responseID != "" {
+		model = w.settings.Model
+	}
+	w.models = append(w.models, model)
 	switch v := item.(type) {
 	case *openresponses.FunctionCall:
 		if appOnly {
@@ -4492,8 +4607,23 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 		}
 		entry.Unknown = map[string]json.RawMessage{FoldMember: raw}
 	}
-	_, err = w.append(ctx, entry)
-	return err
+	if _, err = w.append(ctx, entry); err != nil {
+		return err
+	}
+	// The checkpoint writes what was in force whole: no entry before it
+	// is named by a later keep, and no part that left force before it by
+	// a later hash, so the settings carry on from what a reader of the
+	// path has, without the histories they replayed.
+	raw, err := json.Marshal(w.settings)
+	if err != nil {
+		return fmt.Errorf("session: encode settings: %w", err)
+	}
+	var settled agentsession.Settings
+	if err := json.Unmarshal(raw, &settled); err != nil {
+		return fmt.Errorf("session: decode settings: %w", err)
+	}
+	w.settings = settled
+	return nil
 }
 
 // foldCall names the model call a fold made: the hash and model of its
@@ -4656,9 +4786,11 @@ func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntr
 		// the same text still describe it.
 		prev.InstructionsParts = nil
 	}
-	// What was left out reaches no request, and settle writes it.
+	// What was left out reaches no request, and settle writes it, as it
+	// does the omit setting, which no request carries.
 	omittedDelta := prev.OmittedDelta(omitted)
 	prev.InstructionsOmitted = nil
+	prev.Omit = agentsession.Omit{}
 	if equalJSON(prev, next) {
 		return nil
 	}
