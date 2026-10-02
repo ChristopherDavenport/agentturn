@@ -50,7 +50,8 @@
 //     [ConfigBaseMember]; then, with [WithEnv], for the recorder's own
 //     session, the env entry it supplies when it differs from the last
 //     one on the path, members the library does not define included,
-//     and for a child session that holds none, a copy of the env in
+//     and for a child session that holds none, the entry the function
+//     returns for the child's context, or for nil a copy of the env in
 //     force in its parent's; then, with a configuration, a full config
 //     entry before the first item, so a root starts with one as the
 //     format recommends, and a delta when the configuration
@@ -963,14 +964,22 @@ func WithoutChildSessions() Option {
 // unchanged environment adds nothing; a nil entry writes nothing. The
 // recorder gathers nothing itself: what the host knows about its
 // environment is the host's to supply, and the recorder stays free of
-// the file system. An error at run_start fails the run. A run's start
-// asks for the environment in the recorder's own session alone. A
-// child session's first run start, when the session holds no env
-// entry, writes a copy of the one in force in its parent's at that
-// moment, since the format does not read an environment through
-// parent_session: the child's file then names the workspace it ran in,
-// a move it makes is a later entry of its own, and [Recorder.Env]
-// compares with the child's entry, not its parent's. A workspace
+// the file system. An error at run_start fails the run; at a child's
+// run start, which an observer cannot fail, it ends the record of that
+// child where it is, as a store failure there does. A run's start asks
+// for the environment in the recorder's own session, and at a child
+// session's first run start, when the session holds no env entry, with
+// the child's context: the context the observer receives, the call's,
+// which carries what the host put on it for the child, a sandbox of
+// the child's own among them. The entry the function returns is the
+// child's first, with nothing to compare against, since a child given
+// a workspace of its own never ran where its parent is; for nil the
+// child is where its parent is, and a copy of the env in force in its
+// parent's at that moment is written instead, since the format does
+// not read an environment through parent_session. Either way the
+// child's file then names the workspace it ran in, a move it makes is
+// a later entry of its own, and [Recorder.Env] compares with the
+// child's entry, not its parent's. A workspace
 // that can move while a run goes on, a sandbox in a pool that
 // reschedules it, is recorded only as far as the host calls
 // [Recorder.Env] when it moves: the start of the next run reads the
@@ -3052,11 +3061,27 @@ func (w *writer) differs(ctx context.Context, req openresponses.Request, tools b
 }
 
 // inheritEnv writes, in a child's session that holds no env entry, the
-// env in force for it, its parent's at this moment, so the child's
-// file names the workspace it starts in: a move it makes is then a
-// later env entry to every reader, and [Recorder.Env] compares with
-// the child's own entry rather than its parent's, which may move on.
+// env in force for it, so the child's file names the workspace it
+// starts in: a move it makes is then a later env entry to every
+// reader, and [Recorder.Env] compares with the child's own entry
+// rather than its parent's, which may move on. The host's function is
+// asked first, with the child's context, since a child given a sandbox
+// of its own never ran where its parent is: what it returns is the
+// child's first entry, with nothing to compare against. When it
+// returns nil, the child is where its parent is, and a copy of the env
+// in force in the parent's session at this moment is written instead.
 func (w *writer) inheritEnv(ctx context.Context) error {
+	env, err := w.rec.env(ctx)
+	if err != nil {
+		return fmt.Errorf("session: env: %w", err)
+	}
+	if env != nil {
+		if _, err := w.append(ctx, env); err != nil {
+			return err
+		}
+		w.env = env
+		return nil
+	}
 	have, err := w.rec.envInForce(ctx, w)
 	if err != nil || have == nil {
 		return err

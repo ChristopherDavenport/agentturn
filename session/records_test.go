@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -757,6 +758,16 @@ func isEnv(e agentsession.Entry) bool {
 	return ok
 }
 
+// envOn is the env entry of a sandbox on node, the node a member of
+// the workspace, where the format's substitution rule looks.
+func envOn(node string) *agentsession.EnvEntry {
+	e := agentsession.NewEnvEntry("/work")
+	if err := e.SetWorkspace(agentsession.WorkspaceContainer, "sandbox").SetMember("node", node); err != nil {
+		panic(err)
+	}
+	return e
+}
+
 // envNodes lists the node of each env entry in entries.
 func envNodes(entries []agentsession.Entry) string {
 	var nodes []string
@@ -920,6 +931,130 @@ func TestEnvInAChild(t *testing.T) {
 		verifyAll(t, s)
 		verifyAll(t, child)
 	})
+}
+
+// nodeKey carries, on a tool call's context, the node a child's own
+// sandbox is on, as a host that gives a sub-agent a container of its
+// own puts the sandbox on the call's context.
+type nodeKey struct{}
+
+// onNode runs its tool with the node on the call's context.
+type onNode struct {
+	agenttool.Tool
+	node string
+}
+
+func (o onNode) Execute(ctx context.Context, call agenttool.Call) (agenttool.Result, error) {
+	return o.Tool.Execute(context.WithValue(ctx, nodeKey{}, o.node), call)
+}
+
+// TestChildWithItsOwnWorkspace pins #214: a child's first run start
+// asks the WithEnv function with the child's context, so a child the
+// host gave a sandbox of its own starts under it, its first dispatch
+// is filed where it ran and a later Recorder.Env that finds it there
+// writes nothing; a child the function returns nil for is where its
+// parent is, and starts under a copy of its parent's env as before; an
+// error from the function at the child's start ends the child's
+// record there, since an observer cannot fail the child's run.
+func TestChildWithItsOwnWorkspace(t *testing.T) {
+	boom := errors.New("sandbox gone")
+	cases := []struct {
+		name string
+		// childNode is what the env function returns for the child's
+		// context, "" for nil.
+		childNode string
+		err       error
+		// wantChild is the child's env entries, and wantFirst whether
+		// its first entry after the run start is an env.
+		wantChild string
+		wantFirst bool
+	}{
+		{name: "a sandbox of its own", childNode: "node-9", wantChild: "node-9", wantFirst: true},
+		{name: "where its parent is", wantChild: "node-1", wantFirst: true},
+		{name: "the function fails", err: boom},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			var asked []string
+			// later is set once the child's run is over, when a job
+			// of the child's finds itself on node-9.
+			later := false
+			env := func(ctx context.Context) (*agentsession.EnvEntry, error) {
+				node, own := ctx.Value(nodeKey{}).(string)
+				asked = append(asked, node)
+				switch {
+				case !own:
+					return envOn("node-1"), nil
+				case tc.err != nil:
+					return nil, tc.err
+				case later:
+					return envOn("node-9"), nil
+				case tc.childNode == "":
+					return nil, nil
+				}
+				return envOn(tc.childNode), nil
+			}
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(ctx, store, agentsession.Header{}, WithEnv(env))
+			if err != nil {
+				t.Fatal(err)
+			}
+			childCfg := agentturn.Config{Name: "specialist", Description: "builds in its own sandbox", Model: scriptedCalls{{"upper", `{"text":"t"}`}}, Tools: []agenttool.Tool{upper}}
+			specialist := agent.New(childCfg, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{onNode{specialist, "node-9"}}})
+			defer rec.Attach(a)()
+			if _, err := a.Prompt(ctx, openresponses.UserText("delegate")); err != nil {
+				t.Fatal(err)
+			}
+			if len(asked) < 2 || asked[1] != "node-9" {
+				t.Fatalf("the env function was asked with %q, want the child's context second", asked)
+			}
+			child, err := store.Open(ctx, agentsession.SubsessionID(s.ID(), links(s)[0].CallID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := envNodes(child.Entries()); got != tc.wantChild {
+				t.Errorf("child env entries = %q, want %q", got, tc.wantChild)
+			}
+			if tc.wantFirst {
+				if first := child.Entries()[1]; !isEnv(first) {
+					t.Errorf("the child's run start is followed by %s, want its env", first.EntryType())
+				}
+				// The dispatch is filed under the env the child ran in.
+				types := strings.Fields(entryTypes(child))
+				if !slices.Contains(types, "dispatch") || slices.Index(types, "env") > slices.Index(types, "dispatch") {
+					t.Errorf("child entries = %q, want the env before the dispatch", entryTypes(child))
+				}
+				verifyAll(t, child)
+			}
+			if got := envNodes(s.Entries()); got != "node-1" {
+				t.Errorf("root env entries = %q, want node-1", got)
+			}
+			verifyAll(t, s)
+			if tc.err != nil {
+				return
+			}
+			// A job the child started finds itself on node-9: nothing
+			// is written for a child that started there, and a move
+			// for one that started where its parent is.
+			later = true
+			if err := rec.Env(context.WithValue(ContextWithSessionID(ctx, child.ID()), nodeKey{}, "node-9")); err != nil {
+				t.Fatal(err)
+			}
+			child, err = store.Open(ctx, child.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "node-9"
+			if tc.childNode == "" {
+				want = "node-1,node-9"
+			}
+			if got := envNodes(child.Entries()); got != want {
+				t.Errorf("child env entries after Env = %q, want %q", got, want)
+			}
+		})
+	}
 }
 
 func TestFoldCallIsRecorded(t *testing.T) {
@@ -1764,13 +1899,6 @@ func TestFoldedCallIDsStayReserved(t *testing.T) {
 // root resumed after a compaction writes no second copy of its env.
 func TestEnvSurvivesACompaction(t *testing.T) {
 	ctx := context.Background()
-	envOn := func(node string) *agentsession.EnvEntry {
-		e := agentsession.NewEnvEntry("/work")
-		if err := e.SetWorkspace(agentsession.WorkspaceContainer, "sandbox").SetMember("node", node); err != nil {
-			t.Fatal(err)
-		}
-		return e
-	}
 	env := func(context.Context) (*agentsession.EnvEntry, error) { return envOn("node-1"), nil }
 	cases := []struct {
 		name string
