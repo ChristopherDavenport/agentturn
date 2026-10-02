@@ -321,9 +321,11 @@ func (*ItemEnd) EventType() string { return EventItemEnd }
 // failed is delivered here too, before the run ends with the error, so
 // a recorder can write it, and so is one a [Config.OutputGuard]
 // withheld a message of, with Withheld set. The response's function
-// calls are the items the transcript holds, the same values item_end
-// delivered, so a consumer that edits one edits the transcript: treat
-// every item an event carries as read-only, as the transcript is.
+// calls the stream completed are the items the transcript holds, the
+// same values item_end delivered, so a consumer that edits one edits
+// the transcript: treat every item an event carries as read-only, as
+// the transcript is. A call the response lists that the stream never
+// completed is a copy carrying the ID the loop decided for it.
 type ResponseEnd struct {
 	RunID    string
 	Turn     int
@@ -658,6 +660,12 @@ type PendingCall struct {
 	// RanWhere says where the call ran, for a call with Ran: the reason
 	// an answer giving that output carries.
 	RanWhere string
+	// Refused is the reason the call was refused, for a call pending as
+	// [PendingRejected]: what a reject decision said before the output
+	// that carries it was written. The loop never sets it;
+	// agentturn/session's Pending does, from the record, and the output
+	// such a call is owed is this text, as ReplayAnswers gives it.
+	Refused string
 }
 
 // MayHaveRun reports whether the call may have run and an approval of

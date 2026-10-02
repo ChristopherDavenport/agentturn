@@ -1491,6 +1491,11 @@ type reusedIndexModel struct {
 	atZero bool
 	noID   idPlaces
 	turns  int
+	// accShaped builds the terminal response as openresponses.Accumulator
+	// builds one from a stream that reuses an index: one item per output
+	// index, the last opened there, so earlier calls at the index are
+	// not listed.
+	accShaped bool
 }
 
 // idPlaces names the events of a stream a call's item ID is left off.
@@ -1553,6 +1558,9 @@ func (m *reusedIndexModel) CreateStream(_ context.Context, req openresponses.Req
 		if resp, ok := openresponses.TerminalResponse(ev); ok {
 			for i, item := range resp.Output {
 				resp.Output[i] = strip(item, m.noID.response)
+			}
+			if m.accShaped && m.atZero && len(resp.Output) > 1 {
+				resp.Output = resp.Output[len(resp.Output)-1:]
 			}
 		}
 		return sink.Send(ev)
@@ -1733,12 +1741,16 @@ func TestGuardSeesCallsAtOneOutputIndex(t *testing.T) {
 func TestBatchRunsTheCallsTheTranscriptHolds(t *testing.T) {
 	all := idPlaces{added: true, done: true, response: true}
 	cases := []struct {
-		name   string
-		calls  []string
-		atZero bool
-		noID   idPlaces
+		name      string
+		calls     []string
+		atZero    bool
+		noID      idPlaces
+		accShaped bool
 	}{
 		{name: "a: one index, no item IDs", calls: []string{"call_a", "call_b"}, atZero: true, noID: all},
+		{name: "one index, no item IDs, terminal response lists the last call alone", calls: []string{"call_a", "call_b"}, atZero: true, noID: all, accShaped: true},
+		{name: "one index, one call ID, no item IDs, terminal response lists the last call alone", calls: []string{"call_0", "call_0"}, atZero: true, noID: all, accShaped: true},
+		{name: "one index, item IDs, terminal response lists the last call alone", calls: []string{"call_a", "call_b"}, atZero: true, accShaped: true},
 		{name: "b: one index, one call ID, no item IDs", calls: []string{"call_0", "call_0"}, atZero: true, noID: all},
 		{name: "c: one index, numbered per response, no item IDs", calls: []string{"call_0", "call_1"}, atZero: true, noID: all},
 		{name: "one index, three calls, no item IDs", calls: []string{"call_0", "call_1", "call_2"}, atZero: true, noID: all},
@@ -1753,11 +1765,11 @@ func TestBatchRunsTheCallsTheTranscriptHolds(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := &reusedIndexModel{calls: tc.calls, atZero: tc.atZero, noID: tc.noID}
+			m := &reusedIndexModel{calls: tc.calls, atZero: tc.atZero, noID: tc.noID, accShaped: tc.accShaped}
 			events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")},
 				Config{Model: m, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}}))
-			if err != nil || end.Reason != ReasonDone {
-				t.Fatalf("err=%v reason=%s", err, end.Reason)
+			if err != nil || end.Reason != ReasonDone || len(end.Pending) != 0 {
+				t.Fatalf("err=%v reason=%s pending=%d", err, end.Reason, len(end.Pending))
 			}
 			// The transcript: each call once, each answered once, by
 			// the output of its own arguments.

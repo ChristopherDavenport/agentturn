@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -1583,7 +1584,11 @@ func (r *runner) openedAt(index int) int {
 // which is the order the response lists them in, and each call of the response is
 // paired with one of them: by item ID when both carry one, else by the
 // call ID the model gave it among the completed calls not yet paired,
-// else by order. Renaming by output index alone, as before #210, named
+// else by order. When a completed call is left unpaired, which a
+// terminal response built one item per output index leaves out when a
+// later call took the index, the response's calls give way, as a group,
+// to the completed calls in the order they opened, so every call the
+// transcript holds is run and answered, in the transcript's order. Renaming by output index alone, as before #210, named
 // the last call opened at an index for every call the response listed
 // there, so a stream that opened every call at index 0 with no item
 // IDs ran one call twice, or each with the other's output. An item that
@@ -1624,6 +1629,37 @@ func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Respon
 		if _, ok := item.(*openresponses.FunctionCall); ok && paired[index] < 0 {
 			pair(index, func(*openedItem) bool { return true })
 		}
+	}
+	if slices.Contains(taken, false) {
+		// A completed call the response does not list, because the
+		// server built its terminal response one item per output index
+		// and a later call took the index, is in the transcript all the
+		// same and owed an output. Every call the response lists is
+		// paired by now, so the listed calls, as a group, give way to
+		// the completed calls in the order they opened, which is the
+		// transcript's order, where the first of them stood; an item
+		// that is not a call keeps its place.
+		copied := *resp
+		copied.Output = make(openresponses.Items, 0, len(resp.Output)+len(completed))
+		placed := false
+		for _, item := range resp.Output {
+			if _, ok := item.(*openresponses.FunctionCall); !ok {
+				copied.Output = append(copied.Output, item)
+				continue
+			}
+			if !placed {
+				for _, c := range completed {
+					copied.Output = append(copied.Output, c.done)
+				}
+				placed = true
+			}
+		}
+		if !placed {
+			for _, c := range completed {
+				copied.Output = append(copied.Output, c.done)
+			}
+		}
+		return &copied
 	}
 	var out *openresponses.Response
 	for index, item := range resp.Output {
