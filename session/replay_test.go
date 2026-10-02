@@ -779,6 +779,22 @@ func TestRebaseBeforeADispatch(t *testing.T) {
 			if len(pending) != 1 || pending[0].Reason != agentturn.PendingAborted || pending[0].IdempotencyKey != first || pending[0].Args != nil {
 				t.Fatalf("pending = %+v, want aborted under %q", pending, first)
 			}
+			// agentpolicy#63: a call that completed on the branch left
+			// carries its output and where it ran, so a host answering
+			// the call itself has what ReplayAnswers has.
+			checkRan := func(what string, p agentturn.PendingCall) {
+				t.Helper()
+				if tc.cut {
+					if p.Ran != nil || p.RanWhere != "" {
+						t.Errorf("%s: Ran = %+v where %q, want none for a call cut before its output", what, p.Ran, p.RanWhere)
+					}
+					return
+				}
+				if p.Ran == nil || p.Ran.Output.Text != "charged" || p.RanWhere != ranOffReason {
+					t.Errorf("%s: Ran = %+v where %q, want the output on the branch left, %q", what, p.Ran, p.RanWhere, ranOffReason)
+				}
+			}
+			checkRan("Pending", pending[0])
 			answers, err := ReplayAnswers(ctx, s, tools)
 			if err != nil {
 				t.Fatal(err)
@@ -788,6 +804,11 @@ func TestRebaseBeforeADispatch(t *testing.T) {
 				t.Fatal(err)
 			}
 			b := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: tools}, opts...)
+			if seeded := b.State().Pending; len(seeded) != 1 {
+				t.Fatalf("the agent is seeded with %d pending calls", len(seeded))
+			} else {
+				checkRan("State().Pending", seeded[0])
+			}
 			defer rec.Attach(b)()
 			if end, err := b.Resume(ctx, answers...); err != nil || end.Reason != agentturn.ReasonDone {
 				t.Fatalf("resume: err=%v end=%+v", err, end)
@@ -1107,6 +1128,11 @@ func TestForkReadsItsOrigin(t *testing.T) {
 			}
 			if len(pending) != 1 || pending[0].Reason != tc.want || pending[0].IdempotencyKey != tc.wantKey {
 				t.Fatalf("pending = %+v, want %s under %q", pending, tc.want, tc.wantKey)
+			}
+			// agentpolicy#63: a call that completed in the origin carries
+			// its output and where it ran, when the origin is read.
+			if ran := tc.origins && tc.completed; (pending[0].Ran != nil) != ran || ran && (pending[0].Ran.Output.Text != "charged" || pending[0].RanWhere != ranInOriginReason) || !ran && pending[0].RanWhere != "" {
+				t.Errorf("Ran = %+v where %q, want the origin's output (%v) with %q", pending[0].Ran, pending[0].RanWhere, ran, ranInOriginReason)
 			}
 			var answers []agentturn.Answer
 			if tc.answer != nil {

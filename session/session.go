@@ -1255,10 +1255,17 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // run carries the key of its last dispatch and the arguments that
 // dispatch ran with, the pair a run of it again repeats, the last
 // dispatch in the session when none is on the path, and one the
-// file cannot say about the arguments a decision gave it. It is what
+// file cannot say about the arguments a decision gave it. A call whose
+// dispatch off the path, on the branch a rebase left or in the session
+// this one forks, is followed there by its output ran there, and
+// carries that output as Ran and where it ran as RanWhere, "ran on a
+// branch the rebase left" or "ran in the session this one forks": the
+// answer [ReplayAnswers] gives it, and the one a host answering the
+// call itself should give rather than running the call again or
+// telling the model its outcome is unknown. It is what
 // [agentturn.WithPending] seeds an agent with beside the context's
-// items, so the agent's Resume knows which calls never started;
-// [AgentOptions] gives both.
+// items, so the agent's Resume knows which calls never started and
+// which ran elsewhere; [AgentOptions] gives both.
 //
 // A call in a fork's prefix has its dispatch, if any, in the session
 // the fork was made from, which s does not hold: the file cannot say
@@ -1268,15 +1275,7 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // a rebase left. [Recorder.ReadOptions] gives the options that read a
 // session as the recorder writing it does.
 func Pending(s *agentsession.Session, opts ...ReadOption) ([]agentturn.PendingCall, error) {
-	pending, err := pendingCalls(s, opts)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]agentturn.PendingCall, len(pending))
-	for i, p := range pending {
-		out[i] = p.PendingCall
-	}
-	return out, nil
+	return pendingCalls(s, opts)
 }
 
 // ReadOption configures how [Pending], [AgentOptions] and
@@ -1379,21 +1378,10 @@ func (o *origins) dispatchOff(s *agentsession.Session, callEntry string) (*agent
 	return nil, nil, nil
 }
 
-// pendingCall is a call pending at the leaf as [Pending] reads it, with
-// the output it has on the branch of the dispatch Pending found off the
-// path, when it has one there: it ran there, and that is what it
-// returned. ranWhere says where, as the reason of the answer giving it.
-type pendingCall struct {
-	agentturn.PendingCall
-	ranOff   *openresponses.FunctionCallOutput
-	ranWhere string
-}
-
-// pendingCalls is [Pending] with the output each call has off the path.
-// The origins are read under the context the last [WithContext] in
-// opts gives, which [ReplayAnswers] appends its own as, and under
-// context.Background() without one.
-func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]pendingCall, error) {
+// pendingCalls is [Pending]. The origins are read under the context the
+// last [WithContext] in opts gives, which [ReplayAnswers] appends its
+// own as, and under context.Background() without one.
+func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.PendingCall, error) {
 	if s.Leaf() == "" {
 		return nil, nil
 	}
@@ -1407,9 +1395,9 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]pendingCall, er
 	if err != nil {
 		return nil, fmt.Errorf("session: pending calls at leaf: %w", err)
 	}
-	var out []pendingCall
+	var out []agentturn.PendingCall
 	for _, c := range calls {
-		p := pendingCall{PendingCall: agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingUnknown}}
+		p := agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingUnknown}
 		state := c.State(s.Header())
 		switch state {
 		case agentsession.CallHeld:
@@ -1437,9 +1425,13 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]pendingCall, er
 				if off, err = callAt(at, d, c.Entry.ID); err != nil {
 					return nil, err
 				}
-				p.ranOff, p.ranWhere = outputAfter(at, d, c.Entry.ID), ranOffReason
-				if at != s {
-					p.ranWhere = ranInOriginReason
+				// The call ran where its dispatch is when its output
+				// follows it there: that is its outcome.
+				if p.Ran = outputAfter(at, d, c.Entry.ID); p.Ran != nil {
+					p.RanWhere = ranOffReason
+					if at != s {
+						p.RanWhere = ranInOriginReason
+					}
 				}
 				if state == agentsession.CallHeld {
 					p.Dispatched = true
@@ -1713,13 +1705,13 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 			}
 			ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Output: openresponses.FunctionCallOutputData{Text: reason}})
 		default:
-			if p.ranOff != nil {
+			if p.Ran != nil {
 				// The call ran on the branch its dispatch is on, and the
 				// session holds what it returned: that is its outcome.
-				ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Status: p.ranOff.Status, Output: p.ranOff.Output}).WithReason(p.ranWhere)
+				ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Status: p.Ran.Status, Output: p.Ran.Output}).WithReason(p.RanWhere)
 				break
 			}
-			ans = replayAnswer(ctx, set, p.PendingCall)
+			ans = replayAnswer(ctx, set, p)
 			if q := openQuestion(s, id); q != nil && ans.Output != nil {
 				// The call was waiting on a person when the run was
 				// cut: the answer says so, and what it asked.
