@@ -290,20 +290,23 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 			start = cfg
 		}
 	}
-	if err := checkAnswers(transcript, prompts, e.owned(runCtx, start)); err != nil {
-		if errors.Is(err, a2a.ErrInvalidParams) {
+	caller := slices.Concat(e.callerTools, declared)
+	transcript, closed := e.closeOwnPending(runCtx, transcript, start, caller)
+	for _, item := range prompts {
+		if fco, ok := item.(*openresponses.FunctionCallOutput); ok && closed[fco.CallID] != "" {
 			// The message answers a call the caller can never answer,
-			// one to the agent's own tool; repeating it would leave
-			// the task waiting for an answer that is refused each time.
-			return err
+			// one to the agent's own tool, which is closed above; a
+			// message that does not answer it goes on without it.
+			return fmt.Errorf("%w: function_call_output %q answers a call to %q, the agent's own tool, which the caller cannot answer", a2a.ErrInvalidParams, fco.CallID, closed[fco.CallID])
 		}
+	}
+	if err := checkAnswers(transcript, prompts); err != nil {
 		// A follow-up that does not answer the pending calls leaves the
 		// task where it was, input-required, with the calls repeated
 		// and the rule stated; failing the task would make it
 		// unrecoverable.
 		return e.inputRequired(ctx, reqCtx, q, unanswered(transcript), err.Error())
 	}
-	caller := slices.Concat(e.callerTools, declared)
 	if err := e.checkDeclared(runCtx, declared, start); err != nil {
 		return fmt.Errorf("%w: %w", a2a.ErrInvalidParams, err)
 	}
@@ -627,19 +630,53 @@ func (e *Executor) transfers(name string) bool {
 	return ok
 }
 
-// owned returns the function that says whether a call to name is the
-// agent's to answer: to a tool it offers, under the executor's
-// configuration or start, or a transfer the route takes. The tools are
-// resolved once, on the first call, since most messages answer nothing.
-func (e *Executor) owned(ctx context.Context, start agentturn.Config) func(name string) bool {
+// closeOwnPending drops from t every pending call to a tool the agent
+// owns and the caller does not, and returns the dropped calls by ID
+// with their names. A run no longer leaves such a call pending, since
+// the hook asks the elicitor or refuses it, so one in the store was
+// left by an older release or seeded; the caller cannot answer it, and
+// listing it to the caller again on every message would wedge the
+// conversation, so it is dropped as a call that will never be answered,
+// as [stripUnanswered] drops an aborted run's. A pending call whose
+// name the caller owns as well, through [WithCallerTools] or the
+// message's declaration, is the caller's: a receiver of a handoff that
+// lacks the agent's tool of that name offered the caller's stub, and
+// the model's call to it was deferred to the caller. The agent's tools
+// are resolved once, on the first pending call, since most
+// conversations hold none.
+func (e *Executor) closeOwnPending(ctx context.Context, t agentturn.Transcript, start agentturn.Config, caller []*openresponses.FunctionTool) (agentturn.Transcript, map[string]string) {
+	pending := unanswered(t)
+	if len(pending) == 0 {
+		return t, nil
+	}
+	callers := map[string]bool{}
+	for _, ft := range caller {
+		callers[ft.Name] = true
+	}
 	var own agenttool.Set
-	return func(name string) bool {
+	closed := map[string]string{}
+	for _, fc := range pending {
+		if callers[fc.Name] {
+			continue
+		}
 		if own == nil {
 			own = e.ownTools(ctx, start)
 		}
-		_, ok := own.Lookup(name)
-		return ok || e.transfers(name)
+		if _, ok := own.Lookup(fc.Name); ok || e.transfers(fc.Name) {
+			closed[fc.CallID] = fc.Name
+		}
 	}
+	if len(closed) == 0 {
+		return t, nil
+	}
+	out := make(agentturn.Transcript, 0, len(t))
+	for _, item := range t {
+		if fc, ok := item.(*openresponses.FunctionCall); ok && closed[fc.CallID] != "" {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out, closed
 }
 
 // runConfig returns the config for one run: cfg's tools plus the
@@ -667,7 +704,10 @@ func (e *Executor) owned(ctx context.Context, start agentturn.Config) func(name 
 // to the loop, which asks the same elicitor and refuses the call the
 // same way without one. The elicitor is read from the hook's context,
 // where the loop puts the running configuration's, so one inherited
-// across a handoff is seen; cfg's own is the fallback.
+// across a handoff is seen; cfg's own is the fallback. The question is
+// asked from inside the hook, so the batch's preflight, and a nested
+// call another tool of the batch makes meanwhile, wait on the answer as
+// they would on any hook; the deferral this replaces ended the run.
 func (e *Executor) runConfig(cfg agentturn.Config, caller []*openresponses.FunctionTool) agentturn.Config {
 	if len(caller) == 0 && cfg.BeforeToolCall == nil {
 		// No caller-owned tool to defer to, and no hook to hold a
@@ -796,31 +836,26 @@ func unanswered(t agentturn.Transcript) []*openresponses.FunctionCall {
 // checkAnswers enforces the resume contract when the stored conversation
 // waits on caller-owned calls: the message must carry exactly one
 // function_call_output for each pending call and nothing else, the same
-// rule agentturn.Agent.Resume applies. An output for a pending call to
-// a tool the agent owns, as owned says, is refused with
-// a2a.ErrInvalidParams: the caller answers only calls to the tools it
-// owns, and a run leaves no such call pending, so one in the store came
-// from an older release or a seeded conversation (issue #209).
-func checkAnswers(t agentturn.Transcript, prompts openresponses.Items, owned func(name string) bool) error {
+// rule agentturn.Agent.Resume applies. A pending call to a tool the
+// agent owns and the caller does not never reaches it: closeOwnPending
+// drops it from the conversation first, and Execute refuses a message
+// answering it as invalid params (issue #209).
+func checkAnswers(t agentturn.Transcript, prompts openresponses.Items) error {
 	pending := unanswered(t)
 	if len(pending) == 0 {
 		return nil
 	}
-	want := make(map[string]*openresponses.FunctionCall, len(pending))
+	want := make(map[string]bool, len(pending))
 	for _, fc := range pending {
-		want[fc.CallID] = fc
+		want[fc.CallID] = true
 	}
 	for _, item := range prompts {
 		fco, ok := item.(*openresponses.FunctionCallOutput)
 		if !ok {
 			return fmt.Errorf("task is waiting on %d tool call(s); the message may only carry their function_call_output items", len(pending))
 		}
-		fc, ok := want[fco.CallID]
-		if !ok {
+		if !want[fco.CallID] {
 			return fmt.Errorf("function_call_output %q does not answer a pending call", fco.CallID)
-		}
-		if owned(fc.Name) {
-			return fmt.Errorf("%w: function_call_output %q answers a call to %q, the agent's own tool, which the caller cannot answer", a2a.ErrInvalidParams, fco.CallID, fc.Name)
 		}
 		delete(want, fco.CallID)
 	}

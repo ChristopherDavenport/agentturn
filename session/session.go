@@ -1706,7 +1706,10 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // call to a child session, a tools/agent child's, writes the same
 // subsession link for the call on the new branch before the answer, so
 // the record ties the output to the child session that produced it
-// rather than to nothing. A call an answer ended before its output was written gets
+// rather than to nothing; in a fork, the linked child's header names
+// the origin session as its parent, not this one, so a reader that
+// derives the child's ID from this session and the call does not find
+// it and follows the link instead. A call an answer ended before its output was written gets
 // [agentturn.OutcomeUnknown] as that output, since the record holds
 // the answer and not the output it gave. A held call is waiting for
 // someone and is the caller's to answer, a call held after its

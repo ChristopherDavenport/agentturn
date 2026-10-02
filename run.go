@@ -1580,7 +1580,7 @@ func (r *runner) openedAt(index int) int {
 // which carries the call ID decideCallID gave it and the arguments it
 // completed with, so the calls the batch runs are the ones the
 // transcript holds. The completed calls are in the order they opened,
-// which is the transcript's order, and each call of the response is
+// which is the order the response lists them in, and each call of the response is
 // paired with one of them: by item ID when both carry one, else by the
 // call ID the model gave it among the completed calls not yet paired,
 // else by order. Renaming by output index alone, as before #210, named

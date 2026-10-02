@@ -20,9 +20,12 @@ versions may break the API.
   to ask, the call is refused with a reason saying it cannot be handed
   to the caller. After a `WithHandoff` switch the receiver's hook asks
   the sender's elicitor when its own configuration has none. An output
-  a message carries for a pending call to one of the agent's own tools,
-  which only an older release or a seeded store can hold, is refused as
-  invalid params. The package doc says which calls a caller answers
+  pending call to one of the agent's own tools that the caller does not
+  own, which only an older release or a seeded store can hold, is
+  dropped when the conversation is loaded, as an aborted run's
+  unanswered calls are, and a message answering it is refused as
+  invalid params; a pending call whose name the caller owns too stays
+  the caller's. The package doc says which calls a caller answers
   (#209).
 - **The batch runs the calls the transcript holds, whatever the stream
   knew them by.** The response the turn acts on was renamed by output

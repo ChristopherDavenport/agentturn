@@ -244,6 +244,10 @@ func TestAnswerToOwnCallRefused(t *testing.T) {
 		})}, "issue_refund", "", true},
 		{"a transfer the route takes", nil, []Option{WithTransfers(route)}, "transfer_to_refunds_agent", "", true},
 		{"a caller-owned tool", nil, nil, "remote", "remote", false},
+		// The executor's configuration owns the name too, and a receiver
+		// of a handoff without it offered the caller's stub: the pending
+		// call is the caller's (review of #209).
+		{"a caller tool the agent's configuration shadows", []agenttool.Tool{refund}, []Option{WithCallerTools(&openresponses.FunctionTool{Name: "issue_refund", Parameters: json.RawMessage(`{"type":"object"}`)})}, "issue_refund", "", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ran = 0
@@ -281,6 +285,59 @@ func TestAnswerToOwnCallRefused(t *testing.T) {
 				t.Errorf("stored = %s, want the conversation as it was", itemTypes(stored))
 			}
 		})
+	}
+}
+
+// TestStaleOwnCallIsClosed pins the other half of #209's guard: a
+// stored conversation holding a pending call to one of the agent's own
+// tools, left by an older release, is not wedged. A message that does
+// not answer it goes on, the call is dropped from the conversation, the
+// caller is shown no pending call, and the tool never runs.
+func TestStaleOwnCallIsClosed(t *testing.T) {
+	// The echo model calls the first tool it is offered, so the new run
+	// makes a call of its own; the stale call_1 must not be the one run.
+	var ran []string
+	refund := agenttool.NewFunc("issue_refund", "refunds a charge", json.RawMessage(`{"type":"object"}`),
+		func(_ context.Context, call agenttool.Call) (agenttool.Result, error) {
+			ran = append(ran, call.ID)
+			return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: "refunded"}}, nil
+		})
+	store := &MemoryStore{}
+	if err := store.Save(context.Background(), "c1", openresponses.Items{
+		openresponses.UserText("refund me"),
+		&openresponses.FunctionCall{CallID: "call_1", Name: "issue_refund", Arguments: "{}"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := a2asrv.NewHandler(New(agentturn.Config{Name: "triage", Model: &echo.Adapter{}, Tools: []agenttool.Tool{refund}}, WithConversationStore(store)))
+	msg := a2a.NewMessage(a2a.MessageRoleUser, a2a.TextPart{Text: "never mind"})
+	msg.ContextID = "c1"
+	res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: msg})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	task, _ := res.(*a2a.Task)
+	if task == nil || task.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("task = %+v, want completed", res)
+	}
+	if task.Status.Message != nil {
+		if meta := task.Status.Message.Meta(); meta[MetaPendingCalls] != nil {
+			t.Errorf("the caller was shown pending calls: %v", meta[MetaPendingCalls])
+		}
+	}
+	for _, id := range ran {
+		if id == "call_1" {
+			t.Errorf("the stale call ran: issue_refund ran as %v", ran)
+		}
+	}
+	stored, _ := store.Load(context.Background(), "c1")
+	for _, item := range stored {
+		if fc, ok := item.(*openresponses.FunctionCall); ok && fc.CallID == "call_1" {
+			t.Errorf("stored = %s, want the stale call dropped", itemTypes(stored))
+		}
+	}
+	if len(unanswered(stored)) != 0 {
+		t.Errorf("stored conversation still waits on %d call(s)", len(unanswered(stored)))
 	}
 }
 

@@ -90,9 +90,17 @@
 // call's output. The task therefore never goes input-required on a
 // call of the agent's own, and a transfer the hook held becomes a
 // handoff only when the person lets it run. A stored conversation that
-// nonetheless holds a pending call to a tool the agent offers, left by
-// an older release or seeded, is not the caller's to answer: an output
-// for it is refused as invalid params.
+// nonetheless holds a pending call to a tool the agent offers and the
+// caller does not, left by an older release or seeded, is not the
+// caller's to answer: the call is dropped when the conversation is
+// loaded, as an aborted run's unanswered calls are, so the next message
+// goes on without it, and a message that answers it is refused as
+// invalid params. A pending call whose name the caller owns too, under
+// [WithCallerTools] or its declaration, stays the caller's, since a
+// receiver of a handoff without the agent's tool of that name offered
+// the caller's. The question is put from the hook, before any call of
+// the batch runs, so the batch waits on the person as it would on any
+// hook; before this, a deferral ended the run instead.
 //
 // # Recording
 //
