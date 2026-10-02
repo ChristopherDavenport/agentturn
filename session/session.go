@@ -119,7 +119,11 @@
 //     decision, the format's verdict for a call ended without running
 //     again, whose by is Answer.By and whose reason is Answer.Reason;
 //     the absence of a second dispatch says the tool did not run
-//     again. A call the path shows answered already, its output lost
+//     again. One that repeats the output a child session produced on
+//     the branch left, which [ReplayAnswers] marks with Answer.Origin,
+//     is preceded as well by the subsession link for the call, naming
+//     that child, so the new branch ties the output to the session
+//     that did the work. A call the path shows answered already, its output lost
 //     to a crash between the two or to a write that failed after the
 //     answer, gets its output alone; only an output answers it, and
 //     [Pending] reads it as [agentturn.PendingAnswered]. A second
@@ -257,7 +261,10 @@
 //     records of a parallel batch say whose each one is. This is how a tool
 //     keeps what its output does not carry, the full bytes of a
 //     truncated result for one, in the session without the recorder
-//     knowing its type. Details for in-process subscribers alone are
+//     knowing its type. A question is two entries, the question before
+//     it is put and the answer after, naming the call it is about when
+//     the asker said, so a run cut while a person was deciding shows
+//     the open question. Details for in-process subscribers alone are
 //     not recorded.
 //
 // # Header
@@ -573,23 +580,59 @@ type ModelBlocked struct {
 // ElicitationNS is the namespace of the custom entry written for a
 // question a tool asked the user mid-call, through the elicitor
 // [Recorder.Elicitor] wraps. Its data is an [Elicitation], and its
-// call_id names the call that asked when the session holds it.
+// call_id names the call that asked when the session holds it: the
+// call on the asking tool's context, the invoking call for a question
+// about a nested call, or, when the context carries no call the
+// session holds, the call the question is about.
+//
+// Each question is two entries: one with phase ask, written before the
+// question is put, so a run cut while a person was deciding shows what
+// it was waiting on, and one with phase answer after it is answered,
+// naming the ask entry in asked. A reader of a cut run that finds an
+// ask under an in-flight call with no answer naming it after it takes
+// the question as still open at the cut. An entry with no phase was
+// written by an earlier release, question and answer in one.
 const ElicitationNS = "agentturn:elicitation"
 
-// Elicitation is the data of an [ElicitationNS] custom entry: the
-// question and what became of it.
+// ElicitationAsk and ElicitationAnswer are the phases of an
+// [Elicitation]: the question as it is put, and the answer once given.
+const (
+	ElicitationAsk    = "ask"
+	ElicitationAnswer = "answer"
+)
+
+// Elicitation is the data of an [ElicitationNS] custom entry: a
+// question as it is put to the user, or what became of it.
 type Elicitation struct {
+	// Phase is [ElicitationAsk] on the entry written before the
+	// question is put and [ElicitationAnswer] on the one written after
+	// it is answered; empty on an entry an earlier release wrote,
+	// which holds question and answer in one.
+	Phase string `json:"phase,omitempty"`
+	// Call is the ID of the call the question is about, when the asker
+	// put one on the context as agentturn.AskedCall: a nested call the
+	// hook deferred, or the model's call a front asks about. Tool is
+	// its name and Parent the call whose tool made it, for a nested
+	// one. All three are empty for a question a tool asks of its own,
+	// which is about the call on the entry's call_id.
+	Call   string `json:"call,omitempty"`
+	Tool   string `json:"tool,omitempty"`
+	Parent string `json:"parent,omitempty"`
+	// Asked, on the answer entry, is the ID of the ask entry it answers.
+	Asked string `json:"asked,omitempty"`
+	// Message, Schema and URL are the question, on both entries.
 	Message string          `json:"message,omitempty"`
 	Schema  json.RawMessage `json:"schema,omitempty"`
 	URL     string          `json:"url,omitempty"`
-	// Action is accept, decline or cancel; empty when Error is set.
+	// Action is accept, decline or cancel, on the answer entry; empty
+	// when Error is set.
 	Action  string          `json:"action,omitempty"`
 	Content json.RawMessage `json:"content,omitempty"`
 	// By is who answered, in the session format's terms; empty when
 	// nobody was asked or the asking failed.
 	By string `json:"by,omitempty"`
 	// Error is the harness's failure to ask, which the tool sees as an
-	// error rather than an answer.
+	// error rather than an answer, on the answer entry.
 	Error string `json:"error,omitempty"`
 }
 
@@ -963,6 +1006,14 @@ type callRecord struct {
 	// was handed over. An output arriving in that run is then the
 	// loop's own refusal rather than a caller's answer.
 	settledRun string
+	// ranEntry, for a call with no dispatch on the path and one off
+	// it, is the entry of the output that follows that dispatch on its
+	// branch, the output [Pending] gives as Ran, and childOff the child
+	// session that branch links to the call, when it holds a link: an
+	// output answered now with ranEntry as its origin repeats that
+	// child's work, and the link comes with it.
+	ranEntry string
+	childOff string
 }
 
 // Option configures a Recorder.
@@ -1216,10 +1267,17 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // run carries the key of its last dispatch and the arguments that
 // dispatch ran with, the pair a run of it again repeats, the last
 // dispatch in the session when none is on the path, and one the
-// file cannot say about the arguments a decision gave it. It is what
+// file cannot say about the arguments a decision gave it. A call whose
+// dispatch off the path, on the branch a rebase left or in the session
+// this one forks, is followed there by its output ran there, and
+// carries that output as Ran and where it ran as RanWhere, "ran on a
+// branch the rebase left" or "ran in the session this one forks": the
+// answer [ReplayAnswers] gives it, and the one a host answering the
+// call itself should give rather than running the call again or
+// telling the model its outcome is unknown. It is what
 // [agentturn.WithPending] seeds an agent with beside the context's
-// items, so the agent's Resume knows which calls never started;
-// [AgentOptions] gives both.
+// items, so the agent's Resume knows which calls never started and
+// which ran elsewhere; [AgentOptions] gives both.
 //
 // A call in a fork's prefix has its dispatch, if any, in the session
 // the fork was made from, which s does not hold: the file cannot say
@@ -1229,15 +1287,8 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // a rebase left. [Recorder.ReadOptions] gives the options that read a
 // session as the recorder writing it does.
 func Pending(s *agentsession.Session, opts ...ReadOption) ([]agentturn.PendingCall, error) {
-	pending, err := pendingCalls(s, opts)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]agentturn.PendingCall, len(pending))
-	for i, p := range pending {
-		out[i] = p.PendingCall
-	}
-	return out, nil
+	pending, _, err := pendingCalls(s, opts)
+	return pending, err
 }
 
 // ReadOption configures how [Pending], [AgentOptions] and
@@ -1340,23 +1391,14 @@ func (o *origins) dispatchOff(s *agentsession.Session, callEntry string) (*agent
 	return nil, nil, nil
 }
 
-// pendingCall is a call pending at the leaf as [Pending] reads it, with
-// the output it has on the branch of the dispatch Pending found off the
-// path, when it has one there: it ran there, and that is what it
-// returned. ranWhere says where, as the reason of the answer giving it.
-type pendingCall struct {
-	agentturn.PendingCall
-	ranOff   *openresponses.FunctionCallOutput
-	ranWhere string
-}
-
-// pendingCalls is [Pending] with the output each call has off the path.
-// The origins are read under the context the last [WithContext] in
+// pendingCalls is [Pending], with the entry each call's Ran was read
+// from by call ID, for the origin of the answer [ReplayAnswers] gives
+// it. The origins are read under the context the last [WithContext] in
 // opts gives, which [ReplayAnswers] appends its own as, and under
 // context.Background() without one.
-func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]pendingCall, error) {
+func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.PendingCall, map[string]string, error) {
 	if s.Leaf() == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	o := &origins{ctx: context.Background()}
 	for _, opt := range opts {
@@ -1366,11 +1408,12 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]pendingCall, er
 	}
 	calls, err := s.PendingCalls(s.Leaf())
 	if err != nil {
-		return nil, fmt.Errorf("session: pending calls at leaf: %w", err)
+		return nil, nil, fmt.Errorf("session: pending calls at leaf: %w", err)
 	}
-	var out []pendingCall
+	var out []agentturn.PendingCall
+	ranAt := map[string]string{}
 	for _, c := range calls {
-		p := pendingCall{PendingCall: agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingUnknown}}
+		p := agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingUnknown}
 		state := c.State(s.Header())
 		switch state {
 		case agentsession.CallHeld:
@@ -1392,15 +1435,20 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]pendingCall, er
 		if len(c.Dispatches) == 0 && (state == agentsession.CallHeld || state == agentsession.CallNeverStarted || state == agentsession.CallUnknown) {
 			at, d, err := o.dispatchOff(s, c.Entry.ID)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if d != nil {
 				if off, err = callAt(at, d, c.Entry.ID); err != nil {
-					return nil, err
+					return nil, nil, err
 				}
-				p.ranOff, p.ranWhere = outputAfter(at, d, c.Entry.ID), ranOffReason
-				if at != s {
-					p.ranWhere = ranInOriginReason
+				// The call ran where its dispatch is when its output
+				// follows it there: that is its outcome.
+				var entry string
+				if p.Ran, entry = outputAfter(at, d, c.Entry.ID); p.Ran != nil {
+					ranAt[p.Call.CallID], p.RanWhere = entry, ranOffReason
+					if at != s {
+						p.RanWhere = ranInOriginReason
+					}
 				}
 				if state == agentsession.CallHeld {
 					p.Dispatched = true
@@ -1428,16 +1476,18 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]pendingCall, er
 		}
 		out = append(out, p)
 	}
-	return out, nil
+	return out, ranAt, nil
 }
 
 // outputAfter is the output of the call held by the entry callEntry
 // on a branch through its dispatch d, the last such the session holds,
-// or nil when no branch through d holds one. An output an answer
-// decision put there is not what the call returned but what someone
-// said of it, an outcome unknown among them, and is passed over.
-func outputAfter(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry string) *openresponses.FunctionCallOutput {
+// and the ID of its entry, or nil and "" when no branch through d
+// holds one. An output an answer decision put there is not what the
+// call returned but what someone said of it, an outcome unknown among
+// them, and is passed over.
+func outputAfter(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry string) (*openresponses.FunctionCallOutput, string) {
 	var out *openresponses.FunctionCallOutput
+	entry := ""
 	for _, e := range s.Entries() {
 		ie, ok := e.(*agentsession.ItemEntry)
 		if !ok {
@@ -1448,11 +1498,23 @@ func outputAfter(s *agentsession.Session, d *agentsession.DispatchEntry, callEnt
 		}
 		for _, c := range agentsession.Calls(s.Path(ie.ID)) {
 			if c.Entry.ID == callEntry && c.Output == ie && slices.Contains(c.Dispatches, d) && !c.Answered() {
-				out = ie.Item.(*openresponses.FunctionCallOutput)
+				out, entry = ie.Item.(*openresponses.FunctionCallOutput), ie.ID
 			}
 		}
 	}
-	return out
+	return out, entry
+}
+
+// subsessionOn is the child session the path to entry links to the
+// call callID, through a subsession link, or "" when it holds none.
+func subsessionOn(s *agentsession.Session, entry, callID string) string {
+	child := ""
+	for _, e := range s.Path(entry) {
+		if l, ok := e.(*agentsession.LinkEntry); ok && l.Rel == agentsession.RelSubsession && l.CallID == callID {
+			child = l.Session
+		}
+	}
+	return child
 }
 
 // callAt is the call held by the entry callEntry as the path to the
@@ -1624,7 +1686,11 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // safe" or "run again: keyed"; and it is answered with
 // [agentturn.OutcomeUnknown] otherwise, including when no tool has its
 // name, with a reason saying which: "not run again: no tool", "not run
-// again: keyed without a key" or "not run again: replay unknown". A
+// again: keyed without a key" or "not run again: replay unknown"; when
+// the path holds a question asked under the call that nothing
+// answered, an [ElicitationNS] ask with no answer naming it, the call
+// was waiting on a person when the run was cut, and the reason goes on
+// to name the question and the call it was about. A
 // call that may have run because its only dispatch is on a branch a
 // rebase left, and that its tool completed there, ran: it is answered
 // with the output that branch holds, with the reason "ran on a branch
@@ -1634,7 +1700,13 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // call in a fork's prefix that completed in the session the fork was
 // made from, with the reason "ran in the session this one forks". A
 // recorder writes either answer as an answer decision before the
-// output. A call an answer ended before its output was written gets
+// output. Either answer names the entry of the output it repeats as
+// its Origin, which the loop carries unread to the run's context, and
+// the recorder, finding that the branch holding that entry links the
+// call to a child session, a tools/agent child's, writes the same
+// subsession link for the call on the new branch before the answer, so
+// the record ties the output to the child session that produced it
+// rather than to nothing. A call an answer ended before its output was written gets
 // [agentturn.OutcomeUnknown] as that output, since the record holds
 // the answer and not the output it gave. A held call is waiting for
 // someone and is the caller's to answer, a call held after its
@@ -1647,7 +1719,7 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // pending call as one that may have run, and holds the approval of a
 // call that never started to the replay rule.
 func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agenttool.Tool, opts ...ReadOption) ([]agentturn.Answer, error) {
-	pending, err := pendingCalls(s, append(slices.Clone(opts), WithContext(ctx)))
+	pending, ranAt, err := pendingCalls(s, append(slices.Clone(opts), WithContext(ctx)))
 	if err != nil {
 		return nil, err
 	}
@@ -1670,17 +1742,69 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 			}
 			ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Output: openresponses.FunctionCallOutputData{Text: reason}})
 		default:
-			if p.ranOff != nil {
+			if p.Ran != nil {
 				// The call ran on the branch its dispatch is on, and the
 				// session holds what it returned: that is its outcome.
-				ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Status: p.ranOff.Status, Output: p.ranOff.Output}).WithReason(p.ranWhere)
+				ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Status: p.Ran.Status, Output: p.Ran.Output}).WithReason(p.RanWhere).WithOrigin(ranAt[id])
 				break
 			}
-			ans = replayAnswer(ctx, set, p.PendingCall)
+			ans = replayAnswer(ctx, set, p)
+			if q := openQuestion(s, id); q != nil && ans.Output != nil {
+				// The call was waiting on a person when the run was
+				// cut: the answer says so, and what it asked.
+				ans = ans.WithReason(ans.Reason + "; " + q.openReason())
+			}
 		}
 		out = append(out, ans.WithBy(agentsession.ByPolicy))
 	}
 	return out, nil
+}
+
+// openQuestion is the last question asked under callID on the path to
+// the leaf that nothing answered: an [ElicitationNS] entry with phase
+// ask that no answer entry after it names in asked. It is nil when
+// every question under the call was answered, or none was asked. An
+// entry an earlier release wrote, with no phase, holds its answer.
+func openQuestion(s *agentsession.Session, callID string) *Elicitation {
+	open := map[string]*Elicitation{}
+	var order []string
+	for _, e := range s.Path(s.Leaf()) {
+		c, ok := e.(*agentsession.CustomEntry)
+		if !ok || c.NS != ElicitationNS || c.CallID != callID {
+			continue
+		}
+		var q Elicitation
+		if json.Unmarshal(c.Data, &q) != nil {
+			continue
+		}
+		switch q.Phase {
+		case ElicitationAsk:
+			open[c.ID] = &q
+			order = append(order, c.ID)
+		case ElicitationAnswer:
+			delete(open, q.Asked)
+		}
+	}
+	for i := len(order) - 1; i >= 0; i-- {
+		if q, ok := open[order[i]]; ok {
+			return q
+		}
+	}
+	return nil
+}
+
+// openReason says the question was open when the run was cut, and
+// which call it was about, for the reason of the answer [ReplayAnswers]
+// gives the call it was asked under.
+func (e Elicitation) openReason() string {
+	reason := fmt.Sprintf("a question was open: %q", e.Message)
+	if e.Call != "" {
+		reason += " about call " + e.Call
+		if e.Tool != "" {
+			reason += " (" + e.Tool + ")"
+		}
+	}
+	return reason
 }
 
 // ranOffReason is the reason of the answer [ReplayAnswers] gives a
@@ -2064,6 +2188,14 @@ func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) int {
 // config entry, whatever the order the subscribers were registered in;
 // made during any later event of the turn, after it.
 func (r *Recorder) Annotate(ctx context.Context, ns string, data any) (string, error) {
+	return r.annotate(ctx, ns, data, "")
+}
+
+// annotate is [Recorder.Annotate] with a call to file the entry under
+// when the context carries none the session holds: the call a question
+// is about, for [Recorder.Elicitor], which a front asking about a
+// model's call puts on the context without a call of its own.
+func (r *Recorder) annotate(ctx context.Context, ns string, data any, about string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	w := r.writerOf(ctx)
@@ -2080,7 +2212,11 @@ func (r *Recorder) Annotate(ctx context.Context, ns string, data any) (string, e
 	if err != nil {
 		return "", fmt.Errorf("session: encode annotation %s: %w", ns, err)
 	}
-	return w.append(context.WithoutCancel(ctx), &agentsession.CustomEntry{NS: ns, Data: raw, CallID: w.callOn(ctx)})
+	callID := w.callOn(ctx)
+	if callID == "" && about != "" {
+		callID = w.heldCall(about)
+	}
+	return w.append(context.WithoutCancel(ctx), &agentsession.CustomEntry{NS: ns, Data: raw, CallID: callID})
 }
 
 // Env asks the function [WithEnv] set for the environment now and
@@ -2360,14 +2496,29 @@ func (r *Recorder) RecordFunc() agenttool.RecordFunc {
 }
 
 // Elicitor returns an elicitor that puts each question to fn and
-// writes the question and its answer as an [ElicitationNS] custom
-// entry, under the call that asked, before the answer returns to the
-// tool; by names who answers, in the session format's terms. Set it as
+// writes it as two [ElicitationNS] custom entries under the call that
+// asked: the question, with phase ask, before it is put to fn, and its
+// answer, with phase answer and asked naming the first entry, before
+// the answer returns to the tool; by names who answers, in the session
+// format's terms. A question the loop asks about a nested call, or a
+// front about a model's call, carries that call's ID, tool and parent
+// on both entries, from the agentturn.AskedCall on the context, so
+// consecutive questions are tied to the calls they are about by more
+// than their order; the entries' call_id stays the call on the
+// context, the invoking call for a nested one, and is the call asked
+// about when the context carries none the session holds. A run cut
+// while a person was deciding, the process killed with the question
+// open, leaves the ask and no answer, so a reader of the record knows
+// the in-flight call was waiting on a person and what it asked, and
+// [ReplayAnswers] names the open question in the reason of the answer
+// it gives that call. Set the elicitor as
 // agentturn.Config.ToolElicitor, or install it with
 // agenttool.ContextWithElicitor on the context a run is prompted with.
 // A nil fn answers every question with agenttool.ActionCancel, since
-// nobody was asked, and records that. A failure to write the entry is
-// returned to the tool as the harness failing to ask.
+// nobody was asked, and records that. A failure to write the ask entry
+// is returned to the tool as the harness failing to ask, and fn is not
+// called; a failure to write the answer entry is returned the same
+// way, joined with fn's error if it had one.
 //
 // An agent run from inside a tool served by agenttool's mcpserver
 // finds the elicitor that asks the MCP client on the call's context,
@@ -2383,21 +2534,30 @@ func (r *Recorder) RecordFunc() agenttool.RecordFunc {
 // cancelled.
 func (r *Recorder) Elicitor(by string, fn agenttool.Elicitor) agenttool.Elicitor {
 	return func(ctx context.Context, q agenttool.Elicitation) (agenttool.Answer, error) {
+		data := Elicitation{Phase: ElicitationAsk, Message: q.Message, Schema: q.Schema, URL: q.URL}
+		if about, ok := agentturn.AskedCallFrom(ctx); ok {
+			data.Call, data.Tool, data.Parent = about.CallID, about.Name, about.Parent
+		}
+		// The question is on the record before anyone is asked, so a
+		// run cut while they decide shows what it was waiting on.
+		asked, err := r.annotate(ctx, ElicitationNS, data, data.Call)
+		if err != nil {
+			return agenttool.Answer{}, err
+		}
 		ans := agenttool.Answer{Action: agenttool.ActionCancel}
-		var err error
 		who := ""
 		if fn != nil {
 			ans, err = fn(ctx, q)
 			who = by
 		}
-		data := Elicitation{Message: q.Message, Schema: q.Schema, URL: q.URL}
+		data.Phase, data.Asked = ElicitationAnswer, asked
 		if err != nil {
 			// Nobody answered: the harness failed to ask.
 			data.Error = err.Error()
 		} else {
 			data.Action, data.Content, data.By = string(ans.Action), ans.Content, who
 		}
-		if _, werr := r.Annotate(ctx, ElicitationNS, data); werr != nil {
+		if _, werr := r.annotate(ctx, ElicitationNS, data, data.Call); werr != nil {
 			return agenttool.Answer{}, errors.Join(err, werr)
 		}
 		return ans, err
@@ -2416,6 +2576,9 @@ func (w *writer) reset() {
 	w.items, w.values, w.custom = nil, nil, nil
 	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = false, 0, nil, nil
 	w.calls = map[string]*callRecord{}
+	// The links written are on the branch left: a call whose child is
+	// linked there and answered here gets the link again.
+	w.linked = map[string]bool{}
 	w.env = nil
 	w.base = ""
 	w.attempt, w.attemptModel, w.retries = nil, "", 0
@@ -2494,14 +2657,21 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 	o.r, _ = w.rec.store.(agentsession.Reader)
 	for _, c := range calls {
 		off := false
+		ranEntry, childOff := "", ""
 		if c.Output == nil && len(c.Dispatches) == 0 {
-			_, d, err := o.dispatchOff(s, c.Entry.ID)
+			at, d, err := o.dispatchOff(s, c.Entry.ID)
 			if err != nil {
 				return err
 			}
-			off = d != nil
+			if off = d != nil; off {
+				if _, ranEntry = outputAfter(at, d, c.Entry.ID); ranEntry != "" {
+					childOff = subsessionOn(at, ranEntry, c.ID())
+				}
+			}
 		}
-		w.calls[c.ID()] = callRecordOf(c, s.Header(), off)
+		rec := callRecordOf(c, s.Header(), off)
+		rec.ranEntry, rec.childOff = ranEntry, childOff
+		w.calls[c.ID()] = rec
 	}
 	return nil
 }
@@ -3663,6 +3833,17 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 				// The loop refused it after an approval, finding no
 				// tool, and the output says why.
 				by, reason = agentsession.ByPolicy, outputText(out)
+			}
+			if origin := agentturn.OriginFromContext(ctx, out.CallID); origin != "" && origin == c.ranEntry && c.childOff != "" {
+				// The output repeats one a child session produced on
+				// the branch left, and the link to that child comes
+				// with it, so the path says whose work the output is.
+				// The link on the branch left does not count: this
+				// branch holds none.
+				if _, err := w.append(ctx, agentsession.NewSubsessionLink(c.childOff, out.CallID)); err != nil {
+					return err
+				}
+				w.linked[out.CallID] = true
 			}
 			dec := agentsession.NewDecision(out.CallID, c.entry, agentsession.VerdictAnswer, by)
 			if reason != "" {

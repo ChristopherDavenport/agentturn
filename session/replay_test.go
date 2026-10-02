@@ -779,6 +779,22 @@ func TestRebaseBeforeADispatch(t *testing.T) {
 			if len(pending) != 1 || pending[0].Reason != agentturn.PendingAborted || pending[0].IdempotencyKey != first || pending[0].Args != nil {
 				t.Fatalf("pending = %+v, want aborted under %q", pending, first)
 			}
+			// agentpolicy#63: a call that completed on the branch left
+			// carries its output and where it ran, so a host answering
+			// the call itself has what ReplayAnswers has.
+			checkRan := func(what string, p agentturn.PendingCall) {
+				t.Helper()
+				if tc.cut {
+					if p.Ran != nil || p.RanWhere != "" {
+						t.Errorf("%s: Ran = %+v where %q, want none for a call cut before its output", what, p.Ran, p.RanWhere)
+					}
+					return
+				}
+				if p.Ran == nil || p.Ran.Output.Text != "charged" || p.RanWhere != ranOffReason {
+					t.Errorf("%s: Ran = %+v where %q, want the output on the branch left, %q", what, p.Ran, p.RanWhere, ranOffReason)
+				}
+			}
+			checkRan("Pending", pending[0])
 			answers, err := ReplayAnswers(ctx, s, tools)
 			if err != nil {
 				t.Fatal(err)
@@ -788,6 +804,11 @@ func TestRebaseBeforeADispatch(t *testing.T) {
 				t.Fatal(err)
 			}
 			b := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: tools}, opts...)
+			if seeded := b.State().Pending; len(seeded) != 1 {
+				t.Fatalf("the agent is seeded with %d pending calls", len(seeded))
+			} else {
+				checkRan("State().Pending", seeded[0])
+			}
 			defer rec.Attach(b)()
 			if end, err := b.Resume(ctx, answers...); err != nil || end.Reason != agentturn.ReasonDone {
 				t.Fatalf("resume: err=%v end=%+v", err, end)
@@ -1031,9 +1052,9 @@ func TestForkReadsItsOrigin(t *testing.T) {
 		{name: "cut, keyed, runs again under its key", origins: true, want: agentturn.PendingAborted, wantKey: "k1", runs: 1,
 			wantReason: agentturn.RunAgainKeyedReason, wantRecord: []string{"proceed", "dispatch", "output"}},
 		{name: "completed, answered with its output", origins: true, completed: true, want: agentturn.PendingAborted, wantKey: "k1",
-			wantReason: ranInOriginReason, wantRecord: []string{"answer", "output"}},
+			wantReason: ranInOriginReason, wantRecord: []string{"link", "answer", "output"}},
 		{name: "completed, a fork of a fork", origins: true, completed: true, chain: true, want: agentturn.PendingAborted, wantKey: "k1",
-			wantReason: ranInOriginReason, wantRecord: []string{"answer", "output"}},
+			wantReason: ranInOriginReason, wantRecord: []string{"link", "answer", "output"}},
 		{name: "held, answered by a person", origins: true, held: true, completed: true, want: agentturn.PendingDeferred, wantKey: "k1",
 			answer: func(id string) agentturn.Answer {
 				return agentturn.OutcomeUnknown(id).WithBy(agentsession.ByHuman).WithReason("not sent again")
@@ -1077,6 +1098,10 @@ func TestForkReadsItsOrigin(t *testing.T) {
 			}
 			after = append(after, agentsession.NewDispatch(call.CallID, target).WithIdempotencyKey("k1"))
 			if tc.completed {
+				// The call's work was a child session's (#206): the
+				// origin links it, and a fork that repeats the output
+				// links the same child.
+				after = append(after, agentsession.NewSubsessionLink("child-of-call-1", call.CallID))
 				after = append(after, &agentsession.ItemEntry{Item: openresponses.NewFunctionCallOutput(call.CallID, "charged")})
 			}
 			for _, e := range after {
@@ -1108,6 +1133,11 @@ func TestForkReadsItsOrigin(t *testing.T) {
 			if len(pending) != 1 || pending[0].Reason != tc.want || pending[0].IdempotencyKey != tc.wantKey {
 				t.Fatalf("pending = %+v, want %s under %q", pending, tc.want, tc.wantKey)
 			}
+			// agentpolicy#63: a call that completed in the origin carries
+			// its output and where it ran, when the origin is read.
+			if ran := tc.origins && tc.completed; (pending[0].Ran != nil) != ran || ran && (pending[0].Ran.Output.Text != "charged" || pending[0].RanWhere != ranInOriginReason) || !ran && pending[0].RanWhere != "" {
+				t.Errorf("Ran = %+v where %q, want the origin's output (%v) with %q", pending[0].Ran, pending[0].RanWhere, ran, ranInOriginReason)
+			}
 			var answers []agentturn.Answer
 			if tc.answer != nil {
 				answers = []agentturn.Answer{tc.answer(call.CallID)}
@@ -1133,6 +1163,11 @@ func TestForkReadsItsOrigin(t *testing.T) {
 					continue
 				}
 				switch e := e.(type) {
+				case *agentsession.LinkEntry:
+					record = append(record, "link")
+					if e.Rel != agentsession.RelSubsession || e.CallID != call.CallID || e.Session != "child-of-call-1" {
+						t.Errorf("link = %+v, want the origin's child linked to %s", e, call.CallID)
+					}
 				case *agentsession.DispatchEntry:
 					record = append(record, "dispatch")
 				case *agentsession.DecisionEntry:

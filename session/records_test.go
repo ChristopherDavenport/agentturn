@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1607,6 +1608,7 @@ func TestAskedNestedCallsAreRecorded(t *testing.T) {
 			}
 			var order []string
 			var start *NestedCall
+			var questions []*agentsession.CustomEntry
 			for _, e := range s.Entries() {
 				c, ok := e.(*agentsession.CustomEntry)
 				if !ok {
@@ -1614,7 +1616,8 @@ func TestAskedNestedCallsAreRecorded(t *testing.T) {
 				}
 				switch c.NS {
 				case ElicitationNS:
-					order = append(order, "question")
+					questions = append(questions, c)
+					order = append(order, elicitationOf(t, c).Phase)
 				case NestedCallNS:
 					var n NestedCall
 					if err := json.Unmarshal(c.Data, &n); err != nil {
@@ -1626,15 +1629,202 @@ func TestAskedNestedCallsAreRecorded(t *testing.T) {
 					}
 				}
 			}
-			if strings.Join(order, " ") != "question start end" {
+			// #213: the question is on the record before it is put, the
+			// answer after, both before the nested call's own entries.
+			if strings.Join(order, " ") != "ask answer start end" {
 				t.Errorf("entries = %v", order)
 			}
 			if start == nil || start.Verdict != tc.verdict || start.By != agentsession.ByHuman || !strings.Contains(start.Reason, "ask bash(git push:*)") {
-				t.Errorf("start entry = %+v", start)
+				t.Fatalf("start entry = %+v", start)
+			}
+			// The question names the nested call it is about, its tool
+			// and the call that made it, and is filed under that call;
+			// the answer names the question's entry and repeats the
+			// call, so a reader with two questions in a row ties each
+			// to its nested call without counting.
+			parent := callsOf(t, s)["eval"]
+			ask, answer := elicitationOf(t, questions[0]), elicitationOf(t, questions[1])
+			if ask.Call != start.CallID || ask.Tool != "bash" || ask.Parent != parent.ID() || !strings.Contains(ask.Message, "git push") {
+				t.Errorf("ask entry = %+v, want it about nested call %s (bash) under %s", ask, start.CallID, parent.ID())
+			}
+			if answer.Call != start.CallID || answer.Tool != "bash" || answer.Parent != parent.ID() || answer.Asked != questions[0].ID {
+				t.Errorf("answer entry = %+v, want it about nested call %s naming ask entry %s", answer, start.CallID, questions[0].ID)
+			}
+			if answer.Action != string(tc.action) || answer.By != agentsession.ByHuman {
+				t.Errorf("answer entry = %+v, want %s by human", answer, tc.action)
+			}
+			if questions[0].CallID != parent.ID() || questions[1].CallID != parent.ID() {
+				t.Errorf("the entries name calls %q and %q, want the invoking call %s", questions[0].CallID, questions[1].CallID, parent.ID())
+			}
+			// A reader of the old shape, which finds the answer by its
+			// action, still finds exactly one.
+			var answered int
+			for _, q := range questions {
+				if elicitationOf(t, q).Action != "" {
+					answered++
+				}
+			}
+			if answered != 1 {
+				t.Errorf("%d entries carry an action, want the answer alone", answered)
 			}
 			verifyAll(t, s)
 		})
 	}
+}
+
+// TestOpenQuestionSurvivesACut pins #213: a nested call's question is
+// on the record before it is put, so a run cut while the person was
+// deciding leaves the question under the in-flight call and no answer,
+// and a restart reads the call as waiting on a person: ReplayAnswers
+// names the open question, and the call it was about, in the reason of
+// the outcome-unknown answer it gives the call.
+func TestOpenQuestionSurvivesACut(t *testing.T) {
+	ctx := context.Background()
+	store := &cutStore{Store: agentsession.NewMemoryStore()}
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bash := agenttool.New("bash", "runs a command", func(context.Context, echoArgs) (string, error) { return "pushed", nil })
+	eval := agenttool.New("eval", "runs code", func(ctx context.Context, _ echoArgs) (string, error) {
+		_, err := agentturn.Invoke(ctx, "bash", json.RawMessage(`{"text":"git push"}`))
+		return "ran", err
+	})
+	policy := func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+		if info.Call.Name == "bash" {
+			return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask bash(git push:*)", By: agentsession.ByPolicy}, nil
+		}
+		return nil, nil
+	}
+	user := func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+		// The process dies while the person decides: nothing more of
+		// the run reaches the record.
+		store.cut.Store(true)
+		return agenttool.Answer{Action: agenttool.ActionAccept}, nil
+	}
+	tools := []agenttool.Tool{eval, bash}
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: tools,
+		BeforeToolCall: policy, ToolElicitor: rec.Elicitor(agentsession.ByHuman, user), MaxTurns: 1})
+	unsub := rec.Attach(a)
+	a.Prompt(ctx, openresponses.UserText("x"))
+	unsub()
+	store.cut.Store(false)
+	if got := entryTypes(s); !strings.HasSuffix(got, "dispatch custom") {
+		t.Fatalf("entries = %q, want the record to end at the open question", got)
+	}
+	questions := customs(s, ElicitationNS)
+	if len(questions) != 1 {
+		t.Fatalf("elicitation entries = %d", len(questions))
+	}
+	ask := elicitationOf(t, questions[0])
+	parent := callsOf(t, s)["eval"]
+	if ask.Phase != ElicitationAsk || ask.Call == "" || ask.Tool != "bash" || ask.Parent != parent.ID() || questions[0].CallID != parent.ID() {
+		t.Errorf("ask entry = %+v under %q, want the question about the nested bash call under %s", ask, questions[0].CallID, parent.ID())
+	}
+
+	// A restart.
+	rec, s, err = Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := Pending(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Reason != agentturn.PendingAborted {
+		t.Fatalf("pending = %+v, want the eval call in flight", pending)
+	}
+	answers, err := ReplayAnswers(ctx, s, tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(answers) != 1 || answers[0].Output == nil {
+		t.Fatalf("answers = %+v, want one output", answers)
+	}
+	want := fmt.Sprintf("not run again: replay unknown; a question was open: %q about call %s (bash)", ask.Message, ask.Call)
+	if answers[0].Reason != want {
+		t.Errorf("reason = %q, want %q", answers[0].Reason, want)
+	}
+	// The resume records the answer, with the reason, and verifies.
+	opts, err := AgentOptions(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: tools, BeforeToolCall: policy}, opts...)
+	defer rec.Attach(b)()
+	if end, err := b.Resume(ctx, answers...); err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("resume: err=%v end=%+v", err, end)
+	}
+	c := callsOf(t, s)["eval"]
+	if c == nil || c.Output == nil || len(c.Decisions) != 1 || c.Decisions[0].Verdict != agentsession.VerdictAnswer || c.Decisions[0].Reason != want {
+		t.Errorf("call on the new path = %+v", c)
+	}
+	verifyAll(t, s)
+}
+
+// TestElicitationAskWriteFailureIsTheHarnessFailing pins the other
+// half of #213: when the ask entry cannot be written, nobody is asked
+// and the tool gets the failure, so a question never put is never on
+// the record as answered.
+func TestElicitationAskWriteFailureIsTheHarnessFailing(t *testing.T) {
+	ctx := context.Background()
+	store := &failingCustomStore{Store: agentsession.NewMemoryStore(), ns: ElicitationNS}
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	asked := 0
+	user := func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+		asked++
+		return agenttool.Answer{Action: agenttool.ActionAccept}, nil
+	}
+	var got error
+	tool := agenttool.New("prune", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		ask, _ := agenttool.ElicitorFrom(ctx)
+		_, got = ask(ctx, agenttool.Elicitation{Message: "delete the branch?"})
+		return "stopped", nil
+	})
+	a := agentturn.New(agentturn.Config{Model: allCalls{}, MaxTurns: 1, Tools: []agenttool.Tool{tool}, ToolElicitor: rec.Elicitor(agentsession.ByHuman, user)})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(ctx, openresponses.UserText("go")); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || !strings.Contains(got.Error(), "disk full") {
+		t.Errorf("the tool got %v, want the write failure", got)
+	}
+	if asked != 0 {
+		t.Errorf("the user was asked %d times, want none", asked)
+	}
+	if n := len(customs(s, ElicitationNS)); n != 0 {
+		t.Errorf("elicitation entries = %d, want none", n)
+	}
+}
+
+// cutStore fails every append while cut is set: the process died, and
+// nothing more of the run reaches the record.
+type cutStore struct {
+	agentsession.Store
+	cut atomic.Bool
+}
+
+func (s *cutStore) Append(ctx context.Context, id string, e agentsession.Entry) (string, error) {
+	if s.cut.Load() {
+		return "", errors.New("the process died")
+	}
+	return s.Store.Append(ctx, id, e)
+}
+
+// failingCustomStore fails every append of a custom entry in ns.
+type failingCustomStore struct {
+	agentsession.Store
+	ns string
+}
+
+func (s *failingCustomStore) Append(ctx context.Context, id string, e agentsession.Entry) (string, error) {
+	if c, ok := e.(*agentsession.CustomEntry); ok && c.NS == s.ns {
+		return "", errors.New("disk full")
+	}
+	return s.Store.Append(ctx, id, e)
 }
 
 // switching answers 429 while the request names the primary model and
