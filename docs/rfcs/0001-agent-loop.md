@@ -1141,7 +1141,7 @@ provide a way to chain each, with the fold rule the table gives.
 | before turn | turn phase 2 | the working transcript | items to append as facts | fails the run unless marked as a guard's, which stops it with cause `guard` | items appended in order; the first error drops them all |
 | before model call | turn phase 4, last | the finished request | edits it in place | `model_blocked`, then the run fails; marked as a guard's, the run stops with cause `guard` | in order, each seeing what the last left; the first error stops |
 | output guard | as the stream completes an assistant message | the message | a replacement or none | fails the run unless marked as a guard's, which withholds the message and stops it with cause `guard` | in order, each seeing the last's replacement; the last stands; the first error stops |
-| decision (before tool call) | preflight, per call, model order; a nested call as a batch of one | the call, the tool, the arguments, the batch and index | a decision or none | fails the run; returned to the tool for a nested call | the strictest action wins, block over defer over allow; a block ends the chain, a defer does not; rewritten arguments pass to the hooks after; the first reason and decider of the standing action, the first note; terminate if any set it |
+| decision (before tool call) | preflight, per call, model order; a nested call as a batch of one | the call, the tool, the arguments, the batch and index, and for a nested call its parent | a decision or none | fails the run; returned to the tool for a nested call | the strictest action wins, block over defer over allow; a block ends the chain, a defer does not; rewritten arguments pass to the hooks after; the first reason and decider of the standing action, the first note; terminate if any set it |
 | after tool call | as each call settles, blocked calls excepted | the call, the result, the error | an override or none | fails the run; returned to the tool for a nested call | — |
 | should stop after turn | turn phase 10 | the response, the results, whether the turn was final, the transcript | stop or not; a guard error stops with cause `guard` | fails the run unless marked as a guard's | in order until one stops; the first error stops |
 | transform | request step 2 | a copy of the transcript | the input for this call | fails the run | — |
@@ -1172,8 +1172,11 @@ the loop rather than holding a tool set of its own, where the policy,
 the events and the record would all be absent. The loop runs the call
 as if the model had asked for it under the call in flight:
 
-- the decision hook decides it, seeing a batch of one at index 0. A
-  nested call cannot be handed to the caller, since it belongs to a
+- the decision hook decides it, seeing a batch of one at index 0 and
+  the **parent**, the call that made it, which a call the model made
+  does not carry, so the hook can tell a nested call from a turn of one
+  call and knows the deferral it returns is settled below rather than
+  left for a resume. A nested call cannot be handed to the caller, since it belongs to a
   tool that is running, so a deferred one is put to the user through
   the invoking tool's elicitor when it has one, as a question naming
   the call, its arguments, the first 500 bytes of them, and the

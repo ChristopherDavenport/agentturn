@@ -394,6 +394,13 @@ type ToolCallInfo struct {
 	// it for the answer.
 	Batch []*openresponses.FunctionCall
 	Index int
+	// Parent is the ID of the call whose tool made this one with
+	// [Invoke], as ToolStart.Parent is, and empty for a call the model
+	// made. A nested call the hook defers is answered inline, by the
+	// elicitor on the invoking tool's context or with a refusal, and
+	// never becomes pending: a hook that remembers the calls it defers
+	// for a resume keeps nothing for one with a Parent.
+	Parent string
 }
 
 // ToolAction is what BeforeToolCall decides for a call.

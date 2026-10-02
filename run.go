@@ -2278,7 +2278,7 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 	var decision *ToolDecision
 	if r.cfg.BeforeToolCall != nil {
 		var err error
-		decision, err = r.beforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: turn, Call: call, Tool: p.tool, Args: p.args, Batch: []*openresponses.FunctionCall{call}, Index: 0})
+		decision, err = r.beforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: turn, Call: call, Tool: p.tool, Args: p.args, Batch: []*openresponses.FunctionCall{call}, Index: 0, Parent: parent})
 		if err != nil {
 			return agenttool.Result{}, fmt.Errorf("agentturn: before-tool-call hook: %w", err)
 		}
