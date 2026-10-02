@@ -7,6 +7,11 @@ versions may break the API.
 
 ## Unreleased
 
+- **Requires `openresponses` v0.0.14, up from v0.0.12, `agenttool`
+  v0.0.15, up from v0.0.14, and `agentsession` v0.0.20, up from
+  v0.0.19.** openresponses v0.0.14 adds the `Accumulator.Position` and
+  `ItemAt` the loop and the Responses front now read; agentsession
+  v0.0.20 is format 0.11, which the recorder now writes.
 - **A call to the agent's own tool that its hook held is never handed
   to the A2A caller.** `front/a2a` listed a `Defer` of a call to one of
   the agent's own tools to the caller as input-required and took the
