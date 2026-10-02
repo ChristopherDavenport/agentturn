@@ -457,6 +457,26 @@ the transcript.
   A front that hands the caller the response's function calls to run
   holds them until the response completes, so a withheld response
   hands the caller none.
+- A function call is known, while it streams, by its item ID, and by
+  its output index when the event naming it carries none, so a stream
+  that opens a second call at the output index of the first still
+  gives each its own ID, and a call opened without an item ID and
+  completed with one keeps the ID it opened with. The response the
+  turn acts on, which `response_end` and `turn_end` carry and whose
+  function calls form the batch, holds the calls the transcript holds:
+  each function call of the completed response is paired with one the
+  attempt completed, taken in the order they opened, which is the
+  transcript's order, by item ID when both carry one, else by the call
+  ID the model gave it among the completed calls not yet paired, else
+  by order, and the completed call, with the ID the loop decided and
+  the arguments it completed with, stands in the response's place. A
+  function call the response lists that the stream never completed
+  keeps the ID decided at its output index, and an item that is not a
+  function call is left as the response gave it. A stream that opens
+  every call at one output index with no item IDs, as a text-call
+  parser's does, therefore runs each call under its own ID and answers
+  it with its own output, where pairing by index alone ran the last
+  call opened there for every call listed at that index (#210).
 - `response_end` carries the folded response, usage included, as soon
   as the stream ends and before any tool of the turn runs. A response
   that arrived with a failed status is delivered here too, before the
@@ -984,7 +1004,10 @@ A conforming loop holds these over every run, however it ends:
   the event naming it carries none, so a stream that opens a second
   call at the output index of the first still gives each its own ID,
   and a call opened without an item ID and completed with one keeps
-  the ID it opened with. The
+  the ID it opened with; the response the turn acts on holds the
+  completed calls, paired with the response's as the
+  [model call section](#the-model-call) says, so the batch never runs
+  a call under another's ID. The
   IDs a transcript held stay
   reserved when `SetTranscript` replaces it. A host that seeds the
   loop with less than a whole session, a context after a fold or a

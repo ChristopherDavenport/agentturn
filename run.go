@@ -581,10 +581,16 @@ type runner struct {
 type callSlot struct{ id, itemID string }
 
 // openedItem is an item of the attempt in flight: its output index,
-// and the item as completed once it is done.
+// the item as completed once it is done, and, for a function call, the
+// item ID the stream gave it and the call ID the model gave it, the
+// last each event carried, by which renameCalls pairs the completed
+// response's calls with the ones the transcript took.
 type openedItem struct {
 	index int
 	done  openresponses.Item
+	// itemID and modelCallID are the function call's as the model sent
+	// them, "" for none; done carries the call ID the loop decided.
+	itemID, modelCallID string
 }
 
 // heldItem is a completed item waiting for its attempt to commit.
@@ -1264,6 +1270,7 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 			// The call's ID is decided as it opens, so its item_start,
 			// every item_update and its item_end carry the same one.
 			r.decideCallID(call, e.OutputIndex)
+			r.opened[len(r.opened)-1].itemID, r.opened[len(r.opened)-1].modelCallID = call.ID, call.CallID
 			item = r.withCallID(item, e.OutputIndex)
 		}
 		commits := !committed && commitsAttempt(item)
@@ -1295,6 +1302,14 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 			}
 		}
 		self := r.openedAt(e.OutputIndex)
+		if call, ok := e.Item.(*openresponses.FunctionCall); ok {
+			// What the model called the call as it completed, which is
+			// what the response it completes with carries.
+			r.opened[self].modelCallID = call.CallID
+			if call.ID != "" {
+				r.opened[self].itemID = call.ID
+			}
+		}
 		if m, ok := item.(*openresponses.Message); ok && r.cfg.OutputGuard != nil {
 			// The guard sees the message before anything keeps it,
 			// after the items that opened before it.
@@ -1453,13 +1468,64 @@ func (r *runner) openedAt(index int) int {
 	return len(r.opened) - 1
 }
 
-// renameCalls gives the function calls of a response the call IDs
-// decideCallID gave them, so the calls the turn runs are the ones the
-// transcript holds.
+// renameCalls returns the response the turn acts on: resp with each of
+// its function calls replaced by the one the attempt completed for it,
+// which carries the call ID decideCallID gave it and the arguments it
+// completed with, so the calls the batch runs are the ones the
+// transcript holds. The completed calls are in the order they opened,
+// which is the transcript's order, and each call of the response is
+// paired with one of them: by item ID when both carry one, else by the
+// call ID the model gave it among the completed calls not yet paired,
+// else by order. Renaming by output index alone, as before #210, named
+// the last call opened at an index for every call the response listed
+// there, so a stream that opened every call at index 0 with no item
+// IDs ran one call twice, or each with the other's output. An item that
+// is not a function call, and a function call the stream never
+// completed, which the response alone lists, keep today's name: the
+// call ID decided at their output index, when one was.
 func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Response {
+	var completed []*openedItem
+	for i := range r.opened {
+		if _, ok := r.opened[i].done.(*openresponses.FunctionCall); ok {
+			completed = append(completed, &r.opened[i])
+		}
+	}
+	paired := make([]int, len(resp.Output))
+	for i := range paired {
+		paired[i] = -1
+	}
+	taken := make([]bool, len(completed))
+	pair := func(index int, match func(*openedItem) bool) {
+		for j, c := range completed {
+			if !taken[j] && match(c) {
+				paired[index], taken[j] = j, true
+				return
+			}
+		}
+	}
+	for index, item := range resp.Output {
+		if call, ok := item.(*openresponses.FunctionCall); ok && call.ID != "" {
+			pair(index, func(c *openedItem) bool { return c.itemID == call.ID })
+		}
+	}
+	for index, item := range resp.Output {
+		if call, ok := item.(*openresponses.FunctionCall); ok && paired[index] < 0 && call.CallID != "" {
+			pair(index, func(c *openedItem) bool { return c.modelCallID == call.CallID })
+		}
+	}
+	for index, item := range resp.Output {
+		if _, ok := item.(*openresponses.FunctionCall); ok && paired[index] < 0 {
+			pair(index, func(*openedItem) bool { return true })
+		}
+	}
 	var out *openresponses.Response
 	for index, item := range resp.Output {
-		renamed := r.withCallID(item, index)
+		renamed := item
+		if j := paired[index]; j >= 0 {
+			renamed = completed[j].done
+		} else {
+			renamed = r.withCallID(item, index)
+		}
 		if renamed == item {
 			continue
 		}
