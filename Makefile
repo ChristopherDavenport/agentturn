@@ -6,7 +6,7 @@ GOVULNCHECK ?= $(GO) run golang.org/x/vuln/cmd/govulncheck@latest
 # builds against the tree, and every module shares one version: see
 # release. ./... from the root covers only the root module, so every
 # target loops over them.
-SUBMODULES = front/a2a tools/a2a session
+SUBMODULES = front/a2a front/acp tools/a2a session
 
 .PHONY: build deps replaces test vet fmt tidy tidy-check lint vuln check \
 	extracted release-guard release clean

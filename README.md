@@ -334,12 +334,19 @@ produces them. An agent stands in three places inside another system:
 `Config.Name` and `Config.Description` are the single source for how an
 agent presents itself in every one of these.
 
+A front for a person rather than another agent needs no consume side.
+`front/acp` serves agents over the
+[Agent Client Protocol](https://agentclientprotocol.com) v1, so an
+editor such as Zed or an ACP terminal client can prompt one session at a
+time, watch its tool calls and answer its permission requests.
+
 ## Modules
 
 | path | module | depends on |
 |---|---|---|
 | `.` (`agentturn`), `front/responses`, `compact`, `tools/agent` | root | `openresponses`, `agenttool` |
 | `front/a2a`, `tools/a2a` | nested | `github.com/a2aproject/a2a-go` |
+| `front/acp` | nested, Go 1.27 | `github.com/ironpark/acp-go` |
 | `session` | nested | `github.com/ChristopherDavenport/agentsession` |
 
 Every module shares the root's version and is tagged at the same

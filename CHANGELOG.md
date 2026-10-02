@@ -5,6 +5,22 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- **`front/acp` serves agents over the Agent Client Protocol v1.** A
+  new nested module, on github.com/ironpark/acp-go, and the first to
+  require Go 1.27, which that SDK needs; the other modules keep 1.25.
+  `acp.New` takes a function that builds the `agentturn.Agent` of each
+  ACP session from its working directory. A session/prompt runs the
+  agent and streams text and reasoning deltas as message and thought
+  chunks and each tool call from pending to completed or failed, with a
+  nested call's parent under `_meta`; the response carries the turn's
+  usage and a stop reason from the run's end. A call `BeforeToolCall`
+  defers is put to the client as a permission request, allow once or
+  reject once, and approved or refused by `human`; `acp.Elicitor` asks
+  a nested call's question the same way. session/cancel aborts the
+  run, and a call left pending by it is answered at the next prompt.
+
 ## v0.0.16 - 2026-10-02
 
 - **Requires `openresponses` v0.0.14, up from v0.0.12, `agenttool`

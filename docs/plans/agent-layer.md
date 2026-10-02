@@ -80,6 +80,7 @@ agentturn/                  loop, Agent, events, hooks, queues, run control
 agentturn/tool              Tool contract, registry, argument decoding, batch executor
 agentturn/front/responses   the loop as an openresponses.Adapter
 agentturn/front/a2a         the A2A bridge (separate module: imports a2a-go)
+agentturn/front/acp         ACP v1 for editors and terminal clients (separate module: imports acp-go)
 agentturn/front/mcp         Go tools served over MCP (separate module: imports an MCP SDK)
 agentturn/tools/...         built-in tools, one package each, opt-in
 agentturn/tools/agent       an agent as a Tool: in-process child runs
@@ -396,8 +397,14 @@ behind the same hook.
   a cancel registry, and a per-conversation hook that attaches a
   recorder to the agent driving each task. Only package that imports
   a2a-go.
+- `front/acp`: ACP v1 through ironpark/acp-go. A session/prompt is a
+  `Prompt` plus the `Resume`s its permission requests lead to; events
+  become session updates; a deferred call becomes a
+  session/request_permission. v1 runs one prompt per session at a
+  time, so steering waits for an ACP v2 front, whose prompt returns
+  once the message is inserted.
 - TUI and chat channels: consume `Subscribe`, feed `Prompt`, `Steer`,
-  `FollowUp`.
+  `FollowUp`, or speak ACP to `front/acp`.
 
 ## Composition
 
