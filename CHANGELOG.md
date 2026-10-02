@@ -5,6 +5,34 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- **`front/acp` serves agents over the Agent Client Protocol, v1 and
+  the v2 draft.** A new nested module, on github.com/ironpark/acp-go,
+  and the first to require Go 1.27, which that SDK needs; the other
+  modules keep 1.25, and the Makefile exports `GOTOOLCHAIN=auto` so a
+  1.25 toolchain builds it with the one its go.mod names. `acp.New`
+  takes a function that builds the `agentturn.Agent` of each ACP
+  session from its working directory, and `Server.Serve` speaks
+  whichever version a client asks for. Text and reasoning deltas
+  stream as message and thought chunks and each tool call from pending
+  to completed or failed, with a nested call's parent under `_meta`. A
+  call `BeforeToolCall` defers is put to the client as a permission
+  request, allow once or reject once, and approved or refused by
+  `human`; `acp.Elicitor` asks a nested call's question the same way.
+  Under v2 a prompt is answered once its message is in the transcript,
+  a prompt to a running turn is steered into it, and the turn reports
+  running, requires_action and idle with its usage. session/cancel
+  aborts the run, and a call left pending by it is answered at the next
+  prompt.
+- **`Agent.Continue` takes items steered while the agent was idle.** It
+  checked only the transcript, so an item steered after a run's final
+  drain, or while no run was active, was refused with
+  `ErrCannotContinue` when the transcript ended with an answer, though
+  `Deliver` already continued for it and its doc said `Continue` would.
+  It now checks the transcript followed by the steer queue, and the run
+  takes the queued items before its first model call.
+
 ## v0.0.16 - 2026-10-02
 
 - **Requires `openresponses` v0.0.14, up from v0.0.12, `agenttool`

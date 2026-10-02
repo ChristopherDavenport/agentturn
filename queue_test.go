@@ -473,3 +473,30 @@ func TestDeliverFromInsideTheRun(t *testing.T) {
 		})
 	}
 }
+
+// TestContinueTakesAnIdleSteer checks that an item steered after a run
+// ended is reason enough to continue: the transcript ends with an
+// answer, and the queued message is what the model answers next.
+func TestContinueTakesAnIdleSteer(t *testing.T) {
+	a := New(Config{Model: &echo.Adapter{}})
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("one")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Continue(context.Background()); !errors.Is(err, ErrCannotContinue) {
+		t.Fatalf("continue with nothing queued = %v, want ErrCannotContinue", err)
+	}
+	a.Steer(openresponses.UserText("two"))
+	end, err := a.Continue(context.Background())
+	if err != nil {
+		t.Fatalf("continue after a steer: %v", err)
+	}
+	if text, _ := end.Answer(); !strings.Contains(text, "two") {
+		t.Errorf("answer = %q, want the steered message answered", text)
+	}
+	if got := itemTypes(a.State().Transcript); got != "user assistant user assistant" {
+		t.Errorf("transcript = %q", got)
+	}
+	if st := a.State(); st.Steering != 0 {
+		t.Errorf("steering = %d after the run, want 0", st.Steering)
+	}
+}
