@@ -226,7 +226,9 @@
 //     output item types), so an abort or a failure during the fold
 //     leaves a trace that says what the model answered. One the
 //     transform backs off from also carries its split and prefix hash,
-//     which [CompactOptions] seeds a transform in another process with.
+//     which [CompactOptions], and [Recorder.CompactOptions] for a
+//     recorder seeded from the path, seed a transform in another
+//     process with.
 //   - a child run observed through [Recorder.Observe]: a session of its
 //     own whose ID is derived from the parent's and the call's as the
 //     format recommends, with parent_session, spawned_by and the same
@@ -730,6 +732,10 @@ type Recorder struct {
 	// written, so a record naming one by [SessionIDFromContext] after
 	// its run ended is filed there rather than at the root.
 	childIDs map[string]bool
+	// compactOpts seeds a compact transform with the path the recorder
+	// was seeded from, as [CompactOptions] does for the session: set
+	// wherever the root writer is seeded, nil on a fresh session.
+	compactOpts []compact.Option
 }
 
 // writer is the state of one session being written.
@@ -1100,8 +1106,37 @@ func Start(ctx context.Context, store agentsession.Store, h agentsession.Header,
 		if err := r.root.seed(ctx, s, true); err != nil {
 			return nil, nil, err
 		}
+		if err := r.seedCompact(s); err != nil {
+			return nil, nil, err
+		}
 	}
 	return r, s, nil
+}
+
+// seedCompact remembers what seeds a compact transform with the path
+// at the session's leaf, for [Recorder.CompactOptions].
+func (r *Recorder) seedCompact(s *agentsession.Session) error {
+	opts, err := CompactOptions(s)
+	if err != nil {
+		return err
+	}
+	r.compactOpts = opts
+	return nil
+}
+
+// CompactOptions returns the options that seed a compact transform
+// with the session this recorder was seeded from, as [CompactOptions]
+// does for the session: compact.WithFailedFold with the last failed
+// fold on the path at the leaf the recorder started writing at, by
+// [Resume], [Continue], a [Start] on a based header or
+// [Recorder.Rebase]. It is what a host that is handed the recorder
+// rather than the session passes to compact.NewLocal beside
+// compact.WithOnFold(rec.Fold). nil for a recorder on a fresh session
+// or one whose path holds no such fold.
+func (r *Recorder) CompactOptions() []compact.Option {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.compactOpts)
 }
 
 // Resume opens the session with the given ID and returns a recorder
@@ -1710,6 +1745,9 @@ func resume(ctx context.Context, s *agentsession.Session, store agentsession.Sto
 	if err := r.root.seed(ctx, s, true); err != nil {
 		return nil, nil, err
 	}
+	if err := r.seedCompact(s); err != nil {
+		return nil, nil, err
+	}
 	return r, s, nil
 }
 
@@ -1765,7 +1803,8 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 // agentturn.ContextWithReasoningModels, and
 // then Agent.SetPending from [Pending], so a call held on the branch
 // is approved as a held call and one that may have run is held to the
-// replay rule. Rebase reserves every call ID in the session, [CallIDs],
+// replay rule; [Recorder.CompactOptions] gives what seeds a transform
+// built for the branch. Rebase reserves every call ID in the session, [CallIDs],
 // on the agent [Recorder.Attach] attached, so a call the model makes
 // does not take the ID of one the context leaves out or the branch
 // left behind holds; a host driving another agent calls
@@ -1811,6 +1850,7 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 	if entryID == "" {
 		s.ResetLeaf()
 		w.reset()
+		r.compactOpts = nil
 		for _, in := range w.inbox {
 			in.entry = ""
 		}
@@ -1843,6 +1883,9 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 		return err
 	}
 	if err := w.seed(ctx, s, false); err != nil {
+		return err
+	}
+	if err := r.seedCompact(s); err != nil {
 		return err
 	}
 	return r.reserve(s)
@@ -2684,7 +2727,12 @@ func (r *Recorder) release(runID string, w *writer) {
 }
 
 // Fold records a fold of the compact transform; register it with
-// compact.WithOnFold. A fold that was applied becomes a compaction
+// compact.WithOnFold, beside what [Recorder.CompactOptions] gives for
+// a recorder seeded from a path:
+//
+//	c := compact.NewLocal(model, append(rec.CompactOptions(), compact.WithOnFold(rec.Fold))...)
+//
+// A fold that was applied becomes a compaction
 // entry naming the entry of the first kept item as first_kept, with
 // the summary, the settings in force, the token estimate, the usage
 // and the fold's own call under [FoldMember]; a fold that failed
