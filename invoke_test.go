@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -331,5 +332,60 @@ func TestClip(t *testing.T) {
 				t.Errorf("clip(%q, %d) = %q, want %q", tc.in, tc.n, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestToolCallInfoNamesTheParent pins #208: the decision hook sees a
+// nested call as a batch of one, which looks like a turn where the
+// model made one call, so it must also see the call that made it. A
+// call the model made has none, in a child run started from a tool's
+// context as tools/agent does included: the child's run is its own,
+// and its model's calls are not nested under the tool that started it.
+func TestToolCallInfoNamesTheParent(t *testing.T) {
+	var mu sync.Mutex
+	parents := map[string]string{}
+	policy := func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		parents[info.Call.Name] = info.Parent
+		return nil, nil
+	}
+	read := agenttool.New("read", "reads", func(context.Context, echoArgs) (string, error) { return "contents", nil })
+	eval := agenttool.New("eval", "runs code", func(ctx context.Context, _ echoArgs) (string, error) {
+		_, err := Invoke(ctx, "read", json.RawMessage(`{"text":"go.mod"}`))
+		return "ran", err
+	})
+	upper := agenttool.New("upper", "", upper)
+	spawn := agenttool.New("spawn", "runs a child", func(ctx context.Context, _ echoArgs) (string, error) {
+		child := Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{upper}, BeforeToolCall: policy, MaxTurns: 1}
+		_, end, err := collect(t, Run(ctx, nil, openresponses.Items{openresponses.UserText("x")}, child))
+		if err != nil || end.Reason == ReasonError {
+			return "", fmt.Errorf("child run: %v %+v", err, end)
+		}
+		return "spawned", nil
+	})
+	cfg := Config{Model: callsNamed{names: []string{"eval", "spawn"}}, Tools: []agenttool.Tool{eval, spawn, read}, BeforeToolCall: policy, MaxTurns: 1}
+	events, _, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	evalCall := ""
+	for _, ev := range events {
+		if e, ok := ev.(*ToolStart); ok && e.Name == "eval" {
+			evalCall = e.CallID
+		}
+	}
+	if evalCall == "" {
+		t.Fatal("no tool_start for eval")
+	}
+	for name, want := range map[string]string{"eval": "", "spawn": "", "read": evalCall, "upper": ""} {
+		got, ok := parents[name]
+		if !ok {
+			t.Errorf("the hook never saw %s", name)
+			continue
+		}
+		if got != want {
+			t.Errorf("Parent for %s = %q, want %q", name, got, want)
+		}
 	}
 }

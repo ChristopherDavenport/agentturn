@@ -468,6 +468,15 @@ type Answer struct {
 	// unknown", say. An output for a call that did not run is its own
 	// reason, since it is what the model sees, and this is not recorded.
 	Reason string
+	// Origin, for an output taken from a record rather than produced
+	// now, names where it was taken from, in the terms of the library
+	// that read it: agentturn/session names the entry of the output the
+	// answer repeats, on a branch a rebase left or in the session this
+	// one forks. The loop carries it unread, on the run's context with
+	// [ContextWithOrigins] as it carries Reason, so a session recorder
+	// can tie the output it writes to the one it repeats and to the
+	// child session that produced it. Empty for any other answer.
+	Origin string
 	// IdempotencyKey, for an approval, is the key the tool receives in
 	// place of the one the loop would give it: the pending call's, for
 	// a call that may have run, and a new one otherwise. A key names one
@@ -564,6 +573,14 @@ func (a Answer) WithReason(reason string) Answer {
 	return a
 }
 
+// WithOrigin returns the output answer with origin attached: where the
+// output was taken from, in the terms of the library that read it,
+// for an output a record held rather than one produced now.
+func (a Answer) WithOrigin(origin string) Answer {
+	a.Origin = origin
+	return a
+}
+
 // WithIdempotencyKey returns the approval with key as the key its tool
 // receives.
 func (a Answer) WithIdempotencyKey(key string) Answer {
@@ -641,7 +658,7 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 	}
 	var outputs, notes openresponses.Items
 	var approved []approval
-	deciders, reasons := map[string]string{}, map[string]string{}
+	deciders, reasons, origins := map[string]string{}, map[string]string{}, map[string]string{}
 	terminate := false
 	for _, ans := range answers {
 		p, ok := byID[ans.CallID]
@@ -657,6 +674,9 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 			outputs = append(outputs, ans.Output)
 			if ans.Reason != "" {
 				reasons[ans.CallID] = ans.Reason
+			}
+			if ans.Origin != "" {
+				origins[ans.CallID] = ans.Origin
 			}
 			if ans.Note != "" {
 				notes = append(notes, openresponses.UserText(ans.Note))
@@ -696,9 +716,10 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 		return nil, fmt.Errorf("%w: %d pending call(s) unanswered", ErrNotPending, len(byID))
 	}
 	// An output the caller wrote raises no tool_start, so the decider
-	// of an answer of that kind, and its reason, ride on the run's
-	// context, where a recorder writing the decision for it finds them.
-	ctx = ContextWithReasons(ContextWithDeciders(ctx, deciders), reasons)
+	// of an answer of that kind, its reason and where its output was
+	// taken from ride on the run's context, where a recorder writing
+	// the decision and the output for it finds them.
+	ctx = ContextWithOrigins(ContextWithReasons(ContextWithDeciders(ctx, deciders), reasons), origins)
 	return a.run(ctx, append(outputs, notes...), approved, true, terminate)
 }
 

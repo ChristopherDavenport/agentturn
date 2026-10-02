@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/openresponses"
@@ -215,6 +214,7 @@ type steeredKey struct{}
 type triggerKey struct{}
 type decidersKey struct{}
 type reasonsKey struct{}
+type originsKey struct{}
 type reservedKey struct{}
 
 // ContextWithTrigger attaches a [Trigger] to ctx. A run started with
@@ -316,6 +316,34 @@ func ContextWithReasons(ctx context.Context, reasons map[string]string) context.
 func ReasonFromContext(ctx context.Context, callID string) string {
 	reasons, _ := ctx.Value(reasonsKey{}).(map[string]string)
 	return reasons[callID]
+}
+
+// ContextWithOrigins attaches where the output answering each pending
+// call was taken from, by call ID, as [ContextWithReasons] attaches
+// why, in place of any an outer context attached; an empty map clears
+// them. [Agent.Resume] does it from the [Answer.Origin] of the answers
+// it was given as outputs, so a subscriber writing the record of an
+// output a record held rather than one produced now can tie it to the
+// entry it repeats. The loop reads nothing from it.
+func ContextWithOrigins(ctx context.Context, origins map[string]string) context.Context {
+	if len(origins) == 0 {
+		if ctx.Value(originsKey{}) == nil {
+			return ctx
+		}
+		return context.WithValue(ctx, originsKey{}, map[string]string(nil))
+	}
+	out := make(map[string]string, len(origins))
+	for k, v := range origins {
+		out[k] = v
+	}
+	return context.WithValue(ctx, originsKey{}, out)
+}
+
+// OriginFromContext returns where the caller said the output answering
+// callID was taken from, or "" when it said nothing.
+func OriginFromContext(ctx context.Context, callID string) string {
+	origins, _ := ctx.Value(originsKey{}).(map[string]string)
+	return origins[callID]
 }
 
 // ContextWithTranscript attaches a transcript to ctx. The loop does this
@@ -762,6 +790,7 @@ func (r *runner) pending() []PendingCall {
 			// answered and is left as a cut leaves one; a resume that
 			// failed before its batch leaves it held.
 			p.Reason, p.Dispatched, p.IdempotencyKey, p.Args = before.Reason, before.Dispatched, before.IdempotencyKey, before.Args
+			p.Ran, p.RanWhere = before.Ran, before.RanWhere
 			if before.Reason == PendingDeferred && r.approved[call.CallID] {
 				p.Reason, p.Dispatched = PendingAborted, false
 			}
@@ -772,6 +801,7 @@ func (r *runner) pending() []PendingCall {
 			// with included: a resume that failed before its batch
 			// decided nothing new.
 			p.Reason, p.Dispatched, p.IdempotencyKey, p.Args = before.Reason, before.Dispatched, before.IdempotencyKey, before.Args
+			p.Ran, p.RanWhere = before.Ran, before.RanWhere
 		}
 		if p.Tool == nil {
 			p.Tool = before.Tool
@@ -2234,10 +2264,13 @@ var ErrNoInvoker = errors.New("agentturn: no loop on the context to invoke a too
 // not an object, or a call the hook refused, whose Reason is the error.
 // A nested call cannot be handed to the caller, since it belongs to a
 // tool that is running, so one the hook defers is put to the user
-// through the agenttool.Elicitor on ctx, when there is one: an accept
-// runs it and a decline refuses it, and tool_start carries that answer
-// as the decision, by "human". Without an elicitor, or on a cancel or
-// a failure to ask, the deferral refuses the call. Nothing is appended
+// through the agenttool.Elicitor on ctx, when there is one, with [Ask]:
+// the question names the call, and the elicitor's context carries it
+// as an [AskedCall], its ID, name, whole arguments and the deferral,
+// for [AskedCallFrom]. An accept runs it and a decline refuses it, and
+// tool_start carries that answer as the decision, by "human". Without
+// an elicitor, or on a cancel or a failure to ask, the deferral
+// refuses the call. Nothing is appended
 // to the transcript, so a nested call costs no items and a Terminate
 // on its result means nothing to the loop.
 //
@@ -2278,7 +2311,7 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 	var decision *ToolDecision
 	if r.cfg.BeforeToolCall != nil {
 		var err error
-		decision, err = r.beforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: turn, Call: call, Tool: p.tool, Args: p.args, Batch: []*openresponses.FunctionCall{call}, Index: 0})
+		decision, err = r.beforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: turn, Call: call, Tool: p.tool, Args: p.args, Batch: []*openresponses.FunctionCall{call}, Index: 0, Parent: parent})
 		if err != nil {
 			return agenttool.Result{}, fmt.Errorf("agentturn: before-tool-call hook: %w", err)
 		}
@@ -2287,7 +2320,13 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 				p.args = decision.Args
 			}
 			if decision.Action == Defer {
-				decision = r.askNested(ctx, name, p.args, decision)
+				// A nested call cannot be handed to the caller, so the
+				// user is asked through the invoking tool's elicitor;
+				// without one, or with no answer, the deferral stands
+				// and refuses the call below.
+				if d, ok := Ask(ctx, AskedCall{Parent: parent, CallID: call.CallID, Name: name, Args: p.args, Decision: decision}); ok {
+					decision = d
+				}
 			}
 			switch decision.Action {
 			case Block, Defer:
@@ -2327,63 +2366,6 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 		return agenttool.Result{}, r.endNested(p, err)
 	}
 	return p.result, p.err
-}
-
-// askNested puts a nested call the hook deferred to the user through
-// the elicitor on ctx, the invoking tool's, so the question is filed
-// under the call that made it. An accept allows the call and a decline
-// blocks it, either decided by the user; with no elicitor, a cancel or
-// a failure to ask, the deferral stands and the call is refused.
-func (r *runner) askNested(ctx context.Context, name string, args json.RawMessage, d *ToolDecision) *ToolDecision {
-	elicit, ok := agenttool.ElicitorFrom(ctx)
-	if !ok {
-		return d
-	}
-	msg := fmt.Sprintf("Allow %s with arguments %s?", name, clip(string(args), maxAskedArgs))
-	if d.Reason != "" {
-		msg += " " + d.Reason
-	}
-	ans, err := elicit(ctx, agenttool.Elicitation{Message: msg})
-	if err != nil {
-		return d
-	}
-	// An elicitation is a question for the user, so the user decided.
-	decided := *d
-	decided.By = "human"
-	switch ans.Action {
-	case agenttool.ActionAccept:
-		// The reason is the rule that raised the question, as a held
-		// call's is; the record needs one to write the approval.
-		decided.Action = Allow
-		if decided.Reason == "" {
-			decided.Reason = "allowed when asked"
-		}
-	case agenttool.ActionDecline:
-		decided.Action = Block
-		decided.Reason = "declined when asked"
-		if d.Reason != "" {
-			decided.Reason += ": " + d.Reason
-		}
-	default:
-		return d
-	}
-	return &decided
-}
-
-// maxAskedArgs is the most of a nested call's arguments, in bytes, the
-// question about it quotes: a script's call may carry a whole file.
-const maxAskedArgs = 500
-
-// clip returns s cut to at most n bytes on a rune boundary, with an
-// ellipsis when anything was cut.
-func clip(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	for n > 0 && !utf8.RuneStart(s[n]) {
-		n--
-	}
-	return s[:n] + "…"
 }
 
 // endNested gives a nested call whose loop-side handling failed, a

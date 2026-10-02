@@ -721,8 +721,11 @@ An **answer** names one pending call and is one of:
 
 An answer MAY carry a **note**, what the person said when answering,
 **who decided** it in the session format's terms (`human`, `policy`,
-`agent`) and **why**, which for an output answering an ambiguous call
-says why it was not run again. There is no default decider: a policy engine
+`agent`), **why**, which for an output answering an ambiguous call
+says why it was not run again, and, for an output taken from a record
+rather than produced now, **where it was taken from**, in the terms of
+the library that read it, so a recorder can tie the output it writes
+to the one it repeats. There is no default decider: a policy engine
 answers as often as a person does, so an answer that names nobody is
 recorded as an anonymous decision rather than guessed at. An answer MAY
 ask the run to **terminate** once every answer is in, for a refusal
@@ -788,7 +791,13 @@ function call without an output is pending with reason `unknown`, and
 the agent refuses to run until they are answered. A host SHOULD seed it
 as well with what a record says of them, the reason, the key and the
 arguments, so only a call that may have run is held to the replay rule
-and one that never started is approved without it. Replacing the
+and one that never started is approved without it, and the output of
+one that dispatched and completed off the path the agent continues, on
+a branch a rebase left or in the session this one forks, with where it
+ran, so the host answers the call with that output rather than running
+the call again or telling the model its outcome is unknown. The loop
+carries what it was seeded with onto the pending list of a run that
+leaves the call pending, and sets none of it itself. Replacing the
 transcript re-derives them the same way, except that a call the agent
 already had pending keeps what it knew of it, so a held call stays
 held; the host seeds the rest again from the record. Whatever the old
@@ -1141,7 +1150,7 @@ provide a way to chain each, with the fold rule the table gives.
 | before turn | turn phase 2 | the working transcript | items to append as facts | fails the run unless marked as a guard's, which stops it with cause `guard` | items appended in order; the first error drops them all |
 | before model call | turn phase 4, last | the finished request | edits it in place | `model_blocked`, then the run fails; marked as a guard's, the run stops with cause `guard` | in order, each seeing what the last left; the first error stops |
 | output guard | as the stream completes an assistant message | the message | a replacement or none | fails the run unless marked as a guard's, which withholds the message and stops it with cause `guard` | in order, each seeing the last's replacement; the last stands; the first error stops |
-| decision (before tool call) | preflight, per call, model order; a nested call as a batch of one | the call, the tool, the arguments, the batch and index | a decision or none | fails the run; returned to the tool for a nested call | the strictest action wins, block over defer over allow; a block ends the chain, a defer does not; rewritten arguments pass to the hooks after; the first reason and decider of the standing action, the first note; terminate if any set it |
+| decision (before tool call) | preflight, per call, model order; a nested call as a batch of one | the call, the tool, the arguments, the batch and index, and for a nested call its parent | a decision or none | fails the run; returned to the tool for a nested call | the strictest action wins, block over defer over allow; a block ends the chain, a defer does not; rewritten arguments pass to the hooks after; the first reason and decider of the standing action, the first note; terminate if any set it |
 | after tool call | as each call settles, blocked calls excepted | the call, the result, the error | an override or none | fails the run; returned to the tool for a nested call | — |
 | should stop after turn | turn phase 10 | the response, the results, whether the turn was final, the transcript | stop or not; a guard error stops with cause `guard` | fails the run unless marked as a guard's | in order until one stops; the first error stops |
 | transform | request step 2 | a copy of the transcript | the input for this call | fails the run | — |
@@ -1172,13 +1181,20 @@ the loop rather than holding a tool set of its own, where the policy,
 the events and the record would all be absent. The loop runs the call
 as if the model had asked for it under the call in flight:
 
-- the decision hook decides it, seeing a batch of one at index 0. A
-  nested call cannot be handed to the caller, since it belongs to a
+- the decision hook decides it, seeing a batch of one at index 0 and
+  the **parent**, the call that made it, which a call the model made
+  does not carry, so the hook can tell a nested call from a turn of one
+  call and knows the deferral it returns is settled below rather than
+  left for a resume. A nested call cannot be handed to the caller, since it belongs to a
   tool that is running, so a deferred one is put to the user through
   the invoking tool's elicitor when it has one, as a question naming
   the call, its arguments, the first 500 bytes of them, and the
   decision's reason, asked on the
-  invoking tool's context so it is filed under that call. An accept
+  invoking tool's context so it is filed under that call, with the
+  call it asks about on that context as data, its parent, ID, name,
+  whole arguments and the deferral, so a front that answers for
+  longer than the one call can make a rule of it without parsing the
+  question. An accept
   allows the call and a decline blocks it, with `declined when asked`
   and the reason as the refusal's; either is the decision `tool_start`
   carries, by `human`, an accept with the reason, or `allowed when
@@ -1358,9 +1374,10 @@ run, and on a fork whose base is inside it, with `interrupted` and a
 queued again after its end. The loop is not involved: a run it is
 running is never open to anyone else.
 
-Two facts the record needs are supplied by the caller and carried by
-the loop unread: the trigger of a run, and who decided an answer and
-why. The loop learns nothing from either.
+Three facts the record needs are supplied by the caller and carried by
+the loop unread: the trigger of a run, who decided an answer and why,
+and where an answer's output was taken from when a record held it. The
+loop learns nothing from any of them.
 
 ## Bindings
 

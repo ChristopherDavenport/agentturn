@@ -635,6 +635,17 @@ type PendingCall struct {
 	// handed over nor rewritten. An approval runs the call with them
 	// unless the answer carries its own.
 	Args json.RawMessage
+	// Ran is the output the call has where it ran, when a record shows
+	// it dispatched and completed off the path the agent continues: on
+	// a branch a rebase left, or in the session this one forks. The
+	// loop never sets it; agentturn/session's Pending does, from the
+	// record, and its ReplayAnswers answers the call with it rather
+	// than running the call again, as a host answering the call itself
+	// should. nil for every other call.
+	Ran *openresponses.FunctionCallOutput
+	// RanWhere says where the call ran, for a call with Ran: the reason
+	// an answer giving that output carries.
+	RanWhere string
 }
 
 // MayHaveRun reports whether the call may have run and an approval of

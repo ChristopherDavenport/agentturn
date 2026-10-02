@@ -193,7 +193,9 @@ type Config struct {
 	// the user mid-call, an MCP server's elicitation through mcpclient
 	// among them, reaches the host with the call on its context. A
 	// session recorder wraps one with session.Recorder.Elicitor so the
-	// question and the answer are written under the call. nil leaves an
+	// question and the answer are written under the call. The loop asks
+	// it too, with [Ask], about a nested call the hook defers, with the
+	// call on its context for [AskedCallFrom]. nil leaves an
 	// elicitor already on the run's context in place, and a tool with
 	// none asks nobody: an agent run from inside a tool served by
 	// agenttool's mcpserver, whose call context carries the elicitor
@@ -397,6 +399,13 @@ type ToolCallInfo struct {
 	// it for the answer.
 	Batch []*openresponses.FunctionCall
 	Index int
+	// Parent is the ID of the call whose tool made this one with
+	// [Invoke], as ToolStart.Parent is, and empty for a call the model
+	// made. A nested call the hook defers is answered inline, by the
+	// elicitor on the invoking tool's context or with a refusal, and
+	// never becomes pending: a hook that remembers the calls it defers
+	// for a resume keeps nothing for one with a Parent.
+	Parent string
 }
 
 // ToolAction is what BeforeToolCall decides for a call.
