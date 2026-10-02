@@ -194,6 +194,13 @@ func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*
 //	a2a.WithStart(func(_ context.Context, t agentturn.Transcript) (agentturn.Config, bool) {
 //		return a2a.HandedTo(t, route)
 //	})
+//
+// fn is also asked, with the stored conversation up to a pending call
+// and nothing after it, which configuration made that call, when the
+// conversation holds a pending call the caller does not own; it may
+// be called several times for one message, so it must be a function of
+// the transcript it is given alone, as [HandedTo] is, with no side
+// effects and no reading of the message's items.
 func WithStart(fn func(ctx context.Context, t agentturn.Transcript) (agentturn.Config, bool)) Option {
 	return func(e *Executor) { e.start = fn }
 }
@@ -630,8 +637,10 @@ func (e *Executor) transfers(name string) bool {
 // never be answered, as [stripUnanswered] drops an aborted run's.
 //
 // Ownership is judged by the configuration that made the call, the one
-// the conversation up to that call starts under, as [startFor] picks
-// it, not by the one the next message starts under: a receiver of a
+// the conversation up to that call starts under as [WithStart] or the
+// route shows it, which [startFor] picks, and the executor's own for a
+// host whose handoffs [WithHandoff] alone makes, not by the one the
+// next message starts under: a receiver of a
 // handoff may own a name the sender offered as the caller's stub, and
 // the sender's deferred call to it is the caller's. A pending call
 // whose name the caller owns under [WithCallerTools] or the message's
