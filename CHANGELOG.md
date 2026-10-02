@@ -205,16 +205,16 @@ versions may break the API.
   and an origin it cannot read, as none found. Each call in a fork's
   prefix reads its origins again rather than sharing one read.
 - **A stream that reuses an output index still reaches the loop and
-  the Responses front call by call, under openresponses v0.0.13.**
-  The `Accumulator` there keeps every item of a stream that reuses an
-  index, appended behind the others, so a position in its `Output` is
-  no longer an output index and the loop's `item_start`, `item_update`
-  and `OutputGuard` prefix read the first call at index 0 for every
-  call opened there, undoing #198 and #210. The loop and `front/responses`
-  now follow which position an index names, from the accumulator's
-  reported reuse, in an internal package with its own tests; the front
-  hands an `OutputGuard` the items opened before a message, not those
-  at the indexes below the message's.
+  the Responses front call by call, under openresponses v0.0.14.**
+  The `Accumulator` of v0.0.13 keeps every item of a stream that
+  reuses an index, appended behind the others, so a position in its
+  `Output` is no longer an output index, and the loop's `item_start`,
+  `item_update` and `OutputGuard` prefix read the first call at index
+  0 for every call opened there, undoing #198 and #210. The loop and
+  `front/responses` now ask the accumulator which item an index names,
+  with `ItemAt` and `Position`, which v0.0.14 adds; the front hands an
+  `OutputGuard` the items opened before a message, not those at the
+  indexes below the message's.
 
 ## v0.0.15 - 2026-10-01
 

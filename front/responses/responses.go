@@ -96,7 +96,6 @@ import (
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
-	"github.com/ChristopherDavenport/agentturn/internal/outputslots"
 	"github.com/ChristopherDavenport/openresponses"
 )
 
@@ -535,7 +534,6 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 		}
 	}
 	var acc openresponses.Accumulator
-	var slots outputslots.Slots
 	var final *openresponses.Response
 	// A function call is the caller's to run, so it reaches the caller
 	// only once the response completes: one a guard refuses hands the
@@ -566,10 +564,9 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 			return err
 		}
 		acc.Add(ev)
-		slots.Observe(ev, &acc)
 		switch e := ev.(type) {
 		case *openresponses.OutputItemAddedEvent:
-			item := slots.Item(e.OutputIndex, &acc)
+			item, _ := acc.ItemAt(e.OutputIndex)
 			if _, ok := item.(*openresponses.FunctionCall); ok && held == nil {
 				held = []func() error{}
 			}
@@ -585,7 +582,7 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 				// The items before the message, where the accumulator
 				// holds it: its output index, unless a stream reused
 				// an index before it.
-				at, _ := slots.Position(e.OutputIndex, &acc)
+				at, _ := acc.Position(e.OutputIndex)
 				replacement, err := cfg.OutputGuard(ctx, agentturn.OutputInfo{Turn: 1, ResponseID: out.ID, Message: m, Output: append(openresponses.Items(nil), out.Output[:at]...)})
 				if err != nil {
 					if errors.Is(err, agentturn.ErrGuard) {

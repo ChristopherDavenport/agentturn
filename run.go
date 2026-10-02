@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
-	"github.com/ChristopherDavenport/agentturn/internal/outputslots"
 	"github.com/ChristopherDavenport/openresponses"
 )
 
@@ -611,10 +610,6 @@ type runner struct {
 	// as completed, so the guard sees an earlier item as the loop
 	// completed it, a replacement included.
 	opened []openedItem
-	// slots says which position of the accumulator's Output an output
-	// index names: its own on a stream that keeps the indexes apart,
-	// and after a reuse the position of the item last opened there.
-	slots outputslots.Slots
 }
 
 // callSlot is the last function call opened at an output index: the
@@ -1270,7 +1265,6 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 	var acc openresponses.Accumulator
 	var halt *errStop
 	r.held, r.callAt, r.callItems, r.decided, r.opened = nil, nil, nil, nil, nil
-	r.slots = outputslots.Slots{}
 	for ev, err := range openresponses.Events(ctx, r.cfg.Model, req) {
 		if halt != nil {
 			// OutputGuard withheld a message: the rest of the response
@@ -1372,14 +1366,13 @@ func withheldResponse(acc *openresponses.Accumulator, final *openresponses.Respo
 // tell it from a delivery failure and hand the policy the error
 // itself.
 func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Accumulator, committed bool) (bool, error) {
-	r.slots.Observe(ev, acc)
 	responseID := ""
 	if cur := acc.Response(); cur != nil {
 		responseID = cur.ID
 	}
 	switch e := ev.(type) {
 	case *openresponses.OutputItemAddedEvent:
-		item := r.slots.Item(e.OutputIndex, acc)
+		item, _ := acc.ItemAt(e.OutputIndex)
 		r.opened = append(r.opened, openedItem{index: e.OutputIndex})
 		if call, ok := item.(*openresponses.FunctionCall); ok {
 			// The call's ID is decided as it opens, so its item_start,
@@ -1435,7 +1428,7 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 				case prior.done != nil:
 					before = append(before, prior.done)
 				case cur != nil:
-					if open := r.slots.Item(prior.index, acc); open != nil {
+					if open, ok := acc.ItemAt(prior.index); ok {
 						before = append(before, r.withCallID(open, prior.index))
 					}
 				}
@@ -1467,7 +1460,8 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		return false, &wireError{err: e.Err()}
 	}
 	if idx, ok := outputIndex(ev); ok {
-		return false, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: r.withCallID(r.slots.Item(idx, acc), idx), Stream: ev, ResponseID: responseID})
+		item, _ := acc.ItemAt(idx)
+		return false, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: r.withCallID(item, idx), Stream: ev, ResponseID: responseID})
 	}
 	return false, nil
 }
