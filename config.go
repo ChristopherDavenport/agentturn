@@ -214,7 +214,10 @@ type Config struct {
 	// may return a shorter or otherwise edited one for that call only:
 	// prune, compact, inject context. It receives a copy of the slice
 	// and must not mutate the items. The working transcript is not
-	// replaced.
+	// replaced. A one-shot change to the history, as when another agent
+	// takes over the conversation and should see less of it, belongs in
+	// [Agent.SetTranscript] between runs: a transform that drops items
+	// does so on every call, the receiver's own tool outputs included.
 	Transform func(context.Context, Transcript) (Transcript, error)
 
 	// BeforeToolCall runs once per call, in the model's order, before any

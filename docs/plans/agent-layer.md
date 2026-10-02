@@ -422,6 +422,20 @@ An agent can stand in three places inside another system.
 - **As a peer.** `front/a2a` exposes a loop to A2A callers; `tools/a2a`
   wraps a remote A2A agent as a `Tool`, mapping a task to one call and
   input-required to a returned error the model can answer.
+- **As itself, under new settings.** `Agent.SetConfig` replaces the
+  configuration and keeps the transcript, so the next `Continue` runs
+  the same conversation under another agent's instructions, tools and
+  model: the handoff of the agent frameworks, with no package. A
+  session recorder writes the switch as a config delta, so `ContextAt`
+  at any response gives the settings it was produced under. A
+  terminating tool result is the usual trigger: the loop stops with
+  `StopTerminate`, or `StopPartialTerminate` when the model asked for
+  something else in the same batch, and the destination travels in
+  `Result.Details` where the model cannot see it. `front/responses`
+  and `front/a2a` carry the pattern across their protocols with
+  `WithHandoff`, `WithStart` and `WithTransfers`. A one-shot trim of
+  the history for the receiver is `Agent.SetTranscript` between runs,
+  never `Transform`, which runs on every call (issue #96).
 
 ### Both directions for every protocol
 

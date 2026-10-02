@@ -316,6 +316,20 @@ produces them. An agent stands in three places inside another system:
   the child run a context of the host's making.
 - **As a peer.** `front/a2a` exposes a loop to A2A callers; `tools/a2a`
   wraps a remote A2A agent as a `Tool`.
+- **As itself, under new settings.** A handoff needs no package:
+  `Agent.SetConfig` replaces the configuration and keeps the transcript,
+  so the next `Continue` runs the same conversation under another
+  agent's instructions, tools and model. A terminating tool result is
+  the usual trigger, the loop stopping with `StopTerminate` or
+  `StopPartialTerminate` and the destination travelling in
+  `Result.Details`, where the model cannot see it;
+  `front/responses.Handoffs` reads the transfers a transcript took. A
+  session recorder writes the switch as a config delta. A one-shot trim
+  of what the receiver sees belongs in `Agent.SetTranscript` between
+  runs, not in `Config.Transform`, which runs on every call; a trim from
+  the middle of the history costs the responses after it their request
+  hash. The loop leaves another model's reasoning items out of each
+  request on its own, so a change of model needs no trim.
 
 `Config.Name` and `Config.Description` are the single source for how an
 agent presents itself in every one of these.
