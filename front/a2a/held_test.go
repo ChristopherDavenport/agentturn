@@ -3,7 +3,9 @@ package a2a
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/ChristopherDavenport/agenttool"
@@ -206,6 +208,77 @@ func TestHeldTransferIsNotAHandoff(t *testing.T) {
 			task := sendTask(t, h, next)
 			if task.Status.State != a2a.TaskStateCompleted || !reflect.DeepEqual(served, tc.next) {
 				t.Errorf("next task = %s served by %v, want completed by %v", task.Status.State, served, tc.next)
+			}
+		})
+	}
+}
+
+// TestAnswerToOwnCallRefused pins #209's guard in checkAnswers: a stored
+// conversation that holds a pending call to one of the agent's own
+// tools, which only an older release or a seeded store can leave, is
+// not the caller's to answer. A function_call_output for it is refused
+// as invalid params and the tool never runs; one for a pending call to
+// a caller-owned tool is taken as before.
+func TestAnswerToOwnCallRefused(t *testing.T) {
+	var ran int
+	refund := agenttool.NewFunc("issue_refund", "refunds a charge", json.RawMessage(`{"type":"object"}`),
+		func(context.Context, agenttool.Call) (agenttool.Result, error) {
+			ran++
+			return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: "refunded"}}, nil
+		})
+	refunds := agentturn.Config{Name: "refunds", Model: &echo.Adapter{}, Tools: []agenttool.Tool{refund}}
+	route := func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+		return refunds, "transferred", call.Name == "transfer_to_refunds_agent"
+	}
+	for _, tc := range []struct {
+		name    string
+		tools   []agenttool.Tool
+		opts    []Option
+		pending string
+		declare string
+		refused bool
+	}{
+		{"the agent's own tool", []agenttool.Tool{refund}, nil, "issue_refund", "", true},
+		{"a tool of the configuration the task starts under", nil, []Option{WithStart(func(context.Context, agentturn.Transcript) (agentturn.Config, bool) {
+			return refunds, true
+		})}, "issue_refund", "", true},
+		{"a transfer the route takes", nil, []Option{WithTransfers(route)}, "transfer_to_refunds_agent", "", true},
+		{"a caller-owned tool", nil, nil, "remote", "remote", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ran = 0
+			store := &MemoryStore{}
+			if err := store.Save(context.Background(), "c1", openresponses.Items{
+				openresponses.UserText("refund me"),
+				&openresponses.FunctionCall{CallID: "call_1", Name: tc.pending, Arguments: "{}"},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			h := a2asrv.NewHandler(New(agentturn.Config{Name: "triage", Model: &echo.Adapter{}, Tools: tc.tools},
+				append([]Option{WithConversationStore(store)}, tc.opts...)...))
+			msg := a2a.NewMessage(a2a.MessageRoleUser, a2a.DataPart{Data: map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "approved by the caller"}})
+			if tc.declare != "" {
+				msg.SetMeta(MetaCallerTools, []any{map[string]any{"type": "function", "name": tc.declare, "parameters": map[string]any{"type": "object"}}})
+			}
+			msg.ContextID = "c1"
+			res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: msg})
+			if !tc.refused {
+				if err != nil {
+					t.Fatalf("send: %v", err)
+				}
+				if task, _ := res.(*a2a.Task); task == nil || task.Status.State != a2a.TaskStateCompleted {
+					t.Errorf("task = %+v, want completed", res)
+				}
+				return
+			}
+			if !errors.Is(err, a2a.ErrInvalidParams) || res != nil || !strings.Contains(err.Error(), "agent's own") {
+				t.Fatalf("send = %+v, %v; want refused as invalid params naming the agent's own call", res, err)
+			}
+			if ran != 0 {
+				t.Errorf("issue_refund ran %d times", ran)
+			}
+			if stored, _ := store.Load(context.Background(), "c1"); len(stored) != 2 {
+				t.Errorf("stored = %s, want the conversation as it was", itemTypes(stored))
 			}
 		})
 	}
