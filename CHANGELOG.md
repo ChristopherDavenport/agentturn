@@ -5,6 +5,190 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- **A call to the agent's own tool that its hook held is never handed
+  to the A2A caller.** `front/a2a` listed a `Defer` of a call to one of
+  the agent's own tools to the caller as input-required and took the
+  caller's `function_call_output` as the tool's, so a held transfer
+  became a handoff with nobody asked, and a held `issue_refund` read as
+  done without running. The caller answers only calls to the tools it
+  owns. The executor's hook now puts such a call to
+  `Config.ToolElicitor` with `agentturn.Ask`, as the loop does a nested
+  call the hook deferred: an accept runs it and a decline refuses it,
+  both by `human`, and without an elicitor, or on a cancel or a failure
+  to ask, the call is refused with a reason saying it cannot be handed
+  to the caller. After a `WithHandoff` switch the receiver's hook asks
+  the sender's elicitor when its own configuration has none. A pending
+  call to a tool the agent owned when it made the call and the caller
+  does not own, which only an older release or a seeded store can hold,
+  is dropped when the conversation is loaded, as an aborted run's
+  unanswered calls are, and a message answering it is refused as
+  invalid params; a call whose name the caller owns, or that the
+  configuration that made it did not offer, stays the caller's. The package doc says which calls a caller answers
+  (#209).
+- **The batch runs the calls the transcript holds, whatever the stream
+  knew them by.** The response the turn acts on was renamed by output
+  index, so a stream that opens every call at index 0 with no item
+  IDs, as Ollama 0.23 and a text-call parser do, ran one call twice,
+  failing under a session recorder with "call has its output", or,
+  once the loop had renamed a repeated call ID, ran each call with the
+  other's output and said nothing. Each function call of the completed
+  response is now paired with the one the attempt completed, by item
+  ID when both carry one, else by the model's call ID, else by order,
+  and the completed call stands in its place; a completed call the
+  response leaves out, as a terminal response built one item per output
+  index does, makes the response's calls give way to the completed ones
+  in the order they opened, so every call the transcript holds is run
+  and answered where it was left dangling before. `response_end` and
+  `turn_end` carry the result, so the items they carry are the
+  transcript's own and read-only (#210).
+- **`compact.WithBackOff(false)` turns the back-off after a failed fold
+  off.** A recording made across a restart before v0.0.15, or by a
+  host that resumed without `session.CompactOptions`, asked again about
+  a prefix whose fold had failed; a replay in one process backed off
+  there and diverged, and `WithMinFold(0)` did not move it. With the
+  option off the transform asks again on every call over budget and
+  ignores a seeded failed fold; the failed fold is still reported with
+  its prefix hash (#211).
+- **The call put to the elicitor is on its context as data.**
+  `Ask` puts a call to the `agenttool.Elicitor` on a context as the
+  loop puts a nested call the hook deferred, with the question naming
+  the call and the first 500 bytes of its arguments, and an `AskedCall`
+  on the elicitor's context, read with `AskedCallFrom`: parent, call
+  ID, name, whole arguments and the deferral, so a front answering
+  "for this session" or "always" can make a rule of it without parsing
+  the question. `Invoke` asks through it; `ContextWithAskedCall` is for
+  a front asking through another route (#212).
+- **The session recorder writes a question before it is put and its
+  answer after.** `Recorder.Elicitor` wrote one `agentturn:elicitation`
+  entry once the answer was in, so a process killed while a person was
+  deciding left the parent call's dispatch and nothing else, and the
+  question named neither the nested call nor its tool. It now writes
+  an entry with `phase` `ask` before the elicitor is called and one
+  with `phase` `answer` after, naming the ask entry in `asked`; both
+  carry the asked call's `call`, `tool` and `parent` from
+  `agentturn.AskedCall` when the context has one. A reader treats an
+  ask with no answer in a cut run as a question still open, and
+  `ReplayAnswers` names it in the reason of the outcome-unknown answer
+  it gives the in-flight call. An entry with no phase is one an
+  earlier release wrote (#213).
+- **A child's first env entry is what `WithEnv` returns for the
+  child's context.** A child session's first run start copied the env
+  in force in its parent's and never asked the host's function, so a
+  child the host gave a sandbox of its own, a container per delegate
+  or a worktree per task, was filed under its parent's workspace, and
+  its first `Recorder.Env` wrote its real one as a move that never
+  happened. The recorder now asks the function with the context the
+  observer receives for the child, the call's; a non-nil entry is the
+  child's first, and nil keeps the copy of the parent's. An error at a
+  child's start ends that child's record where it is, since an
+  observer cannot fail the child's run (#214).
+- **`ToolCallInfo.Parent` names the call whose tool made a nested
+  call.** A hook deciding a call made through `Invoke` saw a batch of
+  one at index 0, which is what a turn of one call looks like, while a
+  deferred nested call is settled inline by the invoking tool's
+  elicitor and never becomes pending; a hook that remembers the calls
+  it defers for a resume kept every deferred nested call as waiting
+  forever. `ToolCallInfo` now carries `Parent` as `ToolStart` does,
+  empty for a call the model made, in a child run started from a
+  tool's context included. `front/a2a` reads it in place of a
+  transcript scan (#208).
+- **`BeforeTurn` is told how each of the turn's inputs arrived.**
+  `TurnStartInfo` gains `Inputs []TurnInput`, each item with an
+  `InputMode`: `prompt`, `resume`, `steer`, `follow_up`, `deliver`,
+  `hook`, `tool` or `continued`, with the run's trigger on a prompt's
+  item and the `Queued` trigger on a queued one. A run's first turn
+  opens with the items the transcript already ended with that the
+  model did not produce, as `continued`, so a `Continue` on a handoff
+  sees the transfer's output. `TurnStart` keeps `Inputs` and gains
+  `Arrived`, the same list with the hook's items and the continued
+  ones. `Agent.Deliver`'s items arrive as `deliver`, so a hook that
+  revokes on a user's message no longer mistakes a delivered output
+  after a steer for a resume, or a delivered answer for the user
+  (#157).
+- **`Recorder.SessionOf` names the session a record made with a
+  context goes to, and a late job's record follows its run.**
+  `Annotate`, `RecordFunc` and `Env` filed a record written after a
+  child run ended in the child session the context named, which only
+  `ChildContext` puts there; a child built with `WithObserver` alone
+  had its late records sent to the root with no `call_id`, and a hook
+  in it could not learn which session it wrote. The recorder now
+  remembers the session of every child run it finishes writing,
+  `SessionOf` answers for any context, and a record made with an ended
+  child run's context is filed in the child's session with its call
+  (#158).
+- **`session.WithContext` has `Pending` and `AgentOptions` read a
+  fork's origins under the caller's context.** They read under
+  `context.Background()`, so a front calling `AgentOptions` from a
+  request handler on a slow store never saw the request's deadline.
+  `ReplayAnswers` reads under its own context whatever the option says
+  (#207).
+- **A replayed output keeps its child-session provenance.** An output
+  `ReplayAnswers` took from the branch a rebase left, or from the
+  session a fork was made from, was written on the new branch as an
+  answer and an output alone, so a `tools/agent` child's work read as
+  an output from nowhere. `Answer.Origin` names where an output taken
+  from a record was taken from, carried unread on the run's context
+  with `ContextWithOrigins` and read with `OriginFromContext` as
+  reasons are; `ReplayAnswers` sets it to the entry of the output it
+  repeats, and the recorder writes the same subsession `link` for the
+  call on the new branch before the answer when the branch is this
+  session's; in a fork no link is written, since the child is the
+  origin's and the fork reaches it through the origin's link in its
+  prefix. `tools/agent` clears it for a child's context as it clears
+  reasons and deciders (#206).
+- **A second `tools/agent` execution under one call ID opens a new
+  root in the child's session.** `Execute` builds a fresh child per
+  call whose request is the new input alone, while the recorder
+  continued the child's session at its leaf, so the second run's
+  responses could not be hashed and the first attempt's open call
+  stayed at the leaf; the realistic case is `Agent.Resume` running a
+  cut-off call again after an Esc. `Execute` now marks every run it
+  starts with `ContextWithRetry`, so the recorder opens a new root,
+  every response verifies and the leaf owes nothing. This changes the
+  record beyond the filing: a second execution under one call opens a
+  new root even when both runs complete, where the session package's
+  doc promised a continuation at the leaf; only an observed child is
+  affected, since a child written from `ChildInfo.Items` runs under the
+  parent's unmarked context. A host prompting again the agent it kept
+  through `WithSpawn` still continues at the leaf, since that agent
+  holds its context (#87).
+- **`PendingCall.Ran` and `RanWhere` carry the output a call has where
+  it ran off the path.** The session package answered a call that
+  completed on a branch a rebase left, or in the session a fork was
+  made from, with that output, but held it on an unexported field, so
+  `RunEnd.Pending` and `Agent.State().Pending` never carried it and a
+  host reading those told the model the call may have run. `Pending`
+  and `AgentOptions` now fill both, `ReplayAnswers` reads them, and the
+  loop carries them onto the pending list of a run that leaves the
+  call pending, where it dropped them before. `PendingCall.Refused`
+  carries, for a call pending as `PendingRejected`, the reason the
+  reject decision gave, which `Pending` reads from the record and
+  `ReplayAnswers` gives as the owed output, so a host answering such a
+  call itself writes the record's refusal rather than fixed text
+  (agentpolicy#63, agentpolicy#53).
+- **`Recorder.CompactOptions` seeds a compact transform from the
+  recorder.** `session.CompactOptions(s)` needs the session, which a
+  host handed only the recorder does not hold, so it asked the failed
+  summary again. A recorder seeded from a path, by `Resume`,
+  `Continue`, a `Start` on a based header or `Rebase`, carries the same
+  options; nil on a fresh session (agenteval#48).
+- **`session.MarkedItem` decodes the custom entry written for an item
+  the filter kept from the model.** Since #202 such an output item is
+  a custom entry in the namespace of its type marked with
+  `ResponseIDMember`; the rule reading it back was private, so a
+  replay that rebuilds a response's output from the path dropped those
+  items. `MarkedItem` gives the item and its response ID, and false
+  for any other entry (agenteval#50).
+- **The handoff is documented as the fourth composition.** The README
+  and the plan name `Agent.SetConfig` then `Continue` beside the model,
+  tool and peer compositions, and `Config.Transform`'s doc says a
+  one-shot change to the history belongs in `Agent.SetTranscript`
+  between runs (#96). `front/a2a.WithRecorderFor`'s doc says a host
+  whose hooks record verdicts of their own puts its recorder on the
+  run's context beside the session ID (agentkit#74).
+
 ## v0.0.15 - 2026-10-01
 
 - **Requires `agenttool` v0.0.14, up from v0.0.12, and `agentsession`

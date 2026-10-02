@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/ChristopherDavenport/agentsession"
@@ -145,4 +146,193 @@ func itemRoles(items openresponses.Items) string {
 		out += it.ItemType()
 	}
 	return out
+}
+
+// TestSessionOfNamesWhereARecordGoes pins #158: SessionOf names the
+// session a record made with a context is written to, for a child
+// built with WithObserver alone as for one wired with ChildContext:
+// the child's during its run, when Annotate lands there with the
+// call's ID; the child's after its run ended, when a job the child
+// started writes with the run's context, which the recorder remembers
+// for the run; and the recorder's own for a context with no run.
+func TestSessionOfNamesWhereARecordGoes(t *testing.T) {
+	cases := []struct {
+		name  string
+		wired bool
+	}{
+		{"with ChildContext", true},
+		{"with WithObserver alone", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(ctx, store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var jobCtx context.Context
+			var during, fromContext, noteCall string
+			note := agenttool.New("note", "note something", func(ctx context.Context, _ echoArgs) (string, error) {
+				jobCtx = ctx
+				call, _ := agenttool.CallFrom(ctx)
+				noteCall = call.ID
+				during = rec.SessionOf(ctx)
+				fromContext = SessionIDFromContext(ctx)
+				_, err := rec.Annotate(ctx, "test:manifest", map[string]string{"render": "r1"})
+				return "noted", err
+			})
+			childCfg := agentturn.Config{Name: "helper", Description: "notes", Model: scriptedCalls{{"note", `{"text":"t"}`}}, Tools: []agenttool.Tool{note}}
+			opts := []agent.Option{agent.WithObserver(rec.Observe)}
+			if tc.wired {
+				opts = append(opts, agent.WithRunContext(rec.ChildContext))
+			}
+			helper := agent.New(childCfg, opts...)
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{helper}})
+			defer rec.Attach(a)()
+			if _, err := a.Prompt(ctx, openresponses.UserText("delegate")); err != nil {
+				t.Fatal(err)
+			}
+			l := links(s)
+			if len(l) != 1 {
+				t.Fatalf("links = %+v", l)
+			}
+			childID := l[0].Session
+			if during != childID {
+				t.Errorf("SessionOf during the child's run = %q, want the child's %q", during, childID)
+			}
+			if want := map[bool]string{true: childID, false: ""}[tc.wired]; fromContext != want {
+				t.Errorf("SessionIDFromContext in the child = %q, want %q", fromContext, want)
+			}
+			// The run is over: the recorder remembers which session
+			// it wrote, and a late job's record goes there too.
+			if got := rec.SessionOf(jobCtx); got != childID {
+				t.Errorf("SessionOf after the child's run = %q, want the child's %q", got, childID)
+			}
+			if got := rec.SessionOf(ctx); got != rec.SessionID() {
+				t.Errorf("SessionOf with no run = %q, want the recorder's own %q", got, rec.SessionID())
+			}
+			if _, err := rec.Annotate(jobCtx, "test:job", map[string]string{"state": "done"}); err != nil {
+				t.Fatal(err)
+			}
+			child, err := store.Open(ctx, childID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := map[string]string{}
+			for _, e := range child.Entries() {
+				if c, ok := e.(*agentsession.CustomEntry); ok {
+					got[c.NS] = c.CallID
+				}
+			}
+			for _, ns := range []string{"test:manifest", "test:job"} {
+				if callID, ok := got[ns]; !ok || callID != noteCall {
+					t.Errorf("%s in the child: present=%v call_id=%q, want call %q", ns, ok, callID, noteCall)
+				}
+			}
+			for _, e := range s.Entries() {
+				if c, ok := e.(*agentsession.CustomEntry); ok {
+					t.Errorf("%s was filed at the root", c.NS)
+				}
+			}
+			verifyAll(t, s)
+			verifyAll(t, child)
+		})
+	}
+}
+
+// TestReplayedChildOutputKeepsItsLink pins the session half of #206: a
+// tools/agent child's call completes and is linked, a rebase to before
+// its dispatch leaves the call on the path with its dispatch, link and
+// output on the branch left, and a restart answers it with that output
+// rather than running the child again. The new branch holds a link for
+// the call to the same child session before the answer, so the record
+// says whose work the output is, and the session still verifies.
+func TestReplayedChildOutputKeepsItsLink(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs := 0
+	childCfg := agentturn.Config{Name: "specialist", Description: "a child", Model: &echo.Adapter{}, ModelName: "c",
+		BeforeTurn: func(context.Context, agentturn.TurnStartInfo) (openresponses.Items, error) { runs++; return nil, nil }}
+	specialist := agent.New(childCfg, agent.WithObserver(rec.Observe))
+	tools := []agenttool.Tool{specialist}
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: tools})
+	unsub := rec.Attach(a)
+	if end, err := a.Prompt(ctx, openresponses.UserText("delegate")); err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	unsub()
+	before := links(s)
+	c := callsOf(t, s)["specialist"]
+	if len(before) != 1 || c == nil || c.Dispatch == nil || c.Output == nil || before[0].CallID != c.ID() {
+		t.Fatalf("links = %+v, call = %+v", before, c)
+	}
+	child := before[0].Session
+	if runs != 1 {
+		t.Fatalf("the child ran %d times", runs)
+	}
+
+	// A restart, then the rebase to before the dispatch.
+	rec, s, err = Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Rebase(s, c.Dispatch.Parent); err != nil {
+		t.Fatal(err)
+	}
+	answers, err := ReplayAnswers(ctx, s, tools, rec.ReadOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(answers) != 1 || answers[0].Output == nil || answers[0].Reason != ranOffReason || answers[0].Origin != c.Output.ID {
+		t.Fatalf("answers = %+v, want the output on the branch left with origin %s", answers, c.Output.ID)
+	}
+	opts, err := AgentOptions(s, rec.ReadOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: tools}, opts...)
+	defer rec.Attach(b)()
+	if end, err := b.Resume(ctx, answers...); err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("resume: err=%v end=%+v", err, end)
+	}
+	if runs != 1 {
+		t.Errorf("the child ran %d times, want once", runs)
+	}
+	// The new branch: the link for the call to the same child, then
+	// the answer and the output.
+	var record []string
+	for _, e := range s.Path(s.Leaf()) {
+		switch e := e.(type) {
+		case *agentsession.LinkEntry:
+			record = append(record, "link")
+			if e.Rel != agentsession.RelSubsession || e.CallID != c.ID() || e.Session != child {
+				t.Errorf("link on the new branch = %+v, want %s linked to %s", e, c.ID(), child)
+			}
+		case *agentsession.DecisionEntry:
+			record = append(record, e.Verdict)
+		case *agentsession.DispatchEntry:
+			record = append(record, "dispatch")
+		case *agentsession.ItemEntry:
+			if _, ok := e.Item.(*openresponses.FunctionCallOutput); ok {
+				record = append(record, "output")
+			}
+		}
+	}
+	if got := strings.Join(record, " "); got != "link answer output" {
+		t.Errorf("the new branch's record for the call = %q, want %q", got, "link answer output")
+	}
+	if err := s.VerifyRecords(s.Leaf()); err != nil {
+		t.Errorf("verify records: %v", err)
+	}
+	verifyAll(t, s)
+	cs, err := store.Open(ctx, child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyAll(t, cs)
 }

@@ -435,6 +435,11 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 			if p := pending[0]; p.Reason == agentturn.PendingDeferred && (!p.Dispatched || p.IdempotencyKey != "k1" || !p.MayHaveRun()) {
 				t.Errorf("a hold after a dispatch = %+v", p)
 			}
+			// A rejected call carries the reject's reason, the output
+			// it is owed (agentpolicy#53).
+			if p := pending[0]; (p.Reason == agentturn.PendingRejected) != (p.Refused == "denied by rm") {
+				t.Errorf("refused = %q for %s", p.Refused, p.Reason)
+			}
 			opts, err := AgentOptions(s2)
 			if err != nil {
 				t.Fatal(err)
@@ -779,6 +784,22 @@ func TestRebaseBeforeADispatch(t *testing.T) {
 			if len(pending) != 1 || pending[0].Reason != agentturn.PendingAborted || pending[0].IdempotencyKey != first || pending[0].Args != nil {
 				t.Fatalf("pending = %+v, want aborted under %q", pending, first)
 			}
+			// agentpolicy#63: a call that completed on the branch left
+			// carries its output and where it ran, so a host answering
+			// the call itself has what ReplayAnswers has.
+			checkRan := func(what string, p agentturn.PendingCall) {
+				t.Helper()
+				if tc.cut {
+					if p.Ran != nil || p.RanWhere != "" {
+						t.Errorf("%s: Ran = %+v where %q, want none for a call cut before its output", what, p.Ran, p.RanWhere)
+					}
+					return
+				}
+				if p.Ran == nil || p.Ran.Output.Text != "charged" || p.RanWhere != ranOffReason {
+					t.Errorf("%s: Ran = %+v where %q, want the output on the branch left, %q", what, p.Ran, p.RanWhere, ranOffReason)
+				}
+			}
+			checkRan("Pending", pending[0])
 			answers, err := ReplayAnswers(ctx, s, tools)
 			if err != nil {
 				t.Fatal(err)
@@ -788,6 +809,11 @@ func TestRebaseBeforeADispatch(t *testing.T) {
 				t.Fatal(err)
 			}
 			b := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: tools}, opts...)
+			if seeded := b.State().Pending; len(seeded) != 1 {
+				t.Fatalf("the agent is seeded with %d pending calls", len(seeded))
+			} else {
+				checkRan("State().Pending", seeded[0])
+			}
 			defer rec.Attach(b)()
 			if end, err := b.Resume(ctx, answers...); err != nil || end.Reason != agentturn.ReasonDone {
 				t.Fatalf("resume: err=%v end=%+v", err, end)
@@ -1077,6 +1103,13 @@ func TestForkReadsItsOrigin(t *testing.T) {
 			}
 			after = append(after, agentsession.NewDispatch(call.CallID, target).WithIdempotencyKey("k1"))
 			if tc.completed {
+				// The call's work was a child session's (#206): the
+				// origin links it, and a fork that repeats the output
+				// writes no link of its own, since the child is the
+				// origin's and a link names a child of its writer; the
+				// fork reaches it through the origin's link in its
+				// prefix (agentsession#186's verifier checks the pair).
+				after = append(after, agentsession.NewSubsessionLink("child-of-call-1", call.CallID))
 				after = append(after, &agentsession.ItemEntry{Item: openresponses.NewFunctionCallOutput(call.CallID, "charged")})
 			}
 			for _, e := range after {
@@ -1108,6 +1141,11 @@ func TestForkReadsItsOrigin(t *testing.T) {
 			if len(pending) != 1 || pending[0].Reason != tc.want || pending[0].IdempotencyKey != tc.wantKey {
 				t.Fatalf("pending = %+v, want %s under %q", pending, tc.want, tc.wantKey)
 			}
+			// agentpolicy#63: a call that completed in the origin carries
+			// its output and where it ran, when the origin is read.
+			if ran := tc.origins && tc.completed; (pending[0].Ran != nil) != ran || ran && (pending[0].Ran.Output.Text != "charged" || pending[0].RanWhere != ranInOriginReason) || !ran && pending[0].RanWhere != "" {
+				t.Errorf("Ran = %+v where %q, want the origin's output (%v) with %q", pending[0].Ran, pending[0].RanWhere, ran, ranInOriginReason)
+			}
 			var answers []agentturn.Answer
 			if tc.answer != nil {
 				answers = []agentturn.Answer{tc.answer(call.CallID)}
@@ -1133,6 +1171,11 @@ func TestForkReadsItsOrigin(t *testing.T) {
 					continue
 				}
 				switch e := e.(type) {
+				case *agentsession.LinkEntry:
+					record = append(record, "link")
+					if e.Rel != agentsession.RelSubsession || e.CallID != call.CallID || e.Session != "child-of-call-1" {
+						t.Errorf("link = %+v, want the origin's child linked to %s", e, call.CallID)
+					}
 				case *agentsession.DispatchEntry:
 					record = append(record, "dispatch")
 				case *agentsession.DecisionEntry:
@@ -1267,5 +1310,75 @@ func TestOriginReadErrors(t *testing.T) {
 	}
 	if p, err := Pending(fork); err != nil || len(p) != 1 || p[0].Reason != agentturn.PendingUnknown {
 		t.Errorf("pending alone = %+v, %v", p, err)
+	}
+}
+
+// deadlined is a store whose Read answers with the context's error once
+// the context is done, as a store on a slow disk or a network does.
+type deadlined struct{ *agentsession.MemoryStore }
+
+func (d deadlined) Read(ctx context.Context, id string) (*agentsession.Session, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return d.MemoryStore.Read(ctx, id)
+}
+
+// TestOriginsReadUnderTheCallersContext pins #207: Pending and
+// AgentOptions read a fork's origins under the context WithContext
+// gives, so a cancellation on it ends the reads with its error, and
+// under context.Background() without it; ReplayAnswers reads under
+// its own context whatever the option says.
+func TestOriginsReadUnderTheCallersContext(t *testing.T) {
+	ctx := context.Background()
+	mem := agentsession.NewMemoryStore()
+	store := deadlined{mem}
+	origin, err := mem.Create(ctx, agentsession.Header{Records: agentsession.AllRecords})
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := &openresponses.FunctionCall{CallID: "call_1", Name: "charge", Arguments: `{}`}
+	target, err := mem.Append(ctx, origin.ID(), &agentsession.ItemEntry{Item: call})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mem.Append(ctx, origin.ID(), agentsession.NewDispatch(call.CallID, target).WithIdempotencyKey("k1")); err != nil {
+		t.Fatal(err)
+	}
+	rec, fork, err := Start(ctx, store, agentsession.Header{Base: target, ParentSession: origin.ID()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	cases := []struct {
+		name string
+		opts []ReadOption
+		// wantErr is the error the reads end with, nil for a read of
+		// the origin's dispatch.
+		wantErr error
+	}{
+		{name: "without the option", opts: rec.ReadOptions()},
+		{name: "a live context", opts: append(rec.ReadOptions(), WithContext(ctx))},
+		{name: "a cancelled context", opts: append(rec.ReadOptions(), WithContext(cancelled)), wantErr: context.Canceled},
+		{name: "a cancelled context before the origins", opts: append([]ReadOption{WithContext(cancelled)}, rec.ReadOptions()...), wantErr: context.Canceled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := Pending(fork, tc.opts...)
+			if !errors.Is(err, tc.wantErr) || tc.wantErr == nil && (len(p) != 1 || p[0].IdempotencyKey != "k1") {
+				t.Errorf("Pending = %+v, %v; want err %v", p, err, tc.wantErr)
+			}
+			if _, err := AgentOptions(fork, tc.opts...); !errors.Is(err, tc.wantErr) {
+				t.Errorf("AgentOptions err = %v, want %v", err, tc.wantErr)
+			}
+			// ReplayAnswers reads under its own context.
+			if _, err := ReplayAnswers(ctx, fork, nil, tc.opts...); err != nil {
+				t.Errorf("ReplayAnswers under a live context: %v", err)
+			}
+			if _, err := ReplayAnswers(cancelled, fork, nil, tc.opts...); !errors.Is(err, context.Canceled) {
+				t.Errorf("ReplayAnswers under a cancelled context: %v, want %v", err, context.Canceled)
+			}
+		})
 	}
 }

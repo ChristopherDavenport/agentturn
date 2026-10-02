@@ -447,3 +447,57 @@ func TestResumePutsNeverStartedCallsToTheHook(t *testing.T) {
 		})
 	}
 }
+
+// TestPendingCallCarriesWhereItRan pins agentpolicy#63: the output a
+// call has where it ran off the path the agent continues, which a host
+// seeds the agent with from the record, is on the agent's pending
+// calls and survives a run that leaves the call pending, so a host
+// reading RunEnd.Pending answers the call with it rather than telling
+// the model the call may have run.
+func TestPendingCallCarriesWhereItRan(t *testing.T) {
+	call := &openresponses.FunctionCall{CallID: "call_1", Name: "act", Arguments: `{"text":"t"}`}
+	ran := &openresponses.FunctionCallOutput{CallID: "call_1", Output: openresponses.FunctionCallOutputData{Text: "done there"}}
+	for _, tc := range []struct {
+		name   string
+		seeded PendingCall
+	}{
+		{"held", PendingCall{Call: call, Reason: PendingDeferred, Ran: ran, RanWhere: "on a branch a rebase left"}},
+		{"cut after its dispatch", PendingCall{Call: call, Reason: PendingAborted, IdempotencyKey: "k1", Ran: ran, RanWhere: "in the session this one forks"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			k := &keyedTool{}
+			a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{k.tool(agenttool.ReplaySafe)}},
+				WithTranscript(Transcript{openresponses.UserText("go"), call}), WithPending([]PendingCall{tc.seeded}))
+			if p := a.State().Pending; len(p) != 1 || p[0].Ran != ran || p[0].RanWhere != tc.seeded.RanWhere {
+				t.Fatalf("State().Pending = %+v", p)
+			}
+			// A subscriber refusing run_start ends the run before its
+			// batch, so the call is left pending as the agent knew it.
+			refused := errors.New("refused")
+			a.Subscribe(func(_ context.Context, ev Event) error {
+				if _, ok := ev.(*RunStart); ok {
+					return refused
+				}
+				return nil
+			})
+			end, _ := a.Resume(context.Background(), Approve(call.CallID))
+			if end == nil || len(end.Pending) != 1 || len(k.keys) != 0 {
+				t.Fatalf("end = %+v, ran %d", end, len(k.keys))
+			}
+			if p := end.Pending[0]; p.Reason != tc.seeded.Reason || p.Ran != ran || p.RanWhere != tc.seeded.RanWhere {
+				t.Errorf("RunEnd.Pending = %+v, want Ran and RanWhere kept", p)
+			}
+			if p := a.State().Pending; len(p) != 1 || p[0].Ran != ran || p[0].RanWhere != tc.seeded.RanWhere {
+				t.Errorf("State().Pending after the run = %+v", p)
+			}
+			// SetTranscript keeps what the agent knew of a call the new
+			// transcript still holds.
+			if err := a.SetTranscript(Transcript{openresponses.UserText("go"), call, openresponses.UserText("note")}); err != nil {
+				t.Fatal(err)
+			}
+			if p := a.State().Pending; len(p) != 1 || p[0].Ran != ran || p[0].RanWhere != tc.seeded.RanWhere {
+				t.Errorf("State().Pending after SetTranscript = %+v", p)
+			}
+		})
+	}
+}

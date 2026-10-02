@@ -280,7 +280,10 @@ it raises and the hooks it calls; the events are defined
 
 1. **Cancellation.** If the run's context is cancelled, it ends with
    reason `aborted`.
-2. **Before the turn.** The before-turn hook MAY return items, which
+2. **Before the turn.** The before-turn hook sees the working
+   transcript and the turn's inputs so far, each item with its
+   **input mode**, how it arrived, as described under phase 5, and MAY
+   return items, which
    the loop appends to the transcript with their item events as it
    appends any input. They are then facts about the transcript: a
    recorded session rebuilds the request they were part of, which
@@ -300,7 +303,37 @@ it raises and the hooks it calls; the events are defined
 5. **`turn_start`** carries the request exactly as it will be sent and
    the **inputs** of the turn: the items appended since the previous
    turn's response, or since the run started for the first turn. They
-   are what this turn's response answers.
+   are what this turn's response answers. Beside them it carries the
+   same items as **arrived**, each with its **input mode**, which says
+   how the item came, and on a run's first turn also the items the
+   transcript already ended with when the run started that the model
+   did not produce, after its last output: a run that continues from
+   a transcript answers them first, and the inputs, which name only
+   what the run appended, never held them. The modes are:
+   - `prompt`: an item the run was prompted with;
+   - `resume`: an output or a note a resume appended, or one of the
+     leading outputs a prompt opened with for the pending calls;
+   - `steer`: an item drained from the steer queue;
+   - `follow_up`: an item drained from the follow-up queue;
+   - `deliver`: an item handed in by a [delivery](#queues), which
+     queues it as a steer; the mode is what tells the two apart;
+   - `hook`: an item the before-turn hook appended;
+   - `tool`: a function call output the loop appended for a call it
+     ran, the previous batch's or a resume's approved batch's, and the
+     note a decision attached after the batch's outputs;
+   - `continued`: an item already in the transcript, after its last
+     model output, when the run started: a function call output, a
+     user or developer message or a namespaced custom item, such as the
+     outputs of the run before, which a continue answers.
+   An item of mode `prompt` carries the run's trigger, and one of mode
+   `steer`, `follow_up` or `deliver` the trigger its `queued` report
+   carried; the others carry none. The before-turn hook of phase 2
+   sees the same list without the `hook` items, since it has not run
+   yet, so a layer that must act when a user's message arrives, or
+   once on the turn that answers a handoff, reads the mode rather than
+   inferring it from the transcript's tail, where a steer followed by
+   a delivered output looks like a resume and an answer delivered as a
+   message looks like the user's (#157).
 6. **The model call**, as the [model call section](#the-model-call)
    says: item events as the stream delivers output items, an attempt
    retried under the retry policy when it failed before it began, and
@@ -457,6 +490,32 @@ the transcript.
   A front that hands the caller the response's function calls to run
   holds them until the response completes, so a withheld response
   hands the caller none.
+- A function call is known, while it streams, by its item ID, and by
+  its output index when the event naming it carries none, so a stream
+  that opens a second call at the output index of the first still
+  gives each its own ID, and a call opened without an item ID and
+  completed with one keeps the ID it opened with. The response the
+  turn acts on, which `response_end` and `turn_end` carry and whose
+  function calls form the batch, holds the calls the transcript holds:
+  each function call of the completed response is paired with one the
+  attempt completed, taken in the order they opened, which is the
+  transcript's order, by item ID when both carry one, else by the call
+  ID the model gave it among the completed calls not yet paired, else
+  by order, and the completed call, with the ID the loop decided and
+  the arguments it completed with, stands in the response's place. A
+  function call the response lists that the stream never completed
+  keeps the ID decided at its output index, and an item that is not a
+  function call is left as the response gave it. A completed call no
+  call of the response pairs with, which a terminal response built one
+  item per output index leaves out when a later call took the index,
+  makes the response's calls give way, as a group, to the completed
+  calls in the order they opened, so every call the transcript holds is
+  run and answered in the transcript's order. A
+  stream that opens every call at one output index with no item IDs,
+  as a text-call parser's does, therefore runs each call under its own
+  ID and answers it with its own output, where pairing by index alone
+  ran the last call opened there for every call listed at that index
+  and left a call the response did not list dangling (#210).
 - `response_end` carries the folded response, usage included, as soon
   as the stream ends and before any tool of the turn runs. A response
   that arrived with a failed status is delivered here too, before the
@@ -691,7 +750,8 @@ the tool it resolved to, so a prompt can show what it asks about:
 | `rejected` | a record the agent was seeded with ends the call with a reject before it reached its tool, and stopped before the refusal's output: the tool did not run, and the call is owed that refusal and nothing else. A live run never leaves one |
 
 A call pending when the run started that the run did not hand to its
-tool keeps the reason, the key and the arguments it had, except that a
+tool keeps the reason, the key, the arguments and, for one a reject
+ended, the refusal's reason it had, except that a
 call the resume approved and the cut reached first is `undispatched`,
 or `aborted` when it was dispatched before it was held.
 
@@ -721,8 +781,11 @@ An **answer** names one pending call and is one of:
 
 An answer MAY carry a **note**, what the person said when answering,
 **who decided** it in the session format's terms (`human`, `policy`,
-`agent`) and **why**, which for an output answering an ambiguous call
-says why it was not run again. There is no default decider: a policy engine
+`agent`), **why**, which for an output answering an ambiguous call
+says why it was not run again, and, for an output taken from a record
+rather than produced now, **where it was taken from**, in the terms of
+the library that read it, so a recorder can tie the output it writes
+to the one it repeats. There is no default decider: a policy engine
 answers as often as a person does, so an answer that names nobody is
 recorded as an anonymous decision rather than guessed at. An answer MAY
 ask the run to **terminate** once every answer is in, for a refusal
@@ -788,7 +851,13 @@ function call without an output is pending with reason `unknown`, and
 the agent refuses to run until they are answered. A host SHOULD seed it
 as well with what a record says of them, the reason, the key and the
 arguments, so only a call that may have run is held to the replay rule
-and one that never started is approved without it. Replacing the
+and one that never started is approved without it, and the output of
+one that dispatched and completed off the path the agent continues, on
+a branch a rebase left or in the session this one forks, with where it
+ran, so the host answers the call with that output rather than running
+the call again or telling the model its outcome is unknown. The loop
+carries what it was seeded with onto the pending list of a run that
+leaves the call pending, and sets none of it itself. Replacing the
 transcript re-derives them the same way, except that a call the agent
 already had pending keeps what it knew of it, so a held call stays
 held; the host seeds the rest again from the record. Whatever the old
@@ -984,7 +1053,10 @@ A conforming loop holds these over every run, however it ends:
   the event naming it carries none, so a stream that opens a second
   call at the output index of the first still gives each its own ID,
   and a call opened without an item ID and completed with one keeps
-  the ID it opened with. The
+  the ID it opened with; the response the turn acts on holds the
+  completed calls, paired with the response's as the
+  [model call section](#the-model-call) says, so the batch never runs
+  a call under another's ID. The
   IDs a transcript held stay
   reserved when `SetTranscript` replaces it. A host that seeds the
   loop with less than a whole session, a context after a fold or a
@@ -1138,14 +1210,24 @@ provide a way to chain each, with the fold rule the table gives.
 
 | hook | when | sees | returns | an error | chain |
 | --- | --- | --- | --- | --- | --- |
-| before turn | turn phase 2 | the working transcript | items to append as facts | fails the run unless marked as a guard's, which stops it with cause `guard` | items appended in order; the first error drops them all |
+| before turn | turn phase 2 | the working transcript, and the turn's inputs so far with how each arrived, as phase 5 defines them, the hook's own items excepted | items to append as facts | fails the run unless marked as a guard's, which stops it with cause `guard` | items appended in order; the first error drops them all |
 | before model call | turn phase 4, last | the finished request | edits it in place | `model_blocked`, then the run fails; marked as a guard's, the run stops with cause `guard` | in order, each seeing what the last left; the first error stops |
 | output guard | as the stream completes an assistant message | the message | a replacement or none | fails the run unless marked as a guard's, which withholds the message and stops it with cause `guard` | in order, each seeing the last's replacement; the last stands; the first error stops |
-| decision (before tool call) | preflight, per call, model order; a nested call as a batch of one | the call, the tool, the arguments, the batch and index | a decision or none | fails the run; returned to the tool for a nested call | the strictest action wins, block over defer over allow; a block ends the chain, a defer does not; rewritten arguments pass to the hooks after; the first reason and decider of the standing action, the first note; terminate if any set it |
+| decision (before tool call) | preflight, per call, model order; a nested call as a batch of one | the call, the tool, the arguments, the batch and index, and for a nested call its parent | a decision or none | fails the run; returned to the tool for a nested call | the strictest action wins, block over defer over allow; a block ends the chain, a defer does not; rewritten arguments pass to the hooks after; the first reason and decider of the standing action, the first note; terminate if any set it |
 | after tool call | as each call settles, blocked calls excepted | the call, the result, the error | an override or none | fails the run; returned to the tool for a nested call | — |
 | should stop after turn | turn phase 10 | the response, the results, whether the turn was final, the transcript | stop or not; a guard error stops with cause `guard` | fails the run unless marked as a guard's | in order until one stops; the first error stops |
 | transform | request step 2 | a copy of the transcript | the input for this call | fails the run | — |
 | filter | request step 3 | the transformed list | what the model sees | — | — |
+
+The before-turn hook is where a layer acts on what arrived for the
+turn: a scope that ends when the user speaks again revokes on an input
+of mode `prompt`, `steer` or `continued` whose item is a user message,
+and not on one of mode `deliver`, which a background task's answer
+arrives by; a handoff receiver started on the sender's transcript acts
+once on the turn whose inputs hold the transfer's output as
+`continued`. The list is not the transcript's tail: a delivered output
+after a steered message reads as what it is, and so does an answer
+delivered as a message.
 
 The stop hook, the before-turn hook, the before-model-call hook and
 the output guard tell a policy stop from a failure by marking the error
@@ -1172,13 +1254,20 @@ the loop rather than holding a tool set of its own, where the policy,
 the events and the record would all be absent. The loop runs the call
 as if the model had asked for it under the call in flight:
 
-- the decision hook decides it, seeing a batch of one at index 0. A
-  nested call cannot be handed to the caller, since it belongs to a
+- the decision hook decides it, seeing a batch of one at index 0 and
+  the **parent**, the call that made it, which a call the model made
+  does not carry, so the hook can tell a nested call from a turn of one
+  call and knows the deferral it returns is settled below rather than
+  left for a resume. A nested call cannot be handed to the caller, since it belongs to a
   tool that is running, so a deferred one is put to the user through
   the invoking tool's elicitor when it has one, as a question naming
   the call, its arguments, the first 500 bytes of them, and the
   decision's reason, asked on the
-  invoking tool's context so it is filed under that call. An accept
+  invoking tool's context so it is filed under that call, with the
+  call it asks about on that context as data, its parent, ID, name,
+  whole arguments and the deferral, so a front that answers for
+  longer than the one call can make a rule of it without parsing the
+  question. An accept
   allows the call and a decline blocks it, with `declined when asked`
   and the reason as the refusal's; either is the decision `tool_start`
   carries, by `human`, an accept with the reason, or `allowed when
@@ -1327,14 +1416,14 @@ of the events.
 | `turn_start` | a `config` delta when the request's settings differ from the path's; the request hash is computed here and written on the response. When the host names the parts the request's instructions are composed of, for any session the recorder writes, a child run's included, and they join to the instructions sent, the entries carry `instructions_parts`, a delta naming the parts that moved and each run of unchanged parts as a `keep`, and `instructions_omitted` for what the host left out when it differs from the list in force, which stays in force until a `config` changes it: on a delta each run of parts unchanged in the list in force as a `keep`, `[]` when nothing is left out any more, and on a replace whole whenever it is non-empty; parts that do not join are dropped and the string is written, since the record describes what was sent |
 | `model_retry` | a record entry with the attempt, the error, the delay, the failed attempt's model and whether the retry policy revised the request, before the response of the attempt that answers; the revised request's settings are settled with that attempt, so only the attempt that answered is configured on the path. The record entry stays beside the count below, since it says what the count cannot |
 | `model_blocked` | for an error marked as a guard's, a custom entry in `agentturn:model_blocked` carrying the guard's error, the request hash and the model, since the run stopped rather than failed and a failed `response` would make its end read as a failure; for any other error, a failed `response` carrying the hook's error and the request hash. Either way the call that was refused is told from one that was made and failed |
-| `item_end` | an `item`, with the display flag off for a hidden item, and the run's trigger as `source` for an item the run was prompted with, an answer's output on a resume excepted. Before a caller-supplied output for a call that was neither dispatched nor rejected, a `reject` decision with the output's text as its reason and the decider the caller named, and `policy` as the decider when the loop refused the call itself in this run, for a name no tool has or arguments that are not an object, or closed it because the output guard withheld the response that made it; before one for a call that may have run, dispatched in an earlier run or on a path that does not promise dispatch records, an `answer` decision with the answer's decider and reason, since a `proceed` would say the call went on toward its tool and a `reject` that it never reached it, and no second `dispatch` says the tool did not run again; before one for a call the path already shows answered, nothing; one for a call that has its output is refused with agentsession's `ErrCallCompleted`, since the context would hold two. A call the loop renamed keeps the model's ID in an `agentturn:model_call_id` member beside the `item` |
+| `item_end` | an `item`, with the display flag off for a hidden item, and the run's trigger as `source` for an item the run was prompted with, an answer's output on a resume excepted. Before a caller-supplied output for a call that was neither dispatched nor rejected, a `reject` decision with the output's text as its reason and the decider the caller named, and `policy` as the decider when the loop refused the call itself in this run, for a name no tool has or arguments that are not an object, or closed it because the output guard withheld the response that made it; before one for a call that may have run, dispatched in an earlier run or on a path that does not promise dispatch records, an `answer` decision with the answer's decider and reason, since a `proceed` would say the call went on toward its tool and a `reject` that it never reached it, and no second `dispatch` says the tool did not run again; before one for a call the path already shows answered, nothing; one for a call that has its output is refused with agentsession's `ErrCallCompleted`, since the context would hold two. The answer's output for a call that completed off the path the run continues, which the caller marked with where it was taken from, is written with a `link` to the child session that produced the output it repeats, when the record holds one: the `subsession` link a branch of this session holding the original output has for the call, written again on this branch before the `answer`, since a link on a branch left says nothing of this one; a fork writes none, since a `subsession` link names a child of the session that writes it and the child is the origin's, which the fork reaches through the origin's link in its prefix. A call the loop renamed keeps the model's ID in an `agentturn:model_call_id` member beside the `item` |
 | `response_end` | the `response`, with `request_hash` when the input the loop sent is the input the recorded path rebuilds, and none otherwise, and `attempts`, the calls it took, when the retry policy tried it again; a `response_end` marked withheld is written `incomplete` with `content_filter` and no error, as the loop gives it, so the guard's text is not on it, before the outputs that close its calls; so is the failed `response` `run_end` writes for a call left in flight, where an abort during the retry's backoff counts the attempt that was due, since nothing tells it from an abort before that attempt streamed |
 | `tool_start` | a `decision`: `reject` with the reason for a block, `call blocked` when it gave none, and `answer` in its place for a call that may have run, since the format keeps `reject` for a call no `dispatch` reached; nothing for a call a `reject` or an `answer` already ended, which takes only its output, and a refusal, with `ErrCallCompleted`, for one that has its output, which the format reads as ended, so a loop that lost track of a call fails its run rather than the record hiding it; `hold` for a defer, with the reason when given; `proceed` for a call that was held, whose arguments were rewritten, with the arguments, or whose decision gave a reason, with the reason, and for a call an earlier run dispatched that goes to its tool again, since running it again is a decision: when its decision gives no reason, the proceed is written before its second `dispatch` with `run again` as the reason, and not at all when the loop refuses the call before it. The decider is the decision's, and `policy` for a call nothing was holding and no earlier run dispatched whose decision names nobody. A nested call is a record entry instead |
 | `tool_dispatch` | a `dispatch`, durable before the event returns, so the tool runs after it or not at all, carrying the call's idempotency key as `idempotency_key`; a second one for a call an earlier run dispatched and a resume runs again, carrying the key it runs under, that of the dispatch it repeats unless a decision made it a new operation, so the path holds one per hand-off; nothing for a nested call; and a refusal, with agentsession's `ErrCallCompleted`, for a call whose output is on the path, so its tool does not run again as the same call; and a refusal for a call no `function_call` entry on the path names, other than one the filter keeps from the model, so no tool runs unrecorded. Every `decision` and `dispatch` names its call by `target`, the entry of its `function_call`, whichever writer wrote it: a live run's, one seeded by a resume or a rebase, a reopened child's. A function call the filter keeps from the model is a custom entry, which no `target` can name, and takes none. Subscribers are called in order, so one that vetoes a dispatch is registered before the recorder; one registered after it refuses a call whose dispatch is already durable |
 | `tool_end` | a recordable details value as a record entry in its namespace, its `call_id` naming the call, or for a nested call the call whose tool made it; a nested call's record; for a child run that was not observed, its session written from the items it added and its `link`; an observed child's `link` and session are written by the observer from the child's own events, starting at its `run_start` |
 | `turn_end` | nothing of its own |
 | `run_end` | first, when a `turn_start` had no `response_end`, a failed `response` carrying the run's error; then `run` end, its `pending` list naming the run's calls left without an output, an earlier run's call the run wrote a decision or a `dispatch` for among them, with the reason mapped onto the format's cascade: `done`, `input_required` and `error` as themselves, the error's text as `ref`; `aborted` as `interrupted` with the error's text, since the host asked; `stopped` as `aborted` when the last `response_end` was marked withheld, since the format reads a run whose last response is incomplete so, as `stopped` when the last response made calls, as `done` when it made none, and for a run with no response of its own as `stopped` when it answered a pending call and left none, `aborted` otherwise, with the cause as `ref`, and for a guard's stop the cause followed by the guard's error |
-| a record a tool writes while it runs, a question it asks the user | a record entry at the leaf, its `call_id` naming the call on the tool's context when the session holds it, or the nearest call up a nested call's chain that it holds |
+| a record a tool writes while it runs, a question it asks the user | a record entry at the leaf, its `call_id` naming the call on the tool's context when the session holds it, or the nearest call up a nested call's chain that it holds. A question is two record entries: the question, written before it is put to the user, and the answer, written after it is given and naming the question's entry, so a run cut while the user was deciding shows the open question under the call that was waiting on it; both name the call the question is about, its tool and its parent, when the asker put that call on the context as the Nested calls section has it, and the question's entry takes that call's `call_id` when the context carries none the session holds |
 | a fold the transform reports | a `compaction` naming what was kept and what was pinned, or a record entry for a fold that failed, carrying, for one the transform backs off from, the split and the hash of the prefix it would have folded, so a transform seeded from the record in another process backs off from the same prefix |
 | `queued` | a `queued` entry with the item, the mode and the trigger, its richer facts included, before anything appends the item; the item entry that drains it names it in `queued_from` with the trigger as `source`. A run end closes the entries of the inputs it did not append, and the recorder writes them again after it, since the agent still holds them; so does a rewind. The loop's follow-up mode is spelled `follow_up` and the format's `followup`; a writer maps the one onto the other |
 
@@ -1358,9 +1447,10 @@ run, and on a fork whose base is inside it, with `interrupted` and a
 queued again after its end. The loop is not involved: a run it is
 running is never open to anyone else.
 
-Two facts the record needs are supplied by the caller and carried by
-the loop unread: the trigger of a run, and who decided an answer and
-why. The loop learns nothing from either.
+Three facts the record needs are supplied by the caller and carried by
+the loop unread: the trigger of a run, who decided an answer and why,
+and where an answer's output was taken from when a record held it. The
+loop learns nothing from any of them.
 
 ## Bindings
 
@@ -1541,12 +1631,18 @@ module and is listed in the changelog as one.
   items out of each turn's request (#91); that omission, like every route
   that trims the history mid-path, costs the responses after it their
   request hash, which is the format's question (agentsession#56).
-- **A second execution under one call** (#87). A child tool builds a
-  fresh agent per call while the recorder continues the child session
-  at its leaf, so the second run's path rebuilds a context the child
-  did not read and its response cannot be hashed. Seeding the second
-  execution from the recorded context, or opening a new root, are the
-  two coherent answers.
+- **A second execution under one call** (#87, resolved). A child tool
+  builds a fresh agent per call while the recorder continued the child
+  session at its leaf, so the second run's path rebuilt a context the
+  child did not read and its response could not be hashed. Of the two
+  coherent answers, seeding the second execution from the recorded
+  context or opening a new root, the second is taken: `tools/agent`
+  marks every run its `Execute` starts with `ContextWithRetry`, and
+  the recorder opens a new root in the call's session for it, so every
+  response rebuilds and the earlier attempt's open call is off the
+  leaf. A run a host starts on an agent it kept through `WithSpawn` is
+  unmarked and continues at the leaf, since that agent holds its
+  context.
 - **A fold identifying itself** (#88). The local fold's summary request
   is a request with no tools and no instructions, and a replay tells a
   fold from a turn by that shape. A marker on the context the fold

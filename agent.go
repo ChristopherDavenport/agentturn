@@ -80,8 +80,8 @@ type Agent struct {
 	transcript Transcript
 	subs       []subscription
 	nextSub    int
-	steer      openresponses.Items
-	followUp   openresponses.Items
+	steer      []queuedItem
+	followUp   []queuedItem
 	running    bool
 	// closing is set once the run in flight is past its last drain of
 	// the queues, before its run_end: an item steered after it waits
@@ -377,8 +377,8 @@ func (a *Agent) State() State {
 		Turn:       a.turn,
 		Steering:   len(a.steer),
 		FollowUps:  len(a.followUp),
-		Steered:    append(openresponses.Items(nil), a.steer...),
-		Queued:     append(openresponses.Items(nil), a.followUp...),
+		Steered:    queuedItems(a.steer),
+		Queued:     queuedItems(a.followUp),
 		Pending:    append([]PendingCall(nil), a.pending...),
 	}
 }
@@ -468,6 +468,15 @@ type Answer struct {
 	// unknown", say. An output for a call that did not run is its own
 	// reason, since it is what the model sees, and this is not recorded.
 	Reason string
+	// Origin, for an output taken from a record rather than produced
+	// now, names where it was taken from, in the terms of the library
+	// that read it: agentturn/session names the entry of the output the
+	// answer repeats, on a branch a rebase left or in the session this
+	// one forks. The loop carries it unread, on the run's context with
+	// [ContextWithOrigins] as it carries Reason, so a session recorder
+	// can tie the output it writes to the one it repeats and to the
+	// child session that produced it. Empty for any other answer.
+	Origin string
 	// IdempotencyKey, for an approval, is the key the tool receives in
 	// place of the one the loop would give it: the pending call's, for
 	// a call that may have run, and a new one otherwise. A key names one
@@ -564,6 +573,14 @@ func (a Answer) WithReason(reason string) Answer {
 	return a
 }
 
+// WithOrigin returns the output answer with origin attached: where the
+// output was taken from, in the terms of the library that read it,
+// for an output a record held rather than one produced now.
+func (a Answer) WithOrigin(origin string) Answer {
+	a.Origin = origin
+	return a
+}
+
 // WithIdempotencyKey returns the approval with key as the key its tool
 // receives.
 func (a Answer) WithIdempotencyKey(key string) Answer {
@@ -641,7 +658,7 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 	}
 	var outputs, notes openresponses.Items
 	var approved []approval
-	deciders, reasons := map[string]string{}, map[string]string{}
+	deciders, reasons, origins := map[string]string{}, map[string]string{}, map[string]string{}
 	terminate := false
 	for _, ans := range answers {
 		p, ok := byID[ans.CallID]
@@ -657,6 +674,9 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 			outputs = append(outputs, ans.Output)
 			if ans.Reason != "" {
 				reasons[ans.CallID] = ans.Reason
+			}
+			if ans.Origin != "" {
+				origins[ans.CallID] = ans.Origin
 			}
 			if ans.Note != "" {
 				notes = append(notes, openresponses.UserText(ans.Note))
@@ -696,9 +716,10 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 		return nil, fmt.Errorf("%w: %d pending call(s) unanswered", ErrNotPending, len(byID))
 	}
 	// An output the caller wrote raises no tool_start, so the decider
-	// of an answer of that kind, and its reason, ride on the run's
-	// context, where a recorder writing the decision for it finds them.
-	ctx = ContextWithReasons(ContextWithDeciders(ctx, deciders), reasons)
+	// of an answer of that kind, its reason and where its output was
+	// taken from ride on the run's context, where a recorder writing
+	// the decision and the output for it finds them.
+	ctx = ContextWithOrigins(ContextWithReasons(ContextWithDeciders(ctx, deciders), reasons), origins)
 	return a.run(ctx, append(outputs, notes...), approved, true, terminate)
 }
 
@@ -1073,9 +1094,13 @@ func (a *Agent) Queue(ctx context.Context, mode QueueMode, items ...openresponse
 	if err := trigger.Validate(); err != nil {
 		return err
 	}
+	how := InputSteer
+	if mode == QueueFollowUp {
+		how = InputFollowUp
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.queue(trigger, mode, items)
+	a.queue(trigger, mode, how, items)
 	return nil
 }
 
@@ -1083,7 +1108,12 @@ func (a *Agent) Queue(ctx context.Context, mode QueueMode, items ...openresponse
 // own time: a background task's result, a detached child's answer. The
 // items are queued as [Agent.Queue] queues a steer, with the [Trigger]
 // on ctx, and Deliver waits until a model call has seen them or no run
-// will take them.
+// will take them. They reach the turn that takes them as [InputDeliver]
+// among [TurnStartInfo.Inputs], where a steered item reads
+// [InputSteer], so a [Config.BeforeTurn] hook that acts on a user's
+// message tells a delivery from a steer, which the transcript's tail,
+// where an output delivered after a steer looks like a resume's, does
+// not say.
 //
 // A run in flight drains them after its batch, or when it would
 // otherwise end, and Deliver returns joined true once the request that
@@ -1125,7 +1155,7 @@ func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joine
 	}
 	a.mu.Lock()
 	drains, before := a.drains, len(a.steer)
-	a.queue(TriggerFromContext(ctx), QueueSteer, items)
+	a.queue(TriggerFromContext(ctx), QueueSteer, InputDeliver, items)
 	if len(a.steer) == before {
 		a.mu.Unlock()
 		return false, nil, ErrNoPrompt
@@ -1178,7 +1208,7 @@ func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joine
 		a.mu.Unlock()
 		return false, nil, ErrInputRequired
 	}
-	if !CanContinue(append(append(Transcript(nil), a.transcript...), unhideAll(a.steer)...)) {
+	if !CanContinue(append(append(Transcript(nil), a.transcript...), unhideAll(queuedItems(a.steer))...)) {
 		a.mu.Unlock()
 		return false, nil, ErrCannotContinue
 	}
@@ -1196,8 +1226,43 @@ func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joine
 // run context of background work does not carry it.
 type inRunKey struct{ a *Agent }
 
-// queue is Queue with a.mu held.
-func (a *Agent) queue(trigger Trigger, mode QueueMode, items openresponses.Items) {
+// queuedItem is one item in a queue: the item as it was given, hidden
+// mark included, how it arrived, a steer, a follow-up or a delivery,
+// which the turn that takes it reports among its inputs, and the
+// trigger it was queued with.
+type queuedItem struct {
+	item    openresponses.Item
+	mode    InputMode
+	trigger Trigger
+}
+
+// queuedItems returns the items of q, as [State] hands a queue back.
+func queuedItems(q []queuedItem) openresponses.Items {
+	if len(q) == 0 {
+		return nil
+	}
+	items := make(openresponses.Items, len(q))
+	for i, e := range q {
+		items[i] = e.item
+	}
+	return items
+}
+
+// inputsOf returns q as the turn that takes it reports it.
+func inputsOf(q []queuedItem) []TurnInput {
+	if len(q) == 0 {
+		return nil
+	}
+	inputs := make([]TurnInput, len(q))
+	for i, e := range q {
+		inputs[i] = TurnInput{Item: e.item, Mode: e.mode, Trigger: e.trigger}
+	}
+	return inputs
+}
+
+// queue is Queue with a.mu held; how says how the items arrived, which
+// mode alone does not, since Deliver queues a steer.
+func (a *Agent) queue(trigger Trigger, mode QueueMode, how InputMode, items openresponses.Items) {
 	runID := ""
 	if a.running && !a.closing {
 		runID = a.runID
@@ -1207,28 +1272,29 @@ func (a *Agent) queue(trigger Trigger, mode QueueMode, items openresponses.Items
 			continue
 		}
 		base, hidden := Unhide(item)
+		entry := queuedItem{item: item, mode: how, trigger: trigger}
 		if mode == QueueSteer {
-			a.steer = append(a.steer, item)
+			a.steer = append(a.steer, entry)
 			select {
 			case <-a.steered:
 			default:
 				close(a.steered)
 			}
 		} else {
-			a.followUp = append(a.followUp, item)
+			a.followUp = append(a.followUp, entry)
 		}
 		a.queued = append(a.queued, &Queued{RunID: runID, Item: base, Mode: mode, Hidden: hidden, Trigger: trigger})
 	}
 }
 
-func (a *Agent) drainSteer() openresponses.Items {
+func (a *Agent) drainSteer() []TurnInput {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.takeSteer()
 }
 
 // takeSteer empties the steer queue with a.mu held.
-func (a *Agent) takeSteer() openresponses.Items {
+func (a *Agent) takeSteer() []TurnInput {
 	items := a.steer
 	a.steer = nil
 	if len(items) > 0 {
@@ -1236,17 +1302,17 @@ func (a *Agent) takeSteer() openresponses.Items {
 		a.steered = make(chan struct{})
 		a.drains++
 	}
-	return items
+	return inputsOf(items)
 }
 
 // drainLast drains both queues for a run that would otherwise end,
 // steered items first, and when both are empty marks the run past its
 // last drain in the same step, so nothing steered can fall between the
 // drain and the mark.
-func (a *Agent) drainLast() openresponses.Items {
+func (a *Agent) drainLast() []TurnInput {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	items := append(a.takeSteer(), a.followUp...)
+	items := append(a.takeSteer(), inputsOf(a.followUp)...)
 	a.followUp = nil
 	if len(items) == 0 {
 		a.closing = true
@@ -1283,12 +1349,12 @@ func (a *Agent) steerSignal() <-chan struct{} {
 	return a.steered
 }
 
-func (a *Agent) drainFollowUp() openresponses.Items {
+func (a *Agent) drainFollowUp() []TurnInput {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	items := a.followUp
 	a.followUp = nil
-	return items
+	return inputsOf(items)
 }
 
 // Abort cancels the active run, if any. The model stream and running

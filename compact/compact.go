@@ -119,6 +119,18 @@ func WithFailedFold(split int, prefixHash string, tokens int) Option {
 	}
 }
 
+// WithBackOff turns the back-off after a failed fold off when enabled
+// is false: a prefix whose fold failed with an unfolded send is asked
+// about again on the next call over budget, as before v0.0.13, and
+// [WithFailedFold] seeds nothing. The failed fold is still reported to
+// [WithOnFold] with its prefix hash. It is for replaying a recording
+// made across restarts before v0.0.15, when the back-off lived in the
+// transform's memory alone and a host that restarted asked again, or by
+// a host that resumed without agentturn/session's CompactOptions: a
+// replay in one process would otherwise back off where the recording
+// asked. The default is on.
+func WithBackOff(enabled bool) Option { return func(t *Transform) { t.noBackOff = !enabled } }
+
 // WithPin keeps the items fn reports through a fold: whatever part of
 // the folded prefix they were in, they follow the summary in the
 // request, in their order, and the fold that summarised them
@@ -305,6 +317,9 @@ type Transform struct {
 	failLen    int
 	failHash   string
 	failTokens int
+	// noBackOff says WithBackOff(false) was given: a failed fold is
+	// remembered and reported but never skips the next.
+	noBackOff bool
 }
 
 // New builds a Transform that folds through c's compaction endpoint.
@@ -595,6 +610,7 @@ func (t *Transform) Last() openresponses.Item {
 // folds nothing and reports nothing to [WithOnFold]. A transcript that
 // does not begin with the failed prefix, such as another
 // conversation's or one rewound before it, folds as usual.
+// [WithBackOff] turns the back-off off.
 func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (agentturn.Transcript, error) {
 	t.mu.Lock()
 	view, base := t.view(items)
@@ -689,7 +705,7 @@ func (t *Transform) report(ctx context.Context, f Fold) error {
 // a fold of the same transcript failed with an unfolded send and the
 // transcript has not grown enough since. Called with the lock held.
 func (t *Transform) backOff(items agentturn.Transcript, split, tokens int) bool {
-	if t.failHash == "" || len(items) < t.failLen {
+	if t.noBackOff || t.failHash == "" || len(items) < t.failLen {
 		return false
 	}
 	if split >= t.failLen+max(t.keepLast, 1) || tokens >= t.failTokens+max(t.budget/4, 1) {

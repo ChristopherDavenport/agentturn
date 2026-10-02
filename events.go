@@ -166,12 +166,20 @@ func (*RunStart) EventType() string { return EventRunStart }
 // turn: the tool outputs, the steered and queued messages, the items
 // BeforeTurn added. They are what this turn's response answers, so a
 // front that routes replies to the message that caused them reads them
-// here rather than counting item events between turns.
+// here rather than counting item events between turns. Arrived is the
+// same items with how each came, as [TurnStartInfo.Inputs] gives them
+// to BeforeTurn, plus the items that hook appended, as [InputHook],
+// and, on a run's first turn, the [InputContinued] items the
+// transcript already ended with when the run started, which Inputs
+// does not include: Inputs keeps its definition, so a consumer that
+// counted on it is unchanged, and a consumer that needs what a
+// Continue answers reads Arrived.
 type TurnStart struct {
 	RunID   string
 	Turn    int
 	Request openresponses.Request
 	Inputs  openresponses.Items
+	Arrived []TurnInput
 }
 
 // EventType returns "turn_start".
@@ -312,7 +320,12 @@ func (*ItemEnd) EventType() string { return EventItemEnd }
 // output items have all been delivered with item_end. A response that
 // failed is delivered here too, before the run ends with the error, so
 // a recorder can write it, and so is one a [Config.OutputGuard]
-// withheld a message of, with Withheld set.
+// withheld a message of, with Withheld set. The response's function
+// calls the stream completed are the items the transcript holds, the
+// same values item_end delivered, so a consumer that edits one edits
+// the transcript: treat every item an event carries as read-only, as
+// the transcript is. A call the response lists that the stream never
+// completed is a copy carrying the ID the loop decided for it.
 type ResponseEnd struct {
 	RunID    string
 	Turn     int
@@ -438,7 +451,8 @@ type ToolEnd struct {
 func (*ToolEnd) EventType() string { return EventToolEnd }
 
 // TurnEnd closes a turn with the folded response, usage included, and
-// the tool results in the model's order.
+// the tool results in the model's order. The response is the one
+// [ResponseEnd] carried, its items shared with the transcript.
 type TurnEnd struct {
 	RunID       string
 	Turn        int
@@ -635,6 +649,23 @@ type PendingCall struct {
 	// handed over nor rewritten. An approval runs the call with them
 	// unless the answer carries its own.
 	Args json.RawMessage
+	// Ran is the output the call has where it ran, when a record shows
+	// it dispatched and completed off the path the agent continues: on
+	// a branch a rebase left, or in the session this one forks. The
+	// loop never sets it; agentturn/session's Pending does, from the
+	// record, and its ReplayAnswers answers the call with it rather
+	// than running the call again, as a host answering the call itself
+	// should. nil for every other call.
+	Ran *openresponses.FunctionCallOutput
+	// RanWhere says where the call ran, for a call with Ran: the reason
+	// an answer giving that output carries.
+	RanWhere string
+	// Refused is the reason the call was refused, for a call pending as
+	// [PendingRejected]: what a reject decision said before the output
+	// that carries it was written. The loop never sets it;
+	// agentturn/session's Pending does, from the record, and the output
+	// such a call is owed is this text, as ReplayAnswers gives it.
+	Refused string
 }
 
 // MayHaveRun reports whether the call may have run and an approval of
@@ -688,7 +719,13 @@ const (
 type Queued struct {
 	RunID string
 	Item  openresponses.Item
-	Mode  QueueMode
+	// Mode is the queue the item joined. An item handed in with
+	// [Agent.Deliver] joins the steer queue and is reported with
+	// QueueSteer; the turn that drains it tells it apart as
+	// [InputDeliver] in [TurnStartInfo.Inputs] and [TurnStart.Arrived],
+	// since how an item arrived is a fact about the turn, and the queue
+	// it waited in a fact about the agent.
+	Mode QueueMode
 	// Hidden is set for an item the caller marked with [Hidden].
 	Hidden bool
 	// Trigger is what brought the item in, from the context given to

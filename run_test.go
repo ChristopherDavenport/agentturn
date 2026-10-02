@@ -1491,6 +1491,11 @@ type reusedIndexModel struct {
 	atZero bool
 	noID   idPlaces
 	turns  int
+	// accShaped builds the terminal response as openresponses.Accumulator
+	// builds one from a stream that reuses an index: one item per output
+	// index, the last opened there, so earlier calls at the index are
+	// not listed.
+	accShaped bool
 }
 
 // idPlaces names the events of a stream a call's item ID is left off.
@@ -1553,6 +1558,9 @@ func (m *reusedIndexModel) CreateStream(_ context.Context, req openresponses.Req
 		if resp, ok := openresponses.TerminalResponse(ev); ok {
 			for i, item := range resp.Output {
 				resp.Output[i] = strip(item, m.noID.response)
+			}
+			if m.accShaped && m.atZero && len(resp.Output) > 1 {
+				resp.Output = resp.Output[len(resp.Output)-1:]
 			}
 		}
 		return sink.Send(ev)
@@ -1713,6 +1721,125 @@ func TestGuardSeesCallsAtOneOutputIndex(t *testing.T) {
 			want := []string{`call_a {"text":"t0"}`, `call_b {"text":"t1"}`}
 			if !slices.Equal(saw, want) {
 				t.Errorf("the guard saw %q, want %q", saw, want)
+			}
+		})
+	}
+}
+
+// TestBatchRunsTheCallsTheTranscriptHolds pins #210: the calls the turn
+// runs are the ones the transcript holds, whatever the stream knew them
+// by. A stream that opens every call at output index 0 with no item
+// IDs, as a text-call parser's does, used to rename the completed
+// response's first call to the ID of the last call opened there, so the
+// batch ran one call twice (a, c) or, when the loop had renamed a
+// repeat, ran each call with the other's output (b). Every tool_start
+// and tool_end runs under the ID its item_end carried, every output
+// answers the call whose arguments it echoes, and every call has
+// exactly one output; the streams that paired correctly before, calls
+// at their own indexes, item IDs throughout, a call opened without an
+// item ID and completed with one, keep doing so.
+func TestBatchRunsTheCallsTheTranscriptHolds(t *testing.T) {
+	all := idPlaces{added: true, done: true, response: true}
+	cases := []struct {
+		name      string
+		calls     []string
+		atZero    bool
+		noID      idPlaces
+		accShaped bool
+	}{
+		{name: "a: one index, no item IDs", calls: []string{"call_a", "call_b"}, atZero: true, noID: all},
+		{name: "one index, no item IDs, terminal response lists the last call alone", calls: []string{"call_a", "call_b"}, atZero: true, noID: all, accShaped: true},
+		{name: "one index, one call ID, no item IDs, terminal response lists the last call alone", calls: []string{"call_0", "call_0"}, atZero: true, noID: all, accShaped: true},
+		{name: "one index, item IDs, terminal response lists the last call alone", calls: []string{"call_a", "call_b"}, atZero: true, accShaped: true},
+		{name: "b: one index, one call ID, no item IDs", calls: []string{"call_0", "call_0"}, atZero: true, noID: all},
+		{name: "c: one index, numbered per response, no item IDs", calls: []string{"call_0", "call_1"}, atZero: true, noID: all},
+		{name: "one index, three calls, no item IDs", calls: []string{"call_0", "call_1", "call_2"}, atZero: true, noID: all},
+		{name: "one index, item IDs in the response alone", calls: []string{"call_a", "call_b"}, atZero: true, noID: idPlaces{added: true, done: true}},
+		{name: "one index, item IDs on done alone", calls: []string{"call_a", "call_b"}, atZero: true, noID: idPlaces{added: true}},
+		{name: "one index, one call ID, item IDs on done alone", calls: []string{"call_0", "call_0"}, atZero: true, noID: idPlaces{added: true}},
+		{name: "one index, item IDs", calls: []string{"call_a", "call_b"}, atZero: true},
+		{name: "one index, one call ID, item IDs", calls: []string{"call_0", "call_0"}, atZero: true},
+		{name: "own indexes, no item IDs", calls: []string{"call_a", "call_b"}, noID: all},
+		{name: "own indexes, one call ID, no item IDs", calls: []string{"call_0", "call_0"}, noID: all},
+		{name: "own indexes, item IDs", calls: []string{"call_a", "call_b"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &reusedIndexModel{calls: tc.calls, atZero: tc.atZero, noID: tc.noID, accShaped: tc.accShaped}
+			events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")},
+				Config{Model: m, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}}))
+			if err != nil || end.Reason != ReasonDone || len(end.Pending) != 0 {
+				t.Fatalf("err=%v reason=%s pending=%d", err, end.Reason, len(end.Pending))
+			}
+			// The transcript: each call once, each answered once, by
+			// the output of its own arguments.
+			args := map[string]string{}
+			outputs := map[string][]string{}
+			var order []string
+			for _, item := range end.Items {
+				switch it := item.(type) {
+				case *openresponses.FunctionCall:
+					if _, ok := args[it.CallID]; ok {
+						t.Errorf("call ID %q names two calls", it.CallID)
+					}
+					args[it.CallID] = it.Arguments
+					order = append(order, it.CallID)
+				case *openresponses.FunctionCallOutput:
+					outputs[it.CallID] = append(outputs[it.CallID], it.Output.String())
+				}
+			}
+			if len(order) != len(tc.calls) {
+				t.Fatalf("calls %v, want %d", order, len(tc.calls))
+			}
+			for id, a := range args {
+				var in echoArgs
+				if err := json.Unmarshal([]byte(a), &in); err != nil {
+					t.Fatal(err)
+				}
+				if want := []string{strings.ToUpper(in.Text)}; !slices.Equal(outputs[id], want) {
+					t.Errorf("outputs of %s (%s) = %q, want %q", id, a, outputs[id], want)
+				}
+			}
+			for id := range outputs {
+				if _, ok := args[id]; !ok {
+					t.Errorf("output for %q, which no call in the transcript has", id)
+				}
+			}
+			// The events: the batch runs under the IDs item_end carried,
+			// each once, and the response the turn acts on names them.
+			var ended, started, finished, turned []string
+			for _, ev := range events {
+				switch e := ev.(type) {
+				case *ItemEnd:
+					if call, ok := e.Item.(*openresponses.FunctionCall); ok {
+						ended = append(ended, call.CallID)
+					}
+				case *ToolStart:
+					started = append(started, e.CallID)
+				case *ToolEnd:
+					finished = append(finished, e.CallID)
+				case *TurnEnd:
+					for _, call := range e.Response.FunctionCalls() {
+						turned = append(turned, call.CallID+" "+call.Arguments)
+					}
+				}
+			}
+			if !slices.Equal(ended, order) {
+				t.Errorf("item_end %v, transcript %v", ended, order)
+			}
+			if !slices.Equal(started, order) {
+				t.Errorf("tool_start %v, item_end %v", started, ended)
+			}
+			slices.Sort(finished)
+			if sorted := slices.Sorted(slices.Values(order)); !slices.Equal(finished, sorted) {
+				t.Errorf("tool_end %v, item_end %v", finished, sorted)
+			}
+			var want []string
+			for _, id := range order {
+				want = append(want, id+" "+args[id])
+			}
+			if !slices.Equal(turned, want) {
+				t.Errorf("turn_end response calls %q, transcript %q", turned, want)
 			}
 		})
 	}

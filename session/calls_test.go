@@ -149,8 +149,10 @@ func TestSiblingCallIDsStayReserved(t *testing.T) {
 // session reopened under the same call, the call run again, holds no
 // repeated call ID: the child's agent is new and its model numbers its
 // calls from call_0 again, and ChildContext reserves the IDs the child
-// session holds. The observer swallows a store's refusal, so without
-// the reservation the second run is missing from the child session.
+// session holds, on the root the earlier run left as on the one the
+// second opens (#87). The observer swallows a store's refusal, so
+// without the reservation the second run is missing from the child
+// session.
 func TestReopenedChildSessionCallIDsStayReserved(t *testing.T) {
 	ctx := context.Background()
 	store := agentsession.NewMemoryStore()
@@ -170,15 +172,20 @@ func TestReopenedChildSessionCallIDsStayReserved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	calls, err := child.Calls(child.Leaf())
+	ids, err := CallIDs(child)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 2 || calls[0].ID() == calls[1].ID() {
-		t.Fatalf("child session holds %d calls: %q", len(calls), entryTypes(child))
+	if len(ids) != 2 || ids[0] == ids[1] {
+		t.Fatalf("child session holds calls %v: %q", ids, entryTypes(child))
 	}
-	if err := child.VerifyRecords(child.Leaf()); err != nil {
-		t.Errorf("verify child records: %v", err)
+	if n := roots(child); n != 2 {
+		t.Errorf("the second run under the call left %d roots, want its own", n)
+	}
+	for _, leaf := range child.Leaves() {
+		if err := child.VerifyRecords(leaf); err != nil {
+			t.Errorf("verify child records at %s: %v", leaf, err)
+		}
 	}
 }
 

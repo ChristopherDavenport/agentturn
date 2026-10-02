@@ -104,9 +104,12 @@ func TestDetachReturnsOnceTheChildStarts(t *testing.T) {
 	})
 }
 
-// TestRetryMarkReachesTheObserver pins #122: a host that prompts a
-// spawned child again with ContextWithRetry reaches the observer with
-// the mark, so a recorder starts the child's session afresh.
+// TestRetryMarkReachesTheObserver pins #122 and #87: the run Execute
+// starts carries the ContextWithRetry mark to the observer, since the
+// child is a fresh agent, as does a host that prompts a spawned child
+// again with ContextWithRetry, so a recorder starts the child's session
+// afresh for either; a host's plain prompt carries none and continues
+// it.
 func TestRetryMarkReachesTheObserver(t *testing.T) {
 	var handle *agentturn.Agent
 	var marks []bool
@@ -126,8 +129,8 @@ func TestRetryMarkReachesTheObserver(t *testing.T) {
 	if _, err := handle.Prompt(context.Background(), openresponses.UserText("and continue")); err != nil {
 		t.Fatal(err)
 	}
-	if len(marks) != 3 || marks[0] || !marks[1] || marks[2] {
-		t.Errorf("retry marks by run = %v, want [false true false]", marks)
+	if len(marks) != 3 || !marks[0] || !marks[1] || marks[2] {
+		t.Errorf("retry marks by run = %v, want [true true false]", marks)
 	}
 }
 

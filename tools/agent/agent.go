@@ -225,7 +225,10 @@ func WithObserver(fn func(context.Context, agentturn.Event)) Option {
 // transcript.
 //
 // The observer stays subscribed after Execute returns, so a later run
-// the host starts is recorded into the same child session; the call's
+// the host starts is recorded into the same child session, continuing
+// it at its leaf, since the agent holds the context the leaf
+// rebuilds; only a run Execute starts is marked with
+// [ContextWithRetry], since a fresh agent holds none. The call's
 // progress updates stop, since the call is over.
 func WithSpawn(fn func(callID string, child *agentturn.Agent)) Option {
 	return func(o *options) { o.spawn = fn }
@@ -295,12 +298,22 @@ func ContextWithConfig(ctx context.Context, cfg agentturn.Config) context.Contex
 	return context.WithValue(ctx, configKey{}, cfg)
 }
 
-// ContextWithRetry marks the runs under ctx as retries of the call they
-// belong to rather than continuations of it. An observer that keeps a
-// session per call, agentturn/session's does, continues the existing
-// session at its leaf for a second run under one call, because a
-// subagent that is messaged again answers from its own context; a host
-// that means the other thing, a retry from a clean start, says so here.
+// ContextWithRetry marks the runs under ctx as starting afresh under
+// the call they belong to rather than continuing what an earlier run
+// under it left. An observer that keeps a session per call,
+// agentturn/session's does, opens a new root in the call's session for
+// a run so marked, and continues the session at its leaf for one that
+// is not, because a subagent that is messaged again answers from its
+// own context. Execute puts the mark on every run it starts: it builds
+// a fresh agent per call whose request is the new input alone, so a
+// second Execute under one call ID, Agent.Resume running a cut-off
+// call again for one, never holds the path it would continue, and its
+// run belongs on a new root, where its responses rebuild and the
+// earlier attempt's open call is not at the leaf. For a first call the
+// session does not exist yet and the mark changes nothing. A host that
+// keeps the child through [WithSpawn] and prompts it again does so
+// with a context of its own, unmarked, and that run continues at the
+// leaf, which is right because that agent does hold its context.
 func ContextWithRetry(ctx context.Context) context.Context {
 	return context.WithValue(ctx, retryKey{}, true)
 }
@@ -398,9 +411,9 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		if a.opts.observer != nil {
 			octx := obsCtx
 			if RetryFromContext(evCtx) {
-				// A host that prompts the child again as a retry marks
-				// the run's context; the observer's is the call's, so
-				// the mark is carried to it.
+				// Execute marks the run's context, and so may a host
+				// that prompts the child again; the observer's is the
+				// call's, so the mark is carried to it.
 				octx = ContextWithRetry(octx)
 			}
 			a.opts.observer(octx, ev)
@@ -446,10 +459,17 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	// The parent's trigger names what started the parent's run; the
 	// child's run was started by the call, which the child's link
 	// names, so it carries none unless WithRunContext gives it one.
-	// Who answered the parent's pending calls and why are the
-	// parent's too: a child's call under the same ID is another call.
+	// Who answered the parent's pending calls, why, and where their
+	// outputs were taken from are the parent's too: a child's call
+	// under the same ID is another call.
 	ctx = agentturn.ContextWithTrigger(ctx, agentturn.Trigger{})
-	ctx = agentturn.ContextWithReasons(agentturn.ContextWithDeciders(ctx, nil), nil)
+	ctx = agentturn.ContextWithOrigins(agentturn.ContextWithReasons(agentturn.ContextWithDeciders(ctx, nil), nil), nil)
+	// The child is new and holds nothing of an earlier run under this
+	// call, so its run starts afresh in the call's session: a second
+	// Execute under one call ID, a cut-off call run again, opens a new
+	// root rather than continue a path this agent never read. The
+	// subscriber above carries the mark to the observer's context.
+	ctx = ContextWithRetry(ctx)
 	if a.opts.runCtx != nil {
 		ctx = a.opts.runCtx(ctx, call.ID)
 	}

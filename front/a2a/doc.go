@@ -75,6 +75,38 @@
 // input-required state and agentturn's ReasonInputRequired are the
 // same thing seen from the two sides.
 //
+// The caller answers exactly the calls to the tools it owns: those its
+// message declared and those the executor's [WithCallerTools] gave
+// every caller. A call to one of the agent's own tools is never handed
+// to it, its answer taken as the tool's output, whichever hook holds
+// the call. When the agent's BeforeToolCall defers such a call, as a
+// policy that asks a person does, the question goes to the serving
+// side: the call is put to Config.ToolElicitor with agentturn.Ask,
+// the call on the elicitor's context for agentturn.AskedCallFrom, and
+// the person's accept runs the tool while their decline refuses the
+// call, both recorded as decided by "human". Without an elicitor, or
+// with no answer, the call is refused with a reason saying it cannot
+// be handed to the caller, and the model sees that reason as the
+// call's output. The task therefore never goes input-required on a
+// call of the agent's own, and a transfer the hook held becomes a
+// handoff only when the person lets it run. A stored conversation that
+// nonetheless holds a pending call to a tool the agent offered when it
+// made the call and the caller does not own, left by an older release
+// or seeded, is not the caller's to answer: the call is dropped when
+// the conversation is loaded, as an aborted run's unanswered calls are,
+// so the next message goes on without it, and a message that answers
+// it is refused as invalid params. Which configuration made a call is
+// what the conversation up to it starts under, as [WithStart] or the
+// route of [WithTransfers] picks it, the executor's own without either;
+// a call that configuration did not offer, or whose name the caller
+// owns under [WithCallerTools] or its declaration, stays the caller's,
+// since a receiver of a handoff without the agent's tool of that name
+// offered the caller's and the sender's deferred call to it is the
+// caller's whichever agent answers next. The question is put from the
+// hook, before any call of the batch runs, so the batch waits on the
+// person as it would on any hook; before this, a deferral ended the
+// run instead.
+//
 // # Recording
 //
 // [WithRecorderFor] attaches a record to each conversation: it is

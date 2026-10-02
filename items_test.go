@@ -169,3 +169,70 @@ func TestAnswerBySaysWhoDecided(t *testing.T) {
 		t.Errorf("decider on the context = %q", deciders[callID])
 	}
 }
+
+// TestAnswerOriginSaysWhereTheOutputCameFrom pins #206: an output taken
+// from a record rather than produced now names where it was taken from,
+// and the loop carries that onto the run's context, unread, as it
+// carries who decided and why, so a recorder writing the output can
+// tie it to the entry it repeats.
+func TestAnswerOriginSaysWhereTheOutputCameFrom(t *testing.T) {
+	deferAll := func(context.Context, ToolCallInfo) (*ToolDecision, error) {
+		return &ToolDecision{Action: Defer, Reason: "approval required by upper"}, nil
+	}
+	cfg := Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}, BeforeToolCall: deferAll, MaxTurns: 2}
+	a := New(cfg)
+	end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+	if err != nil || end.Reason != ReasonInputRequired {
+		t.Fatalf("err=%v end=%+v", err, end)
+	}
+	callID := end.Pending[0].Call.CallID
+	var origin, reason, decider string
+	a.Subscribe(func(ctx context.Context, ev Event) error {
+		if _, ok := ev.(*RunStart); ok {
+			origin = OriginFromContext(ctx, callID)
+			reason = ReasonFromContext(ctx, callID)
+			decider = DeciderFromContext(ctx, callID)
+		}
+		return nil
+	})
+	out := openresponses.NewFunctionCallOutput(callID, "DONE")
+	ans := Output(out).WithOrigin("session s1, entry 42").WithReason("not run again: ran on a branch a rebase left").WithBy("policy")
+	if ans.Origin != "session s1, entry 42" {
+		t.Fatalf("WithOrigin: %+v", ans)
+	}
+	if _, err := a.Resume(context.Background(), ans); err != nil {
+		t.Fatal(err)
+	}
+	if origin != "session s1, entry 42" || reason != "not run again: ran on a branch a rebase left" || decider != "policy" {
+		t.Errorf("on the run's context: origin %q, reason %q, decider %q", origin, reason, decider)
+	}
+}
+
+// TestContextWithOrigins checks the context carrier works as
+// ContextWithReasons does: keyed by call ID, replacing what an outer
+// context attached, an empty map clearing it, and a copy of the caller's
+// map.
+func TestContextWithOrigins(t *testing.T) {
+	origins := map[string]string{"call_1": "e1"}
+	ctx := ContextWithOrigins(context.Background(), origins)
+	origins["call_1"] = "changed"
+	if got := OriginFromContext(ctx, "call_1"); got != "e1" {
+		t.Errorf("origin = %q, want the copy taken", got)
+	}
+	if got := OriginFromContext(ctx, "call_2"); got != "" {
+		t.Errorf("origin of an unnamed call = %q", got)
+	}
+	if got := OriginFromContext(context.Background(), "call_1"); got != "" {
+		t.Errorf("origin on an empty context = %q", got)
+	}
+	inner := ContextWithOrigins(ctx, map[string]string{"call_2": "e2"})
+	if OriginFromContext(inner, "call_1") != "" || OriginFromContext(inner, "call_2") != "e2" {
+		t.Error("an inner map does not replace the outer")
+	}
+	if cleared := ContextWithOrigins(ctx, nil); OriginFromContext(cleared, "call_1") != "" {
+		t.Error("an empty map does not clear")
+	}
+	if ContextWithOrigins(context.Background(), nil) != context.Background() {
+		t.Error("clearing a context with none attached allocates")
+	}
+}

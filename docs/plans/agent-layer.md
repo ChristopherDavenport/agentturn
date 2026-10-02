@@ -422,6 +422,20 @@ An agent can stand in three places inside another system.
 - **As a peer.** `front/a2a` exposes a loop to A2A callers; `tools/a2a`
   wraps a remote A2A agent as a `Tool`, mapping a task to one call and
   input-required to a returned error the model can answer.
+- **As itself, under new settings.** `Agent.SetConfig` replaces the
+  configuration and keeps the transcript, so the next `Continue` runs
+  the same conversation under another agent's instructions, tools and
+  model: the handoff of the agent frameworks, with no package. A
+  session recorder writes the switch as a config delta, so `ContextAt`
+  at any response gives the settings it was produced under. A
+  terminating tool result is the usual trigger: the loop stops with
+  `StopTerminate`, or `StopPartialTerminate` when the model asked for
+  something else in the same batch, and the destination travels in
+  `Result.Details` where the model cannot see it. `front/responses`
+  and `front/a2a` carry the pattern across their protocols with
+  `WithHandoff`, `WithStart` and `WithTransfers`. A one-shot trim of
+  the history for the receiver is `Agent.SetTranscript` between runs,
+  never `Transform`, which runs on every call (issue #96).
 
 ### Both directions for every protocol
 
@@ -472,6 +486,11 @@ WithObserver(func(ctx, Event))     // every event of the child run, for session 
   it for subscribers, so what the abort leaves behind is still written.
 - Nesting is unbounded and each level is the same code, so a specialist
   that itself delegates needs nothing new.
+- Every run `Execute` starts is marked with `ContextWithRetry`: the
+  child is a fresh agent whose request is the new input alone, so a
+  second execution under one call ID, a cut-off call approved again
+  through `Agent.Resume`, belongs on a new root of the call's session
+  rather than after a path the agent never read (issue #87).
 
 ### What a product adds
 
@@ -514,7 +533,15 @@ should not have to alias one of them.
   child tool's observer: created on the child's `run_start` under the
   session of the run on the context, filled with the child's config,
   items, responses and folds as they happen (issue #24). A child that
-  was not observed is written from `ChildInfo.Items`, items only.
+  was not observed is written from `ChildInfo.Items`, items only. A
+  second run under one call opens a new root in the child's session
+  when `tools/agent` started it and the child was observed, since its
+  `Execute` builds a fresh agent per call and marks the run with
+  `ContextWithRetry`, which the observer's context carries; a child
+  written from `ChildInfo.Items` alone is written under the parent's
+  unmarked context and still appends at the leaf; a run the
+  host starts on an agent it kept through `WithSpawn` continues the
+  session at its leaf, since that agent holds its context (issue #87).
 - On a fold reported by `compact.WithOnFold` through `Recorder.Fold`,
   writes the compaction entry, naming as `first_kept` the entry of the
   item at the fold's split index; the recorder keeps the entry ID of

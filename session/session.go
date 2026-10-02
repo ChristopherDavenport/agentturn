@@ -50,7 +50,8 @@
 //     [ConfigBaseMember]; then, with [WithEnv], for the recorder's own
 //     session, the env entry it supplies when it differs from the last
 //     one on the path, members the library does not define included,
-//     and for a child session that holds none, a copy of the env in
+//     and for a child session that holds none, the entry the function
+//     returns for the child's context, or for nil a copy of the env in
 //     force in its parent's; then, with a configuration, a full config
 //     entry before the first item, so a root starts with one as the
 //     format recommends, and a delta when the configuration
@@ -99,8 +100,8 @@
 //     extension item, is written as a custom entry
 //     instead so the path rebuilds exactly the input that was sent,
 //     marked with a [ResponseIDMember] member naming the response that
-//     produced it, if any, and [Transcript] puts it back in the agent's
-//     transcript on a resume. A
+//     produced it, if any, which [MarkedItem] decodes, and [Transcript]
+//     puts it back in the agent's transcript on a resume. A
 //     function_call_output for a call the path holds no dispatch and no
 //     reject for, one the caller answered through Agent.Resume with an
 //     output of their own, is preceded by a reject decision carrying
@@ -118,7 +119,11 @@
 //     decision, the format's verdict for a call ended without running
 //     again, whose by is Answer.By and whose reason is Answer.Reason;
 //     the absence of a second dispatch says the tool did not run
-//     again. A call the path shows answered already, its output lost
+//     again. One that repeats the output a child session produced on
+//     the branch left, which [ReplayAnswers] marks with Answer.Origin,
+//     is preceded as well by the subsession link for the call, naming
+//     that child, so the new branch ties the output to the session
+//     that did the work. A call the path shows answered already, its output lost
 //     to a crash between the two or to a write that failed after the
 //     answer, gets its output alone; only an output answers it, and
 //     [Pending] reads it as [agentturn.PendingAnswered]. A second
@@ -225,7 +230,9 @@
 //     output item types), so an abort or a failure during the fold
 //     leaves a trace that says what the model answered. One the
 //     transform backs off from also carries its split and prefix hash,
-//     which [CompactOptions] seeds a transform in another process with.
+//     which [CompactOptions], and [Recorder.CompactOptions] for a
+//     recorder seeded from the path, seed a transform in another
+//     process with.
 //   - a child run observed through [Recorder.Observe]: a session of its
 //     own whose ID is derived from the parent's and the call's as the
 //     format recommends, with parent_session, spawned_by and the same
@@ -254,7 +261,10 @@
 //     records of a parallel batch say whose each one is. This is how a tool
 //     keeps what its output does not carry, the full bytes of a
 //     truncated result for one, in the session without the recorder
-//     knowing its type. Details for in-process subscribers alone are
+//     knowing its type. A question is two entries, the question before
+//     it is put and the answer after, naming the call it is about when
+//     the asker said, so a run cut while a person was deciding shows
+//     the open question. Details for in-process subscribers alone are
 //     not recorded.
 //
 // # Header
@@ -278,10 +288,16 @@
 // so the same function serves every level of nesting: a child's child
 // is linked from the child's session. The child's session inherits the
 // parent's working directory, so a store that buckets sessions by
-// directory files it with its parent, and a second run under the same
-// call continues it at its leaf rather than starting a new root, since
-// a subagent that is messaged again answers from its own context;
-// agent.ContextWithRetry says the other thing.
+// directory files it with its parent. A second run under the same call
+// is written where the run's context says: a run marked with
+// agent.ContextWithRetry, which tools/agent puts on every run its
+// Execute starts, since each builds a fresh agent that holds nothing of
+// an earlier run, opens a new root in the child's session, so a
+// cut-off call run again through Agent.Resume rebuilds every response
+// and leaves the first attempt's open call off the leaf; a run that is
+// not marked, a host prompting again the agent it kept through
+// agent.WithSpawn, continues the session at its leaf, since a subagent
+// that is messaged again answers from its own context.
 //
 // [Recorder.ChildContext] puts the child's session ID on the context
 // the child run is given, so a layer inside the child that attributes
@@ -293,7 +309,11 @@
 //
 // The host does the same for its own runs with
 // [ContextWithSessionID](ctx, rec.SessionID()); [SessionIDFromContext]
-// reads whichever is in force.
+// reads whichever is in force. [Recorder.SessionOf] answers for any
+// context, a child built with WithObserver alone included: the session
+// a record made with the context is written to, the run's while it is
+// written, the child's after its run ended, and what the context names
+// or the recorder's own otherwise.
 //
 // # Request hashes and compaction
 //
@@ -560,23 +580,59 @@ type ModelBlocked struct {
 // ElicitationNS is the namespace of the custom entry written for a
 // question a tool asked the user mid-call, through the elicitor
 // [Recorder.Elicitor] wraps. Its data is an [Elicitation], and its
-// call_id names the call that asked when the session holds it.
+// call_id names the call that asked when the session holds it: the
+// call on the asking tool's context, the invoking call for a question
+// about a nested call, or, when the context carries no call the
+// session holds, the call the question is about.
+//
+// Each question is two entries: one with phase ask, written before the
+// question is put, so a run cut while a person was deciding shows what
+// it was waiting on, and one with phase answer after it is answered,
+// naming the ask entry in asked. A reader of a cut run that finds an
+// ask under an in-flight call with no answer naming it after it takes
+// the question as still open at the cut. An entry with no phase was
+// written by an earlier release, question and answer in one.
 const ElicitationNS = "agentturn:elicitation"
 
-// Elicitation is the data of an [ElicitationNS] custom entry: the
-// question and what became of it.
+// ElicitationAsk and ElicitationAnswer are the phases of an
+// [Elicitation]: the question as it is put, and the answer once given.
+const (
+	ElicitationAsk    = "ask"
+	ElicitationAnswer = "answer"
+)
+
+// Elicitation is the data of an [ElicitationNS] custom entry: a
+// question as it is put to the user, or what became of it.
 type Elicitation struct {
+	// Phase is [ElicitationAsk] on the entry written before the
+	// question is put and [ElicitationAnswer] on the one written after
+	// it is answered; empty on an entry an earlier release wrote,
+	// which holds question and answer in one.
+	Phase string `json:"phase,omitempty"`
+	// Call is the ID of the call the question is about, when the asker
+	// put one on the context as agentturn.AskedCall: a nested call the
+	// hook deferred, or the model's call a front asks about. Tool is
+	// its name and Parent the call whose tool made it, for a nested
+	// one. All three are empty for a question a tool asks of its own,
+	// which is about the call on the entry's call_id.
+	Call   string `json:"call,omitempty"`
+	Tool   string `json:"tool,omitempty"`
+	Parent string `json:"parent,omitempty"`
+	// Asked, on the answer entry, is the ID of the ask entry it answers.
+	Asked string `json:"asked,omitempty"`
+	// Message, Schema and URL are the question, on both entries.
 	Message string          `json:"message,omitempty"`
 	Schema  json.RawMessage `json:"schema,omitempty"`
 	URL     string          `json:"url,omitempty"`
-	// Action is accept, decline or cancel; empty when Error is set.
+	// Action is accept, decline or cancel, on the answer entry; empty
+	// when Error is set.
 	Action  string          `json:"action,omitempty"`
 	Content json.RawMessage `json:"content,omitempty"`
 	// By is who answered, in the session format's terms; empty when
 	// nobody was asked or the asking failed.
 	By string `json:"by,omitempty"`
 	// Error is the harness's failure to ask, which the tool sees as an
-	// error rather than an answer.
+	// error rather than an answer, on the answer entry.
 	Error string `json:"error,omitempty"`
 }
 
@@ -647,6 +703,30 @@ const unnamedReason = "the response named no ID, so the items it produced read a
 // is not put back.
 const ResponseIDMember = "agentturn:response_id"
 
+// MarkedItem decodes a custom entry written for an item of the agent's
+// transcript the filter kept from the model, an app-only input or a
+// model output item, marked with [ResponseIDMember]: the item, the ID
+// of the response that produced it, "" for an input or an output whose
+// stream never named its response, and true; or false for any other
+// entry, one without the member, one whose data does not decode as an
+// item and one whose item is not of the entry's namespace included,
+// which the transcript leaves out as it does today. [Transcript] and a
+// replay that rebuilds a response's output from the path share this
+// rule.
+func MarkedItem(c *agentsession.CustomEntry) (openresponses.Item, string, bool) {
+	raw, ok := c.Unknown[ResponseIDMember]
+	if !ok {
+		return nil, "", false
+	}
+	item, err := openresponses.UnmarshalItem(c.Data)
+	if err != nil || item.ItemType() != c.NS {
+		return nil, "", false
+	}
+	var id string
+	_ = json.Unmarshal(raw, &id)
+	return item, id, true
+}
+
 // ErrRunActive is returned by [Recorder.Rebase] while a run is being
 // written.
 var ErrRunActive = errors.New("session: a run is active")
@@ -715,10 +795,20 @@ type Recorder struct {
 	// written.
 	runs    map[string]*writer
 	rootRun string
+	// ended maps the ID of each child run whose writer was released to
+	// the ID of its session, so a record a job the child started
+	// writes after the run ended, with the run's context, is filed in
+	// the child's session whether or not the host put the session's ID
+	// on that context.
+	ended map[string]string
 	// childIDs holds the ID of every child session the recorder has
 	// written, so a record naming one by [SessionIDFromContext] after
 	// its run ended is filed there rather than at the root.
 	childIDs map[string]bool
+	// compactOpts seeds a compact transform with the path the recorder
+	// was seeded from, as [CompactOptions] does for the session: set
+	// wherever the root writer is seeded, nil on a fresh session.
+	compactOpts []compact.Option
 }
 
 // writer is the state of one session being written.
@@ -916,6 +1006,14 @@ type callRecord struct {
 	// was handed over. An output arriving in that run is then the
 	// loop's own refusal rather than a caller's answer.
 	settledRun string
+	// ranEntry, for a call with no dispatch on the path and one off
+	// it, is the entry of the output that follows that dispatch on its
+	// branch, the output [Pending] gives as Ran, and childOff the child
+	// session that branch links to the call, when it holds a link: an
+	// output answered now with ranEntry as its origin repeats that
+	// child's work, and the link comes with it.
+	ranEntry string
+	childOff string
 }
 
 // Option configures a Recorder.
@@ -963,14 +1061,22 @@ func WithoutChildSessions() Option {
 // unchanged environment adds nothing; a nil entry writes nothing. The
 // recorder gathers nothing itself: what the host knows about its
 // environment is the host's to supply, and the recorder stays free of
-// the file system. An error at run_start fails the run. A run's start
-// asks for the environment in the recorder's own session alone. A
-// child session's first run start, when the session holds no env
-// entry, writes a copy of the one in force in its parent's at that
-// moment, since the format does not read an environment through
-// parent_session: the child's file then names the workspace it ran in,
-// a move it makes is a later entry of its own, and [Recorder.Env]
-// compares with the child's entry, not its parent's. A workspace
+// the file system. An error at run_start fails the run; at a child's
+// run start, which an observer cannot fail, it ends the record of that
+// child where it is, as a store failure there does. A run's start asks
+// for the environment in the recorder's own session, and at a child
+// session's first run start, when the session holds no env entry, with
+// the child's context: the context the observer receives, the call's,
+// which carries what the host put on it for the child, a sandbox of
+// the child's own among them. The entry the function returns is the
+// child's first, with nothing to compare against, since a child given
+// a workspace of its own never ran where its parent is; for nil the
+// child is where its parent is, and a copy of the env in force in its
+// parent's at that moment is written instead, since the format does
+// not read an environment through parent_session. Either way the
+// child's file then names the workspace it ran in, a move it makes is
+// a later entry of its own, and [Recorder.Env] compares with the
+// child's entry, not its parent's. A workspace
 // that can move while a run goes on, a sandbox in a pool that
 // reschedules it, is recorded only as far as the host calls
 // [Recorder.Env] when it moves: the start of the next run reads the
@@ -1028,6 +1134,7 @@ func New(store agentsession.Store, sessionID string, opts ...Option) *Recorder {
 		children: true,
 		now:      time.Now,
 		runs:     map[string]*writer{},
+		ended:    map[string]string{},
 	}
 	r.root = newWriter(r, sessionID)
 	for _, opt := range opts {
@@ -1080,8 +1187,37 @@ func Start(ctx context.Context, store agentsession.Store, h agentsession.Header,
 		if err := r.root.seed(ctx, s, true); err != nil {
 			return nil, nil, err
 		}
+		if err := r.seedCompact(s); err != nil {
+			return nil, nil, err
+		}
 	}
 	return r, s, nil
+}
+
+// seedCompact remembers what seeds a compact transform with the path
+// at the session's leaf, for [Recorder.CompactOptions].
+func (r *Recorder) seedCompact(s *agentsession.Session) error {
+	opts, err := CompactOptions(s)
+	if err != nil {
+		return err
+	}
+	r.compactOpts = opts
+	return nil
+}
+
+// CompactOptions returns the options that seed a compact transform
+// with the session this recorder was seeded from, as [CompactOptions]
+// does for the session: compact.WithFailedFold with the last failed
+// fold on the path at the leaf the recorder started writing at, by
+// [Resume], [Continue], a [Start] on a based header or
+// [Recorder.Rebase]. It is what a host that is handed the recorder
+// rather than the session passes to compact.NewLocal beside
+// compact.WithOnFold(rec.Fold). nil for a recorder on a fresh session
+// or one whose path holds no such fold.
+func (r *Recorder) CompactOptions() []compact.Option {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.compactOpts)
 }
 
 // Resume opens the session with the given ID and returns a recorder
@@ -1131,10 +1267,17 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // run carries the key of its last dispatch and the arguments that
 // dispatch ran with, the pair a run of it again repeats, the last
 // dispatch in the session when none is on the path, and one the
-// file cannot say about the arguments a decision gave it. It is what
+// file cannot say about the arguments a decision gave it. A call whose
+// dispatch off the path, on the branch a rebase left or in the session
+// this one forks, is followed there by its output ran there, and
+// carries that output as Ran and where it ran as RanWhere, "ran on a
+// branch the rebase left" or "ran in the session this one forks": the
+// answer [ReplayAnswers] gives it, and the one a host answering the
+// call itself should give rather than running the call again or
+// telling the model its outcome is unknown. It is what
 // [agentturn.WithPending] seeds an agent with beside the context's
-// items, so the agent's Resume knows which calls never started;
-// [AgentOptions] gives both.
+// items, so the agent's Resume knows which calls never started and
+// which ran elsewhere; [AgentOptions] gives both.
 //
 // A call in a fork's prefix has its dispatch, if any, in the session
 // the fork was made from, which s does not hold: the file cannot say
@@ -1144,21 +1287,24 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // a rebase left. [Recorder.ReadOptions] gives the options that read a
 // session as the recorder writing it does.
 func Pending(s *agentsession.Session, opts ...ReadOption) ([]agentturn.PendingCall, error) {
-	pending, err := pendingCalls(context.Background(), s, opts)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]agentturn.PendingCall, len(pending))
-	for i, p := range pending {
-		out[i] = p.PendingCall
-	}
-	return out, nil
+	pending, _, err := pendingCalls(s, opts)
+	return pending, err
 }
 
 // ReadOption configures how [Pending], [AgentOptions] and
-// [ReplayAnswers] read a session. [WithOrigins] makes one.
+// [ReplayAnswers] read a session. [WithOrigins] and [WithContext] make
+// one.
 type ReadOption struct {
 	apply func(*origins)
+}
+
+// WithContext has [Pending] and [AgentOptions] read a fork's origins
+// under ctx, so a deadline or a cancellation on it ends the reads;
+// without it they read under context.Background(). [ReplayAnswers]
+// takes a context of its own and reads under that one whatever this
+// option says.
+func WithContext(ctx context.Context) ReadOption {
+	return ReadOption{apply: func(o *origins) { o.ctx = ctx }}
 }
 
 // WithOrigins has [Pending], [AgentOptions] and [ReplayAnswers] read a
@@ -1177,7 +1323,9 @@ func WithOrigins(r agentsession.Reader) ReadOption {
 // ReadOptions returns the options that have [Pending], [AgentOptions]
 // and [ReplayAnswers] read a session as the recorder reads it when it
 // is seeded: [WithOrigins] with the recorder's store, when the store
-// is an agentsession.Reader, and none otherwise.
+// is an agentsession.Reader, and none otherwise. A caller with a
+// deadline on the reads, a request handler for one, adds
+// [WithContext] beside them.
 func (r *Recorder) ReadOptions() []ReadOption {
 	if rd, ok := r.store.(agentsession.Reader); ok {
 		return []ReadOption{WithOrigins(rd)}
@@ -1243,22 +1391,16 @@ func (o *origins) dispatchOff(s *agentsession.Session, callEntry string) (*agent
 	return nil, nil, nil
 }
 
-// pendingCall is a call pending at the leaf as [Pending] reads it, with
-// the output it has on the branch of the dispatch Pending found off the
-// path, when it has one there: it ran there, and that is what it
-// returned. ranWhere says where, as the reason of the answer giving it.
-type pendingCall struct {
-	agentturn.PendingCall
-	ranOff   *openresponses.FunctionCallOutput
-	ranWhere string
-}
-
-// pendingCalls is [Pending] with the output each call has off the path.
-func pendingCalls(ctx context.Context, s *agentsession.Session, opts []ReadOption) ([]pendingCall, error) {
+// pendingCalls is [Pending], with the entry each call's Ran was read
+// from by call ID, for the origin of the answer [ReplayAnswers] gives
+// it. The origins are read under the context the last [WithContext] in
+// opts gives, which [ReplayAnswers] appends its own as, and under
+// context.Background() without one.
+func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.PendingCall, map[string]string, error) {
 	if s.Leaf() == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
-	o := &origins{ctx: ctx}
+	o := &origins{ctx: context.Background()}
 	for _, opt := range opts {
 		if opt.apply != nil {
 			opt.apply(o)
@@ -1266,11 +1408,12 @@ func pendingCalls(ctx context.Context, s *agentsession.Session, opts []ReadOptio
 	}
 	calls, err := s.PendingCalls(s.Leaf())
 	if err != nil {
-		return nil, fmt.Errorf("session: pending calls at leaf: %w", err)
+		return nil, nil, fmt.Errorf("session: pending calls at leaf: %w", err)
 	}
-	var out []pendingCall
+	var out []agentturn.PendingCall
+	ranAt := map[string]string{}
 	for _, c := range calls {
-		p := pendingCall{PendingCall: agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingUnknown}}
+		p := agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingUnknown}
 		state := c.State(s.Header())
 		switch state {
 		case agentsession.CallHeld:
@@ -1281,6 +1424,9 @@ func pendingCalls(ctx context.Context, s *agentsession.Session, opts []ReadOptio
 			p.Reason = agentturn.PendingAnswered
 		case agentsession.CallRejected:
 			p.Reason = agentturn.PendingRejected
+			if p.Refused, err = refusal(s, c.Call.CallID); err != nil {
+				return nil, nil, err
+			}
 		case agentsession.CallNeverStarted:
 			p.Reason = agentturn.PendingUndispatched
 		}
@@ -1292,15 +1438,20 @@ func pendingCalls(ctx context.Context, s *agentsession.Session, opts []ReadOptio
 		if len(c.Dispatches) == 0 && (state == agentsession.CallHeld || state == agentsession.CallNeverStarted || state == agentsession.CallUnknown) {
 			at, d, err := o.dispatchOff(s, c.Entry.ID)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if d != nil {
 				if off, err = callAt(at, d, c.Entry.ID); err != nil {
-					return nil, err
+					return nil, nil, err
 				}
-				p.ranOff, p.ranWhere = outputAfter(at, d, c.Entry.ID), ranOffReason
-				if at != s {
-					p.ranWhere = ranInOriginReason
+				// The call ran where its dispatch is when its output
+				// follows it there: that is its outcome.
+				var entry string
+				if p.Ran, entry = outputAfter(at, d, c.Entry.ID); p.Ran != nil {
+					ranAt[p.Call.CallID], p.RanWhere = entry, ranOffReason
+					if at != s {
+						p.RanWhere = ranInOriginReason
+					}
 				}
 				if state == agentsession.CallHeld {
 					p.Dispatched = true
@@ -1328,16 +1479,18 @@ func pendingCalls(ctx context.Context, s *agentsession.Session, opts []ReadOptio
 		}
 		out = append(out, p)
 	}
-	return out, nil
+	return out, ranAt, nil
 }
 
 // outputAfter is the output of the call held by the entry callEntry
 // on a branch through its dispatch d, the last such the session holds,
-// or nil when no branch through d holds one. An output an answer
-// decision put there is not what the call returned but what someone
-// said of it, an outcome unknown among them, and is passed over.
-func outputAfter(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry string) *openresponses.FunctionCallOutput {
+// and the ID of its entry, or nil and "" when no branch through d
+// holds one. An output an answer decision put there is not what the
+// call returned but what someone said of it, an outcome unknown among
+// them, and is passed over.
+func outputAfter(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry string) (*openresponses.FunctionCallOutput, string) {
 	var out *openresponses.FunctionCallOutput
+	entry := ""
 	for _, e := range s.Entries() {
 		ie, ok := e.(*agentsession.ItemEntry)
 		if !ok {
@@ -1348,11 +1501,23 @@ func outputAfter(s *agentsession.Session, d *agentsession.DispatchEntry, callEnt
 		}
 		for _, c := range agentsession.Calls(s.Path(ie.ID)) {
 			if c.Entry.ID == callEntry && c.Output == ie && slices.Contains(c.Dispatches, d) && !c.Answered() {
-				out = ie.Item.(*openresponses.FunctionCallOutput)
+				out, entry = ie.Item.(*openresponses.FunctionCallOutput), ie.ID
 			}
 		}
 	}
-	return out
+	return out, entry
+}
+
+// subsessionOn is the child session the path to entry links to the
+// call callID, through a subsession link, or "" when it holds none.
+func subsessionOn(s *agentsession.Session, entry, callID string) string {
+	child := ""
+	for _, e := range s.Path(entry) {
+		if l, ok := e.(*agentsession.LinkEntry); ok && l.Rel == agentsession.RelSubsession && l.CallID == callID {
+			child = l.Session
+		}
+	}
+	return child
 }
 
 // callAt is the call held by the entry callEntry as the path to the
@@ -1451,7 +1616,7 @@ func TranscriptModels(s *agentsession.Session) (openresponses.Items, agentturn.R
 				produced[v.ID] = settings.Model
 			}
 		case *agentsession.CustomEntry:
-			if _, ok := v.Unknown[ResponseIDMember]; ok && v.NS == openresponses.ItemTypeReasoning {
+			if _, _, ok := MarkedItem(v); ok && v.NS == openresponses.ItemTypeReasoning {
 				produced[v.ID] = settings.Model
 			}
 		}
@@ -1471,7 +1636,7 @@ func TranscriptModels(s *agentsession.Session) (openresponses.Items, agentturn.R
 
 // transcriptOf is the transcript of cx, as [Transcript] reads it, with
 // the ID of the entry contributing each item, and whether that entry
-// is a custom entry, outside the context.
+// is a custom entry, outside the context, one [MarkedItem] decodes.
 func transcriptOf(cx agentsession.Context) (items openresponses.Items, entries []string, custom []bool) {
 	j := 0
 	for _, e := range cx.Entries {
@@ -1483,10 +1648,7 @@ func transcriptOf(cx agentsession.Context) (items openresponses.Items, entries [
 		if !ok {
 			continue
 		}
-		if _, ok := c.Unknown[ResponseIDMember]; !ok {
-			continue
-		}
-		if item, err := openresponses.UnmarshalItem(c.Data); err == nil && item.ItemType() == c.NS {
+		if item, _, ok := MarkedItem(c); ok {
 			items, entries, custom = append(items, item), append(entries, c.ID), append(custom, true)
 		}
 	}
@@ -1527,7 +1689,11 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // safe" or "run again: keyed"; and it is answered with
 // [agentturn.OutcomeUnknown] otherwise, including when no tool has its
 // name, with a reason saying which: "not run again: no tool", "not run
-// again: keyed without a key" or "not run again: replay unknown". A
+// again: keyed without a key" or "not run again: replay unknown"; when
+// the path holds a question asked under the call that nothing
+// answered, an [ElicitationNS] ask with no answer naming it, the call
+// was waiting on a person when the run was cut, and the reason goes on
+// to name the question and the call it was about. A
 // call that may have run because its only dispatch is on a branch a
 // rebase left, and that its tool completed there, ran: it is answered
 // with the output that branch holds, with the reason "ran on a branch
@@ -1537,7 +1703,17 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // call in a fork's prefix that completed in the session the fork was
 // made from, with the reason "ran in the session this one forks". A
 // recorder writes either answer as an answer decision before the
-// output. A call an answer ended before its output was written gets
+// output. Either answer names the entry of the output it repeats as
+// its Origin, which the loop carries unread to the run's context, and
+// the recorder, finding that the branch of this session holding that
+// entry links the call to a child session, a tools/agent child's,
+// writes the same subsession link for the call on the new branch
+// before the answer, so the record ties the output to the child
+// session that produced it rather than to nothing. In a fork no link
+// is written, since a subsession link names a child of the session
+// that writes it and the child is the origin's: the fork's record
+// reaches that child through the origin's link in its prefix, and the
+// answer's Origin names the output it repeats. A call an answer ended before its output was written gets
 // [agentturn.OutcomeUnknown] as that output, since the record holds
 // the answer and not the output it gave. A held call is waiting for
 // someone and is the caller's to answer, a call held after its
@@ -1550,7 +1726,7 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // pending call as one that may have run, and holds the approval of a
 // call that never started to the replay rule.
 func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agenttool.Tool, opts ...ReadOption) ([]agentturn.Answer, error) {
-	pending, err := pendingCalls(ctx, s, opts)
+	pending, ranAt, err := pendingCalls(s, append(slices.Clone(opts), WithContext(ctx)))
 	if err != nil {
 		return nil, err
 	}
@@ -1567,23 +1743,71 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 		case agentturn.PendingAnswered:
 			ans = agentturn.OutcomeUnknown(id)
 		case agentturn.PendingRejected:
-			reason, err := refusal(s, id)
-			if err != nil {
-				return nil, err
-			}
-			ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Output: openresponses.FunctionCallOutputData{Text: reason}})
+			ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Output: openresponses.FunctionCallOutputData{Text: p.Refused}})
 		default:
-			if p.ranOff != nil {
+			if p.Ran != nil {
 				// The call ran on the branch its dispatch is on, and the
 				// session holds what it returned: that is its outcome.
-				ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Status: p.ranOff.Status, Output: p.ranOff.Output}).WithReason(p.ranWhere)
+				ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Status: p.Ran.Status, Output: p.Ran.Output}).WithReason(p.RanWhere).WithOrigin(ranAt[id])
 				break
 			}
-			ans = replayAnswer(ctx, set, p.PendingCall)
+			ans = replayAnswer(ctx, set, p)
+			if q := openQuestion(s, id); q != nil && ans.Output != nil {
+				// The call was waiting on a person when the run was
+				// cut: the answer says so, and what it asked.
+				ans = ans.WithReason(ans.Reason + "; " + q.openReason())
+			}
 		}
 		out = append(out, ans.WithBy(agentsession.ByPolicy))
 	}
 	return out, nil
+}
+
+// openQuestion is the last question asked under callID on the path to
+// the leaf that nothing answered: an [ElicitationNS] entry with phase
+// ask that no answer entry after it names in asked. It is nil when
+// every question under the call was answered, or none was asked. An
+// entry an earlier release wrote, with no phase, holds its answer.
+func openQuestion(s *agentsession.Session, callID string) *Elicitation {
+	open := map[string]*Elicitation{}
+	var order []string
+	for _, e := range s.Path(s.Leaf()) {
+		c, ok := e.(*agentsession.CustomEntry)
+		if !ok || c.NS != ElicitationNS || c.CallID != callID {
+			continue
+		}
+		var q Elicitation
+		if json.Unmarshal(c.Data, &q) != nil {
+			continue
+		}
+		switch q.Phase {
+		case ElicitationAsk:
+			open[c.ID] = &q
+			order = append(order, c.ID)
+		case ElicitationAnswer:
+			delete(open, q.Asked)
+		}
+	}
+	for i := len(order) - 1; i >= 0; i-- {
+		if q, ok := open[order[i]]; ok {
+			return q
+		}
+	}
+	return nil
+}
+
+// openReason says the question was open when the run was cut, and
+// which call it was about, for the reason of the answer [ReplayAnswers]
+// gives the call it was asked under.
+func (e Elicitation) openReason() string {
+	reason := fmt.Sprintf("a question was open: %q", e.Message)
+	if e.Call != "" {
+		reason += " about call " + e.Call
+		if e.Tool != "" {
+			reason += " (" + e.Tool + ")"
+		}
+	}
+	return reason
 }
 
 // ranOffReason is the reason of the answer [ReplayAnswers] gives a
@@ -1675,6 +1899,9 @@ func resume(ctx context.Context, s *agentsession.Session, store agentsession.Sto
 	if err := r.root.seed(ctx, s, true); err != nil {
 		return nil, nil, err
 	}
+	if err := r.seedCompact(s); err != nil {
+		return nil, nil, err
+	}
 	return r, s, nil
 }
 
@@ -1730,7 +1957,8 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 // agentturn.ContextWithReasoningModels, and
 // then Agent.SetPending from [Pending], so a call held on the branch
 // is approved as a held call and one that may have run is held to the
-// replay rule. Rebase reserves every call ID in the session, [CallIDs],
+// replay rule; [Recorder.CompactOptions] gives what seeds a transform
+// built for the branch. Rebase reserves every call ID in the session, [CallIDs],
 // on the agent [Recorder.Attach] attached, so a call the model makes
 // does not take the ID of one the context leaves out or the branch
 // left behind holds; a host driving another agent calls
@@ -1776,6 +2004,7 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 	if entryID == "" {
 		s.ResetLeaf()
 		w.reset()
+		r.compactOpts = nil
 		for _, in := range w.inbox {
 			in.entry = ""
 		}
@@ -1808,6 +2037,9 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 		return err
 	}
 	if err := w.seed(ctx, s, false); err != nil {
+		return err
+	}
+	if err := r.seedCompact(s); err != nil {
 		return err
 	}
 	return r.reserve(s)
@@ -1942,11 +2174,14 @@ func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) int {
 }
 
 // Annotate appends a custom entry in namespace ns carrying data,
-// encoded as JSON, at the current leaf of the session of the run on
-// the context; when the context names no run it is writing, of the
-// child session [SessionIDFromContext] names when that is one of this
-// recorder's, reopened at its leaf, or else of the recorder's own
-// session; and returns the entry's ID, which a
+// encoded as JSON, at the current leaf of the session
+// [Recorder.SessionOf] names for the context: the session of the run
+// on the context while the recorder writes it; after a child run has
+// ended, that child's session, reopened at its leaf, so a job the
+// child started files what it writes where the child's run is; else
+// the child session [SessionIDFromContext] names when that is one of
+// this recorder's; or else the recorder's own session. It returns the
+// entry's ID, which a
 // checkpoint or a rewind can branch to. It never contributes an item
 // or a setting, so the context and the request hashes are untouched.
 // Made with the context of a tool call, from inside the tool, the
@@ -1956,6 +2191,14 @@ func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) int {
 // config entry, whatever the order the subscribers were registered in;
 // made during any later event of the turn, after it.
 func (r *Recorder) Annotate(ctx context.Context, ns string, data any) (string, error) {
+	return r.annotate(ctx, ns, data, "")
+}
+
+// annotate is [Recorder.Annotate] with a call to file the entry under
+// when the context carries none the session holds: the call a question
+// is about, for [Recorder.Elicitor], which a front asking about a
+// model's call puts on the context without a call of its own.
+func (r *Recorder) annotate(ctx context.Context, ns string, data any, about string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	w := r.writerOf(ctx)
@@ -1972,7 +2215,11 @@ func (r *Recorder) Annotate(ctx context.Context, ns string, data any) (string, e
 	if err != nil {
 		return "", fmt.Errorf("session: encode annotation %s: %w", ns, err)
 	}
-	return w.append(context.WithoutCancel(ctx), &agentsession.CustomEntry{NS: ns, Data: raw, CallID: w.callOn(ctx)})
+	callID := w.callOn(ctx)
+	if callID == "" && about != "" {
+		callID = w.heldCall(about)
+	}
+	return w.append(context.WithoutCancel(ctx), &agentsession.CustomEntry{NS: ns, Data: raw, CallID: callID})
 }
 
 // Env asks the function [WithEnv] set for the environment now and
@@ -1984,12 +2231,11 @@ func (r *Recorder) Annotate(ctx context.Context, ns string, data any) (string, e
 // that saw the move or the tool that moved, with the context it was
 // given, and between runs with any. The entry is written where
 // [Recorder.Annotate] files its entry: at the current leaf of the
-// session of the run on the context; when the context names no run
-// being written, of the child session [SessionIDFromContext] names
-// when that is one of this recorder's, reopened at its leaf, so a job
-// a child started that moves the workspace after the child's run
-// ended records the move in the child; or else of the recorder's own
-// session. It is compared with the env in force in that session: the
+// session [Recorder.SessionOf] names for the context, the session of
+// the run on it, a child's after its run ended included, reopened at
+// its leaf, so a job a child started that moves the workspace after
+// the child's run ended records the move in the child; or else of the
+// recorder's own session. It is compared with the env in force in that session: the
 // last on its path, the one a child's first run start copied from its
 // parent's included, so a job a child started that outlives it is
 // compared with where the child ran, not where its parent is now; or,
@@ -2124,19 +2370,55 @@ func (r *Recorder) writerOf(ctx context.Context) *writer {
 	return r.root
 }
 
-// reopen returns a writer at the leaf of the child session the context
-// names, or nil when the context names none of this recorder's
-// children. It is what a record written after a child's run ended, by
-// a job the child started, is filed with, even while a later run of
-// the child is being written: that run's writer knows only the calls
-// pending when it was seeded, and the job's call was answered before.
-// The writer knows every call on the session's path and the nested
-// calls their tools made, which is all callOn asks, and is dropped
-// after the write: the store keeps the leaf, and a later run of the
-// child seeds a writer of its own from it. The caller holds r.mu, so
-// no live writer of the session appends meanwhile.
+// reopen returns a writer at the leaf of the child session a record
+// made with the context is filed in, as [Recorder.SessionOf] resolves
+// it, or nil when that is the recorder's own. It is what a record
+// written after a child's run ended, by a job the child started, is
+// filed with, even while a later run of the child is being written:
+// that run's writer knows only the calls pending when it was seeded,
+// and the job's call was answered before. The writer knows every call
+// on the session's path and the nested calls their tools made, which
+// is all callOn asks, and is dropped after the write: the store keeps
+// the leaf, and a later run of the child seeds a writer of its own
+// from it. The caller holds r.mu, so no live writer of the session
+// appends meanwhile.
 func (r *Recorder) reopen(ctx context.Context) (*writer, error) {
-	return r.reopenID(ctx, SessionIDFromContext(ctx))
+	id := r.sessionOf(ctx)
+	if id == r.root.id {
+		return nil, nil
+	}
+	return r.reopenID(ctx, id)
+}
+
+// SessionOf returns the ID of the session a record made with ctx is
+// written to, the one [Recorder.Annotate], [Recorder.RecordFunc] and
+// [Recorder.Env] write: the session of the run on ctx while the
+// recorder writes it, a child's or its own; after a child run has
+// ended, that child's session, which the recorder remembers for the
+// run; else the child session [ChildContext] put on ctx when it is one
+// of this recorder's; else the recorder's own. It is what a layer that
+// keys its own state by session, a memory manifest for one, reads
+// inside a hook or a tool of a child built with agent.WithObserver
+// alone, which [SessionIDFromContext] says nothing about.
+func (r *Recorder) SessionOf(ctx context.Context) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sessionOf(ctx)
+}
+
+// sessionOf is [Recorder.SessionOf] with r.mu held.
+func (r *Recorder) sessionOf(ctx context.Context) string {
+	runID := agentturn.RunIDFromContext(ctx)
+	if w, ok := r.runs[runID]; ok {
+		return w.id
+	}
+	if id, ok := r.ended[runID]; ok {
+		return id
+	}
+	if id := SessionIDFromContext(ctx); r.childIDs[id] {
+		return id
+	}
+	return r.root.id
 }
 
 // reopenID is reopen for the child session id. The writer knows the
@@ -2198,11 +2480,14 @@ func (w *writer) callOn(ctx context.Context) string {
 //
 // A record written from agentturn.RunContext after the run it names
 // has ended, by a background job that outlived it, finds no run being
-// written. It is filed at the leaf of the child session the context
-// names, when [Recorder.ChildContext] named one of this recorder's
-// children there, and of the recorder's own session otherwise, after
-// whatever that session holds by then, a later run's entries included;
-// its call_id names the job's call when that session holds it. A job
+// written. It is filed at the leaf of the session [Recorder.SessionOf]
+// names for the context: a child's when the run was a child's, which
+// the recorder remembers for the run whether or not
+// [Recorder.ChildContext] named the session on the context, else the
+// one [SessionIDFromContext] names when that is one of this recorder's
+// children, and the recorder's own session otherwise, after whatever
+// that session holds by then, a later run's entries included; its
+// call_id names the job's call when that session holds it. A job
 // in a child names its call with agenttool.WithCall(rc, call): the
 // child's run context carries the parent's call, which the child's
 // session does not hold, so a record without it names no call.
@@ -2214,14 +2499,29 @@ func (r *Recorder) RecordFunc() agenttool.RecordFunc {
 }
 
 // Elicitor returns an elicitor that puts each question to fn and
-// writes the question and its answer as an [ElicitationNS] custom
-// entry, under the call that asked, before the answer returns to the
-// tool; by names who answers, in the session format's terms. Set it as
+// writes it as two [ElicitationNS] custom entries under the call that
+// asked: the question, with phase ask, before it is put to fn, and its
+// answer, with phase answer and asked naming the first entry, before
+// the answer returns to the tool; by names who answers, in the session
+// format's terms. A question the loop asks about a nested call, or a
+// front about a model's call, carries that call's ID, tool and parent
+// on both entries, from the agentturn.AskedCall on the context, so
+// consecutive questions are tied to the calls they are about by more
+// than their order; the entries' call_id stays the call on the
+// context, the invoking call for a nested one, and is the call asked
+// about when the context carries none the session holds. A run cut
+// while a person was deciding, the process killed with the question
+// open, leaves the ask and no answer, so a reader of the record knows
+// the in-flight call was waiting on a person and what it asked, and
+// [ReplayAnswers] names the open question in the reason of the answer
+// it gives that call. Set the elicitor as
 // agentturn.Config.ToolElicitor, or install it with
 // agenttool.ContextWithElicitor on the context a run is prompted with.
 // A nil fn answers every question with agenttool.ActionCancel, since
-// nobody was asked, and records that. A failure to write the entry is
-// returned to the tool as the harness failing to ask.
+// nobody was asked, and records that. A failure to write the ask entry
+// is returned to the tool as the harness failing to ask, and fn is not
+// called; a failure to write the answer entry is returned the same
+// way, joined with fn's error if it had one.
 //
 // An agent run from inside a tool served by agenttool's mcpserver
 // finds the elicitor that asks the MCP client on the call's context,
@@ -2237,21 +2537,30 @@ func (r *Recorder) RecordFunc() agenttool.RecordFunc {
 // cancelled.
 func (r *Recorder) Elicitor(by string, fn agenttool.Elicitor) agenttool.Elicitor {
 	return func(ctx context.Context, q agenttool.Elicitation) (agenttool.Answer, error) {
+		data := Elicitation{Phase: ElicitationAsk, Message: q.Message, Schema: q.Schema, URL: q.URL}
+		if about, ok := agentturn.AskedCallFrom(ctx); ok {
+			data.Call, data.Tool, data.Parent = about.CallID, about.Name, about.Parent
+		}
+		// The question is on the record before anyone is asked, so a
+		// run cut while they decide shows what it was waiting on.
+		asked, err := r.annotate(ctx, ElicitationNS, data, data.Call)
+		if err != nil {
+			return agenttool.Answer{}, err
+		}
 		ans := agenttool.Answer{Action: agenttool.ActionCancel}
-		var err error
 		who := ""
 		if fn != nil {
 			ans, err = fn(ctx, q)
 			who = by
 		}
-		data := Elicitation{Message: q.Message, Schema: q.Schema, URL: q.URL}
+		data.Phase, data.Asked = ElicitationAnswer, asked
 		if err != nil {
 			// Nobody answered: the harness failed to ask.
 			data.Error = err.Error()
 		} else {
 			data.Action, data.Content, data.By = string(ans.Action), ans.Content, who
 		}
-		if _, werr := r.Annotate(ctx, ElicitationNS, data); werr != nil {
+		if _, werr := r.annotate(ctx, ElicitationNS, data, data.Call); werr != nil {
 			return agenttool.Answer{}, errors.Join(err, werr)
 		}
 		return ans, err
@@ -2270,6 +2579,9 @@ func (w *writer) reset() {
 	w.items, w.values, w.custom = nil, nil, nil
 	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = false, 0, nil, nil
 	w.calls = map[string]*callRecord{}
+	// The links written are on the branch left: a call whose child is
+	// linked there and answered here gets the link again.
+	w.linked = map[string]bool{}
 	w.env = nil
 	w.base = ""
 	w.attempt, w.attemptModel, w.retries = nil, "", 0
@@ -2348,14 +2660,24 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 	o.r, _ = w.rec.store.(agentsession.Reader)
 	for _, c := range calls {
 		off := false
+		ranEntry, childOff := "", ""
 		if c.Output == nil && len(c.Dispatches) == 0 {
-			_, d, err := o.dispatchOff(s, c.Entry.ID)
+			at, d, err := o.dispatchOff(s, c.Entry.ID)
 			if err != nil {
 				return err
 			}
-			off = d != nil
+			if off = d != nil; off {
+				if _, ranEntry = outputAfter(at, d, c.Entry.ID); ranEntry != "" && at == s {
+					// A link names a child of this session, so only a
+					// branch of this session can lend one; a fork's
+					// origin holds its own link, in the fork's prefix.
+					childOff = subsessionOn(at, ranEntry, c.ID())
+				}
+			}
 		}
-		w.calls[c.ID()] = callRecordOf(c, s.Header(), off)
+		rec := callRecordOf(c, s.Header(), off)
+		rec.ranEntry, rec.childOff = ranEntry, childOff
+		w.calls[c.ID()] = rec
 	}
 	return nil
 }
@@ -2424,7 +2746,11 @@ func ContextWithSessionID(ctx context.Context, sessionID string) context.Context
 // attributes its writes to a session reads, beside
 // agentturn.RunIDFromContext: inside a child run it names the child's
 // session, which the recorder creates and the host never otherwise
-// sees.
+// sees. It knows only what was put on the context: for a child built
+// without [Recorder.ChildContext] it is "", while the recorder writes
+// that child's session all the same. [Recorder.SessionOf] is the
+// complete answer, the session a record made with the context goes
+// to, whichever way the child was built.
 func SessionIDFromContext(ctx context.Context) string {
 	id, _ := ctx.Value(sessionIDKey{}).(string)
 	return id
@@ -2587,16 +2913,29 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 		return
 	}
 	if err := w.handle(ctx, ev); err != nil {
-		delete(r.runs, runID(ev))
+		r.release(runID(ev), w)
 		return
 	}
 	if _, end := ev.(*agentturn.RunEnd); end && w.detached {
-		delete(r.runs, runID(ev))
+		r.release(runID(ev), w)
 	}
 }
 
+// release drops the writer of the child run runID and remembers which
+// session the run was written to, for [Recorder.SessionOf] and for a
+// record made with the run's context after its end.
+func (r *Recorder) release(runID string, w *writer) {
+	delete(r.runs, runID)
+	r.ended[runID] = w.id
+}
+
 // Fold records a fold of the compact transform; register it with
-// compact.WithOnFold. A fold that was applied becomes a compaction
+// compact.WithOnFold, beside what [Recorder.CompactOptions] gives for
+// a recorder seeded from a path:
+//
+//	c := compact.NewLocal(model, append(rec.CompactOptions(), compact.WithOnFold(rec.Fold))...)
+//
+// A fold that was applied becomes a compaction
 // entry naming the entry of the first kept item as first_kept, with
 // the summary, the settings in force, the token estimate, the usage
 // and the fold's own call under [FoldMember]; a fold that failed
@@ -2624,12 +2963,18 @@ func (r *Recorder) Fold(ctx context.Context, f compact.Fold) error {
 // session's ID is derived from the parent's and the call's, so a
 // reader can compute it from the parent's link alone.
 //
-// A second run under the same call continues the existing session from
-// its leaf: a subagent that is messaged again answers from its own
-// context, so its run belongs after the one before it, with the
-// hashes that follow from that. A host that means a retry from a clean
-// start says so with agent.ContextWithRetry, and the leaf is reset as
-// for a fresh child.
+// A second run under the same call goes where its context says. One
+// marked with agent.ContextWithRetry starts a new root in the existing
+// session, the leaf reset as for a fresh child: tools/agent marks
+// every run its Execute starts, since each builds a fresh agent whose
+// request is the new input alone, which holds nothing of the path the
+// leaf rebuilds, so a cut-off call run again rebuilds every response
+// and the first attempt's open call is not at the leaf (#87). One not
+// marked, a host prompting again the agent it kept through
+// agent.WithSpawn, continues the session from its leaf: a subagent
+// that is messaged again answers from its own context, so its run
+// belongs after the one before it, with the hashes that follow from
+// that.
 //
 // live says the child is written from its events, so the header
 // promises the record entries; a child replayed from its items
@@ -3052,11 +3397,27 @@ func (w *writer) differs(ctx context.Context, req openresponses.Request, tools b
 }
 
 // inheritEnv writes, in a child's session that holds no env entry, the
-// env in force for it, its parent's at this moment, so the child's
-// file names the workspace it starts in: a move it makes is then a
-// later env entry to every reader, and [Recorder.Env] compares with
-// the child's own entry rather than its parent's, which may move on.
+// env in force for it, so the child's file names the workspace it
+// starts in: a move it makes is then a later env entry to every
+// reader, and [Recorder.Env] compares with the child's own entry
+// rather than its parent's, which may move on. The host's function is
+// asked first, with the child's context, since a child given a sandbox
+// of its own never ran where its parent is: what it returns is the
+// child's first entry, with nothing to compare against. When it
+// returns nil, the child is where its parent is, and a copy of the env
+// in force in the parent's session at this moment is written instead.
 func (w *writer) inheritEnv(ctx context.Context) error {
+	env, err := w.rec.env(ctx)
+	if err != nil {
+		return fmt.Errorf("session: env: %w", err)
+	}
+	if env != nil {
+		if _, err := w.append(ctx, env); err != nil {
+			return err
+		}
+		w.env = env
+		return nil
+	}
 	have, err := w.rec.envInForce(ctx, w)
 	if err != nil || have == nil {
 		return err
@@ -3478,6 +3839,17 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 				// The loop refused it after an approval, finding no
 				// tool, and the output says why.
 				by, reason = agentsession.ByPolicy, outputText(out)
+			}
+			if origin := agentturn.OriginFromContext(ctx, out.CallID); origin != "" && origin == c.ranEntry && c.childOff != "" {
+				// The output repeats one a child session produced on
+				// the branch left, and the link to that child comes
+				// with it, so the path says whose work the output is.
+				// The link on the branch left does not count: this
+				// branch holds none.
+				if _, err := w.append(ctx, agentsession.NewSubsessionLink(c.childOff, out.CallID)); err != nil {
+					return err
+				}
+				w.linked[out.CallID] = true
 			}
 			dec := agentsession.NewDecision(out.CallID, c.entry, agentsession.VerdictAnswer, by)
 			if reason != "" {
@@ -4221,7 +4593,7 @@ func (w *writer) child(ctx context.Context, callID string, info agent.ChildInfo)
 		if running && cw.run != "" {
 			cw.detached = true
 		} else {
-			delete(r.runs, info.RunID)
+			r.release(info.RunID, cw)
 		}
 		return w.link(ctx, cw.id, callID)
 	}
