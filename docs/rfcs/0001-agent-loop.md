@@ -280,7 +280,10 @@ it raises and the hooks it calls; the events are defined
 
 1. **Cancellation.** If the run's context is cancelled, it ends with
    reason `aborted`.
-2. **Before the turn.** The before-turn hook MAY return items, which
+2. **Before the turn.** The before-turn hook sees the working
+   transcript and the turn's inputs so far, each item with its
+   **input mode**, how it arrived, as described under phase 5, and MAY
+   return items, which
    the loop appends to the transcript with their item events as it
    appends any input. They are then facts about the transcript: a
    recorded session rebuilds the request they were part of, which
@@ -300,7 +303,37 @@ it raises and the hooks it calls; the events are defined
 5. **`turn_start`** carries the request exactly as it will be sent and
    the **inputs** of the turn: the items appended since the previous
    turn's response, or since the run started for the first turn. They
-   are what this turn's response answers.
+   are what this turn's response answers. Beside them it carries the
+   same items as **arrived**, each with its **input mode**, which says
+   how the item came, and on a run's first turn also the items the
+   transcript already ended with when the run started that the model
+   did not produce, after its last output: a run that continues from
+   a transcript answers them first, and the inputs, which name only
+   what the run appended, never held them. The modes are:
+   - `prompt`: an item the run was prompted with;
+   - `resume`: an output or a note a resume appended, or one of the
+     leading outputs a prompt opened with for the pending calls;
+   - `steer`: an item drained from the steer queue;
+   - `follow_up`: an item drained from the follow-up queue;
+   - `deliver`: an item handed in by a [delivery](#queues), which
+     queues it as a steer; the mode is what tells the two apart;
+   - `hook`: an item the before-turn hook appended;
+   - `tool`: a function call output the loop appended for a call it
+     ran, the previous batch's or a resume's approved batch's, and the
+     note a decision attached after the batch's outputs;
+   - `continued`: an item already in the transcript, after its last
+     model output, when the run started: a function call output, a
+     user or developer message or a namespaced custom item, such as the
+     outputs of the run before, which a continue answers.
+   An item of mode `prompt` carries the run's trigger, and one of mode
+   `steer`, `follow_up` or `deliver` the trigger its `queued` report
+   carried; the others carry none. The before-turn hook of phase 2
+   sees the same list without the `hook` items, since it has not run
+   yet, so a layer that must act when a user's message arrives, or
+   once on the turn that answers a handoff, reads the mode rather than
+   inferring it from the transcript's tail, where a steer followed by
+   a delivered output looks like a resume and an answer delivered as a
+   message looks like the user's (#157).
 6. **The model call**, as the [model call section](#the-model-call)
    says: item events as the stream delivers output items, an attempt
    retried under the retry policy when it failed before it began, and
@@ -457,6 +490,26 @@ the transcript.
   A front that hands the caller the response's function calls to run
   holds them until the response completes, so a withheld response
   hands the caller none.
+- A function call is known, while it streams, by its item ID, and by
+  its output index when the event naming it carries none, so a stream
+  that opens a second call at the output index of the first still
+  gives each its own ID, and a call opened without an item ID and
+  completed with one keeps the ID it opened with. The response the
+  turn acts on, which `response_end` and `turn_end` carry and whose
+  function calls form the batch, holds the calls the transcript holds:
+  each function call of the completed response is paired with one the
+  attempt completed, taken in the order they opened, which is the
+  transcript's order, by item ID when both carry one, else by the call
+  ID the model gave it among the completed calls not yet paired, else
+  by order, and the completed call, with the ID the loop decided and
+  the arguments it completed with, stands in the response's place. A
+  function call the response lists that the stream never completed
+  keeps the ID decided at its output index, and an item that is not a
+  function call is left as the response gave it. A stream that opens
+  every call at one output index with no item IDs, as a text-call
+  parser's does, therefore runs each call under its own ID and answers
+  it with its own output, where pairing by index alone ran the last
+  call opened there for every call listed at that index (#210).
 - `response_end` carries the folded response, usage included, as soon
   as the stream ends and before any tool of the turn runs. A response
   that arrived with a failed status is delivered here too, before the
@@ -993,7 +1046,10 @@ A conforming loop holds these over every run, however it ends:
   the event naming it carries none, so a stream that opens a second
   call at the output index of the first still gives each its own ID,
   and a call opened without an item ID and completed with one keeps
-  the ID it opened with. The
+  the ID it opened with; the response the turn acts on holds the
+  completed calls, paired with the response's as the
+  [model call section](#the-model-call) says, so the batch never runs
+  a call under another's ID. The
   IDs a transcript held stay
   reserved when `SetTranscript` replaces it. A host that seeds the
   loop with less than a whole session, a context after a fold or a
@@ -1147,7 +1203,7 @@ provide a way to chain each, with the fold rule the table gives.
 
 | hook | when | sees | returns | an error | chain |
 | --- | --- | --- | --- | --- | --- |
-| before turn | turn phase 2 | the working transcript | items to append as facts | fails the run unless marked as a guard's, which stops it with cause `guard` | items appended in order; the first error drops them all |
+| before turn | turn phase 2 | the working transcript, and the turn's inputs so far with how each arrived, as phase 5 defines them, the hook's own items excepted | items to append as facts | fails the run unless marked as a guard's, which stops it with cause `guard` | items appended in order; the first error drops them all |
 | before model call | turn phase 4, last | the finished request | edits it in place | `model_blocked`, then the run fails; marked as a guard's, the run stops with cause `guard` | in order, each seeing what the last left; the first error stops |
 | output guard | as the stream completes an assistant message | the message | a replacement or none | fails the run unless marked as a guard's, which withholds the message and stops it with cause `guard` | in order, each seeing the last's replacement; the last stands; the first error stops |
 | decision (before tool call) | preflight, per call, model order; a nested call as a batch of one | the call, the tool, the arguments, the batch and index, and for a nested call its parent | a decision or none | fails the run; returned to the tool for a nested call | the strictest action wins, block over defer over allow; a block ends the chain, a defer does not; rewritten arguments pass to the hooks after; the first reason and decider of the standing action, the first note; terminate if any set it |
@@ -1155,6 +1211,16 @@ provide a way to chain each, with the fold rule the table gives.
 | should stop after turn | turn phase 10 | the response, the results, whether the turn was final, the transcript | stop or not; a guard error stops with cause `guard` | fails the run unless marked as a guard's | in order until one stops; the first error stops |
 | transform | request step 2 | a copy of the transcript | the input for this call | fails the run | — |
 | filter | request step 3 | the transformed list | what the model sees | — | — |
+
+The before-turn hook is where a layer acts on what arrived for the
+turn: a scope that ends when the user speaks again revokes on an input
+of mode `prompt`, `steer` or `continued` whose item is a user message,
+and not on one of mode `deliver`, which a background task's answer
+arrives by; a handoff receiver started on the sender's transcript acts
+once on the turn whose inputs hold the transfer's output as
+`continued`. The list is not the transcript's tail: a delivered output
+after a steered message reads as what it is, and so does an answer
+delivered as a message.
 
 The stop hook, the before-turn hook, the before-model-call hook and
 the output guard tell a policy stop from a failure by marking the error

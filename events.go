@@ -166,12 +166,20 @@ func (*RunStart) EventType() string { return EventRunStart }
 // turn: the tool outputs, the steered and queued messages, the items
 // BeforeTurn added. They are what this turn's response answers, so a
 // front that routes replies to the message that caused them reads them
-// here rather than counting item events between turns.
+// here rather than counting item events between turns. Arrived is the
+// same items with how each came, as [TurnStartInfo.Inputs] gives them
+// to BeforeTurn, plus the items that hook appended, as [InputHook],
+// and, on a run's first turn, the [InputContinued] items the
+// transcript already ended with when the run started, which Inputs
+// does not include: Inputs keeps its definition, so a consumer that
+// counted on it is unchanged, and a consumer that needs what a
+// Continue answers reads Arrived.
 type TurnStart struct {
 	RunID   string
 	Turn    int
 	Request openresponses.Request
 	Inputs  openresponses.Items
+	Arrived []TurnInput
 }
 
 // EventType returns "turn_start".
