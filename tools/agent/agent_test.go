@@ -652,3 +652,32 @@ func (speaksTwice) CreateStream(_ context.Context, req openresponses.Request, si
 	}
 	return em.Complete()
 }
+
+// TestChildRunCarriesNoParentAnswers checks that a child run does not
+// inherit what the parent's resume put on its context about the
+// parent's answers, who decided them, why and where their outputs were
+// taken from: a child's call under the same ID is another call, and a
+// recorder of the child's run would otherwise write the parent's facts
+// on it.
+func TestChildRunCarriesNoParentAnswers(t *testing.T) {
+	var decider, reason, origin string
+	child := New(agentturn.Config{Name: "helper", Model: &echo.Adapter{}}, WithSpawn(func(_ string, a *agentturn.Agent) {
+		a.Subscribe(func(ctx context.Context, ev agentturn.Event) error {
+			if _, ok := ev.(*agentturn.RunStart); ok {
+				decider = agentturn.DeciderFromContext(ctx, "call_1")
+				reason = agentturn.ReasonFromContext(ctx, "call_1")
+				origin = agentturn.OriginFromContext(ctx, "call_1")
+			}
+			return nil
+		})
+	}))
+	ctx := agentturn.ContextWithDeciders(context.Background(), map[string]string{"call_1": "human"})
+	ctx = agentturn.ContextWithReasons(ctx, map[string]string{"call_1": "not run again"})
+	ctx = agentturn.ContextWithOrigins(ctx, map[string]string{"call_1": "entry 42"})
+	if _, err := child.Execute(ctx, agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"go"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if decider != "" || reason != "" || origin != "" {
+		t.Errorf("the child's run start saw decider %q, reason %q, origin %q", decider, reason, origin)
+	}
+}

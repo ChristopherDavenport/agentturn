@@ -214,6 +214,7 @@ type steeredKey struct{}
 type triggerKey struct{}
 type decidersKey struct{}
 type reasonsKey struct{}
+type originsKey struct{}
 type reservedKey struct{}
 
 // ContextWithTrigger attaches a [Trigger] to ctx. A run started with
@@ -315,6 +316,34 @@ func ContextWithReasons(ctx context.Context, reasons map[string]string) context.
 func ReasonFromContext(ctx context.Context, callID string) string {
 	reasons, _ := ctx.Value(reasonsKey{}).(map[string]string)
 	return reasons[callID]
+}
+
+// ContextWithOrigins attaches where the output answering each pending
+// call was taken from, by call ID, as [ContextWithReasons] attaches
+// why, in place of any an outer context attached; an empty map clears
+// them. [Agent.Resume] does it from the [Answer.Origin] of the answers
+// it was given as outputs, so a subscriber writing the record of an
+// output a record held rather than one produced now can tie it to the
+// entry it repeats. The loop reads nothing from it.
+func ContextWithOrigins(ctx context.Context, origins map[string]string) context.Context {
+	if len(origins) == 0 {
+		if ctx.Value(originsKey{}) == nil {
+			return ctx
+		}
+		return context.WithValue(ctx, originsKey{}, map[string]string(nil))
+	}
+	out := make(map[string]string, len(origins))
+	for k, v := range origins {
+		out[k] = v
+	}
+	return context.WithValue(ctx, originsKey{}, out)
+}
+
+// OriginFromContext returns where the caller said the output answering
+// callID was taken from, or "" when it said nothing.
+func OriginFromContext(ctx context.Context, callID string) string {
+	origins, _ := ctx.Value(originsKey{}).(map[string]string)
+	return origins[callID]
 }
 
 // ContextWithTranscript attaches a transcript to ctx. The loop does this

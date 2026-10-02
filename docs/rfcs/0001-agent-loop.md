@@ -721,8 +721,11 @@ An **answer** names one pending call and is one of:
 
 An answer MAY carry a **note**, what the person said when answering,
 **who decided** it in the session format's terms (`human`, `policy`,
-`agent`) and **why**, which for an output answering an ambiguous call
-says why it was not run again. There is no default decider: a policy engine
+`agent`), **why**, which for an output answering an ambiguous call
+says why it was not run again, and, for an output taken from a record
+rather than produced now, **where it was taken from**, in the terms of
+the library that read it, so a recorder can tie the output it writes
+to the one it repeats. There is no default decider: a policy engine
 answers as often as a person does, so an answer that names nobody is
 recorded as an anonymous decision rather than guessed at. An answer MAY
 ask the run to **terminate** once every answer is in, for a refusal
@@ -1371,9 +1374,10 @@ run, and on a fork whose base is inside it, with `interrupted` and a
 queued again after its end. The loop is not involved: a run it is
 running is never open to anyone else.
 
-Two facts the record needs are supplied by the caller and carried by
-the loop unread: the trigger of a run, and who decided an answer and
-why. The loop learns nothing from either.
+Three facts the record needs are supplied by the caller and carried by
+the loop unread: the trigger of a run, who decided an answer and why,
+and where an answer's output was taken from when a record held it. The
+loop learns nothing from any of them.
 
 ## Bindings
 

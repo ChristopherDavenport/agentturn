@@ -446,10 +446,11 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	// The parent's trigger names what started the parent's run; the
 	// child's run was started by the call, which the child's link
 	// names, so it carries none unless WithRunContext gives it one.
-	// Who answered the parent's pending calls and why are the
-	// parent's too: a child's call under the same ID is another call.
+	// Who answered the parent's pending calls, why, and where their
+	// outputs were taken from are the parent's too: a child's call
+	// under the same ID is another call.
 	ctx = agentturn.ContextWithTrigger(ctx, agentturn.Trigger{})
-	ctx = agentturn.ContextWithReasons(agentturn.ContextWithDeciders(ctx, nil), nil)
+	ctx = agentturn.ContextWithOrigins(agentturn.ContextWithReasons(agentturn.ContextWithDeciders(ctx, nil), nil), nil)
 	if a.opts.runCtx != nil {
 		ctx = a.opts.runCtx(ctx, call.ID)
 	}
