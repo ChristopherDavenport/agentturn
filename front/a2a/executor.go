@@ -111,6 +111,13 @@ func WithCallerTools(tools ...*openresponses.FunctionTool) Option {
 //		}
 //		return session.ContextWithSessionID(ctx, rec.SessionID()), rec.Attach(a), nil
 //	})
+//
+// The returned context is the only one the configuration's hooks see.
+// A host whose hooks record verdicts of their own, a kit built on this
+// agent, puts its recorder on that context as well, with the kit's
+// ContextWithRecorder, since the session ID alone records the agent's
+// run and nothing the hooks decide: without it those verdicts are
+// written nowhere and a restart restores none of them.
 type RecorderFor func(ctx context.Context, contextID string, a *agentturn.Agent) (context.Context, func(), error)
 
 // WithRecorderFor records every conversation the executor serves
