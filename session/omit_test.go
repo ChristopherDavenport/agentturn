@@ -134,6 +134,12 @@ func TestModelSwitchKeepsEveryResponseVerifiable(t *testing.T) {
 			sent: []string{"", "a#1", "", "b#3"}, omits: 1},
 		{name: "a switch and back", before: []step{{"a", false}, {"b", false}, {"a", false}},
 			sent: []string{"", "a#1", "", "b#3", "a#1,a#2", "a#1,a#2,a#5"}, omits: 1},
+		// Clearing the model is a replace, which discards the omit with
+		// the rest of the settings, so it carries the rule again.
+		{name: "a replace in between", before: []step{{"a", false}, {"b", false}, {"", false}, {"b", false}},
+			// A request under no model leaves out nothing, and what no
+			// model produced is sent to every model.
+			sent: []string{"", "a#1", "", "b#3", "a#1,a#2,b#3,b#4", "a#1,a#2,b#3,b#4,#5", "b#3,b#4,#5,#6", "b#3,b#4,#5,#6,b#7"}, omits: 2},
 		{name: "plan to act", before: []step{{"plan", false}, {"act", true}},
 			sent: []string{"", "plan#1", "", "act#3"}, omits: 1},
 		{name: "a switch after a restart", before: []step{{"a", false}}, after: []step{{"b", false}, {"b", false}},
