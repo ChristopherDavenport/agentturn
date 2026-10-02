@@ -535,8 +535,11 @@ should not have to alias one of them.
   items, responses and folds as they happen (issue #24). A child that
   was not observed is written from `ChildInfo.Items`, items only. A
   second run under one call opens a new root in the child's session
-  when `tools/agent` started it, since its `Execute` builds a fresh
-  agent per call and marks the run with `ContextWithRetry`; a run the
+  when `tools/agent` started it and the child was observed, since its
+  `Execute` builds a fresh agent per call and marks the run with
+  `ContextWithRetry`, which the observer's context carries; a child
+  written from `ChildInfo.Items` alone is written under the parent's
+  unmarked context and still appends at the leaf; a run the
   host starts on an agent it kept through `WithSpawn` continues the
   session at its leaf, since that agent holds its context (issue #87).
 - On a fold reported by `compact.WithOnFold` through `Recorder.Fold`,

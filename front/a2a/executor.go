@@ -764,7 +764,10 @@ func (e *Executor) runConfig(cfg agentturn.Config, caller []*openresponses.Funct
 			}
 		}
 		if _, ok := info.Tool.(*callerTool); !ok {
-			if decision == nil || decision.Action != agentturn.Defer || info.Parent != "" {
+			if decision == nil || decision.Action != agentturn.Defer || info.Parent != "" || info.Tool == nil {
+				// A nested call is the loop's to ask about, and a call
+				// to a name no tool has is refused by the loop whatever
+				// the decision, so nobody is asked about it.
 				return decision, nil
 			}
 			return askHeld(ctx, info, decision, elicitor), nil

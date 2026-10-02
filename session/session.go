@@ -1424,6 +1424,9 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 			p.Reason = agentturn.PendingAnswered
 		case agentsession.CallRejected:
 			p.Reason = agentturn.PendingRejected
+			if p.Refused, err = refusal(s, c.Call.CallID); err != nil {
+				return nil, nil, err
+			}
 		case agentsession.CallNeverStarted:
 			p.Reason = agentturn.PendingUndispatched
 		}
@@ -1702,14 +1705,15 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // recorder writes either answer as an answer decision before the
 // output. Either answer names the entry of the output it repeats as
 // its Origin, which the loop carries unread to the run's context, and
-// the recorder, finding that the branch holding that entry links the
-// call to a child session, a tools/agent child's, writes the same
-// subsession link for the call on the new branch before the answer, so
-// the record ties the output to the child session that produced it
-// rather than to nothing; in a fork, the linked child's header names
-// the origin session as its parent, not this one, so a reader that
-// derives the child's ID from this session and the call does not find
-// it and follows the link instead. A call an answer ended before its output was written gets
+// the recorder, finding that the branch of this session holding that
+// entry links the call to a child session, a tools/agent child's,
+// writes the same subsession link for the call on the new branch
+// before the answer, so the record ties the output to the child
+// session that produced it rather than to nothing. In a fork no link
+// is written, since a subsession link names a child of the session
+// that writes it and the child is the origin's: the fork's record
+// reaches that child through the origin's link in its prefix, and the
+// answer's Origin names the output it repeats. A call an answer ended before its output was written gets
 // [agentturn.OutcomeUnknown] as that output, since the record holds
 // the answer and not the output it gave. A held call is waiting for
 // someone and is the caller's to answer, a call held after its
@@ -1739,11 +1743,7 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 		case agentturn.PendingAnswered:
 			ans = agentturn.OutcomeUnknown(id)
 		case agentturn.PendingRejected:
-			reason, err := refusal(s, id)
-			if err != nil {
-				return nil, err
-			}
-			ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Output: openresponses.FunctionCallOutputData{Text: reason}})
+			ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Output: openresponses.FunctionCallOutputData{Text: p.Refused}})
 		default:
 			if p.Ran != nil {
 				// The call ran on the branch its dispatch is on, and the
@@ -2667,7 +2667,10 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 				return err
 			}
 			if off = d != nil; off {
-				if _, ranEntry = outputAfter(at, d, c.Entry.ID); ranEntry != "" {
+				if _, ranEntry = outputAfter(at, d, c.Entry.ID); ranEntry != "" && at == s {
+					// A link names a child of this session, so only a
+					// branch of this session can lend one; a fork's
+					// origin holds its own link, in the fork's prefix.
 					childOff = subsessionOn(at, ranEntry, c.ID())
 				}
 			}

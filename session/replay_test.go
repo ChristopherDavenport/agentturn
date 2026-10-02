@@ -435,6 +435,11 @@ func TestResumeHeldAndAnsweredCalls(t *testing.T) {
 			if p := pending[0]; p.Reason == agentturn.PendingDeferred && (!p.Dispatched || p.IdempotencyKey != "k1" || !p.MayHaveRun()) {
 				t.Errorf("a hold after a dispatch = %+v", p)
 			}
+			// A rejected call carries the reject's reason, the output
+			// it is owed (agentpolicy#53).
+			if p := pending[0]; (p.Reason == agentturn.PendingRejected) != (p.Refused == "denied by rm") {
+				t.Errorf("refused = %q for %s", p.Refused, p.Reason)
+			}
 			opts, err := AgentOptions(s2)
 			if err != nil {
 				t.Fatal(err)
@@ -1052,9 +1057,9 @@ func TestForkReadsItsOrigin(t *testing.T) {
 		{name: "cut, keyed, runs again under its key", origins: true, want: agentturn.PendingAborted, wantKey: "k1", runs: 1,
 			wantReason: agentturn.RunAgainKeyedReason, wantRecord: []string{"proceed", "dispatch", "output"}},
 		{name: "completed, answered with its output", origins: true, completed: true, want: agentturn.PendingAborted, wantKey: "k1",
-			wantReason: ranInOriginReason, wantRecord: []string{"link", "answer", "output"}},
+			wantReason: ranInOriginReason, wantRecord: []string{"answer", "output"}},
 		{name: "completed, a fork of a fork", origins: true, completed: true, chain: true, want: agentturn.PendingAborted, wantKey: "k1",
-			wantReason: ranInOriginReason, wantRecord: []string{"link", "answer", "output"}},
+			wantReason: ranInOriginReason, wantRecord: []string{"answer", "output"}},
 		{name: "held, answered by a person", origins: true, held: true, completed: true, want: agentturn.PendingDeferred, wantKey: "k1",
 			answer: func(id string) agentturn.Answer {
 				return agentturn.OutcomeUnknown(id).WithBy(agentsession.ByHuman).WithReason("not sent again")
@@ -1100,7 +1105,10 @@ func TestForkReadsItsOrigin(t *testing.T) {
 			if tc.completed {
 				// The call's work was a child session's (#206): the
 				// origin links it, and a fork that repeats the output
-				// links the same child.
+				// writes no link of its own, since the child is the
+				// origin's and a link names a child of its writer; the
+				// fork reaches it through the origin's link in its
+				// prefix (agentsession#186's verifier checks the pair).
 				after = append(after, agentsession.NewSubsessionLink("child-of-call-1", call.CallID))
 				after = append(after, &agentsession.ItemEntry{Item: openresponses.NewFunctionCallOutput(call.CallID, "charged")})
 			}

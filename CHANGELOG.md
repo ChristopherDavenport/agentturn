@@ -36,9 +36,13 @@ versions may break the API.
   other's output and said nothing. Each function call of the completed
   response is now paired with the one the attempt completed, by item
   ID when both carry one, else by the model's call ID, else by order,
-  and the completed call stands in its place; `response_end` and
-  `turn_end` carry it, so the items they carry are the transcript's
-  own and read-only (#210).
+  and the completed call stands in its place; a completed call the
+  response leaves out, as a terminal response built one item per output
+  index does, makes the response's calls give way to the completed ones
+  in the order they opened, so every call the transcript holds is run
+  and answered where it was left dangling before. `response_end` and
+  `turn_end` carry the result, so the items they carry are the
+  transcript's own and read-only (#210).
 - **`compact.WithBackOff(false)` turns the back-off after a failed fold
   off.** A recording made across a restart before v0.0.15, or by a
   host that resumed without `session.CompactOptions`, asked again about
@@ -129,8 +133,11 @@ versions may break the API.
   with `ContextWithOrigins` and read with `OriginFromContext` as
   reasons are; `ReplayAnswers` sets it to the entry of the output it
   repeats, and the recorder writes the same subsession `link` for the
-  call on the new branch before the answer. `tools/agent` clears it for
-  a child's context as it clears reasons and deciders (#206).
+  call on the new branch before the answer when the branch is this
+  session's; in a fork no link is written, since the child is the
+  origin's and the fork reaches it through the origin's link in its
+  prefix. `tools/agent` clears it for a child's context as it clears
+  reasons and deciders (#206).
 - **A second `tools/agent` execution under one call ID opens a new
   root in the child's session.** `Execute` builds a fresh child per
   call whose request is the new input alone, while the recorder
@@ -139,9 +146,14 @@ versions may break the API.
   stayed at the leaf; the realistic case is `Agent.Resume` running a
   cut-off call again after an Esc. `Execute` now marks every run it
   starts with `ContextWithRetry`, so the recorder opens a new root,
-  every response verifies and the leaf owes nothing. A host prompting
-  again the agent it kept through `WithSpawn` still continues at the
-  leaf, since that agent holds its context (#87).
+  every response verifies and the leaf owes nothing. This changes the
+  record beyond the filing: a second execution under one call opens a
+  new root even when both runs complete, where the session package's
+  doc promised a continuation at the leaf; only an observed child is
+  affected, since a child written from `ChildInfo.Items` runs under the
+  parent's unmarked context. A host prompting again the agent it kept
+  through `WithSpawn` still continues at the leaf, since that agent
+  holds its context (#87).
 - **`PendingCall.Ran` and `RanWhere` carry the output a call has where
   it ran off the path.** The session package answered a call that
   completed on a branch a rebase left, or in the session a fork was
@@ -150,7 +162,12 @@ versions may break the API.
   host reading those told the model the call may have run. `Pending`
   and `AgentOptions` now fill both, `ReplayAnswers` reads them, and the
   loop carries them onto the pending list of a run that leaves the
-  call pending, where it dropped them before (agentpolicy#63).
+  call pending, where it dropped them before. `PendingCall.Refused`
+  carries, for a call pending as `PendingRejected`, the reason the
+  reject decision gave, which `Pending` reads from the record and
+  `ReplayAnswers` gives as the owed output, so a host answering such a
+  call itself writes the record's refusal rather than fixed text
+  (agentpolicy#63, agentpolicy#53).
 - **`Recorder.CompactOptions` seeds a compact transform from the
   recorder.** `session.CompactOptions(s)` needs the session, which a
   host handed only the recorder does not hold, so it asked the failed
