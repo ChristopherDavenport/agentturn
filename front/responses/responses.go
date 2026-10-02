@@ -566,7 +566,7 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 		acc.Add(ev)
 		switch e := ev.(type) {
 		case *openresponses.OutputItemAddedEvent:
-			item := acc.Response().Output[e.OutputIndex]
+			item, _ := acc.ItemAt(e.OutputIndex)
 			if _, ok := item.(*openresponses.FunctionCall); ok && held == nil {
 				held = []func() error{}
 			}
@@ -579,7 +579,11 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 				// The guard sees the message before the caller does, as
 				// the loop's own turns have it.
 				out := acc.Response()
-				replacement, err := cfg.OutputGuard(ctx, agentturn.OutputInfo{Turn: 1, ResponseID: out.ID, Message: m, Output: append(openresponses.Items(nil), out.Output[:e.OutputIndex]...)})
+				// The items before the message, where the accumulator
+				// holds it: its output index, unless a stream reused
+				// an index before it.
+				at, _ := acc.Position(e.OutputIndex)
+				replacement, err := cfg.OutputGuard(ctx, agentturn.OutputInfo{Turn: 1, ResponseID: out.ID, Message: m, Output: append(openresponses.Items(nil), out.Output[:at]...)})
 				if err != nil {
 					if errors.Is(err, agentturn.ErrGuard) {
 						// Withheld and refused, as a full run's guard

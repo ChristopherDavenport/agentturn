@@ -560,3 +560,178 @@ func TestRequestMembersReachModelInBothModes(t *testing.T) {
 		t.Error("template metadata mutated by the hook")
 	}
 }
+
+// reusedIndex is a model that streams its calls to upper the way
+// Ollama 0.23 does: every call at output_index 0, each opened and
+// closed in turn, while the response it completes with lists them at
+// their own positions. The events are written out, not made through
+// an emitter, which numbers the items itself, and are kept for the
+// test to check against the lifecycle with the reuse allowed. With
+// noID the items carry no item ID.
+type reusedIndex struct {
+	calls []string
+	// say ends the first stream with a message holding it, at the same
+	// index, after the calls.
+	say  string
+	noID bool
+	// tool is the function the calls name, upper when it is empty.
+	tool string
+	// streams are the events of each call to the model.
+	streams [][]openresponses.StreamEvent
+}
+
+func (m *reusedIndex) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	resp := openresponses.NewResponse(req)
+	tool := m.tool
+	if tool == "" {
+		tool = "upper"
+	}
+	var seq int64
+	m.streams = append(m.streams, nil)
+	send := func(ev openresponses.StreamEvent) error {
+		n := seq
+		seq++
+		switch e := ev.(type) {
+		case *openresponses.ResponseCreatedEvent:
+			e.SequenceNumber = n
+		case *openresponses.ResponseInProgressEvent:
+			e.SequenceNumber = n
+		case *openresponses.OutputItemAddedEvent:
+			e.SequenceNumber = n
+		case *openresponses.FunctionCallArgumentsDeltaEvent:
+			e.SequenceNumber = n
+		case *openresponses.FunctionCallArgumentsDoneEvent:
+			e.SequenceNumber = n
+		case *openresponses.OutputItemDoneEvent:
+			e.SequenceNumber = n
+		case *openresponses.ResponseCompletedEvent:
+			e.SequenceNumber = n
+		}
+		m.streams[len(m.streams)-1] = append(m.streams[len(m.streams)-1], ev)
+		return sink.Send(ev)
+	}
+	if err := send(&openresponses.ResponseCreatedEvent{Response: resp}); err != nil {
+		return err
+	}
+	if err := send(&openresponses.ResponseInProgressEvent{Response: resp}); err != nil {
+		return err
+	}
+	var listed openresponses.Items
+	if _, ok := req.Input[len(req.Input)-1].(*openresponses.FunctionCallOutput); ok {
+		msg := &openresponses.Message{ID: "msg_done", Role: openresponses.RoleAssistant, Status: openresponses.StatusCompleted, Content: openresponses.Contents{&openresponses.OutputText{Text: "done"}}}
+		listed = openresponses.Items{msg}
+		if err := send(&openresponses.OutputItemAddedEvent{OutputIndex: 0, Item: msg}); err != nil {
+			return err
+		}
+		if err := send(&openresponses.OutputItemDoneEvent{OutputIndex: 0, Item: msg}); err != nil {
+			return err
+		}
+	} else {
+		for i, id := range m.calls {
+			itemID := fmt.Sprintf("fc_%d", i)
+			if m.noID {
+				itemID = ""
+			}
+			args := fmt.Sprintf(`{"text":"t%d"}`, i)
+			open := &openresponses.FunctionCall{ID: itemID, CallID: id, Name: tool, Status: openresponses.StatusInProgress}
+			full := &openresponses.FunctionCall{ID: itemID, CallID: id, Name: tool, Arguments: args, Status: openresponses.StatusCompleted}
+			listed = append(listed, full)
+			for _, ev := range []openresponses.StreamEvent{
+				&openresponses.OutputItemAddedEvent{OutputIndex: 0, Item: open},
+				&openresponses.FunctionCallArgumentsDeltaEvent{ItemID: itemID, OutputIndex: 0, Delta: args},
+				&openresponses.FunctionCallArgumentsDoneEvent{ItemID: itemID, OutputIndex: 0, Arguments: args},
+				&openresponses.OutputItemDoneEvent{OutputIndex: 0, Item: full},
+			} {
+				if err := send(ev); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if m.say != "" && len(m.streams) == 1 {
+		msg := &openresponses.Message{ID: "msg_say", Role: openresponses.RoleAssistant, Status: openresponses.StatusCompleted, Content: openresponses.Contents{&openresponses.OutputText{Text: m.say}}}
+		listed = append(listed, msg)
+		for _, ev := range []openresponses.StreamEvent{
+			&openresponses.OutputItemAddedEvent{OutputIndex: 0, Item: &openresponses.Message{ID: msg.ID, Role: msg.Role, Status: openresponses.StatusInProgress}},
+			&openresponses.OutputItemDoneEvent{OutputIndex: 0, Item: msg},
+		} {
+			if err := send(ev); err != nil {
+				return err
+			}
+		}
+	}
+	resp.Status = openresponses.ResponseStatusCompleted
+	resp.Output = listed
+	return send(&openresponses.ResponseCompletedEvent{Response: resp})
+}
+
+// TestRelayCarriesEveryCallOfAReusedIndex pins that a model that
+// streams all its calls at output_index 0 has each reach the caller as
+// the call it is, with its own arguments, where the accumulator's
+// Output[0] held only the first of them once it kept every item: the
+// calls the front relays are the ones the transcript holds, run and
+// answered each once. The model's own stream is checked first, against
+// the lifecycle with the reuse allowed, so the test streams what a
+// provider does and not what the validator happens to accept.
+func TestRelayCarriesEveryCallOfAReusedIndex(t *testing.T) {
+	for _, noID := range []bool{false, true} {
+		t.Run(fmt.Sprintf("no item IDs %t", noID), func(t *testing.T) {
+			m := &reusedIndex{calls: []string{"call_a", "call_b"}, noID: noID}
+			a := New(agentturn.Config{Model: m, ModelName: "m", Tools: []agenttool.Tool{upper}}, WithToolItems())
+			sink, err := streamtest.Run(context.Background(), a, request(openresponses.UserText("x")))
+			if err != nil {
+				t.Fatalf("the front's stream: %v", err)
+			}
+			if len(m.streams) != 2 {
+				t.Fatalf("model called %d times, want 2", len(m.streams))
+			}
+			if err := streamtest.Validate(m.streams[0], streamtest.WithOutputIndexReuse()); err != nil {
+				t.Fatalf("the model's stream is not the reused-index lifecycle: %v", err)
+			}
+			if streamtest.Validate(m.streams[0]) == nil {
+				t.Fatal("the model's stream reuses no index")
+			}
+			resp := sink.Response()
+			if got := itemTypes(resp.Output); got != "function_call function_call function_call_output function_call_output assistant" {
+				t.Fatalf("output = %q", got)
+			}
+			for i, want := range []struct{ id, args, out string }{{"call_a", `{"text":"t0"}`, "T0"}, {"call_b", `{"text":"t1"}`, "T1"}} {
+				call := resp.Output[i].(*openresponses.FunctionCall)
+				out := resp.Output[2+i].(*openresponses.FunctionCallOutput)
+				if call.CallID != want.id || call.Arguments != want.args || out.CallID != want.id || out.Output.String() != want.out {
+					t.Errorf("call %d: %s %s answered %s with %q, want %+v", i, call.CallID, call.Arguments, out.CallID, out.Output.String(), want)
+				}
+			}
+		})
+	}
+}
+
+// TestGuardSeesTheItemsBeforeAMessageAtAReusedIndex pins that the
+// items an OutputGuard is given ahead of a message are the ones the
+// stream opened before it, whatever output index each was at: a
+// message opened at an index the calls before it reused has both calls
+// ahead of it, not none.
+func TestGuardSeesTheItemsBeforeAMessageAtAReusedIndex(t *testing.T) {
+	m := &reusedIndex{calls: []string{"call_a", "call_b"}, say: "hello", tool: "lookup"}
+	var before []string
+	a := New(agentturn.Config{Model: m, ModelName: "m",
+		OutputGuard: func(_ context.Context, info agentturn.OutputInfo) (*openresponses.Message, error) {
+			for _, item := range info.Output {
+				if call, ok := item.(*openresponses.FunctionCall); ok {
+					before = append(before, call.CallID)
+				}
+			}
+			return nil, nil
+		}})
+	req := request(openresponses.UserText("x"))
+	req.Tools = openresponses.Tools{openresponses.NewFunctionTool("lookup", "caller owned", json.RawMessage(`{"type":"object"}`))}
+	if _, err := streamtest.Run(context.Background(), a, req); err != nil {
+		t.Fatal(err)
+	}
+	if err := streamtest.Validate(m.streams[0], streamtest.WithOutputIndexReuse()); err != nil {
+		t.Fatalf("the model's stream is not the reused-index lifecycle: %v", err)
+	}
+	if strings.Join(before, " ") != "call_a call_b" {
+		t.Errorf("the guard saw the calls %q ahead of the message, want call_a call_b", before)
+	}
+}

@@ -607,8 +607,8 @@ type runner struct {
 	decided   map[string]bool
 	// opened are the items of the attempt in flight in the order they
 	// opened, each with its output index and, once it is done, the item
-	// as completed, so the guard sees an earlier item a stream that
-	// reuses an index no longer holds there.
+	// as completed, so the guard sees an earlier item as the loop
+	// completed it, a replacement included.
 	opened []openedItem
 }
 
@@ -1372,7 +1372,7 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 	}
 	switch e := ev.(type) {
 	case *openresponses.OutputItemAddedEvent:
-		item := acc.Response().Output[e.OutputIndex]
+		item, _ := acc.ItemAt(e.OutputIndex)
 		r.opened = append(r.opened, openedItem{index: e.OutputIndex})
 		if call, ok := item.(*openresponses.FunctionCall); ok {
 			// The call's ID is decided as it opens, so its item_start,
@@ -1427,8 +1427,10 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 				switch {
 				case prior.done != nil:
 					before = append(before, prior.done)
-				case cur != nil && prior.index < len(cur.Output):
-					before = append(before, r.withCallID(cur.Output[prior.index], prior.index))
+				case cur != nil:
+					if open, ok := acc.ItemAt(prior.index); ok {
+						before = append(before, r.withCallID(open, prior.index))
+					}
 				}
 			}
 			replacement, err := r.cfg.OutputGuard(r.ctx, OutputInfo{RunID: r.runID, Turn: r.turn, ResponseID: responseID, Message: m, Output: before})
@@ -1458,7 +1460,8 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 		return false, &wireError{err: e.Err()}
 	}
 	if idx, ok := outputIndex(ev); ok {
-		return false, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: r.withCallID(acc.Response().Output[idx], idx), Stream: ev, ResponseID: responseID})
+		item, _ := acc.ItemAt(idx)
+		return false, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: r.withCallID(item, idx), Stream: ev, ResponseID: responseID})
 	}
 	return false, nil
 }
@@ -1969,11 +1972,14 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 		byID[p.call.CallID] = p
 	}
 	exec := r.executor(func(job agenttool.Job) *callState { return byID[job.Call.ID] })
-	for i, before := range chainBefore(exec, jobs) {
-		if before >= 0 {
-			prev := batch[jobIndex[before]]
+	// A call waits for the one before it in its chain, as the executor
+	// orders them: the same Executor value that runs the batch below
+	// says which that is, so the two cannot disagree (agenttool#66).
+	for _, chain := range exec.Chains(jobs) {
+		for k := 1; k < len(chain); k++ {
+			prev := batch[jobIndex[chain[k-1]]]
 			prev.done = make(chan struct{})
-			batch[jobIndex[i]].after = prev
+			batch[jobIndex[chain[k]]].after = prev
 		}
 	}
 	// The batch has a context of its own, so a failure can stop the
@@ -2148,35 +2154,6 @@ func (r *runner) executor(find func(agenttool.Job) *callState) agenttool.Executo
 			return err
 		},
 	}
-}
-
-// chainBefore returns, for each job, the index of the job before it in
-// its chain, or -1 for the first: every job of a serial batch follows
-// the one before it, and otherwise a job follows the last one naming
-// its resource. It is how exec orders a batch.
-func chainBefore(exec agenttool.Executor, jobs []agenttool.Job) []int {
-	serial := exec.Sequential || exec.MaxParallel == 1
-	for _, job := range jobs {
-		serial = serial || (job.Tool != nil && agenttool.IsSequential(job.Tool))
-	}
-	before := make([]int, len(jobs))
-	last := map[string]int{}
-	for i, job := range jobs {
-		before[i] = -1
-		if serial {
-			before[i] = i - 1
-			continue
-		}
-		if job.Tool == nil || agenttool.ResourceOf(job.Tool) == "" {
-			continue
-		}
-		res := agenttool.ResourceOf(job.Tool)
-		if at, ok := last[res]; ok {
-			before[i] = at
-		}
-		last[res] = i
-	}
-	return before
 }
 
 // collect appends the outputs in the model's order, then the notes the

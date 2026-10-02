@@ -7,6 +7,11 @@ versions may break the API.
 
 ## Unreleased
 
+- **Requires `openresponses` v0.0.14, up from v0.0.12, `agenttool`
+  v0.0.15, up from v0.0.14, and `agentsession` v0.0.20, up from
+  v0.0.19.** openresponses v0.0.14 adds the `Accumulator.Position` and
+  `ItemAt` the loop and the Responses front now read; agentsession
+  v0.0.20 is format 0.11, which the recorder now writes.
 - **A call to the agent's own tool that its hook held is never handed
   to the A2A caller.** `front/a2a` listed a `Defer` of a call to one of
   the agent's own tools to the caller as input-required and took the
@@ -188,6 +193,57 @@ versions may break the API.
   between runs (#96). `front/a2a.WithRecorderFor`'s doc says a host
   whose hooks record verdicts of their own puts its recorder on the
   run's context beside the session ID (agentkit#74).
+- **The loop asks the executor which call a call follows.** The loop
+  kept a copy of the grouping `agenttool.Executor` runs a batch in, to
+  have each call's dispatch wait for the one before it in its chain,
+  and a test that pinned the copy; it now reads `Executor.Chains` with
+  the executor that runs the batch, so the two cannot drift
+  (agenttool#66).
+- **Changed: `session` reads a call's origin dispatches through
+  `agentsession.OriginDispatches`, and `Pending` can now fail on a
+  chain of forks.** The walk up a fork's origins and its cache of the
+  sessions read are gone; the depth bound is agentsession's
+  `MaxOriginDepth`, still 64. A `parent_session` cycle, or a chain of
+  more than 64 forks, is now an error from `Pending`, `AgentOptions`
+  and `ReplayAnswers` with the origins, wrapping
+  `agentsession.ErrOriginChain`, where it was silently taken as no
+  dispatch found after 64; a recorder seeding itself still takes it,
+  and an origin it cannot read, as none found. Each call in a fork's
+  prefix reads its origins again rather than sharing one read.
+- **A stream that reuses an output index still reaches the loop and
+  the Responses front call by call, under openresponses v0.0.14.**
+  The `Accumulator` of v0.0.13 keeps every item of a stream that
+  reuses an index, appended behind the others, so a position in its
+  `Output` is no longer an output index, and the loop's `item_start`,
+  `item_update` and `OutputGuard` prefix read the first call at index
+  0 for every call opened there, undoing #198 and #210. The loop and
+  `front/responses` now ask the accumulator which item an index names,
+  with `ItemAt` and `Position`, which v0.0.14 adds; the front hands an
+  `OutputGuard` the items opened before a message, not those at the
+  indexes below the message's.
+- **A model switch, a Plan-to-Act switch or a handoff across models no
+  longer leaves the rest of the session's responses unhashed
+  (agentsession format 0.11).** The loop leaves the reasoning another
+  model produced out of a request, and the record had no way to say so:
+  every response after the switch was written without a `request_hash`
+  and an `agentturn:unhashed` entry, for as long as that reasoning was
+  on the path. The recorder now writes the omit setting,
+  `reasoning: other_models`, in the config entry that changes the model
+  when the context holds reasoning of another, and hashes each later
+  request against the context rebuilt under the rule, so the response
+  verifies and `Session.Verify` has nothing to report; a switch back is
+  covered by the same rule. `Transcript`, `TranscriptModels` and
+  `AgentOptions` still return every item the path holds, the omitted
+  reasoning included, so an agent resumed on a different model than the
+  leaf's keeps what that model may be sent. The `agentturn:unhashed`
+  entry stays for the causes the format cannot describe.
+- **A hand-back names what the path already holds.** An instruction part
+  whose text the path holds, in force or not, is written as its hash, and
+  a run of the omitted list an earlier config entry wrote is a keep
+  carrying `of`, naming that entry, as format 0.11 lets a writer do,
+  where each was repeated whole; the recorder keeps the histories the
+  helpers need, and starts them afresh after a compaction, as the
+  checkpoint does for a reader.
 
 ## v0.0.15 - 2026-10-01
 
