@@ -483,6 +483,63 @@ type TurnStartInfo struct {
 	// Transcript is the working transcript as the turn starts. It is the
 	// loop's live slice; do not mutate it or keep it past the hook.
 	Transcript Transcript
+	// Inputs are the items that joined the transcript for this turn, in
+	// transcript order, each with how it arrived: the items appended
+	// since the previous turn's response, or since the run started for
+	// the first turn, which then also holds, first, the [InputContinued]
+	// items the transcript already ended with when the run started. The
+	// items this hook returns are not among them, since the hook has
+	// not run yet; [TurnStart.Arrived] has them. A hook that must act
+	// when a user's message arrives, or once on the turn that answers a
+	// handoff, reads the mode here rather than inferring it from the
+	// transcript's tail, which a steer followed by a delivered output,
+	// or an output delivered as a message, gets wrong.
+	Inputs []TurnInput
+}
+
+// InputMode says how an item among a turn's inputs arrived.
+type InputMode string
+
+const (
+	// InputPrompt is an item the run was prompted with: [Agent.Prompt]'s
+	// items, or [Run]'s prompts.
+	InputPrompt InputMode = "prompt"
+	// InputResume is an output or a note an [Agent.Resume] appended, or
+	// one of the leading outputs a Prompt opened with for the pending
+	// calls.
+	InputResume InputMode = "resume"
+	// InputSteer is an item drained from the steer queue: [Agent.Steer],
+	// or [Agent.Queue] with [QueueSteer].
+	InputSteer InputMode = "steer"
+	// InputFollowUp is an item drained from the follow-up queue:
+	// [Agent.FollowUp], or [Agent.Queue] with [QueueFollowUp].
+	InputFollowUp InputMode = "follow_up"
+	// InputDeliver is an item handed in with [Agent.Deliver], which
+	// queues it as a steer; a hook tells the two apart here.
+	InputDeliver InputMode = "deliver"
+	// InputHook is an item [Config.BeforeTurn] appended.
+	InputHook InputMode = "hook"
+	// InputTool is a function_call_output the loop appended for a call
+	// it ran, the previous batch's or a Resume's approved batch's, and
+	// the note a decision attached after the batch's outputs.
+	InputTool InputMode = "tool"
+	// InputContinued is an item that was already in the transcript,
+	// after its last model output, when the run started: what an
+	// [Agent.Continue] answers, such as the outputs of the run before
+	// it. Function call outputs, user and developer messages and
+	// namespaced custom items count; anything the model produced ends
+	// the tail.
+	InputContinued InputMode = "continued"
+)
+
+// TurnInput is one item among a turn's inputs and how it arrived.
+type TurnInput struct {
+	Item openresponses.Item
+	Mode InputMode
+	// Trigger is the run's trigger for a prompt's item and the trigger
+	// its Queued report carried for a steered, followed-up or delivered
+	// item; zero otherwise.
+	Trigger Trigger
 }
 
 // OutputInfo describes an assistant message the stream has completed,

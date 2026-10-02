@@ -475,19 +475,20 @@ func (c Config) baseRequest(tools agenttool.Set) openresponses.Request {
 }
 
 // runner is one run of the loop. send delivers an event and returns an
-// error to abort the run; steer and followUp drain the queues when set.
+// error to abort the run; steer and followUp drain the queues when set,
+// each item with how it was queued and the trigger it was queued with.
 type runner struct {
 	cfg        Config
 	transcript Transcript
 	send       func(Event) error
-	steer      func() openresponses.Items
-	followUp   func() openresponses.Items
+	steer      func() []TurnInput
+	followUp   func() []TurnInput
 	// last drains both queues for a run that would otherwise end and,
 	// when they are empty, marks it past its last drain in the same
 	// step; closing marks it so when the run decides to stop, and
 	// reports whether anything is still queued. Both are nil for the
 	// low-level loop, which has no queues to deliver into.
-	last    func() openresponses.Items
+	last    func() []TurnInput
 	closing func() bool
 	// runID, when set before the run, is the ID the run takes, minted
 	// where the run was started so the agent names it from then on.
@@ -518,6 +519,12 @@ type runner struct {
 	// mark is the length of the transcript after the previous turn's
 	// response, so the next turn_start can name what was appended since.
 	mark int
+	// arrived is what joined the transcript since the previous turn's
+	// response, each item with how it came, for the next turn's
+	// BeforeTurn and turn_start; it opens with the items the transcript
+	// already ended with when the run started that the model did not
+	// produce, which the first turn answers.
+	arrived []TurnInput
 	// deferred holds the IDs of the calls a hook handed to the caller
 	// during this run, so the run end can say why they are pending,
 	// each with the arguments it was held with, which its decision may
@@ -671,6 +678,7 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 		r.runID = openresponses.NewID("run")
 	}
 	r.mark = len(r.transcript)
+	r.arrived = continuedInputs(r.transcript)
 	r.ctxReserved = reservedFromContext(ctx)
 	// Everything the run calls, transform, hooks, model and tools, can
 	// tell which run it serves.
@@ -811,20 +819,27 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 	if err := r.emit(&RunStart{RunID: r.runID, Source: r.source(prompts, approved), Trigger: trigger}); err != nil {
 		return err
 	}
-	// The outputs a resume opens with answer pending calls, and their
-	// decisions say who gave them, so the trigger rides only on what
-	// follows them: the notes the caller supplied.
+	// The outputs a prompt opens with answer pending calls, and arrive
+	// as a resume's whether Resume or Prompt brought them; what follows
+	// them is what the run was prompted with, or on a Resume the notes
+	// the caller supplied. On a Resume the decisions say who gave the
+	// outputs, so the trigger rides only on the notes; a Prompt's item
+	// events carry it on every item, as before.
 	answers := 0
-	for r.resuming && answers < len(prompts) {
-		if _, ok := prompts[answers].(*openresponses.FunctionCallOutput); !ok {
+	for _, item := range unhideAll(prompts) {
+		if _, ok := item.(*openresponses.FunctionCallOutput); !ok {
 			break
 		}
 		answers++
 	}
-	if err := r.appendItems(prompts[:answers]); err != nil {
+	onAnswers, rest, onRest := trigger, InputPrompt, trigger
+	if r.resuming {
+		onAnswers, rest, onRest = Trigger{}, InputResume, Trigger{}
+	}
+	if err := r.appendWith(prompts[:answers], InputResume, Trigger{}, onAnswers); err != nil {
 		return err
 	}
-	if err := r.appendInput(prompts[answers:], trigger); err != nil {
+	if err := r.appendWith(prompts[answers:], rest, onRest, trigger); err != nil {
 		return err
 	}
 	if len(approved) == 0 && !terminate {
@@ -833,7 +848,7 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 		// flight before its next one. A run that begins with approved
 		// calls drains after their batch, and a refusal leaves the
 		// queue for the run that follows it.
-		if err := r.appendItems(r.drain(r.steer)); err != nil {
+		if err := r.appendArrived(r.drain(r.steer)); err != nil {
 			return err
 		}
 	}
@@ -853,7 +868,7 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 		}
 		// What was steered in while the caller was deciding goes to the
 		// model with the answers, as after any batch.
-		if err := r.appendItems(r.drain(r.steer)); err != nil {
+		if err := r.appendArrived(r.drain(r.steer)); err != nil {
 			return err
 		}
 	}
@@ -866,14 +881,14 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 		}
 		r.turn++
 		if r.cfg.BeforeTurn != nil {
-			items, err := r.cfg.BeforeTurn(ctx, TurnStartInfo{RunID: r.runID, Turn: r.turn, Transcript: r.transcript})
+			items, err := r.cfg.BeforeTurn(ctx, TurnStartInfo{RunID: r.runID, Turn: r.turn, Transcript: r.transcript, Inputs: append([]TurnInput(nil), r.arrived...)})
 			if err != nil {
 				if errors.Is(err, ErrGuard) {
 					return stopped(StopGuard, err)
 				}
 				return fmt.Errorf("agentturn: before-turn hook: %w", err)
 			}
-			if err := r.appendItems(items); err != nil {
+			if err := r.appendItems(items, InputHook); err != nil {
 				return err
 			}
 		}
@@ -933,7 +948,7 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 			}
 			return nil
 		}
-		var queued openresponses.Items
+		var queued []TurnInput
 		if len(calls) > 0 {
 			queued = r.drain(r.steer)
 		} else {
@@ -942,13 +957,13 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 				return nil
 			}
 		}
-		if err := r.appendItems(queued); err != nil {
+		if err := r.appendArrived(queued); err != nil {
 			return err
 		}
 	}
 }
 
-func (r *runner) drain(q func() openresponses.Items) openresponses.Items {
+func (r *runner) drain(q func() []TurnInput) []TurnInput {
 	if q == nil {
 		return nil
 	}
@@ -966,11 +981,46 @@ func (r *runner) ending() bool {
 
 // drainLast drains the steered items and then the follow-ups for a run
 // that would otherwise end.
-func (r *runner) drainLast() openresponses.Items {
+func (r *runner) drainLast() []TurnInput {
 	if r.last != nil {
 		return r.last()
 	}
 	return append(r.drain(r.steer), r.drain(r.followUp)...)
+}
+
+// continuedInputs returns the items t ends with that the model did not
+// produce, after its last output, each as [InputContinued]: the
+// function call outputs, the user and developer messages and the
+// namespaced custom items a run started on t answers before anything
+// it appends. Any other item, an assistant message, a function call, a
+// reasoning item, ends the tail.
+func continuedInputs(t Transcript) []TurnInput {
+	start := len(t)
+	for start > 0 && !modelProduced(t[start-1]) {
+		start--
+	}
+	if start == len(t) {
+		return nil
+	}
+	out := make([]TurnInput, 0, len(t)-start)
+	for _, item := range t[start:] {
+		out = append(out, TurnInput{Item: item, Mode: InputContinued})
+	}
+	return out
+}
+
+// modelProduced reports whether item is one the model produces rather
+// than one a caller, a tool or the loop appended for it to answer.
+func modelProduced(item openresponses.Item) bool {
+	switch v := item.(type) {
+	case nil:
+		return true
+	case *openresponses.FunctionCallOutput:
+		return false
+	case *openresponses.Message:
+		return v.Role == openresponses.RoleAssistant
+	}
+	return !strings.Contains(item.ItemType(), ":")
 }
 
 // terminates says whether a batch's results end the run, and how: every
@@ -995,31 +1045,57 @@ func terminates(results []agenttool.Result) (StopCause, bool) {
 	return "", false
 }
 
-// appendItems adds items the loop did not stream (prompts, queued
-// messages, tool outputs) to the transcript with their item events. An
-// item the caller marked with [Hidden] is unwrapped here, so the
-// transcript and the request hold the item itself and only its events
-// say it is hidden.
-func (r *runner) appendItems(items openresponses.Items) error {
-	return r.appendInput(items, Trigger{})
+// appendItems adds items the loop itself appends, a hook's items, a
+// batch's outputs and notes, the outputs closing a withheld response,
+// to the transcript with their item events, each arriving as mode with
+// no trigger.
+func (r *runner) appendItems(items openresponses.Items, mode InputMode) error {
+	return r.appendWith(items, mode, Trigger{}, Trigger{})
 }
 
-// appendInput is appendItems for the items the run was prompted with,
-// whose item_end carries the run's trigger.
-func (r *runner) appendInput(items openresponses.Items, trigger Trigger) error {
+// appendWith appends items as arriving by mode: trigger is what the
+// next turn's inputs carry for each, and endTrigger what each item_end
+// carries, the run's for an item the run was prompted with. An item the
+// caller marked with [Hidden] is unwrapped here, so the transcript and
+// the request hold the item itself and only its events say it is
+// hidden.
+func (r *runner) appendWith(items openresponses.Items, mode InputMode, trigger, endTrigger Trigger) error {
 	for _, item := range items {
-		if item == nil {
-			continue
-		}
-		item, hidden := Unhide(item)
-		if err := r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden}); err != nil {
+		if err := r.appendOne(item, mode, trigger, endTrigger); err != nil {
 			return err
 		}
-		r.transcript = append(r.transcript, item)
-		r.added = append(r.added, item)
-		if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden, Trigger: trigger}); err != nil {
+	}
+	return nil
+}
+
+// appendArrived appends the items a drain took from the queues, each
+// as it was queued: steered, followed up or delivered, with the trigger
+// its Queued report carried. Their item_end carries no trigger, as
+// before; the run's trigger names what started the run, not them.
+func (r *runner) appendArrived(inputs []TurnInput) error {
+	for _, in := range inputs {
+		if err := r.appendOne(in.Item, in.Mode, in.Trigger, Trigger{}); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// appendOne appends one item the loop did not stream with its item
+// events, and remembers how it arrived for the next turn's inputs.
+func (r *runner) appendOne(item openresponses.Item, mode InputMode, trigger, endTrigger Trigger) error {
+	if item == nil {
+		return nil
+	}
+	item, hidden := Unhide(item)
+	if err := r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden}); err != nil {
+		return err
+	}
+	r.transcript = append(r.transcript, item)
+	r.added = append(r.added, item)
+	r.arrived = append(r.arrived, TurnInput{Item: item, Mode: mode, Trigger: trigger})
+	if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden, Trigger: endTrigger}); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1063,7 +1139,7 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 		return nil, err
 	}
 	inputs := append(openresponses.Items(nil), r.transcript[min(r.mark, len(r.transcript)):]...)
-	if err := r.emit(&TurnStart{RunID: r.runID, Turn: r.turn, Request: req, Inputs: inputs}); err != nil {
+	if err := r.emit(&TurnStart{RunID: r.runID, Turn: r.turn, Request: req, Inputs: inputs, Arrived: append([]TurnInput(nil), r.arrived...)}); err != nil {
 		return nil, err
 	}
 	start := len(r.transcript)
@@ -1072,7 +1148,8 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 		// What the attempt kept is this model's, however it ended.
 		r.attribute(r.transcript[start:])
 		if err == nil {
-			r.mark = len(r.transcript)
+			// The next turn's inputs are what joins from here.
+			r.mark, r.arrived = len(r.transcript), nil
 			return resp, nil
 		}
 		var halt *errStop
@@ -1126,7 +1203,7 @@ func (r *runner) closeWithheld(items Transcript) error {
 	for _, call := range unansweredCalls(items) {
 		outputs = append(outputs, &openresponses.FunctionCallOutput{CallID: call.CallID, Output: openresponses.FunctionCallOutputData{Text: WithheldCallOutput}})
 	}
-	return r.appendItems(outputs)
+	return r.appendItems(outputs, InputTool)
 }
 
 // sleep waits for d or until ctx is done.
@@ -1808,7 +1885,7 @@ func (r *runner) appendFinished(ctx context.Context, batch []*callState) error {
 		p.appended = true
 		outputs = append(outputs, &openresponses.FunctionCallOutput{CallID: p.call.CallID, Output: p.result.Output})
 	}
-	return r.appendItems(outputs)
+	return r.appendItems(outputs, InputTool)
 }
 
 // execute runs the calls preflight did not settle and settles each as
@@ -2055,7 +2132,7 @@ func (r *runner) collect(batch []*callState) ([]agenttool.Result, []*openrespons
 			notes = append(notes, p.note)
 		}
 	}
-	if err := r.appendItems(append(outputs, notes...)); err != nil {
+	if err := r.appendItems(append(outputs, notes...), InputTool); err != nil {
 		return nil, nil, err
 	}
 	return results, deferred, nil
