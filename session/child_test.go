@@ -336,3 +336,96 @@ func TestReplayedChildOutputKeepsItsLink(t *testing.T) {
 	}
 	verifyAll(t, cs)
 }
+
+// A child whose calls differ, through agent.WithCallConfig: each child
+// session records the model its call ran, and one that starts from the
+// parent's conversation, given as the call's items rather than a seed,
+// is recorded whole and verifies, request hashes and all.
+func TestAChildPerCallConfigIsRecordedAndVerifies(t *testing.T) {
+	type taskArgs struct {
+		Input string `json:"input"`
+		Fork  bool   `json:"fork,omitempty"`
+		Model string `json:"model,omitempty"`
+	}
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{CWD: "/w"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := agent.New(agentturn.Config{Name: "task", Description: "does tasks", Model: &echo.Adapter{}, ModelName: "small"},
+		agent.WithCallConfig(func(_ context.Context, a taskArgs, parent agentturn.Transcript, cfg agentturn.Config) (agentturn.Config, openresponses.Items, error) {
+			if a.Model != "" {
+				cfg.ModelName = a.Model
+			}
+			var items openresponses.Items
+			if a.Fork {
+				items = append(items, parent...)
+			}
+			return cfg, append(items, openresponses.UserText(a.Input)), nil
+		}),
+		agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+	parentModel := &twoCalls{calls: []string{`{"input":"fresh one"}`, `{"input":"forked one","fork":true,"model":"large"}`}}
+	a := agentturn.New(agentturn.Config{Model: parentModel, Tools: []agenttool.Tool{task}})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("delegate twice")); err != nil {
+		t.Fatal(err)
+	}
+	l := links(s)
+	if len(l) != 2 {
+		t.Fatalf("links = %+v", l)
+	}
+	models := map[string]bool{}
+	for _, link := range l {
+		child, err := store.Open(context.Background(), link.Session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range child.Entries() {
+			if c, ok := e.(*agentsession.ConfigEntry); ok && c.Model != "" {
+				models[c.Model] = true
+			}
+		}
+		if n := verifyAll(t, child); n == 0 {
+			t.Errorf("child %s verified no responses", link.Session)
+		}
+	}
+	if !models["small"] || !models["large"] {
+		t.Errorf("child configs record models %v, want each call's", models)
+	}
+	verifyAll(t, s)
+}
+
+// twoCalls makes each of its calls to task in one batch, then answers.
+type twoCalls struct{ calls []string }
+
+func (m *twoCalls) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	for _, it := range req.Input {
+		if _, ok := it.(*openresponses.FunctionCallOutput); ok {
+			msg, err := em.Message(openresponses.PhaseFinalAnswer)
+			if err != nil {
+				return err
+			}
+			if err := msg.Text("done"); err != nil {
+				return err
+			}
+			if err := msg.Close(); err != nil {
+				return err
+			}
+			return em.Complete()
+		}
+	}
+	for _, args := range m.calls {
+		call, err := em.FunctionCall("", "task")
+		if err != nil {
+			return err
+		}
+		if err := call.Arguments(args); err != nil {
+			return err
+		}
+		if err := call.Close(); err != nil {
+			return err
+		}
+	}
+	return em.Complete()
+}

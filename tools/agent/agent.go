@@ -102,6 +102,7 @@ type options struct {
 	strict   bool
 	name     string
 	render   func(json.RawMessage) (openresponses.Items, error)
+	call     func(ctx context.Context, args json.RawMessage, parent agentturn.Transcript, cfg agentturn.Config) (agentturn.Config, openresponses.Items, error)
 	seed     func(parent agentturn.Transcript) agentturn.Transcript
 	observer func(context.Context, agentturn.Event)
 	noAnswer func(ChildInfo) (agenttool.Result, error)
@@ -169,12 +170,52 @@ func withArgs[T any](strict bool, render func(T) openresponses.Items) Option {
 	return func(o *options) {
 		o.schema = schema
 		o.strict = strict
+		o.call = nil // the later of WithArgs and WithCallConfig decides
 		o.render = func(raw json.RawMessage) (openresponses.Items, error) {
 			v, err := agenttool.Decode[T](raw)
 			if err != nil {
 				return nil, err
 			}
 			return render(v), nil
+		}
+	}
+}
+
+// WithCallConfig decides each call's configuration and opening items
+// from its arguments, for a tool whose calls differ in more than their
+// first message: a model the caller picks, or a child that starts from
+// the conversation so far. fn receives the decoded arguments, the
+// parent's transcript as [WithTranscript]'s seed does (nil outside a
+// loop, its in-flight calls answered with placeholders) and the
+// configuration New was given, and returns the configuration this call
+// runs under and the items its run opens with. T's schema is reflected
+// as in agenttool.New. It and [WithArgs] replace each other: the later
+// of the two decides both the schema and the items.
+//
+// The returned configuration is the child's for this call everywhere:
+// the run, the observer's [ConfigFromContext], so a recorder writes the
+// configuration that ran, and the errors. Its Name must be the one New
+// was given, which the tool is offered and the child is recorded under;
+// a configuration that renames it fails the call. fn's error fails the
+// call before any run starts. Items fn takes from the parent's
+// transcript go in as the run's prompt, not as a seed, so a recorder
+// writes them as the child's own and can stand behind the request that
+// carries them; [WithTranscript]'s seed, which a recorder did not
+// write, it cannot. A seed set as well still goes before the items.
+func WithCallConfig[T any](fn func(ctx context.Context, args T, parent agentturn.Transcript, cfg agentturn.Config) (agentturn.Config, openresponses.Items, error)) Option {
+	schema, err := agenttool.SchemaFor[T]()
+	if err != nil {
+		panic(fmt.Sprintf("agent.WithCallConfig: %v", err))
+	}
+	return func(o *options) {
+		o.schema, o.strict = schema, false
+		o.render = nil // the later of WithArgs and WithCallConfig decides
+		o.call = func(ctx context.Context, raw json.RawMessage, parent agentturn.Transcript, cfg agentturn.Config) (agentturn.Config, openresponses.Items, error) {
+			v, err := agenttool.Decode[T](raw)
+			if err != nil {
+				return cfg, nil, err
+			}
+			return fn(ctx, v, parent, cfg)
 		}
 	}
 }
@@ -348,7 +389,7 @@ func New(cfg agentturn.Config, opts ...Option) agenttool.Tool {
 	if o.noAnswer == nil {
 		o.noAnswer = defaultNoAnswer
 	}
-	if o.render == nil {
+	if o.render == nil && o.call == nil {
 		WithArgs(func(in Input) openresponses.Items {
 			return openresponses.Items{openresponses.UserText(in.Input)}
 		})(&o)
@@ -380,8 +421,23 @@ func (a *agentTool) Strict() bool                { return a.opts.strict }
 // so a session subscriber can link the child run whether or not it
 // succeeded.
 func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool.Result, error) {
-	prompts, err := a.opts.render(call.Args)
-	if err != nil {
+	var parent agentturn.Transcript
+	if a.opts.call != nil || a.opts.seed != nil {
+		p, _ := agentturn.TranscriptFromContext(ctx)
+		parent = answered(p, call.ID, a.cfg.Name)
+	}
+	cfg := a.cfg
+	var prompts openresponses.Items
+	var err error
+	if a.opts.call != nil {
+		cfg, prompts, err = a.opts.call(ctx, call.Args, parent, a.cfg)
+		if err != nil {
+			return agenttool.Result{}, err
+		}
+		if cfg.Name != a.cfg.Name {
+			return agenttool.Result{}, fmt.Errorf("agent %q: the call's configuration is named %q", a.cfg.Name, cfg.Name)
+		}
+	} else if prompts, err = a.opts.render(call.Args); err != nil {
 		return agenttool.Result{}, err
 	}
 	if len(prompts) == 0 {
@@ -389,20 +445,19 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	}
 	var seed agentturn.Transcript
 	if a.opts.seed != nil {
-		parent, _ := agentturn.TranscriptFromContext(ctx)
-		seed = a.opts.seed(answered(parent, call.ID, a.cfg.Name))
+		seed = a.opts.seed(parent)
 	}
 
 	// The observer sees the values of the call's context but never its
 	// cancellation, as an Agent's subscribers do: an abort of the parent
 	// cuts the child through ctx, and the events the cut leaves behind
 	// still have to be written.
-	obsCtx := agenttool.WithCall(context.WithValue(context.WithoutCancel(ctx), configKey{}, a.cfg), call)
+	obsCtx := agenttool.WithCall(context.WithValue(context.WithoutCancel(ctx), configKey{}, cfg), call)
 	var opts []agentturn.Option
 	if seed != nil {
 		opts = append(opts, agentturn.WithTranscript(seed))
 	}
-	child := agentturn.New(a.cfg, opts...)
+	child := agentturn.New(cfg, opts...)
 	var mu sync.Mutex
 	var soFar []string
 	done := false
