@@ -461,6 +461,11 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	var mu sync.Mutex
 	var soFar []string
 	done := false
+	// turned is set by the run's first turn. The items the run opens
+	// with, which WithCallConfig may fill with the parent's
+	// conversation, are appended before it, so an assistant message
+	// ending earlier is the prompt's, not the child's work.
+	turned := false
 	started := make(chan string, 1)
 	child.Subscribe(func(evCtx context.Context, ev agentturn.Event) error {
 		if a.opts.observer != nil {
@@ -479,6 +484,12 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 			default:
 			}
 		}
+		if _, ok := ev.(*agentturn.TurnStart); ok {
+			mu.Lock()
+			turned = true
+			mu.Unlock()
+			return nil
+		}
 		e, ok := ev.(*agentturn.ItemEnd)
 		if !ok {
 			return nil
@@ -489,6 +500,9 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		}
 		mu.Lock()
 		defer mu.Unlock()
+		if !turned {
+			return nil
+		}
 		if done {
 			// The call is over; a later run is the host's and has
 			// nowhere to report progress to.

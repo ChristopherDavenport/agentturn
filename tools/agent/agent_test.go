@@ -865,3 +865,39 @@ func (m *scriptedCall) CreateStream(_ context.Context, req openresponses.Request
 	}
 	return em.Complete()
 }
+
+// A fork opens its run with the parent's conversation, the parent's
+// assistant messages among it. Those are the run's prompt, not the
+// child's work, so the call's progress shows only what the child's
+// model said, from its first turn on.
+func TestProgressIsTheChildsOwnMessages(t *testing.T) {
+	type args struct {
+		Input string `json:"input"`
+	}
+	child := New(agentturn.Config{Name: "task", Model: &echo.Adapter{}},
+		WithCallConfig(func(_ context.Context, a args, _ agentturn.Transcript, cfg agentturn.Config) (agentturn.Config, openresponses.Items, error) {
+			return cfg, openresponses.Items{
+				openresponses.UserText("earlier question"),
+				openresponses.AssistantText("the parent's answer"),
+				openresponses.UserText("now: " + a.Input),
+			}, nil
+		}))
+	var updates []string
+	res, err := child.Execute(context.Background(), agenttool.Call{ID: "c", Args: json.RawMessage(`{"input":"go"}`), OnUpdate: func(r agenttool.Result) {
+		updates = append(updates, r.Output.Text)
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Output.Text != "now: go" {
+		t.Errorf("output %q", res.Output.Text)
+	}
+	for _, u := range updates {
+		if strings.Contains(u, "the parent's answer") {
+			t.Errorf("progress shows a prompt item as the child's: %q", u)
+		}
+	}
+	if len(updates) != 1 || updates[0] != "now: go" {
+		t.Errorf("updates %q, want the child's one message", updates)
+	}
+}
