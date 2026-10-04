@@ -718,3 +718,150 @@ func TestExecuteMarksItsRunAsStartingAfresh(t *testing.T) {
 		t.Errorf("runs the child's tool saw as starting afresh = %v, want both executes and not the host's prompt", inTool)
 	}
 }
+
+// modelNames records the model each request names.
+type modelNames struct {
+	echo.Adapter
+	mu    sync.Mutex
+	names []string
+}
+
+func (m *modelNames) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.mu.Lock()
+	m.names = append(m.names, req.Model)
+	m.mu.Unlock()
+	return m.Adapter.CreateStream(ctx, req, sink)
+}
+
+func TestWithCallConfigDecidesEachCall(t *testing.T) {
+	type taskArgs struct {
+		Input string `json:"input" desc:"The task"`
+		Model string `json:"model,omitempty" enum:"small,large" desc:"Which model"`
+	}
+	model := &modelNames{}
+	var observed []string
+	var mu sync.Mutex
+	child := New(agentturn.Config{Name: "task", Description: "does tasks", Model: model, ModelName: "small"},
+		WithCallConfig(func(_ context.Context, a taskArgs, _ agentturn.Transcript, cfg agentturn.Config) (agentturn.Config, openresponses.Items, error) {
+			if a.Model != "" {
+				cfg.ModelName = a.Model
+			}
+			return cfg, openresponses.Items{openresponses.UserText("task: " + a.Input)}, nil
+		}),
+		WithObserver(func(ctx context.Context, ev agentturn.Event) {
+			if _, ok := ev.(*agentturn.RunStart); ok {
+				cfg, _ := ConfigFromContext(ctx)
+				mu.Lock()
+				observed = append(observed, cfg.ModelName)
+				mu.Unlock()
+			}
+		}))
+	if !strings.Contains(string(child.Parameters()), `"model"`) {
+		t.Errorf("schema = %s", child.Parameters())
+	}
+	for _, args := range []string{`{"input":"a"}`, `{"input":"b","model":"large"}`} {
+		res, err := child.Execute(context.Background(), agenttool.Call{ID: "c", Args: json.RawMessage(args)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(res.Output.Text, "task: ") {
+			t.Errorf("output %q: the call's items did not open the run", res.Output.Text)
+		}
+	}
+	if strings.Join(model.names, ",") != "small,large" {
+		t.Errorf("requests named %v, want each call's model", model.names)
+	}
+	// The observer, which a recorder is, sees the configuration that ran.
+	if strings.Join(observed, ",") != "small,large" {
+		t.Errorf("observer saw %v", observed)
+	}
+}
+
+func TestWithCallConfigRefusals(t *testing.T) {
+	type args struct {
+		Input string `json:"input"`
+	}
+	rename := New(agentturn.Config{Name: "task", Model: &echo.Adapter{}},
+		WithCallConfig(func(_ context.Context, a args, _ agentturn.Transcript, cfg agentturn.Config) (agentturn.Config, openresponses.Items, error) {
+			cfg.Name = "other"
+			return cfg, openresponses.Items{openresponses.UserText(a.Input)}, nil
+		}))
+	if _, err := rename.Execute(context.Background(), agenttool.Call{Args: json.RawMessage(`{"input":"x"}`)}); err == nil || !strings.Contains(err.Error(), `named "other"`) {
+		t.Errorf("a renamed configuration: %v", err)
+	}
+	refuse := New(agentturn.Config{Name: "task", Model: &echo.Adapter{}},
+		WithCallConfig(func(_ context.Context, _ args, _ agentturn.Transcript, cfg agentturn.Config) (agentturn.Config, openresponses.Items, error) {
+			return cfg, nil, errors.New("no such model")
+		}))
+	if _, err := refuse.Execute(context.Background(), agenttool.Call{Args: json.RawMessage(`{"input":"x"}`)}); err == nil || err.Error() != "no such model" {
+		t.Errorf("fn's error: %v", err)
+	}
+	empty := New(agentturn.Config{Name: "task", Model: &echo.Adapter{}},
+		WithCallConfig(func(_ context.Context, _ args, _ agentturn.Transcript, cfg agentturn.Config) (agentturn.Config, openresponses.Items, error) {
+			return cfg, nil, nil
+		}))
+	if _, err := empty.Execute(context.Background(), agenttool.Call{Args: json.RawMessage(`{"input":"x"}`)}); err == nil || !strings.Contains(err.Error(), "rendered no items") {
+		t.Errorf("no items: %v", err)
+	}
+}
+
+// A fork: the call's items are the parent's conversation, answered
+// placeholders included, and a directive; they open the child's run.
+func TestWithCallConfigSeesTheParentUnderALoop(t *testing.T) {
+	type args struct {
+		Input string `json:"input"`
+	}
+	var got openresponses.Items
+	child := New(agentturn.Config{Name: "task", Model: &echo.Adapter{}},
+		WithCallConfig(func(_ context.Context, a args, parent agentturn.Transcript, cfg agentturn.Config) (agentturn.Config, openresponses.Items, error) {
+			items := append(openresponses.Items(nil), parent...)
+			return cfg, append(items, openresponses.UserText("now: "+a.Input)), nil
+		}),
+		WithObserver(func(_ context.Context, ev agentturn.Event) {
+			if e, ok := ev.(*agentturn.RunEnd); ok {
+				got = e.Items
+			}
+		}))
+	parent := agentturn.Config{Model: &scriptedCall{name: "task", args: `{"input":"go"}`}, Tools: []agenttool.Tool{child}}
+	for ev := range agentturn.Run(context.Background(), nil, openresponses.Items{openresponses.UserText("delegate")}, parent) {
+		if e, ok := ev.(*agentturn.RunEnd); ok && e.Err != nil {
+			t.Fatal(e.Err)
+		}
+	}
+	if itemTypes(got) != "user function_call function_call_output user assistant" {
+		t.Errorf("child items %q, want the parent's conversation, the directive and the answer", itemTypes(got))
+	}
+}
+
+// scriptedCall calls one tool once, then answers.
+type scriptedCall struct{ name, args string }
+
+func (m *scriptedCall) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	for _, it := range req.Input {
+		if _, ok := it.(*openresponses.FunctionCallOutput); ok {
+			msg, err := em.Message(openresponses.PhaseFinalAnswer)
+			if err != nil {
+				return err
+			}
+			if err := msg.Text("done"); err != nil {
+				return err
+			}
+			if err := msg.Close(); err != nil {
+				return err
+			}
+			return em.Complete()
+		}
+	}
+	call, err := em.FunctionCall("", m.name)
+	if err != nil {
+		return err
+	}
+	if err := call.Arguments(m.args); err != nil {
+		return err
+	}
+	if err := call.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}

@@ -5,6 +5,23 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- **`tools/agent.WithCallConfig` decides each call's configuration and
+  opening items from its arguments.** A child tool's configuration was
+  fixed at `New`, so a call could not pick its model or start from the
+  conversation so far; `WithArgs` shaped only the first message and
+  `WithTranscript`'s seed never saw the arguments. The hook receives the
+  decoded arguments, the parent's transcript (in-flight calls answered
+  with placeholders) and the configuration `New` was given, and returns
+  the configuration the call runs under, which the observer's
+  `ConfigFromContext` and so a recorder see, and the items its run opens
+  with. Items taken from the parent's transcript go in as the run's
+  prompt, which `session` records as the child's own, so a child that
+  starts from the parent's conversation verifies with request hashes,
+  where a `WithTranscript` seed is recorded without them. A
+  configuration that renames the child fails the call.
+
 ## v0.0.16 - 2026-10-02
 
 - **Requires `openresponses` v0.0.14, up from v0.0.12, `agenttool`
