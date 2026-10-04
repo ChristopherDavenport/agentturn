@@ -5,6 +5,16 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- **A child's progress shows only what its model said.** The updates a
+  `tools/agent` call reports collected every assistant message the
+  child's run carried, so a child that `WithCallConfig` opened with the
+  parent's conversation reported the parent's last answer as its own
+  progress, at the head of every update. Messages that end before the
+  run's first turn, the items it was prompted with, are left out; the
+  call's output and `ChildInfo.Items` are unchanged.
+
 ## v0.0.17 - 2026-10-04
 
 - **`tools/agent.WithCallConfig` decides each call's configuration and
