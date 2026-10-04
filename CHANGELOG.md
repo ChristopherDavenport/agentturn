@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.17 - 2026-10-04
 
 - **`tools/agent.WithCallConfig` decides each call's configuration and
   opening items from its arguments.** A child tool's configuration was
