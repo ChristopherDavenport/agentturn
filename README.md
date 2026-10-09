@@ -339,7 +339,8 @@ agent presents itself in every one of these.
 | path | module | depends on |
 |---|---|---|
 | `.` (`agentturn`), `front/responses`, `compact`, `tools/agent` | root | `openresponses`, `agenttool` |
-| `front/a2a`, `tools/a2a` | nested | `github.com/a2aproject/a2a-go` |
+| `front/a2a` | nested | `github.com/a2aproject/a2a-go` |
+| `tools/a2a` | nested, Go 1.26 | `github.com/a2aproject/a2a-go` |
 | `session` | nested | `github.com/ChristopherDavenport/agentsession` |
 
 Every module shares the root's version and is tagged at the same
