@@ -5,6 +5,13 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Security: `tools/a2a` requires golang.org/x/net v0.60.0, which fixes
+  GO-2026-6617, GO-2026-6612, GO-2026-6611 and GO-2026-6603 in its
+  HTTP/2 code. That version of x/net needs Go 1.26, so `tools/a2a` now
+  requires Go 1.26; every other module keeps the 1.25 floor.
+
 ## v0.0.18 - 2026-10-04
 
 - **A child's progress shows only what its model said.** The updates a

@@ -15,7 +15,8 @@ the change can be discussed before you spend time on it.
 
 ## Development
 
-Go 1.25 or later is required. The full local check is:
+Go 1.25 or later is required; `tools/a2a` needs Go 1.26, which the
+Makefile fetches when the Go running is older. The full local check is:
 
 ```sh
 make check        # gofmt, tidy, vet, deps, replaces, staticcheck, govulncheck, race tests, every module
