@@ -3,7 +3,7 @@ module github.com/ChristopherDavenport/agentturn/tools/a2a
 go 1.26.0
 
 require (
-	github.com/ChristopherDavenport/agenttool v0.0.15
+	github.com/ChristopherDavenport/agenttool v0.0.22
 	github.com/ChristopherDavenport/agentturn v0.0.18
 	github.com/ChristopherDavenport/agentturn/front/a2a v0.0.18
 	github.com/ChristopherDavenport/openresponses v0.0.14

@@ -150,7 +150,13 @@ func (a *Agent) Subscribe(fn func(ctx, Event) error) (unsubscribe func())
 func (a *Agent) Abort()
 func (a *Agent) WaitForIdle(ctx) error
 func (a *Agent) State() State                       // snapshot
+func (a *Agent) QuestionElicitor() agenttool.Elicitor // a call's questions as question events
+func (a *Agent) Reply(id string, answer agenttool.Answer) error
 ```
+
+`Control` names the methods a client drives an agent with (`Prompt`,
+`Resume`, `Queue`, `Abort`, `State`, `Subscribe`, `Reply`), so a front
+can carry them over a wire; `*Agent` is its in-process implementation.
 
 Barrier semantics, as in pi's `Agent` class: subscribers are awaited in
 registration order, and the assistant `item_end` and `turn_end` events are
@@ -396,8 +402,9 @@ behind the same hook.
   a cancel registry, and a per-conversation hook that attaches a
   recorder to the agent driving each task. Only package that imports
   a2a-go.
-- TUI and chat channels: consume `Subscribe`, feed `Prompt`, `Steer`,
-  `FollowUp`.
+- TUI and chat channels: drive the agent through `Control`: consume
+  `Subscribe`, feed `Prompt`, `Queue`, and answer questions with
+  `Reply`.
 
 ## Composition
 

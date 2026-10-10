@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sync"
 
 	"github.com/ChristopherDavenport/agenttool"
@@ -123,6 +124,16 @@ type Agent struct {
 	// transcript it knows, so a run leaves another model's out of its
 	// requests.
 	reasoning ReasoningModels
+	// asks holds the questions QuestionElicitor raised that Reply can
+	// still answer, by ID.
+	asks map[string]*asking
+	// waiting holds the questions delivered and not yet closed, in the
+	// order they were asked, and replays the ones each subscriber that
+	// attached while they waited is owed, by subscription ID: sent
+	// before the next event it gets, or by Subscribe's own delivery if
+	// none comes first.
+	waiting []*Question
+	replays map[int][]*Question
 }
 
 type subscription struct {
@@ -925,9 +936,10 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, approved
 // and [Agent.FollowUp] accepted since the last event are reported
 // first, so an item is always announced before anything it produces.
 //
-// Nothing outside a run delivers, so a subscriber never waits on a
-// barrier it is itself holding: steering from inside an event queues
-// the item and returns.
+// Outside a run only a question delivers, asked by a call that
+// outlived its run or sent to a new subscriber, and neither from a
+// subscriber, so a subscriber never waits on a barrier it is itself
+// holding: steering from inside an event queues the item and returns.
 func (a *Agent) deliver(ctx context.Context, ev Event) error {
 	a.emitMu.Lock()
 	defer a.emitMu.Unlock()
@@ -978,12 +990,24 @@ func (a *Agent) dispatch(ctx context.Context, ev Event) error {
 	case *RunEnd:
 		a.pending = e.Pending
 		a.lastEnd = e
+	case *Question:
+		a.waiting = append(a.waiting, e)
+	case *QuestionClosed:
+		a.waiting = slices.DeleteFunc(a.waiting, func(q *Question) bool { return q.ID == e.ID })
 	}
 	// Snapshot the subscriber list and release the lock before calling
-	// out: a subscriber may Subscribe, unsubscribe or read State.
+	// out: a subscriber may Subscribe, unsubscribe or read State. The
+	// questions a new subscriber is owed are taken with it, so each
+	// reaches it before this event, a question's close included.
 	subs := append([]subscription(nil), a.subs...)
+	replays := a.takeReplays(subs)
 	a.mu.Unlock()
 	for _, s := range subs {
+		for _, q := range replays[s.id] {
+			if err := s.fn(ctx, q); err != nil {
+				return err
+			}
+		}
 		if err := s.fn(ctx, ev); err != nil {
 			return err
 		}
@@ -999,17 +1023,46 @@ func (a *Agent) dispatch(ctx context.Context, ev Event) error {
 	return nil
 }
 
+// takeReplays removes and returns the questions owed to the
+// subscribers of subs. a.mu is held.
+func (a *Agent) takeReplays(subs []subscription) map[int][]*Question {
+	if len(a.replays) == 0 {
+		return nil
+	}
+	out := map[int][]*Question{}
+	for _, s := range subs {
+		if qs, ok := a.replays[s.id]; ok {
+			out[s.id] = qs
+			delete(a.replays, s.id)
+		}
+	}
+	return out
+}
+
 // Subscribe registers fn for every event and returns a function that
 // removes it. Subscribing during a run takes effect from the next event.
+// The questions waiting for an answer when fn subscribes are sent to it
+// first ([Question]): before the next event it gets, or, when none
+// comes, from a goroutine of the agent's, through the delivery barrier,
+// with an error fn returns for them dropped. No other past event is
+// sent.
 func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe func()) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	id := a.nextSub
 	a.nextSub++
 	a.subs = append(a.subs, subscription{id: id, fn: fn})
+	if len(a.waiting) > 0 {
+		if a.replays == nil {
+			a.replays = map[int][]*Question{}
+		}
+		a.replays[id] = append([]*Question(nil), a.waiting...)
+		go a.flushReplay(id, fn)
+	}
 	return func() {
 		a.mu.Lock()
 		defer a.mu.Unlock()
+		delete(a.replays, id)
 		for i, s := range a.subs {
 			if s.id == id {
 				// The three-index slice forces a fresh array, so a
@@ -1017,6 +1070,25 @@ func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe fu
 				a.subs = append(a.subs[:i:i], a.subs[i+1:]...)
 				return
 			}
+		}
+	}
+}
+
+// flushReplay sends the subscriber id the questions it is owed, unless
+// an event has already carried them to it. It holds the barrier, so a
+// subscriber is still entered from one goroutine at a time; it runs on
+// a goroutine of its own because Subscribe may be called from inside a
+// subscriber, which holds the barrier already.
+func (a *Agent) flushReplay(id int, fn func(context.Context, Event) error) {
+	a.emitMu.Lock()
+	defer a.emitMu.Unlock()
+	a.mu.Lock()
+	qs := a.replays[id]
+	delete(a.replays, id)
+	a.mu.Unlock()
+	for _, q := range qs {
+		if fn(context.Background(), q) != nil {
+			return
 		}
 	}
 }

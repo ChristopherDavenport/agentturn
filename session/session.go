@@ -639,6 +639,9 @@ type Elicitation struct {
 	// when Error is set.
 	Action  string          `json:"action,omitempty"`
 	Content json.RawMessage `json:"content,omitempty"`
+	// Note is what the person said with the answer, on the answer
+	// entry: a refusal's reason, or what to bear in mind on an accept.
+	Note string `json:"note,omitempty"`
 	// By is who answered, in the session format's terms; empty when
 	// nobody was asked or the asking failed.
 	By string `json:"by,omitempty"`
@@ -2572,7 +2575,7 @@ func (r *Recorder) Elicitor(by string, fn agenttool.Elicitor) agenttool.Elicitor
 			// Nobody answered: the harness failed to ask.
 			data.Error = err.Error()
 		} else {
-			data.Action, data.Content, data.By = string(ans.Action), ans.Content, who
+			data.Action, data.Content, data.Note, data.By = string(ans.Action), ans.Content, ans.Note, who
 		}
 		if _, werr := r.annotate(ctx, ElicitationNS, data, data.Call); werr != nil {
 			return agenttool.Answer{}, errors.Join(err, werr)

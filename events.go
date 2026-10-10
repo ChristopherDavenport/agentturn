@@ -14,8 +14,9 @@ import (
 // Event is one step of a run. Concrete types are [RunStart], [TurnStart],
 // [ModelRetry], [ModelBlocked], [ItemStart], [ItemUpdate], [ItemEnd],
 // [ResponseEnd], [ToolStart], [ToolDispatch], [ToolUpdate], [ToolEnd],
-// [TurnEnd] and [RunEnd], and [Queued], which belongs to no run. Decoded values are
-// pointers, so switch on *ItemUpdate and so on.
+// [TurnEnd] and [RunEnd], [Queued], which belongs to no run, and
+// [Question] and [QuestionClosed], which a running call raises. Decoded
+// values are pointers, so switch on *ItemUpdate and so on.
 type Event interface {
 	EventType() string
 }
@@ -666,6 +667,15 @@ type PendingCall struct {
 	// agentturn/session's Pending does, from the record, and the output
 	// such a call is owed is this text, as ReplayAnswers gives it.
 	Refused string
+	// Decision is the BeforeToolCall decision that deferred the call,
+	// for a call pending as [PendingDeferred]: its Reason is the rule
+	// that raised the question, which a front shows the person it asks,
+	// and By who held it. It travels with the run's end, so a front
+	// that has only the [RunEnd] can say why the call waits. The loop
+	// sets it for a call a hook deferred in a run and keeps it while
+	// the call stays deferred. It is nil for every other call, and for
+	// a deferred call held before the agent was built.
+	Decision *ToolDecision
 }
 
 // MayHaveRun reports whether the call may have run and an approval of

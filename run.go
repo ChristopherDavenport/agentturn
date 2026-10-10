@@ -557,8 +557,8 @@ type runner struct {
 	// deferred holds the IDs of the calls a hook handed to the caller
 	// during this run, so the run end can say why they are pending,
 	// each with the arguments it was held with, which its decision may
-	// have rewritten.
-	deferred map[string]json.RawMessage
+	// have rewritten, and the decision that held it.
+	deferred map[string]heldCall
 	// callTools holds the tool each call of this run's batches resolved
 	// to, so a pending call carries the tool a prompt asks about.
 	callTools map[string]agenttool.Tool
@@ -789,9 +789,9 @@ func (r *runner) pending() []PendingCall {
 		case deferred:
 			// A decision that rewrote the call's arguments and held it
 			// decided on those, and an approval runs them.
-			p.Reason = PendingDeferred
-			if held != nil && !sameArgs(held, orEmpty(nil, call.Arguments)) {
-				p.Args = held
+			p.Reason, p.Decision = PendingDeferred, held.decision
+			if held.args != nil && !sameArgs(held.args, orEmpty(nil, call.Arguments)) {
+				p.Args = held.args
 			}
 		case dispatched:
 			p.Reason, p.IdempotencyKey = PendingAborted, h.key
@@ -805,9 +805,9 @@ func (r *runner) pending() []PendingCall {
 			// answered and is left as a cut leaves one; a resume that
 			// failed before its batch leaves it held.
 			p.Reason, p.Dispatched, p.IdempotencyKey, p.Args = before.Reason, before.Dispatched, before.IdempotencyKey, before.Args
-			p.Ran, p.RanWhere = before.Ran, before.RanWhere
+			p.Ran, p.RanWhere, p.Decision = before.Ran, before.RanWhere, before.Decision
 			if before.Reason == PendingDeferred && r.approved[call.CallID] {
-				p.Reason, p.Dispatched = PendingAborted, false
+				p.Reason, p.Dispatched, p.Decision = PendingAborted, false, nil
 			}
 		case r.undispatched[call.CallID] || mine[call] || r.approved[call.CallID]:
 			p.Reason = PendingUndispatched
@@ -816,7 +816,7 @@ func (r *runner) pending() []PendingCall {
 			// with included: a resume that failed before its batch
 			// decided nothing new.
 			p.Reason, p.Dispatched, p.IdempotencyKey, p.Args = before.Reason, before.Dispatched, before.IdempotencyKey, before.Args
-			p.Ran, p.RanWhere = before.Ran, before.RanWhere
+			p.Ran, p.RanWhere, p.Decision = before.Ran, before.RanWhere, before.Decision
 		}
 		if p.Tool == nil {
 			p.Tool = before.Tool
@@ -2296,10 +2296,18 @@ func (r *runner) decide(p *callState, decision *ToolDecision) {
 	case Defer:
 		p.deferred = true
 		if r.deferred == nil {
-			r.deferred = map[string]json.RawMessage{}
+			r.deferred = map[string]heldCall{}
 		}
-		r.deferred[p.call.CallID] = p.args
+		held := *decision
+		r.deferred[p.call.CallID] = heldCall{args: p.args, decision: &held}
 	}
+}
+
+// heldCall is a call a hook deferred in this run: the arguments it was
+// held with and a copy of the decision that held it.
+type heldCall struct {
+	args     json.RawMessage
+	decision *ToolDecision
 }
 
 // prepare starts the state of a call: the tool with its name, if any,

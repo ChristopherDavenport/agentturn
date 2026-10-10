@@ -85,12 +85,15 @@ func TestAsk(t *testing.T) {
 		wantOK     bool
 		wantAction ToolAction
 		wantReason string
+		wantNote   string
 	}{
 		{name: "no elicitor", reason: "rule r"},
 		{name: "accept", elicit: answers(agenttool.Answer{Action: agenttool.ActionAccept}), reason: "rule r", wantOK: true, wantAction: Allow, wantReason: "rule r"},
 		{name: "accept, no reason", elicit: answers(agenttool.Answer{Action: agenttool.ActionAccept}), wantOK: true, wantAction: Allow, wantReason: "allowed when asked"},
 		{name: "decline", elicit: answers(agenttool.Answer{Action: agenttool.ActionDecline}), reason: "rule r", wantOK: true, wantAction: Block, wantReason: "declined when asked: rule r"},
 		{name: "decline, no reason", elicit: answers(agenttool.Answer{Action: agenttool.ActionDecline}), wantOK: true, wantAction: Block, wantReason: "declined when asked"},
+		{name: "decline, with a note", elicit: answers(agenttool.Answer{Action: agenttool.ActionDecline, Note: "use the fixture"}), reason: "rule r", wantOK: true, wantAction: Block, wantReason: "declined when asked: rule r; the user said: use the fixture"},
+		{name: "accept, with a note", elicit: answers(agenttool.Answer{Action: agenttool.ActionAccept, Note: "only this once"}), reason: "rule r", wantOK: true, wantAction: Allow, wantReason: "rule r", wantNote: "The user said: only this once"},
 		{name: "cancel", elicit: answers(agenttool.Answer{Action: agenttool.ActionCancel}), reason: "rule r"},
 		{name: "elicitor error", elicit: func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
 			return agenttool.Answer{}, errors.New("no terminal")
@@ -138,8 +141,8 @@ func TestAsk(t *testing.T) {
 				}
 				return
 			}
-			if d == nil || d.Action != tc.wantAction || d.Reason != tc.wantReason || d.By != "human" {
-				t.Errorf("decision = %+v, want %v %q by human", d, tc.wantAction, tc.wantReason)
+			if d == nil || d.Action != tc.wantAction || d.Reason != tc.wantReason || d.Note != tc.wantNote || d.By != "human" {
+				t.Errorf("decision = %+v, want %v %q note %q by human", d, tc.wantAction, tc.wantReason, tc.wantNote)
 			}
 		})
 	}
