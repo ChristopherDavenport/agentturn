@@ -7,6 +7,28 @@ versions may break the API.
 
 ## Unreleased
 
+- Added: **`Control`, the human plane's contract.** The methods a
+  person at a client, or a controller that answers by rule, drives an
+  agent with: `Prompt`, `Resume`, `Queue`, `Abort`, `State`,
+  `Subscribe` and `Reply`. `*Agent` implements it; a front that serves
+  it over a wire, or a host that wraps an agent with its own
+  bookkeeping, implements it too. `Queue` stands for `Steer` and
+  `FollowUp` in the contract, since a wire and a recorder need its
+  context and error. (#224)
+- Added: **questions as events.** `Agent.QuestionElicitor` is an
+  elicitor that asks through the agent's subscribers: a tool's question,
+  or a nested call `Ask` puts to the user, is delivered as a `Question`
+  event, answered with `Agent.Reply`, and closed with `QuestionClosed`,
+  whose `Answer` is nil when the call gave up (an abort). A subscriber
+  that attaches while a question waits is sent it first. A host turns
+  it on by installing it as `Config.ToolElicitor`; the loop never does.
+  (#224)
+- Added: **`PendingCall.Decision`**, the `BeforeToolCall` decision
+  that deferred a call, so a front that has only the run's end can show
+  the rule that asked. The loop keeps it while the call stays deferred,
+  and `session.Pending` reads it from the record's hold decision.
+  (#224)
+
 - Security: `tools/a2a` requires golang.org/x/net v0.60.0, which fixes
   GO-2026-6617, GO-2026-6612, GO-2026-6611 and GO-2026-6603 in its
   HTTP/2 code. That version of x/net needs Go 1.26, so `tools/a2a` now

@@ -111,6 +111,7 @@ run, in order:
 | `tool_start`, `tool_dispatch`, `tool_update`, `tool_end` | one tool call from preflight to result: `tool_start` when it is decided, in the model's order; `tool_dispatch` when it is handed to its tool; `tool_end` in completion order |
 | `turn_end` | the folded `Response` with usage, and the tool results |
 | `run_end` | the items added this run and the reason: done, stopped, input_required, aborted, error |
+| `question`, `question_closed` | a question a running call asks, through `Agent.QuestionElicitor`, and its close with the answer `Agent.Reply` gave, or none when the call gave up |
 
 `queued` belongs to no run. `Steer` and `FollowUp` accept an item and
 return; the goroutine that owns delivery reports it at its next event,
@@ -118,6 +119,15 @@ before anything that item produces, so a host writing what it accepted
 tells an item it was handed from one a run made. A run in flight
 reports it at once, an idle agent at the start of the next run, so a
 gateway that must not lose an input writes it before it accepts it.
+
+A question a call asks while it runs, a tool's own or a nested call its
+hook deferred, is an event too once the host installs
+`a.QuestionElicitor()` as `Config.ToolElicitor`: subscribers get a
+`question`, any of them answers with `a.Reply(id, answer)`, and a
+subscriber that attaches while one waits is sent it first. Those
+methods, with `Prompt`, `Resume`, `Queue`, `Abort`, `State` and
+`Subscribe`, are `agentturn.Control`, the contract a client drives an
+agent through, which `*Agent` implements in process.
 
 ## Tools
 
