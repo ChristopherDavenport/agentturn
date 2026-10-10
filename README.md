@@ -309,6 +309,7 @@ earns a place only with a serve side and a consume side:
 | MCP | `agenttool/mcpserver` | `agenttool/mcpclient` |
 | A2A | `front/a2a` | `tools/a2a` |
 | in-process | `Agent` | `tools/agent` |
+| control | `front/control.Handler` | `front/control.Dial` |
 
 The MCP row lives in `agenttool` because MCP is about tools, not about
 the loop: `mcpserver` serves any `agenttool.Tool`, and `mcpclient`
@@ -341,6 +342,14 @@ produces them. An agent stands in three places inside another system:
   hash. The loop leaves another model's reasoning items out of each
   request on its own, so a change of model needs no trim.
 
+The control row is not a composition: it is the human plane, a person
+at a client or a controller that answers by rule, driving an agent from
+another process. `front/control` serves any `agentturn.Control` over
+HTTP, JSON requests for its methods and a server-sent event stream of
+the agent's events, unnarrowed, questions included; `Dial` returns a
+client that is itself a `Control`. Every request is authenticated, and
+answering what a policy asked about needs a scope of its own.
+
 `Config.Name` and `Config.Description` are the single source for how an
 agent presents itself in every one of these.
 
@@ -348,7 +357,7 @@ agent presents itself in every one of these.
 
 | path | module | depends on |
 |---|---|---|
-| `.` (`agentturn`), `front/responses`, `compact`, `tools/agent` | root | `openresponses`, `agenttool` |
+| `.` (`agentturn`), `front/responses`, `front/control`, `compact`, `tools/agent` | root | `openresponses`, `agenttool` |
 | `front/a2a` | nested | `github.com/a2aproject/a2a-go` |
 | `tools/a2a` | nested, Go 1.26 | `github.com/a2aproject/a2a-go` |
 | `session` | nested | `github.com/ChristopherDavenport/agentsession` |

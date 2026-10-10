@@ -5,6 +5,31 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Added: **`front/control`**, `agentturn.Control` over HTTP (#229).
+  `Handler` serves any `Control`: JSON requests for its methods, with
+  `Prompt` and `Resume` returning the run's end, and `Subscribe` as a
+  server-sent event stream of the agent's events, unnarrowed and in
+  order, questions included. `Dial` returns a `Client` that is itself a
+  `Control`. Every request is authenticated (`WithAuthenticator`,
+  `BearerTokens`, or `WithInsecureNoAuth` for tests); the handler
+  refuses everything without an authenticator, and each method needs
+  its scope: read, control, answer (`Resume`, `Reply`, which no other
+  scope implies) or command. The principal rides on the call's context
+  (`PrincipalFrom`), and a run it starts or answers carries a trigger
+  of kind "control" naming it. A product's own controls are named
+  commands (`WithCommands`, `Client.Command`). A stream that falls
+  behind is cut with an overflow rather than waited on, and a client
+  reconnects and is sent a waiting question again; what is committed
+  comes from the record.
+- Added: `front/control.MarshalEvent` and `UnmarshalEvent`, the JSON
+  form of every event. A field that is not data travels as its
+  description: an error as its text, with `errors.Is` kept for
+  agentturn's sentinels (`RemoteError`); a pending call's tool as its
+  name, description, parameters and annotations (`RemoteTool`, which
+  does not run); a result's `Details` as its JSON.
+
 ## v0.0.20 - 2026-10-10
 
 - Added: `ToolDecision.Held`, on a Defer: the call is deferred only
