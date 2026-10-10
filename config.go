@@ -460,6 +460,13 @@ type ToolDecision struct {
 	// front that has only the run's end ([PendingCall.Decision]) asks
 	// about the other call alone. The loop does nothing else with it.
 	Held bool
+	// Subject is the part of the call the decision is about, when the
+	// hook decided on a part rather than the whole: one command of a
+	// compound shell line, say, as the tool's own splitter wrote it. A
+	// front that asks about a deferred call shows it beside the Reason,
+	// so the person asked knows which part the question is about. Empty
+	// for a decision about the whole call. The loop does not use it.
+	Subject string
 }
 
 // ToolResultInfo describes a completed call.

@@ -5,6 +5,14 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Added: `ToolDecision.Subject`, the part of the call a decision is
+  about when the hook decided on a part (one command of a compound
+  shell line), so a front that has only the run's end shows the
+  question with the part it asks about (#231). `front/control` carries
+  it.
+
 ## v0.0.21 - 2026-10-10
 
 - Added: **`front/control`**, `agentturn.Control` over HTTP (#229).
