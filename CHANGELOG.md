@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.21 - 2026-10-10
 
 - Added: **`front/control`**, `agentturn.Control` over HTTP (#229).
   `Handler` serves any `Control`: JSON requests for its methods, with
