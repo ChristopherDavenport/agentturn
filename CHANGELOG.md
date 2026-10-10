@@ -32,7 +32,7 @@ versions may break the API.
   is told ("declined when asked: <rule>; the user said: <note>"), and an
   approval's is the decision's `Note`, read with the call's result. The
   session recorder writes it on the elicitation's answer entry
-  (`Elicitation.Note`). Requires agenttool vX.Y.Z. (#224)
+  (`Elicitation.Note`). Requires agenttool v0.0.22, up from v0.0.15. (#224)
 - Security: `tools/a2a` requires golang.org/x/net v0.60.0, which fixes
   GO-2026-6617, GO-2026-6612, GO-2026-6611 and GO-2026-6603 in its
   HTTP/2 code. That version of x/net needs Go 1.26, so `tools/a2a` now
