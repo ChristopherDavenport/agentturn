@@ -79,6 +79,7 @@ modules or packages so the core keeps its two dependencies.
 agentturn/                  loop, Agent, events, hooks, queues, run control
 agentturn/tool              Tool contract, registry, argument decoding, batch executor
 agentturn/front/responses   the loop as an openresponses.Adapter
+agentturn/front/control     Control served over HTTP and dialled: the human plane from elsewhere
 agentturn/front/a2a         the A2A bridge (separate module: imports a2a-go)
 agentturn/front/mcp         Go tools served over MCP (separate module: imports an MCP SDK)
 agentturn/tools/...         built-in tools, one package each, opt-in
@@ -405,6 +406,13 @@ behind the same hook.
 - TUI and chat channels: drive the agent through `Control`: consume
   `Subscribe`, feed `Prompt`, `Queue`, and answer questions with
   `Reply`.
+- `front/control`: `Control` over HTTP. `Handler` serves any `Control`
+  (JSON requests, a server-sent event stream of the events in a JSON
+  envelope, scopes per method: read, control, answer, command);
+  `Dial` returns a `Client` that is a `Control`, so a TUI drives an
+  agent elsewhere unchanged. The stream replays nothing but a waiting
+  question; what is committed comes from the record. A product's own
+  controls are named commands beside the contract, never in it.
 
 ## Composition
 
