@@ -1274,8 +1274,9 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 
 // Pending returns the calls pending at the session's leaf as the agent
 // lists them, with the reason the record gives each: a call held by a
-// hold decision is [agentturn.PendingDeferred], and Dispatched when
-// the hold follows its dispatch; one in flight when the record stopped
+// hold decision is [agentturn.PendingDeferred], Dispatched when the
+// hold follows its dispatch, with that hold as its Decision (the rule
+// that raised the question, who held it); one in flight when the record stopped
 // may have run and is [agentturn.PendingAborted], as is one with no
 // dispatch on the path that has one on a branch a rebase to before it
 // left, a held one of which is Dispatched; one an answer
@@ -1413,6 +1414,7 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 		switch state {
 		case agentsession.CallHeld:
 			p.Reason, p.Dispatched = agentturn.PendingDeferred, len(c.Dispatches) > 0
+			p.Decision = holdDecision(c)
 		case agentsession.CallInFlight:
 			p.Reason = agentturn.PendingAborted
 		case agentsession.CallAnswered:
@@ -1855,6 +1857,18 @@ func refusal(s *agentsession.Session, callID string) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+// holdDecision is the hook's deferral a held call's latest hold
+// decision records: its reason and who held it, as the loop's
+// PendingCall.Decision carries them for a call it deferred.
+func holdDecision(c *agentsession.Call) *agentturn.ToolDecision {
+	for i := len(c.Decisions) - 1; i >= 0; i-- {
+		if d := c.Decisions[i]; d.Verdict == agentsession.VerdictHold {
+			return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: d.Reason, By: d.By, Args: d.Args}
+		}
+	}
+	return nil
 }
 
 // replayAnswer is the answer to one call that may have run.
