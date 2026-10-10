@@ -453,6 +453,13 @@ type ToolDecision struct {
 	// result and the note together, in that order, in the same turn. It
 	// applies to an allowed call; a blocked call carries its Reason.
 	Note string
+	// Held, on a Defer, says the call is deferred only because another
+	// call of its batch waits on someone: nobody is asked about it, and
+	// whoever answers the batch decides it. A policy engine that holds
+	// the calls it would allow beside one it asks about sets it, so a
+	// front that has only the run's end ([PendingCall.Decision]) asks
+	// about the other call alone. The loop does nothing else with it.
+	Held bool
 }
 
 // ToolResultInfo describes a completed call.

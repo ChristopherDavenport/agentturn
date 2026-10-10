@@ -7,6 +7,13 @@ versions may break the API.
 
 ## Unreleased
 
+- Added: `ToolDecision.Held`, on a Defer: the call is deferred only
+  because another call of its batch waits on someone, and is decided
+  with the batch. It travels on `PendingCall.Decision`, so a front with
+  only the run's end can tell the call a rule asked about from the ones
+  held beside it. agentpolicy sets it next. The session format has no
+  member for it yet, so a resumed session's held calls carry none.
+  (#227)
 - Added: `session.Pending` sets `PendingCall.Decision` from the record's
   hold decision (its reason, who held it, the arguments it held), so a
   front over a resumed session shows the rule that asked, as it does
