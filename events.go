@@ -673,8 +673,10 @@ type PendingCall struct {
 	// and By who held it. It travels with the run's end, so a front
 	// that has only the [RunEnd] can say why the call waits. The loop
 	// sets it for a call a hook deferred in a run and keeps it while
-	// the call stays deferred. It is nil for every other call, and for
-	// a deferred call held before the agent was built.
+	// the call stays deferred; agentturn/session's Pending sets it from
+	// the record's hold decision. It is nil for every other call, and
+	// for a deferred call held before the agent was built, unless a
+	// record says why.
 	Decision *ToolDecision
 }
 

@@ -1567,7 +1567,7 @@ func TestNestedCallsAreRecorded(t *testing.T) {
 // the hook deferred and the user answered through the elicitor has the
 // question under the call that made it, then the answer as its
 // decision, by the user. What the user said with the answer is on the
-// answer entry.
+// answer entry, and a refusal's reaches the decision's reason.
 func TestAskedNestedCallsAreRecorded(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -1655,6 +1655,9 @@ func TestAskedNestedCallsAreRecorded(t *testing.T) {
 			}
 			if answer.Action != string(tc.action) || answer.Note != tc.note || answer.By != agentsession.ByHuman {
 				t.Errorf("answer entry = %+v, want %s by human with note %q", answer, tc.action, tc.note)
+			}
+			if tc.note != "" && !strings.Contains(start.Reason, tc.note) {
+				t.Errorf("start entry's reason %q leaves out the note %q", start.Reason, tc.note)
 			}
 			if questions[0].CallID != parent.ID() || questions[1].CallID != parent.ID() {
 				t.Errorf("the entries name calls %q and %q, want the invoking call %s", questions[0].CallID, questions[1].CallID, parent.ID())

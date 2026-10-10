@@ -5,6 +5,13 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Added: `session.Pending` sets `PendingCall.Decision` from the record's
+  hold decision (its reason, who held it, the arguments it held), so a
+  front over a resumed session shows the rule that asked, as it does
+  for a call held in this process. (#224)
+
 ## v0.0.19 - 2026-10-10
 
 - Added: **`Control`, the human plane's contract.** The methods a
