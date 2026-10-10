@@ -621,3 +621,109 @@ func TestDialRefusesWhatIsNotTheProtocol(t *testing.T) {
 		t.Error("dialled ftp")
 	}
 }
+
+// endWatcher subscribes to a in process and hands over its run ends.
+func endWatcher(a *agentturn.Agent) <-chan *agentturn.RunEnd {
+	ends := make(chan *agentturn.RunEnd, 4)
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if e, ok := ev.(*agentturn.RunEnd); ok {
+			ends <- e
+		}
+		return nil
+	})
+	return ends
+}
+
+// TestADroppedConnectionDoesNotAbortTheRun cuts the connection under a
+// Prompt: the client says the connection was lost, and the run goes on
+// to its end on the agent, where another subscriber sees it.
+func TestADroppedConnectionDoesNotAbortTheRun(t *testing.T) {
+	running, release := make(chan struct{}, 1), make(chan struct{})
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, MaxTurns: 1, Tools: []agenttool.Tool{blocker(running, release)}})
+	ends := endWatcher(a)
+	srv := httptest.NewServer(Handler(a, WithInsecureNoAuth()))
+	defer srv.Close()
+	c, err := Dial(t.Context(), srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	errs := make(chan error, 1)
+	go func() {
+		_, err := c.Prompt(context.Background(), openresponses.UserText("go"))
+		errs <- err
+	}()
+	<-running
+	srv.CloseClientConnections()
+	select {
+	case err := <-errs:
+		if !errors.Is(err, ErrConnectionLost) {
+			t.Fatalf("Prompt over a cut connection = %v, want ErrConnectionLost", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Prompt did not return when its connection was cut")
+	}
+	if s := a.State(); !s.Running {
+		t.Fatal("the run stopped with its connection")
+	}
+	close(release)
+	select {
+	case end := <-ends:
+		if end.Reason == agentturn.ReasonAborted || end.Err != nil {
+			t.Errorf("the run ended %s (%v), want it to finish", end.Reason, end.Err)
+		}
+		if lastOutput(end.Items) != "released" {
+			t.Errorf("end = %+v", end)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run did not end")
+	}
+}
+
+// TestACancelledCallerAbortsTheRun keeps the in-process meaning of the
+// caller's context: cancelling it aborts the run, through /abort.
+func TestACancelledCallerAbortsTheRun(t *testing.T) {
+	running, release := make(chan struct{}, 1), make(chan struct{})
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{blocker(running, release)}})
+	ends := endWatcher(a)
+	c := serve(t, a)
+	// Registered after serve, so it runs first: a run the cancel failed
+	// to abort is let go, and the server closes, rather than the test
+	// hanging on it.
+	t.Cleanup(func() { close(release) })
+	ctx, cancel := context.WithCancel(t.Context())
+	errs := make(chan error, 1)
+	go func() {
+		_, err := c.Prompt(ctx, openresponses.UserText("go"))
+		errs <- err
+	}()
+	<-running
+	cancel()
+	if err := <-errs; !errors.Is(err, context.Canceled) || errors.Is(err, ErrConnectionLost) {
+		t.Errorf("Prompt = %v, want the context's error", err)
+	}
+	select {
+	case end := <-ends:
+		if end.Reason != agentturn.ReasonAborted {
+			t.Errorf("the run ended %s, want aborted", end.Reason)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelling the caller did not abort the run")
+	}
+}
+
+// TestATransportFailureIsALostConnection checks a server that is gone
+// is ErrConnectionLost, not an answer.
+func TestATransportFailureIsALostConnection(t *testing.T) {
+	srv := httptest.NewServer(Handler(&recorder{}, WithInsecureNoAuth()))
+	c, err := Dial(t.Context(), srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.Close()
+	if _, err := c.Prompt(t.Context(), openresponses.UserText("x")); !errors.Is(err, ErrConnectionLost) {
+		t.Errorf("Prompt = %v", err)
+	}
+	if _, err := c.Resume(t.Context(), agentturn.Approve("c")); !errors.Is(err, ErrConnectionLost) {
+		t.Errorf("Resume = %v", err)
+	}
+}

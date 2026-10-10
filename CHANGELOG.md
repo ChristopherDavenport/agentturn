@@ -19,7 +19,12 @@ versions may break the API.
   scope implies) or command. The principal rides on the call's context
   (`PrincipalFrom`), and a run it starts or answers carries a trigger
   of kind "control" naming it. A product's own controls are named
-  commands (`WithCommands`, `Client.Command`). A stream that falls
+  commands (`WithCommands`, `Client.Command`). A run belongs to the
+  agent, not to the request that started it: a dropped connection does
+  not abort it, only `Abort` does. The client keeps the in-process
+  meaning of its caller's context: cancelling it sends the abort, and a
+  connection lost while the caller waits returns `ErrConnectionLost`,
+  the run perhaps still going. A stream that falls
   behind is cut with an overflow rather than waited on, and a client
   reconnects and is sent a waiting question again; what is committed
   comes from the record.

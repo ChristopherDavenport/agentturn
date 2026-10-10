@@ -202,8 +202,13 @@ type handler struct {
 // Every request is authenticated ([WithAuthenticator]); the principal
 // rides on the call's context ([PrincipalFrom]), and a run it starts or
 // answers carries an agentturn.Trigger of kind "control" naming it.
-// Prompt and Resume run on the request's context, so a client that
-// goes away aborts the run as a cancelled context does in process.
+// Prompt and Resume run on the request's context with its
+// cancellation lifted (context.WithoutCancel, the principal and the
+// trigger kept), so a run goes on when its client goes away: over a
+// wire a dropped connection is not the person's intent. Only POST
+// /abort aborts a run; a [Client] whose caller cancels sends it. The
+// run's end still reaches the event stream and the record when the
+// response that would have carried it cannot be written.
 //
 // The stream carries the agent's events in [MarshalEvent]'s form, one
 // per "data:" frame, in the order the agent delivers them, after a
@@ -296,7 +301,7 @@ func (h *handler) prompt(w http.ResponseWriter, r *http.Request, _ Principal) {
 		writeFailure(w, http.StatusBadRequest, err)
 		return
 	}
-	h.writeRun(w, func() (*agentturn.RunEnd, error) { return h.c.Prompt(r.Context(), items...) })
+	h.writeRun(w, func() (*agentturn.RunEnd, error) { return h.c.Prompt(context.WithoutCancel(r.Context()), items...) })
 }
 
 func (h *handler) resume(w http.ResponseWriter, r *http.Request, _ Principal) {
@@ -311,7 +316,7 @@ func (h *handler) resume(w http.ResponseWriter, r *http.Request, _ Principal) {
 		writeFailure(w, http.StatusBadRequest, err)
 		return
 	}
-	h.writeRun(w, func() (*agentturn.RunEnd, error) { return h.c.Resume(r.Context(), answers...) })
+	h.writeRun(w, func() (*agentturn.RunEnd, error) { return h.c.Resume(context.WithoutCancel(r.Context()), answers...) })
 }
 
 func (h *handler) writeRun(w http.ResponseWriter, run func() (*agentturn.RunEnd, error)) {

@@ -18,6 +18,13 @@
 // beside this handler), and the stream replays nothing but a question
 // still waiting.
 //
+// A run belongs to the agent, not to the request that started it: a
+// connection that drops does not abort it, since over a wire that is
+// not the person's intent, and only an abort does. A [Client] keeps the
+// in-process meaning of its caller's context: cancelling it sends the
+// abort, and a connection lost while the caller still waits returns
+// [ErrConnectionLost], with the run perhaps still going.
+//
 // Every request is authenticated ([WithAuthenticator], or
 // [WithInsecureNoAuth] for tests) and each method needs a scope:
 // read, control, answer (which no other scope implies, since it lets a

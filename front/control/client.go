@@ -39,6 +39,14 @@ import (
 //     wrapping [ErrStreamBroken], so a view knows to catch up.
 //   - Errors are *[RemoteError]s: their text, and errors.Is for the
 //     agentturn sentinels they matched.
+//   - Prompt and Resume keep the caller's intent, not the connection's
+//     fate. A caller that cancels its context aborts the run, as in
+//     process: the client sends Abort and returns the context's error.
+//     A connection that fails while the caller still waits does not
+//     abort it, since the server runs it apart from the request: the
+//     call returns an error wrapping [ErrConnectionLost], the run may
+//     still be going, and the caller follows it with Subscribe and
+//     State, or the record.
 type Client struct {
 	base     *url.URL
 	hc       *http.Client
@@ -78,6 +86,17 @@ func WithReconnectDelay(d time.Duration) DialOption { return func(c *Client) { c
 func WithMaxResponseBytes(n int64) DialOption {
 	return func(c *Client) { c.maxBody, c.maxFrame = n, int(n) }
 }
+
+// ErrConnectionLost wraps the transport's failure when a Prompt or a
+// Resume lost its connection while its caller still waited: the run
+// was not aborted and may still be going on the agent.
+var ErrConnectionLost = errors.New("control: the connection was lost; the run may still be going")
+
+// lostError marks a transport failure, as opposed to an answer.
+type lostError struct{ err error }
+
+func (e *lostError) Error() string { return e.err.Error() }
+func (e *lostError) Unwrap() error { return e.err }
 
 // ErrStreamBroken wraps what a broken event stream reports to the
 // [WithStreamErrors] function: events may have been missed.
@@ -136,12 +155,12 @@ func (c *Client) call(ctx context.Context, method, path string, body, out any) e
 	c.authorize(req)
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return err
+		return &lostError{err}
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, c.maxBody+1))
 	if err != nil {
-		return err
+		return &lostError{err}
 	}
 	if int64(len(data)) > c.maxBody {
 		return fmt.Errorf("control: response over %d bytes", c.maxBody)
@@ -168,6 +187,16 @@ func (c *Client) authorize(req *http.Request) {
 func (c *Client) run(ctx context.Context, path string, body any) (*agentturn.RunEnd, error) {
 	var out runReply
 	if err := c.call(ctx, http.MethodPost, path, body, &out); err != nil {
+		var lost *lostError
+		switch {
+		case ctx.Err() != nil:
+			// The caller's intent: abort the run, which the server keeps
+			// going past a closed request.
+			c.Abort()
+			return nil, ctx.Err()
+		case errors.As(err, &lost):
+			return nil, fmt.Errorf("%w: %w", ErrConnectionLost, lost.err)
+		}
 		return nil, err
 	}
 	var end *agentturn.RunEnd
@@ -181,7 +210,7 @@ func (c *Client) run(ctx context.Context, path string, body any) (*agentturn.Run
 }
 
 // Prompt implements agentturn.Control. Cancelling ctx aborts the run,
-// as it does in process.
+// as it does in process; a lost connection does not (see [Client]).
 func (c *Client) Prompt(ctx context.Context, items ...openresponses.Item) (*agentturn.RunEnd, error) {
 	raw, err := itemsOut(items)
 	if err != nil {
