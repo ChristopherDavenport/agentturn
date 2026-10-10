@@ -25,8 +25,7 @@ versions may break the API.
   (#224)
 - Added: **`PendingCall.Decision`**, the `BeforeToolCall` decision
   that deferred a call, so a front that has only the run's end can show
-  the rule that asked. The loop keeps it while the call stays deferred,
-  and `session.Pending` reads it from the record's hold decision.
+  the rule that asked. The loop keeps it while the call stays deferred.
   (#224)
 - Security: `tools/a2a` requires golang.org/x/net v0.60.0, which fixes
   GO-2026-6617, GO-2026-6612, GO-2026-6611 and GO-2026-6603 in its

@@ -1433,34 +1433,3 @@ func TestOriginsReadUnderTheCallersContext(t *testing.T) {
 		})
 	}
 }
-
-// TestPendingCarriesTheHold pins that Pending gives a held call the
-// hold decision the record has, the rule that asked and who held it,
-// as the loop's PendingCall.Decision gives it in the run that held it.
-func TestPendingCarriesTheHold(t *testing.T) {
-	store := agentsession.NewMemoryStore()
-	rec, s, err := Start(context.Background(), store, agentsession.Header{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	act := agenttool.New("act", "", func(context.Context, echoArgs) (string, error) { return "done", nil })
-	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{act},
-		BeforeToolCall: func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
-			return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "rule r", By: agentsession.ByPolicy}, nil
-		}})
-	defer rec.Attach(a)()
-	end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
-	if err != nil || end.Reason != agentturn.ReasonInputRequired {
-		t.Fatalf("prompt: err=%v end=%+v", err, end)
-	}
-	pending, err := Pending(s)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(pending) != 1 || pending[0].Reason != agentturn.PendingDeferred {
-		t.Fatalf("pending = %+v", pending)
-	}
-	if d := pending[0].Decision; d == nil || d.Action != agentturn.Defer || d.Reason != "rule r" || d.By != agentsession.ByPolicy {
-		t.Errorf("decision = %+v, want the hold's", d)
-	}
-}
