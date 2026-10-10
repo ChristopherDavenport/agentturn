@@ -322,11 +322,11 @@ func TestASubscriberThatFailsOnAQuestionGivesItUp(t *testing.T) {
 // deferred call's PendingCall carries the decision that held it, on the
 // run's end and in State, and keeps it through a resume that fails
 // before its batch; a call that is not deferred carries none. #227: a
-// hook's Held mark travels with it.
+// hook's Held mark and Subject travel with it.
 func TestPendingCarriesTheDeferringDecision(t *testing.T) {
 	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)},
 		BeforeToolCall: func(context.Context, ToolCallInfo) (*ToolDecision, error) {
-			return &ToolDecision{Action: Defer, Reason: "rule r", By: "policy", Held: true}, nil
+			return &ToolDecision{Action: Defer, Reason: "rule r", By: "policy", Held: true, Subject: "rm -rf build"}, nil
 		}})
 	end, err := a.Prompt(context.Background(), openresponses.UserText("abc"))
 	if err != nil {
@@ -337,7 +337,7 @@ func TestPendingCarriesTheDeferringDecision(t *testing.T) {
 		if len(pending) != 1 || pending[0].Reason != PendingDeferred {
 			t.Fatalf("%s: pending = %+v", where, pending)
 		}
-		if d := pending[0].Decision; d == nil || d.Action != Defer || d.Reason != "rule r" || d.By != "policy" || !d.Held {
+		if d := pending[0].Decision; d == nil || d.Action != Defer || d.Reason != "rule r" || d.By != "policy" || !d.Held || d.Subject != "rm -rf build" {
 			t.Errorf("%s: decision = %+v", where, d)
 		}
 	}
