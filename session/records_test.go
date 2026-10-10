@@ -1566,15 +1566,18 @@ func TestNestedCallsAreRecorded(t *testing.T) {
 // TestAskedNestedCallsAreRecorded pins #200's record: a nested call
 // the hook deferred and the user answered through the elicitor has the
 // question under the call that made it, then the answer as its
-// decision, by the user.
+// decision, by the user. What the user said with the answer is on the
+// answer entry.
 func TestAskedNestedCallsAreRecorded(t *testing.T) {
 	cases := []struct {
 		name    string
 		action  agenttool.Action
+		note    string
 		verdict string
 	}{
 		{name: "accept", action: agenttool.ActionAccept, verdict: agentsession.VerdictProceed},
 		{name: "decline", action: agenttool.ActionDecline, verdict: agentsession.VerdictReject},
+		{name: "decline, with a note", action: agenttool.ActionDecline, note: "push from CI", verdict: agentsession.VerdictReject},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1598,7 +1601,7 @@ func TestAskedNestedCallsAreRecorded(t *testing.T) {
 				return nil, nil
 			}
 			user := func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
-				return agenttool.Answer{Action: tc.action}, nil
+				return agenttool.Answer{Action: tc.action, Note: tc.note}, nil
 			}
 			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{eval, bash},
 				BeforeToolCall: policy, ToolElicitor: rec.Elicitor(agentsession.ByHuman, user), MaxTurns: 1})
@@ -1650,8 +1653,8 @@ func TestAskedNestedCallsAreRecorded(t *testing.T) {
 			if answer.Call != start.CallID || answer.Tool != "bash" || answer.Parent != parent.ID() || answer.Asked != questions[0].ID {
 				t.Errorf("answer entry = %+v, want it about nested call %s naming ask entry %s", answer, start.CallID, questions[0].ID)
 			}
-			if answer.Action != string(tc.action) || answer.By != agentsession.ByHuman {
-				t.Errorf("answer entry = %+v, want %s by human", answer, tc.action)
+			if answer.Action != string(tc.action) || answer.Note != tc.note || answer.By != agentsession.ByHuman {
+				t.Errorf("answer entry = %+v, want %s by human with note %q", answer, tc.action, tc.note)
 			}
 			if questions[0].CallID != parent.ID() || questions[1].CallID != parent.ID() {
 				t.Errorf("the entries name calls %q and %q, want the invoking call %s", questions[0].CallID, questions[1].CallID, parent.ID())

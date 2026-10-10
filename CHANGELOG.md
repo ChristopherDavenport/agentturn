@@ -27,6 +27,12 @@ versions may break the API.
   that deferred a call, so a front that has only the run's end can show
   the rule that asked. The loop keeps it while the call stays deferred.
   (#224)
+- Added: **what the user said reaches the model.** `Ask` passes on
+  agenttool's `Answer.Note`: a refusal's note ends the reason the model
+  is told ("declined when asked: <rule>; the user said: <note>"), and an
+  approval's is the decision's `Note`, read with the call's result. The
+  session recorder writes it on the elicitation's answer entry
+  (`Elicitation.Note`). Requires agenttool vX.Y.Z. (#224)
 - Security: `tools/a2a` requires golang.org/x/net v0.60.0, which fixes
   GO-2026-6617, GO-2026-6612, GO-2026-6611 and GO-2026-6603 in its
   HTTP/2 code. That version of x/net needs Go 1.26, so `tools/a2a` now
