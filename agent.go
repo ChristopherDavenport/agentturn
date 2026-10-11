@@ -498,8 +498,9 @@ type Answer struct {
 	// is what was said at answer time: a policy's note on a call it held
 	// is the holding decision's Note, which the loop says itself when an
 	// approval releases the call, and does not belong here. An
-	// approval's note on a call that then never reaches its tool is not
-	// kept: the answer that approves it again brings it again.
+	// approval's note on a call that then never reaches its tool, cut or
+	// deferred again, is kept with the call until it runs or is refused;
+	// the same note on the answer that approves it again is said once.
 	Note string
 	// Terminate ends the run with ReasonStopped and StopRefused once
 	// every answer is in, without calling the model, for a refusal that
@@ -704,7 +705,8 @@ func (a Answer) WithRunAgain() Answer {
 // developer message, or the one BeforeToolCall gives a call it decides
 // now; with nothing approved they follow the answers' outputs. A call
 // the batch defers keeps them waiting for the run that answers it, and
-// a call that never reaches its tool keeps none. Anything
+// a note equal to one already held for the same call is said once
+// ([Note.CallID]). Anything
 // steered in meanwhile follows. A batch whose results set
 // Terminate ends the run with ReasonStopped without calling the model,
 // and so does any answer built with [Refuse]. Otherwise the model is

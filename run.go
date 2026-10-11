@@ -743,13 +743,14 @@ type answerNote struct {
 
 // holdNotesOf queues the notes of a call of a batch: the person's and
 // the decision's, then those said under it while it ran. A call that
-// never reached its tool, deferred, or cut or refused before its
-// dispatch, and left without an output holds none: the hook's next
-// decision on it gives its own, and the person's comes back with the
-// answer that approves it again.
+// never reached its tool keeps its notes too, until it runs or is
+// refused: a person's words are never dropped. What is said about it
+// again, by a hook that decides it again or an answer a host retries,
+// is said once ([runner.hold]).
 func (r *runner) holdNotesOf(p *callState) {
-	if p.appended || p.dispatched {
-		r.notes = append(r.notes, p.notes...)
+	for _, n := range p.notes {
+		n.CallID = p.call.CallID
+		r.hold(n)
 	}
 	p.notes = nil
 	r.noteMu.Lock()
@@ -757,8 +758,32 @@ func (r *runner) holdNotesOf(p *callState) {
 	delete(r.callNotes, p.call.CallID)
 	r.noteMu.Unlock()
 	for _, item := range said {
-		r.notes = append(r.notes, Note{Item: item, Mode: InputTool})
+		r.hold(Note{Item: item, Mode: InputTool, CallID: p.call.CallID})
 	}
+}
+
+// hold adds n to the waiting set unless a note equal to it is already
+// held for the same call: the same call, the same mode, and the same
+// item, a message by its role and text.
+func (r *runner) hold(n Note) {
+	for _, h := range r.notes {
+		if h.CallID == n.CallID && h.Mode == n.Mode && sameNoteItem(h.Item, n.Item) {
+			return
+		}
+	}
+	r.notes = append(r.notes, n)
+}
+
+// sameNoteItem reports whether two notes' items say the same thing.
+func sameNoteItem(a, b openresponses.Item) bool {
+	am, aok := a.(*openresponses.Message)
+	bm, bok := b.(*openresponses.Message)
+	if aok && bok {
+		return am.Role == bm.Role && am.Text() == bm.Text()
+	}
+	ja, errA := json.Marshal(a)
+	jb, errB := json.Marshal(b)
+	return errA == nil && errB == nil && string(ja) == string(jb)
 }
 
 // flushNotes appends the notes waiting on a batch that is now complete,
@@ -1048,7 +1073,7 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 		held := false
 		for _, n := range r.resumeNotes {
 			if n.callID == id {
-				r.notes = append(r.notes, Note{Item: n.item, Mode: InputResume, Trigger: trigger})
+				r.hold(Note{Item: n.item, Mode: InputResume, Trigger: trigger, CallID: id})
 				held = true
 			}
 		}

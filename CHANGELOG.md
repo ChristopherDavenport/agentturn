@@ -12,20 +12,26 @@ versions may break the API.
   carries, so a note held across runs is appended as it would have been
   had nothing waited: a hook's note stays the tool's, not the Resume's.
   `front/control` carries them.
-- Changed, behaviour: a call that never reached its tool, deferred, or
-  cut, refused or failed before its dispatch, holds no note. The hook's
-  next decision on it gives its own, and a person's note comes back
-  with the answer that approves it again, so neither is said twice.
-  v0.0.23 held them and said them again. A deferral no longer holds the
-  person's note on the approval it deferred.
+- Fixed: a note is held once per call. A call's held notes stay with it
+  until it runs or is refused, and a note equal to one already held for
+  that call (same mode, same message) is not held again
+  (`Note.CallID`). So a hook that decides a cut or withdrawn call again
+  and gives the same note, or a host that retries an approval with the
+  same note, says it once, where v0.0.23 said it twice; a different note
+  is said too, after it. A person's note on an approval the hook defers
+  again stays held with the call and follows its output when it finally
+  runs, or the refusal when it is refused: a person's words are never
+  dropped.
 - Changed, behaviour: the note of a decision that held a call
   (`ToolDecision.Note` on a Defer) is the policy's, and the loop says it
   itself, as a developer message after the batch's outputs, once, when
   an approval through `Resume` releases the call, in process or from
-  `PendingCall.Decision` after a restart. `Answer.Note` is only ever a
-  person's: a policy engine releasing the calls it held must not put its
-  hook's note there, or the model reads it as the user's words. The
-  docs of `ToolDecision.Note` and `Answer.Note` say so.
+  `PendingCall.Decision` after a restart. `Answer.Note` is only what the
+  answerer said at answer time: a policy engine releasing the calls it
+  held must not put its hook's note there, or it is said twice. The
+  release note goes through the same per-call de-duplication, so a note
+  already held for the call is said once. The docs of `ToolDecision.Note`
+  and `Answer.Note` say so.
 - Fixed: a note leaves the waiting set only once it is in the
   transcript, so a subscriber failing part way through leaves the rest
   waiting; with no call left pending the run's end carries them as the

@@ -463,9 +463,10 @@ type ToolDecision struct {
 	// to a call the decision deferred once an approval through
 	// [Agent.Resume] releases it, when the loop says it once, after the
 	// released batch's outputs; it travels on [PendingCall.Decision]
-	// until then. A blocked call carries its Reason, and a call that
-	// never reached its tool says nothing: the next decision on it
-	// gives its own.
+	// until then. A blocked call carries its Reason. A call that never
+	// reached its tool keeps its note until it runs or is refused, and
+	// the same note given again, by the next decision on the call, is
+	// said once.
 	Note string
 	// Held, on a Defer, says the call is deferred only because another
 	// call of its batch waits on someone: nobody is asked about it, and

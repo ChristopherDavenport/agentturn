@@ -705,13 +705,14 @@ type PendingCall struct {
 	// does, from the record. nil for every other call.
 	Question *OpenQuestion
 	// Notes are the notes waiting on the outputs of the pending calls:
-	// what a decision or a person said about a call of their batch that
-	// ran, or about a call a Resume answered, held because another call
-	// of the batch was deferred or cut before its output, so that
-	// nothing comes between the calls and their outputs. A call that
-	// never reached its tool holds no note: the hook's next decision on
-	// it gives its own, and a person's comes back with the answer that
-	// approves it again. The loop puts them on the last pending call,
+	// what a decision or a person said about a call of their batch,
+	// held because a call of it was deferred or cut before its output,
+	// so that nothing comes between the calls and their outputs. A call
+	// that never reached its tool keeps its notes until it runs or is
+	// refused, and they follow the outputs then: a person's words are
+	// never dropped. A note said again about the same call, by a hook
+	// that decides it again or an answer a host retries, is held once
+	// ([Note.CallID]). The loop puts them on the last pending call,
 	// since the calls pending at once are of one batch, and the run that
 	// answers the calls appends them after the outputs, before anything
 	// else it brings, each as it arrived the first time. An [Agent]
@@ -736,6 +737,12 @@ type Note struct {
 	// that brought a note on an output answer, and none for a note on a
 	// call of a batch.
 	Trigger Trigger
+	// CallID is the call the note was said about, for a nested call or a
+	// tool's question the batch call it was made under. A note equal to
+	// one already held for the same call, the same mode and the same
+	// message, is not held again, so a hook that decides a call again or
+	// a host that retries an answer says it once.
+	CallID string
 }
 
 // NotesHeld reports the notes now waiting on the pending calls'

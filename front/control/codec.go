@@ -553,6 +553,7 @@ type wireNote struct {
 	Item    json.RawMessage `json:"item"`
 	Mode    string          `json:"mode,omitempty"`
 	Trigger *wireTrigger    `json:"trigger,omitempty"`
+	CallID  string          `json:"call_id,omitempty"`
 }
 
 type wireNotesHeld struct {
@@ -568,7 +569,7 @@ func notesOut(in []agentturn.Note) ([]wireNote, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, wireNote{Item: item, Mode: string(n.Mode), Trigger: triggerOut(n.Trigger)})
+		out = append(out, wireNote{Item: item, Mode: string(n.Mode), Trigger: triggerOut(n.Trigger), CallID: n.CallID})
 	}
 	return out, nil
 }
@@ -580,7 +581,7 @@ func notesIn(in []wireNote) ([]agentturn.Note, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, agentturn.Note{Item: item, Mode: agentturn.InputMode(w.Mode), Trigger: triggerIn(w.Trigger)})
+		out = append(out, agentturn.Note{Item: item, Mode: agentturn.InputMode(w.Mode), Trigger: triggerIn(w.Trigger), CallID: w.CallID})
 	}
 	return out, nil
 }
