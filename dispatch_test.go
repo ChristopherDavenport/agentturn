@@ -126,6 +126,13 @@ func TestToolDispatchFailureStopsTheCall(t *testing.T) {
 	if len(end.Pending) != 1 || end.Pending[0].Reason != PendingUndispatched {
 		t.Errorf("pending: %v", pendingReasons(end))
 	}
+	// Its tool_end says so too, for a recorder that wrote the dispatch
+	// before the subscriber failed (#119).
+	for _, ev := range events {
+		if e, ok := ev.(*ToolEnd); ok && !e.Withdrawn {
+			t.Errorf("tool_end of the refused dispatch: %+v, want withdrawn", e)
+		}
+	}
 }
 
 // pgRecord is a record a tool leaves while it runs.

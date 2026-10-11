@@ -48,16 +48,18 @@ func sampleEvents(t *testing.T) map[string]agentturn.Event {
 		"ToolStart":    &agentturn.ToolStart{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Args: json.RawMessage(`{"text":"a"}`), Decision: decision, Parent: "call_0"},
 		"ToolDispatch": &agentturn.ToolDispatch{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Parent: "call_0", IdempotencyKey: "k"},
 		"ToolUpdate":   &agentturn.ToolUpdate{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Partial: result},
-		"ToolEnd":      &agentturn.ToolEnd{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Result: result, Err: errors.New("boom"), Blocked: true, Deferred: true, Reason: "r", Parent: "call_0"},
+		"ToolEnd":      &agentturn.ToolEnd{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Result: result, Err: errors.New("boom"), Blocked: true, Deferred: true, Reason: "r", Parent: "call_0", Withdrawn: true},
 		"TurnEnd":      &agentturn.TurnEnd{RunID: "run_1", Turn: 1, Response: resp, ToolResults: []agenttool.Result{result}},
 		"RunEnd": &agentturn.RunEnd{RunID: "run_1", Items: openresponses.Items{openresponses.UserText("hi"), call, out}, Reason: agentturn.ReasonInputRequired,
 			Cause: agentturn.StopGuard, Err: agentturn.ErrRunning, Withheld: true, Pending: []agentturn.PendingCall{{
 				Call: call, Reason: agentturn.PendingDeferred, Tool: remoteUpper(), Dispatched: true, IdempotencyKey: "k", Args: json.RawMessage(`{"text":"b"}`),
 				Ran: out, RanWhere: "branch", Refused: "no", Decision: decision,
+				Notes:    openresponses.Items{openresponses.DeveloperText("a ran in the sandbox")},
+				Question: &agentturn.OpenQuestion{ID: "entry_1", Message: "Allow notify?", Call: &agentturn.AskedCall{Parent: "call_1", CallID: "call_2", Name: "notify"}},
 			}}},
 		"Queued":         &agentturn.Queued{RunID: "run_1", Item: openresponses.UserText("more"), Mode: agentturn.QueueSteer, Hidden: true, Trigger: trigger},
 		"Question":       &agentturn.Question{ID: "question_1", RunID: "run_1", CallID: "call_0", Call: &agentturn.AskedCall{Parent: "call_0", CallID: "call_1", Name: "upper", Args: json.RawMessage(`{}`), Decision: decision}, Elicitation: agenttool.Elicitation{Message: "ok?", Schema: json.RawMessage(`{"type":"object"}`), URL: "https://example.test"}},
-		"QuestionClosed": &agentturn.QuestionClosed{ID: "question_1", RunID: "run_1", Answer: &agenttool.Answer{Action: agenttool.ActionDecline, Content: json.RawMessage(`{"a":1}`), Note: "not now"}},
+		"QuestionClosed": &agentturn.QuestionClosed{ID: "question_1", RunID: "run_1", Answer: &agenttool.Answer{Action: agenttool.ActionDecline, Content: json.RawMessage(`{"a":1}`), Note: "not now"}, By: trigger},
 	}
 }
 
@@ -183,6 +185,12 @@ func TestWhatTravelsAsADescription(t *testing.T) {
 	if p.Call.CallID != "call_1" || p.Ran.CallID != "call_1" {
 		t.Errorf("pending = %+v", p)
 	}
+	if len(p.Notes) != 1 || p.Notes[0].(*openresponses.Message).Text() != "a ran in the sandbox" {
+		t.Errorf("notes = %v", p.Notes)
+	}
+	if q := p.Question; q == nil || q.ID != "entry_1" || q.Reason() != `a question was open: "Allow notify?" about call call_2 (notify)` || q.Call.Parent != "call_1" {
+		t.Errorf("question = %+v", p.Question)
+	}
 	retry := decode(samples["ModelRetry"]).(*agentturn.ModelRetry)
 	if retry.Delay != 1500*time.Millisecond || !errors.Is(retry.Err, agentturn.ErrNoModel) {
 		t.Errorf("retry = %+v", retry)
@@ -192,7 +200,7 @@ func TestWhatTravelsAsADescription(t *testing.T) {
 		t.Errorf("details = %#v", te.Result.Details)
 	}
 	closed := decode(samples["QuestionClosed"]).(*agentturn.QuestionClosed)
-	if closed.Answer == nil || closed.Answer.Note != "not now" || closed.Answer.Action != agenttool.ActionDecline {
+	if closed.Answer == nil || closed.Answer.Note != "not now" || closed.Answer.Action != agenttool.ActionDecline || closed.By.Ref != "alice" {
 		t.Errorf("closed = %+v", closed)
 	}
 }

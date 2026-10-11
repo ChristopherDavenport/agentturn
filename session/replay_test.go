@@ -1435,32 +1435,57 @@ func TestOriginsReadUnderTheCallersContext(t *testing.T) {
 }
 
 // TestPendingCarriesTheHold pins that Pending gives a held call the
-// hold decision the record has, the rule that asked and who held it,
-// as the loop's PendingCall.Decision gives it in the run that held it.
+// hold decision the record has, the rule that asked, who held it, the
+// part of the call it is about and whether it is held only beside
+// another, as the loop's PendingCall.Decision gives it in the run that
+// held it, after the session is read again from its store (#238).
 func TestPendingCarriesTheHold(t *testing.T) {
-	store := agentsession.NewMemoryStore()
-	rec, s, err := Start(context.Background(), store, agentsession.Header{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	act := agenttool.New("act", "", func(context.Context, echoArgs) (string, error) { return "done", nil })
-	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{act},
-		BeforeToolCall: func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
-			return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "rule r", By: agentsession.ByPolicy}, nil
-		}})
-	defer rec.Attach(a)()
-	end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
-	if err != nil || end.Reason != agentturn.ReasonInputRequired {
-		t.Fatalf("prompt: err=%v end=%+v", err, end)
-	}
-	pending, err := Pending(s)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(pending) != 1 || pending[0].Reason != agentturn.PendingDeferred {
-		t.Fatalf("pending = %+v", pending)
-	}
-	if d := pending[0].Decision; d == nil || d.Action != agentturn.Defer || d.Reason != "rule r" || d.By != agentsession.ByPolicy {
-		t.Errorf("decision = %+v, want the hold's", d)
+	for _, tc := range []struct {
+		name    string
+		subject string
+		held    bool
+	}{
+		{name: "asked"},
+		{name: "asked about a part", subject: "rm -rf build"},
+		{name: "held beside another", held: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			act := agenttool.New("act", "", func(context.Context, echoArgs) (string, error) { return "done", nil })
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{act},
+				BeforeToolCall: func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+					return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "rule r", By: agentsession.ByPolicy, Subject: tc.subject, Held: tc.held}, nil
+				}})
+			defer rec.Attach(a)()
+			end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+			if err != nil || end.Reason != agentturn.ReasonInputRequired {
+				t.Fatalf("prompt: err=%v end=%+v", err, end)
+			}
+			read, err := store.Open(context.Background(), s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			pending, err := Pending(read)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(pending) != 1 || pending[0].Reason != agentturn.PendingDeferred {
+				t.Fatalf("pending = %+v", pending)
+			}
+			d := pending[0].Decision
+			if d == nil || d.Action != agentturn.Defer || d.Reason != "rule r" || d.By != agentsession.ByPolicy {
+				t.Fatalf("decision = %+v, want the hold's", d)
+			}
+			if d.Subject != tc.subject || d.Held != tc.held {
+				t.Errorf("decision subject %q held %v, want %q %v", d.Subject, d.Held, tc.subject, tc.held)
+			}
+			if live := end.Pending[0].Decision; live.Subject != d.Subject || live.Held != d.Held {
+				t.Errorf("run end's decision subject %q held %v, the record's %q %v", live.Subject, live.Held, d.Subject, d.Held)
+			}
+		})
 	}
 }

@@ -297,7 +297,7 @@ func TestQuestionsCrossTheWire(t *testing.T) {
 					if e.ID != q.ID {
 						t.Errorf("the late subscriber got question %s, want %s", e.ID, q.ID)
 					}
-					if err := c.Reply(e.ID, tc.answer); err != nil {
+					if err := c.Reply(context.Background(), e.ID, tc.answer); err != nil {
 						t.Errorf("Reply: %v", err)
 					}
 				case *agentturn.QuestionClosed:
@@ -320,7 +320,7 @@ func TestQuestionsCrossTheWire(t *testing.T) {
 				t.Errorf("closed = %+v", closed)
 			}
 			// The question is gone: replying again is ErrNoQuestion.
-			if err := c.Reply(q.ID, tc.answer); !errors.Is(err, agentturn.ErrNoQuestion) {
+			if err := c.Reply(context.Background(), q.ID, tc.answer); !errors.Is(err, agentturn.ErrNoQuestion) {
 				t.Errorf("a second reply = %v", err)
 			}
 		})
@@ -329,10 +329,11 @@ func TestQuestionsCrossTheWire(t *testing.T) {
 
 // recorder is a Control that records which methods reached it.
 type recorder struct {
-	mu    sync.Mutex
-	calls []string
-	ctx   context.Context
-	emit  []agentturn.Event
+	mu      sync.Mutex
+	calls   []string
+	ctx     context.Context
+	emit    []agentturn.Event
+	answers []agentturn.Answer
 }
 
 // noteCtx records a call and the context it came with; note one that
@@ -355,8 +356,11 @@ func (r *recorder) Prompt(ctx context.Context, _ ...openresponses.Item) (*agentt
 	return &agentturn.RunEnd{Reason: agentturn.ReasonDone}, nil
 }
 
-func (r *recorder) Resume(ctx context.Context, _ ...agentturn.Answer) (*agentturn.RunEnd, error) {
+func (r *recorder) Resume(ctx context.Context, answers ...agentturn.Answer) (*agentturn.RunEnd, error) {
 	r.noteCtx(ctx, "Resume")
+	r.mu.Lock()
+	r.answers = answers
+	r.mu.Unlock()
 	return &agentturn.RunEnd{Reason: agentturn.ReasonDone}, nil
 }
 
@@ -380,8 +384,8 @@ func (r *recorder) Subscribe(fn func(context.Context, agentturn.Event) error) fu
 	return func() {}
 }
 
-func (r *recorder) Reply(string, agenttool.Answer) error {
-	r.note("Reply")
+func (r *recorder) Reply(ctx context.Context, _ string, _ agenttool.Answer) error {
+	r.noteCtx(ctx, "Reply")
 	return nil
 }
 
@@ -415,7 +419,9 @@ func TestScopes(t *testing.T) {
 			return c.Queue(context.Background(), agentturn.QueueSteer, openresponses.UserText("x"))
 		}},
 		{"Resume", ScopeAnswer, func(c *Client) error { _, err := c.Resume(context.Background(), agentturn.Approve("c")); return err }},
-		{"Reply", ScopeAnswer, func(c *Client) error { return c.Reply("q", agenttool.Answer{Action: agenttool.ActionAccept}) }},
+		{"Reply", ScopeAnswer, func(c *Client) error {
+			return c.Reply(context.Background(), "q", agenttool.Answer{Action: agenttool.ActionAccept})
+		}},
 		{"Command", ScopeCommand, func(c *Client) error { _, err := c.Command(context.Background(), "info", nil); return err }},
 	}
 	for token, p := range tokens {
@@ -462,6 +468,57 @@ func TestScopes(t *testing.T) {
 		}
 		if tr := agentturn.TriggerFromContext(ctx); tr.Kind != "control" || tr.Ref != "alice" {
 			t.Errorf("trigger = %+v", tr)
+		}
+	})
+	t.Run("the principal is on an answer's context", func(t *testing.T) {
+		r := &recorder{}
+		srv := httptest.NewServer(Handler(r, WithAuthenticator(BearerTokens(tokens))))
+		defer srv.Close()
+		c, err := Dial(t.Context(), srv.URL, WithBearerToken("answers"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Reply(t.Context(), "q", agenttool.Answer{Action: agenttool.ActionAccept}); err != nil {
+			t.Fatal(err)
+		}
+		r.mu.Lock()
+		ctx := r.ctx
+		r.mu.Unlock()
+		if by, ok := agentturn.AnswererFrom(ctx); !ok || by.Kind != "control" || by.Ref != "alice" {
+			t.Errorf("answerer = %+v, %v", by, ok)
+		}
+	})
+	// #240: a client holding only answer cannot record its approval as
+	// a rule's; a host lets a principal it names choose.
+	t.Run("who decided a resume", func(t *testing.T) {
+		chooser := map[string]Principal{
+			"answers": {Name: "alice", Scopes: []Scope{ScopeAnswer}},
+			"engine":  {Name: "engine", Scopes: []Scope{ScopeAnswer, "decide"}},
+		}
+		for _, tc := range []struct {
+			token, sent, want string
+		}{
+			{"answers", "policy", "human"},
+			{"answers", "", "human"},
+			{"engine", "policy", "policy"},
+			{"engine", "", ""},
+		} {
+			r := &recorder{}
+			srv := httptest.NewServer(Handler(r, WithAuthenticator(BearerTokens(chooser)), WithChosenBy("decide")))
+			c, err := Dial(t.Context(), srv.URL, WithBearerToken(tc.token))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Resume(t.Context(), agentturn.Approve("c").WithBy(tc.sent)); err != nil {
+				t.Fatal(err)
+			}
+			srv.Close()
+			r.mu.Lock()
+			got := r.answers[0].By
+			r.mu.Unlock()
+			if got != tc.want {
+				t.Errorf("%s sending by %q: recorded %q, want %q", tc.token, tc.sent, got, tc.want)
+			}
 		}
 	})
 	t.Run("a wrong token", func(t *testing.T) {

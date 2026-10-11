@@ -1,0 +1,351 @@
+package agentturn
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/ChristopherDavenport/agenttool"
+	"github.com/ChristopherDavenport/openresponses"
+)
+
+// TestEveryNoteFollowsItsBatch pins the one rule for a note: whatever
+// the user said reaches the model after every output of the batch it
+// belongs to, never between the calls and their outputs. An accept's
+// note on a nested call (#245), at any depth, and a note on a tool's own
+// question each follow the invoking call's batch, as a model call's note
+// does.
+func TestEveryNoteFollowsItsBatch(t *testing.T) {
+	accept := func(note string) agenttool.Elicitor {
+		return func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+			return agenttool.Answer{Action: agenttool.ActionAccept, Note: note}, nil
+		}
+	}
+	read := agenttool.New("read", "reads", func(context.Context, echoArgs) (string, error) { return "contents", nil })
+	other := agenttool.New("other", "", upper)
+	invokes := func(name, target string) agenttool.Tool {
+		return agenttool.New(name, "", func(ctx context.Context, _ echoArgs) (string, error) {
+			if _, err := Invoke(ctx, target, json.RawMessage(`{"text":"t"}`)); err != nil {
+				return "", err
+			}
+			return "done", nil
+		})
+	}
+	confirm := agenttool.New("confirm", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		elicit, _ := agenttool.ElicitorFrom(ctx)
+		if _, err := elicit(ctx, agenttool.Elicitation{Message: "go ahead?"}); err != nil {
+			return "", err
+		}
+		return "confirmed", nil
+	})
+	defersRead := func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
+		if info.Call.Name == "read" {
+			return &ToolDecision{Action: Defer, Reason: "approval required by read"}, nil
+		}
+		return nil, nil
+	}
+	cases := []struct {
+		name  string
+		tools []agenttool.Tool
+		calls []string
+		note  string
+	}{
+		{name: "an accept on a nested call", tools: []agenttool.Tool{invokes("eval", "read"), read, other}, calls: []string{"eval", "other"}, note: "The user said: only the unit tests"},
+		{name: "an accept two calls deep", tools: []agenttool.Tool{invokes("eval", "inner"), invokes("inner", "read"), read, other}, calls: []string{"eval", "other"}, note: "The user said: only the unit tests"},
+		{name: "a tool's own question", tools: []agenttool.Tool{confirm, other}, calls: []string{"confirm", "other"}, note: "The user said: only the unit tests"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{Model: callsNamed{names: tc.calls}, Tools: tc.tools, BeforeToolCall: defersRead, ToolElicitor: accept("only the unit tests"), MaxTurns: 1}
+			_, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := itemTypes(end.Items); got != "user function_call function_call function_call_output function_call_output developer" {
+				t.Fatalf("items = %q", got)
+			}
+			if out := end.Items[3].(*openresponses.FunctionCallOutput); strings.HasPrefix(out.Output.Text, "error") {
+				t.Errorf("the first call failed: %q", out.Output.Text)
+			}
+			if m := end.Items[5].(*openresponses.Message); m.Text() != tc.note {
+				t.Errorf("note = %q, want %q", m.Text(), tc.note)
+			}
+		})
+	}
+}
+
+// TestANoteWaitsForADeferredCall pins that a batch's notes wait while a
+// call of it is deferred: the deferred call's output comes from the
+// Resume, and the notes follow it, the batch's own and then the
+// Resume's, so no message splits the batch's calls from their outputs.
+func TestANoteWaitsForADeferredCall(t *testing.T) {
+	hook := func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
+		if info.Call.Name == "a" {
+			return &ToolDecision{Note: "a ran in the sandbox"}, nil
+		}
+		return &ToolDecision{Action: Defer, Reason: "ask"}, nil
+	}
+	a := New(Config{Model: &twoCalls{}, Tools: []agenttool.Tool{agenttool.New("a", "", upper), agenttool.New("b", "", upper)}, BeforeToolCall: hook, MaxTurns: 1})
+	end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+	if err != nil || end.Reason != ReasonInputRequired {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	if got := itemTypes(a.State().Transcript); got != "user function_call function_call function_call_output" {
+		t.Fatalf("transcript while b waits = %q", got)
+	}
+	b := end.Pending[0].Call.CallID
+	if _, err := a.Resume(context.Background(), Output(openresponses.NewFunctionCallOutput(b, "did it myself")).WithNote("that one I handled")); err != nil {
+		t.Fatal(err)
+	}
+	tr := a.State().Transcript
+	if got := itemTypes(tr[:6]); got != "user function_call function_call function_call_output function_call_output developer" {
+		t.Fatalf("transcript = %q", itemTypes(tr))
+	}
+	if m := tr[5].(*openresponses.Message); m.Text() != "a ran in the sandbox" {
+		t.Errorf("the batch's note = %q", m.Text())
+	}
+	if m, ok := tr[6].(*openresponses.Message); !ok || m.Role != openresponses.RoleUser || m.Text() != "that one I handled" {
+		t.Errorf("the Resume's note = %#v", tr[6])
+	}
+}
+
+// deferB allows a with a note and defers b.
+func deferB(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
+	if info.Call.Name == "a" {
+		return &ToolDecision{Note: "a ran in the sandbox"}, nil
+	}
+	return &ToolDecision{Action: Defer, Reason: "ask"}, nil
+}
+
+func abTools() []agenttool.Tool {
+	return []agenttool.Tool{agenttool.New("a", "", upper), agenttool.New("b", "", upper)}
+}
+
+// texts lists the text of every message in items, role first.
+func texts(items []openresponses.Item) []string {
+	var out []string
+	for _, it := range items {
+		if m, ok := it.(*openresponses.Message); ok {
+			out = append(out, string(m.Role)+": "+m.Text())
+		}
+	}
+	return out
+}
+
+// TestHeldNotesTravelWithThePendingCalls pins review finding 1: the
+// notes a deferred batch holds are on the run end's pending calls, so a
+// caller of the stateless Run passes them back after its outputs, and
+// an agent seeded with the pending calls, as after a restart, appends
+// them after the outputs its Resume brings.
+func TestHeldNotesTravelWithThePendingCalls(t *testing.T) {
+	cfg := Config{Model: &twoCalls{}, Tools: abTools(), BeforeToolCall: deferB, MaxTurns: 1}
+	_, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(end.Pending) != 1 {
+		t.Fatalf("pending = %v", pendingReasons(end))
+	}
+	notes := end.Pending[0].Notes
+	if got := texts(notes); strings.Join(got, "|") != "developer: a ran in the sandbox" {
+		t.Fatalf("pending notes = %q", got)
+	}
+	b := end.Pending[0].Call.CallID
+
+	// A restart: a new agent seeded with the transcript and the pending
+	// calls as the run left them.
+	a := New(Config{Model: &twoCalls{}, Tools: abTools(), MaxTurns: 1}, WithTranscript(end.Items), WithPending(end.Pending))
+	if _, err := a.Resume(context.Background(), Output(openresponses.NewFunctionCallOutput(b, "did it myself"))); err != nil {
+		t.Fatal(err)
+	}
+	tr := a.State().Transcript
+	if got := itemTypes(tr[:6]); got != "user function_call function_call function_call_output function_call_output developer" {
+		t.Errorf("transcript after the restart's resume = %q", itemTypes(tr))
+	}
+}
+
+// TestACutCallsNoteWaitsForItsAnswer pins review finding 2: the note on
+// a call an abort cut is held with the batch and follows the call's
+// output when a Resume answers it.
+func TestACutCallsNoteWaitsForItsAnswer(t *testing.T) {
+	started := make(chan struct{})
+	slow := agenttool.New("a", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		close(started)
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	note := func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
+		if info.Call.Name == "a" {
+			return &ToolDecision{Note: "a ran in the sandbox"}, nil
+		}
+		return nil, nil
+	}
+	a := New(Config{Model: &twoCalls{}, Tools: []agenttool.Tool{slow, agenttool.New("b", "", upper)}, BeforeToolCall: note, MaxTurns: 1})
+	go func() {
+		<-started
+		a.Abort()
+	}()
+	end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+	if err != nil || end.Reason != ReasonAborted {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	if len(end.Pending) != 1 || strings.Join(texts(end.Pending[0].Notes), "|") != "developer: a ran in the sandbox" {
+		t.Fatalf("pending = %+v", end.Pending)
+	}
+	if _, err := a.Resume(context.Background(), OutcomeUnknown(end.Pending[0].Call.CallID)); err != nil {
+		t.Fatal(err)
+	}
+	tr := a.State().Transcript
+	if got := itemTypes(tr[:6]); got != "user function_call function_call function_call_output function_call_output developer" {
+		t.Errorf("transcript = %q", itemTypes(tr))
+	}
+}
+
+// TestSetTranscriptKeepsNotesWhileTheirCallsWait pins review finding
+// 3: SetTranscript keeps the notes while a call they wait on is still
+// pending, moving them to the last such call, and drops them with the
+// calls.
+func TestSetTranscriptKeepsNotesWhileTheirCallsWait(t *testing.T) {
+	tools := append(abTools(), agenttool.New("c", "", upper))
+	a := New(Config{Model: &twoCalls{}, Tools: tools, BeforeToolCall: deferB, MaxTurns: 1})
+	end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(end.Pending) != 2 || len(end.Pending[1].Notes) != 1 {
+		t.Fatalf("pending = %+v, want b and c, the note on c", end.Pending)
+	}
+	tr := a.State().Transcript
+	// c answered by the host: b still waits, and the note with it.
+	answered := append(append(Transcript(nil), tr...), openresponses.NewFunctionCallOutput(end.Pending[1].Call.CallID, "done"))
+	if err := a.SetTranscript(answered); err != nil {
+		t.Fatal(err)
+	}
+	if p := a.State().Pending; len(p) != 1 || strings.Join(texts(p[0].Notes), "|") != "developer: a ran in the sandbox" {
+		t.Fatalf("pending after c was answered = %+v, want b with a's note", p)
+	}
+	if err := a.SetTranscript(tr[:1]); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SetTranscript(tr); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range a.State().Pending {
+		if len(p.Notes) != 0 {
+			t.Errorf("pending after the calls were gone = %+v, want the notes dropped with them", p)
+		}
+	}
+}
+
+// TestAFailedResumeKeepsItsNotesOnce pins review finding 4: a Resume
+// that fails before its outputs are appended leaves the notes as they
+// were, so its retry says them once.
+func TestAFailedResumeKeepsItsNotesOnce(t *testing.T) {
+	deferAll := func(context.Context, ToolCallInfo) (*ToolDecision, error) { return &ToolDecision{Action: Defer}, nil }
+	a := New(Config{Model: &twoCalls{}, Tools: abTools(), BeforeToolCall: deferAll, MaxTurns: 1})
+	end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fail := true
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if _, ok := ev.(*RunStart); ok && fail {
+			fail = false
+			return errors.New("not now")
+		}
+		return nil
+	})
+	answers := []Answer{
+		Output(openresponses.NewFunctionCallOutput(end.Pending[0].Call.CallID, "no")).WithNote("use ci/ instead"),
+		Output(openresponses.NewFunctionCallOutput(end.Pending[1].Call.CallID, "no")),
+	}
+	if _, err := a.Resume(context.Background(), answers...); err == nil {
+		t.Fatal("the first resume did not fail")
+	}
+	if _, err := a.Resume(context.Background(), answers...); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, s := range texts(a.State().Transcript) {
+		if s == "user: use ci/ instead" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("the note is in the transcript %d times, want once: %q", n, texts(a.State().Transcript))
+	}
+}
+
+// TestAnApprovalsNoteSurvivesTheHook pins review finding 5: a person's
+// note on an approval and the note the hook gives the call both reach
+// the model, the person's first, and a hook that defers the call holds
+// the person's note with it.
+func TestAnApprovalsNoteSurvivesTheHook(t *testing.T) {
+	call := &openresponses.FunctionCall{CallID: "call_a", Name: "a", Arguments: `{"text":"t"}`}
+	seed := Transcript{openresponses.UserText("x"), call}
+	for _, tc := range []struct {
+		name string
+		hook *ToolDecision
+		want string
+	}{
+		{name: "allowed with a note", hook: &ToolDecision{Note: "a ran in the sandbox"}, want: "user: only the unit tests|developer: a ran in the sandbox"},
+		{name: "deferred", hook: &ToolDecision{Action: Defer, Reason: "ask again"}, want: "user: only the unit tests"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hook := func(context.Context, ToolCallInfo) (*ToolDecision, error) { return tc.hook, nil }
+			a := New(Config{Model: &twoCalls{}, Tools: abTools(), BeforeToolCall: hook, MaxTurns: 1},
+				WithTranscript(seed), WithPending([]PendingCall{{Call: call, Reason: PendingUndispatched}}))
+			end, err := a.Resume(context.Background(), Approve("call_a").WithNote("only the unit tests"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			if tc.hook.Action == Defer {
+				if len(end.Pending) != 1 {
+					t.Fatalf("pending = %v", pendingReasons(end))
+				}
+				got = texts(end.Pending[0].Notes)
+			} else {
+				got = texts(a.State().Transcript[3:5])
+			}
+			if strings.Join(got, "|") != tc.want {
+				t.Errorf("notes = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAChildsNoteGoesToTheChild pins review finding 6: a question a
+// child agent's tool asks through the parent's elicitor leaves its note
+// with the child's batch, not lost under a call the parent never made.
+func TestAChildsNoteGoesToTheChild(t *testing.T) {
+	confirm := agenttool.New("confirm", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		elicit, _ := agenttool.ElicitorFrom(ctx)
+		if _, err := elicit(ctx, agenttool.Elicitation{Message: "go ahead?"}); err != nil {
+			return "", err
+		}
+		return "confirmed", nil
+	})
+	var child *RunEnd
+	delegate := agenttool.New("delegate", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		_, end, err := collect(t, Run(ctx, nil, openresponses.Items{openresponses.UserText("sub")}, Config{Model: callsNamed{names: []string{"confirm"}}, Tools: []agenttool.Tool{confirm}, MaxTurns: 1}))
+		child = end
+		return "delegated", err
+	})
+	accept := func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+		return agenttool.Answer{Action: agenttool.ActionAccept, Note: "only staging"}, nil
+	}
+	cfg := Config{Model: callsNamed{names: []string{"delegate"}}, Tools: []agenttool.Tool{delegate}, ToolElicitor: accept, MaxTurns: 1}
+	_, parent, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child == nil || strings.Join(texts(child.Items), "|") != "user: sub|developer: The user said: only staging" {
+		t.Errorf("child items = %q", texts(child.Items))
+	}
+	if got := texts(parent.Items); strings.Join(got, "|") != "user: x" {
+		t.Errorf("parent items = %q", got)
+	}
+}

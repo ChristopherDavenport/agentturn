@@ -123,7 +123,8 @@ gateway that must not lose an input writes it before it accepts it.
 A question a call asks while it runs, a tool's own or a nested call its
 hook deferred, is an event too once the host installs
 `a.QuestionElicitor()` as `Config.ToolElicitor`: subscribers get a
-`question`, any of them answers with `a.Reply(id, answer)`, and a
+`question`, any of them answers with `a.Reply(ctx, id, answer)`, whose
+context's trigger names who answered on the `question_closed`, and a
 subscriber that attaches while one waits is sent it first. Those
 methods, with `Prompt`, `Resume`, `Queue`, `Abort`, `State` and
 `Subscribe`, are `agentturn.Control`, the contract a client drives an

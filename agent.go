@@ -228,6 +228,31 @@ func mergePending(pending, known []PendingCall) {
 	}
 }
 
+// keepNotes moves the notes the calls of known waited with onto the
+// last call of pending that known held too, and drops them when none
+// is: the calls pending at once are of one batch, and its notes wait
+// while any of them does.
+func keepNotes(pending, known []PendingCall) {
+	var notes openresponses.Items
+	ids := map[string]bool{}
+	for _, p := range known {
+		notes = append(notes, p.Notes...)
+		if p.Call != nil {
+			ids[p.Call.CallID] = true
+		}
+	}
+	last := -1
+	for i := range pending {
+		pending[i].Notes = nil
+		if ids[pending[i].Call.CallID] {
+			last = i
+		}
+	}
+	if last >= 0 && len(notes) > 0 {
+		pending[last].Notes = notes
+	}
+}
+
 func closedChan() chan struct{} {
 	ch := make(chan struct{})
 	close(ch)
@@ -284,9 +309,12 @@ func (a *Agent) SetConfig(cfg Config) error {
 // and arguments: a held call stays held. Any other is [PendingUnknown],
 // so an approval of it is held to the replay rule as for any call that
 // may have run, until [Agent.SetPending] says what a record knows of
-// it. Whatever the old transcript was waiting on and the new one does
-// not hold is forgotten, and whatever the new one is waiting on must be
-// answered through [Agent.Resume]. Queued Steer and FollowUp items are
+// it. The notes held for the calls pending before
+// ([PendingCall.Notes]) stay while one of those calls is still pending,
+// on the last of them, and are dropped when none is. Whatever the old
+// transcript was waiting on and the new one does not hold is
+// forgotten, and whatever the new one is waiting on must be answered
+// through [Agent.Resume]. Queued Steer and FollowUp items are
 // kept and go to the next run on the new transcript; a host that does
 // not want them there reads them from [Agent.State] first. The call IDs
 // the old transcript holds stay reserved, as [Agent.ReserveCallIDs]
@@ -308,6 +336,9 @@ func (a *Agent) SetTranscript(t Transcript) error {
 	a.reasoning = a.reasoning.retain(a.transcript)
 	a.pending = pendingCalls(unansweredCalls(a.transcript), PendingUnknown)
 	mergePending(a.pending, known)
+	// The notes waiting on the calls pending before stay while one of
+	// those calls is still pending, on the last of them.
+	keepNotes(a.pending, known)
 	return nil
 }
 
@@ -416,7 +447,7 @@ func (a *Agent) Prompt(ctx context.Context, items ...openresponses.Item) (*RunEn
 	if len(items) == 0 {
 		return nil, ErrNoPrompt
 	}
-	return a.run(ctx, items, nil, false, false)
+	return a.run(ctx, items, nil, nil, false, false)
 }
 
 // Continue runs from the transcript as it stands, which must satisfy
@@ -432,7 +463,7 @@ func (a *Agent) Continue(ctx context.Context) (*RunEnd, error) {
 	if !ok {
 		return nil, ErrCannotContinue
 	}
-	return a.run(ctx, nil, nil, false, false)
+	return a.run(ctx, nil, nil, nil, false, false)
 }
 
 // Answer resolves one pending call for [Agent.Resume]: an output the
@@ -450,9 +481,10 @@ type Answer struct {
 	// as ToolDecision.Args does. nil keeps the call's own.
 	Args json.RawMessage
 	// Note is what the user said when answering: it is appended as a
-	// user message after the outputs of every answer of the Resume, so
-	// the model reads the result and the note together, in that order,
-	// in the same turn.
+	// user message after every output of the Resume, those of the
+	// answers and of the approved calls alike, so the model reads the
+	// results and the note together, in that order, in the same turn,
+	// and nothing comes between the calls and their outputs.
 	Note string
 	// Terminate ends the run with ReasonStopped and StopRefused once
 	// every answer is in, without calling the model, for a refusal that
@@ -638,8 +670,7 @@ func (a Answer) WithRunAgain() Answer {
 // or refused without running: those take an output, and an approval
 // of one returns [ErrCallAnswered].
 //
-// The outputs are appended with their item events first, then the
-// notes of the answers that carry one, as user messages. The approved
+// The outputs are appended with their item events first. The approved
 // calls then run as one batch as the loop runs any batch, with
 // BeforeToolCall skipped for a call the approval decides, one held or
 // one that may have run. A call pending as [PendingUndispatched] was
@@ -648,9 +679,14 @@ func (a Answer) WithRunAgain() Answer {
 // would in a run, and a call it defers leaves the run ending with
 // [ReasonInputRequired] once the batch is in. tool_start, tool_update
 // and tool_end are emitted with Turn 0, Sequential and
-// MaxParallelTools apply, AfterToolCall runs, the outputs are appended
-// in the calls' transcript order and their notes after them, and
-// anything steered in meanwhile follows. A batch whose results set
+// MaxParallelTools apply, AfterToolCall runs, and the outputs are
+// appended in the calls' transcript order. Only then come the notes,
+// so nothing splits the calls from their outputs: those a run left
+// waiting on the calls this Resume answers, then the answers' notes as
+// user messages in the order given, then the approved calls' notes;
+// with nothing approved they follow the answers' outputs. A call the
+// batch defers keeps them waiting for the run that answers it. Anything
+// steered in meanwhile follows. A batch whose results set
 // Terminate ends the run with ReasonStopped without calling the model,
 // and so does any answer built with [Refuse]. Otherwise the model is
 // called and the run returns as [Agent.Prompt] does. With nothing
@@ -731,7 +767,7 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 	// taken from ride on the run's context, where a recorder writing
 	// the decision and the output for it finds them.
 	ctx = ContextWithOrigins(ContextWithReasons(ContextWithDeciders(ctx, deciders), reasons), origins)
-	return a.run(ctx, append(outputs, notes...), approved, true, terminate)
+	return a.run(ctx, outputs, notes, approved, true, terminate)
 }
 
 // mayRunAgain applies agenttool's rule for running a call again to an
@@ -830,9 +866,9 @@ func answersPending(pending []PendingCall, prompts openresponses.Items) error {
 	return nil
 }
 
-func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved []approval, resuming, terminate bool) (*RunEnd, error) {
+func (a *Agent) run(ctx context.Context, prompts, notes openresponses.Items, approved []approval, resuming, terminate bool) (*RunEnd, error) {
 	a.mu.Lock()
-	run, err := a.startUnlock(ctx, prompts, approved, resuming, terminate)
+	run, err := a.startUnlock(ctx, prompts, notes, approved, resuming, terminate)
 	if err != nil {
 		return nil, err
 	}
@@ -843,15 +879,15 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved [
 // it however start returns: a panic there, from a tool the
 // configuration holds, leaves the agent usable by a caller that
 // recovers it.
-func (a *Agent) startUnlock(ctx context.Context, prompts openresponses.Items, approved []approval, resuming, terminate bool) (func() (*RunEnd, error), error) {
+func (a *Agent) startUnlock(ctx context.Context, prompts, notes openresponses.Items, approved []approval, resuming, terminate bool) (func() (*RunEnd, error), error) {
 	defer a.mu.Unlock()
-	return a.start(ctx, prompts, approved, resuming, terminate)
+	return a.start(ctx, prompts, notes, approved, resuming, terminate)
 }
 
 // start begins a run with a.mu held, so the check that the agent is
 // idle and the mark that it is running are one step, and returns the
 // function that drives the run once the lock is released.
-func (a *Agent) start(ctx context.Context, prompts openresponses.Items, approved []approval, resuming, terminate bool) (func() (*RunEnd, error), error) {
+func (a *Agent) start(ctx context.Context, prompts, notes openresponses.Items, approved []approval, resuming, terminate bool) (func() (*RunEnd, error), error) {
 	if err := a.cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -870,6 +906,15 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, approved
 	}
 	prior := a.pending
 	a.pending = nil
+	// The notes an earlier run left waiting on the calls this run
+	// answers go first; the Resume's own join them once its outputs
+	// are in.
+	var held []heldNote
+	for _, p := range prior {
+		for _, n := range p.Notes {
+			held = append(held, heldNote{item: n, mode: InputResume})
+		}
+	}
 	// The context a tool's background work derives from: the prompt's
 	// values, cancelled by an abort of this run or by the prompt's own
 	// cancellation, and not by the run ending.
@@ -895,20 +940,22 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, approved
 		ctx := context.WithValue(ctx, inRunKey{a}, runID)
 		subCtx := context.WithoutCancel(ctx)
 		r := &runner{
-			cfg:        cfg,
-			transcript: transcript,
-			send:       func(ev Event) error { return a.deliver(subCtx, ev) },
-			steer:      a.drainSteer,
-			followUp:   a.drainFollowUp,
-			last:       a.drainLast,
-			closing:    a.close,
-			steered:    a.steerSignal,
-			runCtx:     runCtx,
-			prior:      prior,
-			reserved:   a.reserved,
-			reasoning:  a.reasoning.merged(reasoningFromContext(ctx)),
-			runID:      runID,
-			resuming:   resuming,
+			cfg:         cfg,
+			transcript:  transcript,
+			send:        func(ev Event) error { return a.deliver(subCtx, ev) },
+			steer:       a.drainSteer,
+			followUp:    a.drainFollowUp,
+			last:        a.drainLast,
+			closing:     a.close,
+			steered:     a.steerSignal,
+			runCtx:      runCtx,
+			prior:       prior,
+			reserved:    a.reserved,
+			reasoning:   a.reasoning.merged(reasoningFromContext(ctx)),
+			runID:       runID,
+			resuming:    resuming,
+			notes:       held,
+			resumeNotes: notes,
 		}
 		end := r.run(ctx, prompts, approved, terminate)
 		cancel(nil)
@@ -1284,7 +1331,7 @@ func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joine
 		a.mu.Unlock()
 		return false, nil, ErrCannotContinue
 	}
-	run, err := a.startUnlock(ctx, nil, nil, false, false)
+	run, err := a.startUnlock(ctx, nil, nil, nil, false, false)
 	if err != nil {
 		return false, nil, err
 	}

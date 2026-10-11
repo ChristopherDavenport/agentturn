@@ -58,8 +58,9 @@ func ContextWithAskedCall(ctx context.Context, call AskedCall) context.Context {
 // Block with "declined when asked" and the reason on a decline. What
 // the user said with the answer ([agenttool.Answer.Note]) reaches the
 // model: on a decline it ends the reason the model is told, and on an
-// accept it is the decision's Note, which the model reads with the
-// call's result. It
+// accept it is the decision's Note, which the loop appends after the
+// outputs of the batch the call belongs to, for a nested call the
+// batch of the call that made it, as for any allowed call. It
 // returns nil and false when ctx carries no elicitor, the ask failed
 // or the answer was a cancel; the caller then still holds the
 // deferral it started with. call.Decision must be non-nil.
@@ -91,7 +92,7 @@ func Ask(ctx context.Context, call AskedCall) (*ToolDecision, bool) {
 			if decided.Note != "" {
 				decided.Note += "\n"
 			}
-			decided.Note += "The user said: " + ans.Note
+			decided.Note += userSaid(ans.Note)
 		}
 	case agenttool.ActionDecline:
 		decided.Action = Block

@@ -113,9 +113,9 @@ func TestNotesFollowTheOutputs(t *testing.T) {
 		t.Errorf("blocked items = %q", got)
 	}
 
-	// On Resume, an approval's note is a user message after the
-	// approved outputs; an output answer's note follows the outputs; and
-	// what was steered in while the user decided goes with them.
+	// On Resume, every answer's note is a user message after every
+	// output of the Resume, and what was steered in while the user
+	// decided goes with them.
 	deferAll := func(context.Context, ToolCallInfo) (*ToolDecision, error) { return &ToolDecision{Action: Defer}, nil }
 	a := New(Config{Model: &twoCalls{}, Tools: []agenttool.Tool{agenttool.New("a", "", upper), agenttool.New("b", "", upper)}, BeforeToolCall: deferAll, MaxTurns: 1})
 	if _, err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
@@ -129,10 +129,11 @@ func TestNotesFollowTheOutputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The output answer and its note first, then the approved call's
-	// output and its note, then what was steered in; the next turn's
-	// call follows.
-	want := "user function_call function_call function_call_output user function_call_output user user"
+	// Every output of the Resume first, the output answer's and then
+	// the approved call's, so nothing comes between the calls and
+	// their outputs (#239); then the notes in the same order, then what
+	// was steered in; the next turn's call follows.
+	want := "user function_call function_call function_call_output function_call_output user user user"
 	if got := itemTypes(a.State().Transcript[:8]); got != want {
 		t.Errorf("transcript = %q\nwant         %q", got, want)
 	}

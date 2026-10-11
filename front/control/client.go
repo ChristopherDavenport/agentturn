@@ -276,10 +276,12 @@ func (c *Client) FetchState(ctx context.Context) (agentturn.State, error) {
 	return stateIn(w)
 }
 
-// Reply implements agentturn.Control. A question that is not waiting
-// is an error that matches agentturn.ErrNoQuestion.
-func (c *Client) Reply(id string, answer agenttool.Answer) error {
-	ctx, cancel := context.WithTimeout(context.Background(), c.wait)
+// Reply implements agentturn.Control. Who answered is the principal
+// the handler authenticates, not anything on ctx, which bounds the
+// request. A question that is not waiting is an error that matches
+// agentturn.ErrNoQuestion.
+func (c *Client) Reply(ctx context.Context, id string, answer agenttool.Answer) error {
+	ctx, cancel := context.WithTimeout(ctx, c.wait)
 	defer cancel()
 	var out errReply
 	if err := c.call(ctx, http.MethodPost, "reply", struct {

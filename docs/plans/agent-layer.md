@@ -152,7 +152,7 @@ func (a *Agent) Abort()
 func (a *Agent) WaitForIdle(ctx) error
 func (a *Agent) State() State                       // snapshot
 func (a *Agent) QuestionElicitor() agenttool.Elicitor // a call's questions as question events
-func (a *Agent) Reply(id string, answer agenttool.Answer) error
+func (a *Agent) Reply(ctx, id string, answer agenttool.Answer) error // ctx's trigger names who answered
 ```
 
 `Control` names the methods a client drives an agent with (`Prompt`,

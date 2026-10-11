@@ -386,12 +386,16 @@ func (*ToolStart) EventType() string { return EventToolStart }
 // serialised with the run's events, and a subscriber that fails on it
 // stops the call: it ends with that error and the tool does not run,
 // so a dispatch that could not be made durable is never followed by a
-// side effect the record cannot see. The call is then pending as
-// [PendingUndispatched], or still as [PendingAborted] when an earlier
-// run dispatched it. Subscribers are called in registration order,
-// so a subscriber that vetoes a dispatch is registered before the
-// recorder: one registered after it refuses a call whose dispatch is
-// already durable. Parent is set for a nested call.
+// side effect the record cannot see. That is a failure, not a way to
+// refuse a call, which is [Config.BeforeToolCall]'s, since a subscriber
+// observes: for a call the model made the run ends with [ReasonError],
+// and for a nested call the failure is returned to the invoking tool
+// from [Invoke], which decides what follows. The call is
+// then pending as [PendingUndispatched], or still as [PendingAborted]
+// when an earlier run dispatched it, and its tool_end is
+// [ToolEnd.Withdrawn], so a recorder called before the subscriber that
+// failed, which has written the dispatch, writes that the hand-off was
+// withdrawn. Parent is set for a nested call.
 //
 // IdempotencyKey is the key the tool receives on agenttool.Call: the
 // loop mints one for every call it dispatches and keeps it when the
@@ -446,6 +450,12 @@ type ToolEnd struct {
 	// Parent is the ID of the call whose tool made this one with
 	// [Invoke], and empty for a call the model made.
 	Parent string
+	// Withdrawn says the call's tool_dispatch was raised and a
+	// subscriber failed on it, so the tool never ran: the hand-off was
+	// withdrawn. A recorder that wrote the dispatch before that
+	// subscriber failed writes so, and the call reads as never started
+	// rather than as one that may have run.
+	Withdrawn bool
 }
 
 // EventType returns "tool_end".
@@ -678,6 +688,55 @@ type PendingCall struct {
 	// for a deferred call held before the agent was built, unless a
 	// record says why.
 	Decision *ToolDecision
+	// Question is the question a person was asked under the call and
+	// had not answered when its run was cut: a tool's own question, or
+	// one [Ask] put about a nested call. It tells a front, and a host
+	// answering the call, that the call was waiting on a person, and
+	// what it asked, where the reason alone says only that the call may
+	// have run. The loop never sets it; agentturn/session's Pending
+	// does, from the record. nil for every other call.
+	Question *OpenQuestion
+	// Notes are the notes waiting on the outputs of the pending calls:
+	// what a decision or a person said about a call of their batch,
+	// held because a call of it was deferred or cut before its output,
+	// so that nothing comes between the calls and their outputs. The
+	// loop puts them on the last pending call, since the calls pending
+	// at once are of one batch, and the run that answers the calls
+	// appends them after the outputs, before anything else it brings.
+	// An [Agent] carries them itself; a caller of [Run] passes them back
+	// after the outputs it answers with, and a recorder keeps them, so
+	// an agent seeded with the pending calls ([WithPending]) appends
+	// them as the one that held them would have.
+	Notes openresponses.Items
+}
+
+// OpenQuestion is a question a record shows asked under a call and
+// never answered: the run was cut while a person decided.
+type OpenQuestion struct {
+	// ID is the ID of the record's entry that asked it.
+	ID string
+	// Message is the question as it was put.
+	Message string
+	// Call is the call the question is about, for one [Ask] put about a
+	// nested call or a front put about a model's call: its ID, name and
+	// the call whose tool made it, as far as the record names them. It
+	// is nil for a tool's own question, which is about the pending call.
+	Call *AskedCall
+}
+
+// Reason says that the question was open and what it asked, for the
+// reason of an answer given the call it was asked under, such as a
+// replay's: `a question was open: "<message>"`, followed by
+// ` about call <id> (<name>)` when it was about another call.
+func (q *OpenQuestion) Reason() string {
+	reason := fmt.Sprintf("a question was open: %q", q.Message)
+	if q.Call != nil && q.Call.CallID != "" {
+		reason += " about call " + q.Call.CallID
+		if q.Call.Name != "" {
+			reason += " (" + q.Call.Name + ")"
+		}
+	}
+	return reason
 }
 
 // MayHaveRun reports whether the call may have run and an approval of
