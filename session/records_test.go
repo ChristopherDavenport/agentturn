@@ -2771,3 +2771,117 @@ func TestOwedNotesSurviveARestart(t *testing.T) {
 		t.Errorf("held notes entries = %v, want [2 1 0 2]", sizes)
 	}
 }
+
+// TestNotesAlreadySaidAreNotOwed pins that notes whose items the path
+// holds after the last held_notes entry are not restored: a process that
+// died between a note's item and the report that it was said, a flush
+// cut part way, and a rebase to an entry in between each leave the
+// record's last held set behind what was said.
+func TestNotesAlreadySaidAreNotOwed(t *testing.T) {
+	mk := func(name string) agenttool.Tool {
+		return agenttool.New(name, "", func(context.Context, echoArgs) (string, error) { return "ok", nil })
+	}
+	hook := func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+		switch info.Call.Name {
+		case "a":
+			return &agentturn.ToolDecision{Note: "n1"}, nil
+		case "c":
+			return &agentturn.ToolDecision{Note: "n2"}, nil
+		}
+		return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask", By: agentsession.ByPolicy}, nil
+	}
+	tools := []agenttool.Tool{mk("a"), mk("b"), mk("c")}
+	cfg := agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools, BeforeToolCall: hook}
+	// run prompts until b waits, then answers b, cutting the store once
+	// the item of the note cutAt is written ("" cuts nothing).
+	run := func(t *testing.T, cutAt string) (*cutStore, *Recorder, *agentsession.Session) {
+		t.Helper()
+		ctx := context.Background()
+		store := &cutStore{Store: agentsession.NewMemoryStore()}
+		rec, s, err := Start(ctx, store, agentsession.Header{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := agentturn.New(cfg)
+		unsub := rec.Attach(a)
+		defer unsub()
+		a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+			if e, ok := ev.(*agentturn.ItemEnd); ok && cutAt != "" {
+				if m, ok := e.Item.(*openresponses.Message); ok && m.Text() == cutAt {
+					store.cut.Store(true)
+				}
+			}
+			return nil
+		})
+		end, err := a.Prompt(ctx, openresponses.UserText("go"))
+		if err != nil || len(end.Pending) != 1 {
+			t.Fatalf("prompt: err=%v end=%+v", err, end)
+		}
+		a.Resume(ctx, agentturn.Output(openresponses.NewFunctionCallOutput(end.Pending[0].Call.CallID, "no")).WithBy(agentsession.ByHuman))
+		store.cut.Store(false)
+		return store, rec, s
+	}
+	owedTexts := func(t *testing.T, s *agentsession.Session) []string {
+		t.Helper()
+		owed, err := OwedNotes(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, n := range owed {
+			out = append(out, n.Item.(*openresponses.Message).Text())
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name, cutAt, owed string
+	}{
+		{"cut after every note", "n2", ""},
+		{"cut part way", "n1", "n2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, _, s := run(t, tc.cutAt)
+			read, err := store.Open(context.Background(), s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(owedTexts(t, read), ","); got != tc.owed {
+				t.Fatalf("owed = %q, want %q", got, tc.owed)
+			}
+			_, _, b := restart(t, store, s.ID(), cfg)
+			if _, err := b.Prompt(context.Background(), openresponses.UserText("next")); err != nil {
+				t.Fatal(err)
+			}
+			tr := b.State().Transcript
+			// The next batch holds its own notes while b waits again.
+			if countMessage(tr, "developer: n1") != 1 || countMessage(tr, "developer: n2") != 1 {
+				t.Errorf("transcript = %q, want each note once", messagesOf(tr))
+			}
+		})
+	}
+	// A rebase to a note's item: the notes said by then are not owed on
+	// that branch, the ones after it are.
+	for _, tc := range []struct{ at, owed string }{{"n1", "n2"}, {"n2", ""}} {
+		t.Run("a rebase to "+tc.at+"'s item", func(t *testing.T) {
+			_, rec, s := run(t, "")
+			var at string
+			for _, e := range s.Entries() {
+				if it, ok := e.(*agentsession.ItemEntry); ok {
+					if m, ok := it.Item.(*openresponses.Message); ok && m.Text() == tc.at {
+						at = it.Base().ID
+						break
+					}
+				}
+			}
+			if at == "" {
+				t.Fatalf("no item for %s", tc.at)
+			}
+			if err := rec.Rebase(s, at); err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(owedTexts(t, s), ","); got != tc.owed {
+				t.Errorf("owed at %s's item = %q, want %q", tc.at, got, tc.owed)
+			}
+		})
+	}
+}

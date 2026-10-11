@@ -1101,11 +1101,17 @@ const WithdrawnNS = "agentturn:withdrawn"
 // agentturn.NotesHeld reports it changed, an empty set included, and at
 // the run's end when it differs from the last written. Its call_id is
 // the call the last note is about and its data a [HeldNotes]. The last
-// such entry on the path is what waits: [Pending] puts its notes on the
-// last pending call, and when nothing is pending [OwedNotes] gives those
-// whose call's output is on the path, which [AgentOptions] seeds with
-// agentturn.WithNotes. So a process that dies after a recorded output,
-// with no run end, loses nothing a person said.
+// such entry on the path is what waits, less the leading notes whose
+// items the path already holds after it: [Pending] puts the rest on the
+// last pending call, and when nothing is pending [OwedNotes] gives
+// those whose call's output is on the path, which [AgentOptions] seeds
+// with agentturn.WithNotes. A note is on the record once notes_held has
+// reported it, so a process that dies after that, with no run end,
+// loses nothing it said; against agentturn v0.0.24, which reports some
+// notes only after the outputs they follow (a Resume's output answer
+// with nothing approved, and a batch that completes), a process that
+// dies between such an output and the note's own item can still lose
+// that note.
 const HeldNotesNS = "agentturn:held_notes"
 
 // HeldNotes is the data of a [HeldNotesNS] custom entry.
@@ -1169,9 +1175,40 @@ func lastHeldNotes(path []agentsession.Entry) []agentturn.Note {
 			}
 			out = append(out, note)
 		}
-		return out
+		return out[appendedSince(path[i+1:], out):]
 	}
 	return nil
+}
+
+// appendedSince counts the leading notes whose items the entries after
+// their [HeldNotesNS] entry already hold, in order: notes are appended
+// in the order they are held, so those were said, by a run whose report
+// of it the path does not hold (a process that died, a flush cut part
+// way, a rebase to an entry in between), and are not owed again.
+func appendedSince(after []agentsession.Entry, notes []agentturn.Note) int {
+	k := 0
+	for _, e := range after {
+		if k == len(notes) {
+			break
+		}
+		if it, ok := e.(*agentsession.ItemEntry); ok && sameNoteItem(it.Item, notes[k].Item) {
+			k++
+		}
+	}
+	return k
+}
+
+// sameNoteItem reports whether an item on the path says what a note
+// says: a message by its role and text, as the loop compares notes.
+func sameNoteItem(a, b openresponses.Item) bool {
+	am, aok := a.(*openresponses.Message)
+	bm, bok := b.(*openresponses.Message)
+	if aok && bok {
+		return am.Role == bm.Role && am.Text() == bm.Text()
+	}
+	ja, errA := json.Marshal(a)
+	jb, errB := json.Marshal(b)
+	return errA == nil && errB == nil && string(ja) == string(jb)
 }
 
 // OwedNotes returns the notes the session owes after outputs already on
@@ -1537,6 +1574,11 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // a rebase left. [Recorder.ReadOptions] gives the options that read a
 // session as the recorder writing it does.
 //
+// A withdrawn dispatch is read on the path only: a call with a dispatch
+// on a branch the path left, read as dispatched there, is not checked
+// for a withdrawal on that branch, which errs on the side of a call
+// that may have run.
+//
 // A call a question was asked under that nothing answered, a run cut
 // while a person decided, carries that question as its Question. The
 // notes waiting on the pending calls, which the recorder keeps as
@@ -1782,7 +1824,10 @@ func callAt(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry st
 // AgentOptions returns the options that seed an agent with the
 // session at its leaf: the context's items, the pending calls as
 // [Pending] reads them, so the agent's Resume holds only the calls
-// that may have run to the replay rule, and every call ID in the
+// that may have run to the replay rule, with the notes waiting on them
+// (agentturn.WithPending), the notes owed after outputs already on the
+// path as [OwedNotes] reads them (agentturn.WithNotes), and every call
+// ID in the
 // session as reserved, [CallIDs], so a call the model makes does not
 // take the ID of one a compaction folded out of the context or another
 // branch holds, which the format refuses. It is what a host resuming a
@@ -2275,7 +2320,9 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 // agentturn.ContextWithReasoningModels, and
 // then Agent.SetPending from [Pending], so a call held on the branch
 // is approved as a held call and one that may have run is held to the
-// replay rule; [Recorder.CompactOptions] gives what seeds a transform
+// replay rule, with the notes waiting on those calls, and
+// Agent.SetNotes from [OwedNotes], the notes the branch owes after
+// outputs already on it; [Recorder.CompactOptions] gives what seeds a transform
 // built for the branch. Rebase reserves every call ID in the session, [CallIDs],
 // on the agent [Recorder.Attach] attached, so a call the model makes
 // does not take the ID of one the context leaves out or the branch
