@@ -38,6 +38,7 @@ const (
 	EventTurnEnd      = "turn_end"
 	EventRunEnd       = "run_end"
 	EventQueued       = "queued"
+	EventNotesHeld    = "notes_held"
 )
 
 // Reason says why a run ended.
@@ -543,6 +544,16 @@ type RunEnd struct {
 	// and ReasonStopped. The transcript is a valid input again once
 	// each has an output, which Agent.Resume appends.
 	Pending []PendingCall
+	// Notes are the notes the run owed after outputs it had appended,
+	// with no call left pending to wait on, and could not append: a
+	// subscriber failed on one. The next run appends them first, before
+	// anything it brings; an [Agent] carries them ([State.Notes]), and a
+	// caller of [Run] puts their items before its next prompts. A
+	// recorder writes them, as the last [NotesHeld] it kept or from this
+	// end, and a host restoring the session seeds them with [WithNotes]
+	// or [Agent.SetNotes], with their Mode, Trigger and CallID. With
+	// calls pending the notes are on [PendingCall.Notes] instead.
+	Notes []Note
 	// Withheld says the run ended because [Config.OutputGuard]
 	// withheld a message, with Reason ReasonStopped and Cause
 	// StopGuard: the model's last word was kept from the transcript,
@@ -699,16 +710,61 @@ type PendingCall struct {
 	// Notes are the notes waiting on the outputs of the pending calls:
 	// what a decision or a person said about a call of their batch,
 	// held because a call of it was deferred or cut before its output,
-	// so that nothing comes between the calls and their outputs. The
-	// loop puts them on the last pending call, since the calls pending
-	// at once are of one batch, and the run that answers the calls
-	// appends them after the outputs, before anything else it brings.
-	// An [Agent] carries them itself; a caller of [Run] passes them back
+	// so that nothing comes between the calls and their outputs. A call
+	// that never reached its tool keeps its notes until it runs or is
+	// refused, and they follow the outputs then: a person's words are
+	// never dropped. A note said again about the same call, by a hook
+	// that decides it again or an answer a host retries, is held once
+	// ([Note.CallID]). The loop puts them on the last pending call,
+	// since the calls pending at once are of one batch, and the run that
+	// answers the calls appends them after the outputs, before anything
+	// else it brings, each as it arrived the first time. An [Agent]
+	// carries them itself; a caller of [Run] passes their items back
 	// after the outputs it answers with, and a recorder keeps them, so
 	// an agent seeded with the pending calls ([WithPending]) appends
 	// them as the one that held them would have.
-	Notes openresponses.Items
+	Notes []Note
 }
+
+// Note is a note waiting on the outputs of its batch: the item and how
+// it arrived, so it is appended as it would have been had nothing
+// waited.
+type Note struct {
+	Item openresponses.Item
+	// Mode is how it arrives: [InputTool] for a note on a call of a
+	// batch, a decision's, an approval's or one said under the call
+	// while it ran, and [InputResume] for a person's note on a Resume's
+	// output answer.
+	Mode InputMode
+	// Trigger is what its item_end carries: the trigger of the Resume
+	// that brought a note on an output answer, and none for a note on a
+	// call of a batch.
+	Trigger Trigger
+	// CallID is the call the note was said about, for a nested call or a
+	// tool's question the batch call it was made under. A note equal to
+	// one already held for the same call, the same mode and the same
+	// message, is not held again, so a hook that decides a call again or
+	// a host that retries an answer says it once.
+	CallID string
+}
+
+// NotesHeld reports the notes now waiting on the pending calls'
+// outputs, the whole set, each time it changes from what was last
+// reported or what the run started with: when it grows, after an
+// answer's output whose note waits for the approved batch that follows
+// it or when a batch ends with a call deferred or cut, and when it
+// shrinks or empties as the notes are appended. A recorder that keeps
+// the last report holds exactly what waits, so a process that dies after
+// an output loses nothing a person said; the run's end carries the same
+// set, on [PendingCall.Notes] while calls wait and on [RunEnd.Notes]
+// when none does.
+type NotesHeld struct {
+	RunID string
+	Notes []Note
+}
+
+// EventType returns "notes_held".
+func (*NotesHeld) EventType() string { return EventNotesHeld }
 
 // OpenQuestion is a question a record shows asked under a call and
 // never answered: the run was cut while a person decided.

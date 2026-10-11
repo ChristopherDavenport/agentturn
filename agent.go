@@ -114,6 +114,10 @@ type Agent struct {
 	runCancel context.CancelCauseFunc
 	idle      chan struct{}
 	pending   []PendingCall
+	// notes are the notes the last run owed and could not append, with
+	// nothing pending to wait on ([RunEnd.Notes]); the next run appends
+	// them first.
+	notes []Note
 	// seeded is what WithPending gave, applied to the pending calls
 	// once every option has run.
 	seeded []PendingCall
@@ -224,6 +228,7 @@ func mergePending(pending, known []PendingCall) {
 			continue
 		}
 		q.Call = p.Call
+		q.Notes = liveNotes(q.Notes)
 		pending[i] = q
 	}
 }
@@ -233,7 +238,10 @@ func mergePending(pending, known []PendingCall) {
 // is: the calls pending at once are of one batch, and its notes wait
 // while any of them does.
 func keepNotes(pending, known []PendingCall) {
-	var notes openresponses.Items
+	for i := range pending {
+		pending[i].Notes = liveNotes(pending[i].Notes)
+	}
+	var notes []Note
 	ids := map[string]bool{}
 	for _, p := range known {
 		notes = append(notes, p.Notes...)
@@ -251,6 +259,27 @@ func keepNotes(pending, known []PendingCall) {
 	if last >= 0 && len(notes) > 0 {
 		pending[last].Notes = notes
 	}
+}
+
+// keepOwed keeps the owed notes whose call's output is in t: they
+// follow that output, and one whose output is gone goes with it.
+func keepOwed(notes []Note, t Transcript) []Note {
+	if len(notes) == 0 {
+		return nil
+	}
+	answered := map[string]bool{}
+	for _, item := range t {
+		if out, ok := item.(*openresponses.FunctionCallOutput); ok {
+			answered[out.CallID] = true
+		}
+	}
+	var out []Note
+	for _, n := range notes {
+		if n.CallID != "" && answered[n.CallID] {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 func closedChan() chan struct{} {
@@ -311,7 +340,10 @@ func (a *Agent) SetConfig(cfg Config) error {
 // may have run, until [Agent.SetPending] says what a record knows of
 // it. The notes held for the calls pending before
 // ([PendingCall.Notes]) stay while one of those calls is still pending,
-// on the last of them, and are dropped when none is. Whatever the old
+// on the last of them, and are dropped when none is. The notes a failed
+// run owed after outputs already in ([RunEnd.Notes]) stay while the
+// output of the call each is about is in the new transcript. Whatever
+// the old
 // transcript was waiting on and the new one does not hold is
 // forgotten, and whatever the new one is waiting on must be answered
 // through [Agent.Resume]. Queued Steer and FollowUp items are
@@ -337,8 +369,10 @@ func (a *Agent) SetTranscript(t Transcript) error {
 	a.pending = pendingCalls(unansweredCalls(a.transcript), PendingUnknown)
 	mergePending(a.pending, known)
 	// The notes waiting on the calls pending before stay while one of
-	// those calls is still pending, on the last of them.
+	// those calls is still pending, on the last of them; those owed
+	// after the old transcript's outputs go with it.
 	keepNotes(a.pending, known)
+	a.notes = keepOwed(a.notes, a.transcript)
 	return nil
 }
 
@@ -406,6 +440,10 @@ type State struct {
 	// transcript. Continue refuses until Resume has answered them, and
 	// Prompt unless it opens with their outputs.
 	Pending []PendingCall
+	// Notes are the notes the last run owed after outputs already in the
+	// transcript and could not append ([RunEnd.Notes]), which the next
+	// run appends first.
+	Notes []Note
 }
 
 // State returns a snapshot.
@@ -422,7 +460,34 @@ func (a *Agent) State() State {
 		Steered:    queuedItems(a.steer),
 		Queued:     queuedItems(a.followUp),
 		Pending:    append([]PendingCall(nil), a.pending...),
+		Notes:      slices.Clone(a.notes),
 	}
+}
+
+// WithNotes seeds the notes a run owed and could not append
+// ([RunEnd.Notes]), for an agent rebuilt from a record: the next run
+// appends them first, each as it arrived, with its Mode and Trigger, and
+// they stay while the output of the call each is about ([Note.CallID])
+// is in the transcript. A recorder writes them from the run's end, and
+// a host restoring the session passes them here beside [WithPending],
+// which carries the notes waiting on calls still pending. A note with no
+// item is left out.
+func WithNotes(notes []Note) Option {
+	return func(a *Agent) { a.notes = liveNotes(notes) }
+}
+
+// SetNotes replaces the notes the next run appends first, as
+// [WithNotes] seeds them: after [Agent.SetTranscript] to a branch of a
+// session, with what the record says that branch owed. It returns
+// [ErrRunning] while a run is active.
+func (a *Agent) SetNotes(notes []Note) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		return ErrRunning
+	}
+	a.notes = liveNotes(notes)
+	return nil
 }
 
 // Prompt appends items and runs until idle. It returns when the run_end
@@ -480,11 +545,20 @@ type Answer struct {
 	// Args, for an approval, replaces the arguments the tool receives,
 	// as ToolDecision.Args does. nil keeps the call's own.
 	Args json.RawMessage
-	// Note is what the user said when answering: it is appended as a
-	// user message after every output of the Resume, those of the
-	// answers and of the approved calls alike, so the model reads the
-	// results and the note together, in that order, in the same turn,
-	// and nothing comes between the calls and their outputs.
+	// Note is what the answerer said when answering, in its own voice:
+	// a user message for an answer By "human" or by nobody, which is
+	// read as a person's, and a developer message for an answer By
+	// anyone else, a policy or another model, whose words are not the
+	// user's. It is appended after every output of the Resume, those of
+	// the answers and of the approved calls alike, so the model reads
+	// the results and the note together, in that order, in the same
+	// turn, and nothing comes between the calls and their outputs. It
+	// is what was said at answer time: a policy's note on a call it held
+	// is the holding decision's Note, which the loop says itself when an
+	// approval releases the call, and does not belong here. An
+	// approval's note on a call that then never reaches its tool, cut or
+	// deferred again, is kept with the call until it runs or is refused;
+	// the same note on the answer that approves it again is said once.
 	Note string
 	// Terminate ends the run with ReasonStopped and StopRefused once
 	// every answer is in, without calling the model, for a refusal that
@@ -682,10 +756,15 @@ func (a Answer) WithRunAgain() Answer {
 // MaxParallelTools apply, AfterToolCall runs, and the outputs are
 // appended in the calls' transcript order. Only then come the notes,
 // so nothing splits the calls from their outputs: those a run left
-// waiting on the calls this Resume answers, then the answers' notes as
-// user messages in the order given, then the approved calls' notes;
-// with nothing approved they follow the answers' outputs. A call the
-// batch defers keeps them waiting for the run that answers it. Anything
+// waiting on the calls this Resume answers, then the answers' notes in
+// the order given, each in its answerer's voice ([Answer.Note]), then
+// the approved calls' notes: the approval's, then the note of the
+// decision that held the call, which the loop says itself as a
+// developer message, or the one BeforeToolCall gives a call it decides
+// now; with nothing approved they follow the answers' outputs. A call
+// the batch defers keeps them waiting for the run that answers it, and
+// a note equal to one already held for the same call is said once
+// ([Note.CallID]). Anything
 // steered in meanwhile follows. A batch whose results set
 // Terminate ends the run with ReasonStopped without calling the model,
 // and so does any answer built with [Refuse]. Otherwise the model is
@@ -703,7 +782,8 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 	for _, p := range pending {
 		byID[p.Call.CallID] = p
 	}
-	var outputs, notes openresponses.Items
+	var outputs openresponses.Items
+	var notes []answerNote
 	var approved []approval
 	deciders, reasons, origins := map[string]string{}, map[string]string{}, map[string]string{}
 	terminate := false
@@ -726,7 +806,7 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 				origins[ans.CallID] = ans.Origin
 			}
 			if ans.Note != "" {
-				notes = append(notes, openresponses.UserText(ans.Note))
+				notes = append(notes, answerNote{callID: ans.CallID, item: answerNoteItem(ans.Note, ans.By)})
 			}
 			continue
 		}
@@ -757,7 +837,11 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 				reason = rule
 			}
 		}
-		approved = append(approved, approval{call: p.Call, args: args, note: ans.Note, by: ans.By, reason: reason, key: key, decide: p.Reason == PendingUndispatched})
+		held := ""
+		if p.Reason == PendingDeferred && p.Decision != nil {
+			held = p.Decision.Note
+		}
+		approved = append(approved, approval{call: p.Call, args: args, note: ans.Note, held: held, by: ans.By, reason: reason, key: key, decide: p.Reason == PendingUndispatched})
 	}
 	if len(byID) > 0 {
 		return nil, fmt.Errorf("%w: %d pending call(s) unanswered", ErrNotPending, len(byID))
@@ -866,7 +950,7 @@ func answersPending(pending []PendingCall, prompts openresponses.Items) error {
 	return nil
 }
 
-func (a *Agent) run(ctx context.Context, prompts, notes openresponses.Items, approved []approval, resuming, terminate bool) (*RunEnd, error) {
+func (a *Agent) run(ctx context.Context, prompts openresponses.Items, notes []answerNote, approved []approval, resuming, terminate bool) (*RunEnd, error) {
 	a.mu.Lock()
 	run, err := a.startUnlock(ctx, prompts, notes, approved, resuming, terminate)
 	if err != nil {
@@ -879,7 +963,7 @@ func (a *Agent) run(ctx context.Context, prompts, notes openresponses.Items, app
 // it however start returns: a panic there, from a tool the
 // configuration holds, leaves the agent usable by a caller that
 // recovers it.
-func (a *Agent) startUnlock(ctx context.Context, prompts, notes openresponses.Items, approved []approval, resuming, terminate bool) (func() (*RunEnd, error), error) {
+func (a *Agent) startUnlock(ctx context.Context, prompts openresponses.Items, notes []answerNote, approved []approval, resuming, terminate bool) (func() (*RunEnd, error), error) {
 	defer a.mu.Unlock()
 	return a.start(ctx, prompts, notes, approved, resuming, terminate)
 }
@@ -887,7 +971,7 @@ func (a *Agent) startUnlock(ctx context.Context, prompts, notes openresponses.It
 // start begins a run with a.mu held, so the check that the agent is
 // idle and the mark that it is running are one step, and returns the
 // function that drives the run once the lock is released.
-func (a *Agent) start(ctx context.Context, prompts, notes openresponses.Items, approved []approval, resuming, terminate bool) (func() (*RunEnd, error), error) {
+func (a *Agent) start(ctx context.Context, prompts openresponses.Items, notes []answerNote, approved []approval, resuming, terminate bool) (func() (*RunEnd, error), error) {
 	if err := a.cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -909,11 +993,10 @@ func (a *Agent) start(ctx context.Context, prompts, notes openresponses.Items, a
 	// The notes an earlier run left waiting on the calls this run
 	// answers go first; the Resume's own join them once its outputs
 	// are in.
-	var held []heldNote
+	held := a.notes
+	a.notes = nil
 	for _, p := range prior {
-		for _, n := range p.Notes {
-			held = append(held, heldNote{item: n, mode: InputResume})
-		}
+		held = append(held, p.Notes...)
 	}
 	// The context a tool's background work derives from: the prompt's
 	// values, cancelled by an abort of this run or by the prompt's own
@@ -1036,6 +1119,7 @@ func (a *Agent) dispatch(ctx context.Context, ev Event) error {
 		a.transcript = append(a.transcript, e.Item)
 	case *RunEnd:
 		a.pending = e.Pending
+		a.notes = e.Notes
 		a.lastEnd = e
 	case *Question:
 		a.waiting = append(a.waiting, e)

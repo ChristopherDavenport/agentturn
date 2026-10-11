@@ -112,6 +112,7 @@ run, in order:
 | `turn_end` | the folded `Response` with usage, and the tool results |
 | `run_end` | the items added this run and the reason: done, stopped, input_required, aborted, error |
 | `question`, `question_closed` | a question a running call asks, through `Agent.QuestionElicitor`, and its close with the answer `Agent.Reply` gave, or none when the call gave up |
+| `notes_held` | the notes waiting on the pending calls' outputs, the whole set, each time it changes, emptied included |
 
 `queued` belongs to no run. `Steer` and `FollowUp` accept an item and
 return; the goroutine that owns delivery reports it at its next event,
@@ -123,8 +124,9 @@ gateway that must not lose an input writes it before it accepts it.
 A question a call asks while it runs, a tool's own or a nested call its
 hook deferred, is an event too once the host installs
 `a.QuestionElicitor()` as `Config.ToolElicitor`: subscribers get a
-`question`, any of them answers with `a.Reply(ctx, id, answer)`, whose
-context's trigger names who answered on the `question_closed`, and a
+`question`, any of them answers with `a.Reply(ctx, id, answer)`, naming
+itself with `agentturn.ContextWithAnswerer` for the `question_closed`
+to say who answered, and a
 subscriber that attaches while one waits is sent it first. Those
 methods, with `Prompt`, `Resume`, `Queue`, `Abort`, `State` and
 `Subscribe`, are `agentturn.Control`, the contract a client drives an

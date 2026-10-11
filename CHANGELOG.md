@@ -5,6 +5,83 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Changed, breaking: `PendingCall.Notes` is a `[]Note`, each note with
+  the item, how it arrived (`Mode`) and the trigger its `item_end`
+  carries, so a note held across runs is appended as it would have been
+  had nothing waited: a hook's note stays the tool's, not the Resume's.
+  `front/control` carries them.
+- Fixed: a note is held once per call. A call's held notes stay with it
+  until it runs or is refused, and a note equal to one already held for
+  that call (same mode, same message) is not held again
+  (`Note.CallID`). So a hook that decides a cut or withdrawn call again
+  and gives the same note, or a host that retries an approval with the
+  same note, says it once, where v0.0.23 said it twice; a different note
+  is said too, after it. A person's note on an approval the hook defers
+  again stays held with the call and follows its output when it finally
+  runs, or the refusal when it is refused: a person's words are never
+  dropped.
+- Changed, behaviour: the note of a decision that held a call
+  (`ToolDecision.Note` on a Defer) is the policy's, and the loop says it
+  itself, as a developer message after the batch's outputs, once, when
+  an approval through `Resume` releases the call, in process or from
+  `PendingCall.Decision` after a restart. The restart half needs the
+  record to keep the hold decision's note, which agentturn/session does
+  in its next release; until then a resumed session's held call carries
+  no note. `Answer.Note` is only what the
+  answerer said at answer time: a policy engine releasing the calls it
+  held must not put its hook's note there, or it is said twice. The
+  release note goes through the same per-call de-duplication, so a note
+  already held for the call is said once. The docs of `ToolDecision.Note`
+  and `Answer.Note` say so.
+- Fixed: a note leaves the waiting set only once it is in the
+  transcript, so a subscriber failing part way through leaves the rest
+  waiting, and an answer's note waits from the moment its output is in
+  the transcript, even when a subscriber then fails on that output's
+  `item_end`; with no call left pending the run's end carries them as the
+  new `RunEnd.Notes`, which the agent appends first in its next run
+  (`SetTranscript` drops them). A Resume's note on an output answer
+  waits from the moment that output is appended, so a Resume that fails
+  after it keeps the note.
+- Changed, behaviour: an answer's note is said in its answerer's voice.
+  A note on an answer `By` "human", or by nobody, is a user message as
+  before; one on an answer by anyone else, `policy` or `agent`, is now a
+  developer message, so a policy's or a reviewing model's words no
+  longer reach the model as the user's. This holds for output answers
+  and approvals alike. The docs of `Answer.Note` and `Resume` say so.
+- Fixed: `ChainBeforeToolCall` makes a call held (`ToolDecision.Held`)
+  only if every deferring hook held it. A call one hook held beside
+  another and a later hook asked about was kept held, so a front, or a
+  kit after a restart, released it without asking; now the ask stands,
+  with its reason and subject.
+- Added: the `notes_held` event (`NotesHeld`), the whole waiting set
+  each time it changes, when it grows and when it shrinks or empties, so
+  a recorder that keeps the last report holds exactly what waits and a
+  process that dies after an output loses no note. `front/control`
+  carries it.
+- Added: `WithNotes`, `Agent.SetNotes` and `State.Notes`, to seed and
+  read the notes a failed run owed (`RunEnd.Notes`), with their mode,
+  trigger and call, for an agent rebuilt from a record. `SetTranscript`
+  keeps each owed note while its call's output is in the new transcript.
+  A note with no item is left out wherever notes are seeded or decoded.
+- Changed, behaviour: a person's words are a user message on every path.
+  What a person says answering a tool's own question, and with an
+  accept `Ask` puts to them under a run's hook or tool, is now a user
+  message of its own, held with the call and said after its batch's
+  outputs, where v0.0.23 made it a developer message "The user said:
+  ..." (for `Ask`, folded into the decision's `Note`). The decision's
+  own `Note` stays the policy's, a developer message. `Ask` outside a
+  run still folds the note into the decision's `Note`.
+- Changed, breaking on the wire: `front/control` sends a pending call's
+  `notes` as objects (`item`, `mode`, `trigger`, `call_id`) where
+  v0.0.23 sent bare items. A new client reads either; a v0.0.23 client
+  fails to decode a `run_end` or `state` from a new server that carries
+  notes, so upgrade clients with servers. `state` carries the owed
+  notes.
+- Fixed: the README says the replier names itself with
+  `ContextWithAnswerer`, not with the run's trigger.
+
 ## v0.0.23 - 2026-10-11
 
 - Fixed: the recorder writes a hold decision's `Subject` and `Held` as

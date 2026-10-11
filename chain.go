@@ -155,7 +155,9 @@ func ChainShouldStopAfterTurn(fns ...func(context.Context, TurnInfo) (bool, erro
 // Among decisions of one action the first reason and decider stand;
 // a decision that takes the fold to a stricter action brings its own,
 // because the reason has to explain the decision that stands and a
-// block's reason is what the model reads. The first note stands, and
+// block's reason is what the model reads. Two deferrals make a call
+// held ([ToolDecision.Held]) only if both held it: a deferral that asks
+// about it wins, with its reason and subject. The first note stands, and
 // Terminate is set when any decision sets it. Arguments a decision rewrites are passed to the
 // hooks after it, so each sees what the call will actually run with and
 // the last rewrite is what the tool receives. The first error stops the
@@ -215,11 +217,18 @@ func strictness(a ToolAction) int {
 
 // merge folds next into d under the chain's rules.
 func (d *ToolDecision) merge(next *ToolDecision) {
-	if strictness(next.Action) > strictness(d.Action) {
+	switch {
+	case strictness(next.Action) > strictness(d.Action):
 		// The stricter decision stands, and the reason that explains it
 		// stands with it: a block's reason is what the model reads as
 		// the error output.
 		d.Action, d.Reason, d.By = next.Action, next.Reason, next.By
+		d.Held, d.Subject = next.Held, next.Subject
+	case d.Action == Defer && next.Action == Defer && d.Held && !next.Held:
+		// A call one hook only held beside another and a later one asks
+		// about is asked about: held only if every deferring hook held
+		// it, and the ask's reason and part explain the question.
+		d.Held, d.Reason, d.By, d.Subject = false, next.Reason, next.By, next.Subject
 	}
 	if d.Reason == "" {
 		d.Reason = next.Reason
