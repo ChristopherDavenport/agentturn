@@ -33,6 +33,17 @@ versions may break the API.
   (`SetTranscript` drops them). A Resume's note on an output answer
   waits from the moment that output is appended, so a Resume that fails
   after it keeps the note.
+- Changed, behaviour: an answer's note is said in its answerer's voice.
+  A note on an answer `By` "human", or by nobody, is a user message as
+  before; one on an answer by anyone else, `policy` or `agent`, is now a
+  developer message, so a policy's or a reviewing model's words no
+  longer reach the model as the user's. This holds for output answers
+  and approvals alike. The docs of `Answer.Note` and `Resume` say so.
+- Fixed: `ChainBeforeToolCall` makes a call held (`ToolDecision.Held`)
+  only if every deferring hook held it. A call one hook held beside
+  another and a later hook asked about was kept held, so a front, or a
+  kit after a restart, released it without asking; now the ask stands,
+  with its reason and subject.
 - Added: the `notes_held` event (`NotesHeld`), the waiting set each
   time it grows while calls wait, for a recorder to keep, so a process
   that dies after an output loses no note. `front/control` carries it.

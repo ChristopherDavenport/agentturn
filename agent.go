@@ -487,16 +487,19 @@ type Answer struct {
 	// Args, for an approval, replaces the arguments the tool receives,
 	// as ToolDecision.Args does. nil keeps the call's own.
 	Args json.RawMessage
-	// Note is what a person said when answering, and only that: it is
-	// appended as a user message after every output of the Resume, those
-	// of the answers and of the approved calls alike, so the model reads
+	// Note is what the answerer said when answering, in its own voice:
+	// a user message for an answer By "human" or by nobody, which is
+	// read as a person's, and a developer message for an answer By
+	// anyone else, a policy or another model, whose words are not the
+	// user's. It is appended after every output of the Resume, those of
+	// the answers and of the approved calls alike, so the model reads
 	// the results and the note together, in that order, in the same
-	// turn, and nothing comes between the calls and their outputs. A
-	// policy's note on a call it held is not an answer's: it is the
-	// holding decision's Note, which the loop says itself when an
-	// approval releases the call. An approval's note on a call that then
-	// never reaches its tool is not kept: the answer that approves it
-	// again brings it again.
+	// turn, and nothing comes between the calls and their outputs. It
+	// is what was said at answer time: a policy's note on a call it held
+	// is the holding decision's Note, which the loop says itself when an
+	// approval releases the call, and does not belong here. An
+	// approval's note on a call that then never reaches its tool is not
+	// kept: the answer that approves it again brings it again.
 	Note string
 	// Terminate ends the run with ReasonStopped and StopRefused once
 	// every answer is in, without calling the model, for a refusal that
@@ -694,10 +697,14 @@ func (a Answer) WithRunAgain() Answer {
 // MaxParallelTools apply, AfterToolCall runs, and the outputs are
 // appended in the calls' transcript order. Only then come the notes,
 // so nothing splits the calls from their outputs: those a run left
-// waiting on the calls this Resume answers, then the answers' notes as
-// user messages in the order given, then the approved calls' notes;
-// with nothing approved they follow the answers' outputs. A call the
-// batch defers keeps them waiting for the run that answers it. Anything
+// waiting on the calls this Resume answers, then the answers' notes in
+// the order given, each in its answerer's voice ([Answer.Note]), then
+// the approved calls' notes: the approval's, then the note of the
+// decision that held the call, which the loop says itself as a
+// developer message, or the one BeforeToolCall gives a call it decides
+// now; with nothing approved they follow the answers' outputs. A call
+// the batch defers keeps them waiting for the run that answers it, and
+// a call that never reaches its tool keeps none. Anything
 // steered in meanwhile follows. A batch whose results set
 // Terminate ends the run with ReasonStopped without calling the model,
 // and so does any answer built with [Refuse]. Otherwise the model is
@@ -739,7 +746,7 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 				origins[ans.CallID] = ans.Origin
 			}
 			if ans.Note != "" {
-				notes = append(notes, answerNote{callID: ans.CallID, item: openresponses.UserText(ans.Note)})
+				notes = append(notes, answerNote{callID: ans.CallID, item: answerNoteItem(ans.Note, ans.By)})
 			}
 			continue
 		}

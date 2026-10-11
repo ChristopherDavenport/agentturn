@@ -594,3 +594,34 @@ func TestAHeldCallsPolicyNoteIsSaidOnRelease(t *testing.T) {
 		})
 	}
 }
+
+// TestAnAnswersNoteIsInItsAnswerersVoice pins R11: a note on an answer
+// by a person, or by nobody, is a user message; one by a policy or
+// another model is a developer message, not the user's words.
+func TestAnAnswersNoteIsInItsAnswerersVoice(t *testing.T) {
+	for _, tc := range []struct {
+		by, want string
+	}{
+		{"", "user: use ci/ instead"},
+		{"human", "user: use ci/ instead"},
+		{"policy", "developer: use ci/ instead"},
+		{"agent", "developer: use ci/ instead"},
+	} {
+		t.Run("by "+tc.by, func(t *testing.T) {
+			deferAll := func(context.Context, ToolCallInfo) (*ToolDecision, error) { return &ToolDecision{Action: Defer}, nil }
+			a := New(Config{Model: &twoCalls{}, Tools: abTools(), BeforeToolCall: deferAll, MaxTurns: 1})
+			end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := a.Resume(context.Background(),
+				Output(openresponses.NewFunctionCallOutput(end.Pending[0].Call.CallID, "no")).WithNote("use ci/ instead").WithBy(tc.by),
+				Approve(end.Pending[1].Call.CallID).WithNote("use ci/ instead").WithBy(tc.by)); err != nil {
+				t.Fatal(err)
+			}
+			if n := count(a.State().Transcript, tc.want); n != 2 {
+				t.Errorf("%q is in the transcript %d times, want both notes: %q", tc.want, n, texts(a.State().Transcript))
+			}
+		})
+	}
+}

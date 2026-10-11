@@ -723,8 +723,19 @@ type approval struct {
 	decide bool
 }
 
-// answerNote is a person's note on a Resume's output answer, for the
-// call it answers.
+// answerNoteItem is the message an answer's note reaches the model as,
+// in the voice of whoever answered: a user message for a person, "human"
+// or an answer that names nobody, and a developer message for anyone
+// else, a policy or another model, whose words are not the user's.
+func answerNoteItem(note, by string) openresponses.Item {
+	if by == "" || by == "human" {
+		return openresponses.UserText(note)
+	}
+	return openresponses.DeveloperText(note)
+}
+
+// answerNote is the note on a Resume's output answer, for the call it
+// answers.
 type answerNote struct {
 	callID string
 	item   openresponses.Item
@@ -2423,7 +2434,7 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 			// The person's note comes first; a note the hook gives the
 			// call below, or the one the decision that held it gave,
 			// follows it.
-			p.notes = append(p.notes, Note{Item: openresponses.UserText(ap.note), Mode: InputTool})
+			p.notes = append(p.notes, Note{Item: answerNoteItem(ap.note, ap.by), Mode: InputTool})
 		}
 		if ap.held != "" {
 			// The policy's note on the call it held is said now the
