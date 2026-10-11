@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.27 - 2026-10-11
 
 - Fixed: a person's accept note on a call `Ask` puts to them about a
   nested call the loop never runs through `Invoke` reaches the model
