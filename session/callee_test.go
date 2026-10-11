@@ -524,30 +524,30 @@ func TestSubsessionOnIgnoresCallees(t *testing.T) {
 	remote := agentsession.Callee{URL: "https://remote.example", Task: "task-1", Session: "remote-session"}
 	for _, tc := range []struct {
 		name  string
-		links func(*agentsession.Session) []agentsession.Entry
+		links func(*testing.T, *agentsession.Session) []agentsession.Entry
 		want  string
 	}{
-		{"an in-process child", func(*agentsession.Session) []agentsession.Entry {
+		{"an in-process child", func(*testing.T, *agentsession.Session) []agentsession.Entry {
 			return []agentsession.Entry{agentsession.NewSubsessionLink("child", "call_1")}
 		}, "child"},
-		{"a callee in another system", func(*agentsession.Session) []agentsession.Entry {
+		{"a callee in another system", func(*testing.T, *agentsession.Session) []agentsession.Entry {
 			return []agentsession.Entry{agentsession.NewCalleeSubsessionLink("call_1", remote)}
 		}, ""},
-		{"a child, then a callee and its notice", func(s *agentsession.Session) []agentsession.Entry {
+		{"a child, then a callee and its notice", func(t *testing.T, s *agentsession.Session) []agentsession.Entry {
 			callee := agentsession.NewCalleeSubsessionLink("call_1", remote)
 			return []agentsession.Entry{agentsession.NewSubsessionLink("child", "call_1"), callee}
 		}, "child"},
-		{"a notice naming an earlier child", func(s *agentsession.Session) []agentsession.Entry {
+		{"a notice naming an earlier child", func(t *testing.T, s *agentsession.Session) []agentsession.Entry {
 			a := agentsession.NewSubsessionLink("child-a", "call_1")
 			if _, err := s.Append(a); err != nil {
-				panic(err)
+				t.Fatal(err)
 			}
 			if _, err := s.Append(agentsession.NewSubsessionLink("child-b", "call_1")); err != nil {
-				panic(err)
+				t.Fatal(err)
 			}
 			return []agentsession.Entry{agentsession.NewCancelSentLink(a)}
 		}, "child-b"},
-		{"another call's child", func(*agentsession.Session) []agentsession.Entry {
+		{"another call's child", func(*testing.T, *agentsession.Session) []agentsession.Entry {
 			return []agentsession.Entry{agentsession.NewSubsessionLink("child", "call_2")}
 		}, ""},
 	} {
@@ -559,7 +559,7 @@ func TestSubsessionOnIgnoresCallees(t *testing.T) {
 			if _, err := s.Append(agentsession.NewItemEntry(&openresponses.FunctionCall{CallID: "call_1", Name: "remote", Arguments: "{}"})); err != nil {
 				t.Fatal(err)
 			}
-			for _, e := range tc.links(s) {
+			for _, e := range tc.links(t, s) {
 				if _, err := s.Append(e); err != nil {
 					t.Fatal(err)
 				}
@@ -862,6 +862,9 @@ func TestReplayedA2ACopyIsFinished(t *testing.T) {
 			// link and no decision, which VerifyRecords reads as the
 			// shape of an input, as it reads any resume cut before its
 			// first decision; every other run verifies.
+			// TODO: drop the exemption once agentsession#229
+			// (https://github.com/ChristopherDavenport/agentsession/issues/229)
+			// exempts a resume segment that adds nothing to the context.
 			cut := ""
 			for _, e := range s.Path(s.Leaf()) {
 				if r, ok := e.(*agentsession.RunEntry); ok && r.Phase == agentsession.RunStart {
@@ -871,8 +874,8 @@ func TestReplayedA2ACopyIsFinished(t *testing.T) {
 					break
 				}
 			}
-			if err := s.VerifyRecords(s.Leaf()); err != nil && (cut == "" || !strings.Contains(err.Error(), cut)) {
-				t.Errorf("verify records: %v, want only the cut run %q reported", err, cut)
+			if err := s.VerifyRecords(s.Leaf()); err != nil && (cut == "" || !errors.Is(err, agentsession.ErrSourceMismatch) || !strings.Contains(err.Error(), cut)) {
+				t.Errorf("verify records: %v, want only the cut run %q's source reported", err, cut)
 			}
 			if err := s.VerifyLinks(noLinkedSession(t)); err != nil {
 				t.Errorf("verify links: %v", err)
@@ -962,4 +965,96 @@ func TestForkCopiesNoCallees(t *testing.T) {
 	if err := fork.VerifyRecords(fork.Leaf()); err != nil {
 		t.Errorf("verify records: %v", err)
 	}
+}
+
+// TestStaleReplayAnswerCopiesNothing: an answer ReplayAnswers gave
+// before the call was dispatched again on the new branch still names
+// the branch left's output as its origin, but the call's work on this
+// branch is that dispatch's: no link or notice of the branch left is
+// copied after it, and its own link, to the same task, is not taken for
+// a copy and given the branch left's notice.
+func TestStaleReplayAnswerCopiesNothing(t *testing.T) {
+	ctx := context.Background()
+	const url = "https://remote.example/a2a"
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	again := false
+	started := make(chan struct{}, 1)
+	tool := agenttool.New("remote", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		if err := agenttool.WriteRecord(ctx, calleeRecord(url, "task-1", "ctx-1", "subsession")); err != nil {
+			return "", err
+		}
+		if !again {
+			return "answered", agenttool.WriteRecord(ctx, cancelRecord(url, "task-1"))
+		}
+		started <- struct{}{}
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	tools := []agenttool.Tool{tool}
+	a := agentturn.New(agentturn.Config{Model: allCalls{}, Tools: tools, ToolRecorder: rec.RecordFunc()})
+	unsub := rec.Attach(a)
+	if _, err := a.Prompt(ctx, openresponses.UserText("go")); err != nil {
+		t.Fatal(err)
+	}
+	unsub()
+	c := callsOf(t, s)["remote"]
+	if err := rec.Rebase(s, c.Dispatch.Parent); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := ReplayAnswers(ctx, s, tools, rec.ReadOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stale) != 1 || stale[0].Origin != c.Output.ID {
+		t.Fatalf("answers = %+v, want the branch left's output", stale)
+	}
+
+	// The host runs the call again instead, and that run is cut after
+	// the callee is recorded, the same task as on the branch left.
+	again = true
+	opts, err := AgentOptions(s, rec.ReadOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := agentturn.New(agentturn.Config{Model: allCalls{}, Tools: tools, ToolRecorder: rec.RecordFunc()}, opts...)
+	unsub = rec.Attach(b)
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Resume(ctx, agentturn.Approve(c.ID()).WithRunAgain().WithBy(agentsession.ByHuman))
+		done <- err
+	}()
+	<-started
+	b.Abort()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	unsub()
+
+	// Then answers it with the stale answer.
+	if opts, err = AgentOptions(s, rec.ReadOptions()...); err != nil {
+		t.Fatal(err)
+	}
+	d := agentturn.New(agentturn.Config{Model: allCalls{}, Tools: tools, ToolRecorder: rec.RecordFunc()}, opts...)
+	defer rec.Attach(d)()
+	if _, err := d.Resume(ctx, stale...); err != nil {
+		t.Fatal(err)
+	}
+	call := callsOf(t, s)["remote"]
+	if call == nil || call.Output == nil || len(call.Dispatches) != 1 {
+		t.Fatalf("call = %+v, want one dispatch and an output", call)
+	}
+	callees, err := s.Callees(s.Leaf())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The branch left's link was cancelled; the new dispatch's, to the
+	// same task, was not, and must not be taken for its copy.
+	if len(callees) != 1 || callees[0].Dispatch != call.Dispatches[0].ID || callees[0].Cancelled {
+		t.Errorf("callees = %+v, want the new dispatch's own link alone, not cancelled", shapesOf(callees))
+	}
+	verifyAll(t, s)
 }

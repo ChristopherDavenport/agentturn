@@ -35,10 +35,13 @@ versions may break the API.
   not define included, and each cancel notice is written again naming
   the copy, since a notice names its link by entry ID. A copy cut short,
   by a failed append or a crash before the answer, is finished on the
-  next attempt rather than written again. The copies precede the answer
-  decision, so `Callees` reads each as belonging to no dispatch of the
-  new branch and not answered: the output is the harness's answer, and
-  the answer's reason ties it to the branch left. A fork copies none of
+  next attempt rather than written again. Nothing is copied once the
+  call has a dispatch on the new branch, so a stale answer given after
+  the call ran again there does not file the branch left's links under
+  that dispatch; the same holds for a child's link. The copies precede
+  the answer decision, so `Callees` reads each as belonging to no
+  dispatch of the new branch and not answered: the output is the
+  harness's answer, and the answer's reason ties it to the branch left. A fork copies none of
   its origin's, as it copies no child's link: it started none of that
   work and sent none of those cancels, and its `fork_of` reaches the
   origin, which holds them.

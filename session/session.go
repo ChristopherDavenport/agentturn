@@ -4386,12 +4386,14 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 				// tool, and the output says why.
 				by, reason = agentsession.ByPolicy, outputText(out)
 			}
-			if origin := agentturn.OriginFromContext(ctx, out.CallID); origin != "" && origin == c.ranEntry {
+			if origin := agentturn.OriginFromContext(ctx, out.CallID); origin != "" && origin == c.ranEntry && !c.dispatched {
 				// The output repeats one a child session produced on
 				// the branch left, and the link to that child comes
 				// with it, so the path says whose work the output is.
 				// The link on the branch left does not count: this
-				// branch holds none.
+				// branch holds none. A call dispatched on this branch
+				// since, its answer computed before, gets none: the
+				// links after that dispatch would read as its own.
 				if c.childOff != "" {
 					if _, err := w.append(ctx, agentsession.NewSubsessionLink(c.childOff, out.CallID)); err != nil {
 						return err
