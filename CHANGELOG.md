@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.28 - 2026-10-11
 
 - Added: `tools/a2a` records the callee a call reaches, through
   `agenttool.WriteRecord`, as soon as it is known: a `Callee` record
