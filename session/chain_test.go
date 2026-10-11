@@ -87,7 +87,7 @@ func TestFoldAfterAProductTransform(t *testing.T) {
 				t.Fatalf("no fold recorded in %q", entryTypes(s))
 			}
 			kept, _ := s.Entry(entry.FirstKept)
-			if it, ok := kept.(*agentsession.ItemEntry); !ok || it.Item != folded.First {
+			if it, ok := kept.(*agentsession.ItemEntry); !ok || !equalJSON(it.Item, folded.First) {
 				t.Errorf("first_kept holds %+v, the fold kept %+v", kept, folded.First)
 			}
 		})

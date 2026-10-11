@@ -277,6 +277,25 @@
 //     the asker said, so a run cut while a person was deciding shows
 //     the open question. Details for in-process subscribers alone are
 //     not recorded.
+//   - a record tools/a2a writes for the callee a call reached, in the
+//     agentturn:a2a_callee namespace, through either of those: a link
+//     entry of the call in place of the custom entry, naming the URL,
+//     task and context, the subsession link
+//     agentsession.NewCalleeSubsessionLink builds for relation
+//     subsession and the peer link for peer; and one for a cancel the
+//     call sent, agentturn:a2a_cancel: the cancel notice naming the
+//     latest link of the call to the same URL and task on the path. The
+//     recorder reads their JSON and imports neither tools/a2a nor
+//     a2a-go. A record it cannot write as a link, one that does not
+//     decode, names another relation, or names no URL or no call the
+//     session holds, and a cancel whose callee's link is not on the
+//     path, is the custom entry it was. A call dispatched again reaches
+//     a new task and gets a link of its own. An output answered on a
+//     new branch with the one the call returned on a branch left, which
+//     [ReplayAnswers] gives, brings the links of the callees that
+//     dispatch reached with it, as it brings a child's link, each
+//     copied whole and each cancel notice written again naming the
+//     copy, since a notice names its link by entry ID.
 //
 // # Header
 //
@@ -929,6 +948,10 @@ type writer struct {
 	calls map[string]*callRecord
 	// linked marks the calls whose subsession link is written.
 	linked map[string]bool
+	// callees holds the links on the path naming a callee in another
+	// system, each with its entry ID, in order: a cancel notice names
+	// the one it is about by that ID.
+	callees []*agentsession.LinkEntry
 	// parents maps a nested call, one a tool made through
 	// agentturn.Invoke, to the call whose tool made it, so a record the
 	// nested call writes names a call the path holds.
@@ -1063,9 +1086,12 @@ type callRecord struct {
 	// branch, the output [Pending] gives as Ran, and childOff the child
 	// session that branch links to the call, when it holds a link: an
 	// output answered now with ranEntry as its origin repeats that
-	// child's work, and the link comes with it.
-	ranEntry string
-	childOff string
+	// child's work, and the link comes with it. calleesOff are the
+	// links that branch holds naming the callees in another system the
+	// dispatch reached, which come with it the same way.
+	ranEntry   string
+	childOff   string
+	calleesOff []agentsession.CalleeLink
 	// dispatchEntry is the ID of the last dispatch entry written or
 	// seeded for the call, and lastWithdrawn says a [WithdrawnNS] entry
 	// withdrew it. handedOff counts the call's dispatches on the path no
@@ -1795,11 +1821,13 @@ func outputAfter(s *agentsession.Session, d *agentsession.DispatchEntry, callEnt
 }
 
 // subsessionOn is the child session the path to entry links to the
-// call callID, through a subsession link, or "" when it holds none.
+// call callID, through a subsession link, or "" when it holds none. A
+// link naming a callee in another system, or a cancel notice, names no
+// child of this store and is passed over.
 func subsessionOn(s *agentsession.Session, entry, callID string) string {
 	child := ""
 	for _, e := range s.Path(entry) {
-		if l, ok := e.(*agentsession.LinkEntry); ok && l.Rel == agentsession.RelSubsession && l.CallID == callID {
+		if l, ok := e.(*agentsession.LinkEntry); ok && l.Rel == agentsession.RelSubsession && l.CallID == callID && l.URL == "" && l.Cancel == "" {
 			child = l.Session
 		}
 	}
@@ -2564,6 +2592,13 @@ func (r *Recorder) Annotate(ctx context.Context, ns string, data any) (string, e
 // is about, for [Recorder.Elicitor], which a front asking about a
 // model's call puts on the context without a call of its own.
 func (r *Recorder) annotate(ctx context.Context, ns string, data any, about string) (string, error) {
+	return r.write(ctx, ns, data, about, false)
+}
+
+// write is [Recorder.annotate], and with record set what
+// [Recorder.RecordFunc] writes: a tool's record, which [writer.record]
+// writes as a link where the record names a callee or a cancel.
+func (r *Recorder) write(ctx context.Context, ns string, data any, about string, record bool) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	w := r.writerOf(ctx)
@@ -2583,6 +2618,9 @@ func (r *Recorder) annotate(ctx context.Context, ns string, data any, about stri
 	callID := w.callOn(ctx)
 	if callID == "" && about != "" {
 		callID = w.heldCall(about)
+	}
+	if record {
+		return w.record(context.WithoutCancel(ctx), ns, raw, callID)
 	}
 	return w.append(context.WithoutCancel(ctx), &agentsession.CustomEntry{NS: ns, Data: raw, CallID: callID})
 }
@@ -2807,6 +2845,7 @@ func (r *Recorder) reopenID(ctx context.Context, id string) (*writer, error) {
 		return nil, err
 	}
 	w.appOnly = appOnlyCalls(s.Path(s.Leaf()))
+	w.callees = calleesOf(s.Path(s.Leaf()))
 	for _, e := range s.Path(s.Leaf()) {
 		if env, ok := e.(*agentsession.EnvEntry); ok {
 			w.env = env
@@ -2839,7 +2878,9 @@ func (w *writer) callOn(ctx context.Context) string {
 // reaches: each record is written as a custom entry in the record's
 // namespace, at the leaf of the run on the context, with call_id
 // naming the call that wrote it, durably before it returns, as
-// [Recorder.Annotate] writes one. Set it as
+// [Recorder.Annotate] writes one; the callee and cancel records of
+// tools/a2a are written as link entries of the call instead, as the
+// package documentation says. Set it as
 // agentturn.Config.ToolRecorder, or install it with
 // agenttool.ContextWithRecorder on the context a run is prompted with.
 //
@@ -2858,7 +2899,7 @@ func (w *writer) callOn(ctx context.Context) string {
 // session does not hold, so a record without it names no call.
 func (r *Recorder) RecordFunc() agenttool.RecordFunc {
 	return func(ctx context.Context, rec *agenttool.Record) error {
-		_, err := r.Annotate(ctx, rec.NS, json.RawMessage(rec.Data))
+		_, err := r.write(ctx, rec.NS, json.RawMessage(rec.Data), "", true)
 		return err
 	}
 }
@@ -2959,6 +3000,7 @@ func (w *writer) reset() {
 	// The links written are on the branch left: a call whose child is
 	// linked there and answered here gets the link again.
 	w.linked = map[string]bool{}
+	w.callees = nil
 	w.env = nil
 	w.base = ""
 	w.attempt, w.attemptModel, w.retries = nil, "", 0
@@ -2986,6 +3028,7 @@ func (w *writer) seed(ctx context.Context, s *agentsession.Session, owed bool) e
 	}
 	w.base = lastConfigBase(s.Path(s.Leaf()))
 	w.seededNotes, w.heldNotes = lastHeldNotes(s.Path(s.Leaf())), nil
+	w.callees = calleesOf(s.Path(s.Leaf()))
 	// The env in force is the last on the path, one a compaction left
 	// out of the context included: an env entry contributes nothing to
 	// it, and still says where the calls after it ran. So is the cause
@@ -3046,6 +3089,7 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 	for _, c := range calls {
 		off := false
 		ranEntry, childOff := "", ""
+		var calleesOff []agentsession.CalleeLink
 		if c.Output == nil && len(c.Dispatches) == 0 {
 			at, d, err := o.dispatchOff(s, c.Entry.ID)
 			if err != nil {
@@ -3058,10 +3102,15 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 					// origin holds its own link, in the fork's prefix.
 					childOff = subsessionOn(at, ranEntry, c.ID())
 				}
+				if ranEntry != "" {
+					// A callee in another system is no child of either
+					// session, so a fork's origin lends its links too.
+					calleesOff = calleesAt(at, ranEntry, d.ID, c.ID())
+				}
 			}
 		}
 		rec := callRecordOf(c, s.Header(), off)
-		rec.ranEntry, rec.childOff = ranEntry, childOff
+		rec.ranEntry, rec.childOff, rec.calleesOff = ranEntry, childOff, calleesOff
 		rec.dispatchEntry = lastDispatch(c)
 		rec.lastWithdrawn = withdrawn[rec.dispatchEntry]
 		for _, d := range c.Dispatches {
@@ -3585,7 +3634,8 @@ func (w *writer) drained(item openresponses.Item) *inboxItem {
 // toolEnd writes what a call's result carries for the record: a child
 // run's link, and the tool's own side data when its Details value is
 // an agenttool.Recordable, as a custom entry in the namespace the value
-// names, between the call's dispatch and its output.
+// names, or the link a callee or cancel record is, between the call's
+// dispatch and its output.
 func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 	if c := w.calls[e.CallID]; c != nil && e.Parent == "" && !e.Deferred && !c.dispatched && !c.rejected {
 		c.settledRun = w.run
@@ -3632,7 +3682,7 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 	if e.Parent != "" {
 		owner = e.Parent
 	}
-	_, err = w.append(ctx, &agentsession.CustomEntry{NS: rec.NS, Data: rec.Data, CallID: w.heldCall(owner)})
+	_, err = w.record(ctx, rec.NS, rec.Data, w.heldCall(owner))
 	return err
 }
 
@@ -4314,16 +4364,23 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 				// tool, and the output says why.
 				by, reason = agentsession.ByPolicy, outputText(out)
 			}
-			if origin := agentturn.OriginFromContext(ctx, out.CallID); origin != "" && origin == c.ranEntry && c.childOff != "" {
+			if origin := agentturn.OriginFromContext(ctx, out.CallID); origin != "" && origin == c.ranEntry {
 				// The output repeats one a child session produced on
 				// the branch left, and the link to that child comes
 				// with it, so the path says whose work the output is.
 				// The link on the branch left does not count: this
 				// branch holds none.
-				if _, err := w.append(ctx, agentsession.NewSubsessionLink(c.childOff, out.CallID)); err != nil {
+				if c.childOff != "" {
+					if _, err := w.append(ctx, agentsession.NewSubsessionLink(c.childOff, out.CallID)); err != nil {
+						return err
+					}
+					w.linked[out.CallID] = true
+				}
+				// So do the links to the callees in another system
+				// whose work it is, and the cancels sent to them.
+				if err := w.copyCallees(ctx, c.calleesOff); err != nil {
 					return err
 				}
-				w.linked[out.CallID] = true
 			}
 			dec := agentsession.NewDecision(out.CallID, c.entry, agentsession.VerdictAnswer, by)
 			if reason != "" {

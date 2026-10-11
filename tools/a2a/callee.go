@@ -9,12 +9,13 @@ import (
 
 // The namespaces of the records a call writes through
 // agenttool.WriteRecord while it runs. A session recorder that knows
-// them turns each into a link entry of the call: a [Callee] into a link
-// with rel "subsession" or "peer" naming the callee in another system,
-// a [CancelSent] into the notice that a cancel was sent for it. One that
-// does not writes each as a custom entry beside the call, as it writes
-// any record. The JSON of each type is the contract, so a recorder reads
-// it without importing this module or a2a-go.
+// them, as agentturn's session.Recorder does, turns each into a
+// link entry of the call: a [Callee] into a link with rel "subsession"
+// or "peer" naming the callee in another system, a [CancelSent] into
+// the notice that a cancel was sent for it. One that does not writes
+// each as a custom entry beside the call, as it writes any record. The
+// JSON of each type is the contract, so a recorder reads it without
+// importing this module or a2a-go.
 const (
 	CalleeNS = "agentturn:a2a_callee"
 	CancelNS = "agentturn:a2a_cancel"

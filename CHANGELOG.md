@@ -5,6 +5,36 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Changed: `session` requires agentsession v0.0.24, so the sessions it
+  writes are format 0.12, which a reader of 0.11 refuses once the file
+  is raised.
+- Added: `session`'s recorder writes the records `tools/a2a` writes as
+  link entries of the call, where it wrote custom entries: a `Callee`
+  record (`agentturn:a2a_callee`) as the subsession link
+  (`agentsession.NewCalleeSubsessionLink`) for relation `subsession` and
+  the peer link (`NewPeerLink`) for `peer`, naming the URL, task and
+  context; a `CancelSent` record (`agentturn:a2a_cancel`) as the cancel
+  notice (`NewCancelSentLink`) naming the latest link of the call to the
+  same URL and task on the path, so `agentsession.Session.Callees`
+  reads each callee, its dispatch, whether a cancel was sent and whether
+  the output came from it. It reads the records' JSON by namespace and
+  imports neither `tools/a2a` nor a2a-go. A record it cannot write as a
+  link, one that does not decode, names another relation, no URL or no
+  call the session holds, and a cancel whose callee's link is not on the
+  path, is the custom entry it was; none is dropped. A call dispatched
+  again after a restart reaches a new task and gets a link of its own
+  beside the first.
+- Added: an output `session.ReplayAnswers` gives from a branch a rebase
+  left brings that dispatch's callee links with it, as it brought a
+  child's subsession link, each copied whole, and each cancel notice is
+  written again naming the copy, since a notice names its link by entry
+  ID.
+- Fixed: `session` read a subsession link naming a callee in another
+  system, or a cancel notice, as a link to a child session of the store
+  when it looked for the child a replayed output came from.
+
 ## v0.0.28 - 2026-10-11
 
 - Added: `tools/a2a` records the callee a call reaches, through
