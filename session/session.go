@@ -1066,12 +1066,54 @@ type callRecord struct {
 // after a dispatch the loop withdrew (agentturn.ToolEnd.Withdrawn): a
 // subscriber called after the recorder failed on the call's
 // tool_dispatch, so the tool never ran. Its call_id is the call's and
-// its data a [Withdrawn]. [Pending] reads a call whose last dispatch it
-// withdraws as agentturn.PendingUndispatched, which the loop knew it to
+// its data a [Withdrawn], which names the one dispatch it withdraws.
+// [Pending] reads a call whose every dispatch on the path is withdrawn
+// as agentturn.PendingUndispatched, which the loop knew it to
 // be, rather than as one that may have run; a reader that does not
 // know the namespace reads the call in flight, which errs on the side
 // of caution.
 const WithdrawnNS = "agentturn:withdrawn"
+
+// HeldNotesNS is the namespace of the custom entry the recorder writes
+// when a run ends with notes held for its pending calls
+// (agentturn.PendingCall.Notes): what a decision or a person said about
+// a call of a batch a call of which was deferred or cut, which the run
+// that answers the calls appends after their outputs. Its call_id is
+// the pending call that holds them and its data a [HeldNotes].
+// [Pending] puts the notes of the last such entry on the path back on
+// the last pending call when a call it names is still pending.
+const HeldNotesNS = "agentturn:held_notes"
+
+// HeldNotes is the data of a [HeldNotesNS] custom entry.
+type HeldNotes struct {
+	// Calls are the IDs of the calls pending when the run ended, the
+	// calls the notes wait on.
+	Calls []string `json:"calls"`
+	// Notes are the notes, in the order they are appended.
+	Notes openresponses.Items `json:"notes"`
+}
+
+// heldNotes returns the notes the last [HeldNotesNS] entry on path
+// holds, when a call it names is in pending.
+func heldNotes(path []agentsession.Entry, pending []agentturn.PendingCall) openresponses.Items {
+	for i := len(path) - 1; i >= 0; i-- {
+		c, ok := path[i].(*agentsession.CustomEntry)
+		if !ok || c.NS != HeldNotesNS {
+			continue
+		}
+		var h HeldNotes
+		if json.Unmarshal(c.Data, &h) != nil {
+			return nil
+		}
+		for _, p := range pending {
+			if slices.Contains(h.Calls, p.Call.CallID) {
+				return h.Notes
+			}
+		}
+		return nil
+	}
+	return nil
+}
 
 // Withdrawn is the data of a [WithdrawnNS] custom entry.
 type Withdrawn struct {
@@ -1366,10 +1408,11 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // that raised the question, who held it, the part of the call it is
 // about and whether the call is held only beside another, from
 // [SubjectMember] and [HeldMember]); one in flight when the record stopped
-// may have run and is [agentturn.PendingAborted], unless a [WithdrawnNS]
-// entry withdrew every dispatch it has, when it never started, as is one with no
+// may have run and is [agentturn.PendingAborted], as is one with no
 // dispatch on the path that has one on a branch a rebase to before it
-// left, a held one of which is Dispatched; one an answer
+// left, a held one of which is Dispatched; one in flight whose every
+// dispatch a [WithdrawnNS] entry withdrew never reached its tool and is
+// [agentturn.PendingUndispatched]; one an answer
 // decision ended before its output was written is
 // [agentturn.PendingAnswered], owed that output and nothing else; one
 // a reject decision refused before its output was written is
@@ -1401,7 +1444,11 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // session as the recorder writing it does.
 //
 // A call a question was asked under that nothing answered, a run cut
-// while a person decided, carries that question as its Question.
+// while a person decided, carries that question as its Question. The
+// notes a run left waiting on the pending calls, which the recorder
+// keeps as a [HeldNotesNS] entry, are on the last pending call as its
+// Notes, so an agent seeded with them ([AgentOptions]) appends them
+// after the outputs that answer the calls.
 func Pending(s *agentsession.Session, opts ...ReadOption) ([]agentturn.PendingCall, error) {
 	pending, _, err := pendingCalls(s, opts)
 	return pending, err
@@ -1577,6 +1624,9 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 		}
 		p.Question = open[c.Call.CallID]
 		out = append(out, p)
+	}
+	if len(out) > 0 {
+		out[len(out)-1].Notes = heldNotes(path, out)
 	}
 	return out, ranAt, nil
 }
@@ -2667,7 +2717,8 @@ func (r *Recorder) RecordFunc() agenttool.RecordFunc {
 // format's terms. When fn is an agent's QuestionElicitor answered
 // through Reply with a trigger on its context, such as front/control's
 // principal, the answer entry names it as its Source
-// (agentturn.ContextWithAnswerer). A question the loop asks about a nested call, or a
+// (agentturn.WatchAnswerer, named by the replier with
+// agentturn.ContextWithAnswerer). A question the loop asks about a nested call, or a
 // front about a model's call, carries that call's ID, tool and parent
 // on both entries, from the agentturn.AskedCall on the context, so
 // consecutive questions are tied to the calls they are about by more
@@ -2715,7 +2766,7 @@ func (r *Recorder) Elicitor(by string, fn agenttool.Elicitor) agenttool.Elicitor
 		who := ""
 		var source agentturn.Trigger
 		if fn != nil {
-			actx, answerer := agentturn.ContextWithAnswerer(ctx)
+			actx, answerer := agentturn.WatchAnswerer(ctx)
 			ans, err = fn(actx, q)
 			who, source = by, answerer()
 		}
@@ -4566,6 +4617,9 @@ func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
 	if w.run == "" {
 		return nil
 	}
+	if err := w.holdNotes(ctx, e.Pending); err != nil {
+		return err
+	}
 	reason, ref := w.endReason(e)
 	entry := agentsession.NewRunEnd(w.run, reason, ref, append([]string(nil), w.open...))
 	w.run, w.open = "", nil
@@ -4575,6 +4629,29 @@ func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
 	// The end closes the queued entries of the inputs the run did not
 	// append; the ones the agent still holds are written again.
 	return w.endInbox(ctx)
+}
+
+// holdNotes writes the notes the run left on its pending calls, so a
+// reader of the record appends them as the agent would have.
+func (w *writer) holdNotes(ctx context.Context, pending []agentturn.PendingCall) error {
+	var h HeldNotes
+	holder := ""
+	for _, p := range pending {
+		h.Calls = append(h.Calls, p.Call.CallID)
+		if len(p.Notes) > 0 {
+			h.Notes = append(h.Notes, p.Notes...)
+			holder = p.Call.CallID
+		}
+	}
+	if len(h.Notes) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(h)
+	if err != nil {
+		return fmt.Errorf("session: held notes: %w", err)
+	}
+	_, err = w.append(ctx, &agentsession.CustomEntry{NS: HeldNotesNS, Data: data, CallID: w.heldCall(holder)})
+	return err
 }
 
 // endInFlight writes the response entry of the call in flight, if any,

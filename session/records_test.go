@@ -2283,7 +2283,7 @@ func TestAnAnswerNamesWhoGaveIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rec.Attach(a)()
-	bob := agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "control", Ref: "bob"})
+	bob := agentturn.ContextWithAnswerer(ctx, agentturn.Trigger{Kind: "control", Ref: "bob"})
 	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
 		if q, ok := ev.(*agentturn.Question); ok {
 			return a.Reply(bob, q.ID, agenttool.Answer{Action: agenttool.ActionAccept})
@@ -2388,5 +2388,71 @@ func TestAWithdrawnDispatchReadsAsNeverStarted(t *testing.T) {
 		if d.Reason == agentRunAgain {
 			t.Errorf("the replay of a call that never ran is recorded as a run again: %+v", d)
 		}
+	}
+}
+
+// TestHeldNotesSurviveARestart pins the recorder half of the review's
+// first finding: the notes a deferred batch holds are kept in the
+// record, read back onto the pending calls, and appended after the
+// outputs by the agent a restart builds, as the one that held them
+// would have.
+func TestHeldNotesSurviveARestart(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := []agenttool.Tool{agenttool.New("a", "", func(context.Context, echoArgs) (string, error) { return "A", nil }),
+		agenttool.New("b", "", func(context.Context, echoArgs) (string, error) { return "B", nil })}
+	hook := func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+		if info.Call.Name == "a" {
+			return &agentturn.ToolDecision{Note: "a ran in the sandbox"}, nil
+		}
+		return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask", By: agentsession.ByPolicy}, nil
+	}
+	a := agentturn.New(agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools, BeforeToolCall: hook})
+	unsub := rec.Attach(a)
+	if _, err := a.Prompt(ctx, openresponses.UserText("go")); err != nil {
+		t.Fatal(err)
+	}
+	unsub()
+
+	rec, s, err = Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := Pending(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || len(pending[0].Notes) != 1 {
+		t.Fatalf("pending = %+v, want b with a's note", pending)
+	}
+	opts, err := AgentOptions(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := agentturn.New(agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools}, opts...)
+	defer rec.Attach(b)()
+	out := openresponses.NewFunctionCallOutput(pending[0].Call.CallID, "did it myself")
+	if _, err := b.Resume(ctx, agentturn.Output(out).WithBy(agentsession.ByHuman)); err != nil {
+		t.Fatal(err)
+	}
+	var types []string
+	for _, it := range b.State().Transcript[:6] {
+		types = append(types, it.ItemType())
+	}
+	if got := strings.Join(types, " "); got != "message function_call function_call function_call_output function_call_output message" {
+		t.Fatalf("transcript = %q", got)
+	}
+	if m := b.State().Transcript[5].(*openresponses.Message); m.Text() != "a ran in the sandbox" {
+		t.Errorf("note = %q", m.Text())
+	}
+	if p, err := Pending(s); err != nil || len(p) != 0 {
+		t.Errorf("pending after the resume = %+v, %v", p, err)
+	}
+	if err := s.VerifyRecords(s.Leaf()); err != nil {
+		t.Errorf("verify: %v", err)
 	}
 }
