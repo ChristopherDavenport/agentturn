@@ -748,16 +748,18 @@ type Note struct {
 	CallID string
 }
 
-// NotesHeld reports the notes now waiting on the pending calls'
-// outputs, the whole set, each time it changes from what was last
-// reported or what the run started with: when it grows, after an
-// answer's output whose note waits for the approved batch that follows
-// it or when a batch ends with a call deferred or cut, and when it
-// shrinks or empties as the notes are appended. A recorder that keeps
-// the last report holds exactly what waits, so a process that dies after
-// an output loses nothing a person said; the run's end carries the same
-// set, on [PendingCall.Notes] while calls wait and on [RunEnd.Notes]
-// when none does.
+// NotesHeld reports the notes now waiting on outputs, the whole set,
+// each time it changes from what was last reported or what the run
+// started with. A note is reported held before the first output or item
+// it waits on is appended: before a Resume's output answer that carries
+// it, and before the outputs of the batch whose call it is about, a
+// hook's, an approval's, a released call's and one said under a call
+// alike. It is reported gone, the set shrunk or emptied, only after its
+// own item is appended. So a recorder that keeps the last report holds
+// every note from before its outputs until after its item, and a process
+// that dies anywhere between loses nothing a person said. The run's end
+// carries the same set, on [PendingCall.Notes] while calls wait and on
+// [RunEnd.Notes] when none does.
 type NotesHeld struct {
 	RunID string
 	Notes []Note
