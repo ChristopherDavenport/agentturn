@@ -95,8 +95,18 @@ func Ask(ctx context.Context, call AskedCall) (*ToolDecision, bool) {
 		if ans.Note != "" {
 			if r, ok := ctx.Value(noteSinkKey{}).(*runner); ok {
 				// The person's words are theirs, a user message held
-				// with the call, apart from the decision's own Note.
-				r.sayUnder(call.CallID, openresponses.UserText(ans.Note))
+				// with the call, apart from the decision's own Note. A
+				// nested call is tied to the call that made it, as
+				// Invoke ties it, so the note waits with that call's
+				// batch even when the loop never runs the nested call.
+				// One tied to nothing is held with the call whose tool
+				// asked.
+				r.adopt(call.CallID, call.Parent)
+				asking := ""
+				if c, ok := agenttool.CallFrom(ctx); ok {
+					asking = c.ID
+				}
+				r.sayUnder(openresponses.UserText(ans.Note), call.CallID, call.Parent, asking)
 			} else {
 				// No run to hold it with: the decision carries it.
 				if decided.Note != "" {

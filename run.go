@@ -558,6 +558,12 @@ type runner struct {
 	// an accept's note on a nested call it made, and what the user
 	// said answering a question its tool asked.
 	callNotes map[string]openresponses.Items
+	// noteKeys are the keys of callNotes in the order each first had a
+	// note, so notes no batch call takes are held in the order said.
+	noteKeys []string
+	// batchCalls are the calls of this run's batches, which a note said
+	// under a call is held with.
+	batchCalls map[string]bool
 
 	// hookMu serialises the tool hooks. A nested call runs on the
 	// goroutine of the tool that made it, so without it two tools of
@@ -759,6 +765,7 @@ func (r *runner) holdNotesOf(p *callState) {
 	r.noteMu.Lock()
 	said := r.callNotes[p.call.CallID]
 	delete(r.callNotes, p.call.CallID)
+	r.noteKeys = slices.DeleteFunc(r.noteKeys, func(id string) bool { return id == p.call.CallID })
 	r.noteMu.Unlock()
 	for _, item := range said {
 		r.hold(Note{Item: item, Mode: InputTool, CallID: p.call.CallID})
@@ -855,21 +862,75 @@ func (r *runner) adopt(id, parent string) {
 	r.roots[id] = parent
 }
 
-// sayUnder queues a note said under the call id, a call of the batch
-// or one nested under it, behind that batch call's output.
-func (r *runner) sayUnder(id string, note openresponses.Item) {
-	if id == "" {
-		return
-	}
+// batchCall marks id a call of one of the run's batches.
+func (r *runner) batchCall(id string) {
 	r.noteMu.Lock()
 	defer r.noteMu.Unlock()
-	if root, ok := r.roots[id]; ok {
-		id = root
+	if r.batchCalls == nil {
+		r.batchCalls = map[string]bool{}
+	}
+	r.batchCalls[id] = true
+}
+
+// sayUnder queues a note said under a call, behind its batch call's
+// output: under the first of ids that is a call of a batch or one
+// nested under it, and when none is, under the first that names a call
+// at all, which the batch then holds as a stray ([runner.holdStrays]).
+func (r *runner) sayUnder(note openresponses.Item, ids ...string) {
+	r.noteMu.Lock()
+	defer r.noteMu.Unlock()
+	id := ""
+	for _, c := range ids {
+		if root, ok := r.roots[c]; ok {
+			id = root
+			break
+		}
+		if r.batchCalls[c] {
+			id = c
+			break
+		}
+	}
+	if id == "" {
+		for _, c := range ids {
+			if c != "" {
+				id = c
+				break
+			}
+		}
+	}
+	if id == "" {
+		// Said under no call at all: the batch holds it as a stray.
+		id = "-"
 	}
 	if r.callNotes == nil {
 		r.callNotes = map[string]openresponses.Items{}
 	}
+	if _, ok := r.callNotes[id]; !ok {
+		r.noteKeys = append(r.noteKeys, id)
+	}
 	r.callNotes[id] = append(r.callNotes[id], note)
+}
+
+// holdStrays holds the notes said under a call no call of the batch
+// took ([runner.holdNotesOf]): one keyed by a call the loop never ran
+// and nothing tied to the batch, or said after its call's notes were
+// taken. They wait with the batch, in the order said, under the call
+// they were said about, so a note is never left where nothing reads it.
+func (r *runner) holdStrays() {
+	r.noteMu.Lock()
+	keys := r.noteKeys
+	stray := r.callNotes
+	r.noteKeys, r.callNotes = nil, nil
+	r.noteMu.Unlock()
+	for _, id := range keys {
+		callID := id
+		if callID == "-" {
+			callID = ""
+		}
+		for _, item := range stray[id] {
+			r.hold(Note{Item: item, Mode: InputTool, CallID: callID})
+		}
+	}
 }
 
 // noteSinkKey carries the runner whose hooks and tools run under a
@@ -904,7 +965,7 @@ func (r *runner) noteElicitor(elicit agenttool.Elicitor) agenttool.Elicitor {
 		}
 		if call, ok := agenttool.CallFrom(ctx); ok {
 			// A person's words, in the person's voice.
-			r.sayUnder(call.ID, openresponses.UserText(ans.Note))
+			r.sayUnder(openresponses.UserText(ans.Note), call.ID)
 		}
 		return ans, err
 	}
@@ -2225,6 +2286,7 @@ func (r *runner) appendFinished(ctx context.Context, batch []*callState) error {
 			r.holdNotesOf(p)
 		}
 	}
+	r.holdStrays()
 	// Reported held before the outputs they follow are appended.
 	if err := r.notesHeld(); err != nil {
 		return err
@@ -2462,6 +2524,7 @@ func (r *runner) collect(batch []*callState) ([]agenttool.Result, []*openrespons
 		}
 		r.holdNotesOf(p)
 	}
+	r.holdStrays()
 	// The notes are reported held before the outputs they follow are
 	// appended, so a record never holds an output without them.
 	if err := r.notesHeld(); err != nil {
@@ -2497,6 +2560,7 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 	for i, ap := range approved {
 		p := r.prepare(tools, r.turn, ap.call, ap.args)
 		r.resolved(p)
+		r.batchCall(ap.call.CallID)
 		if r.approved == nil {
 			r.approved = map[string]bool{}
 		}
@@ -2558,6 +2622,7 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 func (r *runner) preflight(ctx context.Context, tools agenttool.Set, call *openresponses.FunctionCall, batch []*openresponses.FunctionCall, index int) (*callState, error) {
 	p := r.prepare(tools, r.turn, call, nil)
 	r.resolved(p)
+	r.batchCall(call.CallID)
 	var decision *ToolDecision
 	if r.cfg.BeforeToolCall != nil {
 		var err error
@@ -2816,7 +2881,7 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 				// as a model call's does: after the outputs of the
 				// batch the invoking call belongs to.
 				if decision.Note != "" {
-					r.sayUnder(parent, openresponses.DeveloperText(decision.Note))
+					r.sayUnder(openresponses.DeveloperText(decision.Note), parent)
 				}
 			}
 		}

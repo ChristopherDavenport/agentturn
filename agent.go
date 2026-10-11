@@ -262,7 +262,8 @@ func keepNotes(pending, known []PendingCall) {
 }
 
 // keepOwed keeps the owed notes whose call's output is in t: they
-// follow that output, and one whose output is gone goes with it.
+// follow that output, and one whose output is gone goes with it. A note
+// about no call is kept, since nothing says it is gone.
 func keepOwed(notes []Note, t Transcript) []Note {
 	if len(notes) == 0 {
 		return nil
@@ -275,7 +276,7 @@ func keepOwed(notes []Note, t Transcript) []Note {
 	}
 	var out []Note
 	for _, n := range notes {
-		if n.CallID != "" && answered[n.CallID] {
+		if n.CallID == "" || answered[n.CallID] {
 			out = append(out, n)
 		}
 	}
