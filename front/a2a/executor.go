@@ -242,7 +242,11 @@ func New(cfg agentturn.Config, opts ...Option) *Executor {
 		e.store = &MemoryStore{}
 	}
 	if e.owners == nil {
-		e.owners = &MemoryOwners{}
+		if o, ok := e.store.(Owners); ok {
+			e.owners = o
+		} else {
+			e.owners = &MemoryOwners{}
+		}
 	}
 	if e.escalate && e.auth == nil {
 		// An approval lets a call run on the caller's word, so the
@@ -371,8 +375,8 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 		// carries the decision the policy made about it, its note
 		// included, which the loop says when the approval releases it.
 		var seeded []agentturn.PendingCall
-		for _, fc := range unanswered(transcript) {
-			seeded = append(seeded, agentturn.PendingCall{Call: fc, Reason: agentturn.PendingDeferred, Decision: asked[fc.CallID].Decision})
+		for _, c := range escalated {
+			seeded = append(seeded, agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingDeferred, Decision: c.Decision})
 		}
 		opts = append(opts, agentturn.WithPending(seeded))
 	}
@@ -402,6 +406,11 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 		for _, a := range approvals {
 			answers = append(answers, a.answer(asked[a.CallID], principal))
 		}
+		for _, c := range escalated {
+			if !c.asked() {
+				answers = append(answers, c.release())
+			}
+		}
 		run = func(ctx context.Context) (*agentturn.RunEnd, error) { return agent.Resume(ctx, answers...) }
 	}
 	out := e.relay(ctx, runCtx, cancel, reqCtx, q, agent, run, caller)
@@ -418,7 +427,11 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	if e.escalate {
 		if out.end.Reason == agentturn.ReasonInputRequired {
 			for _, p := range out.end.Pending {
-				if p.Call != nil && !callers[p.Call.Name] {
+				// Only a call the policy deferred, with the decision
+				// that did, is the caller's to approve or held beside
+				// one; anything else of the agent's own is never run on
+				// the caller's word.
+				if p.Call != nil && !callers[p.Call.Name] && p.Reason == agentturn.PendingDeferred && p.Decision != nil {
 					escalated = append(escalated, Escalated{Task: string(reqCtx.TaskID), Call: p.Call, Decision: p.Decision})
 				}
 			}
@@ -982,8 +995,14 @@ func checkAnswers(t agentturn.Transcript, prompts openresponses.Items, approvals
 	want := make(map[string]bool, len(pending))
 	own := make(map[string]bool, len(pending))
 	for _, fc := range pending {
+		c, ok := asked[fc.CallID]
+		if ok && !c.asked() {
+			// Held beside a call put to the caller: the policy
+			// releases it with the caller's answers.
+			continue
+		}
 		want[fc.CallID] = true
-		_, own[fc.CallID] = asked[fc.CallID]
+		own[fc.CallID] = ok
 	}
 	for _, item := range prompts {
 		fco, ok := item.(*openresponses.FunctionCallOutput)
@@ -1039,6 +1058,8 @@ func (e *Executor) inputRequired(ctx context.Context, reqCtx *a2asrv.RequestCont
 	parts = append(parts, asked...)
 	isAsked := map[string]bool{}
 	for _, c := range escalated {
+		// Asked or held, the call is not one the caller answers with
+		// an output.
 		isAsked[c.Call.CallID] = true
 	}
 	for _, fc := range pending {

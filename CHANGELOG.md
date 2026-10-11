@@ -15,8 +15,9 @@ versions may break the API.
   under `WithoutCancelOnAbort`. A call dispatched again reaches a new task
   and writes a new record; the answers on one task do not. The URL is the
   endpoint the client sent to when the client carries the new
-  `ObserveEndpoint` interceptor, else the card's URL when the card offers
-  no other interface, else none; `New` changes nothing on the client.
+  `ObserveEndpoint` interceptor, and none otherwise, since the tool cannot
+  tell which endpoint a client it did not build calls; `New` changes
+  nothing on the client. A record whose write failed is written again.
 - Added: a record that cannot be written while the task runs fails the
   call, which gives the task up; once the remote agent has answered, the
   answer is returned and the failure is on `TaskInfo.RecordErr`.
@@ -29,7 +30,8 @@ versions may break the API.
   after the `Callee` if that was not yet written, which says the stop was
   asked for, not that the work stopped. `WithoutCancelOnAbort` leaves a
   peer's task running and records no cancel. A task waiting on input is
-  left as it is. A blocking call given up before the remote agent
+  left as it is, and a call that ends with a message answer cancels
+  nothing. A blocking call given up before the remote agent
   answered has no task ID to cancel.
 - Added: `tools/a2a`'s `WithInputRequired(fn)` answers a task that enters
   input-required inside the call, on the same task, at most
@@ -42,11 +44,14 @@ versions may break the API.
   authenticates every call from its metadata on every method and
   transport and refuses an unauthenticated one before the executor or the
   task store sees it; each task and conversation belongs to the principal
-  that created it (`Owners`, in memory by default, `WithOwners`), and a
-  call about another's, a message, tasks/get, tasks/cancel, resubscribe
-  or the push configuration, is refused as not found, while tasks/list
-  shows the principal's own; the executor runs no task for a call that
-  did not pass the interceptor; each task's run is prompted under the
+  that created it, claimed as soon as the answer names it (`Owners`, kept
+  by a `ConversationStore` that implements it, as `MemoryStore` does,
+  else in memory, or `WithOwners`), and a call about another's, a
+  message continuing it or referencing another's task, tasks/get,
+  tasks/cancel, resubscribe or the push configuration, is refused as not
+  found, as is a stored conversation whose owner was lost; tasks/list is
+  not served; the executor runs no task for a call that did not pass the
+  interceptor; each task's run is prompted under the
   trigger `{Kind: "a2a", Ref: principal}`. `Executor.Handler` answers an
   HTTP request early with 401, and `Executor.Secure` returns a copy of a
   card that requires the scheme once.
@@ -58,7 +63,9 @@ versions may break the API.
   `MetaEscalatedCalls`, and the caller answers with an `Approval` data
   part (`ApprovalPart`). Only the calls the policy deferred in that task
   may be approved, as the policy decided them, its rewrite of the
-  arguments and its note included; they are kept beside the conversation
+  arguments, which the question shows, and its note included; a call held
+  only beside an asked one is not put to the caller but released by the
+  policy with the caller's answers; they are kept beside the conversation
   (`EscalationStore`, which `MemoryStore` implements), so a re-ask keeps
   the policy's reason. The answer's run is under the caller's principal,
   the decision names nobody (the executor cannot tell a person on the
@@ -66,6 +73,12 @@ versions may break the API.
   refused; the caller's note reaches the model as "The caller
   <principal> said: …" in the user's voice, or in a refusal's output.
   `MetaPendingCalls` lists only the calls to the caller's own tools.
+- Changed (breaking): `front/a2a`'s `ItemsFromMessage`, which reads a
+  caller's message, takes from a typed data part only a user message or a
+  `function_call_output`; a developer, system or assistant message, a
+  `function_call` or any other item is refused as invalid params, so a
+  caller cannot give the agent instructions in the developer's voice or
+  forge its past turns.
 
 ## v0.0.27 - 2026-10-11
 

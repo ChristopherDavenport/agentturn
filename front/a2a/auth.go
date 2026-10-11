@@ -83,10 +83,13 @@ func BearerTokens(tokens map[string]string) Authenticator {
 //     a task leaves that task as it was.
 //   - The interceptor refuses, as a2a.ErrTaskNotFound, a call about a
 //     task or a context another principal owns: a message continuing
-//     it, tasks/get, tasks/cancel, resubscribe and the push
-//     configuration methods; tasks/list returns the principal's own
-//     tasks only. A task or a context belongs to the principal whose
-//     message created it, as [Owners] records.
+//     it or referencing another's task, tasks/get, tasks/cancel,
+//     resubscribe and the push configuration methods. A task or a
+//     context belongs to the principal whose message created it, as
+//     [Owners] records, claimed as soon as the answer names it; a
+//     stored conversation nobody owns is refused to everyone.
+//     tasks/list is not served (a2a.ErrUnsupportedOperation): it is
+//     paged before another's tasks could be taken out.
 //   - The executor refuses a message or a cancel that did not pass the
 //     interceptor, so a handler built without it runs no task; it
 //     cannot guard the methods that never reach the executor, which is
@@ -112,10 +115,15 @@ func WithAuthenticator(auth Authenticator) Option {
 // [WithAuthenticator]. Claim sets key's owner to principal unless it
 // has one, and returns the owner it has after the call, so two claims
 // of one key agree on one owner. A key is "task:<id>" or
-// "context:<id>". The executor keeps them in memory by default
-// ([WithOwners] replaces that): after a restart a task or conversation
-// nobody owns is not found, and a conversation is claimed again by the
-// first principal that writes to it.
+// "context:<id>". The executor keeps them where the conversations are
+// when its [ConversationStore] implements Owners, as [MemoryStore]
+// does, else in memory ([WithOwners] names a store of its own). A task
+// nobody owns is not found, and so is a conversation nobody owns that
+// the store holds, after a restart that lost its owner or on a replica
+// that does not share them: it fails closed rather than going to its
+// first writer. A new conversation is claimed by the principal whose
+// message starts it, whatever ID the caller chose; one principal can
+// take an ID another has not used yet, which leaks nothing.
 type Owners interface {
 	Owner(ctx context.Context, key string) (string, bool, error)
 	Claim(ctx context.Context, key, principal string) (string, error)
@@ -232,12 +240,18 @@ func (g guard) Before(ctx context.Context, callCtx *a2asrv.CallContext, req *a2a
 	ctx = context.WithValue(ContextWithPrincipal(ctx, principal), guardedKey{}, true)
 	var task a2a.TaskID
 	var conversation string
+	var refs []a2a.TaskID
 	if req != nil {
 		switch p := req.Payload.(type) {
 		case *a2a.MessageSendParams:
 			if p != nil && p.Message != nil {
-				task, conversation = p.Message.TaskID, p.Message.ContextID
+				task, conversation, refs = p.Message.TaskID, p.Message.ContextID, p.Message.ReferenceTasks
 			}
+		case *a2a.ListTasksRequest:
+			// A list is paged before the guard could take another's
+			// tasks out, so its pages and totals would mislead; it is
+			// not served under ownership.
+			return ctx, a2a.NewError(a2a.ErrUnsupportedOperation, "tasks/list is not served to an authenticated caller")
 		case *a2a.TaskQueryParams:
 			task = p.ID
 		case *a2a.TaskIDParams:
@@ -252,11 +266,14 @@ func (g guard) Before(ctx context.Context, callCtx *a2asrv.CallContext, req *a2a
 			task = p.TaskID
 		}
 	}
-	if task != "" {
-		// A task is its creator's; one nobody owns was not created
-		// through this executor, or before a restart, and is not
-		// found either.
-		owner, ok, err := e.owners.Owner(ctx, "task:"+string(task))
+	// A task is its creator's; one nobody owns was not created
+	// through this executor, or before a restart, and is not found
+	// either. A message's referenced tasks are held to the same rule.
+	for _, t := range append([]a2a.TaskID{task}, refs...) {
+		if t == "" {
+			continue
+		}
+		owner, ok, err := e.owners.Owner(ctx, "task:"+string(t))
 		if err != nil {
 			return ctx, err
 		}
@@ -265,36 +282,60 @@ func (g guard) Before(ctx context.Context, callCtx *a2asrv.CallContext, req *a2a
 		}
 	}
 	if conversation != "" {
-		owner, ok, err := e.owners.Owner(ctx, "context:"+conversation)
-		if err != nil {
+		if err := e.mayWrite(ctx, principal, conversation); err != nil {
 			return ctx, err
-		}
-		if ok && owner != principal {
-			return ctx, notFound()
 		}
 	}
 	return ctx, nil
 }
 
-// After leaves tasks/list with the principal's own tasks.
-func (g guard) After(ctx context.Context, _ *a2asrv.CallContext, resp *a2asrv.Response) error {
-	if g.e.auth == nil || resp == nil {
-		return nil
+// mayWrite refuses a conversation another principal owns, and one
+// nobody owns that the store holds: its owner was lost, to a restart
+// with owners kept in memory or to a replica that does not share them,
+// and the first writer must not take it. Only a new conversation is
+// free to claim.
+func (e *Executor) mayWrite(ctx context.Context, principal, conversation string) error {
+	owner, ok, err := e.owners.Owner(ctx, "context:"+conversation)
+	if err != nil {
+		return err
 	}
-	list, ok := resp.Payload.(*a2a.ListTasksResponse)
-	if !ok || list == nil {
-		return nil
-	}
-	principal, _ := PrincipalFrom(ctx)
-	kept := list.Tasks[:0:0]
-	for _, t := range list.Tasks {
-		if owner, ok, err := g.e.owners.Owner(ctx, "task:"+string(t.ID)); err == nil && ok && owner == principal {
-			kept = append(kept, t)
+	if ok {
+		if owner != principal {
+			return notFound()
 		}
+		return nil
 	}
-	list.Tasks = kept
-	list.TotalSize = len(kept)
+	held, err := e.store.Load(ctx, conversation)
+	if err != nil {
+		return err
+	}
+	if len(held) > 0 {
+		return notFound()
+	}
 	return nil
+}
+
+// After makes the task and conversation a message send answered with
+// the sender's, as soon as the answer names them: a send that does not
+// wait for the run can answer before the executor claims them, and the
+// creator gets and follows its task at once.
+func (g guard) After(ctx context.Context, callCtx *a2asrv.CallContext, resp *a2asrv.Response) error {
+	if g.e.auth == nil || resp == nil || resp.Err != nil || callCtx == nil {
+		return nil
+	}
+	if m := callCtx.Method(); m != "OnSendMessage" && m != "OnSendMessageStream" {
+		return nil
+	}
+	info, ok := resp.Payload.(a2a.TaskInfoProvider)
+	if !ok || info == nil {
+		return nil
+	}
+	principal, ok := PrincipalFrom(ctx)
+	if !ok {
+		return nil
+	}
+	ti := info.TaskInfo()
+	return g.e.takeOwnership(ctx, principal, ti.TaskID, ti.ContextID)
 }
 
 func unauthenticated() error {
@@ -348,6 +389,11 @@ func (e *Executor) authenticated(ctx context.Context) (context.Context, string, 
 func (e *Executor) takeOwnership(ctx context.Context, principal string, task a2a.TaskID, conversation string) error {
 	if e.auth == nil {
 		return nil
+	}
+	if conversation != "" {
+		if err := e.mayWrite(ctx, principal, conversation); err != nil {
+			return err
+		}
 	}
 	for _, key := range []string{"context:" + conversation, "task:" + string(task)} {
 		if key == "context:" || key == "task:" {

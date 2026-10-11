@@ -143,19 +143,16 @@ const DefaultInputRounds = 8
 func WithInputRounds(n int) Option { return func(r *remote) { r.inputRounds = n } }
 
 // New wraps a remote agent as a tool. The client is usually built from
-// the same card with a2aclient.NewFromCard, with the [ObserveEndpoint]
-// interceptor, so a call records the URL its requests went to; New
-// changes nothing on client. Without the interceptor a call records the
-// card's URL when the card offers no other interface, and no URL
-// otherwise.
+// the same card with a2aclient.NewFromCard. Build it with the
+// [ObserveEndpoint] interceptor, however it is built, so a call records
+// the URL its requests went to; New changes nothing on client, and
+// without the interceptor a call records no URL, since the tool cannot
+// tell which endpoint a client it did not build calls.
 func New(client *a2aclient.Client, card *a2a.AgentCard, opts ...Option) agenttool.Tool {
 	r := &remote{client: client, inputRounds: DefaultInputRounds}
 	if card != nil {
 		r.name = functionName(card.Name)
 		r.description = describe(card)
-		if len(card.AdditionalInterfaces) == 0 {
-			r.cardURL = card.URL
-		}
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -190,7 +187,6 @@ type remote struct {
 	peer          bool
 	inputRequired InputRequired
 	inputRounds   int
-	cardURL       string
 	schema        json.RawMessage
 }
 
@@ -248,10 +244,11 @@ func (r *remote) Execute(ctx context.Context, call agenttool.Call) (agenttool.Re
 		// The task waits for input, which a host may give it with the
 		// IDs the call returns; it is left as it is.
 	default:
-		if out.taskID != "" && !out.state.Terminal() {
+		if out.taskID != "" && !out.state.Terminal() && out.message == nil {
 			// The stream closed, or a blocking call returned, before
 			// the task ended: the call is over, and its own work is
-			// stopped as an abort stops it.
+			// stopped as an abort stops it. A message answer ends the
+			// exchange; there is nothing left running.
 			c.cancel(ctx, &out)
 		}
 	}
@@ -276,16 +273,12 @@ func (c *callState) relation() string {
 	return RelationSubsession
 }
 
-// url is the endpoint the call's requests went to: the one the client
-// sent them to, when it carries the [ObserveEndpoint] interceptor, else
-// the card's URL when the card offers no other interface, the only one
-// a client built from it can have called.
-func (c *callState) url() string {
-	if u := c.ep.get(); u != "" {
-		return u
-	}
-	return c.remote.cardURL
-}
+// url is the endpoint the call's requests went to, which the client
+// tells when it carries the [ObserveEndpoint] interceptor. Without it
+// the call cannot tell which endpoint was called, the client having
+// been built some way the tool does not see, and records none rather
+// than one that may be wrong.
+func (c *callState) url() string { return c.ep.get() }
 
 // report writes the [Callee] record once the callee is known: a task,
 // or a plain message answer with no task. It is written once per task,
@@ -297,16 +290,23 @@ func (c *callState) report(ctx context.Context, out *outcome) error {
 		if c.reported == string(out.taskID) {
 			return nil
 		}
-		c.reported = string(out.taskID)
 	case out.message != nil:
 		if c.reportedM {
 			return nil
 		}
-		c.reportedM = true
 	default:
 		return nil
 	}
-	return agenttool.WriteRecord(context.WithoutCancel(ctx), Callee{URL: c.url(), Task: string(out.taskID), Context: out.contextID, Relation: c.relation()})
+	if err := agenttool.WriteRecord(context.WithoutCancel(ctx), Callee{URL: c.url(), Task: string(out.taskID), Context: out.contextID, Relation: c.relation()}); err != nil {
+		return err
+	}
+	// Marked once it is written, so a failed write is tried again.
+	if out.taskID != "" {
+		c.reported = string(out.taskID)
+	} else {
+		c.reportedM = true
+	}
+	return nil
 }
 
 // cancel sends tasks/cancel for a task the call gave up, unless the

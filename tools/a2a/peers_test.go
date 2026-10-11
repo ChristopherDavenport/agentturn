@@ -350,24 +350,23 @@ func TestACallThatEndsBeforeItsTaskCancelsIt(t *testing.T) {
 
 // TestTheEndpointIsTheOneCalled pins the URL: with ObserveEndpoint on
 // the client the record names the endpoint the client sent to, and New
-// leaves the client as it was; without it, a card with other interfaces
-// names no URL rather than one the client may not have called.
+// leaves the client as it was; without it the record names no URL
+// rather than one the client may not have called.
 func TestTheEndpointIsTheOneCalled(t *testing.T) {
 	remoteCfg := agentturn.Config{Name: "Echo", Model: &echo.Adapter{}, ModelName: "remote"}
-	client, card := serve(t, fronta2a.New(remoteCfg), nil)
-	card.AdditionalInterfaces = []a2a.AgentInterface{{URL: "http://elsewhere.invalid/rpc", Transport: a2a.TransportProtocolGRPC}}
-	observed, err := a2aclient.NewFromCard(context.Background(), card, a2aclient.WithInterceptors(ObserveEndpoint()))
+	observed, card := serve(t, fronta2a.New(remoteCfg), nil)
+	plain, err := a2aclient.NewFromCard(context.Background(), card)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = observed.Destroy() })
+	t.Cleanup(func() { _ = plain.Destroy() })
 	for _, tc := range []struct {
 		name   string
 		client *a2aclient.Client
 		url    string
 	}{
 		{"observed", observed, card.URL},
-		{"unobserved", client, ""},
+		{"unobserved", plain, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var recs records
@@ -448,5 +447,91 @@ func TestARecordThatCannotBeWritten(t *testing.T) {
 	case <-remote.cancelled:
 	case <-time.After(5 * time.Second):
 		t.Error("streaming: the task was not given up")
+	}
+}
+
+// messaging asks on the first message of a task and answers the next
+// with a plain message, not a task.
+type messaging struct{ cancelled chan a2a.TaskID }
+
+func (messaging) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue) error {
+	if reqCtx.StoredTask == nil {
+		ev := a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateInputRequired, a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: "which?"}))
+		ev.Final = true
+		return q.Write(ctx, ev)
+	}
+	return q.Write(ctx, a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: "done"}))
+}
+
+func (s messaging) Cancel(_ context.Context, reqCtx *a2asrv.RequestContext, _ eventqueue.Queue) error {
+	s.cancelled <- reqCtx.TaskID
+	return nil
+}
+
+// TestAMessageAnswerAfterAnInputRoundCancelsNothing pins that a call
+// whose answered round ends in a message has nothing left running to
+// cancel.
+func TestAMessageAnswerAfterAnInputRoundCancelsNothing(t *testing.T) {
+	remote := messaging{cancelled: make(chan a2a.TaskID, 4)}
+	client, card := serve(t, remote, nil)
+	hook := func(context.Context, TaskInfo, *a2a.Message) ([]a2a.Part, error) {
+		return []a2a.Part{a2a.TextPart{Text: "that one"}}, nil
+	}
+	var recs records
+	ctx := agenttool.ContextWithRecorder(context.Background(), recs.fn)
+	res, err := New(client, card, WithBlocking(), WithInputRequired(hook)).Execute(ctx, agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"go"}`)})
+	if err != nil || res.Output.Text != "done" {
+		t.Fatalf("result = %+v err = %v", res.Output, err)
+	}
+	select {
+	case id := <-remote.cancelled:
+		t.Errorf("task %q was cancelled after a message answer", id)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if n := len(recs.of(CancelNS)); n != 0 {
+		t.Errorf("cancel records = %d", n)
+	}
+}
+
+// flaky fails its first write and takes the rest.
+type flaky struct {
+	records
+	failed bool
+}
+
+func (f *flaky) fn(ctx context.Context, rec *agenttool.Record) error {
+	f.mu.Lock()
+	first := !f.failed
+	f.failed = true
+	f.mu.Unlock()
+	if first {
+		return errors.New("busy")
+	}
+	return f.records.fn(ctx, rec)
+}
+
+// TestACalleeRecordThatFailedIsWrittenAgain pins that a Callee whose
+// write failed is not marked written: the cancel that follows writes it
+// before the CancelSent.
+func TestACalleeRecordThatFailedIsWrittenAgain(t *testing.T) {
+	remote := newStalling()
+	defer func() {
+		close(remote.release)
+		remote.once.Do(func() { close(remote.done) })
+	}()
+	client, card := serve(t, remote, nil)
+	var f flaky
+	ctx := agenttool.ContextWithRecorder(context.Background(), f.fn)
+	if _, err := New(client, card).Execute(ctx, agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"work"}`)}); err == nil {
+		t.Fatal("a call whose record failed while the task ran succeeded")
+	}
+	f.mu.Lock()
+	var order []string
+	for _, r := range f.got {
+		order = append(order, r.NS)
+	}
+	f.mu.Unlock()
+	if len(order) != 2 || order[0] != CalleeNS || order[1] != CancelNS {
+		t.Errorf("records = %v, want the callee written again, then the cancel", order)
 	}
 }

@@ -72,9 +72,12 @@ func ApprovalPart(a Approval) a2a.DataPart {
 // the caller's word: [New] panics without it.
 func WithEscalation() Option { return func(e *Executor) { e.escalate = true } }
 
-// Escalated is a call a task put to its caller: the call, and the
-// decision the policy made that deferred it, with its reason, its
-// rewrite of the arguments and its note.
+// Escalated is a call a task put to its caller, or held beside one: the
+// call, and the decision the policy made that deferred it, with its
+// reason, its rewrite of the arguments and its note. A held call
+// (Decision.Held), which the policy allowed and held only beside an
+// asked sibling, is not put to the caller; it is released, by the
+// policy, with the answers to the calls that were.
 type Escalated struct {
 	Task     string                      `json:"task"`
 	Call     *openresponses.FunctionCall `json:"call"`
@@ -175,12 +178,39 @@ func (a Approval) answer(call Escalated, principal string) agentturn.Answer {
 	return agentturn.Output(&openresponses.FunctionCallOutput{CallID: a.CallID, Output: openresponses.FunctionCallOutputData{Text: text}})
 }
 
+// asked reports whether c is put to the caller rather than held beside
+// a call that is.
+func (c Escalated) asked() bool { return c.Decision == nil || !c.Decision.Held }
+
+// args is what the call runs with when it is approved: the policy's
+// rewrite, else the model's arguments.
+func (c Escalated) args() string {
+	if c.Decision != nil && c.Decision.Args != nil {
+		return string(c.Decision.Args)
+	}
+	return c.Call.Arguments
+}
+
+// release is the policy's answer to a held call: it runs, as the policy
+// allowed it, with its rewrite.
+func (c Escalated) release() agentturn.Answer {
+	ans := agentturn.Approve(c.Call.CallID)
+	if c.Decision.Args != nil {
+		ans = agentturn.ApproveWith(c.Call.CallID, c.Decision.Args)
+	}
+	return ans.WithBy("policy").WithReason("released: " + c.Decision.Reason)
+}
+
 // escalation is what an input-required status message says about the
-// escalated calls: the text parts and the metadata.
+// calls put to the caller: the text parts and the metadata, each with
+// the arguments the call runs with if approved.
 func escalation(calls []Escalated) ([]a2a.Part, []any) {
 	var parts []a2a.Part
 	var meta []any
 	for _, c := range calls {
+		if !c.asked() {
+			continue
+		}
 		reason := ""
 		if c.Decision != nil {
 			reason = c.Decision.Reason
@@ -188,8 +218,8 @@ func escalation(calls []Escalated) ([]a2a.Part, []any) {
 		if reason == "" {
 			reason = "the policy asks before this call runs"
 		}
-		parts = append(parts, a2a.TextPart{Text: fmt.Sprintf("The agent's policy asks before running %s (call %s): %s", c.Call.Name, c.Call.CallID, reason)})
-		meta = append(meta, map[string]any{"call_id": c.Call.CallID, "name": c.Call.Name, "reason": reason})
+		parts = append(parts, a2a.TextPart{Text: fmt.Sprintf("The agent's policy asks before running %s (call %s) with %s: %s", c.Call.Name, c.Call.CallID, c.args(), reason)})
+		meta = append(meta, map[string]any{"call_id": c.Call.CallID, "name": c.Call.Name, "arguments": c.args(), "reason": reason})
 	}
 	return parts, meta
 }
