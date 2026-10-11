@@ -5,6 +5,51 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Added: `Recorder.Elicitor` writes who answered on the answer entry,
+  as `Elicitation.Source`, when the replier named itself on
+  `Agent.Reply`'s context with `ContextWithAnswerer`, as `front/control`
+  names its principal. (#240)
+- Added: `Pending` sets `PendingCall.Question` from the record's open
+  question, and `ReplayAnswers` takes the reason it appends from there
+  (`OpenQuestion.Reason`), so a host or a front that reads the pending
+  call, rather than the record, knows the call was waiting on a person.
+  (#241)
+- Added: the recorder writes an `agentturn:withdrawn` custom entry
+  (`WithdrawnNS`, `Withdrawn`) after a dispatch the loop withdrew
+  (`ToolEnd.Withdrawn`), and `Pending` reads a call whose every dispatch
+  was withdrawn as `PendingUndispatched` rather than `PendingAborted`,
+  so a subscriber registered after the recorder that fails on
+  `tool_dispatch` no longer leaves a call the record says may have run.
+  Its replay runs it, not as a run again. A live recorder counts
+  withdrawals as one seeded from the path does, so both write the same
+  decisions. (#119)
+- Added: the hold decision keeps the deferring decision's own note as
+  the member `agentturn:note` (`NoteMember`), and `Pending` reads it back
+  onto `PendingCall.Decision`, so after a restart the loop says a held
+  call's policy note once when an approval releases it (agentturn's
+  release note).
+- Added: the notes waiting on the pending calls, or owed after outputs a
+  failed run appended, are on the record as `agentturn:held_notes`
+  entries (`HeldNotesNS`, `HeldNotes`, `HeldNote`), each note with its
+  item, mode, trigger and call. The recorder writes the whole set on
+  every `notes_held` event, an empty one included, and at the run's end
+  when it differs. agentturn v0.0.25 reports every note held before the
+  first output it waits on and gone only after its own item, so the
+  record holds each note from before its outputs until after its item,
+  and a process that dies anywhere between, with no run end, loses
+  nothing a person said. `Pending` puts the last entry's
+  notes on the last pending call; with nothing pending the new
+  `OwedNotes` gives those whose call's output is on the path, and
+  `AgentOptions` seeds them with `WithNotes`. Notes whose items the path
+  already holds after the entry, from a run that died before reporting
+  them gone, a flush cut part way or a rebase to an entry in between,
+  are not restored, so they are not said twice. A restored note keeps
+  its call, so a note an answer brings again after the restart is said
+  once. The `Rebase` doc and the README's recipe restore owed notes with
+  `SetNotes(OwedNotes(s))` beside `SetPending(Pending(s))`.
+
 ## v0.0.25 - 2026-10-11
 
 - Fixed: every note is reported held (`notes_held`) before the first
@@ -97,22 +142,6 @@ versions may break the API.
 
 ## v0.0.23 - 2026-10-11
 
-- Added: agentturn/session's `Recorder.Elicitor` writes who answered
-  on the answer entry, as `Elicitation.Source`, when the answer came
-  through `Agent.Reply` with a trigger on its context, such as
-  `front/control`'s principal. (#240)
-- Added: agentturn/session's `Pending` sets `PendingCall.Question` from
-  the record's open question, and `ReplayAnswers` takes the reason it
-  appends from there (`OpenQuestion.Reason`), so a host or a front that
-  reads the pending call, rather than the record, knows the call was
-  waiting on a person. (#241)
-- Added: the recorder writes an `agentturn:withdrawn` custom entry
-  (`session.WithdrawnNS`, `session.Withdrawn`) after a dispatch the loop
-  withdrew (`ToolEnd.Withdrawn`), and `Pending` reads a call whose every
-  dispatch was withdrawn as `PendingUndispatched` rather than
-  `PendingAborted`, so a subscriber registered after the recorder that
-  fails on `tool_dispatch` no longer leaves a call the record says may
-  have run. Its replay runs it, not as a run again. (#119)
 - Fixed: the recorder writes a hold decision's `Subject` and `Held` as
   the members `agentturn:subject` and `agentturn:held`
   (`session.SubjectMember`, `session.HeldMember`), and `session.Pending`

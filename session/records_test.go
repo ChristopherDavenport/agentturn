@@ -2885,3 +2885,125 @@ func TestNotesAlreadySaidAreNotOwed(t *testing.T) {
 		})
 	}
 }
+
+// TestANoteSurvivesACrashBeforeItsItem pins the full crash claim, with
+// agentturn v0.0.25 reporting notes held before their outputs: a
+// process that dies after an output's entry and before the note's own
+// item loses nothing, and the agent a restart builds says the note once.
+func TestANoteSurvivesACrashBeforeItsItem(t *testing.T) {
+	mk := func(name string) agenttool.Tool {
+		return agenttool.New(name, "", func(context.Context, echoArgs) (string, error) { return "ok", nil })
+	}
+	tools := []agenttool.Tool{mk("a"), mk("b")}
+	for _, tc := range []struct {
+		name string
+		// hook decides every call; deferring the first run's calls.
+		hook func(n int, info agentturn.ToolCallInfo) *agentturn.ToolDecision
+		// answer answers the first run's pending calls.
+		answer func(pending []agentturn.PendingCall) []agentturn.Answer
+		cutAt  string // the call whose output's entry is the last written
+		note   string
+	}{
+		{
+			name: "a Resume's output answer, nothing approved",
+			hook: func(int, agentturn.ToolCallInfo) *agentturn.ToolDecision {
+				return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask", By: agentsession.ByPolicy}
+			},
+			answer: func(p []agentturn.PendingCall) []agentturn.Answer {
+				return []agentturn.Answer{
+					agentturn.Output(openresponses.NewFunctionCallOutput(p[0].Call.CallID, "no")).WithNote("put it under ci/").WithBy(agentsession.ByHuman),
+					agentturn.Output(openresponses.NewFunctionCallOutput(p[1].Call.CallID, "no")).WithBy(agentsession.ByHuman),
+				}
+			},
+			cutAt: "a", note: "user: put it under ci/",
+		},
+		{
+			name: "an approval's note, its batch completing",
+			hook: func(n int, _ agentturn.ToolCallInfo) *agentturn.ToolDecision {
+				if n <= 2 {
+					return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask", By: agentsession.ByPolicy}
+				}
+				return nil
+			},
+			answer: func(p []agentturn.PendingCall) []agentturn.Answer {
+				return []agentturn.Answer{
+					agentturn.Approve(p[0].Call.CallID).WithNote("only the unit tests").WithBy(agentsession.ByHuman),
+					agentturn.Output(openresponses.NewFunctionCallOutput(p[1].Call.CallID, "no")).WithBy(agentsession.ByHuman),
+				}
+			},
+			cutAt: "a", note: "user: only the unit tests",
+		},
+		{
+			name: "a released call's policy note",
+			hook: func(n int, _ agentturn.ToolCallInfo) *agentturn.ToolDecision {
+				if n <= 2 {
+					return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask", By: agentsession.ByPolicy, Note: "it runs in the sandbox"}
+				}
+				return nil
+			},
+			answer: func(p []agentturn.PendingCall) []agentturn.Answer {
+				return []agentturn.Answer{
+					agentturn.Approve(p[0].Call.CallID).WithBy(agentsession.ByHuman),
+					agentturn.Output(openresponses.NewFunctionCallOutput(p[1].Call.CallID, "no")).WithBy(agentsession.ByHuman),
+				}
+			},
+			cutAt: "a", note: "developer: it runs in the sandbox",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := &cutStore{Store: agentsession.NewMemoryStore()}
+			rec, s, err := Start(ctx, store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			decided := 0
+			cfg := agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools,
+				BeforeToolCall: func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+					decided++
+					return tc.hook(decided, info), nil
+				}}
+			a := agentturn.New(cfg)
+			unsub := rec.Attach(a)
+			names := map[string]string{}
+			a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+				if e, ok := ev.(*agentturn.ItemEnd); ok {
+					switch it := e.Item.(type) {
+					case *openresponses.FunctionCall:
+						names[it.CallID] = it.Name
+					case *openresponses.FunctionCallOutput:
+						if names[it.CallID] == tc.cutAt {
+							store.cut.Store(true) // dies after the output's entry
+						}
+					}
+				}
+				return nil
+			})
+			end, err := a.Prompt(ctx, openresponses.UserText("go"))
+			if err != nil || len(end.Pending) != 2 {
+				t.Fatalf("prompt: err=%v end=%+v", err, end)
+			}
+			a.Resume(ctx, tc.answer(end.Pending)...)
+			unsub()
+			store.cut.Store(false)
+
+			cfg.BeforeToolCall = nil
+			rec, _, b := restart(t, store, s.ID(), cfg)
+			defer rec.Attach(b)()
+			if p := b.State().Pending; len(p) > 0 {
+				var answers []agentturn.Answer
+				for _, c := range p {
+					answers = append(answers, agentturn.OutcomeUnknown(c.Call.CallID).WithBy(agentsession.ByHuman))
+				}
+				if _, err := b.Resume(ctx, answers...); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := b.Prompt(ctx, openresponses.UserText("next")); err != nil {
+				t.Fatal(err)
+			}
+			if n := countMessage(b.State().Transcript, tc.note); n != 1 {
+				t.Errorf("%q is in the transcript %d times, want once: %q", tc.note, n, messagesOf(b.State().Transcript))
+			}
+		})
+	}
+}

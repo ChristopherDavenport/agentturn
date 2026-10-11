@@ -1105,13 +1105,12 @@ const WithdrawnNS = "agentturn:withdrawn"
 // items the path already holds after it: [Pending] puts the rest on the
 // last pending call, and when nothing is pending [OwedNotes] gives
 // those whose call's output is on the path, which [AgentOptions] seeds
-// with agentturn.WithNotes. A note is on the record once notes_held has
-// reported it, so a process that dies after that, with no run end,
-// loses nothing it said; against agentturn v0.0.24, which reports some
-// notes only after the outputs they follow (a Resume's output answer
-// with nothing approved, and a batch that completes), a process that
-// dies between such an output and the note's own item can still lose
-// that note.
+// with agentturn.WithNotes. The loop reports a note held before the
+// first output it waits on is appended and gone only after its own item
+// is, so the record holds every note from before its outputs until after
+// its item: a process that dies anywhere between, with no run end, loses
+// nothing a person said, and one that dies after the item does not say
+// it twice.
 const HeldNotesNS = "agentturn:held_notes"
 
 // HeldNotes is the data of a [HeldNotesNS] custom entry.
