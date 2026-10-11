@@ -5,6 +5,50 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Added: `tools/a2a` records the callee a call reaches, through
+  `agenttool.WriteRecord`, as soon as it is known: a `Callee` record
+  (namespace `agentturn:a2a_callee`) with the URL the call was sent to
+  (the endpoint the client connected to, never a name the card claims),
+  the task and context IDs, or the context alone for an answer that is a
+  plain message, and the relation, `subsession` by default and `peer`
+  under `WithoutCancelOnAbort`. A call dispatched again reaches a new task
+  and writes a new record; the answers on one task do not.
+- Added: a `tools/a2a` call given up before its task ended, its context
+  ended or the call failed, sends `tasks/cancel` for the task from a
+  goroutine of its own, bounded by `CancelTimeout`, and returns at once
+  without waiting for the task to reach canceled; it records a
+  `CancelSent` (namespace `agentturn:a2a_cancel`), which says the stop was
+  asked for, not that the work stopped. `WithoutCancelOnAbort` leaves a
+  peer's task running and records no cancel. A blocking call
+  (`WithBlocking`) that is given up before the remote agent answered has
+  no task ID to cancel.
+- Added: `tools/a2a`'s `WithInputRequired(fn)` answers a task that enters
+  input-required inside the call: the remote agent's question goes to
+  `fn`, its answer is sent on the same task and the call goes on. A hook
+  that cannot answer returns an error matching `agentturn.ErrInputRequired`
+  and the call ends with an `InputRequiredError` as before.
+- Added: `front/a2a`'s `WithAuthenticator`, with `BearerTokens`:
+  `Executor.Handler` authenticates each HTTP request and refuses one it
+  does not accept with 401; the executor refuses a message or a cancel
+  whose context names no principal (`ContextWithPrincipal`), so a handler
+  mounted without it serves nobody; each task's run is prompted under the
+  trigger `{Kind: "a2a", Ref: principal}`; and `Executor.Secure` declares
+  the scheme on the agent card.
+- Added: `front/a2a`'s `WithEscalation` puts a call of the agent's own
+  tool its policy defers to the caller instead of the serving side's
+  elicitor: the task enters input-required with the call among the
+  status message's data parts, the policy's reason as text and under
+  `MetaEscalatedCalls`, and the caller answers with an `Approval` data
+  part (`ApprovalPart`). An approval runs the call, its note said to the
+  model after the batch's outputs in the voice its `By` names ("human",
+  or "agent" when it names none); a refusal is the call's output, with
+  the caller's note in it. A caller cannot answer as "policy", answer an
+  escalated call with a `function_call_output`, or send an approval to an
+  executor without the option. `MetaPendingCalls` lists only the calls to
+  the caller's own tools.
+
 ## v0.0.27 - 2026-10-11
 
 - Fixed: a person's accept note on a call `Ask` puts to them about a
