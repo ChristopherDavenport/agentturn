@@ -120,6 +120,29 @@
 // keeps them as cut off, so the store is the conversation's source and
 // the session its record.
 //
+// # Authentication
+//
+// [WithAuthenticator] names a principal on every message and cancel:
+// [Executor.Handler] authenticates each HTTP request and refuses one it
+// does not accept with 401, the executor refuses a request whose
+// context names no principal, and each task's run is prompted under the
+// trigger {Kind: "a2a", Ref: principal}, so the record says who asked.
+// [Executor.Secure] declares the scheme on the card, which is served
+// apart, unauthenticated, so a caller can learn it. TLS is the
+// deployment's.
+//
+// # Escalation
+//
+// [WithEscalation] changes who answers the agent's own policy: a call of
+// the agent's own tool its BeforeToolCall defers is put to the caller,
+// not to Config.ToolElicitor. The task enters input-required with the
+// call among the status message's data parts and the policy's reason as
+// text and under [MetaEscalatedCalls], and the caller answers with an
+// [Approval] data part on a message for the same task, beside the
+// outputs of any calls to its own tools. It is for a headless agent
+// nobody watches, whose caller's human plane should decide; without it
+// each system's policy is its own.
+//
 // # One task per conversation
 //
 // A context ID runs one task at a time, so a conversation's store and
