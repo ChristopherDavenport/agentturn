@@ -645,10 +645,12 @@ type Elicitation struct {
 	// By is who answered, in the session format's terms; empty when
 	// nobody was asked or the asking failed.
 	By string `json:"by,omitempty"`
-	// Source, on the answer entry, names who answered when the answer
-	// came through agentturn's Agent.Reply with a trigger on its
-	// context: front/control's principal, as a run start's trigger
-	// names who prompted. nil when the answer named nobody.
+	// Source, on the answer entry, names who answered: the answerer the
+	// replier put on agentturn's Agent.Reply context with
+	// agentturn.ContextWithAnswerer, such as front/control's principal.
+	// It is written in the session format's trigger form, but it is not
+	// the run's trigger, which names who prompted. nil when the replier
+	// named nobody.
 	Source *agentsession.Trigger `json:"source,omitempty"`
 	// Error is the harness's failure to ask, which the tool sees as an
 	// error rather than an answer, on the answer entry.
@@ -672,6 +674,12 @@ const SubjectMember = "agentturn:subject"
 // ([agentturn.ToolDecision.Held]); it is true when present. [Pending]
 // reads it back onto the call's Decision.
 const HeldMember = "agentturn:held"
+
+// NoteMember is the member of a hold decision that keeps the deferring
+// decision's own note ([agentturn.ToolDecision.Note]), which the loop
+// says as a developer message when an approval releases the call.
+// [Pending] reads it back onto the call's Decision.
+const NoteMember = "agentturn:note"
 
 // UnhashedNS is the namespace of the custom entry written when the
 // recorder declines to hash a request because its input is not what
@@ -1054,13 +1062,20 @@ type callRecord struct {
 	ranEntry string
 	childOff string
 	// dispatchEntry is the ID of the last dispatch entry written or
-	// seeded for the call, and withdrawn says [WithdrawnNS] entries
-	// withdrew it and every dispatch before it: a subscriber failed on
-	// each, so the tool never ran. The call keeps its dispatch for the format's sake, a
-	// decision that ends it is an answer, but is not run again.
+	// seeded for the call, and lastWithdrawn says a [WithdrawnNS] entry
+	// withdrew it. handedOff counts the call's dispatches on the path no
+	// such entry withdrew, the hand-offs its tool may have run on; a
+	// dispatched call with none never ran. It keeps its dispatches for
+	// the format's sake, a decision that ends it is an answer, but it is
+	// not run again. A live recorder and one seeded from the path count
+	// alike, so both write the same decisions.
 	dispatchEntry string
-	withdrawn     bool
+	lastWithdrawn bool
+	handedOff     int
 }
+
+// neverRan reports whether every dispatch the call has was withdrawn.
+func (c *callRecord) neverRan() bool { return c.dispatched && c.handedOff == 0 }
 
 // WithdrawnNS is the namespace of the custom entry the recorder writes
 // after a dispatch the loop withdrew (agentturn.ToolEnd.Withdrawn): a
@@ -1406,8 +1421,9 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // hold decision is [agentturn.PendingDeferred], Dispatched when the
 // hold follows its dispatch, with that hold as its Decision (the rule
 // that raised the question, who held it, the part of the call it is
-// about and whether the call is held only beside another, from
-// [SubjectMember] and [HeldMember]); one in flight when the record stopped
+// about, whether the call is held only beside another, and the
+// decision's own note, from [SubjectMember], [HeldMember] and
+// [NoteMember]); one in flight when the record stopped
 // may have run and is [agentturn.PendingAborted], as is one with no
 // dispatch on the path that has one on a branch a rebase to before it
 // left, a held one of which is Dispatched; one in flight whose every
@@ -2024,15 +2040,19 @@ func holdDecision(c *agentsession.Call) *agentturn.ToolDecision {
 			if raw, ok := d.Unknown[HeldMember]; ok {
 				_ = json.Unmarshal(raw, &out.Held)
 			}
+			if raw, ok := d.Unknown[NoteMember]; ok {
+				_ = json.Unmarshal(raw, &out.Note)
+			}
 			return out
 		}
 	}
 	return nil
 }
 
-// holdMembers writes the deferral's [agentturn.ToolDecision.Subject]
-// and [agentturn.ToolDecision.Held] on its hold decision, as
-// [SubjectMember] and [HeldMember], when they are set.
+// holdMembers writes the deferral's [agentturn.ToolDecision.Subject],
+// [agentturn.ToolDecision.Held] and [agentturn.ToolDecision.Note] on its
+// hold decision, as [SubjectMember], [HeldMember] and [NoteMember], when
+// they are set.
 func holdMembers(hold *agentsession.DecisionEntry, d *agentturn.ToolDecision) {
 	if d.Subject != "" {
 		raw, _ := json.Marshal(d.Subject)
@@ -2040,6 +2060,10 @@ func holdMembers(hold *agentsession.DecisionEntry, d *agentturn.ToolDecision) {
 	}
 	if d.Held {
 		setMember(&hold.EntryBase, HeldMember, json.RawMessage("true"))
+	}
+	if d.Note != "" {
+		raw, _ := json.Marshal(d.Note)
+		setMember(&hold.EntryBase, NoteMember, raw)
 	}
 }
 
@@ -2907,7 +2931,12 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 		rec := callRecordOf(c, s.Header(), off)
 		rec.ranEntry, rec.childOff = ranEntry, childOff
 		rec.dispatchEntry = lastDispatch(c)
-		rec.withdrawn = allWithdrawn(c, withdrawn)
+		rec.lastWithdrawn = withdrawn[rec.dispatchEntry]
+		for _, d := range c.Dispatches {
+			if !withdrawn[d.Base().ID] {
+				rec.handedOff++
+			}
+		}
 		w.calls[c.ID()] = rec
 	}
 	return nil
@@ -3425,7 +3454,7 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 	if c := w.calls[e.CallID]; c != nil && e.Parent == "" && !e.Deferred && !c.dispatched && !c.rejected {
 		c.settledRun = w.run
 	}
-	if c := w.calls[e.CallID]; c != nil && e.Parent == "" && e.Withdrawn && c.dispatched && c.dispatchRun == w.run && !c.withdrawn {
+	if c := w.calls[e.CallID]; c != nil && e.Parent == "" && e.Withdrawn && c.dispatched && c.dispatchRun == w.run && !c.lastWithdrawn {
 		// The dispatch is on the path, and the tool never ran: say so,
 		// so the call reads as never started rather than as one that
 		// may have run.
@@ -3436,7 +3465,8 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 		if _, err := w.append(ctx, &agentsession.CustomEntry{NS: WithdrawnNS, Data: data, CallID: e.CallID}); err != nil {
 			return err
 		}
-		c.withdrawn = true
+		c.lastWithdrawn = true
+		c.handedOff--
 	}
 	if e.Parent != "" {
 		if err := w.nested(ctx, NestedCall{
@@ -4377,7 +4407,7 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 	d := e.Decision
 	// A call an earlier run dispatched goes to its tool again only on
 	// an approval, which names its decider as a held call's does.
-	again := c.dispatched && !c.withdrawn && c.dispatchRun != w.run
+	again := c.dispatched && !c.neverRan() && c.dispatchRun != w.run
 	c.again = nil
 	by := ""
 	if d != nil {
@@ -4514,7 +4544,8 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 	}
 	w.takeUp(e.CallID)
 	c.dispatched, c.dispatchRun, c.unknown = true, w.run, false
-	c.dispatchEntry, c.withdrawn = id, false
+	c.dispatchEntry, c.lastWithdrawn = id, false
+	c.handedOff++
 	return nil
 }
 

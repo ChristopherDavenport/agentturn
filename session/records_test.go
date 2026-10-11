@@ -2456,3 +2456,61 @@ func TestHeldNotesSurviveARestart(t *testing.T) {
 		t.Errorf("verify: %v", err)
 	}
 }
+
+// TestALiveRecorderCountsWithdrawalsAsARestartedOneDoes pins S6: a call
+// that may have run once and then had a dispatch withdrawn still may
+// have run, so the live recorder writes its next approval as one of a
+// call run again, as a recorder seeded from the path writes it: with
+// the approver's by, none here, rather than the policy's.
+func TestALiveRecorderCountsWithdrawalsAsARestartedOneDoes(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	first := true
+	notify := agenttool.New("notify", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		if first {
+			first = false
+			close(started)
+			<-ctx.Done()
+			return "", ctx.Err()
+		}
+		return "sent", nil
+	})
+	a := agentturn.New(agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: []agenttool.Tool{notify}})
+	defer rec.Attach(a)()
+	refuse := false
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if _, ok := ev.(*agentturn.ToolDispatch); ok && refuse {
+			refuse = false
+			return errors.New("the audit log is down")
+		}
+		return nil
+	})
+	go func() {
+		<-started
+		a.Abort()
+	}()
+	end, err := a.Prompt(ctx, openresponses.UserText("go"))
+	if err != nil || end.Reason != agentturn.ReasonAborted || len(end.Pending) != 1 {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	id := end.Pending[0].Call.CallID
+	refuse = true
+	if _, err := a.Resume(ctx, agentturn.Approve(id).WithRunAgain()); err == nil {
+		t.Fatal("the withdrawn resume did not fail")
+	}
+	if _, err := a.Resume(ctx, agentturn.Approve(id).WithRunAgain()); err != nil {
+		t.Fatal(err)
+	}
+	c := callsOf(t, s)["notify"]
+	if c == nil || c.Output == nil || len(c.Dispatches) != 3 {
+		t.Fatalf("call = %+v", c)
+	}
+	if len(c.Decisions) != 2 || c.Decisions[0].By != c.Decisions[1].By {
+		t.Errorf("decisions = %+v / %+v, want both written as of a call run again", c.Decisions[0], c.Decisions[len(c.Decisions)-1])
+	}
+}
