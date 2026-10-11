@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.24 - 2026-10-11
 
 - Changed, breaking: `PendingCall.Notes` is a `[]Note`, each note with
   the item, how it arrived (`Mode`) and the trigger its `item_end`
