@@ -645,6 +645,13 @@ type Elicitation struct {
 	// By is who answered, in the session format's terms; empty when
 	// nobody was asked or the asking failed.
 	By string `json:"by,omitempty"`
+	// Source, on the answer entry, names who answered: the answerer the
+	// replier put on agentturn's Agent.Reply context with
+	// agentturn.ContextWithAnswerer, such as front/control's principal.
+	// It is written in the session format's trigger form, but it is not
+	// the run's trigger, which names who prompted. nil when the replier
+	// named nobody.
+	Source *agentsession.Trigger `json:"source,omitempty"`
 	// Error is the harness's failure to ask, which the tool sees as an
 	// error rather than an answer, on the answer entry.
 	Error string `json:"error,omitempty"`
@@ -667,6 +674,12 @@ const SubjectMember = "agentturn:subject"
 // ([agentturn.ToolDecision.Held]); it is true when present. [Pending]
 // reads it back onto the call's Decision.
 const HeldMember = "agentturn:held"
+
+// NoteMember is the member of a hold decision that keeps the deferring
+// decision's own note ([agentturn.ToolDecision.Note]), which the loop
+// says as a developer message when an approval releases the call.
+// [Pending] reads it back onto the call's Decision.
+const NoteMember = "agentturn:note"
 
 // UnhashedNS is the namespace of the custom entry written when the
 // recorder declines to hash a request because its input is not what
@@ -845,6 +858,11 @@ type writer struct {
 	rec *Recorder
 	id  string
 	cfg *agentturn.Config
+	// heldNotes is the data of the last [HeldNotesNS] entry written, nil
+	// until one is or the seeded set is read; seededNotes are the notes
+	// the path's last such entry held when the writer was seeded.
+	heldNotes   json.RawMessage
+	seededNotes []agentturn.Note
 	// cwd is the working directory the session's header names, which a
 	// child session inherits: a child runs in its parent's process and
 	// its parent's directory, and a store buckets sessions by it.
@@ -1048,6 +1066,234 @@ type callRecord struct {
 	// child's work, and the link comes with it.
 	ranEntry string
 	childOff string
+	// dispatchEntry is the ID of the last dispatch entry written or
+	// seeded for the call, and lastWithdrawn says a [WithdrawnNS] entry
+	// withdrew it. handedOff counts the call's dispatches on the path no
+	// such entry withdrew, the hand-offs its tool may have run on; a
+	// dispatched call with none never ran. It keeps its dispatches for
+	// the format's sake, a decision that ends it is an answer, but it is
+	// not run again. A live recorder and one seeded from the path count
+	// alike, so both write the same decisions.
+	dispatchEntry string
+	lastWithdrawn bool
+	handedOff     int
+}
+
+// neverRan reports whether every dispatch the call has was withdrawn.
+func (c *callRecord) neverRan() bool { return c.dispatched && c.handedOff == 0 }
+
+// WithdrawnNS is the namespace of the custom entry the recorder writes
+// after a dispatch the loop withdrew (agentturn.ToolEnd.Withdrawn): a
+// subscriber called after the recorder failed on the call's
+// tool_dispatch, so the tool never ran. Its call_id is the call's and
+// its data a [Withdrawn], which names the one dispatch it withdraws.
+// [Pending] reads a call whose every dispatch on the path is withdrawn
+// as agentturn.PendingUndispatched, which the loop knew it to
+// be, rather than as one that may have run; a reader that does not
+// know the namespace reads the call in flight, which errs on the side
+// of caution.
+const WithdrawnNS = "agentturn:withdrawn"
+
+// HeldNotesNS is the namespace of the custom entry the recorder writes
+// for the notes waiting on the pending calls' outputs
+// (agentturn.PendingCall.Notes) or owed after outputs a failed run
+// appended (agentturn.RunEnd.Notes): the whole set, each time
+// agentturn.NotesHeld reports it changed, an empty set included, and at
+// the run's end when it differs from the last written. Its call_id is
+// the call the last note is about and its data a [HeldNotes]. The last
+// such entry on the path is what waits, less the leading notes whose
+// items the path already holds after it: [Pending] puts the rest on the
+// last pending call, and when nothing is pending [OwedNotes] gives
+// those whose call's output is on the path, which [AgentOptions] seeds
+// with agentturn.WithNotes. The loop reports a note held before the
+// first output it waits on is appended and gone only after its own item
+// is, so the record holds every note from before its outputs until after
+// its item: a process that dies anywhere between, with no run end, loses
+// nothing a person said, and one that dies after the item does not say
+// it twice.
+const HeldNotesNS = "agentturn:held_notes"
+
+// HeldNotes is the data of a [HeldNotesNS] custom entry.
+type HeldNotes struct {
+	// Notes are the notes, in the order they are appended.
+	Notes []HeldNote `json:"notes"`
+}
+
+// HeldNote is one agentturn.Note as the record keeps it: its item, how
+// it arrives, the trigger its item_end carries, and the call it is
+// about, so an agent restored from the record appends it as the one
+// that held it would have, and says it once.
+type HeldNote struct {
+	Item    json.RawMessage       `json:"item"`
+	Mode    string                `json:"mode,omitempty"`
+	Trigger *agentsession.Trigger `json:"trigger,omitempty"`
+	CallID  string                `json:"call_id,omitempty"`
+}
+
+// heldNotesData is the entry data for notes.
+func heldNotesData(notes []agentturn.Note) (json.RawMessage, error) {
+	h := HeldNotes{Notes: []HeldNote{}}
+	for _, n := range notes {
+		if n.Item == nil {
+			continue
+		}
+		item, err := json.Marshal(n.Item)
+		if err != nil {
+			return nil, fmt.Errorf("session: held note: %w", err)
+		}
+		t, err := sessionTrigger(n.Trigger)
+		if err != nil {
+			return nil, err
+		}
+		h.Notes = append(h.Notes, HeldNote{Item: item, Mode: string(n.Mode), Trigger: t, CallID: n.CallID})
+	}
+	return json.Marshal(h)
+}
+
+// lastHeldNotes returns the notes of the last [HeldNotesNS] entry on
+// path, nil when there is none or it holds none.
+func lastHeldNotes(path []agentsession.Entry) []agentturn.Note {
+	for i := len(path) - 1; i >= 0; i-- {
+		c, ok := path[i].(*agentsession.CustomEntry)
+		if !ok || c.NS != HeldNotesNS {
+			continue
+		}
+		var h HeldNotes
+		if json.Unmarshal(c.Data, &h) != nil {
+			return nil
+		}
+		var out []agentturn.Note
+		for _, n := range h.Notes {
+			item, err := openresponses.UnmarshalItem(n.Item)
+			if err != nil || item == nil {
+				continue
+			}
+			note := agentturn.Note{Item: item, Mode: agentturn.InputMode(n.Mode), CallID: n.CallID}
+			if n.Trigger != nil {
+				note.Trigger = agentTrigger(n.Trigger)
+			}
+			out = append(out, note)
+		}
+		return out[appendedSince(path[i+1:], out):]
+	}
+	return nil
+}
+
+// appendedSince counts the leading notes whose items the entries after
+// their [HeldNotesNS] entry already hold, in order: notes are appended
+// in the order they are held, so those were said, by a run whose report
+// of it the path does not hold (a process that died, a flush cut part
+// way, a rebase to an entry in between), and are not owed again.
+func appendedSince(after []agentsession.Entry, notes []agentturn.Note) int {
+	k := 0
+	for _, e := range after {
+		if k == len(notes) {
+			break
+		}
+		if it, ok := e.(*agentsession.ItemEntry); ok && sameNoteItem(it.Item, notes[k].Item) {
+			k++
+		}
+	}
+	return k
+}
+
+// sameNoteItem reports whether an item on the path says what a note
+// says: a message by its role and text, as the loop compares notes.
+func sameNoteItem(a, b openresponses.Item) bool {
+	am, aok := a.(*openresponses.Message)
+	bm, bok := b.(*openresponses.Message)
+	if aok && bok {
+		return am.Role == bm.Role && am.Text() == bm.Text()
+	}
+	ja, errA := json.Marshal(a)
+	jb, errB := json.Marshal(b)
+	return errA == nil && errB == nil && string(ja) == string(jb)
+}
+
+// OwedNotes returns the notes the session owes after outputs already on
+// its path, with no call pending to wait on: those of the last
+// [HeldNotesNS] entry whose call's output is on the path, which a failed
+// run could not append. [AgentOptions] seeds an agent with them; with
+// calls pending, [Pending] puts the notes on the last of them instead.
+func OwedNotes(s *agentsession.Session) ([]agentturn.Note, error) {
+	if s.Leaf() == "" {
+		return nil, nil
+	}
+	pending, err := s.PendingCalls(s.Leaf())
+	if err != nil {
+		return nil, fmt.Errorf("session: pending calls at leaf: %w", err)
+	}
+	if len(pending) > 0 {
+		return nil, nil
+	}
+	path := s.Path(s.Leaf())
+	answered := map[string]bool{}
+	for _, e := range path {
+		if it, ok := e.(*agentsession.ItemEntry); ok {
+			if out, ok := it.Item.(*openresponses.FunctionCallOutput); ok {
+				answered[out.CallID] = true
+			}
+		}
+	}
+	var out []agentturn.Note
+	for _, n := range lastHeldNotes(path) {
+		if n.CallID != "" && answered[n.CallID] {
+			out = append(out, n)
+		}
+	}
+	return out, nil
+}
+
+// Withdrawn is the data of a [WithdrawnNS] custom entry.
+type Withdrawn struct {
+	// Dispatch is the ID of the dispatch entry withdrawn.
+	Dispatch string `json:"dispatch"`
+	// Reason is the failure that withdrew it.
+	Reason string `json:"reason,omitempty"`
+}
+
+// withdrawnDispatches returns the IDs of the dispatch entries a
+// [WithdrawnNS] entry on path withdraws.
+func withdrawnDispatches(path []agentsession.Entry) map[string]bool {
+	var out map[string]bool
+	for _, e := range path {
+		c, ok := e.(*agentsession.CustomEntry)
+		if !ok || c.NS != WithdrawnNS {
+			continue
+		}
+		var w Withdrawn
+		if json.Unmarshal(c.Data, &w) != nil || w.Dispatch == "" {
+			continue
+		}
+		if out == nil {
+			out = map[string]bool{}
+		}
+		out[w.Dispatch] = true
+	}
+	return out
+}
+
+// lastDispatch is the ID of the call's last dispatch on the path, ""
+// when it has none.
+func lastDispatch(c *agentsession.Call) string {
+	if len(c.Dispatches) == 0 {
+		return ""
+	}
+	return c.Dispatches[len(c.Dispatches)-1].Base().ID
+}
+
+// allWithdrawn reports whether the call has dispatches on the path and
+// withdrawn holds every one of them, so its tool never ran there.
+func allWithdrawn(c *agentsession.Call, withdrawn map[string]bool) bool {
+	if len(c.Dispatches) == 0 || len(withdrawn) == 0 {
+		return false
+	}
+	for _, d := range c.Dispatches {
+		if !withdrawn[d.Base().ID] {
+			return false
+		}
+	}
+	return true
 }
 
 // Option configures a Recorder.
@@ -1289,11 +1535,14 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // hold decision is [agentturn.PendingDeferred], Dispatched when the
 // hold follows its dispatch, with that hold as its Decision (the rule
 // that raised the question, who held it, the part of the call it is
-// about and whether the call is held only beside another, from
-// [SubjectMember] and [HeldMember]); one in flight when the record stopped
+// about, whether the call is held only beside another, and the
+// decision's own note, from [SubjectMember], [HeldMember] and
+// [NoteMember]); one in flight when the record stopped
 // may have run and is [agentturn.PendingAborted], as is one with no
 // dispatch on the path that has one on a branch a rebase to before it
-// left, a held one of which is Dispatched; one an answer
+// left, a held one of which is Dispatched; one in flight whose every
+// dispatch a [WithdrawnNS] entry withdrew never reached its tool and is
+// [agentturn.PendingUndispatched]; one an answer
 // decision ended before its output was written is
 // [agentturn.PendingAnswered], owed that output and nothing else; one
 // a reject decision refused before its output was written is
@@ -1323,6 +1572,19 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // reads a call it finds dispatched there as one dispatched on a branch
 // a rebase left. [Recorder.ReadOptions] gives the options that read a
 // session as the recorder writing it does.
+//
+// A withdrawn dispatch is read on the path only: a call with a dispatch
+// on a branch the path left, read as dispatched there, is not checked
+// for a withdrawal on that branch, which errs on the side of a call
+// that may have run.
+//
+// A call a question was asked under that nothing answered, a run cut
+// while a person decided, carries that question as its Question. The
+// notes waiting on the pending calls, which the recorder keeps as
+// [HeldNotesNS] entries, are on the last pending call as its Notes, each
+// with its mode, trigger and call, so an agent seeded with them
+// ([AgentOptions]) appends them after the outputs that answer the calls,
+// and says once a note an answer brings again.
 func Pending(s *agentsession.Session, opts ...ReadOption) ([]agentturn.PendingCall, error) {
 	pending, _, err := pendingCalls(s, opts)
 	return pending, err
@@ -1422,15 +1684,23 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 	}
 	var out []agentturn.PendingCall
 	ranAt := map[string]string{}
+	path := s.Path(s.Leaf())
+	withdrawn := withdrawnDispatches(path)
+	open := openQuestions(path)
 	for _, c := range calls {
 		p := agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingUnknown}
 		state := c.State(s.Header())
+		never := allWithdrawn(c, withdrawn)
 		switch state {
 		case agentsession.CallHeld:
-			p.Reason, p.Dispatched = agentturn.PendingDeferred, len(c.Dispatches) > 0
+			p.Reason, p.Dispatched = agentturn.PendingDeferred, len(c.Dispatches) > 0 && !never
 			p.Decision = holdDecision(c)
 		case agentsession.CallInFlight:
 			p.Reason = agentturn.PendingAborted
+			if never {
+				// Every hand-off was withdrawn before the tool ran.
+				p.Reason = agentturn.PendingUndispatched
+			}
 		case agentsession.CallAnswered:
 			p.Reason = agentturn.PendingAnswered
 		case agentsession.CallRejected:
@@ -1488,7 +1758,11 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 		if args != "" && !sameJSON(json.RawMessage(args), c.Call.Arguments) {
 			p.Args = json.RawMessage(args)
 		}
+		p.Question = open[c.Call.CallID]
 		out = append(out, p)
+	}
+	if len(out) > 0 {
+		out[len(out)-1].Notes = lastHeldNotes(path)
 	}
 	return out, ranAt, nil
 }
@@ -1549,7 +1823,10 @@ func callAt(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry st
 // AgentOptions returns the options that seed an agent with the
 // session at its leaf: the context's items, the pending calls as
 // [Pending] reads them, so the agent's Resume holds only the calls
-// that may have run to the replay rule, and every call ID in the
+// that may have run to the replay rule, with the notes waiting on them
+// (agentturn.WithPending), the notes owed after outputs already on the
+// path as [OwedNotes] reads them (agentturn.WithNotes), and every call
+// ID in the
 // session as reserved, [CallIDs], so a call the model makes does not
 // take the ID of one a compaction folded out of the context or another
 // branch holds, which the format refuses. It is what a host resuming a
@@ -1571,7 +1848,11 @@ func AgentOptions(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Opti
 	if err != nil {
 		return nil, err
 	}
-	return []agentturn.Option{agentturn.WithTranscript(items), agentturn.WithReasoningModels(models), agentturn.WithPending(pending), agentturn.WithReservedCallIDs(ids)}, nil
+	owed, err := OwedNotes(s)
+	if err != nil {
+		return nil, err
+	}
+	return []agentturn.Option{agentturn.WithTranscript(items), agentturn.WithReasoningModels(models), agentturn.WithPending(pending), agentturn.WithNotes(owed), agentturn.WithReservedCallIDs(ids)}, nil
 }
 
 // Transcript returns the agent's transcript at the session's leaf: the
@@ -1785,10 +2066,10 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 				break
 			}
 			ans = replayAnswer(ctx, set, p)
-			if q := openQuestion(s, id); q != nil && ans.Output != nil {
+			if q := p.Question; q != nil && ans.Output != nil {
 				// The call was waiting on a person when the run was
 				// cut: the answer says so, and what it asked.
-				ans = ans.WithReason(ans.Reason + "; " + q.openReason())
+				ans = ans.WithReason(ans.Reason + "; " + q.Reason())
 			}
 		}
 		out = append(out, ans.WithBy(agentsession.ByPolicy))
@@ -1796,17 +2077,21 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 	return out, nil
 }
 
-// openQuestion is the last question asked under callID on the path to
-// the leaf that nothing answered: an [ElicitationNS] entry with phase
-// ask that no answer entry after it names in asked. It is nil when
-// every question under the call was answered, or none was asked. An
-// entry an earlier release wrote, with no phase, holds its answer.
-func openQuestion(s *agentsession.Session, callID string) *Elicitation {
-	open := map[string]*Elicitation{}
-	var order []string
-	for _, e := range s.Path(s.Leaf()) {
+// openQuestions returns, for each call on path that a question was
+// asked under and nothing answered, the last such question, as
+// [agentturn.PendingCall.Question] carries it: the [ElicitationNS]
+// entries with phase ask that no answer entry after them names in
+// asked.
+func openQuestions(path []agentsession.Entry) map[string]*agentturn.OpenQuestion {
+	type ask struct {
+		id, call string
+		q        Elicitation
+	}
+	open := map[string]bool{}
+	var asks []ask
+	for _, e := range path {
 		c, ok := e.(*agentsession.CustomEntry)
-		if !ok || c.NS != ElicitationNS || c.CallID != callID {
+		if !ok || c.NS != ElicitationNS || c.CallID == "" {
 			continue
 		}
 		var q Elicitation
@@ -1815,32 +2100,28 @@ func openQuestion(s *agentsession.Session, callID string) *Elicitation {
 		}
 		switch q.Phase {
 		case ElicitationAsk:
-			open[c.ID] = &q
-			order = append(order, c.ID)
+			open[c.ID] = true
+			asks = append(asks, ask{id: c.ID, call: c.CallID, q: q})
 		case ElicitationAnswer:
 			delete(open, q.Asked)
 		}
 	}
-	for i := len(order) - 1; i >= 0; i-- {
-		if q, ok := open[order[i]]; ok {
-			return q
+	var out map[string]*agentturn.OpenQuestion
+	for _, a := range asks {
+		if !open[a.id] {
+			continue
 		}
-	}
-	return nil
-}
-
-// openReason says the question was open when the run was cut, and
-// which call it was about, for the reason of the answer [ReplayAnswers]
-// gives the call it was asked under.
-func (e Elicitation) openReason() string {
-	reason := fmt.Sprintf("a question was open: %q", e.Message)
-	if e.Call != "" {
-		reason += " about call " + e.Call
-		if e.Tool != "" {
-			reason += " (" + e.Tool + ")"
+		if out == nil {
+			out = map[string]*agentturn.OpenQuestion{}
 		}
+		q := &agentturn.OpenQuestion{ID: a.id, Message: a.q.Message}
+		if a.q.Call != "" {
+			q.Call = &agentturn.AskedCall{Parent: a.q.Parent, CallID: a.q.Call, Name: a.q.Tool}
+		}
+		// The last one asked under the call is the one it waited on.
+		out[a.call] = q
 	}
-	return reason
+	return out
 }
 
 // ranOffReason is the reason of the answer [ReplayAnswers] gives a
@@ -1886,15 +2167,19 @@ func holdDecision(c *agentsession.Call) *agentturn.ToolDecision {
 			if raw, ok := d.Unknown[HeldMember]; ok {
 				_ = json.Unmarshal(raw, &out.Held)
 			}
+			if raw, ok := d.Unknown[NoteMember]; ok {
+				_ = json.Unmarshal(raw, &out.Note)
+			}
 			return out
 		}
 	}
 	return nil
 }
 
-// holdMembers writes the deferral's [agentturn.ToolDecision.Subject]
-// and [agentturn.ToolDecision.Held] on its hold decision, as
-// [SubjectMember] and [HeldMember], when they are set.
+// holdMembers writes the deferral's [agentturn.ToolDecision.Subject],
+// [agentturn.ToolDecision.Held] and [agentturn.ToolDecision.Note] on its
+// hold decision, as [SubjectMember], [HeldMember] and [NoteMember], when
+// they are set.
 func holdMembers(hold *agentsession.DecisionEntry, d *agentturn.ToolDecision) {
 	if d.Subject != "" {
 		raw, _ := json.Marshal(d.Subject)
@@ -1902,6 +2187,10 @@ func holdMembers(hold *agentsession.DecisionEntry, d *agentturn.ToolDecision) {
 	}
 	if d.Held {
 		setMember(&hold.EntryBase, HeldMember, json.RawMessage("true"))
+	}
+	if d.Note != "" {
+		raw, _ := json.Marshal(d.Note)
+		setMember(&hold.EntryBase, NoteMember, raw)
 	}
 }
 
@@ -2030,7 +2319,9 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 // agentturn.ContextWithReasoningModels, and
 // then Agent.SetPending from [Pending], so a call held on the branch
 // is approved as a held call and one that may have run is held to the
-// replay rule; [Recorder.CompactOptions] gives what seeds a transform
+// replay rule, with the notes waiting on those calls, and
+// Agent.SetNotes from [OwedNotes], the notes the branch owes after
+// outputs already on it; [Recorder.CompactOptions] gives what seeds a transform
 // built for the branch. Rebase reserves every call ID in the session, [CallIDs],
 // on the agent [Recorder.Attach] attached, so a call the model makes
 // does not take the ID of one the context leaves out or the branch
@@ -2576,7 +2867,11 @@ func (r *Recorder) RecordFunc() agenttool.RecordFunc {
 // asked: the question, with phase ask, before it is put to fn, and its
 // answer, with phase answer and asked naming the first entry, before
 // the answer returns to the tool; by names who answers, in the session
-// format's terms. A question the loop asks about a nested call, or a
+// format's terms. When fn is an agent's QuestionElicitor answered
+// through Reply with a trigger on its context, such as front/control's
+// principal, the answer entry names it as its Source
+// (agentturn.WatchAnswerer, named by the replier with
+// agentturn.ContextWithAnswerer). A question the loop asks about a nested call, or a
 // front about a model's call, carries that call's ID, tool and parent
 // on both entries, from the agentturn.AskedCall on the context, so
 // consecutive questions are tied to the calls they are about by more
@@ -2622,9 +2917,11 @@ func (r *Recorder) Elicitor(by string, fn agenttool.Elicitor) agenttool.Elicitor
 		}
 		ans := agenttool.Answer{Action: agenttool.ActionCancel}
 		who := ""
+		var source agentturn.Trigger
 		if fn != nil {
-			ans, err = fn(ctx, q)
-			who = by
+			actx, answerer := agentturn.WatchAnswerer(ctx)
+			ans, err = fn(actx, q)
+			who, source = by, answerer()
 		}
 		data.Phase, data.Asked = ElicitationAnswer, asked
 		if err != nil {
@@ -2632,6 +2929,12 @@ func (r *Recorder) Elicitor(by string, fn agenttool.Elicitor) agenttool.Elicitor
 			data.Error = err.Error()
 		} else {
 			data.Action, data.Content, data.Note, data.By = string(ans.Action), ans.Content, ans.Note, who
+			// Who answered, when the answer named them, is kept
+			// beside the answer; a trigger that cannot be written is
+			// left out rather than losing the answer.
+			if t, terr := sessionTrigger(source); terr == nil {
+				data.Source = t
+			}
 		}
 		if _, werr := r.annotate(ctx, ElicitationNS, data, data.Call); werr != nil {
 			return agenttool.Answer{}, errors.Join(err, werr)
@@ -2660,6 +2963,7 @@ func (w *writer) reset() {
 	w.attempt, w.attemptModel, w.retries = nil, "", 0
 	w.parents = map[string]string{}
 	w.appOnly = map[string]bool{}
+	w.heldNotes, w.seededNotes = nil, nil
 }
 
 // seed sets the writer's state from the session at its leaf.
@@ -2680,6 +2984,7 @@ func (w *writer) seed(ctx context.Context, s *agentsession.Session, owed bool) e
 		w.models[i] = produced[id]
 	}
 	w.base = lastConfigBase(s.Path(s.Leaf()))
+	w.seededNotes, w.heldNotes = lastHeldNotes(s.Path(s.Leaf())), nil
 	// The env in force is the last on the path, one a compaction left
 	// out of the context included: an env entry contributes nothing to
 	// it, and still says where the calls after it ran. So is the cause
@@ -2736,6 +3041,7 @@ func (w *writer) seed(ctx context.Context, s *agentsession.Session, owed bool) e
 func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls []*agentsession.Call) error {
 	o := &origins{ctx: ctx, lenient: true}
 	o.r, _ = w.rec.store.(agentsession.Reader)
+	withdrawn := withdrawnDispatches(s.Path(s.Leaf()))
 	for _, c := range calls {
 		off := false
 		ranEntry, childOff := "", ""
@@ -2755,6 +3061,13 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 		}
 		rec := callRecordOf(c, s.Header(), off)
 		rec.ranEntry, rec.childOff = ranEntry, childOff
+		rec.dispatchEntry = lastDispatch(c)
+		rec.lastWithdrawn = withdrawn[rec.dispatchEntry]
+		for _, d := range c.Dispatches {
+			if !withdrawn[d.Base().ID] {
+				rec.handedOff++
+			}
+		}
 		w.calls[c.ID()] = rec
 	}
 	return nil
@@ -3135,6 +3448,8 @@ func runID(ev agentturn.Event) string {
 		return e.RunID
 	case *agentturn.RunEnd:
 		return e.RunID
+	case *agentturn.NotesHeld:
+		return e.RunID
 	}
 	return ""
 }
@@ -3221,6 +3536,8 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 		return w.toolEnd(ctx, e)
 	case *agentturn.Queued:
 		return w.queued(ctx, e)
+	case *agentturn.NotesHeld:
+		return w.holdNotes(ctx, e.Notes)
 	}
 	return nil
 }
@@ -3271,6 +3588,20 @@ func (w *writer) drained(item openresponses.Item) *inboxItem {
 func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 	if c := w.calls[e.CallID]; c != nil && e.Parent == "" && !e.Deferred && !c.dispatched && !c.rejected {
 		c.settledRun = w.run
+	}
+	if c := w.calls[e.CallID]; c != nil && e.Parent == "" && e.Withdrawn && c.dispatched && c.dispatchRun == w.run && !c.lastWithdrawn {
+		// The dispatch is on the path, and the tool never ran: say so,
+		// so the call reads as never started rather than as one that
+		// may have run.
+		data, err := json.Marshal(Withdrawn{Dispatch: c.dispatchEntry, Reason: errText(e.Err)})
+		if err != nil {
+			return err
+		}
+		if _, err := w.append(ctx, &agentsession.CustomEntry{NS: WithdrawnNS, Data: data, CallID: e.CallID}); err != nil {
+			return err
+		}
+		c.lastWithdrawn = true
+		c.handedOff--
 	}
 	if e.Parent != "" {
 		if err := w.nested(ctx, NestedCall{
@@ -4211,7 +4542,7 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 	d := e.Decision
 	// A call an earlier run dispatched goes to its tool again only on
 	// an approval, which names its decider as a held call's does.
-	again := c.dispatched && c.dispatchRun != w.run
+	again := c.dispatched && !c.neverRan() && c.dispatchRun != w.run
 	c.again = nil
 	by := ""
 	if d != nil {
@@ -4342,11 +4673,14 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 		c.again = nil
 	}
 	d := agentsession.NewDispatch(e.CallID, c.entry).WithIdempotencyKey(e.IdempotencyKey)
-	if _, err := w.append(ctx, d); err != nil {
+	id, err := w.append(ctx, d)
+	if err != nil {
 		return err
 	}
 	w.takeUp(e.CallID)
 	c.dispatched, c.dispatchRun, c.unknown = true, w.run, false
+	c.dispatchEntry, c.lastWithdrawn = id, false
+	c.handedOff++
 	return nil
 }
 
@@ -4449,6 +4783,16 @@ func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
 	if w.run == "" {
 		return nil
 	}
+	// What waits at the end, on the pending calls or owed: written when
+	// it differs from what notes_held last reported.
+	var held []agentturn.Note
+	for _, p := range e.Pending {
+		held = append(held, p.Notes...)
+	}
+	held = append(held, e.Notes...)
+	if err := w.holdNotes(ctx, held); err != nil {
+		return err
+	}
 	reason, ref := w.endReason(e)
 	entry := agentsession.NewRunEnd(w.run, reason, ref, append([]string(nil), w.open...))
 	w.run, w.open = "", nil
@@ -4458,6 +4802,37 @@ func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
 	// The end closes the queued entries of the inputs the run did not
 	// append; the ones the agent still holds are written again.
 	return w.endInbox(ctx)
+}
+
+// holdNotes writes the notes now waiting as a [HeldNotesNS] entry, the
+// whole set, an empty one included, unless it is the set the path's
+// last such entry already holds.
+func (w *writer) holdNotes(ctx context.Context, notes []agentturn.Note) error {
+	data, err := heldNotesData(notes)
+	if err != nil {
+		return err
+	}
+	if w.heldNotes == nil {
+		// Read once from the path, or nothing written yet: an empty
+		// set needs no entry.
+		last, err := heldNotesData(w.seededNotes)
+		if err != nil {
+			return err
+		}
+		w.heldNotes = last
+	}
+	if string(data) == string(w.heldNotes) {
+		return nil
+	}
+	callID := ""
+	if len(notes) > 0 {
+		callID = w.heldCall(notes[len(notes)-1].CallID)
+	}
+	if _, err := w.append(ctx, &agentsession.CustomEntry{NS: HeldNotesNS, Data: data, CallID: callID}); err != nil {
+		return err
+	}
+	w.heldNotes = data
+	return nil
 }
 
 // endInFlight writes the response entry of the call in flight, if any,

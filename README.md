@@ -219,6 +219,8 @@ cx, _ := s.Context()
 _ = a.SetTranscript(cx.Items)
 pending, _ := session.Pending(s)
 _ = a.SetPending(pending)
+owed, _ := session.OwedNotes(s) // notes owed after outputs already on the branch
+_ = a.SetNotes(owed)
 ```
 
 A front whose user has moved on answers them on the way to the

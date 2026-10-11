@@ -1444,10 +1444,12 @@ func TestPendingCarriesTheHold(t *testing.T) {
 		name    string
 		subject string
 		held    bool
+		note    string
 	}{
 		{name: "asked"},
 		{name: "asked about a part", subject: "rm -rf build"},
 		{name: "held beside another", held: true},
+		{name: "with the policy's note", note: "it runs in the sandbox"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := agentsession.NewMemoryStore()
@@ -1458,7 +1460,7 @@ func TestPendingCarriesTheHold(t *testing.T) {
 			act := agenttool.New("act", "", func(context.Context, echoArgs) (string, error) { return "done", nil })
 			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{act},
 				BeforeToolCall: func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
-					return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "rule r", By: agentsession.ByPolicy, Subject: tc.subject, Held: tc.held}, nil
+					return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "rule r", By: agentsession.ByPolicy, Subject: tc.subject, Held: tc.held, Note: tc.note}, nil
 				}})
 			defer rec.Attach(a)()
 			end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
@@ -1480,8 +1482,8 @@ func TestPendingCarriesTheHold(t *testing.T) {
 			if d == nil || d.Action != agentturn.Defer || d.Reason != "rule r" || d.By != agentsession.ByPolicy {
 				t.Fatalf("decision = %+v, want the hold's", d)
 			}
-			if d.Subject != tc.subject || d.Held != tc.held {
-				t.Errorf("decision subject %q held %v, want %q %v", d.Subject, d.Held, tc.subject, tc.held)
+			if d.Subject != tc.subject || d.Held != tc.held || d.Note != tc.note {
+				t.Errorf("decision subject %q held %v note %q, want %q %v %q", d.Subject, d.Held, d.Note, tc.subject, tc.held, tc.note)
 			}
 			if live := end.Pending[0].Decision; live.Subject != d.Subject || live.Held != d.Held {
 				t.Errorf("run end's decision subject %q held %v, the record's %q %v", live.Subject, live.Held, d.Subject, d.Held)

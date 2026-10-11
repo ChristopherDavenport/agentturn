@@ -1740,6 +1740,11 @@ func TestOpenQuestionSurvivesACut(t *testing.T) {
 	if len(pending) != 1 || pending[0].Reason != agentturn.PendingAborted {
 		t.Fatalf("pending = %+v, want the eval call in flight", pending)
 	}
+	// The pending call says it was waiting on a person, and what it
+	// asked (#241).
+	if q := pending[0].Question; q == nil || q.ID != questions[0].ID || q.Message != ask.Message || q.Call == nil || q.Call.CallID != ask.Call || q.Call.Name != "bash" || q.Call.Parent != parent.ID() {
+		t.Errorf("pending question = %+v, want the ask entry's", pending[0].Question)
+	}
 	answers, err := ReplayAnswers(ctx, s, tools)
 	if err != nil {
 		t.Fatal(err)
@@ -2248,6 +2253,756 @@ func TestEnvSurvivesACompaction(t *testing.T) {
 			}
 			if nodes := envNodes(got.Entries()); nodes != tc.want {
 				t.Errorf("env entries = %q, want %q alone", nodes, tc.want)
+			}
+		})
+	}
+}
+
+// TestAnAnswerNamesWhoGaveIt pins the recorder half of agentturn#240:
+// an answer given through Agent.Reply with a trigger on its context,
+// as front/control gives one for its principal, is written with that
+// trigger as the answer entry's source, beside by.
+func TestAnAnswerNamesWhoGaveIt(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool := agenttool.New("prune", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		ask, _ := agenttool.ElicitorFrom(ctx)
+		if _, err := ask(ctx, agenttool.Elicitation{Message: "delete the branch?"}); err != nil {
+			return "", err
+		}
+		return "pruned", nil
+	})
+	a := agentturn.New(agentturn.Config{Model: allCalls{}, MaxTurns: 1, Tools: []agenttool.Tool{tool}})
+	cfg := a.Config()
+	cfg.ToolElicitor = rec.Elicitor(agentsession.ByHuman, a.QuestionElicitor())
+	if err := a.SetConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Attach(a)()
+	bob := agentturn.ContextWithAnswerer(ctx, agentturn.Trigger{Kind: "control", Ref: "bob"})
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if q, ok := ev.(*agentturn.Question); ok {
+			return a.Reply(bob, q.ID, agenttool.Answer{Action: agenttool.ActionAccept})
+		}
+		return nil
+	})
+	if _, err := a.Prompt(ctx, openresponses.UserText("go")); err != nil {
+		t.Fatal(err)
+	}
+	var answer *Elicitation
+	for _, c := range customs(s, ElicitationNS) {
+		var e Elicitation
+		if err := json.Unmarshal(c.Data, &e); err != nil {
+			t.Fatal(err)
+		}
+		if e.Phase == ElicitationAnswer {
+			answer = &e
+		}
+	}
+	if answer == nil || answer.By != agentsession.ByHuman || answer.Source == nil || answer.Source.Kind != "control" || answer.Source.Ref != "bob" {
+		t.Fatalf("answer entry = %+v, want by human from control:bob", answer)
+	}
+}
+
+// TestAWithdrawnDispatchReadsAsNeverStarted pins the recorder half of
+// agentturn#119: a subscriber registered after the recorder that fails
+// on a call's tool_dispatch stops the tool after the dispatch is on the
+// record. The recorder then writes that the hand-off was withdrawn, so
+// Pending reads the call as never started, as the loop knew it, a
+// replay runs it, and its new dispatch is not recorded as a run again.
+func TestAWithdrawnDispatchReadsAsNeverStarted(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ran := 0
+	notify := agenttool.New("notify", "", func(context.Context, echoArgs) (string, error) {
+		ran++
+		return "sent", nil
+	})
+	tools := []agenttool.Tool{notify}
+	a := agentturn.New(agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools})
+	unsub := rec.Attach(a)
+	boom := errors.New("the audit log is down")
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if _, ok := ev.(*agentturn.ToolDispatch); ok {
+			return boom
+		}
+		return nil
+	})
+	if _, err := a.Prompt(ctx, openresponses.UserText("go")); !errors.Is(err, boom) {
+		t.Fatalf("prompt: %v, want the subscriber's failure", err)
+	}
+	unsub()
+	if ran != 0 {
+		t.Fatal("the tool ran after its dispatch was refused")
+	}
+	marks := customs(s, WithdrawnNS)
+	c := callsOf(t, s)["notify"]
+	if len(marks) != 1 || c == nil || len(c.Dispatches) != 1 || marks[0].CallID != c.ID() {
+		t.Fatalf("withdrawn entries = %d, call %+v", len(marks), c)
+	}
+	var w Withdrawn
+	if err := json.Unmarshal(marks[0].Data, &w); err != nil || w.Dispatch != c.Dispatches[0].ID || !strings.Contains(w.Reason, "audit log") {
+		t.Errorf("withdrawn = %+v (%v), want the dispatch %s and the failure", w, err, c.Dispatches[0].ID)
+	}
+
+	rec, s, err = Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := Pending(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Reason != agentturn.PendingUndispatched || pending[0].MayHaveRun() {
+		t.Fatalf("pending = %+v, want the call never started", pending)
+	}
+	answers, err := ReplayAnswers(ctx, s, tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts, err := AgentOptions(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := agentturn.New(agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools}, opts...)
+	defer rec.Attach(b)()
+	if _, err := b.Resume(ctx, answers...); err != nil {
+		t.Fatal(err)
+	}
+	if ran != 1 {
+		t.Errorf("the tool ran %d times on the replay, want once", ran)
+	}
+	c = callsOf(t, s)["notify"]
+	if c == nil || c.Output == nil || len(c.Dispatches) != 2 {
+		t.Fatalf("call after the replay = %+v", c)
+	}
+	for _, d := range c.Decisions {
+		if d.Reason == agentRunAgain {
+			t.Errorf("the replay of a call that never ran is recorded as a run again: %+v", d)
+		}
+	}
+}
+
+// TestHeldNotesSurviveARestart pins the recorder half of the review's
+// first finding: the notes a deferred batch holds are kept in the
+// record, read back onto the pending calls, and appended after the
+// outputs by the agent a restart builds, as the one that held them
+// would have.
+func TestHeldNotesSurviveARestart(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := []agenttool.Tool{agenttool.New("a", "", func(context.Context, echoArgs) (string, error) { return "A", nil }),
+		agenttool.New("b", "", func(context.Context, echoArgs) (string, error) { return "B", nil })}
+	hook := func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+		if info.Call.Name == "a" {
+			return &agentturn.ToolDecision{Note: "a ran in the sandbox"}, nil
+		}
+		return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask", By: agentsession.ByPolicy}, nil
+	}
+	a := agentturn.New(agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools, BeforeToolCall: hook})
+	unsub := rec.Attach(a)
+	if _, err := a.Prompt(ctx, openresponses.UserText("go")); err != nil {
+		t.Fatal(err)
+	}
+	unsub()
+
+	rec, s, err = Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := Pending(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || len(pending[0].Notes) != 1 {
+		t.Fatalf("pending = %+v, want b with a's note", pending)
+	}
+	opts, err := AgentOptions(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := agentturn.New(agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools}, opts...)
+	defer rec.Attach(b)()
+	out := openresponses.NewFunctionCallOutput(pending[0].Call.CallID, "did it myself")
+	if _, err := b.Resume(ctx, agentturn.Output(out).WithBy(agentsession.ByHuman)); err != nil {
+		t.Fatal(err)
+	}
+	var types []string
+	for _, it := range b.State().Transcript[:6] {
+		types = append(types, it.ItemType())
+	}
+	if got := strings.Join(types, " "); got != "message function_call function_call function_call_output function_call_output message" {
+		t.Fatalf("transcript = %q", got)
+	}
+	if m := b.State().Transcript[5].(*openresponses.Message); m.Text() != "a ran in the sandbox" {
+		t.Errorf("note = %q", m.Text())
+	}
+	if p, err := Pending(s); err != nil || len(p) != 0 {
+		t.Errorf("pending after the resume = %+v, %v", p, err)
+	}
+	if err := s.VerifyRecords(s.Leaf()); err != nil {
+		t.Errorf("verify: %v", err)
+	}
+}
+
+// TestALiveRecorderCountsWithdrawalsAsARestartedOneDoes pins S6: a call
+// that may have run once and then had a dispatch withdrawn still may
+// have run, so the live recorder writes its next approval as one of a
+// call run again, as a recorder seeded from the path writes it: with
+// the approver's by, none here, rather than the policy's.
+func TestALiveRecorderCountsWithdrawalsAsARestartedOneDoes(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	first := true
+	notify := agenttool.New("notify", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		if first {
+			first = false
+			close(started)
+			<-ctx.Done()
+			return "", ctx.Err()
+		}
+		return "sent", nil
+	})
+	a := agentturn.New(agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: []agenttool.Tool{notify}})
+	defer rec.Attach(a)()
+	refuse := false
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if _, ok := ev.(*agentturn.ToolDispatch); ok && refuse {
+			refuse = false
+			return errors.New("the audit log is down")
+		}
+		return nil
+	})
+	go func() {
+		<-started
+		a.Abort()
+	}()
+	end, err := a.Prompt(ctx, openresponses.UserText("go"))
+	if err != nil || end.Reason != agentturn.ReasonAborted || len(end.Pending) != 1 {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	id := end.Pending[0].Call.CallID
+	refuse = true
+	if _, err := a.Resume(ctx, agentturn.Approve(id).WithRunAgain()); err == nil {
+		t.Fatal("the withdrawn resume did not fail")
+	}
+	if _, err := a.Resume(ctx, agentturn.Approve(id).WithRunAgain()); err != nil {
+		t.Fatal(err)
+	}
+	c := callsOf(t, s)["notify"]
+	if c == nil || c.Output == nil || len(c.Dispatches) != 3 {
+		t.Fatalf("call = %+v", c)
+	}
+	if len(c.Decisions) != 2 || c.Decisions[0].By != c.Decisions[1].By {
+		t.Errorf("decisions = %+v / %+v, want both written as of a call run again", c.Decisions[0], c.Decisions[len(c.Decisions)-1])
+	}
+}
+
+// messagesOf lists the messages of items, role first.
+func messagesOf(items []openresponses.Item) []string {
+	var out []string
+	for _, it := range items {
+		if m, ok := it.(*openresponses.Message); ok {
+			out = append(out, string(m.Role)+": "+m.Text())
+		}
+	}
+	return out
+}
+
+// countMessage is how many messages of items read want.
+func countMessage(items []openresponses.Item, want string) int {
+	n := 0
+	for _, m := range messagesOf(items) {
+		if m == want {
+			n++
+		}
+	}
+	return n
+}
+
+// restart reads the session again and builds an agent from it.
+func restart(t *testing.T, store agentsession.Store, id string, cfg agentturn.Config) (*Recorder, *agentsession.Session, *agentturn.Agent) {
+	t.Helper()
+	rec, s, err := Resume(context.Background(), store, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts, err := AgentOptions(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rec, s, agentturn.New(cfg, opts...)
+}
+
+// TestAPersonsNoteSurvivesACrashAfterTheOutput pins S4: the note on a
+// Resume's output answer is on the record from the moment its output
+// is, through notes_held, so a process that dies before the run's end
+// keeps it, with its mode, trigger and call.
+func TestAPersonsNoteSurvivesACrashAfterTheOutput(t *testing.T) {
+	ctx := context.Background()
+	store := &cutStore{Store: agentsession.NewMemoryStore()}
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := []agenttool.Tool{
+		agenttool.New("a", "", func(context.Context, echoArgs) (string, error) { return "A", nil }),
+		agenttool.New("b", "", func(context.Context, echoArgs) (string, error) {
+			store.cut.Store(true) // the process dies while b runs
+			return "B", nil
+		}),
+	}
+	deferAll := func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+		return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask", By: agentsession.ByPolicy}, nil
+	}
+	a := agentturn.New(agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools, BeforeToolCall: deferAll})
+	unsub := rec.Attach(a)
+	end, err := a.Prompt(ctx, openresponses.UserText("go"))
+	if err != nil || len(end.Pending) != 2 {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	first, second := end.Pending[0].Call.CallID, end.Pending[1].Call.CallID
+	who := agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "control", Ref: "alice"})
+	a.Resume(who, agentturn.Output(openresponses.NewFunctionCallOutput(first, "no")).WithNote("put it under ci/").WithBy(agentsession.ByHuman),
+		agentturn.Approve(second).WithBy(agentsession.ByHuman))
+	unsub()
+	store.cut.Store(false)
+
+	_, _, b := restart(t, store, s.ID(), agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools})
+	pending := b.State().Pending
+	if len(pending) != 1 || len(pending[0].Notes) != 1 {
+		t.Fatalf("pending after the crash = %+v, want b with the person's note", pending)
+	}
+	n := pending[0].Notes[0]
+	if n.Mode != agentturn.InputResume || n.CallID != first || n.Trigger.Ref != "alice" {
+		t.Errorf("restored note = %+v, want the Resume's, about %s, from alice", n, first)
+	}
+	if _, err := b.Resume(ctx, agentturn.OutcomeUnknown(second).WithBy(agentsession.ByHuman)); err != nil {
+		t.Fatal(err)
+	}
+	tr := b.State().Transcript
+	if countMessage(tr, "user: put it under ci/") != 1 {
+		t.Errorf("transcript = %q, want the note once", messagesOf(tr))
+	}
+}
+
+// TestAHeldCallsPolicyNoteIsSaidOnceAfterARestart pins R8's restart
+// half: the hold decision keeps its note, and the agent a restart builds
+// says it once when an approval releases the call.
+func TestAHeldCallsPolicyNoteIsSaidOnceAfterARestart(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := []agenttool.Tool{agenttool.New("b", "", func(context.Context, echoArgs) (string, error) { return "B", nil })}
+	hold := func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+		return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask", By: agentsession.ByPolicy, Note: "b runs in the sandbox"}, nil
+	}
+	a := agentturn.New(agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools, BeforeToolCall: hold})
+	unsub := rec.Attach(a)
+	end, err := a.Prompt(ctx, openresponses.UserText("go"))
+	if err != nil || len(end.Pending) != 1 {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	unsub()
+	rec, _, b := restart(t, store, s.ID(), agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools})
+	defer rec.Attach(b)()
+	if _, err := b.Resume(ctx, agentturn.Approve(end.Pending[0].Call.CallID).WithBy(agentsession.ByHuman)); err != nil {
+		t.Fatal(err)
+	}
+	if n := countMessage(b.State().Transcript, "developer: b runs in the sandbox"); n != 1 {
+		t.Errorf("the policy's note is in the transcript %d times, want once: %q", n, messagesOf(b.State().Transcript))
+	}
+}
+
+// TestARestoredNoteIsSaidOnce pins that a note restored from the record
+// keeps its call, so the agent says once a note an answer after the
+// restart brings again: a person's approval note on a call whose
+// dispatch was withdrawn, approved again with the same note.
+func TestARestoredNoteIsSaidOnce(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := []agenttool.Tool{agenttool.New("b", "", func(context.Context, echoArgs) (string, error) { return "B", nil })}
+	decided := 0
+	hook := func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+		decided++
+		if decided == 1 {
+			return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask", By: agentsession.ByPolicy}, nil
+		}
+		return nil, nil
+	}
+	cfg := agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools, BeforeToolCall: hook}
+	a := agentturn.New(cfg)
+	unsub := rec.Attach(a)
+	refuse := false
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if _, ok := ev.(*agentturn.ToolDispatch); ok && refuse {
+			refuse = false
+			return errors.New("the audit log is down")
+		}
+		return nil
+	})
+	end, err := a.Prompt(ctx, openresponses.UserText("go"))
+	if err != nil || len(end.Pending) != 1 {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	id := end.Pending[0].Call.CallID
+	refuse = true
+	// The dispatch is withdrawn: the call never ran, and the approval's
+	// note stays with it.
+	end, err = a.Resume(ctx, agentturn.Approve(id).WithNote("only the unit tests").WithBy(agentsession.ByHuman))
+	if err == nil || len(end.Pending) != 1 || len(end.Pending[0].Notes) != 1 {
+		t.Fatalf("resume: err=%v end=%+v", err, end)
+	}
+	unsub()
+	rec, _, b := restart(t, store, s.ID(), cfg)
+	defer rec.Attach(b)()
+	if p := b.State().Pending; len(p) != 1 || len(p[0].Notes) != 1 || p[0].Notes[0].CallID != id {
+		t.Fatalf("restored pending = %+v, want the note about %s", p, id)
+	}
+	if _, err := b.Resume(ctx, agentturn.Approve(id).WithNote("only the unit tests").WithBy(agentsession.ByHuman)); err != nil {
+		t.Fatal(err)
+	}
+	if n := countMessage(b.State().Transcript, "user: only the unit tests"); n != 1 {
+		t.Errorf("the note is in the transcript %d times, want once: %q", n, messagesOf(b.State().Transcript))
+	}
+}
+
+// TestOwedNotesSurviveARestart pins the restore of the notes a failed
+// run owed after outputs already in: OwedNotes gives them, AgentOptions
+// seeds them, and the next run appends them first; once appended, the
+// record's last held notes are empty and nothing is owed.
+func TestOwedNotesSurviveARestart(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mk := func(name string) agenttool.Tool {
+		return agenttool.New(name, "", func(context.Context, echoArgs) (string, error) { return "ok", nil })
+	}
+	tools := []agenttool.Tool{mk("a"), mk("b"), mk("c")}
+	hook := func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+		switch info.Call.Name {
+		case "a":
+			return &agentturn.ToolDecision{Note: "n1"}, nil
+		case "c":
+			return &agentturn.ToolDecision{Note: "n2"}, nil
+		}
+		return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask", By: agentsession.ByPolicy}, nil
+	}
+	cfg := agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools, BeforeToolCall: hook}
+	a := agentturn.New(cfg)
+	unsub := rec.Attach(a)
+	end, err := a.Prompt(ctx, openresponses.UserText("go"))
+	if err != nil || len(end.Pending) != 1 {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	fail := true
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if e, ok := ev.(*agentturn.ItemStart); ok && fail {
+			if m, ok := e.Item.(*openresponses.Message); ok && m.Text() == "n2" {
+				fail = false
+				return errors.New("disk full")
+			}
+		}
+		return nil
+	})
+	end, err = a.Resume(ctx, agentturn.Output(openresponses.NewFunctionCallOutput(end.Pending[0].Call.CallID, "no")).WithBy(agentsession.ByHuman))
+	if err == nil || len(end.Notes) != 1 {
+		t.Fatalf("resume: err=%v end=%+v", err, end)
+	}
+	unsub()
+	read, err := store.Open(ctx, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owed, err := OwedNotes(read)
+	if err != nil || len(owed) != 1 || owed[0].CallID == "" {
+		t.Fatalf("owed = %+v, %v", owed, err)
+	}
+	rec, s, b := restart(t, store, s.ID(), cfg)
+	defer rec.Attach(b)()
+	if _, err := b.Prompt(ctx, openresponses.UserText("next")); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(messagesOf(b.State().Transcript)[:4], "|"); got != "user: go|developer: n1|developer: n2|user: next" {
+		t.Errorf("transcript = %q", messagesOf(b.State().Transcript))
+	}
+	if owed, err := OwedNotes(s); err != nil || len(owed) != 0 {
+		t.Errorf("owed after the notes were appended = %+v, %v", owed, err)
+	}
+	// The held notes the record went through: the deferred batch's two,
+	// the one the failed run owed, emptied once the restarted agent
+	// appended it, then the next batch's.
+	var sizes []int
+	for _, c := range customs(s, HeldNotesNS) {
+		var h HeldNotes
+		if err := json.Unmarshal(c.Data, &h); err != nil {
+			t.Fatal(err)
+		}
+		sizes = append(sizes, len(h.Notes))
+	}
+	if fmt.Sprint(sizes) != "[2 1 0 2]" {
+		t.Errorf("held notes entries = %v, want [2 1 0 2]", sizes)
+	}
+}
+
+// TestNotesAlreadySaidAreNotOwed pins that notes whose items the path
+// holds after the last held_notes entry are not restored: a process that
+// died between a note's item and the report that it was said, a flush
+// cut part way, and a rebase to an entry in between each leave the
+// record's last held set behind what was said.
+func TestNotesAlreadySaidAreNotOwed(t *testing.T) {
+	mk := func(name string) agenttool.Tool {
+		return agenttool.New(name, "", func(context.Context, echoArgs) (string, error) { return "ok", nil })
+	}
+	hook := func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+		switch info.Call.Name {
+		case "a":
+			return &agentturn.ToolDecision{Note: "n1"}, nil
+		case "c":
+			return &agentturn.ToolDecision{Note: "n2"}, nil
+		}
+		return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask", By: agentsession.ByPolicy}, nil
+	}
+	tools := []agenttool.Tool{mk("a"), mk("b"), mk("c")}
+	cfg := agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools, BeforeToolCall: hook}
+	// run prompts until b waits, then answers b, cutting the store once
+	// the item of the note cutAt is written ("" cuts nothing).
+	run := func(t *testing.T, cutAt string) (*cutStore, *Recorder, *agentsession.Session) {
+		t.Helper()
+		ctx := context.Background()
+		store := &cutStore{Store: agentsession.NewMemoryStore()}
+		rec, s, err := Start(ctx, store, agentsession.Header{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := agentturn.New(cfg)
+		unsub := rec.Attach(a)
+		defer unsub()
+		a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+			if e, ok := ev.(*agentturn.ItemEnd); ok && cutAt != "" {
+				if m, ok := e.Item.(*openresponses.Message); ok && m.Text() == cutAt {
+					store.cut.Store(true)
+				}
+			}
+			return nil
+		})
+		end, err := a.Prompt(ctx, openresponses.UserText("go"))
+		if err != nil || len(end.Pending) != 1 {
+			t.Fatalf("prompt: err=%v end=%+v", err, end)
+		}
+		a.Resume(ctx, agentturn.Output(openresponses.NewFunctionCallOutput(end.Pending[0].Call.CallID, "no")).WithBy(agentsession.ByHuman))
+		store.cut.Store(false)
+		return store, rec, s
+	}
+	owedTexts := func(t *testing.T, s *agentsession.Session) []string {
+		t.Helper()
+		owed, err := OwedNotes(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, n := range owed {
+			out = append(out, n.Item.(*openresponses.Message).Text())
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name, cutAt, owed string
+	}{
+		{"cut after every note", "n2", ""},
+		{"cut part way", "n1", "n2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, _, s := run(t, tc.cutAt)
+			read, err := store.Open(context.Background(), s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(owedTexts(t, read), ","); got != tc.owed {
+				t.Fatalf("owed = %q, want %q", got, tc.owed)
+			}
+			_, _, b := restart(t, store, s.ID(), cfg)
+			if _, err := b.Prompt(context.Background(), openresponses.UserText("next")); err != nil {
+				t.Fatal(err)
+			}
+			tr := b.State().Transcript
+			// The next batch holds its own notes while b waits again.
+			if countMessage(tr, "developer: n1") != 1 || countMessage(tr, "developer: n2") != 1 {
+				t.Errorf("transcript = %q, want each note once", messagesOf(tr))
+			}
+		})
+	}
+	// A rebase to a note's item: the notes said by then are not owed on
+	// that branch, the ones after it are.
+	for _, tc := range []struct{ at, owed string }{{"n1", "n2"}, {"n2", ""}} {
+		t.Run("a rebase to "+tc.at+"'s item", func(t *testing.T) {
+			_, rec, s := run(t, "")
+			var at string
+			for _, e := range s.Entries() {
+				if it, ok := e.(*agentsession.ItemEntry); ok {
+					if m, ok := it.Item.(*openresponses.Message); ok && m.Text() == tc.at {
+						at = it.Base().ID
+						break
+					}
+				}
+			}
+			if at == "" {
+				t.Fatalf("no item for %s", tc.at)
+			}
+			if err := rec.Rebase(s, at); err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(owedTexts(t, s), ","); got != tc.owed {
+				t.Errorf("owed at %s's item = %q, want %q", tc.at, got, tc.owed)
+			}
+		})
+	}
+}
+
+// TestANoteSurvivesACrashBeforeItsItem pins the full crash claim, with
+// agentturn v0.0.25 reporting notes held before their outputs: a
+// process that dies after an output's entry and before the note's own
+// item loses nothing, and the agent a restart builds says the note once.
+func TestANoteSurvivesACrashBeforeItsItem(t *testing.T) {
+	mk := func(name string) agenttool.Tool {
+		return agenttool.New(name, "", func(context.Context, echoArgs) (string, error) { return "ok", nil })
+	}
+	tools := []agenttool.Tool{mk("a"), mk("b")}
+	for _, tc := range []struct {
+		name string
+		// hook decides every call; deferring the first run's calls.
+		hook func(n int, info agentturn.ToolCallInfo) *agentturn.ToolDecision
+		// answer answers the first run's pending calls.
+		answer func(pending []agentturn.PendingCall) []agentturn.Answer
+		cutAt  string // the call whose output's entry is the last written
+		note   string
+	}{
+		{
+			name: "a Resume's output answer, nothing approved",
+			hook: func(int, agentturn.ToolCallInfo) *agentturn.ToolDecision {
+				return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask", By: agentsession.ByPolicy}
+			},
+			answer: func(p []agentturn.PendingCall) []agentturn.Answer {
+				return []agentturn.Answer{
+					agentturn.Output(openresponses.NewFunctionCallOutput(p[0].Call.CallID, "no")).WithNote("put it under ci/").WithBy(agentsession.ByHuman),
+					agentturn.Output(openresponses.NewFunctionCallOutput(p[1].Call.CallID, "no")).WithBy(agentsession.ByHuman),
+				}
+			},
+			cutAt: "a", note: "user: put it under ci/",
+		},
+		{
+			name: "an approval's note, its batch completing",
+			hook: func(n int, _ agentturn.ToolCallInfo) *agentturn.ToolDecision {
+				if n <= 2 {
+					return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask", By: agentsession.ByPolicy}
+				}
+				return nil
+			},
+			answer: func(p []agentturn.PendingCall) []agentturn.Answer {
+				return []agentturn.Answer{
+					agentturn.Approve(p[0].Call.CallID).WithNote("only the unit tests").WithBy(agentsession.ByHuman),
+					agentturn.Output(openresponses.NewFunctionCallOutput(p[1].Call.CallID, "no")).WithBy(agentsession.ByHuman),
+				}
+			},
+			cutAt: "a", note: "user: only the unit tests",
+		},
+		{
+			name: "a released call's policy note",
+			hook: func(n int, _ agentturn.ToolCallInfo) *agentturn.ToolDecision {
+				if n <= 2 {
+					return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask", By: agentsession.ByPolicy, Note: "it runs in the sandbox"}
+				}
+				return nil
+			},
+			answer: func(p []agentturn.PendingCall) []agentturn.Answer {
+				return []agentturn.Answer{
+					agentturn.Approve(p[0].Call.CallID).WithBy(agentsession.ByHuman),
+					agentturn.Output(openresponses.NewFunctionCallOutput(p[1].Call.CallID, "no")).WithBy(agentsession.ByHuman),
+				}
+			},
+			cutAt: "a", note: "developer: it runs in the sandbox",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := &cutStore{Store: agentsession.NewMemoryStore()}
+			rec, s, err := Start(ctx, store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			decided := 0
+			cfg := agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools,
+				BeforeToolCall: func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+					decided++
+					return tc.hook(decided, info), nil
+				}}
+			a := agentturn.New(cfg)
+			unsub := rec.Attach(a)
+			names := map[string]string{}
+			a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+				if e, ok := ev.(*agentturn.ItemEnd); ok {
+					switch it := e.Item.(type) {
+					case *openresponses.FunctionCall:
+						names[it.CallID] = it.Name
+					case *openresponses.FunctionCallOutput:
+						if names[it.CallID] == tc.cutAt {
+							store.cut.Store(true) // dies after the output's entry
+						}
+					}
+				}
+				return nil
+			})
+			end, err := a.Prompt(ctx, openresponses.UserText("go"))
+			if err != nil || len(end.Pending) != 2 {
+				t.Fatalf("prompt: err=%v end=%+v", err, end)
+			}
+			a.Resume(ctx, tc.answer(end.Pending)...)
+			unsub()
+			store.cut.Store(false)
+
+			cfg.BeforeToolCall = nil
+			rec, _, b := restart(t, store, s.ID(), cfg)
+			defer rec.Attach(b)()
+			if p := b.State().Pending; len(p) > 0 {
+				var answers []agentturn.Answer
+				for _, c := range p {
+					answers = append(answers, agentturn.OutcomeUnknown(c.Call.CallID).WithBy(agentsession.ByHuman))
+				}
+				if _, err := b.Resume(ctx, answers...); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := b.Prompt(ctx, openresponses.UserText("next")); err != nil {
+				t.Fatal(err)
+			}
+			if n := countMessage(b.State().Transcript, tc.note); n != 1 {
+				t.Errorf("%q is in the transcript %d times, want once: %q", tc.note, n, messagesOf(b.State().Transcript))
 			}
 		})
 	}
