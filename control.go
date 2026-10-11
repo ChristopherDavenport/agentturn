@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/openresponses"
@@ -29,6 +30,10 @@ import (
 // Queue stands for [Agent.Steer] and [Agent.FollowUp]: it carries a
 // context and an error, which a wire needs and which a recorder that
 // writes a queued input before the agent takes it has to return.
+// Reply carries a context for the same reason, and so that who answered
+// a question is known as who prompted is: the trigger on its context
+// ([ContextWithTrigger]) names the answerer on [QuestionClosed] and to a
+// recorder ([ContextWithAnswerer]).
 type Control interface {
 	Prompt(ctx context.Context, items ...openresponses.Item) (*RunEnd, error)
 	Resume(ctx context.Context, answers ...Answer) (*RunEnd, error)
@@ -36,7 +41,7 @@ type Control interface {
 	Abort()
 	State() State
 	Subscribe(fn func(context.Context, Event) error) (unsubscribe func())
-	Reply(id string, answer agenttool.Answer) error
+	Reply(ctx context.Context, id string, answer agenttool.Answer) error
 }
 
 var _ Control = (*Agent)(nil)
@@ -90,11 +95,14 @@ func (*Question) EventType() string { return EventQuestion }
 // QuestionClosed reports that a [Question] no longer waits. Answer is
 // what [Agent.Reply] gave it, and nil when the call gave up first: its
 // context ended, by an abort among other things, or the question could
-// not be delivered.
+// not be delivered. By is who answered: the trigger on the context
+// Reply was given, such as front/control's principal, and zero when
+// that context carried none or nothing answered.
 type QuestionClosed struct {
 	ID     string
 	RunID  string
 	Answer *agenttool.Answer
+	By     Trigger
 }
 
 // EventType returns "question_closed".
@@ -111,7 +119,51 @@ var ErrNoQuestion = errors.New("agentturn: no such question is waiting")
 
 // asking is a question waiting for its answer.
 type asking struct {
-	reply chan agenttool.Answer
+	reply chan replied
+}
+
+// replied is an answer [Agent.Reply] gave and who gave it.
+type replied struct {
+	answer agenttool.Answer
+	by     Trigger
+}
+
+type answererKey struct{}
+
+// answerer is where the asking side of a question learns who answered
+// it; each one installed under ctx hears of the answer.
+type answerer struct {
+	mu     sync.Mutex
+	by     Trigger
+	parent *answerer
+}
+
+// ContextWithAnswerer returns ctx and a function that reports who
+// answered a question asked under it through [Agent.Reply]: the trigger
+// on the context Reply was given. An elicitor that wraps the agent's
+// [Agent.QuestionElicitor], such as a session recorder's, asks the
+// inner one under the returned context and calls the function once it
+// has returned, to write who answered beside the answer. The function
+// returns the zero Trigger when nothing answered through Reply or its
+// context named nobody.
+func ContextWithAnswerer(ctx context.Context) (context.Context, func() Trigger) {
+	parent, _ := ctx.Value(answererKey{}).(*answerer)
+	h := &answerer{parent: parent}
+	return context.WithValue(ctx, answererKey{}, h), func() Trigger {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return h.by
+	}
+}
+
+// tellAnswerer passes who answered to every [ContextWithAnswerer]
+// under ctx.
+func tellAnswerer(ctx context.Context, by Trigger) {
+	for h, _ := ctx.Value(answererKey{}).(*answerer); h != nil; h = h.parent {
+		h.mu.Lock()
+		h.by = by
+		h.mu.Unlock()
+	}
 }
 
 // QuestionElicitor returns an agenttool.Elicitor that asks through the
@@ -147,7 +199,7 @@ func (a *Agent) ask(ctx context.Context, q agenttool.Elicitation) (agenttool.Ans
 	if call, ok := AskedCallFrom(ctx); ok {
 		ev.Call = &call
 	}
-	w := &asking{reply: make(chan agenttool.Answer, 1)}
+	w := &asking{reply: make(chan replied, 1)}
 	a.mu.Lock()
 	if a.asks == nil {
 		a.asks = map[string]*asking{}
@@ -161,9 +213,10 @@ func (a *Agent) ask(ctx context.Context, q agenttool.Elicitation) (agenttool.Ans
 	err := a.deliver(dctx, ev)
 	if err == nil {
 		select {
-		case ans := <-w.reply:
-			_ = a.deliver(dctx, &QuestionClosed{ID: ev.ID, RunID: ev.RunID, Answer: &ans})
-			return ans, nil
+		case r := <-w.reply:
+			tellAnswerer(ctx, r.by)
+			_ = a.deliver(dctx, &QuestionClosed{ID: ev.ID, RunID: ev.RunID, Answer: &r.answer, By: r.by})
+			return r.answer, nil
 		case <-ctx.Done():
 			err = ctx.Err()
 		}
@@ -174,20 +227,24 @@ func (a *Agent) ask(ctx context.Context, q agenttool.Elicitation) (agenttool.Ans
 	delete(a.asks, ev.ID)
 	a.mu.Unlock()
 	if !waiting {
-		ans := <-w.reply
-		_ = a.deliver(dctx, &QuestionClosed{ID: ev.ID, RunID: ev.RunID, Answer: &ans})
-		return ans, nil
+		r := <-w.reply
+		tellAnswerer(ctx, r.by)
+		_ = a.deliver(dctx, &QuestionClosed{ID: ev.ID, RunID: ev.RunID, Answer: &r.answer, By: r.by})
+		return r.answer, nil
 	}
 	_ = a.deliver(dctx, &QuestionClosed{ID: ev.ID, RunID: ev.RunID})
 	return agenttool.Answer{}, err
 }
 
 // Reply answers the [Question] id with answer: an accept, with the
-// content a form asked for, a decline, or a cancel. It returns
-// [ErrNoQuestion] when id names no waiting question, one already
-// answered or given up among them. It never blocks, so a subscriber
-// may reply from inside the question's own event.
-func (a *Agent) Reply(id string, answer agenttool.Answer) error {
+// content a form asked for, a decline, or a cancel. The trigger on ctx
+// ([ContextWithTrigger]) names who answered: [QuestionClosed] carries
+// it, and so does the [ContextWithAnswerer] the question was asked
+// under. Only its values are read; Reply does not wait on it. It
+// returns [ErrNoQuestion] when id names no waiting question, one
+// already answered or given up among them. It never blocks, so a
+// subscriber may reply from inside the question's own event.
+func (a *Agent) Reply(ctx context.Context, id string, answer agenttool.Answer) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	w, ok := a.asks[id]
@@ -195,6 +252,6 @@ func (a *Agent) Reply(id string, answer agenttool.Answer) error {
 		return fmt.Errorf("%w: %q", ErrNoQuestion, id)
 	}
 	delete(a.asks, id)
-	w.reply <- answer
+	w.reply <- replied{answer: answer, by: TriggerFromContext(ctx)}
 	return nil
 }

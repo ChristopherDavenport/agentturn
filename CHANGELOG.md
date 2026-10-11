@@ -39,6 +39,19 @@ versions may break the API.
     waited on. The agent holds them, not the record.
   The docs of `ToolDecision.Note`, `Answer.Note`, `Resume`, `Ask` and
   `Config.ToolElicitor` say so.
+- Changed, breaking: `Control.Reply` and `Agent.Reply` take a context,
+  whose trigger names who answered. `QuestionClosed.By` carries it, and
+  `ContextWithAnswerer` hands it to an elicitor that wraps the agent's,
+  so a recorder can write who answered beside the answer. `front/control`
+  calls `Reply` with the request's context, so an answer names the
+  principal as a run start does, and `Client.Reply` takes the caller's
+  context. agentturn/session writes it on the answer entry in the
+  release after this one. (#240)
+- Changed: `front/control` records an answer to `Resume` as decided by
+  `human`, whatever `By` the client sent, unless the principal holds the
+  scope the host names with the new `WithChosenBy`, such as a policy
+  engine answering over the wire; a client holding only `answer` can no
+  longer make a person's decision read as a rule's. (#240)
 
 ## v0.0.22 - 2026-10-10
 

@@ -58,7 +58,7 @@ func sampleEvents(t *testing.T) map[string]agentturn.Event {
 			}}},
 		"Queued":         &agentturn.Queued{RunID: "run_1", Item: openresponses.UserText("more"), Mode: agentturn.QueueSteer, Hidden: true, Trigger: trigger},
 		"Question":       &agentturn.Question{ID: "question_1", RunID: "run_1", CallID: "call_0", Call: &agentturn.AskedCall{Parent: "call_0", CallID: "call_1", Name: "upper", Args: json.RawMessage(`{}`), Decision: decision}, Elicitation: agenttool.Elicitation{Message: "ok?", Schema: json.RawMessage(`{"type":"object"}`), URL: "https://example.test"}},
-		"QuestionClosed": &agentturn.QuestionClosed{ID: "question_1", RunID: "run_1", Answer: &agenttool.Answer{Action: agenttool.ActionDecline, Content: json.RawMessage(`{"a":1}`), Note: "not now"}},
+		"QuestionClosed": &agentturn.QuestionClosed{ID: "question_1", RunID: "run_1", Answer: &agenttool.Answer{Action: agenttool.ActionDecline, Content: json.RawMessage(`{"a":1}`), Note: "not now"}, By: trigger},
 	}
 }
 
@@ -196,7 +196,7 @@ func TestWhatTravelsAsADescription(t *testing.T) {
 		t.Errorf("details = %#v", te.Result.Details)
 	}
 	closed := decode(samples["QuestionClosed"]).(*agentturn.QuestionClosed)
-	if closed.Answer == nil || closed.Answer.Note != "not now" || closed.Answer.Action != agenttool.ActionDecline {
+	if closed.Answer == nil || closed.Answer.Note != "not now" || closed.Answer.Action != agenttool.ActionDecline || closed.By.Ref != "alice" {
 		t.Errorf("closed = %+v", closed)
 	}
 }

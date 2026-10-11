@@ -164,7 +164,7 @@ func wireOf(ev agentturn.Event) (any, error) {
 	case *agentturn.Question:
 		return wireQuestion{Type: e.EventType(), ID: e.ID, RunID: e.RunID, CallID: e.CallID, Call: askedCallOut(e.Call), Elicitation: elicitationOut(e.Elicitation)}, nil
 	case *agentturn.QuestionClosed:
-		return wireQuestionClosed{Type: e.EventType(), ID: e.ID, RunID: e.RunID, Answer: elicitAnswerOut(e.Answer)}, nil
+		return wireQuestionClosed{Type: e.EventType(), ID: e.ID, RunID: e.RunID, Answer: elicitAnswerOut(e.Answer), By: triggerOut(e.By)}, nil
 	}
 	return nil, fmt.Errorf("control: event %T has no wire form", ev)
 }
@@ -354,7 +354,7 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 		if err := json.Unmarshal(data, &w); err != nil {
 			return nil, err
 		}
-		return &agentturn.QuestionClosed{ID: w.ID, RunID: w.RunID, Answer: elicitAnswerIn(w.Answer)}, nil
+		return &agentturn.QuestionClosed{ID: w.ID, RunID: w.RunID, Answer: elicitAnswerIn(w.Answer), By: triggerIn(w.By)}, nil
 	},
 }
 
@@ -517,6 +517,7 @@ type wireQuestionClosed struct {
 	ID     string            `json:"id"`
 	RunID  string            `json:"run_id,omitempty"`
 	Answer *wireElicitAnswer `json:"answer,omitempty"`
+	By     *wireTrigger      `json:"by,omitempty"`
 }
 
 // The wire forms of the values the events and the methods carry.

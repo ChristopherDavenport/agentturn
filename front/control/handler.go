@@ -19,6 +19,9 @@ import (
 	"github.com/ChristopherDavenport/agentturn"
 )
 
+// byHuman is the session format's name for a person who decided.
+const byHuman = "human"
+
 // Protocol names the wire this package speaks, as GET / reports it.
 const Protocol = "agentturn-control/1"
 
@@ -158,6 +161,18 @@ func WithCommands(cmds map[string]Command) Option {
 	}
 }
 
+// WithChosenBy lets a principal that holds scope say who decided its
+// answers to Resume, with agentturn.Answer.By: a policy engine or
+// another agent that answers over the wire, whose host names a scope
+// for it. Without it, or for a principal without scope, every answer
+// to Resume is recorded as decided by "human", whatever By the client
+// sent: a person at a client is who answers through one, and a client
+// holding only [ScopeAnswer] cannot make a person's decision read as a
+// rule's. Who it was is the run's trigger, which names the principal.
+func WithChosenBy(scope Scope) Option {
+	return func(h *handler) { h.chosenBy = scope }
+}
+
 // WithMaxRequestBytes bounds a request body; a larger one is refused.
 // The default is 16 MiB, room for a prompt with images.
 func WithMaxRequestBytes(n int64) Option {
@@ -177,6 +192,7 @@ type handler struct {
 	c        agentturn.Control
 	auth     Authenticator
 	insecure bool
+	chosenBy Scope
 	commands map[string]Command
 	maxBody  int64
 	buffer   int
@@ -201,7 +217,11 @@ type handler struct {
 //
 // Every request is authenticated ([WithAuthenticator]); the principal
 // rides on the call's context ([PrincipalFrom]), and a run it starts or
-// answers carries an agentturn.Trigger of kind "control" naming it.
+// answers carries an agentturn.Trigger of kind "control" naming it. So
+// does an answer to a question: Reply gets the request's context, so
+// agentturn.QuestionClosed.By and a recorder name who answered. An
+// answer to Resume is recorded as decided by "human" unless the
+// principal holds the scope [WithChosenBy] names.
 // Prompt and Resume run on the request's context with its
 // cancellation lifted (context.WithoutCancel, the principal and the
 // trigger kept), so a run goes on when its client goes away: over a
@@ -304,7 +324,7 @@ func (h *handler) prompt(w http.ResponseWriter, r *http.Request, _ Principal) {
 	h.writeRun(w, func() (*agentturn.RunEnd, error) { return h.c.Prompt(context.WithoutCancel(r.Context()), items...) })
 }
 
-func (h *handler) resume(w http.ResponseWriter, r *http.Request, _ Principal) {
+func (h *handler) resume(w http.ResponseWriter, r *http.Request, p Principal) {
 	var req struct {
 		Answers []wireAnswer `json:"answers"`
 	}
@@ -315,6 +335,11 @@ func (h *handler) resume(w http.ResponseWriter, r *http.Request, _ Principal) {
 	if err != nil {
 		writeFailure(w, http.StatusBadRequest, err)
 		return
+	}
+	if h.chosenBy == "" || !p.Has(h.chosenBy) {
+		for i := range answers {
+			answers[i].By = byHuman
+		}
 	}
 	h.writeRun(w, func() (*agentturn.RunEnd, error) { return h.c.Resume(context.WithoutCancel(r.Context()), answers...) })
 }
@@ -382,7 +407,9 @@ func (h *handler) reply(w http.ResponseWriter, r *http.Request, _ Principal) {
 		writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: reply: unknown action %q", a.Action))
 		return
 	}
-	writeJSON(w, http.StatusOK, errReply{errorOut(h.c.Reply(req.ID, *a))})
+	// The request's context carries the principal and its trigger, so
+	// the answer names who gave it.
+	writeJSON(w, http.StatusOK, errReply{errorOut(h.c.Reply(r.Context(), req.ID, *a))})
 }
 
 type commandInfo struct {

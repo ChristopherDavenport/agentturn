@@ -87,7 +87,7 @@ func TestQuestionsAreEvents(t *testing.T) {
 			a.Subscribe(func(_ context.Context, ev Event) error {
 				events = append(events, ev)
 				if q, ok := ev.(*Question); ok {
-					replyErr = a.Reply(q.ID, tc.answer)
+					replyErr = a.Reply(context.Background(), q.ID, tc.answer)
 				}
 				return nil
 			})
@@ -193,7 +193,7 @@ func TestAQuestionWaitingIsSentToANewSubscriber(t *testing.T) {
 			if q.ID != id {
 				t.Errorf("sent %s, want the waiting %s", q.ID, id)
 			}
-			if err := a.Reply(q.ID, agenttool.Answer{Action: agenttool.ActionAccept}); err != nil {
+			if err := a.Reply(context.Background(), q.ID, agenttool.Answer{Action: agenttool.ActionAccept}); err != nil {
 				t.Errorf("Reply: %v", err)
 			}
 		}
@@ -258,7 +258,7 @@ func TestAbortClosesAWaitingQuestion(t *testing.T) {
 	if !errors.Is(toolErr, context.Canceled) {
 		t.Errorf("the tool's elicitor returned %v, want the context's error", toolErr)
 	}
-	if err := a.Reply(id, agenttool.Answer{Action: agenttool.ActionAccept}); !errors.Is(err, ErrNoQuestion) {
+	if err := a.Reply(context.Background(), id, agenttool.Answer{Action: agenttool.ActionAccept}); !errors.Is(err, ErrNoQuestion) {
 		t.Errorf("Reply after the abort = %v, want ErrNoQuestion", err)
 	}
 }
@@ -267,15 +267,15 @@ func TestAbortClosesAWaitingQuestion(t *testing.T) {
 // and of a second answer to one question.
 func TestReplyToNoQuestion(t *testing.T) {
 	a := New(Config{Model: &echo.Adapter{}})
-	if err := a.Reply("question_x", agenttool.Answer{Action: agenttool.ActionAccept}); !errors.Is(err, ErrNoQuestion) {
+	if err := a.Reply(context.Background(), "question_x", agenttool.Answer{Action: agenttool.ActionAccept}); !errors.Is(err, ErrNoQuestion) {
 		t.Errorf("Reply = %v, want ErrNoQuestion", err)
 	}
 	a = questionAgent(t, Config{Model: &echo.Adapter{}, MaxTurns: 1, Tools: []agenttool.Tool{asker("ask")}})
 	var second error
 	a.Subscribe(func(_ context.Context, ev Event) error {
 		if q, ok := ev.(*Question); ok {
-			_ = a.Reply(q.ID, agenttool.Answer{Action: agenttool.ActionAccept})
-			second = a.Reply(q.ID, agenttool.Answer{Action: agenttool.ActionDecline})
+			_ = a.Reply(context.Background(), q.ID, agenttool.Answer{Action: agenttool.ActionAccept})
+			second = a.Reply(context.Background(), q.ID, agenttool.Answer{Action: agenttool.ActionDecline})
 		}
 		return nil
 	})
@@ -376,5 +376,46 @@ func TestPendingCarriesTheDeferringDecision(t *testing.T) {
 		if p.Decision != nil {
 			t.Errorf("a %s call carries a decision: %+v", p.Reason, p.Decision)
 		}
+	}
+}
+
+// TestAReplyNamesWhoAnswered pins #240: the trigger on Reply's context
+// names who answered, on QuestionClosed and to an elicitor that wraps
+// the agent's under ContextWithAnswerer, as a recorder does.
+func TestAReplyNamesWhoAnswered(t *testing.T) {
+	a := New(Config{Model: &echo.Adapter{}, MaxTurns: 1, Tools: []agenttool.Tool{asker("ask")}})
+	var heard Trigger
+	inner := a.QuestionElicitor()
+	cfg := a.Config()
+	cfg.ToolElicitor = func(ctx context.Context, q agenttool.Elicitation) (agenttool.Answer, error) {
+		ctx, who := ContextWithAnswerer(ctx)
+		ans, err := inner(ctx, q)
+		heard = who()
+		return ans, err
+	}
+	if err := a.SetConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	bob := Trigger{Kind: "control", Ref: "bob"}
+	var closed *QuestionClosed
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		switch e := ev.(type) {
+		case *Question:
+			if err := a.Reply(ContextWithTrigger(context.Background(), bob), e.ID, agenttool.Answer{Action: agenttool.ActionAccept}); err != nil {
+				t.Error(err)
+			}
+		case *QuestionClosed:
+			closed = e
+		}
+		return nil
+	})
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("x")); err != nil {
+		t.Fatal(err)
+	}
+	if closed == nil || closed.By.Ref != "bob" || closed.By.Kind != "control" {
+		t.Errorf("question_closed = %+v, want by %+v", closed, bob)
+	}
+	if heard.Ref != "bob" || heard.Kind != "control" {
+		t.Errorf("the wrapping elicitor heard %+v, want %+v", heard, bob)
 	}
 }
