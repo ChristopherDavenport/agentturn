@@ -2252,3 +2252,53 @@ func TestEnvSurvivesACompaction(t *testing.T) {
 		})
 	}
 }
+
+// TestAnAnswerNamesWhoGaveIt pins the recorder half of agentturn#240:
+// an answer given through Agent.Reply with a trigger on its context,
+// as front/control gives one for its principal, is written with that
+// trigger as the answer entry's source, beside by.
+func TestAnAnswerNamesWhoGaveIt(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool := agenttool.New("prune", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		ask, _ := agenttool.ElicitorFrom(ctx)
+		if _, err := ask(ctx, agenttool.Elicitation{Message: "delete the branch?"}); err != nil {
+			return "", err
+		}
+		return "pruned", nil
+	})
+	a := agentturn.New(agentturn.Config{Model: allCalls{}, MaxTurns: 1, Tools: []agenttool.Tool{tool}})
+	cfg := a.Config()
+	cfg.ToolElicitor = rec.Elicitor(agentsession.ByHuman, a.QuestionElicitor())
+	if err := a.SetConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Attach(a)()
+	bob := agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "control", Ref: "bob"})
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if q, ok := ev.(*agentturn.Question); ok {
+			return a.Reply(bob, q.ID, agenttool.Answer{Action: agenttool.ActionAccept})
+		}
+		return nil
+	})
+	if _, err := a.Prompt(ctx, openresponses.UserText("go")); err != nil {
+		t.Fatal(err)
+	}
+	var answer *Elicitation
+	for _, c := range customs(s, ElicitationNS) {
+		var e Elicitation
+		if err := json.Unmarshal(c.Data, &e); err != nil {
+			t.Fatal(err)
+		}
+		if e.Phase == ElicitationAnswer {
+			answer = &e
+		}
+	}
+	if answer == nil || answer.By != agentsession.ByHuman || answer.Source == nil || answer.Source.Kind != "control" || answer.Source.Ref != "bob" {
+		t.Fatalf("answer entry = %+v, want by human from control:bob", answer)
+	}
+}

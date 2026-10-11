@@ -645,6 +645,11 @@ type Elicitation struct {
 	// By is who answered, in the session format's terms; empty when
 	// nobody was asked or the asking failed.
 	By string `json:"by,omitempty"`
+	// Source, on the answer entry, names who answered when the answer
+	// came through agentturn's Agent.Reply with a trigger on its
+	// context: front/control's principal, as a run start's trigger
+	// names who prompted. nil when the answer named nobody.
+	Source *agentsession.Trigger `json:"source,omitempty"`
 	// Error is the harness's failure to ask, which the tool sees as an
 	// error rather than an answer, on the answer entry.
 	Error string `json:"error,omitempty"`
@@ -2576,7 +2581,10 @@ func (r *Recorder) RecordFunc() agenttool.RecordFunc {
 // asked: the question, with phase ask, before it is put to fn, and its
 // answer, with phase answer and asked naming the first entry, before
 // the answer returns to the tool; by names who answers, in the session
-// format's terms. A question the loop asks about a nested call, or a
+// format's terms. When fn is an agent's QuestionElicitor answered
+// through Reply with a trigger on its context, such as front/control's
+// principal, the answer entry names it as its Source
+// (agentturn.ContextWithAnswerer). A question the loop asks about a nested call, or a
 // front about a model's call, carries that call's ID, tool and parent
 // on both entries, from the agentturn.AskedCall on the context, so
 // consecutive questions are tied to the calls they are about by more
@@ -2622,9 +2630,11 @@ func (r *Recorder) Elicitor(by string, fn agenttool.Elicitor) agenttool.Elicitor
 		}
 		ans := agenttool.Answer{Action: agenttool.ActionCancel}
 		who := ""
+		var source agentturn.Trigger
 		if fn != nil {
-			ans, err = fn(ctx, q)
-			who = by
+			actx, answerer := agentturn.ContextWithAnswerer(ctx)
+			ans, err = fn(actx, q)
+			who, source = by, answerer()
 		}
 		data.Phase, data.Asked = ElicitationAnswer, asked
 		if err != nil {
@@ -2632,6 +2642,12 @@ func (r *Recorder) Elicitor(by string, fn agenttool.Elicitor) agenttool.Elicitor
 			data.Error = err.Error()
 		} else {
 			data.Action, data.Content, data.Note, data.By = string(ans.Action), ans.Content, ans.Note, who
+			// Who answered, when the answer named them, is kept
+			// beside the answer; a trigger that cannot be written is
+			// left out rather than losing the answer.
+			if t, terr := sessionTrigger(source); terr == nil {
+				data.Source = t
+			}
 		}
 		if _, werr := r.annotate(ctx, ElicitationNS, data, data.Call); werr != nil {
 			return agenttool.Answer{}, errors.Join(err, werr)

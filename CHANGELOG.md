@@ -97,6 +97,10 @@ versions may break the API.
 
 ## v0.0.23 - 2026-10-11
 
+- Added: agentturn/session's `Recorder.Elicitor` writes who answered
+  on the answer entry, as `Elicitation.Source`, when the answer came
+  through `Agent.Reply` with a trigger on its context, such as
+  `front/control`'s principal. (#240)
 - Fixed: the recorder writes a hold decision's `Subject` and `Held` as
   the members `agentturn:subject` and `agentturn:held`
   (`session.SubjectMember`, `session.HeldMember`), and `session.Pending`
