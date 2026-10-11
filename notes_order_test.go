@@ -163,3 +163,37 @@ func TestNotesAreHeldBeforeTheirOutputs(t *testing.T) {
 		}
 	})
 }
+
+// TestANoteWhoseOutputNeverWentInIsNotHeld pins that a Resume's note,
+// reported held before its output, is let go again when the output
+// fails to go in: the Resume leaves the notes as they were.
+func TestANoteWhoseOutputNeverWentInIsNotHeld(t *testing.T) {
+	deferAll := func(context.Context, ToolCallInfo) (*ToolDecision, error) {
+		return &ToolDecision{Action: Defer, Reason: "ask"}, nil
+	}
+	a := New(Config{Model: &twoCalls{}, Tools: abTools(), BeforeToolCall: deferAll, MaxTurns: 1})
+	end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+	if err != nil || len(end.Pending) != 2 {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	first := end.Pending[0].Call.CallID
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if e, ok := ev.(*ItemStart); ok {
+			if o, ok := e.Item.(*openresponses.FunctionCallOutput); ok && o.CallID == first {
+				return errors.New("disk full")
+			}
+		}
+		return nil
+	})
+	end, err = a.Resume(context.Background(),
+		Output(openresponses.NewFunctionCallOutput(first, "no")).WithNote("use ci/ instead"),
+		Output(openresponses.NewFunctionCallOutput(end.Pending[1].Call.CallID, "no")))
+	if err == nil {
+		t.Fatal("the resume did not fail")
+	}
+	for _, p := range end.Pending {
+		if len(p.Notes) != 0 {
+			t.Errorf("pending %s holds %+v, want no note: its output never went in", p.Call.CallID, p.Notes)
+		}
+	}
+}
