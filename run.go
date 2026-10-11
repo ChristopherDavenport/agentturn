@@ -533,6 +533,26 @@ type runner struct {
 	// sent.
 	resuming bool
 
+	// notes are the notes waiting on the outputs of the batch they
+	// belong to, in the order they are appended. A note is appended
+	// once every call of its batch has its output, so nothing comes
+	// between a model's calls and their outputs: after the batch's
+	// outputs when the batch completes, and otherwise, when a call is
+	// deferred or the batch is cut, after the answers of the run that
+	// completes it. A Resume's notes and those an earlier run left join
+	// here before anything runs.
+	notes []heldNote
+	// noteMu guards roots and callNotes, which a nested call writes
+	// from the goroutine of the tool that made it.
+	noteMu sync.Mutex
+	// roots maps a nested call to the call of the batch it was made
+	// under, whatever depth it was made at.
+	roots map[string]string
+	// callNotes holds, by the batch's call, the notes said under it:
+	// an accept's note on a nested call it made, and what the user
+	// said answering a question its tool asked.
+	callNotes map[string]openresponses.Items
+
 	// hookMu serialises the tool hooks. A nested call runs on the
 	// goroutine of the tool that made it, so without it two tools of
 	// one batch would enter BeforeToolCall at once, and a nested
@@ -696,6 +716,105 @@ type approval struct {
 	key    string
 	decide bool
 }
+
+// heldNote is a note waiting on the outputs of its batch: the item, how
+// it arrives and the trigger its item_end carries.
+type heldNote struct {
+	item       openresponses.Item
+	mode       InputMode
+	endTrigger Trigger
+}
+
+// holdNote queues item, arriving as mode, behind the open batch.
+func (r *runner) holdNote(item openresponses.Item, mode InputMode, endTrigger Trigger) {
+	r.notes = append(r.notes, heldNote{item: item, mode: mode, endTrigger: endTrigger})
+}
+
+// holdNotesOf queues the notes of a call whose output is in: the
+// decision's, then those said under it while it ran.
+func (r *runner) holdNotesOf(p *callState) {
+	if p.note != nil {
+		r.holdNote(p.note, InputTool, Trigger{})
+	}
+	r.noteMu.Lock()
+	said := r.callNotes[p.call.CallID]
+	delete(r.callNotes, p.call.CallID)
+	r.noteMu.Unlock()
+	for _, item := range said {
+		r.holdNote(item, InputTool, Trigger{})
+	}
+}
+
+// flushNotes appends the notes waiting on a batch that is now complete.
+func (r *runner) flushNotes() error {
+	notes := r.notes
+	r.notes = nil
+	for _, n := range notes {
+		if err := r.appendOne(n.item, n.mode, Trigger{}, n.endTrigger); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// adopt records that the nested call id was made under the call
+// parent, so a note said under it waits on the batch call at its root.
+func (r *runner) adopt(id, parent string) {
+	if parent == "" {
+		return
+	}
+	r.noteMu.Lock()
+	defer r.noteMu.Unlock()
+	if root, ok := r.roots[parent]; ok {
+		parent = root
+	}
+	if r.roots == nil {
+		r.roots = map[string]string{}
+	}
+	r.roots[id] = parent
+}
+
+// sayUnder queues a note said under the call id, a call of the batch
+// or one nested under it, behind that batch call's output.
+func (r *runner) sayUnder(id string, note openresponses.Item) {
+	if id == "" {
+		return
+	}
+	r.noteMu.Lock()
+	defer r.noteMu.Unlock()
+	if root, ok := r.roots[id]; ok {
+		id = root
+	}
+	if r.callNotes == nil {
+		r.callNotes = map[string]openresponses.Items{}
+	}
+	r.callNotes[id] = append(r.callNotes[id], note)
+}
+
+// noteElicitor wraps the configuration's elicitor so that what the user
+// says answering a tool's own question reaches the model as an accept's
+// note on a call does, after the outputs of the call's batch: the tool
+// may not pass it on. A question [Ask] puts about a call carries its
+// note on the decision instead.
+func (r *runner) noteElicitor(elicit agenttool.Elicitor) agenttool.Elicitor {
+	return func(ctx context.Context, q agenttool.Elicitation) (agenttool.Answer, error) {
+		ans, err := elicit(ctx, q)
+		if err != nil || ans.Note == "" {
+			return ans, err
+		}
+		if _, asked := AskedCallFrom(ctx); asked {
+			return ans, err
+		}
+		if call, ok := agenttool.CallFrom(ctx); ok {
+			r.sayUnder(call.ID, openresponses.DeveloperText(userSaid(ans.Note)))
+		}
+		return ans, err
+	}
+}
+
+// userSaid is how a note the user gave with an answer reads to the
+// model.
+func userSaid(note string) string { return "The user said: " + note }
 
 // run drives the loop and returns the RunEnd. terminate says the caller
 // asked the run to end once the answers are in, without a model call.
@@ -869,6 +988,14 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 	}
 	if err := r.appendWith(prompts[:answers], InputResume, Trigger{}, onAnswers); err != nil {
 		return err
+	}
+	if len(approved) == 0 {
+		// Every pending call is answered, so the notes waiting on
+		// them, and a Resume's, follow the answers; with approved calls
+		// they wait for that batch's outputs too.
+		if err := r.flushNotes(); err != nil {
+			return err
+		}
 	}
 	if err := r.appendWith(prompts[answers:], rest, onRest, trigger); err != nil {
 		return err
@@ -1838,7 +1965,7 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 func (r *runner) toolContext(ctx context.Context, tools agenttool.Set) context.Context {
 	ctx = ContextWithTranscript(ctx, append(Transcript(nil), r.transcript...))
 	if r.cfg.ToolElicitor != nil {
-		ctx = agenttool.ContextWithElicitor(ctx, r.cfg.ToolElicitor)
+		ctx = agenttool.ContextWithElicitor(ctx, r.noteElicitor(r.cfg.ToolElicitor))
 	}
 	if r.steered != nil {
 		ctx = context.WithValue(ctx, steeredKey{}, r.steered())
@@ -1953,8 +2080,20 @@ func (r *runner) appendFinished(ctx context.Context, batch []*callState) error {
 		}
 		p.appended = true
 		outputs = append(outputs, &openresponses.FunctionCallOutput{CallID: p.call.CallID, Output: p.result.Output})
+		r.holdNotesOf(p)
 	}
-	return r.appendItems(outputs, InputTool)
+	if err := r.appendItems(outputs, InputTool); err != nil {
+		return err
+	}
+	// The notes wait for the cut calls' outputs, which the run that
+	// answers them appends; a batch every call of which finished is
+	// complete.
+	for _, p := range batch {
+		if p == nil || !p.appended {
+			return nil
+		}
+	}
+	return r.flushNotes()
 }
 
 // execute runs the calls preflight did not settle and settles each as
@@ -2156,12 +2295,14 @@ func (r *runner) executor(find func(agenttool.Job) *callState) agenttool.Executo
 	}
 }
 
-// collect appends the outputs in the model's order, then the notes the
-// decisions attached, and returns the results with the deferred calls.
+// collect appends the outputs in the model's order, then, when no call
+// of the batch was deferred, the notes waiting on it: those a Resume
+// brought, then those of each call in the model's order. A deferred
+// call's output comes later, so the notes wait for it. It returns the
+// results with the deferred calls.
 func (r *runner) collect(batch []*callState) ([]agenttool.Result, []*openresponses.FunctionCall, error) {
 	results := make([]agenttool.Result, len(batch))
 	outputs := make(openresponses.Items, 0, len(batch))
-	var notes openresponses.Items
 	var deferred []*openresponses.FunctionCall
 	for i, p := range batch {
 		results[i] = p.result
@@ -2171,12 +2312,15 @@ func (r *runner) collect(batch []*callState) ([]agenttool.Result, []*openrespons
 		}
 		p.appended = true
 		outputs = append(outputs, &openresponses.FunctionCallOutput{CallID: p.call.CallID, Output: p.result.Output})
-		if p.note != nil {
-			notes = append(notes, p.note)
-		}
+		r.holdNotesOf(p)
 	}
-	if err := r.appendItems(append(outputs, notes...), InputTool); err != nil {
+	if err := r.appendItems(outputs, InputTool); err != nil {
 		return nil, nil, err
+	}
+	if len(deferred) == 0 {
+		if err := r.flushNotes(); err != nil {
+			return nil, nil, err
+		}
 	}
 	return results, deferred, nil
 }
@@ -2472,6 +2616,7 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 	call := &openresponses.FunctionCall{CallID: openresponses.NewID("call"), Name: name, Arguments: string(args)}
 	p := r.prepare(tools, turn, call, args)
 	p.parent = parent
+	r.adopt(call.CallID, parent)
 	var decision *ToolDecision
 	if r.cfg.BeforeToolCall != nil {
 		var err error
@@ -2504,6 +2649,13 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 				p.blocked = true
 				p.err = errors.New(reason)
 				p.reason = reason
+			case Allow:
+				// The note, an accept's among them, reaches the model
+				// as a model call's does: after the outputs of the
+				// batch the invoking call belongs to.
+				if decision.Note != "" {
+					r.sayUnder(parent, openresponses.DeveloperText(decision.Note))
+				}
 			}
 		}
 	}

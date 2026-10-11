@@ -195,7 +195,12 @@ type Config struct {
 	// session recorder wraps one with session.Recorder.Elicitor so the
 	// question and the answer are written under the call. The loop asks
 	// it too, with [Ask], about a nested call the hook defers, with the
-	// call on its context for [AskedCallFrom]. nil leaves an
+	// call on its context for [AskedCallFrom]. What the user says with
+	// an answer to a tool's own question ([agenttool.Answer.Note])
+	// reaches the model too, whatever the tool does with it: as "The
+	// user said: <note>", a developer message after the outputs of the
+	// batch the asking call belongs to, as a decision's Note does.
+	// nil leaves an
 	// elicitor already on the run's context in place, and a tool with
 	// none asks nobody: an agent run from inside a tool served by
 	// agenttool's mcpserver, whose call context carries the elicitor
@@ -448,10 +453,14 @@ type ToolDecision struct {
 	// nobody for the approval of a held call, where [Answer.By] is what
 	// says who answered. The loop does not use it.
 	By string
-	// Note is text the model sees with the result: it is appended after
-	// the batch's outputs as a developer message, so the model reads the
-	// result and the note together, in that order, in the same turn. It
-	// applies to an allowed call; a blocked call carries its Reason.
+	// Note is text the model sees with the result: it is appended as a
+	// developer message after every output of the batch the call belongs
+	// to, so the model reads the result and the note together, in that
+	// order, in the same turn. A nested call's note follows the batch of
+	// the call that made it; a batch with a deferred call keeps its
+	// notes until the run that answers that call has appended its
+	// output. It applies to an allowed call; a blocked call carries its
+	// Reason.
 	Note string
 	// Held, on a Defer, says the call is deferred only because another
 	// call of its batch waits on someone: nobody is asked about it, and

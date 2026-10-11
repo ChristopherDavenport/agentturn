@@ -21,6 +21,24 @@ versions may break the API.
   carries for it. `front/control` carries it, so `State` over the wire
   says the call was waiting on a person. agentturn/session's `Pending`
   sets it from the record in the release after this one. (#241)
+- Changed: one rule for a note. Whatever a person said reaches the
+  model after every output of the batch it belongs to, and nothing
+  comes between a model's calls and their outputs:
+  - An accept's note on a nested call, which `invoke` dropped, follows
+    the batch of the call that made it, at any depth (#245).
+  - A Resume's notes follow every output of the Resume, the approved
+    calls' included, where an output answer's note used to come before
+    the approved calls' outputs and split them from their calls, which
+    Chat Completions and Messages refuse (#239).
+  - What the user says answering a tool's own question reaches the
+    model as `The user said: <note>` after its batch, whatever the
+    tool does with it.
+  - A batch with a deferred call, or one cut by an abort, keeps its
+    notes until the run that answers the waiting calls has appended
+    their outputs; `SetTranscript` drops them with the calls they
+    waited on. The agent holds them, not the record.
+  The docs of `ToolDecision.Note`, `Answer.Note`, `Resume`, `Ask` and
+  `Config.ToolElicitor` say so.
 
 ## v0.0.22 - 2026-10-10
 

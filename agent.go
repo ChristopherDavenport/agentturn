@@ -114,6 +114,10 @@ type Agent struct {
 	runCancel context.CancelCauseFunc
 	idle      chan struct{}
 	pending   []PendingCall
+	// notes are the notes a run left waiting on its pending calls'
+	// outputs, which the run that answers them appends after those
+	// outputs. Only this agent holds them: a record holds none.
+	notes []heldNote
 	// seeded is what WithPending gave, applied to the pending calls
 	// once every option has run.
 	seeded []PendingCall
@@ -307,6 +311,8 @@ func (a *Agent) SetTranscript(t Transcript) error {
 	a.transcript = append(Transcript(nil), t...)
 	a.reasoning = a.reasoning.retain(a.transcript)
 	a.pending = pendingCalls(unansweredCalls(a.transcript), PendingUnknown)
+	// The notes waited on the calls of the transcript replaced.
+	a.notes = nil
 	mergePending(a.pending, known)
 	return nil
 }
@@ -416,7 +422,7 @@ func (a *Agent) Prompt(ctx context.Context, items ...openresponses.Item) (*RunEn
 	if len(items) == 0 {
 		return nil, ErrNoPrompt
 	}
-	return a.run(ctx, items, nil, false, false)
+	return a.run(ctx, items, nil, nil, false, false)
 }
 
 // Continue runs from the transcript as it stands, which must satisfy
@@ -432,7 +438,7 @@ func (a *Agent) Continue(ctx context.Context) (*RunEnd, error) {
 	if !ok {
 		return nil, ErrCannotContinue
 	}
-	return a.run(ctx, nil, nil, false, false)
+	return a.run(ctx, nil, nil, nil, false, false)
 }
 
 // Answer resolves one pending call for [Agent.Resume]: an output the
@@ -450,9 +456,10 @@ type Answer struct {
 	// as ToolDecision.Args does. nil keeps the call's own.
 	Args json.RawMessage
 	// Note is what the user said when answering: it is appended as a
-	// user message after the outputs of every answer of the Resume, so
-	// the model reads the result and the note together, in that order,
-	// in the same turn.
+	// user message after every output of the Resume, those of the
+	// answers and of the approved calls alike, so the model reads the
+	// results and the note together, in that order, in the same turn,
+	// and nothing comes between the calls and their outputs.
 	Note string
 	// Terminate ends the run with ReasonStopped and StopRefused once
 	// every answer is in, without calling the model, for a refusal that
@@ -638,8 +645,7 @@ func (a Answer) WithRunAgain() Answer {
 // or refused without running: those take an output, and an approval
 // of one returns [ErrCallAnswered].
 //
-// The outputs are appended with their item events first, then the
-// notes of the answers that carry one, as user messages. The approved
+// The outputs are appended with their item events first. The approved
 // calls then run as one batch as the loop runs any batch, with
 // BeforeToolCall skipped for a call the approval decides, one held or
 // one that may have run. A call pending as [PendingUndispatched] was
@@ -648,9 +654,14 @@ func (a Answer) WithRunAgain() Answer {
 // would in a run, and a call it defers leaves the run ending with
 // [ReasonInputRequired] once the batch is in. tool_start, tool_update
 // and tool_end are emitted with Turn 0, Sequential and
-// MaxParallelTools apply, AfterToolCall runs, the outputs are appended
-// in the calls' transcript order and their notes after them, and
-// anything steered in meanwhile follows. A batch whose results set
+// MaxParallelTools apply, AfterToolCall runs, and the outputs are
+// appended in the calls' transcript order. Only then come the notes,
+// so nothing splits the calls from their outputs: those a run left
+// waiting on the calls this Resume answers, then the answers' notes as
+// user messages in the order given, then the approved calls' notes;
+// with nothing approved they follow the answers' outputs. A call the
+// batch defers keeps them waiting for the run that answers it. Anything
+// steered in meanwhile follows. A batch whose results set
 // Terminate ends the run with ReasonStopped without calling the model,
 // and so does any answer built with [Refuse]. Otherwise the model is
 // called and the run returns as [Agent.Prompt] does. With nothing
@@ -731,7 +742,7 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 	// taken from ride on the run's context, where a recorder writing
 	// the decision and the output for it finds them.
 	ctx = ContextWithOrigins(ContextWithReasons(ContextWithDeciders(ctx, deciders), reasons), origins)
-	return a.run(ctx, append(outputs, notes...), approved, true, terminate)
+	return a.run(ctx, outputs, notes, approved, true, terminate)
 }
 
 // mayRunAgain applies agenttool's rule for running a call again to an
@@ -830,9 +841,9 @@ func answersPending(pending []PendingCall, prompts openresponses.Items) error {
 	return nil
 }
 
-func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved []approval, resuming, terminate bool) (*RunEnd, error) {
+func (a *Agent) run(ctx context.Context, prompts, notes openresponses.Items, approved []approval, resuming, terminate bool) (*RunEnd, error) {
 	a.mu.Lock()
-	run, err := a.startUnlock(ctx, prompts, approved, resuming, terminate)
+	run, err := a.startUnlock(ctx, prompts, notes, approved, resuming, terminate)
 	if err != nil {
 		return nil, err
 	}
@@ -843,15 +854,15 @@ func (a *Agent) run(ctx context.Context, prompts openresponses.Items, approved [
 // it however start returns: a panic there, from a tool the
 // configuration holds, leaves the agent usable by a caller that
 // recovers it.
-func (a *Agent) startUnlock(ctx context.Context, prompts openresponses.Items, approved []approval, resuming, terminate bool) (func() (*RunEnd, error), error) {
+func (a *Agent) startUnlock(ctx context.Context, prompts, notes openresponses.Items, approved []approval, resuming, terminate bool) (func() (*RunEnd, error), error) {
 	defer a.mu.Unlock()
-	return a.start(ctx, prompts, approved, resuming, terminate)
+	return a.start(ctx, prompts, notes, approved, resuming, terminate)
 }
 
 // start begins a run with a.mu held, so the check that the agent is
 // idle and the mark that it is running are one step, and returns the
 // function that drives the run once the lock is released.
-func (a *Agent) start(ctx context.Context, prompts openresponses.Items, approved []approval, resuming, terminate bool) (func() (*RunEnd, error), error) {
+func (a *Agent) start(ctx context.Context, prompts, notes openresponses.Items, approved []approval, resuming, terminate bool) (func() (*RunEnd, error), error) {
 	if err := a.cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -870,6 +881,14 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, approved
 	}
 	prior := a.pending
 	a.pending = nil
+	// The notes an earlier run left waiting on the calls this run
+	// answers go first, then the Resume's own, each as a user message
+	// the run's trigger names.
+	held := a.notes
+	a.notes = nil
+	for _, n := range notes {
+		held = append(held, heldNote{item: n, mode: InputResume, endTrigger: TriggerFromContext(ctx)})
+	}
 	// The context a tool's background work derives from: the prompt's
 	// values, cancelled by an abort of this run or by the prompt's own
 	// cancellation, and not by the run ending.
@@ -909,11 +928,16 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, approved
 			reasoning:  a.reasoning.merged(reasoningFromContext(ctx)),
 			runID:      runID,
 			resuming:   resuming,
+			notes:      held,
 		}
 		end := r.run(ctx, prompts, approved, terminate)
 		cancel(nil)
 
 		a.mu.Lock()
+		if len(end.Pending) > 0 {
+			// What the batch's notes wait on is still pending.
+			a.notes = r.notes
+		}
 		a.reasoning = r.reasoning.retain(a.transcript)
 		a.running = false
 		a.closing = false
@@ -1284,7 +1308,7 @@ func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joine
 		a.mu.Unlock()
 		return false, nil, ErrCannotContinue
 	}
-	run, err := a.startUnlock(ctx, nil, nil, false, false)
+	run, err := a.startUnlock(ctx, nil, nil, nil, false, false)
 	if err != nil {
 		return false, nil, err
 	}
