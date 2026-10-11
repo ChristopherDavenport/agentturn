@@ -5,6 +5,19 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Fixed: every note is reported held (`notes_held`) before the first
+  output or item it waits on is appended, and reported gone only after
+  its own item is, so a recorder that keeps the last report holds each
+  note from before its outputs until after its item, and a process that
+  dies in between loses nothing. v0.0.24 appended a Resume's output
+  before reporting its note, and reported nothing at all for a Resume
+  with no approvals or for a batch that completed, whose notes went
+  straight from the hook, the approval, a released call or a question
+  under the call to the transcript. A Resume's note whose output then
+  fails to go in is not kept held, as before.
+
 ## v0.0.24 - 2026-10-11
 
 - Changed, breaking: `PendingCall.Notes` is a `[]Note`, each note with

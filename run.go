@@ -1090,33 +1090,34 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 	if r.resuming {
 		onAnswers, rest, onRest = Trigger{}, InputResume, Trigger{}
 	}
-	// An answer's note waits from the moment its output is in: a Resume
-	// that failed before leaves it with its caller, whose retry says it
-	// once, and one that failed after keeps it.
+	// An answer's note is reported held before its output is appended,
+	// so a record never holds the output without the note: a process
+	// that dies between them keeps it. It stays held only if the output
+	// went in: a Resume that failed before leaves it with its caller,
+	// whose retry says it once, and one that failed after keeps it.
 	r.reported = slices.Clone(r.notes)
 	for _, item := range prompts[:answers] {
+		out, _ := Unhide(item)
+		id := out.(*openresponses.FunctionCallOutput).CallID
+		held := slices.Clone(r.notes)
+		for _, n := range r.resumeNotes {
+			if n.callID == id {
+				r.hold(Note{Item: n.item, Mode: InputResume, Trigger: trigger, CallID: id})
+			}
+		}
+		if err := r.notesHeld(); err != nil {
+			r.notes = held
+			return err
+		}
 		// The output is in once appendOne has put it in the transcript,
-		// whatever a subscriber of its item_end then says, and its note
-		// waits from then.
+		// whatever a subscriber of its item_end then says.
 		before := len(r.transcript)
 		err := r.appendWith(openresponses.Items{item}, InputResume, Trigger{}, onAnswers)
-		if len(r.transcript) > before {
-			out, _ := Unhide(item)
-			id := out.(*openresponses.FunctionCallOutput).CallID
-			for _, n := range r.resumeNotes {
-				if n.callID == id {
-					r.hold(Note{Item: n.item, Mode: InputResume, Trigger: trigger, CallID: id})
-				}
-			}
+		if len(r.transcript) == before {
+			r.notes = held
 		}
 		if err != nil {
 			return err
-		}
-		if len(approved) > 0 {
-			// The note waits on the approved batch: a recorder keeps it.
-			if err := r.notesHeld(); err != nil {
-				return err
-			}
 		}
 	}
 	if len(approved) == 0 {
@@ -2224,6 +2225,10 @@ func (r *runner) appendFinished(ctx context.Context, batch []*callState) error {
 			r.holdNotesOf(p)
 		}
 	}
+	// Reported held before the outputs they follow are appended.
+	if err := r.notesHeld(); err != nil {
+		return err
+	}
 	if err := r.appendItems(outputs, InputTool); err != nil {
 		return err
 	}
@@ -2232,7 +2237,7 @@ func (r *runner) appendFinished(ctx context.Context, batch []*callState) error {
 	// complete.
 	for _, p := range batch {
 		if p == nil || !p.appended {
-			return r.notesHeld()
+			return nil
 		}
 	}
 	return r.flushNotes()
@@ -2437,9 +2442,10 @@ func (r *runner) executor(find func(agenttool.Job) *callState) agenttool.Executo
 	}
 }
 
-// collect appends the outputs in the model's order, then, when no call
-// of the batch was deferred, the notes waiting on it: those a Resume
-// brought, then those of each call in the model's order. A deferred
+// collect reports the notes waiting on the batch as held, appends the
+// outputs in the model's order, then, when no call of the batch was
+// deferred, the notes: those a Resume brought, then those of each call
+// in the model's order. A deferred
 // call's output comes later, so the notes wait for it. It returns the
 // results with the deferred calls.
 func (r *runner) collect(batch []*callState) ([]agenttool.Result, []*openresponses.FunctionCall, error) {
@@ -2456,11 +2462,16 @@ func (r *runner) collect(batch []*callState) ([]agenttool.Result, []*openrespons
 		}
 		r.holdNotesOf(p)
 	}
+	// The notes are reported held before the outputs they follow are
+	// appended, so a record never holds an output without them.
+	if err := r.notesHeld(); err != nil {
+		return nil, nil, err
+	}
 	if err := r.appendItems(outputs, InputTool); err != nil {
 		return nil, nil, err
 	}
 	if len(deferred) > 0 {
-		return results, deferred, r.notesHeld()
+		return results, deferred, nil
 	}
 	if err := r.flushNotes(); err != nil {
 		return nil, nil, err
