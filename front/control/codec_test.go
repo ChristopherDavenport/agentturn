@@ -217,3 +217,23 @@ func TestUnmarshalEventRefusesWhatItCannotRead(t *testing.T) {
 		}
 	}
 }
+
+// TestNotesOfAnOlderServerDecode pins that a pending call's notes as
+// agentturn v0.0.23 sent them, bare items, decode as notes with only
+// their item known, and that a note with no item is left out.
+func TestNotesOfAnOlderServerDecode(t *testing.T) {
+	item, err := json.Marshal(openresponses.DeveloperText("a ran in the sandbox"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := `{"type":"run_end","run_id":"run_1","reason":"input_required","pending":[{"call":{"type":"function_call","call_id":"call_1","name":"upper","arguments":"{}"},"reason":"deferred","notes":[` +
+		string(item) + `,{"item":null,"mode":"tool"}]}]}`
+	ev, err := UnmarshalEvent([]byte(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	notes := ev.(*agentturn.RunEnd).Pending[0].Notes
+	if len(notes) != 1 || notes[0].Item.(*openresponses.Message).Text() != "a ran in the sandbox" || notes[0].Mode != "" {
+		t.Errorf("notes = %+v", notes)
+	}
+}

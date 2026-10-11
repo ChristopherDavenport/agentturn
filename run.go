@@ -542,6 +542,9 @@ type runner struct {
 	// completes it. A Resume's notes and those an earlier run left join
 	// here before anything runs.
 	notes []Note
+	// reported is the waiting set the last notes_held reported, or the
+	// one the run started with.
+	reported []Note
 	// resumeNotes are the notes of a Resume's output answers, each of
 	// which joins notes once its own output is appended.
 	resumeNotes []answerNote
@@ -792,6 +795,11 @@ func sameNoteItem(a, b openresponses.Item) bool {
 func (r *runner) flushNotes() error {
 	for len(r.notes) > 0 {
 		n := r.notes[0]
+		if n.Item == nil {
+			// Nothing to say; appendOne would append nothing.
+			r.notes = r.notes[1:]
+			continue
+		}
 		// A note is in the transcript once appendOne has put it
 		// there, whatever a subscriber of its item_end then says.
 		before := len(r.transcript)
@@ -803,15 +811,31 @@ func (r *runner) flushNotes() error {
 			return err
 		}
 	}
+	return r.notesHeld()
+}
+
+// notesHeld reports the waiting set when it differs from what was last
+// reported, emptied included, as a whole: a recorder that keeps the last
+// report holds exactly what waits.
+func (r *runner) notesHeld() error {
+	if slices.EqualFunc(r.notes, r.reported, sameNote) {
+		return nil
+	}
+	if err := r.emit(&NotesHeld{RunID: r.runID, Notes: slices.Clone(r.notes)}); err != nil {
+		return err
+	}
+	r.reported = slices.Clone(r.notes)
 	return nil
 }
 
-// notesHeld reports the waiting set while it is not empty.
-func (r *runner) notesHeld() error {
-	if len(r.notes) == 0 {
-		return nil
-	}
-	return r.emit(&NotesHeld{RunID: r.runID, Notes: slices.Clone(r.notes)})
+// sameNote reports whether two held notes are the same note.
+func sameNote(a, b Note) bool {
+	return a.CallID == b.CallID && a.Mode == b.Mode && a.Item == b.Item
+}
+
+// liveNotes is notes without the ones that say nothing, a nil item.
+func liveNotes(notes []Note) []Note {
+	return slices.DeleteFunc(slices.Clone(notes), func(n Note) bool { return n.Item == nil })
 }
 
 // adopt records that the nested call id was made under the call
@@ -848,15 +872,19 @@ func (r *runner) sayUnder(id string, note openresponses.Item) {
 	r.callNotes[id] = append(r.callNotes[id], note)
 }
 
+// noteSinkKey carries the runner whose hooks and tools run under a
+// context, for [Ask] to hold a person's note with the call it is about.
+type noteSinkKey struct{}
+
 // notedKey marks the context of a question whose note a run's
 // noteElicitor has taken, so an elicitor it wraps, another run's,
 // leaves it alone.
 type notedKey struct{}
 
 // noteElicitor wraps the elicitor a run's tools ask through so that what
-// the user says answering a tool's own question reaches the model as an
-// accept's note on a call does, after the outputs of the call's batch:
-// the tool may not pass it on. A question [Ask] puts about a call
+// the user says answering a tool's own question reaches the model, as a
+// user message after the outputs of the call's batch: the tool may not
+// pass it on. A question [Ask] puts about a call
 // carries its note on the decision instead. A run inside a tool, a
 // child agent's, wraps the elicitor it finds on its context, its
 // parent's, so the note goes to the run whose tool asked: the
@@ -875,7 +903,8 @@ func (r *runner) noteElicitor(elicit agenttool.Elicitor) agenttool.Elicitor {
 			return ans, err
 		}
 		if call, ok := agenttool.CallFrom(ctx); ok {
-			r.sayUnder(call.ID, openresponses.DeveloperText(userSaid(ans.Note)))
+			// A person's words, in the person's voice.
+			r.sayUnder(call.ID, openresponses.UserText(ans.Note))
 		}
 		return ans, err
 	}
@@ -1064,20 +1093,26 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 	// An answer's note waits from the moment its output is in: a Resume
 	// that failed before leaves it with its caller, whose retry says it
 	// once, and one that failed after keeps it.
+	r.reported = slices.Clone(r.notes)
 	for _, item := range prompts[:answers] {
-		if err := r.appendWith(openresponses.Items{item}, InputResume, Trigger{}, onAnswers); err != nil {
-			return err
-		}
-		out, _ := Unhide(item)
-		id := out.(*openresponses.FunctionCallOutput).CallID
-		held := false
-		for _, n := range r.resumeNotes {
-			if n.callID == id {
-				r.hold(Note{Item: n.item, Mode: InputResume, Trigger: trigger, CallID: id})
-				held = true
+		// The output is in once appendOne has put it in the transcript,
+		// whatever a subscriber of its item_end then says, and its note
+		// waits from then.
+		before := len(r.transcript)
+		err := r.appendWith(openresponses.Items{item}, InputResume, Trigger{}, onAnswers)
+		if len(r.transcript) > before {
+			out, _ := Unhide(item)
+			id := out.(*openresponses.FunctionCallOutput).CallID
+			for _, n := range r.resumeNotes {
+				if n.callID == id {
+					r.hold(Note{Item: n.item, Mode: InputResume, Trigger: trigger, CallID: id})
+				}
 			}
 		}
-		if held && len(approved) > 0 {
+		if err != nil {
+			return err
+		}
+		if len(approved) > 0 {
 			// The note waits on the approved batch: a recorder keeps it.
 			if err := r.notesHeld(); err != nil {
 				return err
@@ -2059,6 +2094,9 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 // runs another of the turn's tools through the loop.
 func (r *runner) toolContext(ctx context.Context, tools agenttool.Set) context.Context {
 	ctx = ContextWithTranscript(ctx, append(Transcript(nil), r.transcript...))
+	// [Ask] says a person's accept note through the run whose hook or
+	// tool asked.
+	ctx = context.WithValue(ctx, noteSinkKey{}, r)
 	if r.cfg.ToolElicitor != nil {
 		ctx = agenttool.ContextWithElicitor(ctx, r.noteElicitor(r.cfg.ToolElicitor))
 	} else if inherited, ok := agenttool.ElicitorFrom(ctx); ok {
@@ -2178,9 +2216,9 @@ func (r *runner) appendFinished(ctx context.Context, batch []*callState) error {
 		p.appended = true
 		outputs = append(outputs, &openresponses.FunctionCallOutput{CallID: p.call.CallID, Output: p.result.Output})
 	}
-	// The notes of the calls that reached their tools wait with the
-	// batch, a cut one's included: what was said about it still holds
-	// when the run that answers it appends its output.
+	// The notes of every call of the batch wait with the batch, a cut
+	// one's included: what was said about it still holds when the run
+	// that answers it appends its output.
 	for _, p := range batch {
 		if p != nil {
 			r.holdNotesOf(p)

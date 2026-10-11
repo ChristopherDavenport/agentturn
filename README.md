@@ -112,7 +112,7 @@ run, in order:
 | `turn_end` | the folded `Response` with usage, and the tool results |
 | `run_end` | the items added this run and the reason: done, stopped, input_required, aborted, error |
 | `question`, `question_closed` | a question a running call asks, through `Agent.QuestionElicitor`, and its close with the answer `Agent.Reply` gave, or none when the call gave up |
-| `notes_held` | the notes waiting on the pending calls' outputs, the whole set, each time it grows while calls wait |
+| `notes_held` | the notes waiting on the pending calls' outputs, the whole set, each time it changes, emptied included |
 
 `queued` belongs to no run. `Steer` and `FollowUp` accept an item and
 return; the goroutine that owns delivery reports it at its next event,

@@ -556,6 +556,22 @@ type wireNote struct {
 	CallID  string          `json:"call_id,omitempty"`
 }
 
+// UnmarshalJSON reads a note, or a bare item as agentturn v0.0.23 wrote
+// a pending call's notes, which is the note's item with nothing else
+// known of it.
+func (w *wireNote) UnmarshalJSON(data []byte) error {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	if _, ok := probe["item"]; !ok {
+		*w = wireNote{Item: append(json.RawMessage(nil), data...)}
+		return nil
+	}
+	type plain wireNote
+	return json.Unmarshal(data, (*plain)(w))
+}
+
 type wireNotesHeld struct {
 	Type  string     `json:"type"`
 	RunID string     `json:"run_id"`
@@ -580,6 +596,10 @@ func notesIn(in []wireNote) ([]agentturn.Note, error) {
 		item, err := itemIn(w.Item)
 		if err != nil {
 			return nil, err
+		}
+		if item == nil {
+			// A note that says nothing is no note.
+			continue
 		}
 		out = append(out, agentturn.Note{Item: item, Mode: agentturn.InputMode(w.Mode), Trigger: triggerIn(w.Trigger), CallID: w.CallID})
 	}
@@ -997,6 +1017,7 @@ type wireState struct {
 	Steered    json.RawMessage `json:"steered,omitempty"`
 	Queued     json.RawMessage `json:"queued,omitempty"`
 	Pending    []wirePending   `json:"pending,omitempty"`
+	Notes      []wireNote      `json:"notes,omitempty"`
 }
 
 func stateOut(s agentturn.State) (wireState, error) {
@@ -1011,7 +1032,10 @@ func stateOut(s agentturn.State) (wireState, error) {
 	if w.Queued, err = itemsOut(s.Queued); err != nil {
 		return w, err
 	}
-	w.Pending, err = pendingOut(s.Pending)
+	if w.Pending, err = pendingOut(s.Pending); err != nil {
+		return w, err
+	}
+	w.Notes, err = notesOut(s.Notes)
 	return w, err
 }
 
@@ -1027,7 +1051,10 @@ func stateIn(w wireState) (agentturn.State, error) {
 	if s.Queued, err = itemsIn(w.Queued); err != nil {
 		return s, err
 	}
-	s.Pending, err = pendingIn(w.Pending)
+	if s.Pending, err = pendingIn(w.Pending); err != nil {
+		return s, err
+	}
+	s.Notes, err = notesIn(w.Notes)
 	return s, err
 }
 

@@ -7,6 +7,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/ChristopherDavenport/agenttool"
+	"github.com/ChristopherDavenport/openresponses"
 )
 
 // AskedCall is a call the loop, or a front, is putting to the user
@@ -58,9 +59,12 @@ func ContextWithAskedCall(ctx context.Context, call AskedCall) context.Context {
 // Block with "declined when asked" and the reason on a decline. What
 // the user said with the answer ([agenttool.Answer.Note]) reaches the
 // model: on a decline it ends the reason the model is told, and on an
-// accept it is the decision's Note, which the loop appends after the
-// outputs of the batch the call belongs to, for a nested call the
-// batch of the call that made it, as for any allowed call. It
+// accept, under a run's hook or tool, it is a user message of its own,
+// in the person's voice, held with the call and appended after the
+// outputs of the batch it belongs to, for a nested call the batch of
+// the call that made it; the decision's Note stays the policy's,
+// a developer message. Outside a run there is nothing to hold it with,
+// and the decision's Note carries it as "The user said: <note>". It
 // returns nil and false when ctx carries no elicitor, the ask failed
 // or the answer was a cancel; the caller then still holds the
 // deferral it started with. call.Decision must be non-nil.
@@ -89,10 +93,17 @@ func Ask(ctx context.Context, call AskedCall) (*ToolDecision, bool) {
 			decided.Reason = "allowed when asked"
 		}
 		if ans.Note != "" {
-			if decided.Note != "" {
-				decided.Note += "\n"
+			if r, ok := ctx.Value(noteSinkKey{}).(*runner); ok {
+				// The person's words are theirs, a user message held
+				// with the call, apart from the decision's own Note.
+				r.sayUnder(call.CallID, openresponses.UserText(ans.Note))
+			} else {
+				// No run to hold it with: the decision carries it.
+				if decided.Note != "" {
+					decided.Note += "\n"
+				}
+				decided.Note += userSaid(ans.Note)
 			}
-			decided.Note += userSaid(ans.Note)
 		}
 	case agenttool.ActionDecline:
 		decided.Action = Block

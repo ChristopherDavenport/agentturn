@@ -228,6 +228,7 @@ func mergePending(pending, known []PendingCall) {
 			continue
 		}
 		q.Call = p.Call
+		q.Notes = liveNotes(q.Notes)
 		pending[i] = q
 	}
 }
@@ -237,6 +238,9 @@ func mergePending(pending, known []PendingCall) {
 // is: the calls pending at once are of one batch, and its notes wait
 // while any of them does.
 func keepNotes(pending, known []PendingCall) {
+	for i := range pending {
+		pending[i].Notes = liveNotes(pending[i].Notes)
+	}
 	var notes []Note
 	ids := map[string]bool{}
 	for _, p := range known {
@@ -255,6 +259,27 @@ func keepNotes(pending, known []PendingCall) {
 	if last >= 0 && len(notes) > 0 {
 		pending[last].Notes = notes
 	}
+}
+
+// keepOwed keeps the owed notes whose call's output is in t: they
+// follow that output, and one whose output is gone goes with it.
+func keepOwed(notes []Note, t Transcript) []Note {
+	if len(notes) == 0 {
+		return nil
+	}
+	answered := map[string]bool{}
+	for _, item := range t {
+		if out, ok := item.(*openresponses.FunctionCallOutput); ok {
+			answered[out.CallID] = true
+		}
+	}
+	var out []Note
+	for _, n := range notes {
+		if n.CallID != "" && answered[n.CallID] {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 func closedChan() chan struct{} {
@@ -315,8 +340,10 @@ func (a *Agent) SetConfig(cfg Config) error {
 // may have run, until [Agent.SetPending] says what a record knows of
 // it. The notes held for the calls pending before
 // ([PendingCall.Notes]) stay while one of those calls is still pending,
-// on the last of them, and are dropped when none is, as are the notes a
-// failed run owed ([RunEnd.Notes]). Whatever the old
+// on the last of them, and are dropped when none is. The notes a failed
+// run owed after outputs already in ([RunEnd.Notes]) stay while the
+// output of the call each is about is in the new transcript. Whatever
+// the old
 // transcript was waiting on and the new one does not hold is
 // forgotten, and whatever the new one is waiting on must be answered
 // through [Agent.Resume]. Queued Steer and FollowUp items are
@@ -345,7 +372,7 @@ func (a *Agent) SetTranscript(t Transcript) error {
 	// those calls is still pending, on the last of them; those owed
 	// after the old transcript's outputs go with it.
 	keepNotes(a.pending, known)
-	a.notes = nil
+	a.notes = keepOwed(a.notes, a.transcript)
 	return nil
 }
 
@@ -413,6 +440,10 @@ type State struct {
 	// transcript. Continue refuses until Resume has answered them, and
 	// Prompt unless it opens with their outputs.
 	Pending []PendingCall
+	// Notes are the notes the last run owed after outputs already in the
+	// transcript and could not append ([RunEnd.Notes]), which the next
+	// run appends first.
+	Notes []Note
 }
 
 // State returns a snapshot.
@@ -429,7 +460,34 @@ func (a *Agent) State() State {
 		Steered:    queuedItems(a.steer),
 		Queued:     queuedItems(a.followUp),
 		Pending:    append([]PendingCall(nil), a.pending...),
+		Notes:      slices.Clone(a.notes),
 	}
+}
+
+// WithNotes seeds the notes a run owed and could not append
+// ([RunEnd.Notes]), for an agent rebuilt from a record: the next run
+// appends them first, each as it arrived, with its Mode and Trigger, and
+// they stay while the output of the call each is about ([Note.CallID])
+// is in the transcript. A recorder writes them from the run's end, and
+// a host restoring the session passes them here beside [WithPending],
+// which carries the notes waiting on calls still pending. A note with no
+// item is left out.
+func WithNotes(notes []Note) Option {
+	return func(a *Agent) { a.notes = liveNotes(notes) }
+}
+
+// SetNotes replaces the notes the next run appends first, as
+// [WithNotes] seeds them: after [Agent.SetTranscript] to a branch of a
+// session, with what the record says that branch owed. It returns
+// [ErrRunning] while a run is active.
+func (a *Agent) SetNotes(notes []Note) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		return ErrRunning
+	}
+	a.notes = liveNotes(notes)
+	return nil
 }
 
 // Prompt appends items and runs until idle. It returns when the run_end

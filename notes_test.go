@@ -6,9 +6,11 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/openresponses"
+	"github.com/ChristopherDavenport/openresponses/echo"
 )
 
 // TestEveryNoteFollowsItsBatch pins the one rule for a note: whatever
@@ -52,9 +54,9 @@ func TestEveryNoteFollowsItsBatch(t *testing.T) {
 		calls []string
 		note  string
 	}{
-		{name: "an accept on a nested call", tools: []agenttool.Tool{invokes("eval", "read"), read, other}, calls: []string{"eval", "other"}, note: "The user said: only the unit tests"},
-		{name: "an accept two calls deep", tools: []agenttool.Tool{invokes("eval", "inner"), invokes("inner", "read"), read, other}, calls: []string{"eval", "other"}, note: "The user said: only the unit tests"},
-		{name: "a tool's own question", tools: []agenttool.Tool{confirm, other}, calls: []string{"confirm", "other"}, note: "The user said: only the unit tests"},
+		{name: "an accept on a nested call", tools: []agenttool.Tool{invokes("eval", "read"), read, other}, calls: []string{"eval", "other"}, note: "only the unit tests"},
+		{name: "an accept two calls deep", tools: []agenttool.Tool{invokes("eval", "inner"), invokes("inner", "read"), read, other}, calls: []string{"eval", "other"}, note: "only the unit tests"},
+		{name: "a tool's own question", tools: []agenttool.Tool{confirm, other}, calls: []string{"confirm", "other"}, note: "only the unit tests"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -63,7 +65,8 @@ func TestEveryNoteFollowsItsBatch(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := itemTypes(end.Items); got != "user function_call function_call function_call_output function_call_output developer" {
+			// A person's words, in the person's voice.
+			if got := itemTypes(end.Items); got != "user function_call function_call function_call_output function_call_output user" {
 				t.Fatalf("items = %q", got)
 			}
 			if out := end.Items[3].(*openresponses.FunctionCallOutput); strings.HasPrefix(out.Output.Text, "error") {
@@ -367,7 +370,7 @@ func TestAChildsNoteGoesToTheChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if child == nil || strings.Join(texts(child.Items), "|") != "user: sub|developer: The user said: only staging" {
+	if child == nil || strings.Join(texts(child.Items), "|") != "user: sub|user: only staging" {
 		t.Errorf("child items = %q", texts(child.Items))
 	}
 	if got := texts(parent.Items); strings.Join(got, "|") != "user: x" {
@@ -694,5 +697,187 @@ func TestAnAnswersNoteIsInItsAnswerersVoice(t *testing.T) {
 				t.Errorf("%q is in the transcript %d times, want both notes: %q", tc.want, n, texts(a.State().Transcript))
 			}
 		})
+	}
+}
+
+// TestAnOutputsNoteWaitsOnceTheOutputIsIn pins review item 1: an output
+// whose item_end a subscriber fails on is already in the transcript, so
+// its note waits from then rather than being lost.
+func TestAnOutputsNoteWaitsOnceTheOutputIsIn(t *testing.T) {
+	deferAll := func(context.Context, ToolCallInfo) (*ToolDecision, error) { return &ToolDecision{Action: Defer}, nil }
+	a := New(Config{Model: &twoCalls{}, Tools: abTools(), BeforeToolCall: deferAll, MaxTurns: 1})
+	end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+	if err != nil || len(end.Pending) != 2 {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	first, second := end.Pending[0].Call.CallID, end.Pending[1].Call.CallID
+	fail := true
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if e, ok := ev.(*ItemEnd); ok && fail {
+			if o, ok := e.Item.(*openresponses.FunctionCallOutput); ok && o.CallID == first {
+				fail = false
+				return errors.New("disk full")
+			}
+		}
+		return nil
+	})
+	end, err = a.Resume(context.Background(),
+		Output(openresponses.NewFunctionCallOutput(first, "no")).WithNote("use ci/ instead"),
+		Output(openresponses.NewFunctionCallOutput(second, "no")))
+	if err == nil {
+		t.Fatal("the resume did not fail")
+	}
+	if len(end.Pending) != 1 || strings.Join(texts(noteItems(end.Pending[0].Notes)), "|") != "user: use ci/ instead" {
+		t.Fatalf("pending = %+v, want the second call with the first's note", end.Pending)
+	}
+	if _, err := a.Resume(context.Background(), Output(openresponses.NewFunctionCallOutput(second, "no"))); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(a.State().Transcript, "user: use ci/ instead"); n != 1 {
+		t.Errorf("the note is in the transcript %d times, want once", n)
+	}
+}
+
+// TestANoteWithNoItemIsNoNote pins review item 2: a seeded note with no
+// item is left out, and the run that would append it does not spin.
+func TestANoteWithNoItemIsNoNote(t *testing.T) {
+	call := &openresponses.FunctionCall{CallID: "call_a", Name: "a", Arguments: `{"text":"t"}`}
+	a := New(Config{Model: &echo.Adapter{}, Tools: abTools(), MaxTurns: 1},
+		WithTranscript(Transcript{openresponses.UserText("x"), call}),
+		WithPending([]PendingCall{{Call: call, Reason: PendingDeferred, Notes: []Note{{Mode: InputTool, CallID: "call_a"}}}}),
+		WithNotes([]Note{{Mode: InputTool}}))
+	if p := a.State().Pending; len(p) != 1 || len(p[0].Notes) != 0 || len(a.State().Notes) != 0 {
+		t.Fatalf("state = %+v, want no note", a.State())
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.Resume(context.Background(), Output(openresponses.NewFunctionCallOutput("call_a", "no")))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the resume did not return")
+	}
+}
+
+// TestOwedNotesStayWithTheirOutputs pins review item 4: the notes a
+// failed run owed stay while their calls' outputs are in the transcript,
+// State reports them, and WithNotes seeds them on a rebuilt agent.
+func TestOwedNotesStayWithTheirOutputs(t *testing.T) {
+	hook := func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
+		switch info.Call.Name {
+		case "a":
+			return &ToolDecision{Note: "n1"}, nil
+		case "c":
+			return &ToolDecision{Note: "n2"}, nil
+		}
+		return &ToolDecision{Action: Defer, Reason: "ask"}, nil
+	}
+	tools := append(abTools(), agenttool.New("c", "", upper))
+	cfg := Config{Model: &twoCalls{}, Tools: tools, BeforeToolCall: hook, MaxTurns: 1}
+	a := New(cfg)
+	end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+	if err != nil || len(end.Pending) != 1 {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	fail := true
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if e, ok := ev.(*ItemStart); ok && fail {
+			if m, ok := e.Item.(*openresponses.Message); ok && m.Text() == "n2" {
+				fail = false
+				return errors.New("disk full")
+			}
+		}
+		return nil
+	})
+	end, err = a.Resume(context.Background(), Output(openresponses.NewFunctionCallOutput(end.Pending[0].Call.CallID, "no")))
+	if err == nil || len(end.Notes) != 1 {
+		t.Fatalf("resume: err=%v end=%+v", err, end)
+	}
+	owed := a.State().Notes
+	if len(owed) != 1 || owed[0].CallID == "" {
+		t.Fatalf("state notes = %+v", owed)
+	}
+	tr := a.State().Transcript
+	if err := a.SetTranscript(tr); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.State().Notes) != 1 {
+		t.Errorf("owed notes after the same transcript = %+v", a.State().Notes)
+	}
+	// A rebuilt agent seeded with them appends them first.
+	b := New(cfg, WithTranscript(tr), WithNotes(owed))
+	if _, err := b.Prompt(context.Background(), openresponses.UserText("next")); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(texts(b.State().Transcript)[:4], "|"); got != "user: x|developer: n1|developer: n2|user: next" {
+		t.Errorf("rebuilt agent's transcript = %q", got)
+	}
+	// Without the output it follows, an owed note goes.
+	if err := a.SetTranscript(tr[:1]); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.State().Notes) != 0 {
+		t.Errorf("owed notes after their outputs went = %+v", a.State().Notes)
+	}
+}
+
+// TestNotesHeldReportsEveryChange pins review item 6: notes_held is sent
+// whenever the waiting set changes, emptied included.
+func TestNotesHeldReportsEveryChange(t *testing.T) {
+	a := New(Config{Model: &twoCalls{}, Tools: abTools(), BeforeToolCall: deferB, MaxTurns: 1})
+	var held [][]Note
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if e, ok := ev.(*NotesHeld); ok {
+			held = append(held, e.Notes)
+		}
+		return nil
+	})
+	end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+	if err != nil || len(end.Pending) != 1 {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	if len(held) != 1 || len(held[0]) != 1 {
+		t.Fatalf("notes_held while b waits = %+v", held)
+	}
+	if _, err := a.Resume(context.Background(), Output(openresponses.NewFunctionCallOutput(end.Pending[0].Call.CallID, "no"))); err != nil {
+		t.Fatal(err)
+	}
+	if len(held) < 2 || len(held[1]) != 0 {
+		t.Errorf("notes_held after the notes were appended = %+v, want an empty set", held)
+	}
+}
+
+// TestAsksAcceptNoteIsThePersons pins review item 7: a person's note on
+// an accept Ask puts to them is a user message of its own, beside the
+// policy's note, a developer message.
+func TestAsksAcceptNoteIsThePersons(t *testing.T) {
+	read := agenttool.New("read", "reads", func(context.Context, echoArgs) (string, error) { return "contents", nil })
+	eval := agenttool.New("eval", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		if _, err := Invoke(ctx, "read", json.RawMessage(`{"text":"t"}`)); err != nil {
+			return "", err
+		}
+		return "done", nil
+	})
+	hook := func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
+		if info.Call.Name == "read" {
+			return &ToolDecision{Action: Defer, Reason: "ask", Note: "read runs in the sandbox"}, nil
+		}
+		return nil, nil
+	}
+	accept := func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+		return agenttool.Answer{Action: agenttool.ActionAccept, Note: "only go.mod"}, nil
+	}
+	cfg := Config{Model: callsNamed{names: []string{"eval"}}, Tools: []agenttool.Tool{eval, read}, BeforeToolCall: hook, ToolElicitor: accept, MaxTurns: 1}
+	_, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(texts(end.Items), "|"); got != "user: x|user: only go.mod|developer: read runs in the sandbox" {
+		t.Errorf("messages = %q", got)
 	}
 }

@@ -547,9 +547,12 @@ type RunEnd struct {
 	// Notes are the notes the run owed after outputs it had appended,
 	// with no call left pending to wait on, and could not append: a
 	// subscriber failed on one. The next run appends them first, before
-	// anything it brings; an [Agent] carries them, and a caller of [Run]
-	// puts their items before its next prompts. With calls pending the
-	// notes are on [PendingCall.Notes] instead.
+	// anything it brings; an [Agent] carries them ([State.Notes]), and a
+	// caller of [Run] puts their items before its next prompts. A
+	// recorder writes them, as the last [NotesHeld] it kept or from this
+	// end, and a host restoring the session seeds them with [WithNotes]
+	// or [Agent.SetNotes], with their Mode, Trigger and CallID. With
+	// calls pending the notes are on [PendingCall.Notes] instead.
 	Notes []Note
 	// Withheld says the run ended because [Config.OutputGuard]
 	// withheld a message, with Reason ReasonStopped and Cause
@@ -746,12 +749,15 @@ type Note struct {
 }
 
 // NotesHeld reports the notes now waiting on the pending calls'
-// outputs, the whole set, each time it grows while calls wait: after an
+// outputs, the whole set, each time it changes from what was last
+// reported or what the run started with: when it grows, after an
 // answer's output whose note waits for the approved batch that follows
-// it, and when a batch ends with a call deferred or cut. A recorder
-// writes the set, so a process that dies after the output loses
-// nothing a person said; the run's end carries the same set on
-// [PendingCall.Notes].
+// it or when a batch ends with a call deferred or cut, and when it
+// shrinks or empties as the notes are appended. A recorder that keeps
+// the last report holds exactly what waits, so a process that dies after
+// an output loses nothing a person said; the run's end carries the same
+// set, on [PendingCall.Notes] while calls wait and on [RunEnd.Notes]
+// when none does.
 type NotesHeld struct {
 	RunID string
 	Notes []Note
