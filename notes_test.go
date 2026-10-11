@@ -123,6 +123,15 @@ func abTools() []agenttool.Tool {
 	return []agenttool.Tool{agenttool.New("a", "", upper), agenttool.New("b", "", upper)}
 }
 
+// noteItems is the items of notes.
+func noteItems(notes []Note) []openresponses.Item {
+	var out []openresponses.Item
+	for _, n := range notes {
+		out = append(out, n.Item)
+	}
+	return out
+}
+
 // texts lists the text of every message in items, role first.
 func texts(items []openresponses.Item) []string {
 	var out []string
@@ -149,7 +158,7 @@ func TestHeldNotesTravelWithThePendingCalls(t *testing.T) {
 		t.Fatalf("pending = %v", pendingReasons(end))
 	}
 	notes := end.Pending[0].Notes
-	if got := texts(notes); strings.Join(got, "|") != "developer: a ran in the sandbox" {
+	if got := texts(noteItems(notes)); strings.Join(got, "|") != "developer: a ran in the sandbox" {
 		t.Fatalf("pending notes = %q", got)
 	}
 	b := end.Pending[0].Call.CallID
@@ -191,7 +200,7 @@ func TestACutCallsNoteWaitsForItsAnswer(t *testing.T) {
 	if err != nil || end.Reason != ReasonAborted {
 		t.Fatalf("prompt: err=%v end=%+v", err, end)
 	}
-	if len(end.Pending) != 1 || strings.Join(texts(end.Pending[0].Notes), "|") != "developer: a ran in the sandbox" {
+	if len(end.Pending) != 1 || strings.Join(texts(noteItems(end.Pending[0].Notes)), "|") != "developer: a ran in the sandbox" {
 		t.Fatalf("pending = %+v", end.Pending)
 	}
 	if _, err := a.Resume(context.Background(), OutcomeUnknown(end.Pending[0].Call.CallID)); err != nil {
@@ -223,7 +232,7 @@ func TestSetTranscriptKeepsNotesWhileTheirCallsWait(t *testing.T) {
 	if err := a.SetTranscript(answered); err != nil {
 		t.Fatal(err)
 	}
-	if p := a.State().Pending; len(p) != 1 || strings.Join(texts(p[0].Notes), "|") != "developer: a ran in the sandbox" {
+	if p := a.State().Pending; len(p) != 1 || strings.Join(texts(noteItems(p[0].Notes)), "|") != "developer: a ran in the sandbox" {
 		t.Fatalf("pending after c was answered = %+v, want b with a's note", p)
 	}
 	if err := a.SetTranscript(tr[:1]); err != nil {
@@ -281,7 +290,8 @@ func TestAFailedResumeKeepsItsNotesOnce(t *testing.T) {
 // TestAnApprovalsNoteSurvivesTheHook pins review finding 5: a person's
 // note on an approval and the note the hook gives the call both reach
 // the model, the person's first, and a hook that defers the call holds
-// the person's note with it.
+// nothing: the call never ran, and the person's note comes back with the
+// answer that approves it again (review of v0.0.23, R2).
 func TestAnApprovalsNoteSurvivesTheHook(t *testing.T) {
 	call := &openresponses.FunctionCall{CallID: "call_a", Name: "a", Arguments: `{"text":"t"}`}
 	seed := Transcript{openresponses.UserText("x"), call}
@@ -291,7 +301,7 @@ func TestAnApprovalsNoteSurvivesTheHook(t *testing.T) {
 		want string
 	}{
 		{name: "allowed with a note", hook: &ToolDecision{Note: "a ran in the sandbox"}, want: "user: only the unit tests|developer: a ran in the sandbox"},
-		{name: "deferred", hook: &ToolDecision{Action: Defer, Reason: "ask again"}, want: "user: only the unit tests"},
+		{name: "deferred", hook: &ToolDecision{Action: Defer, Reason: "ask again"}, want: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			hook := func(context.Context, ToolCallInfo) (*ToolDecision, error) { return tc.hook, nil }
@@ -306,7 +316,7 @@ func TestAnApprovalsNoteSurvivesTheHook(t *testing.T) {
 				if len(end.Pending) != 1 {
 					t.Fatalf("pending = %v", pendingReasons(end))
 				}
-				got = texts(end.Pending[0].Notes)
+				got = texts(noteItems(end.Pending[0].Notes))
 			} else {
 				got = texts(a.State().Transcript[3:5])
 			}
@@ -347,5 +357,240 @@ func TestAChildsNoteGoesToTheChild(t *testing.T) {
 	}
 	if got := texts(parent.Items); strings.Join(got, "|") != "user: x" {
 		t.Errorf("parent items = %q", got)
+	}
+}
+
+// count is how many messages of items read want.
+func count(items []openresponses.Item, want string) int {
+	n := 0
+	for _, s := range texts(items) {
+		if s == want {
+			n++
+		}
+	}
+	return n
+}
+
+// TestACallThatNeverRanHoldsNoNote pins R1: a call an abort cut before
+// its dispatch holds no note, since the hook decides it again when it is
+// approved, and says its note then, once.
+func TestACallThatNeverRanHoldsNoNote(t *testing.T) {
+	started := make(chan struct{})
+	slow := agenttool.New("a", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		close(started)
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	hook := func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
+		if info.Call.Name == "b" {
+			return &ToolDecision{Note: "b ran in the sandbox"}, nil
+		}
+		return nil, nil
+	}
+	a := New(Config{Model: &twoCalls{}, Tools: []agenttool.Tool{slow, agenttool.New("b", "", upper)}, BeforeToolCall: hook, ToolExecution: ExecSequential, MaxTurns: 1})
+	go func() {
+		<-started
+		a.Abort()
+	}()
+	end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+	if err != nil || end.Reason != ReasonAborted || len(end.Pending) != 2 || end.Pending[1].Reason != PendingUndispatched {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	if _, err := a.Resume(context.Background(), OutcomeUnknown(end.Pending[0].Call.CallID), Approve(end.Pending[1].Call.CallID)); err != nil {
+		t.Fatal(err)
+	}
+	// The resume's batch: the calls, their outputs, the note once; the
+	// next turn calls both again, and its batch has the note once more.
+	tr := a.State().Transcript
+	want := "user function_call function_call function_call_output function_call_output developer function_call function_call function_call_output function_call_output developer"
+	if got := itemTypes(tr); got != want {
+		t.Errorf("transcript = %q\nwant         %q", got, want)
+	}
+}
+
+// TestAnApprovalOfACallThatNeverRanHoldsNoNote pins R2: a person's note
+// on an approval whose call then never reaches its tool is not held, so
+// the host's retry, which brings it again, says it once.
+func TestAnApprovalOfACallThatNeverRanHoldsNoNote(t *testing.T) {
+	decided := 0
+	hook := func(context.Context, ToolCallInfo) (*ToolDecision, error) {
+		decided++
+		if decided == 1 {
+			return &ToolDecision{Action: Defer, Reason: "ask"}, nil
+		}
+		return nil, nil
+	}
+	a := New(Config{Model: callsNamed{names: []string{"b"}}, Tools: []agenttool.Tool{agenttool.New("b", "", upper)}, BeforeToolCall: hook, MaxTurns: 1})
+	end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+	if err != nil || len(end.Pending) != 1 {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	b := end.Pending[0].Call.CallID
+	refuse := true
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if _, ok := ev.(*ToolDispatch); ok && refuse {
+			refuse = false
+			return errors.New("the audit log is down")
+		}
+		return nil
+	})
+	if _, err := a.Resume(context.Background(), Approve(b).WithNote("only the unit tests")); err == nil {
+		t.Fatal("the first resume did not fail")
+	}
+	if p := a.State().Pending; len(p) != 1 || len(p[0].Notes) != 0 {
+		t.Fatalf("pending after the withdrawn dispatch = %+v, want b with no note", p)
+	}
+	if _, err := a.Resume(context.Background(), Approve(b).WithNote("only the unit tests")); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(a.State().Transcript, "user: only the unit tests"); n != 1 {
+		t.Errorf("the note is in the transcript %d times, want once: %q", n, texts(a.State().Transcript))
+	}
+}
+
+// TestANoteIsKeptUntilItIsAppended pins R3: a note is off the waiting
+// set only once it is in the transcript, so a failure part way through
+// leaves the rest owed to the next run, and an answer's note waits from
+// the moment its own output is in.
+func TestANoteIsKeptUntilItIsAppended(t *testing.T) {
+	t.Run("a failure between notes", func(t *testing.T) {
+		hook := func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
+			switch info.Call.Name {
+			case "a":
+				return &ToolDecision{Note: "n1"}, nil
+			case "c":
+				return &ToolDecision{Note: "n2"}, nil
+			}
+			return &ToolDecision{Action: Defer, Reason: "ask"}, nil
+		}
+		tools := append(abTools(), agenttool.New("c", "", upper))
+		a := New(Config{Model: &twoCalls{}, Tools: tools, BeforeToolCall: hook, MaxTurns: 1})
+		end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+		if err != nil || len(end.Pending) != 1 {
+			t.Fatalf("prompt: err=%v end=%+v", err, end)
+		}
+		fail := true
+		a.Subscribe(func(_ context.Context, ev Event) error {
+			if e, ok := ev.(*ItemStart); ok && fail {
+				if m, ok := e.Item.(*openresponses.Message); ok && m.Text() == "n2" {
+					fail = false
+					return errors.New("disk full")
+				}
+			}
+			return nil
+		})
+		end, err = a.Resume(context.Background(), Output(openresponses.NewFunctionCallOutput(end.Pending[0].Call.CallID, "no")))
+		if err == nil {
+			t.Fatal("the resume did not fail")
+		}
+		if len(end.Pending) != 0 || len(end.Notes) != 1 {
+			t.Fatalf("run end = %+v, want n2 owed", end)
+		}
+		if _, err := a.Prompt(context.Background(), openresponses.UserText("next")); err != nil {
+			t.Fatal(err)
+		}
+		tr := a.State().Transcript
+		if count(tr, "developer: n1") != 1 || count(tr, "developer: n2") != 1 {
+			t.Fatalf("transcript = %q", texts(tr))
+		}
+		if got := strings.Join(texts(tr)[:4], "|"); got != "user: x|developer: n1|developer: n2|user: next" {
+			t.Errorf("order = %q", got)
+		}
+	})
+	t.Run("a failure between outputs", func(t *testing.T) {
+		deferAll := func(context.Context, ToolCallInfo) (*ToolDecision, error) { return &ToolDecision{Action: Defer}, nil }
+		a := New(Config{Model: &twoCalls{}, Tools: abTools(), BeforeToolCall: deferAll, MaxTurns: 1})
+		end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+		if err != nil || len(end.Pending) != 2 {
+			t.Fatalf("prompt: err=%v end=%+v", err, end)
+		}
+		first, second := end.Pending[0].Call.CallID, end.Pending[1].Call.CallID
+		fail := true
+		a.Subscribe(func(_ context.Context, ev Event) error {
+			if e, ok := ev.(*ItemStart); ok && fail {
+				if o, ok := e.Item.(*openresponses.FunctionCallOutput); ok && o.CallID == second {
+					fail = false
+					return errors.New("disk full")
+				}
+			}
+			return nil
+		})
+		end, err = a.Resume(context.Background(),
+			Output(openresponses.NewFunctionCallOutput(first, "no")).WithNote("use ci/ instead"),
+			Output(openresponses.NewFunctionCallOutput(second, "no")))
+		if err == nil {
+			t.Fatal("the resume did not fail")
+		}
+		if len(end.Pending) != 1 || strings.Join(texts(noteItems(end.Pending[0].Notes)), "|") != "user: use ci/ instead" {
+			t.Fatalf("pending = %+v, want the second call with the first's note", end.Pending)
+		}
+		if _, err := a.Resume(context.Background(), Output(openresponses.NewFunctionCallOutput(second, "no"))); err != nil {
+			t.Fatal(err)
+		}
+		if n := count(a.State().Transcript, "user: use ci/ instead"); n != 1 {
+			t.Errorf("the note is in the transcript %d times, want once", n)
+		}
+	})
+}
+
+// TestAHeldNoteKeepsHowItArrived pins R5: a decision's note held across
+// runs reaches the next turn as the tool's, not as the Resume's.
+func TestAHeldNoteKeepsHowItArrived(t *testing.T) {
+	var modes []string
+	cfg := Config{Model: &twoCalls{}, Tools: abTools(), BeforeToolCall: deferB, MaxTurns: 1,
+		BeforeTurn: func(_ context.Context, info TurnStartInfo) (openresponses.Items, error) {
+			for _, in := range info.Inputs {
+				if m, ok := in.Item.(*openresponses.Message); ok && m.Role == openresponses.RoleDeveloper {
+					modes = append(modes, string(in.Mode))
+				}
+			}
+			return nil, nil
+		}}
+	a := New(cfg)
+	end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+	if err != nil || len(end.Pending) != 1 {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	if n := end.Pending[0].Notes; len(n) != 1 || n[0].Mode != InputTool {
+		t.Fatalf("held notes = %+v", n)
+	}
+	if _, err := a.Resume(context.Background(), Output(openresponses.NewFunctionCallOutput(end.Pending[0].Call.CallID, "no"))); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(modes, " ") != "tool" {
+		t.Errorf("the note arrived as %q, want tool", modes)
+	}
+}
+
+// TestAHeldCallsPolicyNoteIsSaidOnRelease pins R8: the note of the
+// decision that held a call is the policy's, said by the loop as a
+// developer message once an approval releases the call, in this
+// process and after a restart.
+func TestAHeldCallsPolicyNoteIsSaidOnRelease(t *testing.T) {
+	hook := func(context.Context, ToolCallInfo) (*ToolDecision, error) {
+		return &ToolDecision{Action: Defer, Reason: "ask", Note: "b runs in the sandbox"}, nil
+	}
+	cfg := Config{Model: callsNamed{names: []string{"b"}}, Tools: []agenttool.Tool{agenttool.New("b", "", upper)}, BeforeToolCall: hook, MaxTurns: 1}
+	a := New(cfg)
+	end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
+	if err != nil || len(end.Pending) != 1 {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	for _, tc := range []struct {
+		name  string
+		agent *Agent
+	}{
+		{"in process", a},
+		{"after a restart", New(cfg, WithTranscript(end.Items), WithPending(end.Pending))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.agent.Resume(context.Background(), Approve(end.Pending[0].Call.CallID).WithNote("go ahead")); err != nil {
+				t.Fatal(err)
+			}
+			tr := tc.agent.State().Transcript
+			if got := strings.Join(texts(tr)[:3], "|"); got != "user: x|user: go ahead|developer: b runs in the sandbox" {
+				t.Errorf("messages = %q", texts(tr))
+			}
+		})
 	}
 }

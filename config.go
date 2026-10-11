@@ -453,14 +453,19 @@ type ToolDecision struct {
 	// nobody for the approval of a held call, where [Answer.By] is what
 	// says who answered. The loop does not use it.
 	By string
-	// Note is text the model sees with the result: it is appended as a
-	// developer message after every output of the batch the call belongs
-	// to, so the model reads the result and the note together, in that
-	// order, in the same turn. A nested call's note follows the batch of
-	// the call that made it; a batch with a deferred call keeps its
-	// notes until the run that answers that call has appended its
-	// output. It applies to an allowed call; a blocked call carries its
-	// Reason.
+	// Note is the decider's own text for the model, never a person's: it
+	// is appended as a developer message after every output of the
+	// batch the call belongs to, so the model reads the result and the
+	// note together, in that order, in the same turn. A nested call's
+	// note follows the batch of the call that made it; a batch with a
+	// deferred call keeps its notes until the run that answers that
+	// call has appended its output. It applies to an allowed call, and
+	// to a call the decision deferred once an approval through
+	// [Agent.Resume] releases it, when the loop says it once, after the
+	// released batch's outputs; it travels on [PendingCall.Decision]
+	// until then. A blocked call carries its Reason, and a call that
+	// never reached its tool says nothing: the next decision on it
+	// gives its own.
 	Note string
 	// Held, on a Defer, says the call is deferred only because another
 	// call of its batch waits on someone: nobody is asked about it, and

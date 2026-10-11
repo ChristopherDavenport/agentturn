@@ -5,6 +5,40 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Changed, breaking: `PendingCall.Notes` is a `[]Note`, each note with
+  the item, how it arrived (`Mode`) and the trigger its `item_end`
+  carries, so a note held across runs is appended as it would have been
+  had nothing waited: a hook's note stays the tool's, not the Resume's.
+  `front/control` carries them.
+- Changed, behaviour: a call that never reached its tool, deferred, or
+  cut, refused or failed before its dispatch, holds no note. The hook's
+  next decision on it gives its own, and a person's note comes back
+  with the answer that approves it again, so neither is said twice.
+  v0.0.23 held them and said them again. A deferral no longer holds the
+  person's note on the approval it deferred.
+- Changed, behaviour: the note of a decision that held a call
+  (`ToolDecision.Note` on a Defer) is the policy's, and the loop says it
+  itself, as a developer message after the batch's outputs, once, when
+  an approval through `Resume` releases the call, in process or from
+  `PendingCall.Decision` after a restart. `Answer.Note` is only ever a
+  person's: a policy engine releasing the calls it held must not put its
+  hook's note there, or the model reads it as the user's words. The
+  docs of `ToolDecision.Note` and `Answer.Note` say so.
+- Fixed: a note leaves the waiting set only once it is in the
+  transcript, so a subscriber failing part way through leaves the rest
+  waiting; with no call left pending the run's end carries them as the
+  new `RunEnd.Notes`, which the agent appends first in its next run
+  (`SetTranscript` drops them). A Resume's note on an output answer
+  waits from the moment that output is appended, so a Resume that fails
+  after it keeps the note.
+- Added: the `notes_held` event (`NotesHeld`), the waiting set each
+  time it grows while calls wait, for a recorder to keep, so a process
+  that dies after an output loses no note. `front/control` carries it.
+- Fixed: the README says the replier names itself with
+  `ContextWithAnswerer`, not with the run's trigger.
+
 ## v0.0.23 - 2026-10-11
 
 - Fixed: the recorder writes a hold decision's `Subject` and `Held` as
