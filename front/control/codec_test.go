@@ -54,6 +54,7 @@ func sampleEvents(t *testing.T) map[string]agentturn.Event {
 			Cause: agentturn.StopGuard, Err: agentturn.ErrRunning, Withheld: true, Pending: []agentturn.PendingCall{{
 				Call: call, Reason: agentturn.PendingDeferred, Tool: remoteUpper(), Dispatched: true, IdempotencyKey: "k", Args: json.RawMessage(`{"text":"b"}`),
 				Ran: out, RanWhere: "branch", Refused: "no", Decision: decision,
+				Question: &agentturn.OpenQuestion{ID: "entry_1", Message: "Allow notify?", Call: &agentturn.AskedCall{Parent: "call_1", CallID: "call_2", Name: "notify"}},
 			}}},
 		"Queued":         &agentturn.Queued{RunID: "run_1", Item: openresponses.UserText("more"), Mode: agentturn.QueueSteer, Hidden: true, Trigger: trigger},
 		"Question":       &agentturn.Question{ID: "question_1", RunID: "run_1", CallID: "call_0", Call: &agentturn.AskedCall{Parent: "call_0", CallID: "call_1", Name: "upper", Args: json.RawMessage(`{}`), Decision: decision}, Elicitation: agenttool.Elicitation{Message: "ok?", Schema: json.RawMessage(`{"type":"object"}`), URL: "https://example.test"}},
@@ -182,6 +183,9 @@ func TestWhatTravelsAsADescription(t *testing.T) {
 	}
 	if p.Call.CallID != "call_1" || p.Ran.CallID != "call_1" {
 		t.Errorf("pending = %+v", p)
+	}
+	if q := p.Question; q == nil || q.ID != "entry_1" || q.Reason() != `a question was open: "Allow notify?" about call call_2 (notify)` || q.Call.Parent != "call_1" {
+		t.Errorf("question = %+v", p.Question)
 	}
 	retry := decode(samples["ModelRetry"]).(*agentturn.ModelRetry)
 	if retry.Delay != 1500*time.Millisecond || !errors.Is(retry.Err, agentturn.ErrNoModel) {

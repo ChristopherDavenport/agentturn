@@ -678,6 +678,43 @@ type PendingCall struct {
 	// for a deferred call held before the agent was built, unless a
 	// record says why.
 	Decision *ToolDecision
+	// Question is the question a person was asked under the call and
+	// had not answered when its run was cut: a tool's own question, or
+	// one [Ask] put about a nested call. It tells a front, and a host
+	// answering the call, that the call was waiting on a person, and
+	// what it asked, where the reason alone says only that the call may
+	// have run. The loop never sets it; agentturn/session's Pending
+	// does, from the record. nil for every other call.
+	Question *OpenQuestion
+}
+
+// OpenQuestion is a question a record shows asked under a call and
+// never answered: the run was cut while a person decided.
+type OpenQuestion struct {
+	// ID is the ID of the record's entry that asked it.
+	ID string
+	// Message is the question as it was put.
+	Message string
+	// Call is the call the question is about, for one [Ask] put about a
+	// nested call or a front put about a model's call: its ID, name and
+	// the call whose tool made it, as far as the record names them. It
+	// is nil for a tool's own question, which is about the pending call.
+	Call *AskedCall
+}
+
+// Reason says that the question was open and what it asked, for the
+// reason of an answer given the call it was asked under, such as a
+// replay's: `a question was open: "<message>"`, followed by
+// ` about call <id> (<name>)` when it was about another call.
+func (q *OpenQuestion) Reason() string {
+	reason := fmt.Sprintf("a question was open: %q", q.Message)
+	if q.Call != nil && q.Call.CallID != "" {
+		reason += " about call " + q.Call.CallID
+		if q.Call.Name != "" {
+			reason += " (" + q.Call.Name + ")"
+		}
+	}
+	return reason
 }
 
 // MayHaveRun reports whether the call may have run and an approval of

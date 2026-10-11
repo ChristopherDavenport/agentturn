@@ -14,6 +14,13 @@ versions may break the API.
   resumed session asks about the part of the call it asked about
   before the restart, and asks nothing about a call held only beside
   another. A hold written by v0.0.22 or earlier has neither. (#238)
+- Added: `PendingCall.Question`, an `OpenQuestion`: the question a
+  person was asked under the call and had not answered when its run was
+  cut, with its message, the ID of the entry that asked it and the call
+  it was about. `OpenQuestion.Reason` is the text a replay's answer
+  carries for it. `front/control` carries it, so `State` over the wire
+  says the call was waiting on a person. agentturn/session's `Pending`
+  sets it from the record in the release after this one. (#241)
 
 ## v0.0.22 - 2026-10-10
 

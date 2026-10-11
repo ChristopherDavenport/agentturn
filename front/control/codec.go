@@ -640,23 +640,49 @@ func decisionIn(w *wireDecision) (*agentturn.ToolDecision, error) {
 }
 
 type wirePending struct {
-	Call           json.RawMessage `json:"call"`
-	Reason         string          `json:"reason"`
-	Tool           *wireTool       `json:"tool,omitempty"`
-	Dispatched     bool            `json:"dispatched,omitempty"`
-	IdempotencyKey string          `json:"idempotency_key,omitempty"`
-	Args           json.RawMessage `json:"args,omitempty"`
-	Ran            json.RawMessage `json:"ran,omitempty"`
-	RanWhere       string          `json:"ran_where,omitempty"`
-	Refused        string          `json:"refused,omitempty"`
-	Decision       *wireDecision   `json:"decision,omitempty"`
+	Call           json.RawMessage      `json:"call"`
+	Reason         string               `json:"reason"`
+	Tool           *wireTool            `json:"tool,omitempty"`
+	Dispatched     bool                 `json:"dispatched,omitempty"`
+	IdempotencyKey string               `json:"idempotency_key,omitempty"`
+	Args           json.RawMessage      `json:"args,omitempty"`
+	Ran            json.RawMessage      `json:"ran,omitempty"`
+	RanWhere       string               `json:"ran_where,omitempty"`
+	Refused        string               `json:"refused,omitempty"`
+	Decision       *wireDecision        `json:"decision,omitempty"`
+	Question       *wirePendingQuestion `json:"question,omitempty"`
+}
+
+// wirePendingQuestion is a pending call's [agentturn.OpenQuestion].
+type wirePendingQuestion struct {
+	ID      string         `json:"id,omitempty"`
+	Message string         `json:"message"`
+	Call    *wireAskedCall `json:"call,omitempty"`
+}
+
+func questionOut(q *agentturn.OpenQuestion) *wirePendingQuestion {
+	if q == nil {
+		return nil
+	}
+	return &wirePendingQuestion{ID: q.ID, Message: q.Message, Call: askedCallOut(q.Call)}
+}
+
+func questionIn(w *wirePendingQuestion) (*agentturn.OpenQuestion, error) {
+	if w == nil {
+		return nil, nil
+	}
+	call, err := askedCallIn(w.Call)
+	if err != nil {
+		return nil, err
+	}
+	return &agentturn.OpenQuestion{ID: w.ID, Message: w.Message, Call: call}, nil
 }
 
 func pendingOut(in []agentturn.PendingCall) ([]wirePending, error) {
 	var out []wirePending
 	for _, p := range in {
 		w := wirePending{Reason: string(p.Reason), Tool: toolOut(p.Tool), Dispatched: p.Dispatched, IdempotencyKey: p.IdempotencyKey,
-			Args: p.Args, RanWhere: p.RanWhere, Refused: p.Refused, Decision: decisionOut(p.Decision)}
+			Args: p.Args, RanWhere: p.RanWhere, Refused: p.Refused, Decision: decisionOut(p.Decision), Question: questionOut(p.Question)}
 		var err error
 		if p.Call != nil {
 			if w.Call, err = json.Marshal(p.Call); err != nil {
@@ -689,6 +715,9 @@ func pendingIn(in []wirePending) ([]agentturn.PendingCall, error) {
 			return nil, err
 		}
 		if p.Decision, err = decisionIn(w.Decision); err != nil {
+			return nil, err
+		}
+		if p.Question, err = questionIn(w.Question); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
