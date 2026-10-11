@@ -656,6 +656,18 @@ type Elicitation struct {
 // writer that replaces a repeated ID to keep the native one there.
 const ModelCallIDMember = "agentturn:model_call_id"
 
+// SubjectMember is the member of a hold decision, beside its reason,
+// that keeps the part of the call the deferral is about
+// ([agentturn.ToolDecision.Subject]), such as one command of a compound
+// shell line. [Pending] reads it back onto the call's Decision.
+const SubjectMember = "agentturn:subject"
+
+// HeldMember is the member of a hold decision that marks a call
+// deferred only because another call of its batch waits on someone
+// ([agentturn.ToolDecision.Held]); it is true when present. [Pending]
+// reads it back onto the call's Decision.
+const HeldMember = "agentturn:held"
+
 // UnhashedNS is the namespace of the custom entry written when the
 // recorder declines to hash a request because its input is not what
 // the recorded path rebuilds: a Transform or a BeforeModelCall changed
@@ -1276,7 +1288,9 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // lists them, with the reason the record gives each: a call held by a
 // hold decision is [agentturn.PendingDeferred], Dispatched when the
 // hold follows its dispatch, with that hold as its Decision (the rule
-// that raised the question, who held it); one in flight when the record stopped
+// that raised the question, who held it, the part of the call it is
+// about and whether the call is held only beside another, from
+// [SubjectMember] and [HeldMember]); one in flight when the record stopped
 // may have run and is [agentturn.PendingAborted], as is one with no
 // dispatch on the path that has one on a branch a rebase to before it
 // left, a held one of which is Dispatched; one an answer
@@ -1865,10 +1879,38 @@ func refusal(s *agentsession.Session, callID string) (string, error) {
 func holdDecision(c *agentsession.Call) *agentturn.ToolDecision {
 	for i := len(c.Decisions) - 1; i >= 0; i-- {
 		if d := c.Decisions[i]; d.Verdict == agentsession.VerdictHold {
-			return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: d.Reason, By: d.By, Args: d.Args}
+			out := &agentturn.ToolDecision{Action: agentturn.Defer, Reason: d.Reason, By: d.By, Args: d.Args}
+			if raw, ok := d.Unknown[SubjectMember]; ok {
+				_ = json.Unmarshal(raw, &out.Subject)
+			}
+			if raw, ok := d.Unknown[HeldMember]; ok {
+				_ = json.Unmarshal(raw, &out.Held)
+			}
+			return out
 		}
 	}
 	return nil
+}
+
+// holdMembers writes the deferral's [agentturn.ToolDecision.Subject]
+// and [agentturn.ToolDecision.Held] on its hold decision, as
+// [SubjectMember] and [HeldMember], when they are set.
+func holdMembers(hold *agentsession.DecisionEntry, d *agentturn.ToolDecision) {
+	if d.Subject != "" {
+		raw, _ := json.Marshal(d.Subject)
+		setMember(&hold.EntryBase, SubjectMember, raw)
+	}
+	if d.Held {
+		setMember(&hold.EntryBase, HeldMember, json.RawMessage("true"))
+	}
+}
+
+// setMember sets one member the format does not define on an entry.
+func setMember(e *agentsession.EntryBase, name string, raw json.RawMessage) {
+	if e.Unknown == nil {
+		e.Unknown = make(map[string]json.RawMessage)
+	}
+	e.Unknown[name] = raw
 }
 
 // replayAnswer is the answer to one call that may have run.
@@ -4211,6 +4253,11 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 			if d.Reason != "" {
 				hold.WithReason(d.Reason)
 			}
+			// The part of the call the hold is about, and whether the
+			// call is held only beside another, are kept as members of
+			// the decision, so a front over a resumed session asks the
+			// question it asked before the restart.
+			holdMembers(hold, d)
 			carried := c.carries(e.Args)
 			if carried {
 				hold.WithArgs(e.Args)

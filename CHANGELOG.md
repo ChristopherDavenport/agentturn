@@ -5,6 +5,16 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Fixed: the recorder writes a hold decision's `Subject` and `Held` as
+  the members `agentturn:subject` and `agentturn:held`
+  (`session.SubjectMember`, `session.HeldMember`), and `session.Pending`
+  reads them back onto `PendingCall.Decision`, so a front over a
+  resumed session asks about the part of the call it asked about
+  before the restart, and asks nothing about a call held only beside
+  another. A hold written by v0.0.22 or earlier has neither. (#238)
+
 ## v0.0.22 - 2026-10-10
 
 - Added: `ToolDecision.Subject`, the part of the call a decision is
