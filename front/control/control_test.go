@@ -549,21 +549,27 @@ func TestScopes(t *testing.T) {
 	t.Run("a read-only stream", func(t *testing.T) {
 		srv := httptest.NewServer(Handler(&recorder{}, WithAuthenticator(BearerTokens(tokens))))
 		defer srv.Close()
-		var errs []error
-		var mu sync.Mutex
+		// The stream's refusal arrives on its own goroutine, after
+		// Subscribe returns: wait for it.
+		first := make(chan error, 1)
 		c, err := Dial(t.Context(), srv.URL, WithBearerToken("answers"), WithStreamErrors(func(err error) {
-			mu.Lock()
-			errs = append(errs, err)
-			mu.Unlock()
+			select {
+			case first <- err:
+			default:
+			}
 		}))
 		if err != nil {
 			t.Fatal(err)
 		}
-		c.Subscribe(func(context.Context, agentturn.Event) error { return nil })()
-		mu.Lock()
-		defer mu.Unlock()
-		if len(errs) == 0 || !errors.Is(errs[0], ErrForbidden) || !errors.Is(errs[0], ErrStreamBroken) {
-			t.Errorf("stream errors = %v", errs)
+		unsubscribe := c.Subscribe(func(context.Context, agentturn.Event) error { return nil })
+		defer unsubscribe()
+		select {
+		case err := <-first:
+			if !errors.Is(err, ErrForbidden) || !errors.Is(err, ErrStreamBroken) {
+				t.Errorf("stream error = %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("no stream error within 5s")
 		}
 	})
 }
