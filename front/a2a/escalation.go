@@ -1,8 +1,10 @@
 package a2a
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/openresponses"
@@ -27,21 +29,21 @@ const (
 // data part ([ApprovalPart]) on a message for the same task, beside the
 // function_call_output items of any calls to its own tools, one answer
 // per pending call.
+//
+// Who decided is the authenticated principal, never what the caller
+// claims: the run the answer resumes is prompted under the principal's
+// trigger, and the decision names nobody in the session format's terms
+// (By ""), since the executor cannot tell a person on the caller's side
+// from a program. A note is the caller's words, untrusted: an
+// approval's reaches the model after the batch's outputs as a user
+// message, "The caller <principal> said: <note>", never in the
+// developer's voice; a refusal's is part of the refusal the model reads
+// as the call's output.
 type Approval struct {
 	CallID string `json:"call_id"`
-	// Approve runs the call; false refuses it, and the model reads the
-	// refusal, with Note, as the call's output.
-	Approve bool `json:"approve"`
-	// Note is what the caller's side said when answering. An approval's
-	// note reaches the model after the batch's outputs, in the voice of
-	// By; a refusal's is part of the refusal the model reads.
-	Note string `json:"note,omitempty"`
-	// By says who decided on the caller's side: "human" for a person,
-	// "agent" for a model or a program, which is what an empty By
-	// means. A caller cannot answer as this agent's "policy". The
-	// record names the caller's principal on the run that the answer
-	// resumes, under [WithAuthenticator].
-	By string `json:"by,omitempty"`
+	// Approve runs the call; false refuses it.
+	Approve bool   `json:"approve"`
+	Note    string `json:"note,omitempty"`
 }
 
 // ApprovalPart encodes an approval as the data part a message carries.
@@ -49,9 +51,6 @@ func ApprovalPart(a Approval) a2a.DataPart {
 	data := map[string]any{"type": ApprovalType, "call_id": a.CallID, "approve": a.Approve}
 	if a.Note != "" {
 		data["note"] = a.Note
-	}
-	if a.By != "" {
-		data["by"] = a.By
 	}
 	return a2a.DataPart{Data: data}
 }
@@ -61,11 +60,64 @@ func ApprovalPart(a Approval) a2a.DataPart {
 // run ends input-required, the task enters input-required with the call
 // among the status message's function_call data parts and the policy's
 // reason under [MetaEscalatedCalls] and as text, and the caller's
-// [Approval] runs or refuses it. It is for a headless agent nobody
-// watches, whose caller's human plane should decide. Without it each
-// system's policy is its own, and the serving side answers its own
-// agent's questions, as the package documents.
+// [Approval] runs or refuses it. Only the calls the policy deferred in
+// that task may be approved, with the decision the policy made about
+// them, its rewrite of the arguments and its note included; an approval
+// runs the call as decided, without asking the policy again. It is for
+// a headless agent nobody watches, whose caller's human plane should
+// decide. Without it each system's policy is its own, and the serving
+// side answers its own agent's questions, as the package documents.
+//
+// It requires [WithAuthenticator], since an approval lets a call run on
+// the caller's word: [New] panics without it.
 func WithEscalation() Option { return func(e *Executor) { e.escalate = true } }
+
+// Escalated is a call a task put to its caller: the call, and the
+// decision the policy made that deferred it, with its reason, its
+// rewrite of the arguments and its note.
+type Escalated struct {
+	Task     string                      `json:"task"`
+	Call     *openresponses.FunctionCall `json:"call"`
+	Decision *agentturn.ToolDecision     `json:"decision,omitempty"`
+}
+
+// EscalationStore keeps the calls each conversation's last task put to
+// its caller, beside the transcript, so an approval after a restart
+// runs the call as the policy decided. A [ConversationStore] that
+// implements it keeps them; with one that does not, the executor keeps
+// them in memory, and after a restart an approval of a call it no
+// longer knows is refused and the call dropped, as an unanswerable one
+// is. [MemoryStore] implements it.
+type EscalationStore interface {
+	LoadEscalated(ctx context.Context, contextID string) ([]Escalated, error)
+	SaveEscalated(ctx context.Context, contextID string, calls []Escalated) error
+}
+
+// memoryEscalations is the executor's fallback [EscalationStore].
+type memoryEscalations struct {
+	mu    sync.Mutex
+	calls map[string][]Escalated
+}
+
+func (m *memoryEscalations) LoadEscalated(_ context.Context, contextID string) ([]Escalated, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]Escalated(nil), m.calls[contextID]...), nil
+}
+
+func (m *memoryEscalations) SaveEscalated(_ context.Context, contextID string, calls []Escalated) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.calls == nil {
+		m.calls = map[string][]Escalated{}
+	}
+	if len(calls) == 0 {
+		delete(m.calls, contextID)
+		return nil
+	}
+	m.calls[contextID] = append([]Escalated(nil), calls...)
+	return nil
+}
 
 // approvalsOf takes the [Approval] parts out of msg, returning them and
 // a copy of msg with the other parts.
@@ -79,6 +131,9 @@ func approvalsOf(msg *a2a.Message) ([]Approval, *a2a.Message, error) {
 			rest.Parts = append(rest.Parts, part)
 			continue
 		}
+		if _, ok := dp.Data["by"]; ok {
+			return nil, nil, fmt.Errorf("parts[%d]: an approval names who decided; the executor records the authenticated principal", i)
+		}
 		raw, err := json.Marshal(dp.Data)
 		if err != nil {
 			return nil, nil, fmt.Errorf("parts[%d]: %w", i, err)
@@ -90,47 +145,51 @@ func approvalsOf(msg *a2a.Message) ([]Approval, *a2a.Message, error) {
 		if a.CallID == "" {
 			return nil, nil, fmt.Errorf("parts[%d]: an approval names no call_id", i)
 		}
-		switch a.By {
-		case "":
-			a.By = "agent"
-		case "human", "agent":
-		default:
-			return nil, nil, fmt.Errorf("parts[%d]: an approval by %q; a caller answers as \"human\" or \"agent\"", i, a.By)
-		}
 		out = append(out, a)
 	}
 	return out, &rest, nil
 }
 
-// answer is the agentturn answer an approval makes. A refusal says the
-// caller's note in its output, which the model reads, so the note is
-// not said a second time.
-func (a Approval) answer() agentturn.Answer {
+// answer is the agentturn answer an approval of call makes, said by
+// principal. An approval runs the call with the policy's rewrite of its
+// arguments; a refusal says the caller's note in its output, which the
+// model reads, so the note is not said a second time.
+func (a Approval) answer(call Escalated, principal string) agentturn.Answer {
 	if a.Approve {
-		return agentturn.Approve(a.CallID).WithBy(a.By).WithNote(a.Note).WithReason("approved by the caller")
+		ans := agentturn.Approve(a.CallID)
+		if call.Decision != nil && call.Decision.Args != nil {
+			ans = agentturn.ApproveWith(a.CallID, call.Decision.Args)
+		}
+		ans = ans.WithReason("approved by the caller " + principal)
+		if a.Note != "" {
+			// By "" says it in the user's voice: the caller's words,
+			// never the developer's.
+			ans = ans.WithNote("The caller " + principal + " said: " + a.Note)
+		}
+		return ans
 	}
-	text := "the caller refused this call"
+	text := "the caller " + principal + " refused this call"
 	if a.Note != "" {
 		text += "; the caller said: " + a.Note
 	}
-	return agentturn.Output(&openresponses.FunctionCallOutput{CallID: a.CallID, Output: openresponses.FunctionCallOutputData{Text: text}}).WithBy(a.By)
+	return agentturn.Output(&openresponses.FunctionCallOutput{CallID: a.CallID, Output: openresponses.FunctionCallOutputData{Text: text}})
 }
 
 // escalation is what an input-required status message says about the
-// escalated calls among pending: the text parts and the metadata.
-func escalation(pending []*openresponses.FunctionCall, caller map[string]bool, reasons map[string]string) ([]a2a.Part, []any) {
+// escalated calls: the text parts and the metadata.
+func escalation(calls []Escalated) ([]a2a.Part, []any) {
 	var parts []a2a.Part
 	var meta []any
-	for _, fc := range pending {
-		if caller[fc.Name] {
-			continue
+	for _, c := range calls {
+		reason := ""
+		if c.Decision != nil {
+			reason = c.Decision.Reason
 		}
-		reason := reasons[fc.CallID]
 		if reason == "" {
 			reason = "the policy asks before this call runs"
 		}
-		parts = append(parts, a2a.TextPart{Text: fmt.Sprintf("The agent's policy asks before running %s (call %s): %s", fc.Name, fc.CallID, reason)})
-		meta = append(meta, map[string]any{"call_id": fc.CallID, "name": fc.Name, "reason": reason})
+		parts = append(parts, a2a.TextPart{Text: fmt.Sprintf("The agent's policy asks before running %s (call %s): %s", c.Call.Name, c.Call.CallID, reason)})
+		meta = append(meta, map[string]any{"call_id": c.Call.CallID, "name": c.Call.Name, "reason": reason})
 	}
 	return parts, meta
 }

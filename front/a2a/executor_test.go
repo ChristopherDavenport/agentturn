@@ -545,7 +545,7 @@ func TestStripHelpers(t *testing.T) {
 		if tc.name == "nothing pending" {
 			tr = items[:5]
 		}
-		if err := checkAnswers(tr, tc.prompts, nil, false, nil); (err == nil) != tc.ok {
+		if err := checkAnswers(tr, tc.prompts, nil, nil); (err == nil) != tc.ok {
 			t.Errorf("%s: err = %v", tc.name, err)
 		}
 	}

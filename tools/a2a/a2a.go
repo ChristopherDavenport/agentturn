@@ -49,6 +49,10 @@ type TaskInfo struct {
 	TaskID    a2a.TaskID
 	ContextID string
 	State     a2a.TaskState
+	// RecordErr is a failure to write the call's [Callee] record after
+	// the remote agent had answered: the answer is returned, and a host
+	// learns here that the record does not name the callee.
+	RecordErr error
 }
 
 // InputRequiredError is returned when the remote agent needs more input
@@ -123,23 +127,35 @@ type InputRequired func(ctx context.Context, info TaskInfo, question *a2a.Messag
 // WithInputRequired answers a task that enters input-required through
 // fn, on the same task, inside the call: a product wires fn to its
 // human plane, so the remote agent's question reaches whoever answers
-// the caller's own questions. An auth-required task is not put to fn;
-// it ends the call as before.
+// the caller's own questions. A question with no status message is put
+// as an empty agent message. An auth-required task is not put to fn; it
+// ends the call as before, as does a task still asking after
+// [WithInputRounds] answers.
 func WithInputRequired(fn InputRequired) Option { return func(r *remote) { r.inputRequired = fn } }
 
+// DefaultInputRounds is how many times a call answers a task's
+// questions through [WithInputRequired] before it ends input-required.
+const DefaultInputRounds = 8
+
+// WithInputRounds bounds the answers a call gives a task's questions
+// through [WithInputRequired]; after n the call ends input-required as
+// it would without the hook. The default is [DefaultInputRounds].
+func WithInputRounds(n int) Option { return func(r *remote) { r.inputRounds = n } }
+
 // New wraps a remote agent as a tool. The client is usually built from
-// the same card with a2aclient.NewFromCard. New adds an interceptor to
-// client that reads the URL each request is sent to, which a call
-// records as its [Callee]'s, so a client shared by several tools carries
-// one per tool; each reads only its own calls.
+// the same card with a2aclient.NewFromCard, with the [ObserveEndpoint]
+// interceptor, so a call records the URL its requests went to; New
+// changes nothing on client. Without the interceptor a call records the
+// card's URL when the card offers no other interface, and no URL
+// otherwise.
 func New(client *a2aclient.Client, card *a2a.AgentCard, opts ...Option) agenttool.Tool {
-	r := &remote{client: client}
-	if client != nil {
-		client.AddCallInterceptor(endpointWatch{})
-	}
+	r := &remote{client: client, inputRounds: DefaultInputRounds}
 	if card != nil {
 		r.name = functionName(card.Name)
 		r.description = describe(card)
+		if len(card.AdditionalInterfaces) == 0 {
+			r.cardURL = card.URL
+		}
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -173,6 +189,8 @@ type remote struct {
 	sequential    bool
 	peer          bool
 	inputRequired InputRequired
+	inputRounds   int
+	cardURL       string
 	schema        json.RawMessage
 }
 
@@ -195,31 +213,47 @@ func (r *remote) Execute(ctx context.Context, call agenttool.Call) (agenttool.Re
 	ctx = context.WithValue(ctx, endpointKey{}, ep)
 	c := &callState{remote: r, ep: ep}
 	var out outcome
-	for {
+	for rounds := 0; ; rounds++ {
 		err := r.send(ctx, call, &a2a.MessageSendParams{Message: msg}, &out, c)
 		if err != nil {
 			// The call gives up a task that has not ended, aborted or
 			// failed alike: its own work is stopped.
 			if !out.state.Terminal() {
-				c.cancel(ctx, out.taskID)
+				c.cancel(ctx, &out)
 			}
 			return agenttool.Result{}, err
 		}
-		if out.state != a2a.TaskStateInputRequired || r.inputRequired == nil || out.taskID == "" {
+		if out.state != a2a.TaskStateInputRequired || r.inputRequired == nil || out.taskID == "" || rounds >= r.inputRounds {
 			break
 		}
 		info := TaskInfo{TaskID: out.taskID, ContextID: out.contextID, State: out.state}
-		answer, err := r.inputRequired(ctx, info, out.status)
+		question := out.status
+		if question == nil {
+			question = a2a.NewMessageForTask(a2a.MessageRoleAgent, a2a.TaskInfo{TaskID: out.taskID, ContextID: out.contextID})
+		}
+		answer, err := r.inputRequired(ctx, info, question)
 		if errors.Is(err, agentturn.ErrInputRequired) {
 			break
 		}
 		if err != nil {
 			// The call gives the task up: its own work is stopped.
-			c.cancel(ctx, out.taskID)
+			c.cancel(ctx, &out)
 			return agenttool.Result{Details: info}, err
 		}
 		msg = a2a.NewMessageForTask(a2a.MessageRoleUser, a2a.TaskInfo{TaskID: out.taskID, ContextID: out.contextID}, answer...)
 		out.answered()
+	}
+	switch out.state {
+	case a2a.TaskStateInputRequired, a2a.TaskStateAuthRequired:
+		// The task waits for input, which a host may give it with the
+		// IDs the call returns; it is left as it is.
+	default:
+		if out.taskID != "" && !out.state.Terminal() {
+			// The stream closed, or a blocking call returned, before
+			// the task ended: the call is over, and its own work is
+			// stopped as an abort stops it.
+			c.cancel(ctx, &out)
+		}
 	}
 	return out.result()
 }
@@ -242,8 +276,21 @@ func (c *callState) relation() string {
 	return RelationSubsession
 }
 
+// url is the endpoint the call's requests went to: the one the client
+// sent them to, when it carries the [ObserveEndpoint] interceptor, else
+// the card's URL when the card offers no other interface, the only one
+// a client built from it can have called.
+func (c *callState) url() string {
+	if u := c.ep.get(); u != "" {
+		return u
+	}
+	return c.remote.cardURL
+}
+
 // report writes the [Callee] record once the callee is known: a task,
-// or a plain message answer with no task. It is written once per task.
+// or a plain message answer with no task. It is written once per task,
+// under a context the call's end does not cancel, since it is the
+// handle a given-up call leaves behind.
 func (c *callState) report(ctx context.Context, out *outcome) error {
 	switch {
 	case out.taskID != "":
@@ -259,15 +306,19 @@ func (c *callState) report(ctx context.Context, out *outcome) error {
 	default:
 		return nil
 	}
-	return agenttool.WriteRecord(ctx, Callee{URL: c.ep.get(), Task: string(out.taskID), Context: out.contextID, Relation: c.relation()})
+	return agenttool.WriteRecord(context.WithoutCancel(ctx), Callee{URL: c.url(), Task: string(out.taskID), Context: out.contextID, Relation: c.relation()})
 }
 
 // cancel sends tasks/cancel for a task the call gave up, unless the
-// callee is a peer, and records that it was sent. It does not wait for
-// the remote agent: the request goes from a goroutine of its own, under
-// a context that outlives the call by at most [CancelTimeout], and the
-// record says the stop was asked for, not that the work stopped.
-func (c *callState) cancel(ctx context.Context, task a2a.TaskID) {
+// callee is a peer, and records that it was sent, after the [Callee]
+// record if the call had not written it yet, so a cancel is never
+// recorded about a callee the record does not name. It does not wait
+// for the remote agent: the request goes from a goroutine of its own,
+// under a context that outlives the call by at most [CancelTimeout],
+// and the record says the stop was asked for, not that the work
+// stopped.
+func (c *callState) cancel(ctx context.Context, out *outcome) {
+	task := out.taskID
 	if c.remote.peer || task == "" {
 		return
 	}
@@ -276,34 +327,35 @@ func (c *callState) cancel(ctx context.Context, task a2a.TaskID) {
 		defer stop()
 		_, _ = c.remote.client.CancelTask(cctx, &a2a.TaskIDParams{ID: task})
 	}()
-	// The call is over, so its context may be too; the record is written
-	// under one that is not, and its failure changes nothing the call
-	// returns.
-	_ = agenttool.WriteRecord(context.WithoutCancel(ctx), CancelSent{URL: c.ep.get(), Task: string(task)})
+	// The call is over, so its context may be too; the records are
+	// written under one that is not, and their failure changes nothing
+	// the call returns.
+	_ = c.report(ctx, out)
+	_ = agenttool.WriteRecord(context.WithoutCancel(ctx), CancelSent{URL: c.url(), Task: string(task)})
 }
 
 // send sends one message and folds the answer into out, reporting the
 // callee as soon as it is known. It returns when the task is final or
-// waits on input.
+// waits on input. A record the call cannot write while the task runs
+// fails the call, which then gives the task up; once the remote agent
+// has answered, the answer stands and the record's failure is on
+// [TaskInfo.RecordErr].
 func (r *remote) send(ctx context.Context, call agenttool.Call, params *a2a.MessageSendParams, out *outcome, c *callState) error {
 	if r.blocking {
 		res, err := r.client.SendMessage(ctx, params)
 		if err != nil {
 			return fmt.Errorf("a2a: %w", err)
 		}
-		out.absorb(res)
-		if err := c.report(ctx, out); err != nil {
-			return fmt.Errorf("a2a: record the callee: %w", err)
-		}
-		return nil
+		final := out.absorb(res)
+		return out.recorded(c.report(ctx, out), final)
 	}
 	for ev, err := range r.client.SendStreamingMessage(ctx, params) {
 		if err != nil {
 			return fmt.Errorf("a2a: %w", err)
 		}
 		final := out.absorb(ev)
-		if err := c.report(ctx, out); err != nil {
-			return fmt.Errorf("a2a: record the callee: %w", err)
+		if err := out.recorded(c.report(ctx, out), final); err != nil {
+			return err
 		}
 		if final {
 			break
@@ -316,6 +368,20 @@ func (r *remote) send(ctx context.Context, call agenttool.Call, params *a2a.Mess
 		return fmt.Errorf("a2a: %w", err)
 	}
 	return nil
+}
+
+// recorded applies a failure to write the [Callee] record: it fails the
+// call while the task runs, and is kept on the result once the task
+// has answered.
+func (o *outcome) recorded(err error, final bool) error {
+	if err == nil {
+		return nil
+	}
+	if final && (o.state.Terminal() || o.message != nil) {
+		o.recordErr = err
+		return nil
+	}
+	return fmt.Errorf("a2a: record the callee: %w", err)
 }
 
 // outcome folds task events into a final view of the task.
@@ -331,6 +397,9 @@ type outcome struct {
 	// artifact marks it for a rebuild.
 	streamed strings.Builder
 	rebuild  bool
+	// recordErr is a failure to write the Callee record after the task
+	// answered.
+	recordErr error
 }
 
 // answered readies o for the agent's reply to an answer sent on the
@@ -428,7 +497,7 @@ func (o *outcome) text() string {
 }
 
 func (o *outcome) result() (agenttool.Result, error) {
-	details := TaskInfo{TaskID: o.taskID, ContextID: o.contextID, State: o.state}
+	details := TaskInfo{TaskID: o.taskID, ContextID: o.contextID, State: o.state, RecordErr: o.recordErr}
 	res := agenttool.Result{Details: details}
 	if o.message != nil && o.state == "" {
 		// A bare message reply, no task.

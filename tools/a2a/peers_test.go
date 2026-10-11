@@ -14,6 +14,7 @@ import (
 	"github.com/ChristopherDavenport/openresponses"
 	"github.com/ChristopherDavenport/openresponses/echo"
 	"github.com/a2aproject/a2a-go/a2a"
+	"github.com/a2aproject/a2a-go/a2aclient"
 	"github.com/a2aproject/a2a-go/a2asrv"
 	"github.com/a2aproject/a2a-go/a2asrv/eventqueue"
 )
@@ -296,5 +297,156 @@ func TestTheInputRequiredHookAnswersOnTheSameTask(t *testing.T) {
 				t.Errorf("with a hook that cannot answer err = %v", err)
 			}
 		})
+	}
+}
+
+// working is a remote agent whose task works until it is cancelled.
+type working struct{ cancelled chan a2a.TaskID }
+
+func (working) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue) error {
+	return q.Write(ctx, a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateWorking, nil))
+}
+
+func (s working) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue) error {
+	s.cancelled <- reqCtx.TaskID
+	ev := a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateCanceled, nil)
+	ev.Final = true
+	return q.Write(ctx, ev)
+}
+
+// TestACallThatEndsBeforeItsTaskCancelsIt pins the early end: a call
+// that returns while its task still works, here a blocking call over a
+// client that polls, which answers with the task as it stands, ends and
+// stops the task as an abort does, the Callee recorded before the
+// CancelSent.
+func TestACallThatEndsBeforeItsTaskCancelsIt(t *testing.T) {
+	remote := working{cancelled: make(chan a2a.TaskID, 4)}
+	_, card := serve(t, remote, nil)
+	client, err := a2aclient.NewFromCard(context.Background(), card, a2aclient.WithConfig(a2aclient.Config{Polling: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Destroy() })
+	var recs records
+	ctx := agenttool.ContextWithRecorder(context.Background(), recs.fn)
+	if _, err := New(client, card, WithBlocking()).Execute(ctx, agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"work"}`)}); err == nil {
+		t.Fatal("a call whose task never ended succeeded")
+	}
+	select {
+	case <-remote.cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the remote agent saw no tasks/cancel")
+	}
+	recs.mu.Lock()
+	var order []string
+	for _, r := range recs.got {
+		order = append(order, r.NS)
+	}
+	recs.mu.Unlock()
+	if len(order) != 2 || order[0] != CalleeNS || order[1] != CancelNS {
+		t.Errorf("records = %v, want the callee then the cancel", order)
+	}
+}
+
+// TestTheEndpointIsTheOneCalled pins the URL: with ObserveEndpoint on
+// the client the record names the endpoint the client sent to, and New
+// leaves the client as it was; without it, a card with other interfaces
+// names no URL rather than one the client may not have called.
+func TestTheEndpointIsTheOneCalled(t *testing.T) {
+	remoteCfg := agentturn.Config{Name: "Echo", Model: &echo.Adapter{}, ModelName: "remote"}
+	client, card := serve(t, fronta2a.New(remoteCfg), nil)
+	card.AdditionalInterfaces = []a2a.AgentInterface{{URL: "http://elsewhere.invalid/rpc", Transport: a2a.TransportProtocolGRPC}}
+	observed, err := a2aclient.NewFromCard(context.Background(), card, a2aclient.WithInterceptors(ObserveEndpoint()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = observed.Destroy() })
+	for _, tc := range []struct {
+		name   string
+		client *a2aclient.Client
+		url    string
+	}{
+		{"observed", observed, card.URL},
+		{"unobserved", client, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var recs records
+			ctx := agenttool.ContextWithRecorder(context.Background(), recs.fn)
+			if _, err := New(tc.client, card).Execute(ctx, agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"hi"}`)}); err != nil {
+				t.Fatal(err)
+			}
+			var c Callee
+			_ = json.Unmarshal(recs.of(CalleeNS)[0], &c)
+			if c.URL != tc.url {
+				t.Errorf("url = %q, want %q", c.URL, tc.url)
+			}
+		})
+	}
+}
+
+// pestering asks on every message, with no status message after the
+// first, so a hook answers until the bound.
+type pestering struct{}
+
+func (pestering) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue) error {
+	var msg *a2a.Message
+	if reqCtx.StoredTask == nil {
+		msg = a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: "more?"})
+	}
+	ev := a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateInputRequired, msg)
+	ev.Final = true
+	return q.Write(ctx, ev)
+}
+
+func (pestering) Cancel(context.Context, *a2asrv.RequestContext, eventqueue.Queue) error { return nil }
+
+// TestInputRoundsAreBounded pins the bound and the empty question: a
+// hook is asked at most WithInputRounds times, then the call ends
+// input-required, and a question with no message reaches it as an empty
+// one, never nil.
+func TestInputRoundsAreBounded(t *testing.T) {
+	client, card := serve(t, pestering{}, nil)
+	var asked int
+	var nilQuestion bool
+	hook := func(_ context.Context, _ TaskInfo, q *a2a.Message) ([]a2a.Part, error) {
+		asked++
+		nilQuestion = nilQuestion || q == nil
+		return []a2a.Part{a2a.TextPart{Text: "yes"}}, nil
+	}
+	_, err := New(client, card, WithInputRequired(hook), WithInputRounds(3)).Execute(context.Background(), agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"go"}`)})
+	var ir *InputRequiredError
+	if !errors.As(err, &ir) || asked != 3 || nilQuestion {
+		t.Errorf("err = %v, asked %d times, a nil question %v", err, asked, nilQuestion)
+	}
+}
+
+// failing is a recorder that cannot write.
+func failing(context.Context, *agenttool.Record) error { return errors.New("disk full") }
+
+// TestARecordThatCannotBeWritten pins the record's failure: while the
+// task runs it fails the call, which gives the task up; once the remote
+// agent has answered, the answer stands and the failure is on the
+// result's TaskInfo.
+func TestARecordThatCannotBeWritten(t *testing.T) {
+	remoteCfg := agentturn.Config{Name: "Echo", Model: &echo.Adapter{}, ModelName: "remote"}
+	client, card := serve(t, fronta2a.New(remoteCfg), nil)
+	ctx := agenttool.ContextWithRecorder(context.Background(), failing)
+	res, err := New(client, card, WithBlocking()).Execute(ctx, agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"hi"}`)})
+	if err != nil || res.Output.Text != "hi" || res.Details.(TaskInfo).RecordErr == nil {
+		t.Errorf("blocking: %+v %v", res, err)
+	}
+	remote := newStalling()
+	defer func() {
+		close(remote.release)
+		remote.once.Do(func() { close(remote.done) })
+	}()
+	stalled, stalledCard := serve(t, remote, nil)
+	if _, err := New(stalled, stalledCard).Execute(ctx, agenttool.Call{ID: "c2", Args: json.RawMessage(`{"input":"work"}`)}); err == nil {
+		t.Error("streaming: a call whose record failed while the task ran succeeded")
+	}
+	select {
+	case <-remote.cancelled:
+	case <-time.After(5 * time.Second):
+		t.Error("streaming: the task was not given up")
 	}
 }

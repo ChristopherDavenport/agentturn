@@ -31,6 +31,8 @@ type Executor struct {
 	route       Route
 	auth        *Authenticator
 	escalate    bool
+	owners      Owners
+	escalations memoryEscalations
 
 	mu      sync.Mutex
 	cancels map[a2a.TaskID]context.CancelFunc
@@ -239,7 +241,24 @@ func New(cfg agentturn.Config, opts ...Option) *Executor {
 	if e.store == nil {
 		e.store = &MemoryStore{}
 	}
+	if e.owners == nil {
+		e.owners = &MemoryOwners{}
+	}
+	if e.escalate && e.auth == nil {
+		// An approval lets a call run on the caller's word, so the
+		// caller must be someone.
+		panic("front/a2a: WithEscalation requires WithAuthenticator")
+	}
 	return e
+}
+
+// escalationStore is where the calls a task put to its caller are
+// kept: the conversation store when it keeps them, else memory.
+func (e *Executor) escalationStore() EscalationStore {
+	if s, ok := e.store.(EscalationStore); ok {
+		return s
+	}
+	return &e.escalations
 }
 
 // Execute runs the loop for one message and translates the run into A2A
@@ -250,8 +269,11 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	if reqCtx.Message == nil {
 		return fmt.Errorf("%w: message is required", a2a.ErrInvalidParams)
 	}
-	ctx, _, err := e.authenticated(ctx)
+	ctx, principal, err := e.authenticated(ctx)
 	if err != nil {
+		return err
+	}
+	if err := e.takeOwnership(ctx, principal, reqCtx.TaskID, reqCtx.ContextID); err != nil {
 		return err
 	}
 	approvals, rest, err := approvalsOf(reqCtx.Message)
@@ -302,12 +324,24 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	start := e.startFor(runCtx, slices.Concat(transcript, prompts))
 	caller := slices.Concat(e.callerTools, declared)
 	callers := callerNames(caller)
-	var closed map[string]string
-	if !e.escalate {
-		// Under escalation a pending call of the agent's own tool is
-		// the caller's to approve, not one to drop.
-		transcript, closed = e.closeOwnPending(runCtx, transcript, caller)
+	// The calls this task put to its caller, which an approval may run
+	// as the policy decided; any other pending call of the agent's own
+	// is dropped below, as one the caller cannot answer.
+	var escalated []Escalated
+	asked := map[string]Escalated{}
+	if e.escalate {
+		all, err := e.escalationStore().LoadEscalated(ctx, reqCtx.ContextID)
+		if err != nil {
+			return fmt.Errorf("load escalated calls of %q: %w", reqCtx.ContextID, err)
+		}
+		for _, c := range all {
+			if c.Call != nil && c.Task == string(reqCtx.TaskID) {
+				escalated = append(escalated, c)
+				asked[c.Call.CallID] = c
+			}
+		}
 	}
+	transcript, closed := e.closeOwnPending(runCtx, transcript, caller, asked)
 	for _, item := range prompts {
 		if fco, ok := item.(*openresponses.FunctionCallOutput); ok && closed[fco.CallID] != "" {
 			// The message answers a call the caller can never answer,
@@ -316,12 +350,12 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 			return fmt.Errorf("%w: function_call_output %q answers a call to %q, the agent's own tool, which the caller cannot answer", a2a.ErrInvalidParams, fco.CallID, closed[fco.CallID])
 		}
 	}
-	if err := checkAnswers(transcript, prompts, approvals, e.escalate, callers); err != nil {
+	if err := checkAnswers(transcript, prompts, approvals, asked); err != nil {
 		// A follow-up that does not answer the pending calls leaves the
 		// task where it was, input-required, with the calls repeated
 		// and the rule stated; failing the task would make it
 		// unrecoverable.
-		return e.inputRequired(ctx, reqCtx, q, unanswered(transcript), err.Error(), callers, nil)
+		return e.inputRequired(ctx, reqCtx, q, unanswered(transcript), err.Error(), escalated)
 	}
 	if err := e.checkDeclared(runCtx, declared, start); err != nil {
 		return fmt.Errorf("%w: %w", a2a.ErrInvalidParams, err)
@@ -333,11 +367,12 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	opts := []agentturn.Option{agentturn.WithTranscript(transcript), agentturn.WithReasoningModels(models)}
 	if len(approvals) > 0 {
 		// The calls the last run deferred, the caller's and the escalated
-		// ones alike, were never handed to a tool, so an approval runs
-		// the call as it stands.
+		// ones alike, were never handed to a tool; an escalated one
+		// carries the decision the policy made about it, its note
+		// included, which the loop says when the approval releases it.
 		var seeded []agentturn.PendingCall
 		for _, fc := range unanswered(transcript) {
-			seeded = append(seeded, agentturn.PendingCall{Call: fc, Reason: agentturn.PendingDeferred})
+			seeded = append(seeded, agentturn.PendingCall{Call: fc, Reason: agentturn.PendingDeferred, Decision: asked[fc.CallID].Decision})
 		}
 		opts = append(opts, agentturn.WithPending(seeded))
 	}
@@ -365,7 +400,7 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 			answers = append(answers, agentturn.Output(item.(*openresponses.FunctionCallOutput)))
 		}
 		for _, a := range approvals {
-			answers = append(answers, a.answer())
+			answers = append(answers, a.answer(asked[a.CallID], principal))
 		}
 		run = func(ctx context.Context) (*agentturn.RunEnd, error) { return agent.Resume(ctx, answers...) }
 	}
@@ -379,7 +414,20 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 		// report the task as canceled.
 		return out.writeErr
 	}
-	return e.conclude(ctx, reqCtx, q, out, callers)
+	escalated = nil
+	if e.escalate {
+		if out.end.Reason == agentturn.ReasonInputRequired {
+			for _, p := range out.end.Pending {
+				if p.Call != nil && !callers[p.Call.Name] {
+					escalated = append(escalated, Escalated{Task: string(reqCtx.TaskID), Call: p.Call, Decision: p.Decision})
+				}
+			}
+		}
+		if err := e.escalationStore().SaveEscalated(ctx, reqCtx.ContextID, escalated); err != nil {
+			return fmt.Errorf("save escalated calls of %q: %w", reqCtx.ContextID, err)
+		}
+	}
+	return e.conclude(ctx, reqCtx, q, out, escalated)
 }
 
 // track registers cancel for the task and returns the function that
@@ -594,16 +642,10 @@ func (e *Executor) persist(ctx context.Context, contextID string, transcript age
 }
 
 // conclude writes the task's final status from the run's reason.
-func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue, out outcome, callers map[string]bool) error {
+func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue, out outcome, escalated []Escalated) error {
 	switch out.end.Reason {
 	case agentturn.ReasonInputRequired:
-		reasons := map[string]string{}
-		for _, p := range out.end.Pending {
-			if p.Call != nil && p.Decision != nil {
-				reasons[p.Call.CallID] = p.Decision.Reason
-			}
-		}
-		return e.inputRequired(ctx, reqCtx, q, agentturn.PendingCalls(out.end.Pending), "", callers, reasons)
+		return e.inputRequired(ctx, reqCtx, q, agentturn.PendingCalls(out.end.Pending), "", escalated)
 	case agentturn.ReasonDone, agentturn.ReasonStopped:
 		if _, ok := out.end.Answer(); out.end.Cause == agentturn.StopGuard && !ok {
 			// A guard stopped the run before the agent answered, at
@@ -693,7 +735,7 @@ func (e *Executor) transfers(name string) bool {
 // whose name the caller owns under [WithCallerTools] or the message's
 // declaration is the caller's whatever the agent owns. A transfer the
 // route takes is the agent's under any configuration.
-func (e *Executor) closeOwnPending(ctx context.Context, t agentturn.Transcript, caller []*openresponses.FunctionTool) (agentturn.Transcript, map[string]string) {
+func (e *Executor) closeOwnPending(ctx context.Context, t agentturn.Transcript, caller []*openresponses.FunctionTool, asked map[string]Escalated) (agentturn.Transcript, map[string]string) {
 	answered := answeredCalls(t)
 	callers := map[string]bool{}
 	for _, ft := range caller {
@@ -703,6 +745,10 @@ func (e *Executor) closeOwnPending(ctx context.Context, t agentturn.Transcript, 
 	for i, item := range t {
 		fc, ok := item.(*openresponses.FunctionCall)
 		if !ok || answered[fc.CallID] || callers[fc.Name] {
+			continue
+		}
+		if _, escalated := asked[fc.CallID]; escalated {
+			// The caller approves it: this task put it to the caller.
 			continue
 		}
 		if e.transfers(fc.Name) {
@@ -922,7 +968,7 @@ func unanswered(t agentturn.Transcript) []*openresponses.FunctionCall {
 // agent owns and the caller does not never reaches it: closeOwnPending
 // drops it from the conversation first, and Execute refuses a message
 // answering it as invalid params (issue #209).
-func checkAnswers(t agentturn.Transcript, prompts openresponses.Items, approvals []Approval, escalate bool, callers map[string]bool) error {
+func checkAnswers(t agentturn.Transcript, prompts openresponses.Items, approvals []Approval, asked map[string]Escalated) error {
 	pending := unanswered(t)
 	if len(pending) == 0 {
 		if len(approvals) > 0 {
@@ -930,14 +976,14 @@ func checkAnswers(t agentturn.Transcript, prompts openresponses.Items, approvals
 		}
 		return nil
 	}
-	// own says the call is one of the agent's own tools the caller
-	// approves, under escalation, rather than one of the caller's that
-	// it answers with an output.
+	// own says the call is one of the agent's own tools this task put
+	// to the caller, which it approves, rather than one of the caller's
+	// that it answers with an output.
 	want := make(map[string]bool, len(pending))
 	own := make(map[string]bool, len(pending))
 	for _, fc := range pending {
 		want[fc.CallID] = true
-		own[fc.CallID] = escalate && !callers[fc.Name]
+		_, own[fc.CallID] = asked[fc.CallID]
 	}
 	for _, item := range prompts {
 		fco, ok := item.(*openresponses.FunctionCallOutput)
@@ -984,16 +1030,16 @@ func stripUnanswered(items openresponses.Items) openresponses.Items {
 
 // inputRequired ends the execution with the pending calls on the status
 // message, preceded by note as a text part when it is not empty.
-func (e *Executor) inputRequired(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue, pending []*openresponses.FunctionCall, note string, callers map[string]bool, reasons map[string]string) error {
+func (e *Executor) inputRequired(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue, pending []*openresponses.FunctionCall, note string, escalated []Escalated) error {
 	parts := make([]a2a.Part, 0, len(pending)+1)
 	if note != "" {
 		parts = append(parts, a2a.TextPart{Text: note})
 	}
-	var escalated []any
-	if e.escalate {
-		var asked []a2a.Part
-		asked, escalated = escalation(pending, callers, reasons)
-		parts = append(parts, asked...)
+	asked, meta := escalation(escalated)
+	parts = append(parts, asked...)
+	isAsked := map[string]bool{}
+	for _, c := range escalated {
+		isAsked[c.Call.CallID] = true
 	}
 	for _, fc := range pending {
 		dp, err := dataPart(fc)
@@ -1006,15 +1052,15 @@ func (e *Executor) inputRequired(ctx context.Context, reqCtx *a2asrv.RequestCont
 	// JSON decode produces, and so does every caller on the wire.
 	ids := make([]any, 0, len(pending))
 	for _, fc := range pending {
-		if e.escalate && !callers[fc.Name] {
+		if isAsked[fc.CallID] {
 			continue
 		}
 		ids = append(ids, fc.CallID)
 	}
 	msg := a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, parts...)
 	msg.SetMeta(MetaPendingCalls, ids)
-	if len(escalated) > 0 {
-		msg.SetMeta(MetaEscalatedCalls, escalated)
+	if len(meta) > 0 {
+		msg.SetMeta(MetaEscalatedCalls, meta)
 	}
 	return e.finish(ctx, reqCtx, q, a2a.TaskStateInputRequired, msg)
 }
@@ -1035,7 +1081,11 @@ func errorMessage(info a2a.TaskInfoProvider, err error) *a2a.Message {
 // Cancel aborts the task's run, if one is active, and marks the task
 // canceled.
 func (e *Executor) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue) error {
-	if _, _, err := e.authenticated(ctx); err != nil {
+	_, principal, err := e.authenticated(ctx)
+	if err != nil {
+		return err
+	}
+	if err := e.owns(ctx, principal, reqCtx.TaskID); err != nil {
 		return err
 	}
 	e.mu.Lock()

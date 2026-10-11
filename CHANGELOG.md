@@ -9,45 +9,63 @@ versions may break the API.
 
 - Added: `tools/a2a` records the callee a call reaches, through
   `agenttool.WriteRecord`, as soon as it is known: a `Callee` record
-  (namespace `agentturn:a2a_callee`) with the URL the call was sent to
-  (the endpoint the client connected to, never a name the card claims),
+  (namespace `agentturn:a2a_callee`) with the URL the call was sent to,
   the task and context IDs, or the context alone for an answer that is a
   plain message, and the relation, `subsession` by default and `peer`
   under `WithoutCancelOnAbort`. A call dispatched again reaches a new task
-  and writes a new record; the answers on one task do not.
-- Added: a `tools/a2a` call given up before its task ended, its context
-  ended or the call failed, sends `tasks/cancel` for the task from a
-  goroutine of its own, bounded by `CancelTimeout`, and returns at once
-  without waiting for the task to reach canceled; it records a
-  `CancelSent` (namespace `agentturn:a2a_cancel`), which says the stop was
+  and writes a new record; the answers on one task do not. The URL is the
+  endpoint the client sent to when the client carries the new
+  `ObserveEndpoint` interceptor, else the card's URL when the card offers
+  no other interface, else none; `New` changes nothing on the client.
+- Added: a record that cannot be written while the task runs fails the
+  call, which gives the task up; once the remote agent has answered, the
+  answer is returned and the failure is on `TaskInfo.RecordErr`.
+- Changed: a `tools/a2a` call given up before its task ended, its context
+  ended, the call failed, or the call returned while the task still
+  worked (a stream that closed early, a polling client's answer), sends
+  `tasks/cancel` for the task from a goroutine of its own, bounded by
+  `CancelTimeout`, and returns without waiting for the task to reach
+  canceled; it records a `CancelSent` (namespace `agentturn:a2a_cancel`),
+  after the `Callee` if that was not yet written, which says the stop was
   asked for, not that the work stopped. `WithoutCancelOnAbort` leaves a
-  peer's task running and records no cancel. A blocking call
-  (`WithBlocking`) that is given up before the remote agent answered has
-  no task ID to cancel.
+  peer's task running and records no cancel. A task waiting on input is
+  left as it is. A blocking call given up before the remote agent
+  answered has no task ID to cancel.
 - Added: `tools/a2a`'s `WithInputRequired(fn)` answers a task that enters
-  input-required inside the call: the remote agent's question goes to
-  `fn`, its answer is sent on the same task and the call goes on. A hook
-  that cannot answer returns an error matching `agentturn.ErrInputRequired`
-  and the call ends with an `InputRequiredError` as before.
-- Added: `front/a2a`'s `WithAuthenticator`, with `BearerTokens`:
-  `Executor.Handler` authenticates each HTTP request and refuses one it
-  does not accept with 401; the executor refuses a message or a cancel
-  whose context names no principal (`ContextWithPrincipal`), so a handler
-  mounted without it serves nobody; each task's run is prompted under the
-  trigger `{Kind: "a2a", Ref: principal}`; and `Executor.Secure` declares
-  the scheme on the agent card.
-- Added: `front/a2a`'s `WithEscalation` puts a call of the agent's own
-  tool its policy defers to the caller instead of the serving side's
-  elicitor: the task enters input-required with the call among the
+  input-required inside the call, on the same task, at most
+  `WithInputRounds` times (`DefaultInputRounds`, 8); a hook that cannot
+  answer returns an error matching `agentturn.ErrInputRequired` and the
+  call ends with an `InputRequiredError` as before.
+- Added: `front/a2a`'s `WithAuthenticator`, with `BearerTokens` (the
+  token compared as a hash with every known one, the scheme in any
+  case): `Executor.Interceptor`, installed by `Executor.RequestHandler`,
+  authenticates every call from its metadata on every method and
+  transport and refuses an unauthenticated one before the executor or the
+  task store sees it; each task and conversation belongs to the principal
+  that created it (`Owners`, in memory by default, `WithOwners`), and a
+  call about another's, a message, tasks/get, tasks/cancel, resubscribe
+  or the push configuration, is refused as not found, while tasks/list
+  shows the principal's own; the executor runs no task for a call that
+  did not pass the interceptor; each task's run is prompted under the
+  trigger `{Kind: "a2a", Ref: principal}`. `Executor.Handler` answers an
+  HTTP request early with 401, and `Executor.Secure` returns a copy of a
+  card that requires the scheme once.
+- Added: `front/a2a`'s `WithEscalation`, which requires
+  `WithAuthenticator` (`New` panics without it), puts a call of the
+  agent's own tool its policy defers to the caller instead of the serving
+  side's elicitor: the task enters input-required with the call among the
   status message's data parts, the policy's reason as text and under
   `MetaEscalatedCalls`, and the caller answers with an `Approval` data
-  part (`ApprovalPart`). An approval runs the call, its note said to the
-  model after the batch's outputs in the voice its `By` names ("human",
-  or "agent" when it names none); a refusal is the call's output, with
-  the caller's note in it. A caller cannot answer as "policy", answer an
-  escalated call with a `function_call_output`, or send an approval to an
-  executor without the option. `MetaPendingCalls` lists only the calls to
-  the caller's own tools.
+  part (`ApprovalPart`). Only the calls the policy deferred in that task
+  may be approved, as the policy decided them, its rewrite of the
+  arguments and its note included; they are kept beside the conversation
+  (`EscalationStore`, which `MemoryStore` implements), so a re-ask keeps
+  the policy's reason. The answer's run is under the caller's principal,
+  the decision names nobody (the executor cannot tell a person on the
+  caller's side from a program), and an approval naming its decider is
+  refused; the caller's note reaches the model as "The caller
+  <principal> said: …" in the user's voice, or in a refusal's output.
+  `MetaPendingCalls` lists only the calls to the caller's own tools.
 
 ## v0.0.27 - 2026-10-11
 

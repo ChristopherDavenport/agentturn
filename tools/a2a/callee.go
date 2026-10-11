@@ -88,9 +88,17 @@ func (e *endpoint) get() string {
 
 type endpointKey struct{}
 
-// endpointWatch is the client interceptor that reads the URL each
-// request goes to: the endpoint the client chose among the card's
-// interfaces, which is the one called.
+// ObserveEndpoint returns the client interceptor that tells a call the
+// URL each of its requests goes to: the endpoint the client chose among
+// the card's interfaces, which is the one the [Callee] record names.
+// Install it when building the client, so [New] need not change it:
+//
+//	client, _ := a2aclient.NewFromCard(ctx, card, a2aclient.WithInterceptors(a2a.ObserveEndpoint()))
+//
+// It reads only the calls of this package's tools, through their
+// contexts, so one client can serve several tools and other callers.
+func ObserveEndpoint() a2aclient.CallInterceptor { return endpointWatch{} }
+
 type endpointWatch struct {
 	a2aclient.PassthroughInterceptor
 }

@@ -122,26 +122,39 @@
 //
 // # Authentication
 //
-// [WithAuthenticator] names a principal on every message and cancel:
-// [Executor.Handler] authenticates each HTTP request and refuses one it
-// does not accept with 401, the executor refuses a request whose
-// context names no principal, and each task's run is prompted under the
-// trigger {Kind: "a2a", Ref: principal}, so the record says who asked.
+// [WithAuthenticator] names a principal on every call and makes each
+// task and conversation its creator's. [Executor.Interceptor], which
+// [Executor.RequestHandler] installs, authenticates every call of the
+// A2A handler from its metadata, on every method and transport, and
+// refuses one it does not accept before it reaches the executor or the
+// task store, so an unauthenticated message naming a task leaves that
+// task as it was. It refuses, as task not found, a call about a task or
+// conversation another principal owns, and tasks/list shows a principal
+// its own tasks only. The executor runs no task for a call that did not
+// pass the interceptor. Each task's run is prompted under the trigger
+// {Kind: "a2a", Ref: principal}, so the record says who asked.
+// [Executor.Handler] answers an HTTP request early with 401;
 // [Executor.Secure] declares the scheme on the card, which is served
 // apart, unauthenticated, so a caller can learn it. TLS is the
 // deployment's.
 //
 // # Escalation
 //
-// [WithEscalation] changes who answers the agent's own policy: a call of
-// the agent's own tool its BeforeToolCall defers is put to the caller,
-// not to Config.ToolElicitor. The task enters input-required with the
-// call among the status message's data parts and the policy's reason as
-// text and under [MetaEscalatedCalls], and the caller answers with an
+// [WithEscalation], which requires [WithAuthenticator], changes who
+// answers the agent's own policy: a call of the agent's own tool its
+// BeforeToolCall defers is put to the caller, not to
+// Config.ToolElicitor. The task enters input-required with the call
+// among the status message's data parts and the policy's reason as text
+// and under [MetaEscalatedCalls], and the caller answers with an
 // [Approval] data part on a message for the same task, beside the
-// outputs of any calls to its own tools. It is for a headless agent
-// nobody watches, whose caller's human plane should decide; without it
-// each system's policy is its own.
+// outputs of any calls to its own tools. Only the calls the policy
+// deferred in that task may be approved, and an approval runs the call
+// as the policy decided it, its rewrite of the arguments and its note
+// included. The run the answer resumes is under the caller's principal,
+// and the caller's note reaches the model as the caller's words, in the
+// user's voice, never the developer's. It is for a headless agent nobody
+// watches, whose caller's human plane should decide; without it each
+// system's policy is its own.
 //
 // # One task per conversation
 //
