@@ -386,12 +386,14 @@ func (*ToolStart) EventType() string { return EventToolStart }
 // serialised with the run's events, and a subscriber that fails on it
 // stops the call: it ends with that error and the tool does not run,
 // so a dispatch that could not be made durable is never followed by a
-// side effect the record cannot see. The call is then pending as
-// [PendingUndispatched], or still as [PendingAborted] when an earlier
-// run dispatched it. Subscribers are called in registration order,
-// so a subscriber that vetoes a dispatch is registered before the
-// recorder: one registered after it refuses a call whose dispatch is
-// already durable. Parent is set for a nested call.
+// side effect the record cannot see. That is a failure, and the run
+// ends with [ReasonError]; it is not a way to refuse a call, which is
+// [Config.BeforeToolCall]'s, since a subscriber observes. The call is
+// then pending as [PendingUndispatched], or still as [PendingAborted]
+// when an earlier run dispatched it, and its tool_end is
+// [ToolEnd.Withdrawn], so a recorder called before the subscriber that
+// failed, which has written the dispatch, writes that the hand-off was
+// withdrawn. Parent is set for a nested call.
 //
 // IdempotencyKey is the key the tool receives on agenttool.Call: the
 // loop mints one for every call it dispatches and keeps it when the
@@ -446,6 +448,12 @@ type ToolEnd struct {
 	// Parent is the ID of the call whose tool made this one with
 	// [Invoke], and empty for a call the model made.
 	Parent string
+	// Withdrawn says the call's tool_dispatch was raised and a
+	// subscriber failed on it, so the tool never ran: the hand-off was
+	// withdrawn. A recorder that wrote the dispatch before that
+	// subscriber failed writes so, and the call reads as never started
+	// rather than as one that may have run.
+	Withdrawn bool
 }
 
 // EventType returns "tool_end".

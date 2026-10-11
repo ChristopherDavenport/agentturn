@@ -23,7 +23,12 @@ import (
 //
 // The events a subscriber gets are the agent's own, unnarrowed: what a
 // client needs that the loop knows is on them, and a question asked
-// while a call runs is one of them ([Question]). A product's controls,
+// while a call runs is one of them ([Question]). A subscriber observes:
+// an error it returns is a failure, such as a recorder that could not
+// write, and ends the run with [ReasonError]. It is not a decision, and
+// a view must not use it as one: refusing or holding a call is
+// [Config.BeforeToolCall]'s, whose verdict the record keeps, and asking
+// a person is a [Question] answered with Reply. A product's controls,
 // such as switching the model, are not the loop's vocabulary and are
 // not in the contract.
 //

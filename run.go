@@ -2542,7 +2542,7 @@ func (r *runner) finish(p *callState) error {
 	// delivery that fails is the consumer's failure, and the call is
 	// not ended a second time for it.
 	p.ended = true
-	return r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Reason: p.reason, Parent: p.parent})
+	return r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Reason: p.reason, Parent: p.parent, Withdrawn: p.dispatchErr != nil})
 }
 
 func validObject(raw json.RawMessage) bool {

@@ -52,6 +52,17 @@ versions may break the API.
   scope the host names with the new `WithChosenBy`, such as a policy
   engine answering over the wire; a client holding only `answer` can no
   longer make a person's decision read as a rule's. (#240)
+- Changed: a subscriber observes. `Control`'s doc says an error a
+  subscriber returns is a failure that ends the run with `ReasonError`,
+  never a decision: refusing a call is `BeforeToolCall`'s and asking a
+  person is a `Question`. `tool_dispatch`'s doc no longer tells a host
+  to register a vetoing subscriber before the recorder. (#119)
+- Added: `ToolEnd.Withdrawn`, set when a subscriber failed on the call's
+  `tool_dispatch`, so the tool never ran, and carried by
+  `front/control`. A recorder that wrote the dispatch first can now say
+  the hand-off was withdrawn; agentturn/session does in the release
+  after this one, so such a call reads as never started rather than as
+  one that may have run. (#119)
 
 ## v0.0.22 - 2026-10-10
 
