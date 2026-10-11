@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -10,7 +11,9 @@ import (
 	"github.com/ChristopherDavenport/agentsession"
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
+	"github.com/ChristopherDavenport/agentturn/tools/agent"
 	"github.com/ChristopherDavenport/openresponses"
+	"github.com/ChristopherDavenport/openresponses/echo"
 )
 
 // rawRecord is a record in any namespace with any JSON, as tools/a2a's
@@ -127,6 +130,25 @@ func TestA2ARecordsAreLinks(t *testing.T) {
 			name:    "an unknown relation stays a custom entry",
 			records: []rawRecord{calleeRecord(url, "task-1", "ctx-1", "sibling")},
 			entries: a2aCalleeNS,
+		},
+		{
+			name:    "a callee with no relation stays a custom entry",
+			records: []rawRecord{{a2aCalleeNS, `{"url":"` + url + `","task":"task-1","context":"ctx-1"}`}},
+			entries: a2aCalleeNS,
+		},
+		{
+			name:    "a callee with a member the link has no place for stays a custom entry",
+			records: []rawRecord{{a2aCalleeNS, `{"url":"` + url + `","task":"task-1","context":"ctx-1","relation":"subsession","session":"s-1"}`}},
+			entries: a2aCalleeNS,
+		},
+		{
+			name: "a cancel with a member the link has no place for stays a custom entry",
+			records: []rawRecord{
+				calleeRecord(url, "task-1", "ctx-1", "subsession"),
+				{a2aCancelNS, `{"url":"` + url + `","task":"task-1","reason":"timeout"}`},
+			},
+			entries: "link:subsession " + a2aCancelNS,
+			callees: []calleeShape{{agentsession.RelSubsession, "task-1", false, true}},
 		},
 		{
 			name:    "a callee that does not decode stays a custom entry",
@@ -477,6 +499,11 @@ func TestReplayedA2AOutputKeepsItsCallees(t *testing.T) {
 		if cl.Cancelled != was.Cancelled {
 			t.Errorf("callee %d cancelled = %v, the branch left's %v", i, cl.Cancelled, was.Cancelled)
 		}
+		// The output on the new branch is the harness's answer: a copy
+		// belongs to no dispatch of this branch and did not answer.
+		if cl.Answered || cl.Dispatch != "" {
+			t.Errorf("callee %d answered = %v on dispatch %q, want a copy that answered nothing", i, cl.Answered, cl.Dispatch)
+		}
 	}
 	for _, e := range s.Path(s.Leaf()) {
 		if l, ok := e.(*agentsession.LinkEntry); ok && l.Cancel != "" && l.Target != callees[0].ID {
@@ -510,6 +537,16 @@ func TestSubsessionOnIgnoresCallees(t *testing.T) {
 			callee := agentsession.NewCalleeSubsessionLink("call_1", remote)
 			return []agentsession.Entry{agentsession.NewSubsessionLink("child", "call_1"), callee}
 		}, "child"},
+		{"a notice naming an earlier child", func(s *agentsession.Session) []agentsession.Entry {
+			a := agentsession.NewSubsessionLink("child-a", "call_1")
+			if _, err := s.Append(a); err != nil {
+				panic(err)
+			}
+			if _, err := s.Append(agentsession.NewSubsessionLink("child-b", "call_1")); err != nil {
+				panic(err)
+			}
+			return []agentsession.Entry{agentsession.NewCancelSentLink(a)}
+		}, "child-b"},
 		{"another call's child", func(*agentsession.Session) []agentsession.Entry {
 			return []agentsession.Entry{agentsession.NewSubsessionLink("child", "call_2")}
 		}, ""},
@@ -577,4 +614,352 @@ func TestA2ACancelOffThePath(t *testing.T) {
 		t.Errorf("cancels written as custom entries = %d, want 1", n)
 	}
 	verifyAll(t, s)
+}
+
+// TestA2ANestedCallRecordStaysCustom: a record written by a call a tool
+// made through agentturn.Invoke names the call the session holds, the
+// one whose tool made it, and a link of that call would read as its
+// callee having answered it; it stays a custom entry. The outer call's
+// own record is its link.
+func TestA2ANestedCallRecordStaysCustom(t *testing.T) {
+	ctx := context.Background()
+	const url = "https://remote.example/a2a"
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer := agenttool.New("outer", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		if err := agenttool.WriteRecord(ctx, calleeRecord(url, "outer-task", "", "subsession")); err != nil {
+			return "", err
+		}
+		if _, err := agentturn.Invoke(ctx, "remote", json.RawMessage(`{"text":"x"}`)); err != nil {
+			return "", err
+		}
+		return "combined", nil
+	})
+	inner := recordsTool(calleeRecord(url, "inner-task", "", "subsession"), cancelRecord(url, "outer-task"))
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{outer, inner}, MaxTurns: 1, ToolRecorder: rec.RecordFunc()})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(ctx, openresponses.UserText("x")); err != nil {
+		t.Fatal(err)
+	}
+	call := callsOf(t, s)["outer"]
+	if call == nil {
+		t.Fatalf("no outer call in %q", entryTypes(s))
+	}
+	callees, err := s.Callees(s.Leaf())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := shapesOf(callees), []calleeShape{{agentsession.RelSubsession, "outer-task", false, true}}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("callees = %+v, want the outer call's alone, %+v", got, want)
+	}
+	for _, ns := range []string{a2aCalleeNS, a2aCancelNS} {
+		cs := customs(s, ns)
+		if len(cs) != 1 || cs[0].CallID != call.ID() {
+			t.Errorf("%s custom entries = %+v, want the nested call's one, under %s", ns, cs, call.ID())
+		}
+	}
+	verifyAll(t, s)
+}
+
+// TestA2AJobCancelInAChild: a cancel a job in a child run writes after
+// the run ended goes to the child's session, reopened at its leaf, and
+// names the callee link the child's run wrote there.
+func TestA2AJobCancelInAChild(t *testing.T) {
+	ctx := context.Background()
+	const url = "https://remote.example/a2a"
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jobCtx context.Context
+	remote := agenttool.New("remote", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		jobCtx = ctx
+		return "started", agenttool.WriteRecord(ctx, calleeRecord(url, "task-1", "", "subsession"))
+	})
+	childCfg := agentturn.Config{Name: "helper", Description: "delegates", Model: scriptedCalls{{"remote", `{"text":"t"}`}},
+		Tools: []agenttool.Tool{remote}, ToolRecorder: rec.RecordFunc()}
+	helper := agent.New(childCfg, agent.WithObserver(rec.Observe))
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{helper}})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(ctx, openresponses.UserText("delegate")); err != nil {
+		t.Fatal(err)
+	}
+	l := links(s)
+	if len(l) != 1 || jobCtx == nil {
+		t.Fatalf("links = %+v", l)
+	}
+	data, _ := json.Marshal(map[string]string{"url": url, "task": "task-1"})
+	if err := rec.RecordFunc()(jobCtx, &agenttool.Record{NS: a2aCancelNS, Data: data}); err != nil {
+		t.Fatal(err)
+	}
+	child, err := store.Open(ctx, l[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callees, err := child.Callees(child.Leaf())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := shapesOf(callees), []calleeShape{{agentsession.RelSubsession, "task-1", true, false}}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("child callees = %+v, want %+v", got, want)
+	}
+	if n := len(customs(child, a2aCancelNS)); n != 0 {
+		t.Errorf("%d cancels written as custom entries in the child", n)
+	}
+	verifyAll(t, s)
+	verifyAll(t, child)
+}
+
+// TestCalleeCopyKeepsExtensionMembers: a copy carries the members of
+// the link the library does not define, so it is the link whole, and
+// leaves a target or cancel member behind, which a callee link has
+// none of.
+func TestCalleeCopyKeepsExtensionMembers(t *testing.T) {
+	l := agentsession.NewCalleeSubsessionLink("call_1", agentsession.Callee{URL: "https://remote.example", Task: "task-1", Context: "ctx-1", Session: "s-1"})
+	l.ID = "old"
+	l.Unknown = map[string]json.RawMessage{"x:priority": json.RawMessage(`"high"`), "target": json.RawMessage(`7`), "cancel": json.RawMessage(`true`)}
+	c := calleeCopy(l, "new")
+	if c.ID != "new" || !sameCallee(c, l) {
+		t.Errorf("copy = %+v, want %+v as new", c, l)
+	}
+	if len(c.Unknown) != 1 || string(c.Unknown["x:priority"]) != `"high"` {
+		t.Errorf("copy's members = %v, want x:priority alone", c.Unknown)
+	}
+	c.Unknown["x:priority"] = json.RawMessage(`"low"`)
+	if string(l.Unknown["x:priority"]) != `"high"` {
+		t.Error("the copy shares the link's members")
+	}
+	s, err := agentsession.NewMemoryStore().Create(context.Background(), agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(agentsession.NewItemEntry(&openresponses.FunctionCall{CallID: "call_1", Name: "remote", Arguments: "{}"})); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.Append(calleeCopy(l, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, _ := s.Entry(id)
+	if got, ok := e.(*agentsession.LinkEntry); !ok || string(got.Unknown["x:priority"]) != `"high"` || got.URL != l.URL {
+		t.Errorf("stored copy = %+v", e)
+	}
+}
+
+// failingNotice fails the first cancel notice appended while armed, as
+// a store that runs out of room between two appends does.
+type failingNotice struct {
+	agentsession.Store
+	armed *bool
+}
+
+func (s failingNotice) Append(ctx context.Context, id string, e agentsession.Entry) (string, error) {
+	if l, ok := e.(*agentsession.LinkEntry); ok && l.Cancel != "" && *s.armed {
+		*s.armed = false
+		return "", errors.New("disk full")
+	}
+	return s.Store.Append(ctx, id, e)
+}
+
+// TestReplayedA2ACopyIsFinished pins the copy's idempotence: a copy of
+// the branch left's callee links cut short after the link and before
+// its notice is finished by the next attempt, by the same recorder or
+// by one resumed after a restart, which keeps the copy it finds, writes
+// the notice it lacks, and writes no second copy.
+func TestReplayedA2ACopyIsFinished(t *testing.T) {
+	const url = "https://remote.example/a2a"
+	for _, restart := range []bool{false, true} {
+		t.Run(fmt.Sprintf("restart=%v", restart), func(t *testing.T) {
+			ctx := context.Background()
+			armed := false
+			store := failingNotice{agentsession.NewMemoryStore(), &armed}
+			rec, s, err := Start(ctx, store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tool := recordsTool(calleeRecord(url, "task-1", "", "subsession"), cancelRecord(url, "task-1"), calleeRecord(url, "task-2", "", "peer"))
+			tools := []agenttool.Tool{tool}
+			a := agentturn.New(agentturn.Config{Model: allCalls{}, Tools: tools, ToolRecorder: rec.RecordFunc()})
+			unsub := rec.Attach(a)
+			if _, err := a.Prompt(ctx, openresponses.UserText("go")); err != nil {
+				t.Fatal(err)
+			}
+			unsub()
+			c := callsOf(t, s)["remote"]
+			if err := rec.Rebase(s, c.Dispatch.Parent); err != nil {
+				t.Fatal(err)
+			}
+			answers, err := ReplayAnswers(ctx, s, tools, rec.ReadOptions()...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts, err := AgentOptions(s, rec.ReadOptions()...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := agentturn.New(agentturn.Config{Model: allCalls{}, Tools: tools, ToolRecorder: rec.RecordFunc()}, opts...)
+			unsub = rec.Attach(b)
+			armed = true
+			if end, err := b.Resume(ctx, answers...); err == nil && end.Reason == agentturn.ReasonDone {
+				t.Fatalf("the cut copy did not fail the run: %+v", end)
+			}
+			unsub()
+			if armed {
+				t.Fatal("no notice was appended")
+			}
+			// The failed run gave the call up; the next attempt seeds
+			// an agent from the record again.
+			if restart {
+				rec, s, err = Resume(ctx, store, s.ID())
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if answers, err = ReplayAnswers(ctx, s, tools, rec.ReadOptions()...); err != nil {
+				t.Fatal(err)
+			}
+			if opts, err = AgentOptions(s, rec.ReadOptions()...); err != nil {
+				t.Fatal(err)
+			}
+			b = agentturn.New(agentturn.Config{Model: allCalls{}, Tools: tools, ToolRecorder: rec.RecordFunc()}, opts...)
+			defer rec.Attach(b)()
+			if end, err := b.Resume(ctx, answers...); err != nil || end.Reason != agentturn.ReasonDone {
+				t.Fatalf("retry: err=%v end=%+v", err, end)
+			}
+			var record []string
+			for _, e := range s.Path(s.Leaf()) {
+				switch e := e.(type) {
+				case *agentsession.LinkEntry:
+					if e.Cancel != "" {
+						record = append(record, "cancel")
+					} else {
+						record = append(record, "link:"+e.Rel)
+					}
+				case *agentsession.DecisionEntry:
+					record = append(record, e.Verdict)
+				case *agentsession.ItemEntry:
+					if _, ok := e.Item.(*openresponses.FunctionCallOutput); ok {
+						record = append(record, "output")
+					}
+				}
+			}
+			if got, want := strings.Join(record, " "), "link:subsession cancel link:peer answer output"; got != want {
+				t.Errorf("the new branch's record for the call = %q, want %q", got, want)
+			}
+			callees, err := s.Callees(s.Leaf())
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []calleeShape{{agentsession.RelSubsession, "task-1", true, false}, {agentsession.RelPeer, "task-2", false, false}}
+			if got := shapesOf(callees); fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("callees = %+v, want %+v", got, want)
+			}
+			// The cut run started as a resume and holds the copied
+			// link and no decision, which VerifyRecords reads as the
+			// shape of an input, as it reads any resume cut before its
+			// first decision; every other run verifies.
+			cut := ""
+			for _, e := range s.Path(s.Leaf()) {
+				if r, ok := e.(*agentsession.RunEntry); ok && r.Phase == agentsession.RunStart {
+					cut = r.RunID
+				}
+				if _, ok := e.(*agentsession.LinkEntry); ok {
+					break
+				}
+			}
+			if err := s.VerifyRecords(s.Leaf()); err != nil && (cut == "" || !strings.Contains(err.Error(), cut)) {
+				t.Errorf("verify records: %v, want only the cut run %q reported", err, cut)
+			}
+			if err := s.VerifyLinks(noLinkedSession(t)); err != nil {
+				t.Errorf("verify links: %v", err)
+			}
+		})
+	}
+}
+
+// TestForkCopiesNoCallees: a fork that answers a call with the output
+// its origin holds writes none of the origin's callee links or cancel
+// notices: the fork started none of that work and sent none of those
+// cancels, and its fork_of reaches the origin, which holds them.
+func TestForkCopiesNoCallees(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	origin, err := store.Create(ctx, agentsession.Header{Records: agentsession.AllRecords})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append(ctx, origin.ID(), &agentsession.ItemEntry{Item: openresponses.UserText("ask the remote")}); err != nil {
+		t.Fatal(err)
+	}
+	call := &openresponses.FunctionCall{CallID: "call_1", Name: "remote", Arguments: `{"text":"t"}`}
+	target, err := store.Append(ctx, origin.ID(), &agentsession.ItemEntry{Item: call, ResponseID: "resp_1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := store.Append(ctx, origin.ID(), &agentsession.ResponseEntry{ResponseID: "resp_1", Status: openresponses.ResponseStatusCompleted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append(ctx, origin.ID(), agentsession.NewDispatch(call.CallID, target)); err != nil {
+		t.Fatal(err)
+	}
+	link := agentsession.NewCalleeSubsessionLink(call.CallID, agentsession.Callee{URL: "https://remote.example", Task: "task-1"})
+	if _, err := store.Append(ctx, origin.ID(), link); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range []agentsession.Entry{
+		agentsession.NewCancelSentLink(link),
+		&agentsession.ItemEntry{Item: openresponses.NewFunctionCallOutput(call.CallID, "answered")},
+	} {
+		if _, err := store.Append(ctx, origin.ID(), e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec, fork, err := Start(ctx, store, agentsession.Header{Base: base, ParentSession: origin.ID()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := []agenttool.Tool{recordsTool()}
+	answers, err := ReplayAnswers(ctx, fork, tools, rec.ReadOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(answers) != 1 || answers[0].Output == nil || answers[0].Reason != ranInOriginReason {
+		t.Fatalf("answers = %+v, want the origin's output", answers)
+	}
+	opts, err := AgentOptions(fork, rec.ReadOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: tools}, opts...)
+	defer rec.Attach(a)()
+	if end, err := a.Resume(ctx, answers...); err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("resume: err=%v end=%+v", err, end)
+	}
+	var record []string
+	for _, e := range fork.Path(fork.Leaf()) {
+		if fork.Prefix(e.Base().ID) {
+			continue
+		}
+		switch e := e.(type) {
+		case *agentsession.LinkEntry:
+			t.Errorf("the fork wrote a link: %+v", e)
+		case *agentsession.DecisionEntry:
+			record = append(record, e.Verdict)
+		case *agentsession.ItemEntry:
+			if _, ok := e.Item.(*openresponses.FunctionCallOutput); ok {
+				record = append(record, "output")
+			}
+		}
+	}
+	if got := strings.Join(record, " "); got != "answer output" {
+		t.Errorf("the fork's record for the call = %q, want %q", got, "answer output")
+	}
+	if err := fork.VerifyRecords(fork.Leaf()); err != nil {
+		t.Errorf("verify records: %v", err)
+	}
 }

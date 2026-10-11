@@ -286,16 +286,25 @@
 //     call sent, agentturn:a2a_cancel: the cancel notice naming the
 //     latest link of the call to the same URL and task on the path. The
 //     recorder reads their JSON and imports neither tools/a2a nor
-//     a2a-go. A record it cannot write as a link, one that does not
-//     decode, names another relation, or names no URL or no call the
-//     session holds, and a cancel whose callee's link is not on the
-//     path, is the custom entry it was. A call dispatched again reaches
-//     a new task and gets a link of its own. An output answered on a
-//     new branch with the one the call returned on a branch left, which
-//     [ReplayAnswers] gives, brings the links of the callees that
-//     dispatch reached with it, as it brings a child's link, each
-//     copied whole and each cancel notice written again naming the
-//     copy, since a notice names its link by entry ID.
+//     a2a-go. A record it cannot write as a link stays the custom entry
+//     it was: one that does not decode, carries a member the link has
+//     no place for, names another relation or none, or names no URL or
+//     no call the session holds; one a nested call wrote, through
+//     agentturn.Invoke, whose callee is that call's and not the one
+//     the session holds; and a cancel whose callee's link is not on
+//     the path. A call dispatched again reaches a new task and gets a
+//     link of its own. An output answered on a new branch with the one
+//     the call returned on a branch left, which [ReplayAnswers] gives,
+//     brings the links of the callees that dispatch reached with it, as
+//     it brings a child's link, each copied whole, members the library
+//     does not define included, and each cancel notice written again
+//     naming the copy, since a notice names its link by entry ID; a
+//     copy cut short is finished, not written again. The copies come
+//     before the answer decision, so [agentsession.Callees] reads each
+//     as belonging to no dispatch of the new branch and not answered:
+//     the output is the harness's answer, and the answer's reason ties
+//     it to the branch left. A fork copies none, as it copies no
+//     child's link: the fork started none of that work.
 //
 // # Header
 //
@@ -950,8 +959,10 @@ type writer struct {
 	linked map[string]bool
 	// callees holds the links on the path naming a callee in another
 	// system, each with its entry ID, in order: a cancel notice names
-	// the one it is about by that ID.
-	callees []*agentsession.LinkEntry
+	// the one it is about by that ID. cancelled holds the IDs of those
+	// a cancel notice on the path names.
+	callees   []*agentsession.LinkEntry
+	cancelled map[string]bool
 	// parents maps a nested call, one a tool made through
 	// agentturn.Invoke, to the call whose tool made it, so a record the
 	// nested call writes names a call the path holds.
@@ -1451,7 +1462,7 @@ func New(store agentsession.Store, sessionID string, opts ...Option) *Recorder {
 }
 
 func newWriter(r *Recorder, id string) *writer {
-	return &writer{rec: r, id: id, calls: map[string]*callRecord{}, linked: map[string]bool{}, parents: map[string]string{}, appOnly: map[string]bool{}}
+	return &writer{rec: r, id: id, calls: map[string]*callRecord{}, linked: map[string]bool{}, cancelled: map[string]bool{}, parents: map[string]string{}, appOnly: map[string]bool{}}
 }
 
 // Start creates a session from h and returns a recorder for it. When
@@ -2052,11 +2063,15 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // entry links the call to a child session, a tools/agent child's,
 // writes the same subsession link for the call on the new branch
 // before the answer, so the record ties the output to the child
-// session that produced it rather than to nothing. In a fork no link
-// is written, since a subsession link names a child of the session
-// that writes it and the child is the origin's: the fork's record
-// reaches that child through the origin's link in its prefix, and the
-// answer's Origin names the output it repeats. A call an answer ended before its output was written gets
+// session that produced it rather than to nothing; the links that
+// branch holds to callees in another system, which tools/a2a records,
+// come with it the same way, each with its cancel notice, if it has
+// one, naming the copy. In a fork no link is written, since a
+// subsession link names a child of the session that writes it and the
+// child is the origin's, and the callees in another system are the
+// origin's work, whose cancels the origin sent: the fork's record
+// reaches them through the origin, and the answer's Origin names the
+// output it repeats. A call an answer ended before its output was written gets
 // [agentturn.OutcomeUnknown] as that output, since the record holds
 // the answer and not the output it gave. A held call is waiting for
 // someone and is the caller's to answer, a call held after its
@@ -2620,7 +2635,10 @@ func (r *Recorder) write(ctx context.Context, ns string, data any, about string,
 		callID = w.heldCall(about)
 	}
 	if record {
-		return w.record(context.WithoutCancel(ctx), ns, raw, callID)
+		// A link names the call that wrote the record, not one whose
+		// tool made it through agentturn.Invoke.
+		call, ok := agenttool.CallFrom(ctx)
+		return w.record(context.WithoutCancel(ctx), ns, raw, callID, ok && call.ID == callID)
 	}
 	return w.append(context.WithoutCancel(ctx), &agentsession.CustomEntry{NS: ns, Data: raw, CallID: callID})
 }
@@ -2845,7 +2863,7 @@ func (r *Recorder) reopenID(ctx context.Context, id string) (*writer, error) {
 		return nil, err
 	}
 	w.appOnly = appOnlyCalls(s.Path(s.Leaf()))
-	w.callees = calleesOf(s.Path(s.Leaf()))
+	w.callees, w.cancelled = calleesOf(s.Path(s.Leaf()))
 	for _, e := range s.Path(s.Leaf()) {
 		if env, ok := e.(*agentsession.EnvEntry); ok {
 			w.env = env
@@ -2880,7 +2898,9 @@ func (w *writer) callOn(ctx context.Context) string {
 // naming the call that wrote it, durably before it returns, as
 // [Recorder.Annotate] writes one; the callee and cancel records of
 // tools/a2a are written as link entries of the call instead, as the
-// package documentation says. Set it as
+// package documentation says. Only RecordFunc reads them so: a
+// recorder that wraps [Recorder.Annotate] writes them as custom
+// entries. Set it as
 // agentturn.Config.ToolRecorder, or install it with
 // agenttool.ContextWithRecorder on the context a run is prompted with.
 //
@@ -3000,7 +3020,7 @@ func (w *writer) reset() {
 	// The links written are on the branch left: a call whose child is
 	// linked there and answered here gets the link again.
 	w.linked = map[string]bool{}
-	w.callees = nil
+	w.callees, w.cancelled = nil, map[string]bool{}
 	w.env = nil
 	w.base = ""
 	w.attempt, w.attemptModel, w.retries = nil, "", 0
@@ -3028,7 +3048,7 @@ func (w *writer) seed(ctx context.Context, s *agentsession.Session, owed bool) e
 	}
 	w.base = lastConfigBase(s.Path(s.Leaf()))
 	w.seededNotes, w.heldNotes = lastHeldNotes(s.Path(s.Leaf())), nil
-	w.callees = calleesOf(s.Path(s.Leaf()))
+	w.callees, w.cancelled = calleesOf(s.Path(s.Leaf()))
 	// The env in force is the last on the path, one a compaction left
 	// out of the context included: an env entry contributes nothing to
 	// it, and still says where the calls after it ran. So is the cause
@@ -3102,9 +3122,11 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 					// origin holds its own link, in the fork's prefix.
 					childOff = subsessionOn(at, ranEntry, c.ID())
 				}
-				if ranEntry != "" {
-					// A callee in another system is no child of either
-					// session, so a fork's origin lends its links too.
+				if ranEntry != "" && at == s {
+					// Nor does a fork take its origin's callee links:
+					// the fork started none of that work and sent none
+					// of those cancels, and its fork_of reaches the
+					// origin, which holds them.
 					calleesOff = calleesAt(at, ranEntry, d.ID, c.ID())
 				}
 			}
@@ -3682,7 +3704,7 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 	if e.Parent != "" {
 		owner = e.Parent
 	}
-	_, err = w.record(ctx, rec.NS, rec.Data, w.heldCall(owner))
+	_, err = w.record(ctx, rec.NS, rec.Data, w.heldCall(owner), e.Parent == "")
 	return err
 }
 
@@ -4378,7 +4400,7 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 				}
 				// So do the links to the callees in another system
 				// whose work it is, and the cancels sent to them.
-				if err := w.copyCallees(ctx, c.calleesOff); err != nil {
+				if err := w.copyCallees(ctx, out.CallID, c.calleesOff); err != nil {
 					return err
 				}
 			}
