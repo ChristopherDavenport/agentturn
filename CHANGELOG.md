@@ -5,6 +5,81 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Added: `tools/a2a` records the callee a call reaches, through
+  `agenttool.WriteRecord`, as soon as it is known: a `Callee` record
+  (namespace `agentturn:a2a_callee`) with the URL the call was sent to,
+  the task and context IDs, or the context alone for an answer that is a
+  plain message, and the relation, `subsession` by default and `peer`
+  under `WithoutCancelOnAbort`. A call dispatched again reaches a new task
+  and writes a new record; the answers on one task do not. The URL is the
+  endpoint the client sent to when the client carries the new
+  `ObserveEndpoint` interceptor, and none otherwise, since the tool cannot
+  tell which endpoint a client it did not build calls; `New` changes
+  nothing on the client. A record whose write failed is written again.
+- Added: a record that cannot be written while the task runs fails the
+  call, which gives the task up; once the remote agent has answered, the
+  answer is returned and the failure is on `TaskInfo.RecordErr`.
+- Changed: a `tools/a2a` call given up before its task ended, its context
+  ended, the call failed, or the call returned while the task still
+  worked (a stream that closed early, a polling client's answer), sends
+  `tasks/cancel` for the task from a goroutine of its own, bounded by
+  `CancelTimeout`, and returns without waiting for the task to reach
+  canceled; it records a `CancelSent` (namespace `agentturn:a2a_cancel`),
+  after the `Callee` if that was not yet written, which says the stop was
+  asked for, not that the work stopped. `WithoutCancelOnAbort` leaves a
+  peer's task running and records no cancel. A task waiting on input is
+  left as it is, and a call that ends with a message answer cancels
+  nothing. A blocking call given up before the remote agent
+  answered has no task ID to cancel.
+- Added: `tools/a2a`'s `WithInputRequired(fn)` answers a task that enters
+  input-required inside the call, on the same task, at most
+  `WithInputRounds` times (`DefaultInputRounds`, 8); a hook that cannot
+  answer returns an error matching `agentturn.ErrInputRequired` and the
+  call ends with an `InputRequiredError` as before.
+- Added: `front/a2a`'s `WithAuthenticator`, with `BearerTokens` (the
+  token compared as a hash with every known one, the scheme in any
+  case): `Executor.Interceptor`, installed by `Executor.RequestHandler`,
+  authenticates every call from its metadata on every method and
+  transport and refuses an unauthenticated one before the executor or the
+  task store sees it; each task and conversation belongs to the principal
+  that created it, claimed as soon as the answer names it (`Owners`, kept
+  by a `ConversationStore` that implements it, as `MemoryStore` does,
+  else in memory, or `WithOwners`), and a call about another's, a
+  message continuing it or referencing another's task, tasks/get,
+  tasks/cancel, resubscribe or the push configuration, is refused as not
+  found, as is a stored conversation whose owner was lost; tasks/list is
+  not served; the executor runs no task for a call that did not pass the
+  interceptor; each task's run is prompted under the
+  trigger `{Kind: "a2a", Ref: principal}`. `Executor.Handler` answers an
+  HTTP request early with 401, and `Executor.Secure` returns a copy of a
+  card that requires the scheme once.
+- Added: `front/a2a`'s `WithEscalation`, which requires
+  `WithAuthenticator` (`New` panics without it), puts a call of the
+  agent's own tool its policy defers to the caller instead of the serving
+  side's elicitor: the task enters input-required with the call among the
+  status message's data parts, the policy's reason as text and under
+  `MetaEscalatedCalls`, and the caller answers with an `Approval` data
+  part (`ApprovalPart`). Only the calls the policy deferred in that task
+  may be approved, as the policy decided them, its rewrite of the
+  arguments, which the question shows, and its note included; a call held
+  only beside an asked one is not put to the caller but released by the
+  policy with the caller's answers; they are kept beside the conversation
+  (`EscalationStore`, which `MemoryStore` implements), so a re-ask keeps
+  the policy's reason. The answer's run is under the caller's principal,
+  the decision names nobody (the executor cannot tell a person on the
+  caller's side from a program), and an approval naming its decider is
+  refused; the caller's note reaches the model as "The caller
+  <principal> said: …" in the user's voice, or in a refusal's output.
+  `MetaPendingCalls` lists only the calls to the caller's own tools.
+- Changed (breaking): `front/a2a`'s `ItemsFromMessage`, which reads a
+  caller's message, takes from a typed data part only a user message or a
+  `function_call_output`; a developer, system or assistant message, a
+  `function_call` or any other item is refused as invalid params, so a
+  caller cannot give the agent instructions in the developer's voice or
+  forge its past turns.
+
 ## v0.0.27 - 2026-10-11
 
 - Fixed: a person's accept note on a call `Ask` puts to them about a

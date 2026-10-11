@@ -26,11 +26,15 @@ const (
 	MetaPendingCalls = "agentturn.pending_calls"
 )
 
-// ItemsFromMessage converts an A2A message into Open Responses input.
-// Text and file parts group into user messages; a data part carrying an
-// object with a "type" key is decoded as an item through the registry,
-// so a caller can send a function_call_output or any other item
-// verbatim; other data parts become input_text carrying their JSON.
+// ItemsFromMessage converts a caller's A2A message into Open Responses
+// input. Text and file parts group into user messages; a data part
+// carrying an object with a "type" key is decoded as an item through
+// the registry, and only the items a caller may speak are taken: a
+// function_call_output answering a call, and a message in the user's
+// role. Any other item, a developer, system or assistant message that
+// would give the agent instructions or forge its past turns, a
+// function_call, reasoning, is refused. Other data parts become
+// input_text carrying their JSON.
 func ItemsFromMessage(msg *a2a.Message) (openresponses.Items, error) {
 	var items openresponses.Items
 	// buffered holds text and file parts until a data part or the end
@@ -62,6 +66,9 @@ func ItemsFromMessage(msg *a2a.Message) (openresponses.Items, error) {
 				if err != nil {
 					return nil, fmt.Errorf("parts[%d]: %w", i, err)
 				}
+				if err := callerItem(item); err != nil {
+					return nil, fmt.Errorf("parts[%d]: %w", i, err)
+				}
 				flush()
 				items = append(items, item)
 				continue
@@ -73,6 +80,22 @@ func ItemsFromMessage(msg *a2a.Message) (openresponses.Items, error) {
 	}
 	flush()
 	return items, nil
+}
+
+// callerItem refuses an item a caller may not put in the agent's
+// conversation: anything but a user message or a function call's
+// output.
+func callerItem(item openresponses.Item) error {
+	switch it := item.(type) {
+	case *openresponses.FunctionCallOutput:
+		return nil
+	case *openresponses.Message:
+		if it.Role == openresponses.RoleUser {
+			return nil
+		}
+		return fmt.Errorf("a %s message is the agent's side to write; a caller sends user messages", it.Role)
+	}
+	return fmt.Errorf("a caller may send user messages and function_call_output items, not %T", item)
 }
 
 // contentFromFile mirrors the file-part conversion in tools/a2a's

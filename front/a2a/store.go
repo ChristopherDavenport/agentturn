@@ -20,6 +20,8 @@ type ConversationStore interface {
 type MemoryStore struct {
 	mu            sync.Mutex
 	conversations map[string]agentturn.Transcript
+	escalated     map[string][]Escalated
+	owners        MemoryOwners
 }
 
 // Load returns a copy of the stored transcript, or nil.
@@ -45,3 +47,40 @@ func (m *MemoryStore) Save(_ context.Context, contextID string, t agentturn.Tran
 }
 
 var _ ConversationStore = (*MemoryStore)(nil)
+
+// LoadEscalated returns the calls the conversation's last task put to
+// its caller.
+func (m *MemoryStore) LoadEscalated(_ context.Context, contextID string) ([]Escalated, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]Escalated(nil), m.escalated[contextID]...), nil
+}
+
+// SaveEscalated replaces them; none removes them.
+func (m *MemoryStore) SaveEscalated(_ context.Context, contextID string, calls []Escalated) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.escalated == nil {
+		m.escalated = map[string][]Escalated{}
+	}
+	if len(calls) == 0 {
+		delete(m.escalated, contextID)
+		return nil
+	}
+	m.escalated[contextID] = append([]Escalated(nil), calls...)
+	return nil
+}
+
+var _ EscalationStore = (*MemoryStore)(nil)
+
+// Owner returns key's owner, kept with the conversations.
+func (m *MemoryStore) Owner(ctx context.Context, key string) (string, bool, error) {
+	return m.owners.Owner(ctx, key)
+}
+
+// Claim sets key's owner unless it has one and returns the owner.
+func (m *MemoryStore) Claim(ctx context.Context, key, principal string) (string, error) {
+	return m.owners.Claim(ctx, key, principal)
+}
+
+var _ Owners = (*MemoryStore)(nil)

@@ -30,7 +30,7 @@ func serve(t *testing.T, exec a2asrv.AgentExecutor, card *a2a.AgentCard) (*a2acl
 	}
 	card.URL = srv.URL
 	card.PreferredTransport = a2a.TransportProtocolJSONRPC
-	client, err := a2aclient.NewFromCard(context.Background(), card)
+	client, err := a2aclient.NewFromCard(context.Background(), card, a2aclient.WithInterceptors(ObserveEndpoint()))
 	if err != nil {
 		t.Fatal(err)
 	}
