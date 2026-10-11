@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.26 - 2026-10-11
 
 - Added: `Recorder.Elicitor` writes who answered on the answer entry,
   as `Elicitation.Source`, when the replier named itself on
