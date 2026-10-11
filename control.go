@@ -25,7 +25,9 @@ import (
 // client needs that the loop knows is on them, and a question asked
 // while a call runs is one of them ([Question]). A subscriber observes:
 // an error it returns is a failure, such as a recorder that could not
-// write, and ends the run with [ReasonError]. It is not a decision, and
+// write, and ends the run with [ReasonError], except on a nested call's
+// tool_dispatch, whose failure goes to the invoking tool from [Invoke].
+// It is not a decision, and
 // a view must not use it as one: refusing or holding a call is
 // [Config.BeforeToolCall]'s, whose verdict the record keeps, and asking
 // a person is a [Question] answered with Reply. A product's controls,
@@ -36,9 +38,9 @@ import (
 // context and an error, which a wire needs and which a recorder that
 // writes a queued input before the agent takes it has to return.
 // Reply carries a context for the same reason, and so that who answered
-// a question is known as who prompted is: the trigger on its context
-// ([ContextWithTrigger]) names the answerer on [QuestionClosed] and to a
-// recorder ([ContextWithAnswerer]).
+// a question can be known as who prompted is: the answerer the replier
+// put on it ([ContextWithAnswerer]) is named on [QuestionClosed] and to
+// a recorder ([WatchAnswerer]).
 type Control interface {
 	Prompt(ctx context.Context, items ...openresponses.Item) (*RunEnd, error)
 	Resume(ctx context.Context, answers ...Answer) (*RunEnd, error)
@@ -100,9 +102,9 @@ func (*Question) EventType() string { return EventQuestion }
 // QuestionClosed reports that a [Question] no longer waits. Answer is
 // what [Agent.Reply] gave it, and nil when the call gave up first: its
 // context ended, by an abort among other things, or the question could
-// not be delivered. By is who answered: the trigger on the context
-// Reply was given, such as front/control's principal, and zero when
-// that context carried none or nothing answered.
+// not be delivered. By is who answered: the answerer the replier put on
+// Reply's context with [ContextWithAnswerer], such as front/control's
+// principal, and zero when it named none or nothing answered.
 type QuestionClosed struct {
 	ID     string
 	RunID  string
@@ -135,6 +137,25 @@ type replied struct {
 
 type answererKey struct{}
 
+type watchKey struct{}
+
+// ContextWithAnswerer returns ctx naming by as who answers the questions
+// replied to under it, for [Agent.Reply]. front/control names its
+// principal so; an in-process client names itself. It is set apart
+// from the run's trigger on purpose: a [Question] is delivered on the
+// asking call's context, which carries the trigger of whoever started
+// the run, and a subscriber replying with that context has not said
+// who it is.
+func ContextWithAnswerer(ctx context.Context, by Trigger) context.Context {
+	return context.WithValue(ctx, answererKey{}, by)
+}
+
+// AnswererFrom returns the answerer [ContextWithAnswerer] put on ctx.
+func AnswererFrom(ctx context.Context) (Trigger, bool) {
+	by, ok := ctx.Value(answererKey{}).(Trigger)
+	return by, ok
+}
+
 // answerer is where the asking side of a question learns who answered
 // it; each one installed under ctx hears of the answer.
 type answerer struct {
@@ -143,28 +164,27 @@ type answerer struct {
 	parent *answerer
 }
 
-// ContextWithAnswerer returns ctx and a function that reports who
-// answered a question asked under it through [Agent.Reply]: the trigger
-// on the context Reply was given. An elicitor that wraps the agent's
-// [Agent.QuestionElicitor], such as a session recorder's, asks the
-// inner one under the returned context and calls the function once it
-// has returned, to write who answered beside the answer. The function
-// returns the zero Trigger when nothing answered through Reply or its
-// context named nobody.
-func ContextWithAnswerer(ctx context.Context) (context.Context, func() Trigger) {
-	parent, _ := ctx.Value(answererKey{}).(*answerer)
+// WatchAnswerer returns ctx and a function that reports who answered a
+// question asked under it through [Agent.Reply]: the answerer the
+// replier named with [ContextWithAnswerer]. An elicitor that wraps the
+// agent's [Agent.QuestionElicitor], such as a session recorder's, asks
+// the inner one under the returned context and calls the function once
+// it has returned, to write who answered beside the answer. The
+// function returns the zero Trigger when nothing answered through Reply
+// or the replier named nobody.
+func WatchAnswerer(ctx context.Context) (context.Context, func() Trigger) {
+	parent, _ := ctx.Value(watchKey{}).(*answerer)
 	h := &answerer{parent: parent}
-	return context.WithValue(ctx, answererKey{}, h), func() Trigger {
+	return context.WithValue(ctx, watchKey{}, h), func() Trigger {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		return h.by
 	}
 }
 
-// tellAnswerer passes who answered to every [ContextWithAnswerer]
-// under ctx.
+// tellAnswerer passes who answered to every [WatchAnswerer] under ctx.
 func tellAnswerer(ctx context.Context, by Trigger) {
-	for h, _ := ctx.Value(answererKey{}).(*answerer); h != nil; h = h.parent {
+	for h, _ := ctx.Value(watchKey{}).(*answerer); h != nil; h = h.parent {
 		h.mu.Lock()
 		h.by = by
 		h.mu.Unlock()
@@ -242,10 +262,13 @@ func (a *Agent) ask(ctx context.Context, q agenttool.Elicitation) (agenttool.Ans
 }
 
 // Reply answers the [Question] id with answer: an accept, with the
-// content a form asked for, a decline, or a cancel. The trigger on ctx
-// ([ContextWithTrigger]) names who answered: [QuestionClosed] carries
-// it, and so does the [ContextWithAnswerer] the question was asked
-// under. Only its values are read; Reply does not wait on it. It
+// content a form asked for, a decline, or a cancel. The answerer on ctx
+// ([ContextWithAnswerer]) names who answered: [QuestionClosed] carries
+// it, and so does the [WatchAnswerer] the question was asked under.
+// Nothing else on ctx names the answerer, the run's trigger least of
+// all, which the question's own event context carries: an answer whose
+// replier named nobody is unattributed. Only ctx's values are read;
+// Reply does not wait on it. It
 // returns [ErrNoQuestion] when id names no waiting question, one
 // already answered or given up among them. It never blocks, so a
 // subscriber may reply from inside the question's own event.
@@ -257,6 +280,7 @@ func (a *Agent) Reply(ctx context.Context, id string, answer agenttool.Answer) e
 		return fmt.Errorf("%w: %q", ErrNoQuestion, id)
 	}
 	delete(a.asks, id)
-	w.reply <- replied{answer: answer, by: TriggerFromContext(ctx)}
+	by, _ := AnswererFrom(ctx)
+	w.reply <- replied{answer: answer, by: by}
 	return nil
 }

@@ -392,7 +392,7 @@ func (h *handler) abort(w http.ResponseWriter, _ *http.Request, _ Principal) {
 	writeJSON(w, http.StatusOK, errReply{})
 }
 
-func (h *handler) reply(w http.ResponseWriter, r *http.Request, _ Principal) {
+func (h *handler) reply(w http.ResponseWriter, r *http.Request, p Principal) {
 	var req struct {
 		ID     string           `json:"id"`
 		Answer wireElicitAnswer `json:"answer"`
@@ -407,9 +407,12 @@ func (h *handler) reply(w http.ResponseWriter, r *http.Request, _ Principal) {
 		writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: reply: unknown action %q", a.Action))
 		return
 	}
-	// The request's context carries the principal and its trigger, so
-	// the answer names who gave it.
-	writeJSON(w, http.StatusOK, errReply{errorOut(h.c.Reply(r.Context(), req.ID, *a))})
+	// The principal is who answered, as a run it starts names it.
+	ctx := r.Context()
+	if p.Name != "" {
+		ctx = agentturn.ContextWithAnswerer(ctx, agentturn.Trigger{Kind: "control", Ref: p.Name})
+	}
+	writeJSON(w, http.StatusOK, errReply{errorOut(h.c.Reply(ctx, req.ID, *a))})
 }
 
 type commandInfo struct {

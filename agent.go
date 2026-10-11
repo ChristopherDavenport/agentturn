@@ -114,10 +114,6 @@ type Agent struct {
 	runCancel context.CancelCauseFunc
 	idle      chan struct{}
 	pending   []PendingCall
-	// notes are the notes a run left waiting on its pending calls'
-	// outputs, which the run that answers them appends after those
-	// outputs. Only this agent holds them: a record holds none.
-	notes []heldNote
 	// seeded is what WithPending gave, applied to the pending calls
 	// once every option has run.
 	seeded []PendingCall
@@ -232,6 +228,31 @@ func mergePending(pending, known []PendingCall) {
 	}
 }
 
+// keepNotes moves the notes the calls of known waited with onto the
+// last call of pending that known held too, and drops them when none
+// is: the calls pending at once are of one batch, and its notes wait
+// while any of them does.
+func keepNotes(pending, known []PendingCall) {
+	var notes openresponses.Items
+	ids := map[string]bool{}
+	for _, p := range known {
+		notes = append(notes, p.Notes...)
+		if p.Call != nil {
+			ids[p.Call.CallID] = true
+		}
+	}
+	last := -1
+	for i := range pending {
+		pending[i].Notes = nil
+		if ids[pending[i].Call.CallID] {
+			last = i
+		}
+	}
+	if last >= 0 && len(notes) > 0 {
+		pending[last].Notes = notes
+	}
+}
+
 func closedChan() chan struct{} {
 	ch := make(chan struct{})
 	close(ch)
@@ -288,9 +309,12 @@ func (a *Agent) SetConfig(cfg Config) error {
 // and arguments: a held call stays held. Any other is [PendingUnknown],
 // so an approval of it is held to the replay rule as for any call that
 // may have run, until [Agent.SetPending] says what a record knows of
-// it. Whatever the old transcript was waiting on and the new one does
-// not hold is forgotten, and whatever the new one is waiting on must be
-// answered through [Agent.Resume]. Queued Steer and FollowUp items are
+// it. The notes held for the calls pending before
+// ([PendingCall.Notes]) stay while one of those calls is still pending,
+// on the last of them, and are dropped when none is. Whatever the old
+// transcript was waiting on and the new one does not hold is
+// forgotten, and whatever the new one is waiting on must be answered
+// through [Agent.Resume]. Queued Steer and FollowUp items are
 // kept and go to the next run on the new transcript; a host that does
 // not want them there reads them from [Agent.State] first. The call IDs
 // the old transcript holds stay reserved, as [Agent.ReserveCallIDs]
@@ -311,9 +335,10 @@ func (a *Agent) SetTranscript(t Transcript) error {
 	a.transcript = append(Transcript(nil), t...)
 	a.reasoning = a.reasoning.retain(a.transcript)
 	a.pending = pendingCalls(unansweredCalls(a.transcript), PendingUnknown)
-	// The notes waited on the calls of the transcript replaced.
-	a.notes = nil
 	mergePending(a.pending, known)
+	// The notes waiting on the calls pending before stay while one of
+	// those calls is still pending, on the last of them.
+	keepNotes(a.pending, known)
 	return nil
 }
 
@@ -882,12 +907,13 @@ func (a *Agent) start(ctx context.Context, prompts, notes openresponses.Items, a
 	prior := a.pending
 	a.pending = nil
 	// The notes an earlier run left waiting on the calls this run
-	// answers go first, then the Resume's own, each as a user message
-	// the run's trigger names.
-	held := a.notes
-	a.notes = nil
-	for _, n := range notes {
-		held = append(held, heldNote{item: n, mode: InputResume, endTrigger: TriggerFromContext(ctx)})
+	// answers go first; the Resume's own join them once its outputs
+	// are in.
+	var held []heldNote
+	for _, p := range prior {
+		for _, n := range p.Notes {
+			held = append(held, heldNote{item: n, mode: InputResume})
+		}
 	}
 	// The context a tool's background work derives from: the prompt's
 	// values, cancelled by an abort of this run or by the prompt's own
@@ -914,30 +940,27 @@ func (a *Agent) start(ctx context.Context, prompts, notes openresponses.Items, a
 		ctx := context.WithValue(ctx, inRunKey{a}, runID)
 		subCtx := context.WithoutCancel(ctx)
 		r := &runner{
-			cfg:        cfg,
-			transcript: transcript,
-			send:       func(ev Event) error { return a.deliver(subCtx, ev) },
-			steer:      a.drainSteer,
-			followUp:   a.drainFollowUp,
-			last:       a.drainLast,
-			closing:    a.close,
-			steered:    a.steerSignal,
-			runCtx:     runCtx,
-			prior:      prior,
-			reserved:   a.reserved,
-			reasoning:  a.reasoning.merged(reasoningFromContext(ctx)),
-			runID:      runID,
-			resuming:   resuming,
-			notes:      held,
+			cfg:         cfg,
+			transcript:  transcript,
+			send:        func(ev Event) error { return a.deliver(subCtx, ev) },
+			steer:       a.drainSteer,
+			followUp:    a.drainFollowUp,
+			last:        a.drainLast,
+			closing:     a.close,
+			steered:     a.steerSignal,
+			runCtx:      runCtx,
+			prior:       prior,
+			reserved:    a.reserved,
+			reasoning:   a.reasoning.merged(reasoningFromContext(ctx)),
+			runID:       runID,
+			resuming:    resuming,
+			notes:       held,
+			resumeNotes: notes,
 		}
 		end := r.run(ctx, prompts, approved, terminate)
 		cancel(nil)
 
 		a.mu.Lock()
-		if len(end.Pending) > 0 {
-			// What the batch's notes wait on is still pending.
-			a.notes = r.notes
-		}
 		a.reasoning = r.reasoning.retain(a.transcript)
 		a.running = false
 		a.closing = false

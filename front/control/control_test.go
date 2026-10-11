@@ -484,8 +484,8 @@ func TestScopes(t *testing.T) {
 		r.mu.Lock()
 		ctx := r.ctx
 		r.mu.Unlock()
-		if tr := agentturn.TriggerFromContext(ctx); tr.Kind != "control" || tr.Ref != "alice" {
-			t.Errorf("trigger = %+v", tr)
+		if by, ok := agentturn.AnswererFrom(ctx); !ok || by.Kind != "control" || by.Ref != "alice" {
+			t.Errorf("answerer = %+v, %v", by, ok)
 		}
 	})
 	// #240: a client holding only answer cannot record its approval as

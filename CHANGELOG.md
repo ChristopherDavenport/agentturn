@@ -33,28 +33,47 @@ versions may break the API.
   - What the user says answering a tool's own question reaches the
     model as `The user said: <note>` after its batch, whatever the
     tool does with it.
-  - A batch with a deferred call, or one cut by an abort, keeps its
-    notes until the run that answers the waiting calls has appended
-    their outputs; `SetTranscript` drops them with the calls they
-    waited on. The agent holds them, not the record.
-  The docs of `ToolDecision.Note`, `Answer.Note`, `Resume`, `Ask` and
-  `Config.ToolElicitor` say so.
+  - A run's notes go to its own batch: a child agent run inside a tool
+    takes the notes its tools' questions get, rather than the parent.
+  - A person's note on an approval and the note the hook then gives
+    the call both reach the model, the person's first; a hook that
+    defers the call holds the person's note with it.
+  - A batch with a deferred call, or one cut by an abort or a failure,
+    the cut calls' own notes included, holds its notes until the run
+    that answers the waiting calls has appended their outputs. The new
+    `PendingCall.Notes` carries them on the last pending call, so
+    `RunEnd`, `State`, `WithPending` and `front/control` hand them out:
+    a caller of `Run` passes them back after its outputs, and an agent
+    seeded with the pending calls appends them. A Resume's own notes
+    are held only once its outputs are appended, so a Resume that fails
+    before then leaves the notes as they were. `SetTranscript` keeps
+    them while one of the calls they wait on is still pending, and
+    drops them with the calls. agentturn/session keeps them in the
+    record in the release after this one.
+  The docs of `ToolDecision.Note`, `Answer.Note`, `Resume`, `Ask`,
+  `Config.ToolElicitor`, `PendingCall.Notes` and `SetTranscript` say so.
 - Changed, breaking: `Control.Reply` and `Agent.Reply` take a context,
-  whose trigger names who answered. `QuestionClosed.By` carries it, and
-  `ContextWithAnswerer` hands it to an elicitor that wraps the agent's,
-  so a recorder can write who answered beside the answer. `front/control`
-  calls `Reply` with the request's context, so an answer names the
-  principal as a run start does, and `Client.Reply` takes the caller's
-  context. agentturn/session writes it on the answer entry in the
+  on which the replier names itself with the new `ContextWithAnswerer`.
+  `QuestionClosed.By` carries it, and `WatchAnswerer` hands it to an
+  elicitor that wraps the agent's, so a recorder can write who answered
+  beside the answer. Nothing else names the answerer: not the run's
+  trigger, which a question's event context carries, so a subscriber
+  that replies with that context without naming itself is unattributed.
+  `front/control` names its principal on `Reply`'s context, so an answer
+  names the principal as a run start does, and `Client.Reply` takes the
+  caller's context. agentturn/session writes it on the answer entry in the
   release after this one. (#240)
-- Changed: `front/control` records an answer to `Resume` as decided by
-  `human`, whatever `By` the client sent, unless the principal holds the
-  scope the host names with the new `WithChosenBy`, such as a policy
-  engine answering over the wire; a client holding only `answer` can no
+- Changed, breaking: `front/control` records an answer to `Resume` as
+  decided by `human`, whatever `By` the client sent, unless the
+  principal holds the scope the host names with the new `WithChosenBy`.
+  A host whose client answers over the wire with `By: "policy"` (or
+  `agent`) records `human` until it gives that principal a scope and
+  names it with `WithChosenBy`. A client holding only `answer` can no
   longer make a person's decision read as a rule's. (#240)
 - Changed: a subscriber observes. `Control`'s doc says an error a
-  subscriber returns is a failure that ends the run with `ReasonError`,
-  never a decision: refusing a call is `BeforeToolCall`'s and asking a
+  subscriber returns is a failure, never a decision; it ends the run
+  with `ReasonError`, except on a nested call's `tool_dispatch`, whose
+  failure goes to the invoking tool: refusing a call is `BeforeToolCall`'s and asking a
   person is a `Question`. `tool_dispatch`'s doc no longer tells a host
   to register a vetoing subscriber before the recorder. (#119)
 - Added: `ToolEnd.Withdrawn`, set when a subscriber failed on the call's

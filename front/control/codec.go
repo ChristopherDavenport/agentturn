@@ -653,6 +653,7 @@ type wirePending struct {
 	Refused        string               `json:"refused,omitempty"`
 	Decision       *wireDecision        `json:"decision,omitempty"`
 	Question       *wirePendingQuestion `json:"question,omitempty"`
+	Notes          json.RawMessage      `json:"notes,omitempty"`
 }
 
 // wirePendingQuestion is a pending call's [agentturn.OpenQuestion].
@@ -696,6 +697,11 @@ func pendingOut(in []agentturn.PendingCall) ([]wirePending, error) {
 				return nil, err
 			}
 		}
+		if len(p.Notes) > 0 {
+			if w.Notes, err = itemsOut(p.Notes); err != nil {
+				return nil, err
+			}
+		}
 		out = append(out, w)
 	}
 	return out, nil
@@ -721,6 +727,11 @@ func pendingIn(in []wirePending) ([]agentturn.PendingCall, error) {
 		}
 		if p.Question, err = questionIn(w.Question); err != nil {
 			return nil, err
+		}
+		if len(w.Notes) > 0 {
+			if p.Notes, err = itemsIn(w.Notes); err != nil {
+				return nil, err
+			}
 		}
 		out = append(out, p)
 	}

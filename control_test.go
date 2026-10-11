@@ -388,7 +388,7 @@ func TestAReplyNamesWhoAnswered(t *testing.T) {
 	inner := a.QuestionElicitor()
 	cfg := a.Config()
 	cfg.ToolElicitor = func(ctx context.Context, q agenttool.Elicitation) (agenttool.Answer, error) {
-		ctx, who := ContextWithAnswerer(ctx)
+		ctx, who := WatchAnswerer(ctx)
 		ans, err := inner(ctx, q)
 		heard = who()
 		return ans, err
@@ -401,7 +401,7 @@ func TestAReplyNamesWhoAnswered(t *testing.T) {
 	a.Subscribe(func(_ context.Context, ev Event) error {
 		switch e := ev.(type) {
 		case *Question:
-			if err := a.Reply(ContextWithTrigger(context.Background(), bob), e.ID, agenttool.Answer{Action: agenttool.ActionAccept}); err != nil {
+			if err := a.Reply(ContextWithAnswerer(context.Background(), bob), e.ID, agenttool.Answer{Action: agenttool.ActionAccept}); err != nil {
 				t.Error(err)
 			}
 		case *QuestionClosed:
@@ -417,5 +417,53 @@ func TestAReplyNamesWhoAnswered(t *testing.T) {
 	}
 	if heard.Ref != "bob" || heard.Kind != "control" {
 		t.Errorf("the wrapping elicitor heard %+v, want %+v", heard, bob)
+	}
+}
+
+// TestAReplyOnTheEventsContextNamesNobody pins review finding 7: a
+// question's event context carries the trigger of whoever started the
+// run, and a subscriber that replies with it has not said who it is.
+func TestAReplyOnTheEventsContextNamesNobody(t *testing.T) {
+	a := questionAgent(t, Config{Model: &echo.Adapter{}, MaxTurns: 1, Tools: []agenttool.Tool{asker("ask")}})
+	var closed *QuestionClosed
+	a.Subscribe(func(ctx context.Context, ev Event) error {
+		switch e := ev.(type) {
+		case *Question:
+			return a.Reply(ctx, e.ID, agenttool.Answer{Action: agenttool.ActionAccept})
+		case *QuestionClosed:
+			closed = e
+		}
+		return nil
+	})
+	prompter := ContextWithTrigger(context.Background(), Trigger{Kind: "control", Ref: "alice"})
+	if _, err := a.Prompt(prompter, openresponses.UserText("x")); err != nil {
+		t.Fatal(err)
+	}
+	if closed == nil || !closed.By.IsZero() {
+		t.Errorf("question_closed = %+v, want no answerer", closed)
+	}
+}
+
+// TestAFailedResumeKeepsTheOpenQuestion pins review finding 8: a call
+// pending with an open question keeps it through a run that leaves it
+// pending.
+func TestAFailedResumeKeepsTheOpenQuestion(t *testing.T) {
+	call := &openresponses.FunctionCall{CallID: "call_a", Name: "ask", Arguments: `{"text":"t"}`}
+	q := &OpenQuestion{ID: "entry_1", Message: "delete the branch?"}
+	a := New(Config{Model: &echo.Adapter{}, MaxTurns: 1, Tools: []agenttool.Tool{asker("ask")}},
+		WithTranscript(Transcript{openresponses.UserText("x"), call}),
+		WithPending([]PendingCall{{Call: call, Reason: PendingAborted, Question: q}}))
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if _, ok := ev.(*RunStart); ok {
+			return errors.New("not now")
+		}
+		return nil
+	})
+	end, err := a.Resume(context.Background(), OutcomeUnknown("call_a"))
+	if err == nil {
+		t.Fatal("the resume did not fail")
+	}
+	if len(end.Pending) != 1 || end.Pending[0].Question != q {
+		t.Errorf("pending = %+v, want the open question kept", end.Pending)
 	}
 }

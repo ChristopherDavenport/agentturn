@@ -386,9 +386,11 @@ func (*ToolStart) EventType() string { return EventToolStart }
 // serialised with the run's events, and a subscriber that fails on it
 // stops the call: it ends with that error and the tool does not run,
 // so a dispatch that could not be made durable is never followed by a
-// side effect the record cannot see. That is a failure, and the run
-// ends with [ReasonError]; it is not a way to refuse a call, which is
-// [Config.BeforeToolCall]'s, since a subscriber observes. The call is
+// side effect the record cannot see. That is a failure, not a way to
+// refuse a call, which is [Config.BeforeToolCall]'s, since a subscriber
+// observes: for a call the model made the run ends with [ReasonError],
+// and for a nested call the failure is returned to the invoking tool
+// from [Invoke], which decides what follows. The call is
 // then pending as [PendingUndispatched], or still as [PendingAborted]
 // when an earlier run dispatched it, and its tool_end is
 // [ToolEnd.Withdrawn], so a recorder called before the subscriber that
@@ -694,6 +696,18 @@ type PendingCall struct {
 	// have run. The loop never sets it; agentturn/session's Pending
 	// does, from the record. nil for every other call.
 	Question *OpenQuestion
+	// Notes are the notes waiting on the outputs of the pending calls:
+	// what a decision or a person said about a call of their batch,
+	// held because a call of it was deferred or cut before its output,
+	// so that nothing comes between the calls and their outputs. The
+	// loop puts them on the last pending call, since the calls pending
+	// at once are of one batch, and the run that answers the calls
+	// appends them after the outputs, before anything else it brings.
+	// An [Agent] carries them itself; a caller of [Run] passes them back
+	// after the outputs it answers with, and a recorder keeps them, so
+	// an agent seeded with the pending calls ([WithPending]) appends
+	// them as the one that held them would have.
+	Notes openresponses.Items
 }
 
 // OpenQuestion is a question a record shows asked under a call and
