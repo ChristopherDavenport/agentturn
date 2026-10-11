@@ -1740,6 +1740,11 @@ func TestOpenQuestionSurvivesACut(t *testing.T) {
 	if len(pending) != 1 || pending[0].Reason != agentturn.PendingAborted {
 		t.Fatalf("pending = %+v, want the eval call in flight", pending)
 	}
+	// The pending call says it was waiting on a person, and what it
+	// asked (#241).
+	if q := pending[0].Question; q == nil || q.ID != questions[0].ID || q.Message != ask.Message || q.Call == nil || q.Call.CallID != ask.Call || q.Call.Name != "bash" || q.Call.Parent != parent.ID() {
+		t.Errorf("pending question = %+v, want the ask entry's", pending[0].Question)
+	}
 	answers, err := ReplayAnswers(ctx, s, tools)
 	if err != nil {
 		t.Fatal(err)
@@ -2300,5 +2305,88 @@ func TestAnAnswerNamesWhoGaveIt(t *testing.T) {
 	}
 	if answer == nil || answer.By != agentsession.ByHuman || answer.Source == nil || answer.Source.Kind != "control" || answer.Source.Ref != "bob" {
 		t.Fatalf("answer entry = %+v, want by human from control:bob", answer)
+	}
+}
+
+// TestAWithdrawnDispatchReadsAsNeverStarted pins the recorder half of
+// agentturn#119: a subscriber registered after the recorder that fails
+// on a call's tool_dispatch stops the tool after the dispatch is on the
+// record. The recorder then writes that the hand-off was withdrawn, so
+// Pending reads the call as never started, as the loop knew it, a
+// replay runs it, and its new dispatch is not recorded as a run again.
+func TestAWithdrawnDispatchReadsAsNeverStarted(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ran := 0
+	notify := agenttool.New("notify", "", func(context.Context, echoArgs) (string, error) {
+		ran++
+		return "sent", nil
+	})
+	tools := []agenttool.Tool{notify}
+	a := agentturn.New(agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools})
+	unsub := rec.Attach(a)
+	boom := errors.New("the audit log is down")
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if _, ok := ev.(*agentturn.ToolDispatch); ok {
+			return boom
+		}
+		return nil
+	})
+	if _, err := a.Prompt(ctx, openresponses.UserText("go")); !errors.Is(err, boom) {
+		t.Fatalf("prompt: %v, want the subscriber's failure", err)
+	}
+	unsub()
+	if ran != 0 {
+		t.Fatal("the tool ran after its dispatch was refused")
+	}
+	marks := customs(s, WithdrawnNS)
+	c := callsOf(t, s)["notify"]
+	if len(marks) != 1 || c == nil || len(c.Dispatches) != 1 || marks[0].CallID != c.ID() {
+		t.Fatalf("withdrawn entries = %d, call %+v", len(marks), c)
+	}
+	var w Withdrawn
+	if err := json.Unmarshal(marks[0].Data, &w); err != nil || w.Dispatch != c.Dispatches[0].ID || !strings.Contains(w.Reason, "audit log") {
+		t.Errorf("withdrawn = %+v (%v), want the dispatch %s and the failure", w, err, c.Dispatches[0].ID)
+	}
+
+	rec, s, err = Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := Pending(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Reason != agentturn.PendingUndispatched || pending[0].MayHaveRun() {
+		t.Fatalf("pending = %+v, want the call never started", pending)
+	}
+	answers, err := ReplayAnswers(ctx, s, tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts, err := AgentOptions(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := agentturn.New(agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools}, opts...)
+	defer rec.Attach(b)()
+	if _, err := b.Resume(ctx, answers...); err != nil {
+		t.Fatal(err)
+	}
+	if ran != 1 {
+		t.Errorf("the tool ran %d times on the replay, want once", ran)
+	}
+	c = callsOf(t, s)["notify"]
+	if c == nil || c.Output == nil || len(c.Dispatches) != 2 {
+		t.Fatalf("call after the replay = %+v", c)
+	}
+	for _, d := range c.Decisions {
+		if d.Reason == agentRunAgain {
+			t.Errorf("the replay of a call that never ran is recorded as a run again: %+v", d)
+		}
 	}
 }

@@ -101,6 +101,18 @@ versions may break the API.
   on the answer entry, as `Elicitation.Source`, when the answer came
   through `Agent.Reply` with a trigger on its context, such as
   `front/control`'s principal. (#240)
+- Added: agentturn/session's `Pending` sets `PendingCall.Question` from
+  the record's open question, and `ReplayAnswers` takes the reason it
+  appends from there (`OpenQuestion.Reason`), so a host or a front that
+  reads the pending call, rather than the record, knows the call was
+  waiting on a person. (#241)
+- Added: the recorder writes an `agentturn:withdrawn` custom entry
+  (`session.WithdrawnNS`, `session.Withdrawn`) after a dispatch the loop
+  withdrew (`ToolEnd.Withdrawn`), and `Pending` reads a call whose every
+  dispatch was withdrawn as `PendingUndispatched` rather than
+  `PendingAborted`, so a subscriber registered after the recorder that
+  fails on `tool_dispatch` no longer leaves a call the record says may
+  have run. Its replay runs it, not as a run again. (#119)
 - Fixed: the recorder writes a hold decision's `Subject` and `Held` as
   the members `agentturn:subject` and `agentturn:held`
   (`session.SubjectMember`, `session.HeldMember`), and `session.Pending`

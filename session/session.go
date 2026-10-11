@@ -1053,6 +1053,76 @@ type callRecord struct {
 	// child's work, and the link comes with it.
 	ranEntry string
 	childOff string
+	// dispatchEntry is the ID of the last dispatch entry written or
+	// seeded for the call, and withdrawn says [WithdrawnNS] entries
+	// withdrew it and every dispatch before it: a subscriber failed on
+	// each, so the tool never ran. The call keeps its dispatch for the format's sake, a
+	// decision that ends it is an answer, but is not run again.
+	dispatchEntry string
+	withdrawn     bool
+}
+
+// WithdrawnNS is the namespace of the custom entry the recorder writes
+// after a dispatch the loop withdrew (agentturn.ToolEnd.Withdrawn): a
+// subscriber called after the recorder failed on the call's
+// tool_dispatch, so the tool never ran. Its call_id is the call's and
+// its data a [Withdrawn]. [Pending] reads a call whose last dispatch it
+// withdraws as agentturn.PendingUndispatched, which the loop knew it to
+// be, rather than as one that may have run; a reader that does not
+// know the namespace reads the call in flight, which errs on the side
+// of caution.
+const WithdrawnNS = "agentturn:withdrawn"
+
+// Withdrawn is the data of a [WithdrawnNS] custom entry.
+type Withdrawn struct {
+	// Dispatch is the ID of the dispatch entry withdrawn.
+	Dispatch string `json:"dispatch"`
+	// Reason is the failure that withdrew it.
+	Reason string `json:"reason,omitempty"`
+}
+
+// withdrawnDispatches returns the IDs of the dispatch entries a
+// [WithdrawnNS] entry on path withdraws.
+func withdrawnDispatches(path []agentsession.Entry) map[string]bool {
+	var out map[string]bool
+	for _, e := range path {
+		c, ok := e.(*agentsession.CustomEntry)
+		if !ok || c.NS != WithdrawnNS {
+			continue
+		}
+		var w Withdrawn
+		if json.Unmarshal(c.Data, &w) != nil || w.Dispatch == "" {
+			continue
+		}
+		if out == nil {
+			out = map[string]bool{}
+		}
+		out[w.Dispatch] = true
+	}
+	return out
+}
+
+// lastDispatch is the ID of the call's last dispatch on the path, ""
+// when it has none.
+func lastDispatch(c *agentsession.Call) string {
+	if len(c.Dispatches) == 0 {
+		return ""
+	}
+	return c.Dispatches[len(c.Dispatches)-1].Base().ID
+}
+
+// allWithdrawn reports whether the call has dispatches on the path and
+// withdrawn holds every one of them, so its tool never ran there.
+func allWithdrawn(c *agentsession.Call, withdrawn map[string]bool) bool {
+	if len(c.Dispatches) == 0 || len(withdrawn) == 0 {
+		return false
+	}
+	for _, d := range c.Dispatches {
+		if !withdrawn[d.Base().ID] {
+			return false
+		}
+	}
+	return true
 }
 
 // Option configures a Recorder.
@@ -1296,7 +1366,8 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // that raised the question, who held it, the part of the call it is
 // about and whether the call is held only beside another, from
 // [SubjectMember] and [HeldMember]); one in flight when the record stopped
-// may have run and is [agentturn.PendingAborted], as is one with no
+// may have run and is [agentturn.PendingAborted], unless a [WithdrawnNS]
+// entry withdrew every dispatch it has, when it never started, as is one with no
 // dispatch on the path that has one on a branch a rebase to before it
 // left, a held one of which is Dispatched; one an answer
 // decision ended before its output was written is
@@ -1328,6 +1399,9 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // reads a call it finds dispatched there as one dispatched on a branch
 // a rebase left. [Recorder.ReadOptions] gives the options that read a
 // session as the recorder writing it does.
+//
+// A call a question was asked under that nothing answered, a run cut
+// while a person decided, carries that question as its Question.
 func Pending(s *agentsession.Session, opts ...ReadOption) ([]agentturn.PendingCall, error) {
 	pending, _, err := pendingCalls(s, opts)
 	return pending, err
@@ -1427,15 +1501,23 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 	}
 	var out []agentturn.PendingCall
 	ranAt := map[string]string{}
+	path := s.Path(s.Leaf())
+	withdrawn := withdrawnDispatches(path)
+	open := openQuestions(path)
 	for _, c := range calls {
 		p := agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingUnknown}
 		state := c.State(s.Header())
+		never := allWithdrawn(c, withdrawn)
 		switch state {
 		case agentsession.CallHeld:
-			p.Reason, p.Dispatched = agentturn.PendingDeferred, len(c.Dispatches) > 0
+			p.Reason, p.Dispatched = agentturn.PendingDeferred, len(c.Dispatches) > 0 && !never
 			p.Decision = holdDecision(c)
 		case agentsession.CallInFlight:
 			p.Reason = agentturn.PendingAborted
+			if never {
+				// Every hand-off was withdrawn before the tool ran.
+				p.Reason = agentturn.PendingUndispatched
+			}
 		case agentsession.CallAnswered:
 			p.Reason = agentturn.PendingAnswered
 		case agentsession.CallRejected:
@@ -1493,6 +1575,7 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 		if args != "" && !sameJSON(json.RawMessage(args), c.Call.Arguments) {
 			p.Args = json.RawMessage(args)
 		}
+		p.Question = open[c.Call.CallID]
 		out = append(out, p)
 	}
 	return out, ranAt, nil
@@ -1790,10 +1873,10 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 				break
 			}
 			ans = replayAnswer(ctx, set, p)
-			if q := openQuestion(s, id); q != nil && ans.Output != nil {
+			if q := p.Question; q != nil && ans.Output != nil {
 				// The call was waiting on a person when the run was
 				// cut: the answer says so, and what it asked.
-				ans = ans.WithReason(ans.Reason + "; " + q.openReason())
+				ans = ans.WithReason(ans.Reason + "; " + q.Reason())
 			}
 		}
 		out = append(out, ans.WithBy(agentsession.ByPolicy))
@@ -1801,17 +1884,21 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 	return out, nil
 }
 
-// openQuestion is the last question asked under callID on the path to
-// the leaf that nothing answered: an [ElicitationNS] entry with phase
-// ask that no answer entry after it names in asked. It is nil when
-// every question under the call was answered, or none was asked. An
-// entry an earlier release wrote, with no phase, holds its answer.
-func openQuestion(s *agentsession.Session, callID string) *Elicitation {
-	open := map[string]*Elicitation{}
-	var order []string
-	for _, e := range s.Path(s.Leaf()) {
+// openQuestions returns, for each call on path that a question was
+// asked under and nothing answered, the last such question, as
+// [agentturn.PendingCall.Question] carries it: the [ElicitationNS]
+// entries with phase ask that no answer entry after them names in
+// asked.
+func openQuestions(path []agentsession.Entry) map[string]*agentturn.OpenQuestion {
+	type ask struct {
+		id, call string
+		q        Elicitation
+	}
+	open := map[string]bool{}
+	var asks []ask
+	for _, e := range path {
 		c, ok := e.(*agentsession.CustomEntry)
-		if !ok || c.NS != ElicitationNS || c.CallID != callID {
+		if !ok || c.NS != ElicitationNS || c.CallID == "" {
 			continue
 		}
 		var q Elicitation
@@ -1820,32 +1907,28 @@ func openQuestion(s *agentsession.Session, callID string) *Elicitation {
 		}
 		switch q.Phase {
 		case ElicitationAsk:
-			open[c.ID] = &q
-			order = append(order, c.ID)
+			open[c.ID] = true
+			asks = append(asks, ask{id: c.ID, call: c.CallID, q: q})
 		case ElicitationAnswer:
 			delete(open, q.Asked)
 		}
 	}
-	for i := len(order) - 1; i >= 0; i-- {
-		if q, ok := open[order[i]]; ok {
-			return q
+	var out map[string]*agentturn.OpenQuestion
+	for _, a := range asks {
+		if !open[a.id] {
+			continue
 		}
-	}
-	return nil
-}
-
-// openReason says the question was open when the run was cut, and
-// which call it was about, for the reason of the answer [ReplayAnswers]
-// gives the call it was asked under.
-func (e Elicitation) openReason() string {
-	reason := fmt.Sprintf("a question was open: %q", e.Message)
-	if e.Call != "" {
-		reason += " about call " + e.Call
-		if e.Tool != "" {
-			reason += " (" + e.Tool + ")"
+		if out == nil {
+			out = map[string]*agentturn.OpenQuestion{}
 		}
+		q := &agentturn.OpenQuestion{ID: a.id, Message: a.q.Message}
+		if a.q.Call != "" {
+			q.Call = &agentturn.AskedCall{Parent: a.q.Parent, CallID: a.q.Call, Name: a.q.Tool}
+		}
+		// The last one asked under the call is the one it waited on.
+		out[a.call] = q
 	}
-	return reason
+	return out
 }
 
 // ranOffReason is the reason of the answer [ReplayAnswers] gives a
@@ -2752,6 +2835,7 @@ func (w *writer) seed(ctx context.Context, s *agentsession.Session, owed bool) e
 func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls []*agentsession.Call) error {
 	o := &origins{ctx: ctx, lenient: true}
 	o.r, _ = w.rec.store.(agentsession.Reader)
+	withdrawn := withdrawnDispatches(s.Path(s.Leaf()))
 	for _, c := range calls {
 		off := false
 		ranEntry, childOff := "", ""
@@ -2771,6 +2855,8 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 		}
 		rec := callRecordOf(c, s.Header(), off)
 		rec.ranEntry, rec.childOff = ranEntry, childOff
+		rec.dispatchEntry = lastDispatch(c)
+		rec.withdrawn = allWithdrawn(c, withdrawn)
 		w.calls[c.ID()] = rec
 	}
 	return nil
@@ -3287,6 +3373,19 @@ func (w *writer) drained(item openresponses.Item) *inboxItem {
 func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 	if c := w.calls[e.CallID]; c != nil && e.Parent == "" && !e.Deferred && !c.dispatched && !c.rejected {
 		c.settledRun = w.run
+	}
+	if c := w.calls[e.CallID]; c != nil && e.Parent == "" && e.Withdrawn && c.dispatched && c.dispatchRun == w.run && !c.withdrawn {
+		// The dispatch is on the path, and the tool never ran: say so,
+		// so the call reads as never started rather than as one that
+		// may have run.
+		data, err := json.Marshal(Withdrawn{Dispatch: c.dispatchEntry, Reason: errText(e.Err)})
+		if err != nil {
+			return err
+		}
+		if _, err := w.append(ctx, &agentsession.CustomEntry{NS: WithdrawnNS, Data: data, CallID: e.CallID}); err != nil {
+			return err
+		}
+		c.withdrawn = true
 	}
 	if e.Parent != "" {
 		if err := w.nested(ctx, NestedCall{
@@ -4227,7 +4326,7 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 	d := e.Decision
 	// A call an earlier run dispatched goes to its tool again only on
 	// an approval, which names its decider as a held call's does.
-	again := c.dispatched && c.dispatchRun != w.run
+	again := c.dispatched && !c.withdrawn && c.dispatchRun != w.run
 	c.again = nil
 	by := ""
 	if d != nil {
@@ -4358,11 +4457,13 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 		c.again = nil
 	}
 	d := agentsession.NewDispatch(e.CallID, c.entry).WithIdempotencyKey(e.IdempotencyKey)
-	if _, err := w.append(ctx, d); err != nil {
+	id, err := w.append(ctx, d)
+	if err != nil {
 		return err
 	}
 	w.takeUp(e.CallID)
 	c.dispatched, c.dispatchRun, c.unknown = true, w.run, false
+	c.dispatchEntry, c.withdrawn = id, false
 	return nil
 }
 
