@@ -1212,7 +1212,8 @@ func sameNoteItem(a, b openresponses.Item) bool {
 
 // OwedNotes returns the notes the session owes after outputs already on
 // its path, with no call pending to wait on: those of the last
-// [HeldNotesNS] entry whose call's output is on the path, which a failed
+// [HeldNotesNS] entry whose call's output is on the path, or that name
+// no call, which a failed
 // run could not append. [AgentOptions] seeds an agent with them; with
 // calls pending, [Pending] puts the notes on the last of them instead.
 func OwedNotes(s *agentsession.Session) ([]agentturn.Note, error) {
@@ -1237,7 +1238,7 @@ func OwedNotes(s *agentsession.Session) ([]agentturn.Note, error) {
 	}
 	var out []agentturn.Note
 	for _, n := range lastHeldNotes(path) {
-		if n.CallID != "" && answered[n.CallID] {
+		if n.CallID == "" || answered[n.CallID] {
 			out = append(out, n)
 		}
 	}

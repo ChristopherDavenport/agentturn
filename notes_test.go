@@ -881,3 +881,85 @@ func TestAsksAcceptNoteIsThePersons(t *testing.T) {
 		t.Errorf("messages = %q", got)
 	}
 }
+
+// TestAnAskedNestedCallsNoteReachesTheModel pins that a tool asking with
+// Ask about a nested call the loop never runs through Invoke keeps the
+// person's accept note: it waits with the asking call's batch and the
+// model reads it once, after the batch's outputs, as the person's.
+// v0.0.24 to v0.0.26 held it under the nested call's ID, which nothing
+// read. A note about a call nothing ties to the batch is held too.
+func TestAnAskedNestedCallsNoteReachesTheModel(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		parent bool
+	}{
+		{"with its parent", true},
+		{"tied to nothing", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eval := agenttool.New("eval", "", func(ctx context.Context, _ echoArgs) (string, error) {
+				asked := AskedCall{CallID: "call_nested", Name: "read", Args: json.RawMessage(`{"path":"go.mod"}`),
+					Decision: &ToolDecision{Action: Defer, Reason: "ask"}}
+				if tc.parent {
+					call, _ := agenttool.CallFrom(ctx)
+					asked.Parent = call.ID
+				}
+				if d, ok := Ask(ctx, asked); !ok || d.Action != Allow {
+					return "", errors.New("not allowed")
+				}
+				return "read it myself", nil
+			})
+			accept := func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+				return agenttool.Answer{Action: agenttool.ActionAccept, Note: "only go.mod"}, nil
+			}
+			cfg := Config{Model: callsNamed{names: []string{"eval"}}, Tools: []agenttool.Tool{eval}, ToolElicitor: accept, MaxTurns: 1}
+			_, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := itemTypes(end.Items); got != "user function_call function_call_output user" {
+				t.Fatalf("items = %q", got)
+			}
+			if got := strings.Join(texts(end.Items), "|"); got != "user: x|user: only go.mod" {
+				t.Errorf("messages = %q", got)
+			}
+		})
+	}
+}
+
+// TestAnOwedNoteAboutNoCallIsKept pins that SetTranscript keeps an owed
+// note that names no call, since nothing says it is gone.
+func TestAnOwedNoteAboutNoCallIsKept(t *testing.T) {
+	a := New(Config{Model: &echo.Adapter{}, MaxTurns: 1},
+		WithTranscript(Transcript{openresponses.UserText("x")}),
+		WithNotes([]Note{{Item: openresponses.DeveloperText("said before"), Mode: InputTool}}))
+	if err := a.SetTranscript(a.State().Transcript); err != nil {
+		t.Fatal(err)
+	}
+	if n := a.State().Notes; len(n) != 1 {
+		t.Errorf("owed notes = %+v, want the note kept", n)
+	}
+}
+
+// TestANoteAboutAnUnknownCallIsNotLost pins the stray guard: a hook that
+// asks about a call no batch holds, with no call on its context, still
+// gets the person's note to the model, after the batch's outputs.
+func TestANoteAboutAnUnknownCallIsNotLost(t *testing.T) {
+	hook := func(ctx context.Context, info ToolCallInfo) (*ToolDecision, error) {
+		if _, ok := Ask(ctx, AskedCall{CallID: "call_ghost", Name: "read", Decision: &ToolDecision{Action: Defer, Reason: "ask"}}); !ok {
+			return nil, errors.New("not asked")
+		}
+		return nil, nil
+	}
+	accept := func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+		return agenttool.Answer{Action: agenttool.ActionAccept, Note: "only go.mod"}, nil
+	}
+	cfg := Config{Model: callsNamed{names: []string{"a"}}, Tools: abTools(), BeforeToolCall: hook, ToolElicitor: accept, MaxTurns: 1}
+	_, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(texts(end.Items), "|"); got != "user: x|user: only go.mod" {
+		t.Errorf("messages = %q", got)
+	}
+}

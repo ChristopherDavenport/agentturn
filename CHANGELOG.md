@@ -5,6 +5,20 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Fixed: a person's accept note on a call `Ask` puts to them about a
+  nested call the loop never runs through `Invoke` reaches the model
+  again, once, as a user message after the asking call's batch outputs.
+  Since v0.0.24 it was held under the nested call's ID, which no batch
+  call reads. `Ask` now ties the nested call to its `Parent` as `Invoke`
+  does, and a note about a call nothing ties to a batch is held with the
+  call whose tool asked.
+- Fixed: a note said under a call no call of the batch takes is held
+  with the batch, in the order said, rather than left where nothing
+  reads it; a note that names no call is kept by `SetTranscript` and by
+  agentturn/session's `OwedNotes`, since nothing says it is gone.
+
 ## v0.0.26 - 2026-10-11
 
 - Added: `Recorder.Elicitor` writes who answered on the answer entry,
