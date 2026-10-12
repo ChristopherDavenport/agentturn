@@ -290,6 +290,9 @@ func TestTheInputRequiredHookAnswersOnTheSameTask(t *testing.T) {
 			if n := len(recs.of(CalleeNS)); n != 1 {
 				t.Errorf("callee records = %d, want 1 for one task", n)
 			}
+			if n := len(recs.of(CancelNS)); n != 0 {
+				t.Errorf("cancel records = %d for a task that completed", n)
+			}
 
 			_, err = New(client, card, opts...).Execute(context.Background(), agenttool.Call{ID: "c2", Args: json.RawMessage(`{"input":"paint"}`)})
 			var ir *InputRequiredError
@@ -478,9 +481,10 @@ func (s messaging) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, q 
 }
 
 // TestAMessageAnswerAfterAnInputRoundCancelsTheTask pins that a call
-// whose answered round ends in a message answers with it, and stops the
-// task it last saw asking: the message is no state of the task, which no
-// one asks anything of any more.
+// whose answered round ends in a message answers with it, recording the
+// message as a callee of its own, and stops the task it last saw asking:
+// the message is no state of the task, which no one asks anything of
+// any more.
 func TestAMessageAnswerAfterAnInputRoundCancelsTheTask(t *testing.T) {
 	remote := messaging{cancelled: make(chan a2a.TaskID, 4)}
 	client, card := serve(t, remote, nil)
@@ -501,8 +505,8 @@ func TestAMessageAnswerAfterAnInputRoundCancelsTheTask(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the remote agent saw no tasks/cancel")
 	}
-	if got := recs.order(); len(got) != 2 || got[0] != CalleeNS || got[1] != CancelNS {
-		t.Errorf("records = %v, want the callee then the cancel", got)
+	if got := recs.order(); len(got) != 3 || got[0] != CalleeNS || got[1] != CalleeNS || got[2] != CancelNS {
+		t.Errorf("records = %v, want the task's callee, the message's, then the cancel", got)
 	}
 }
 
@@ -778,7 +782,7 @@ func TestACallCancelsEveryTaskItLeaves(t *testing.T) {
 	}{
 		{"new task asking", asks("t2", a2a.TaskStateInputRequired), nil, []a2a.TaskID{"t1", "t2"}, []string{CalleeNS, CalleeNS, CancelNS, CancelNS}, false},
 		{"new task done", asks("t2", a2a.TaskStateCompleted), nil, []a2a.TaskID{"t1"}, []string{CalleeNS, CalleeNS, CancelNS}, true},
-		{"bare message", a2a.NewMessage(a2a.MessageRoleAgent, a2a.TextPart{Text: "done"}), nil, []a2a.TaskID{"t1"}, []string{CalleeNS, CancelNS}, true},
+		{"bare message", a2a.NewMessage(a2a.MessageRoleAgent, a2a.TextPart{Text: "done"}), nil, []a2a.TaskID{"t1"}, []string{CalleeNS, CalleeNS, CancelNS}, true},
 		{"peer", asks("t2", a2a.TaskStateInputRequired), []Option{WithoutCancelOnAbort()}, nil, []string{CalleeNS, CalleeNS}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -837,6 +841,13 @@ func TestACallCancelsEveryTaskItLeaves(t *testing.T) {
 			}
 			if !slices.Equal(sent, tc.cancelled) {
 				t.Errorf("cancel records name %v, want %v", sent, tc.cancelled)
+			}
+			if _, ok := tc.second.(*a2a.Message); ok {
+				var m Callee
+				_ = json.Unmarshal(recs.of(CalleeNS)[1], &m)
+				if m.Task != "" || m.URL != srv.URL || m.Relation != RelationSubsession {
+					t.Errorf("message callee = %+v, want no task, url %q", m, srv.URL)
+				}
 			}
 		})
 	}

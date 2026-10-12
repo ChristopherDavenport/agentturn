@@ -262,7 +262,9 @@ type callState struct {
 	remote *remote
 	ep     *endpoint
 	// tasks are the tasks the call reached, in the order it reached them.
-	tasks     []*task
+	tasks []*task
+	// reportedM is whether the [Callee] record of a message answer is
+	// written.
 	reportedM bool
 }
 
@@ -329,12 +331,18 @@ func (c *callState) url() string { return c.ep.get() }
 // report writes the [Callee] record once the callee is known: a task,
 // or a plain message answer with no task. It is written once per task,
 // under a context the call's end does not cancel, since it is the
-// handle a given-up call leaves behind.
+// handle a given-up call leaves behind. A message that answers after a
+// task ran, the reply to an answer given on it, gets a record of its
+// own beside the task's: the message answered the call, while the task
+// is left and cancelled.
 func (c *callState) report(ctx context.Context, out *outcome) error {
-	if t := c.seen(out); t != nil {
-		return c.callee(ctx, t)
+	t := c.seen(out)
+	if t != nil {
+		if err := c.callee(ctx, t); err != nil {
+			return err
+		}
 	}
-	if out.message == nil || c.reportedM {
+	if out.message == nil || c.reportedM || (t != nil && !t.running) {
 		return nil
 	}
 	if err := agenttool.WriteRecord(context.WithoutCancel(ctx), Callee{URL: c.url(), Context: out.contextID, Relation: c.relation()}); err != nil {
@@ -360,9 +368,10 @@ func (c *callState) callee(ctx context.Context, t *task) error {
 // leave sends tasks/cancel for each task the call leaves unfinished,
 // unless the callee is a peer: every task a task event named whose last
 // state was not terminal, the one the call ends on and any it moved off,
-// each once. It records each cancel, after the task's [Callee] record
-// if the call had not written it yet, so a cancel is never recorded
-// about a callee the record does not name. It does not wait for the
+// each once. It records each cancel after the task's [Callee] record,
+// which it writes first if it is not written yet; when that write fails
+// again the cancel is recorded all the same, about a task no [Callee]
+// names, rather than lost. It does not wait for the
 // remote agent: each request goes from a goroutine of its own, under a
 // context that outlives the call by at most [CancelTimeout], and the
 // record says the stop was asked for, not that the work stopped.

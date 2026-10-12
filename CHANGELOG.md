@@ -29,6 +29,12 @@ versions may break the API.
   as on a normal end. Each task gets its own `tasks/cancel` and its own
   `CancelSent` naming it, after its `Callee`, and none is cancelled
   twice. A task known only from a message answer is not cancelled.
+- Changed: when the remote agent's reply to an answer is a message, the
+  call writes a `Callee` record for the message, with the URL and
+  context and no task, once per call, besides the task's; it comes
+  before the `CancelSent` of the task left asking and before the output,
+  so agentsession's `Callees` reads the message's link as the one that
+  answered.
 
 ## v0.0.28 - 2026-10-11
 
