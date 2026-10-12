@@ -16,7 +16,19 @@ versions may break the API.
   `CancelTimeout`, and records a `CancelSent` after the `Callee`; the
   `InputRequiredError` and the model's output are unchanged. A peer's
   task under `WithoutCancelOnAbort` is left asking, and a call aborted
-  while its hook holds the question cancels once.
+  while its hook holds the question cancels once. A host that resumed a
+  subsession's task by the IDs in `TaskInfo` must now build the tool
+  with `WithoutCancelOnAbort`. Where the `session` module's recorder
+  writes the records as links, such a call now reads in agentsession's
+  `Callees` as cancel sent and not answered; the callee's question is in
+  the call's output.
+- Changed: a `tools/a2a` subsession call cancels every task it leaves
+  unfinished, not only the one it ends on: when the remote agent's reply
+  to an answer moves to a new task or comes as a message, the task it
+  answered was last seen asking and is cancelled too, on the abort path
+  as on a normal end. Each task gets its own `tasks/cancel` and its own
+  `CancelSent` naming it, after its `Callee`, and none is cancelled
+  twice. A task known only from a message answer is not cancelled.
 
 ## v0.0.28 - 2026-10-11
 

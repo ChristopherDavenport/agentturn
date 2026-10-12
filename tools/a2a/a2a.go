@@ -8,18 +8,20 @@
 // stops in input-required becomes a returned error carrying the agent's
 // question, so the model can answer it in its next turn, with a new call
 // and so a new task: the call gives up the task it leaves asking, as it
-// does one left in auth-required.
-// [WithInputRequired] answers the question inside the call instead, on
-// the same task. The task and context IDs travel in Result.Details; a
-// host that wants to resume a task itself makes the callee a peer.
+// does one left in auth-required. [WithInputRequired] answers the
+// question inside the call instead, on the same task. The task and
+// context IDs travel in Result.Details; a host that wants to resume a
+// task itself makes the callee a peer.
 //
 // The call records the callee it reaches as soon as it knows it, with
 // agenttool.WriteRecord: a [Callee] naming the URL it called, the task
-// and its context. The task is the call's own work, which the call
-// cancels when it gives it up, left asking for input included, and the
-// record names it a subsession; with [WithoutCancelOnAbort] it is a
-// peer's, which outlives the call. A cancel is sent and not waited on,
-// and recorded as [CancelSent].
+// and its context. The task is the call's own work, and the record names
+// it a subsession; with [WithoutCancelOnAbort] it is a peer's, which
+// outlives the call. When a call ends, no one asks anything more of the
+// tasks it leaves unfinished, so it cancels each: the one it ends on,
+// if that has not ended, and any the remote agent moved off in reply to
+// an answer. A cancel is sent and not waited on, and recorded as
+// [CancelSent].
 //
 //	card, _ := agentcard.DefaultResolver.Resolve(ctx, url)
 //	client, _ := a2aclient.NewFromCard(ctx, card)
@@ -108,13 +110,13 @@ func WithSequential() Option { return func(r *remote) { r.sequential = true } }
 // WithoutCancelOnAbort leaves a task running when its call is given
 // up: the remote agent is a peer whose work outlives the call and keeps
 // its own record, and the call's [Callee] record names it with
-// [RelationPeer]. By default a call whose context ends before its task
-// does, or that ends with its task in input-required or auth-required,
-// sends tasks/cancel for the task, and the task is the call's own work,
-// a [RelationSubsession].
+// [RelationPeer]. By default a call sends tasks/cancel for each task it
+// leaves unfinished, its context ended before the task did or the task
+// left in input-required or auth-required, and the task is the call's
+// own work, a [RelationSubsession].
 func WithoutCancelOnAbort() Option { return func(r *remote) { r.peer = true } }
 
-// CancelTimeout bounds the tasks/cancel a given-up call sends. The call
+// CancelTimeout bounds each tasks/cancel a call sends as it ends. The call
 // does not wait for it: it is sent from a goroutine of its own, under a
 // context that outlives the call by at most this long.
 const CancelTimeout = 10 * time.Second
@@ -134,10 +136,10 @@ type InputRequired func(ctx context.Context, info TaskInfo, question *a2a.Messag
 // human plane, so the remote agent's question reaches whoever answers
 // the caller's own questions. A question with no status message is put
 // as an empty agent message. An auth-required task is not put to fn; it
-// ends the call as before, as does a task still asking after
-// [WithInputRounds] answers. A call that ends input-required or
-// auth-required, fn unable to answer or out of rounds, cancels the task
-// as a call without fn does, unless the callee is a peer.
+// ends the call, as does a task still asking after [WithInputRounds]
+// answers. A call that ends input-required or auth-required, fn unable
+// to answer or out of rounds, cancels the task as a call without fn
+// does, unless the callee is a peer.
 func WithInputRequired(fn InputRequired) Option { return func(r *remote) { r.inputRequired = fn } }
 
 // DefaultInputRounds is how many times a call answers a task's
@@ -219,11 +221,9 @@ func (r *remote) Execute(ctx context.Context, call agenttool.Call) (agenttool.Re
 	for rounds := 0; ; rounds++ {
 		err := r.send(ctx, call, &a2a.MessageSendParams{Message: msg}, &out, c)
 		if err != nil {
-			// The call gives up a task that has not ended, aborted or
+			// The call gives up the tasks that have not ended, aborted or
 			// failed alike: its own work is stopped.
-			if !out.state.Terminal() {
-				c.cancel(ctx, &out)
-			}
+			c.leave(ctx, &out)
 			return agenttool.Result{}, err
 		}
 		if out.state != a2a.TaskStateInputRequired || r.inputRequired == nil || out.taskID == "" || rounds >= r.inputRounds {
@@ -240,28 +240,20 @@ func (r *remote) Execute(ctx context.Context, call agenttool.Call) (agenttool.Re
 		}
 		if err != nil {
 			// The call gives the task up: its own work is stopped.
-			c.cancel(ctx, &out)
+			c.leave(ctx, &out)
 			return agenttool.Result{Details: info}, err
 		}
 		msg = a2a.NewMessageForTask(a2a.MessageRoleUser, a2a.TaskInfo{TaskID: out.taskID, ContextID: out.contextID}, answer...)
 		out.answered()
 	}
-	switch out.state {
-	case a2a.TaskStateInputRequired, a2a.TaskStateAuthRequired:
-		// The call ends asking for input or credentials nobody gave it,
-		// and the model that reads the question calls again, which
-		// starts a new task: nothing comes back to this one, so the
-		// call's own work is stopped. A peer's task is left to the peer.
-		c.cancel(ctx, &out)
-	default:
-		if out.taskID != "" && !out.state.Terminal() && out.message == nil {
-			// The stream closed, or a blocking call returned, before
-			// the task ended: the call is over, and its own work is
-			// stopped as an abort stops it. A message answer ends the
-			// exchange; there is nothing left running.
-			c.cancel(ctx, &out)
-		}
-	}
+	// The call is over, and no one is asking for the work of a task it
+	// leaves unfinished: one that waits on input or credentials nobody
+	// gave it, since the model that reads the question calls again and
+	// so starts a new task; one whose stream closed, or whose blocking
+	// call returned, before it ended; an earlier task the remote agent
+	// moved off with its reply to an answer. Each is stopped as an abort
+	// stops it.
+	c.leave(ctx, &out)
 	return out.result()
 }
 
@@ -269,10 +261,54 @@ func (r *remote) Execute(ctx context.Context, call agenttool.Call) (agenttool.Re
 type callState struct {
 	remote *remote
 	ep     *endpoint
-	// reported is the task the call last wrote a [Callee] record for, so
-	// the answers on one task do not write it again.
-	reported  string
+	// tasks are the tasks the call reached, in the order it reached them.
+	tasks     []*task
 	reportedM bool
+}
+
+// task is one task a call reached.
+type task struct {
+	id        a2a.TaskID
+	contextID string
+	// state is the last state the task was seen in. running is whether
+	// a task event named it; a task only a message answer names is not
+	// known to run.
+	state   a2a.TaskState
+	running bool
+	// reported is whether its [Callee] record is written, so the answers
+	// on one task do not write it again; cancelled whether tasks/cancel
+	// was sent for it.
+	reported  bool
+	cancelled bool
+}
+
+// seen folds out into the task it names, and returns it, or nil when
+// out names no task.
+func (c *callState) seen(out *outcome) *task {
+	if out.taskID == "" {
+		return nil
+	}
+	var t *task
+	for _, have := range c.tasks {
+		if have.id == out.taskID {
+			t = have
+			break
+		}
+	}
+	if t == nil {
+		t = &task{id: out.taskID}
+		c.tasks = append(c.tasks, t)
+	}
+	if out.contextID != "" {
+		t.contextID = out.contextID
+	}
+	if out.state != "" {
+		t.state = out.state
+	}
+	if out.message == nil {
+		t.running = true
+	}
+	return t
 }
 
 // relation is the link the call's callee is.
@@ -295,53 +331,63 @@ func (c *callState) url() string { return c.ep.get() }
 // under a context the call's end does not cancel, since it is the
 // handle a given-up call leaves behind.
 func (c *callState) report(ctx context.Context, out *outcome) error {
-	switch {
-	case out.taskID != "":
-		if c.reported == string(out.taskID) {
-			return nil
-		}
-	case out.message != nil:
-		if c.reportedM {
-			return nil
-		}
-	default:
+	if t := c.seen(out); t != nil {
+		return c.callee(ctx, t)
+	}
+	if out.message == nil || c.reportedM {
 		return nil
 	}
-	if err := agenttool.WriteRecord(context.WithoutCancel(ctx), Callee{URL: c.url(), Task: string(out.taskID), Context: out.contextID, Relation: c.relation()}); err != nil {
+	if err := agenttool.WriteRecord(context.WithoutCancel(ctx), Callee{URL: c.url(), Context: out.contextID, Relation: c.relation()}); err != nil {
 		return err
 	}
-	// Marked once it is written, so a failed write is tried again.
-	if out.taskID != "" {
-		c.reported = string(out.taskID)
-	} else {
-		c.reportedM = true
-	}
+	c.reportedM = true
 	return nil
 }
 
-// cancel sends tasks/cancel for a task the call gave up, unless the
-// callee is a peer, and records that it was sent, after the [Callee]
-// record if the call had not written it yet, so a cancel is never
-// recorded about a callee the record does not name. It does not wait
-// for the remote agent: the request goes from a goroutine of its own,
-// under a context that outlives the call by at most [CancelTimeout],
-// and the record says the stop was asked for, not that the work
-// stopped.
-func (c *callState) cancel(ctx context.Context, out *outcome) {
-	task := out.taskID
-	if c.remote.peer || task == "" {
+// callee writes t's [Callee] record unless it is written. It is marked
+// once it is written, so a failed write is tried again.
+func (c *callState) callee(ctx context.Context, t *task) error {
+	if t.reported {
+		return nil
+	}
+	if err := agenttool.WriteRecord(context.WithoutCancel(ctx), Callee{URL: c.url(), Task: string(t.id), Context: t.contextID, Relation: c.relation()}); err != nil {
+		return err
+	}
+	t.reported = true
+	return nil
+}
+
+// leave sends tasks/cancel for each task the call leaves unfinished,
+// unless the callee is a peer: every task a task event named whose last
+// state was not terminal, the one the call ends on and any it moved off,
+// each once. It records each cancel, after the task's [Callee] record
+// if the call had not written it yet, so a cancel is never recorded
+// about a callee the record does not name. It does not wait for the
+// remote agent: each request goes from a goroutine of its own, under a
+// context that outlives the call by at most [CancelTimeout], and the
+// record says the stop was asked for, not that the work stopped.
+func (c *callState) leave(ctx context.Context, out *outcome) {
+	if c.remote.peer {
 		return
 	}
-	cctx, stop := context.WithTimeout(context.WithoutCancel(ctx), CancelTimeout)
-	go func() {
-		defer stop()
-		_, _ = c.remote.client.CancelTask(cctx, &a2a.TaskIDParams{ID: task})
-	}()
-	// The call is over, so its context may be too; the records are
-	// written under one that is not, and their failure changes nothing
-	// the call returns.
-	_ = c.report(ctx, out)
-	_ = agenttool.WriteRecord(context.WithoutCancel(ctx), CancelSent{URL: c.url(), Task: string(task)})
+	c.seen(out)
+	for _, t := range c.tasks {
+		if t.cancelled || !t.running || t.state.Terminal() {
+			continue
+		}
+		t.cancelled = true
+		id := t.id
+		cctx, stop := context.WithTimeout(context.WithoutCancel(ctx), CancelTimeout)
+		go func() {
+			defer stop()
+			_, _ = c.remote.client.CancelTask(cctx, &a2a.TaskIDParams{ID: id})
+		}()
+		// The call is over, so its context may be too; the records are
+		// written under one that is not, and their failure changes
+		// nothing the call returns.
+		_ = c.callee(ctx, t)
+		_ = agenttool.WriteRecord(context.WithoutCancel(ctx), CancelSent{URL: c.url(), Task: string(id)})
+	}
 }
 
 // send sends one message and folds the answer into out, reporting the
