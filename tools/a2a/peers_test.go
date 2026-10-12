@@ -540,12 +540,20 @@ func TestACalleeRecordThatFailedIsWrittenAgain(t *testing.T) {
 	}
 }
 
-// questioning asks on every message of a task, and tells the test of
-// each cancel.
-type questioning struct{ cancelled chan a2a.TaskID }
+// questioning asks on every message of a task, for input or, with
+// state auth-required, for credentials, and tells the test of each
+// cancel.
+type questioning struct {
+	cancelled chan a2a.TaskID
+	state     a2a.TaskState
+}
 
-func (questioning) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue) error {
-	ev := a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateInputRequired, a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: "which?"}))
+func (s questioning) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue) error {
+	state := s.state
+	if state == "" {
+		state = a2a.TaskStateInputRequired
+	}
+	ev := a2a.NewStatusUpdateEvent(reqCtx, state, a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: "which?"}))
 	ev.Final = true
 	return q.Write(ctx, ev)
 }
@@ -570,8 +578,8 @@ func (r *records) order() []string {
 
 // TestACallLeftAskingCancelsItsTask pins #253: a subsession call that
 // ends input-required, with no hook, a hook that cannot answer or its
-// rounds spent, gives its task up, since the model's next call starts a
-// new one. It sends tasks/cancel for the task and records CancelSent
+// rounds spent, or auth-required, gives its task up, since the model's
+// next call starts a new one. It sends tasks/cancel for the task and records CancelSent
 // after the Callee, and returns the same InputRequiredError as before;
 // a peer's task is left asking.
 func TestACallLeftAskingCancelsItsTask(t *testing.T) {
@@ -583,19 +591,24 @@ func TestACallLeftAskingCancelsItsTask(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name   string
+		state  a2a.TaskState
 		opts   []Option
 		cancel bool
 	}{
-		{"no hook", nil, true},
-		{"no hook blocking", []Option{WithBlocking()}, true},
-		{"hook declines", []Option{WithInputRequired(declining)}, true},
-		{"rounds spent", []Option{WithInputRequired(answering), WithInputRounds(2)}, true},
-		{"rounds spent blocking", []Option{WithBlocking(), WithInputRequired(answering), WithInputRounds(2)}, true},
-		{"peer", []Option{WithoutCancelOnAbort()}, false},
-		{"peer hook declines", []Option{WithoutCancelOnAbort(), WithInputRequired(declining)}, false},
+		{"no hook", "", nil, true},
+		{"no hook blocking", "", []Option{WithBlocking()}, true},
+		{"hook declines", "", []Option{WithInputRequired(declining)}, true},
+		{"rounds spent", "", []Option{WithInputRequired(answering), WithInputRounds(2)}, true},
+		{"rounds spent blocking", "", []Option{WithBlocking(), WithInputRequired(answering), WithInputRounds(2)}, true},
+		{"peer", "", []Option{WithoutCancelOnAbort()}, false},
+		{"peer hook declines", "", []Option{WithoutCancelOnAbort(), WithInputRequired(declining)}, false},
+		{"auth", a2a.TaskStateAuthRequired, nil, true},
+		{"auth blocking", a2a.TaskStateAuthRequired, []Option{WithBlocking()}, true},
+		{"auth with a hook", a2a.TaskStateAuthRequired, []Option{WithInputRequired(answering)}, true},
+		{"auth peer", a2a.TaskStateAuthRequired, []Option{WithoutCancelOnAbort()}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			remote := questioning{cancelled: make(chan a2a.TaskID, 4)}
+			remote := questioning{cancelled: make(chan a2a.TaskID, 4), state: tc.state}
 			client, card := serve(t, remote, nil)
 			var recs records
 			ctx := agenttool.ContextWithRecorder(context.Background(), recs.fn)
@@ -604,8 +617,12 @@ func TestACallLeftAskingCancelsItsTask(t *testing.T) {
 			if !errors.As(err, &ir) || !errors.Is(err, agentturn.ErrInputRequired) || err.Error() != "the agent needs more input: which?" {
 				t.Fatalf("err = %v, want the agent's question", err)
 			}
+			want := tc.state
+			if want == "" {
+				want = a2a.TaskStateInputRequired
+			}
 			info, _ := res.Details.(TaskInfo)
-			if info.State != a2a.TaskStateInputRequired || info.TaskID == "" || info.TaskID != ir.TaskID || res.Output.Text != "" {
+			if info.State != want || info.TaskID == "" || info.TaskID != ir.TaskID || res.Output.Text != "" {
 				t.Errorf("result = %+v, error ids %+v", res, ir)
 			}
 			if !tc.cancel {

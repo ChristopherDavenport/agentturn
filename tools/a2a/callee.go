@@ -53,7 +53,8 @@ func (Callee) RecordNS() string { return CalleeNS }
 
 // CancelSent is the record that the call asked the remote agent to stop
 // a task, written when the call was given up before the task ended or
-// ended with the task in input-required: tasks/cancel was sent, and the
+// ended with the task in input-required or auth-required: tasks/cancel
+// was sent, and the
 // call did not wait for the task to reach canceled, so it says the stop
 // was asked for, not that the work stopped. A peer's task under [WithoutCancelOnAbort] is never
 // cancelled and has none.
