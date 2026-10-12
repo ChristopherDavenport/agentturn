@@ -158,6 +158,41 @@
 // watches, whose caller's human plane should decide; without it each
 // system's policy is its own.
 //
+// # Cancel
+//
+// tasks/cancel on a task with a run in flight aborts the run, and the
+// task ends canceled. A task its last run left input-required has no
+// run: its calls are pending in the conversation, the caller's own and
+// those put to it under [WithEscalation], and a caller that gives the
+// task up no longer asks for them. The cancel settles them before the
+// task ends canceled: each call the task's status message listed is
+// refused with agentturn.Refuse, its output saying "the caller
+// <principal> canceled the task, so this call was not run", and the
+// answer's reason the same. The refusal is a run of the conversation's
+// agent, which what [WithRecorderFor] attached records, under the
+// caller's trigger {Kind: "a2a", Ref: principal} and naming nobody as
+// the decider, as an [Approval]'s refusal does, so a session recorder
+// writes each as the caller's refusal of the held call, with that
+// reason. The run ends without calling the model, since nobody asks for
+// the work; a call the policy held beside an asked one does not run.
+// The [ConversationStore] then holds no unanswered call, the calls put
+// to the caller are forgotten, and the conversation's next message
+// starts clean, the model reading the refusals with it. A late answer
+// to a settled call is refused as invalid params. A failure to record
+// fails the cancel, as it fails a task.
+//
+// The settlement needs nothing the process held, so a cancel after a
+// restart settles the task the old process left. A cancel from a
+// principal that does not own the task, or may not write its
+// conversation, is refused as not found and writes nothing. A second
+// cancel finds the task canceled and settles nothing. The cancel holds
+// the conversation as a task does, so it never settles while a task
+// runs: when another task is in flight on the conversation, that task
+// answers the calls or lists them as its own, and the cancel settles
+// nothing. A message on the task that was on its way when the cancel
+// came, let through before the task was canceled, does not run: the
+// task stays canceled.
+//
 // # One task per conversation
 //
 // A context ID runs one task at a time, so a conversation's store and

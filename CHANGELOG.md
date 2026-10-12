@@ -5,6 +5,32 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Fixed: a `front/a2a` cancel of a task its last run left input-required,
+  arriving with no run active, settles what the task left pending in its
+  conversation instead of only marking the task canceled (#255). Each call
+  the task's status message listed, the caller's own and those put to it
+  under `WithEscalation`, the call held beside one included, is refused
+  with `agentturn.Refuse`: the output, and the answer's reason, say "the
+  caller <principal> canceled the task, so this call was not run". The
+  refusal runs on the conversation's agent with what `WithRecorderFor`
+  attached, under the caller's `{Kind: "a2a", Ref: principal}` trigger
+  and naming nobody as the decider, as an `Approval`'s refusal does, so a
+  session recorder writes each as a refusal of the held call, and the run
+  ends without calling the model. The stored conversation holds no
+  unanswered call, the calls put to the caller are forgotten, and the
+  conversation's next message starts clean. The cancel is refused as not
+  found for a principal who may not write the conversation; a
+  conversation another task has moved on in is left as it is; a cancel
+  with a run active aborts it as before.
+- Fixed: a `front/a2a` message on a task that a cancel ended while the
+  message was on its way ends canceled without running, and a cancel
+  finds a run from the moment the run holds its conversation.
+- Changed: a `front/a2a` message carrying a `function_call_output` when
+  the conversation has no pending call is refused as invalid params,
+  rather than stored as a second output of a call already answered.
+
 ## v0.0.28 - 2026-10-11
 
 - Added: `tools/a2a` records the callee a call reaches, through

@@ -686,9 +686,13 @@ func TestFailedEventWriteIsReturnedNotCanceled(t *testing.T) {
 	if len(tr) == 0 || unanswered(tr) != nil {
 		t.Errorf("stored transcript = %d items, unanswered = %v", len(tr), unanswered(tr))
 	}
-	// The zero Executor is usable: track initialises the registry.
+	// The zero Executor is usable: claim initialises the registries.
 	var zero Executor
-	zero.track("x", func() {})()
+	release, err := zero.claim("c", "x", func() {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
 }
 
 // speaksTwice says something and then echoes the input, two messages
