@@ -6,17 +6,19 @@
 // One call is one task: the tool sends the arguments as a user message,
 // follows the task to a final state and returns its text. A task that
 // stops in input-required becomes a returned error carrying the agent's
-// question, so the model can answer it in its next turn; the task and
-// context IDs travel in Result.Details for a host that wants to resume
-// the task itself. [WithInputRequired] answers the question inside the
-// call instead, on the same task.
+// question, so the model can answer it in its next turn, with a new call
+// and so a new task: the call gives up the task it leaves asking.
+// [WithInputRequired] answers the question inside the call instead, on
+// the same task. The task and context IDs travel in Result.Details; a
+// host that wants to resume a task itself makes the callee a peer.
 //
 // The call records the callee it reaches as soon as it knows it, with
 // agenttool.WriteRecord: a [Callee] naming the URL it called, the task
 // and its context. The task is the call's own work, which the call
-// cancels when it is given up, and the record names it a subsession; with
-// [WithoutCancelOnAbort] it is a peer's, which outlives the call. A
-// cancel is sent and not waited on, and recorded as [CancelSent].
+// cancels when it gives it up, left asking for input included, and the
+// record names it a subsession; with [WithoutCancelOnAbort] it is a
+// peer's, which outlives the call. A cancel is sent and not waited on,
+// and recorded as [CancelSent].
 //
 //	card, _ := agentcard.DefaultResolver.Resolve(ctx, url)
 //	client, _ := a2aclient.NewFromCard(ctx, card)
@@ -56,9 +58,10 @@ type TaskInfo struct {
 }
 
 // InputRequiredError is returned when the remote agent needs more input
-// before it can finish. The model sees the message; a host can resume
-// the task with the IDs. It matches agentturn.ErrInputRequired under
-// errors.Is.
+// before it can finish. The model sees the message. A host can resume a
+// peer's task, or an auth-required one, with the IDs; a subsession's
+// task left in input-required has been sent tasks/cancel. It matches
+// agentturn.ErrInputRequired under errors.Is.
 type InputRequiredError struct {
 	TaskID    a2a.TaskID
 	ContextID string
@@ -105,8 +108,9 @@ func WithSequential() Option { return func(r *remote) { r.sequential = true } }
 // up: the remote agent is a peer whose work outlives the call and keeps
 // its own record, and the call's [Callee] record names it with
 // [RelationPeer]. By default a call whose context ends before its task
-// does sends tasks/cancel for the task, and the task is the call's own
-// work, a [RelationSubsession].
+// does, or that ends with its task in input-required, sends tasks/cancel
+// for the task, and the task is the call's own work, a
+// [RelationSubsession].
 func WithoutCancelOnAbort() Option { return func(r *remote) { r.peer = true } }
 
 // CancelTimeout bounds the tasks/cancel a given-up call sends. The call
@@ -130,7 +134,9 @@ type InputRequired func(ctx context.Context, info TaskInfo, question *a2a.Messag
 // the caller's own questions. A question with no status message is put
 // as an empty agent message. An auth-required task is not put to fn; it
 // ends the call as before, as does a task still asking after
-// [WithInputRounds] answers.
+// [WithInputRounds] answers. A call that ends input-required, fn unable
+// to answer or out of rounds, cancels the task as a call without fn
+// does, unless the callee is a peer.
 func WithInputRequired(fn InputRequired) Option { return func(r *remote) { r.inputRequired = fn } }
 
 // DefaultInputRounds is how many times a call answers a task's
@@ -240,9 +246,15 @@ func (r *remote) Execute(ctx context.Context, call agenttool.Call) (agenttool.Re
 		out.answered()
 	}
 	switch out.state {
-	case a2a.TaskStateInputRequired, a2a.TaskStateAuthRequired:
-		// The task waits for input, which a host may give it with the
-		// IDs the call returns; it is left as it is.
+	case a2a.TaskStateInputRequired:
+		// The call ends asking for input nobody gave it, and the model
+		// that reads the question calls again, which starts a new task:
+		// nothing comes back to this one, so the call's own work is
+		// stopped. A peer's task is left to the peer.
+		c.cancel(ctx, &out)
+	case a2a.TaskStateAuthRequired:
+		// The task waits for credentials, which a host may give it with
+		// the IDs the call returns; it is left as it is.
 	default:
 		if out.taskID != "" && !out.state.Terminal() && out.message == nil {
 			// The stream closed, or a blocking call returned, before

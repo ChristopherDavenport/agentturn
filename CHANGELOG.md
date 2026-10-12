@@ -5,6 +5,19 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Changed: a `tools/a2a` subsession call that ends input-required, with
+  no `WithInputRequired` hook, a hook that returned
+  `agentturn.ErrInputRequired` or its `WithInputRounds` spent, gives its
+  task up: the model's next call starts a new task, so nothing would come
+  back to this one. It sends `tasks/cancel` for the task as a given-up
+  call does, not waited on and bounded by `CancelTimeout`, and records a
+  `CancelSent` after the `Callee`; the `InputRequiredError` and the
+  model's output are unchanged. A peer's task under
+  `WithoutCancelOnAbort` is left asking, as is an auth-required task, and
+  a call aborted while its hook holds the question cancels once.
+
 ## v0.0.28 - 2026-10-11
 
 - Added: `tools/a2a` records the callee a call reaches, through
