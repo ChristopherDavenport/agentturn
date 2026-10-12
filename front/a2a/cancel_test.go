@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
@@ -412,6 +413,11 @@ func TestCancelRacingAMessage(t *testing.T) {
 		if after, _ := store.Load(context.Background(), task.ContextID); len(after) != len(before) || model.count() != 1 {
 			t.Errorf("the late message ran: %d items, was %d; %d model calls", len(after), len(before), model.count())
 		}
+		exec.mu.Lock()
+		if _, kept := exec.canceled[task.ContextID]; kept {
+			t.Error("the cancel's mark outlived the message it served")
+		}
+		exec.mu.Unlock()
 		next := userMessage("again")
 		next.ContextID = task.ContextID
 		if res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: next}); err != nil || res.(*a2a.Task).Status.State != a2a.TaskStateCompleted {
@@ -459,4 +465,208 @@ func TestCancelRacingAMessage(t *testing.T) {
 			t.Errorf("outputs = %q, unanswered = %d; want the other task's answer alone", outputs, len(unanswered(tr)))
 		}
 	})
+}
+
+// TestCancelSeesTheConversationFree pins the order at a run's end: the
+// record has let go and the conversation is free before the task's
+// input-required status is written, so a cancel sent the moment a
+// blocking send returns that status settles the calls rather than
+// finding the run still registered. The record's detach is slow, which
+// is when the old order lost the race.
+func TestCancelSeesTheConversationFree(t *testing.T) {
+	t.Run("at the status", func(t *testing.T) {
+		var detached bool
+		exec := New(agentturn.Config{Model: callsThenDone{"remote"}}, WithCallerTools(remoteTool),
+			WithRecorderFor(func(ctx context.Context, _ string, _ *agentturn.Agent) (context.Context, func(), error) {
+				return ctx, func() { detached = true }, nil
+			}))
+		var checked bool
+		q := &probe{at: func(ev a2a.Event) {
+			st, ok := ev.(*a2a.TaskStatusUpdateEvent)
+			if !ok || st.Status.State != a2a.TaskStateInputRequired {
+				return
+			}
+			checked = true
+			exec.mu.Lock()
+			defer exec.mu.Unlock()
+			if exec.busy["c1"] || exec.cancels["t1"] != nil || !detached {
+				t.Errorf("at the input-required status: busy %v, run registered %v, detached %v", exec.busy["c1"], exec.cancels["t1"] != nil, detached)
+			}
+		}}
+		reqCtx := &a2asrv.RequestContext{Message: userMessage("go"), TaskID: "t1", ContextID: "c1"}
+		if err := exec.Execute(context.Background(), reqCtx, q); err != nil || !checked {
+			t.Fatalf("Execute = %v, status seen %v", err, checked)
+		}
+		// The follow-up that answers nothing re-lists the calls the same way.
+		checked = false
+		reqCtx = &a2asrv.RequestContext{Message: userMessage("well?"), TaskID: "t1", ContextID: "c1"}
+		if err := exec.Execute(context.Background(), reqCtx, q); err != nil || !checked {
+			t.Fatalf("the follow-up's Execute = %v, status seen %v", err, checked)
+		}
+	})
+	t.Run("over the wire", func(t *testing.T) {
+		store, log := &MemoryStore{}, &runLog{}
+		slow := func(ctx context.Context, id string, a *agentturn.Agent) (context.Context, func(), error) {
+			ctx, detach, err := log.attach(ctx, id, a)
+			return ctx, func() {
+				time.Sleep(100 * time.Millisecond)
+				detach()
+			}, err
+		}
+		exec := New(agentturn.Config{Model: callsThenDone{"remote"}},
+			WithAuthenticator(BearerTokens(map[string]string{"a-token": "alice"})),
+			WithConversationStore(store), WithCallerTools(remoteTool), WithRecorderFor(slow))
+		alice := peer(t, exec, &taskStore{})("a-token")
+		task := send(t, alice, userMessage("go"))
+		ids := pendingIDs(t, task)
+		got, err := alice.CancelTask(context.Background(), &a2a.TaskIDParams{ID: task.ID})
+		if err != nil || got.Status.State != a2a.TaskStateCanceled {
+			t.Fatalf("cancel = %+v, %v", got, err)
+		}
+		settledAs(t, store, task.ContextID, log, "alice", ids...)
+	})
+}
+
+// probe is a queue that shows every event to at before keeping it.
+type probe struct {
+	capture
+	at func(a2a.Event)
+}
+
+func (p *probe) Write(ctx context.Context, ev a2a.Event) error {
+	p.at(ev)
+	return p.capture.Write(ctx, ev)
+}
+
+// ctxStore is a conversation store that, as a durable one does, fails a
+// write whose context is done.
+type ctxStore struct{ *MemoryStore }
+
+func (c ctxStore) Save(ctx context.Context, id string, t agentturn.Transcript) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return c.MemoryStore.Save(ctx, id, t)
+}
+
+// TestCancelOutlivesItsRequest pins that the settlement does not hang
+// on the cancel's request: a caller that hung up, its context canceled
+// before the executor looked, still has the calls refused, recorded and
+// stored, by a record and a store that fail a write whose context is
+// done.
+func TestCancelOutlivesItsRequest(t *testing.T) {
+	store, log := &MemoryStore{}, &runLog{}
+	record := func(ctx context.Context, id string, a *agentturn.Agent) (context.Context, func(), error) {
+		ctx, detach, err := log.attach(ctx, id, a)
+		stop := a.Subscribe(func(ctx context.Context, _ agentturn.Event) error { return ctx.Err() })
+		return ctx, func() { stop(); detach() }, err
+	}
+	exec := New(agentturn.Config{Model: callsThenDone{"remote"}},
+		WithAuthenticator(BearerTokens(map[string]string{"a-token": "alice"})),
+		WithConversationStore(ctxStore{store}), WithCallerTools(remoteTool), WithRecorderFor(record))
+	task := send(t, peer(t, exec, &taskStore{})("a-token"), userMessage("go"))
+	ids := pendingIDs(t, task)
+	ctx, hangUp := context.WithCancel(context.WithValue(ContextWithPrincipal(context.Background(), "alice"), guardedKey{}, true))
+	hangUp()
+	q := &capture{}
+	if err := exec.Cancel(ctx, &a2asrv.RequestContext{TaskID: task.ID, ContextID: task.ContextID, StoredTask: task}, q); err != nil {
+		t.Fatalf("Cancel = %v", err)
+	}
+	if len(q.events) != 1 || q.events[0].(*a2a.TaskStatusUpdateEvent).Status.State != a2a.TaskStateCanceled {
+		t.Errorf("events = %+v, want the task canceled", q.events)
+	}
+	settledAs(t, store, task.ContextID, log, "alice", ids...)
+}
+
+// alwaysCalls calls name on every request.
+type alwaysCalls struct{ name string }
+
+func (m alwaysCalls) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.FunctionCall("", m.name)
+	if err != nil {
+		return err
+	}
+	if err := w.Arguments(`{}`); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestCancelLeavesALaterTasksCalls pins that a cancel settles only what
+// the conversation waits on its task for. When a later task listed the
+// same calls again, a message that answered none of them, or answered
+// them and left calls of its own, the cancel of the earlier task settles
+// nothing, and the later task's calls stay its to answer or cancel.
+func TestCancelLeavesALaterTasksCalls(t *testing.T) {
+	sendOn := func(t *testing.T, h a2asrv.RequestHandler, msg *a2a.Message) *a2a.Task {
+		t.Helper()
+		res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: msg})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.(*a2a.Task)
+	}
+	output := func(id, text string) a2a.DataPart {
+		return a2a.DataPart{Data: map[string]any{"type": "function_call_output", "call_id": id, "output": text}}
+	}
+	t.Run("listed again", func(t *testing.T) {
+		store := &MemoryStore{}
+		h := a2asrv.NewHandler(New(agentturn.Config{Model: callsThenDone{"remote"}}, WithConversationStore(store), WithCallerTools(remoteTool)))
+		first := sendOn(t, h, userMessage("go"))
+		ids := pendingIDs(t, first)
+		again := userMessage("hello?")
+		again.ContextID = first.ContextID
+		second := sendOn(t, h, again)
+		if relisted := pendingIDs(t, second); len(relisted) != 1 || relisted[0] != ids[0] {
+			t.Fatalf("the second task lists %v, want %v", relisted, ids)
+		}
+		if got, err := h.OnCancelTask(context.Background(), &a2a.TaskIDParams{ID: first.ID}); err != nil || got.Status.State != a2a.TaskStateCanceled {
+			t.Fatalf("cancel = %+v, %v", got, err)
+		}
+		if tr, _ := store.Load(context.Background(), first.ContextID); len(unanswered(tr)) != 1 {
+			t.Errorf("the cancel settled the second task's call: %d unanswered", len(unanswered(tr)))
+		}
+		if done := sendOn(t, h, a2a.NewMessageForTask(a2a.MessageRoleUser, second, output(ids[0], "ok"))); done.Status.State != a2a.TaskStateCompleted {
+			t.Errorf("the second task's answer = %s %q", done.Status.State, taskText(done))
+		}
+	})
+	t.Run("moved on", func(t *testing.T) {
+		store := &MemoryStore{}
+		h := a2asrv.NewHandler(New(agentturn.Config{Model: alwaysCalls{"remote"}}, WithConversationStore(store), WithCallerTools(remoteTool)))
+		first := sendOn(t, h, userMessage("go"))
+		ids := pendingIDs(t, first)
+		answer := a2a.NewMessage(a2a.MessageRoleUser, output(ids[0], "ok"))
+		answer.ContextID = first.ContextID
+		second := sendOn(t, h, answer)
+		next := pendingIDs(t, second)
+		if _, err := h.OnCancelTask(context.Background(), &a2a.TaskIDParams{ID: first.ID}); err != nil {
+			t.Fatal(err)
+		}
+		tr, _ := store.Load(context.Background(), first.ContextID)
+		if left := unanswered(tr); len(left) != 1 || left[0].CallID != next[0] {
+			t.Errorf("after the first task's cancel, unanswered = %v, want the second task's %v", left, next)
+		}
+		if _, err := h.OnCancelTask(context.Background(), &a2a.TaskIDParams{ID: second.ID}); err != nil {
+			t.Fatal(err)
+		}
+		if tr, _ := store.Load(context.Background(), first.ContextID); len(unanswered(tr)) != 0 {
+			t.Errorf("the second task's cancel left %d unanswered", len(unanswered(tr)))
+		}
+	})
+}
+
+// TestCanceledMarksAgeOut pins that a cancel's mark does not outlive
+// the window it serves when its conversation sees no further message.
+func TestCanceledMarksAgeOut(t *testing.T) {
+	var exec Executor
+	now := time.Now()
+	exec.markCanceled("old", "t1", now.Add(-2*canceledMarkAge))
+	exec.markCanceled("new", "t2", now)
+	if _, ok := exec.canceled["old"]; ok || len(exec.canceled) != 1 {
+		t.Errorf("marks = %v, want the old one dropped", exec.canceled)
+	}
 }

@@ -22,14 +22,31 @@ versions may break the API.
   unanswered call, the calls put to the caller are forgotten, and the
   conversation's next message starts clean. The cancel is refused as not
   found for a principal who may not write the conversation; a
-  conversation another task has moved on in is left as it is; a cancel
-  with a run active aborts it as before.
+  conversation another task has moved on in, answering the calls or
+  listing them again under its own task, is left as it is; a cancel with
+  a run active aborts it as before. The settlement runs apart from the
+  cancel's request, so a caller that hangs up after sending it still has
+  the calls settled.
+- Added: `front/a2a`'s `WaitingStore`, kept beside the transcript as
+  `EscalationStore` is, names the task each conversation waits on; a
+  cancel settles only that task's calls. `MemoryStore` implements it;
+  with a store that does not, the executor keeps it in memory, and after
+  a restart a cancel settles the calls the task listed when they are
+  every call the conversation holds unanswered.
+- Fixed: a `front/a2a` run lets go of its record and its conversation
+  before it writes the task's final status, so a cancel sent the moment
+  a caller sees input-required finds no run and settles, rather than
+  finding the finished run still registered and settling nothing.
 - Fixed: a `front/a2a` message on a task that a cancel ended while the
   message was on its way ends canceled without running, and a cancel
-  finds a run from the moment the run holds its conversation.
+  finds a run from the moment the run holds its conversation. The mark
+  that does this serves one message and lasts a minute.
 - Changed: a `front/a2a` message carrying a `function_call_output` when
   the conversation has no pending call is refused as invalid params,
-  rather than stored as a second output of a call already answered.
+  rather than stored as a second output of a call already answered. A
+  caller that retries an answer after the callee lost its conversation
+  now gets invalid params, where its output used to be stored as an
+  orphan the model could not take.
 
 ## v0.0.28 - 2026-10-11
 

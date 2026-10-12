@@ -21,6 +21,7 @@ type MemoryStore struct {
 	mu            sync.Mutex
 	conversations map[string]agentturn.Transcript
 	escalated     map[string][]Escalated
+	waiting       memoryWaiting
 	owners        MemoryOwners
 }
 
@@ -84,3 +85,56 @@ func (m *MemoryStore) Claim(ctx context.Context, key, principal string) (string,
 }
 
 var _ Owners = (*MemoryStore)(nil)
+
+// LoadWaiting returns the task the conversation waits on, or "".
+func (m *MemoryStore) LoadWaiting(ctx context.Context, contextID string) (string, error) {
+	return m.waiting.LoadWaiting(ctx, contextID)
+}
+
+// SaveWaiting replaces it; "" removes it.
+func (m *MemoryStore) SaveWaiting(ctx context.Context, contextID, task string) error {
+	return m.waiting.SaveWaiting(ctx, contextID, task)
+}
+
+var _ WaitingStore = (*MemoryStore)(nil)
+
+// WaitingStore keeps, beside the transcript, the task each conversation
+// waits on: the last one to end input-required, with the calls it
+// listed pending, until a task ends otherwise. A cancel settles what a
+// task left pending only while the conversation waits on that task, so
+// the cancel of a task whose calls a later task listed again leaves
+// them to the later one. A [ConversationStore] that implements it keeps
+// it; with one that does not, the executor keeps it in memory, and after
+// a restart a cancel, finding no task named, settles the calls the task
+// listed when they are every call the conversation holds unanswered.
+// [MemoryStore] implements it.
+type WaitingStore interface {
+	LoadWaiting(ctx context.Context, contextID string) (string, error)
+	SaveWaiting(ctx context.Context, contextID, task string) error
+}
+
+// memoryWaiting is the executor's fallback [WaitingStore].
+type memoryWaiting struct {
+	mu   sync.Mutex
+	task map[string]string
+}
+
+func (m *memoryWaiting) LoadWaiting(_ context.Context, contextID string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.task[contextID], nil
+}
+
+func (m *memoryWaiting) SaveWaiting(_ context.Context, contextID, task string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if task == "" {
+		delete(m.task, contextID)
+		return nil
+	}
+	if m.task == nil {
+		m.task = map[string]string{}
+	}
+	m.task[contextID] = task
+	return nil
+}

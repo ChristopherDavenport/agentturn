@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/openresponses"
@@ -32,6 +33,10 @@ func (e *Executor) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, q 
 	if err := e.owns(ctx, principal, reqCtx.TaskID); err != nil {
 		return err
 	}
+	// A caller sends the cancel and need not wait for it: one that hangs
+	// up still has the calls settled. The settlement calls no model, and
+	// the context keeps the caller's trigger.
+	ctx = context.WithoutCancel(ctx)
 	cancel, release := e.claimCancel(reqCtx.ContextID, reqCtx.TaskID)
 	if cancel != nil {
 		cancel()
@@ -41,14 +46,37 @@ func (e *Executor) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, q 
 		if err := e.settle(ctx, reqCtx, principal); err != nil {
 			return err
 		}
-		e.mu.Lock()
-		if e.canceled == nil {
-			e.canceled = map[string]a2a.TaskID{}
-		}
-		e.canceled[reqCtx.ContextID] = reqCtx.TaskID
-		e.mu.Unlock()
+		e.markCanceled(reqCtx.ContextID, reqCtx.TaskID, time.Now())
 	}
 	return e.finish(ctx, reqCtx, q, a2a.TaskStateCanceled, nil)
+}
+
+// canceledMarkAge is how long a cancel's mark outlives it: the mark is
+// for a message the SDK let through before the cancel, and after the
+// cancel the SDK refuses a message on the canceled task itself.
+const canceledMarkAge = time.Minute
+
+// canceledMark is the task a cancel ended with no run active, and when.
+type canceledMark struct {
+	task a2a.TaskID
+	at   time.Time
+}
+
+// markCanceled marks task, canceled at now in its conversation, and
+// drops the marks older than canceledMarkAge, so conversations that see
+// no further message do not keep theirs.
+func (e *Executor) markCanceled(contextID string, task a2a.TaskID, now time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for id, mark := range e.canceled {
+		if now.Sub(mark.at) > canceledMarkAge {
+			delete(e.canceled, id)
+		}
+	}
+	if e.canceled == nil {
+		e.canceled = map[string]canceledMark{}
+	}
+	e.canceled[contextID] = canceledMark{task: task, at: now}
 }
 
 // claimCancel returns the cancel of the task's run when one is active.
@@ -81,9 +109,13 @@ func (e *Executor) claimCancel(contextID string, task a2a.TaskID) (context.Cance
 // conversation, as canceled by the caller, for a cancel that found no
 // run active and holds the conversation.
 //
-// The calls are those the task's status message listed, when every call
-// still unanswered in the conversation is among them; a conversation
-// another task has moved on from them holds none of this task's. Each
+// The calls are those the task's status message listed, while the
+// conversation waits on the task ([WaitingStore]) and every call still
+// unanswered in it is among them. A conversation another task has moved
+// on in, answering the calls or listing them again as its own, holds
+// none of this task's, and nothing is settled; with no task named,
+// after a restart under a store that does not keep it, the calls alone
+// decide. Each
 // is answered with agentturn.Refuse, which ends the run without
 // calling the model, since nobody asks for the work: the output, which
 // the model reads on the conversation's next run, says the caller
@@ -101,6 +133,13 @@ func (e *Executor) settle(ctx context.Context, reqCtx *a2asrv.RequestContext, pr
 	}
 	listed := listedCalls(reqCtx.StoredTask)
 	if len(listed) == 0 {
+		return nil
+	}
+	waiting, err := e.waitingStore().LoadWaiting(ctx, reqCtx.ContextID)
+	if err != nil {
+		return fmt.Errorf("load the task %q waits on: %w", reqCtx.ContextID, err)
+	}
+	if waiting != "" && waiting != string(reqCtx.TaskID) {
 		return nil
 	}
 	transcript, err := e.store.Load(ctx, reqCtx.ContextID)
@@ -132,6 +171,8 @@ func (e *Executor) settle(ctx context.Context, reqCtx *a2asrv.RequestContext, pr
 	for _, fc := range pending {
 		answers = append(answers, agentturn.Refuse(&openresponses.FunctionCallOutput{CallID: fc.CallID, Output: openresponses.FunctionCallOutputData{Text: text}}).WithReason(text))
 	}
+	// The tools a message declared are not offered: the run makes no
+	// request, and an output answers a call whatever tool it named.
 	agent := agentturn.New(e.runConfig(e.startFor(ctx, transcript), e.callerTools), agentturn.WithTranscript(transcript))
 	runCtx := ctx
 	if e.recorderFor != nil {
@@ -180,6 +221,9 @@ func (e *Executor) settle(ctx context.Context, reqCtx *a2asrv.RequestContext, pr
 				return fmt.Errorf("save escalated calls of %q: %w", reqCtx.ContextID, err)
 			}
 		}
+	}
+	if err := e.waitingStore().SaveWaiting(ctx, reqCtx.ContextID, ""); err != nil {
+		return fmt.Errorf("save the task %q waits on: %w", reqCtx.ContextID, err)
 	}
 	return nil
 }

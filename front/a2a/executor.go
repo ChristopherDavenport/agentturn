@@ -42,7 +42,8 @@ type Executor struct {
 	// canceled holds, by context ID, the last task a cancel ended with no
 	// run active, so a message on that task the SDK let through before
 	// the cancel does not run on the conversation the cancel settled.
-	canceled map[string]a2a.TaskID
+	canceled map[string]canceledMark
+	waiting  memoryWaiting
 }
 
 // ErrConversationBusy is the cause of the error a message gets when its
@@ -269,6 +270,15 @@ func (e *Executor) escalationStore() EscalationStore {
 	return &e.escalations
 }
 
+// waitingStore is where the task each conversation waits on is kept:
+// the conversation store when it keeps it, else memory.
+func (e *Executor) waitingStore() WaitingStore {
+	if s, ok := e.store.(WaitingStore); ok {
+		return s
+	}
+	return &e.waiting
+}
+
 // Execute runs the loop for one message and translates the run into A2A
 // events. It returns nil after a terminal or input-required status has
 // been written; a returned error, including a failure to write an
@@ -379,7 +389,13 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 		// A follow-up that does not answer the pending calls leaves the
 		// task where it was, input-required, with the calls repeated
 		// and the rule stated; failing the task would make it
-		// unrecoverable.
+		// unrecoverable. The task is the one the conversation waits on,
+		// and the conversation is free before the caller sees the status,
+		// so a cancel that follows it settles the calls.
+		if err := e.waitingStore().SaveWaiting(ctx, reqCtx.ContextID, string(reqCtx.TaskID)); err != nil {
+			return fmt.Errorf("save the task %q waits on: %w", reqCtx.ContextID, err)
+		}
+		release()
 		return e.inputRequired(ctx, reqCtx, q, unanswered(transcript), err.Error(), escalated)
 	}
 	if err := e.checkDeclared(runCtx, declared, start); err != nil {
@@ -402,9 +418,11 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 		opts = append(opts, agentturn.WithPending(seeded))
 	}
 	agent := agentturn.New(e.runConfig(start, caller), opts...)
+	var detach func()
 	if e.recorderFor != nil {
-		rctx, detach, err := e.recorderFor(runCtx, reqCtx.ContextID, agent)
-		if detach != nil {
+		rctx, d, err := e.recorderFor(runCtx, reqCtx.ContextID, agent)
+		if d != nil {
+			detach = sync.OnceFunc(d)
 			defer detach()
 		}
 		if err == nil && rctx == nil {
@@ -461,6 +479,22 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 			return fmt.Errorf("save escalated calls of %q: %w", reqCtx.ContextID, err)
 		}
 	}
+	waiting := ""
+	if out.end.Reason == agentturn.ReasonInputRequired {
+		waiting = string(reqCtx.TaskID)
+	}
+	if err := e.waitingStore().SaveWaiting(ctx, reqCtx.ContextID, waiting); err != nil {
+		return fmt.Errorf("save the task %q waits on: %w", reqCtx.ContextID, err)
+	}
+	// The run is over and stored. The record lets go of the session and
+	// the conversation is free before the caller can see the task's
+	// status, so a cancel that follows the status finds no run and
+	// settles what the run left; detaching first keeps two recorders off
+	// one session.
+	if detach != nil {
+		detach()
+	}
+	release()
 	return e.conclude(ctx, reqCtx, q, out, escalated)
 }
 
@@ -471,9 +505,10 @@ var errCanceled = errors.New("task canceled")
 // claim marks the conversation busy and registers cancel as the task's
 // run, in one step, so a cancel of the task finds the run from the
 // moment it holds the conversation. It returns the function that undoes
-// both and calls cancel, the error a message on a busy conversation
-// gets, or errCanceled for the task a cancel last ended in the
-// conversation with no run active.
+// both and calls cancel, which does so once however often it is called,
+// the error a message on a busy conversation gets, or errCanceled for
+// the task a cancel last ended in the conversation with no run active,
+// whose mark it then removes.
 func (e *Executor) claim(contextID string, task a2a.TaskID, cancel context.CancelFunc) (func(), error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -487,22 +522,23 @@ func (e *Executor) claim(contextID string, task a2a.TaskID, cancel context.Cance
 		return nil, a2a.NewError(fmt.Errorf("%w: %w", a2a.ErrInvalidRequest, ErrConversationBusy),
 			fmt.Sprintf("context %q has a task in flight; send again once it has ended", contextID))
 	}
-	if id, ok := e.canceled[contextID]; ok {
-		if id == task {
+	if mark, ok := e.canceled[contextID]; ok {
+		// The mark serves one message that was on its way, or the
+		// conversation has moved on to another task.
+		delete(e.canceled, contextID)
+		if mark.task == task {
 			return nil, errCanceled
 		}
-		// The conversation has moved on to another task.
-		delete(e.canceled, contextID)
 	}
 	e.busy[contextID] = true
 	e.cancels[task] = cancel
-	return func() {
+	return sync.OnceFunc(func() {
 		e.mu.Lock()
 		delete(e.busy, contextID)
 		delete(e.cancels, task)
 		e.mu.Unlock()
 		cancel()
-	}, nil
+	}), nil
 }
 
 // outcome is what relay reports about a run.
