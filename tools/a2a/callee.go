@@ -53,11 +53,13 @@ type Callee struct {
 func (Callee) RecordNS() string { return CalleeNS }
 
 // CancelSent is the record that the call asked the remote agent to stop
-// a task, written when the call was given up before the task ended:
-// tasks/cancel was sent, and the call did not wait for the task to
-// reach canceled, so it says the stop was asked for, not that the work
-// stopped. A peer's task under [WithoutCancelOnAbort] is never
-// cancelled and has none.
+// a task, written for each task the call left unfinished: given up
+// before it ended, or left in input-required or auth-required, the one
+// the call ended on and any the remote agent moved off. tasks/cancel
+// was sent, and the call did not wait for the task to reach canceled,
+// so it says the stop was asked for, not that the work stopped. Each
+// names one task and follows that task's [Callee]. A peer's task under
+// [WithoutCancelOnAbort] is never cancelled and has none.
 type CancelSent struct {
 	URL  string `json:"url"`
 	Task string `json:"task"`
