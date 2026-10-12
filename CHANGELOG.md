@@ -5,6 +5,37 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Changed: a `tools/a2a` subsession call that ends input-required (with
+  no `WithInputRequired` hook, a hook that returned
+  `agentturn.ErrInputRequired` or its `WithInputRounds` spent) or
+  auth-required gives its task up: the model's next call starts a new
+  task, so nothing would come back to this one. It sends `tasks/cancel`
+  for the task as a given-up call does, not waited on and bounded by
+  `CancelTimeout`, and records a `CancelSent` after the `Callee`; the
+  `InputRequiredError` and the model's output are unchanged. A peer's
+  task under `WithoutCancelOnAbort` is left asking, and a call aborted
+  while its hook holds the question cancels once. A host that resumed a
+  subsession's task by the IDs in `TaskInfo` must now build the tool
+  with `WithoutCancelOnAbort`. Where the `session` module's recorder
+  writes the records as links, such a call now reads in agentsession's
+  `Callees` as cancel sent and not answered; the callee's question is in
+  the call's output.
+- Changed: a `tools/a2a` subsession call cancels every task it leaves
+  unfinished, not only the one it ends on: when the remote agent's reply
+  to an answer moves to a new task or comes as a message, the task it
+  answered was last seen asking and is cancelled too, on the abort path
+  as on a normal end. Each task gets its own `tasks/cancel` and its own
+  `CancelSent` naming it, after its `Callee`, and none is cancelled
+  twice. A task known only from a message answer is not cancelled.
+- Changed: when the remote agent's reply to an answer is a message, the
+  call writes a `Callee` record for the message, with the URL and
+  context and no task, once per call, besides the task's; it comes
+  before the `CancelSent` of the task left asking and before the output,
+  so agentsession's `Callees` reads the message's link as the one that
+  answered.
+
 ## v0.0.28 - 2026-10-11
 
 - Added: `tools/a2a` records the callee a call reaches, through
