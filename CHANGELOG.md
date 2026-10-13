@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.29 - 2026-10-13
 
 - Fixed: a `front/a2a` cancel of a task its last run left input-required,
   arriving with no run active, settles what the task left pending in its
