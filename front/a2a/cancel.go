@@ -109,15 +109,16 @@ func (e *Executor) claimCancel(contextID string, task a2a.TaskID) (context.Cance
 // conversation, as canceled by the caller, for a cancel that found no
 // run active and holds the conversation.
 //
-// The calls are those the task's status message listed, while the
-// conversation waits on the task ([WaitingStore]) and every call still
-// unanswered in it is among them. A conversation another task has moved
+// The calls are those the conversation holds unanswered while it waits
+// on the task ([WaitingStore]), whether or not the task's input-required
+// status has reached the SDK yet. A conversation another task has moved
 // on in, answering the calls or listing them again as its own, holds
-// none of this task's, and nothing is settled; with no task named,
-// after a restart under a store that does not keep it, the calls alone
-// decide. Each
-// is answered with agentturn.Refuse, which ends the run without
-// calling the model, since nobody asks for the work: the output, which
+// none of this task's, and nothing is settled. With no task named, after
+// a restart under a store that does not keep it, the calls the task's
+// status message listed are settled when they are every call the
+// conversation holds unanswered. Each is answered with
+// agentturn.Refuse, which ends the run without calling the model,
+// since nobody asks for the work: the output, which
 // the model reads on the conversation's next run, says the caller
 // canceled the task, and so does the answer's reason. The run is under
 // the caller's trigger and names nobody as the decider (By ""), as an
@@ -131,29 +132,37 @@ func (e *Executor) settle(ctx context.Context, reqCtx *a2asrv.RequestContext, pr
 			return err
 		}
 	}
-	listed := listedCalls(reqCtx.StoredTask)
-	if len(listed) == 0 {
-		return nil
-	}
 	waiting, err := e.waitingStore().LoadWaiting(ctx, reqCtx.ContextID)
 	if err != nil {
 		return fmt.Errorf("load the task %q waits on: %w", reqCtx.ContextID, err)
 	}
-	if waiting != "" && waiting != string(reqCtx.TaskID) {
+	mine := waiting == string(reqCtx.TaskID)
+	listed := listedCalls(reqCtx.StoredTask)
+	if waiting != "" && !mine || waiting == "" && len(listed) == 0 {
 		return nil
 	}
 	transcript, err := e.store.Load(ctx, reqCtx.ContextID)
 	if err != nil {
 		return fmt.Errorf("load conversation %q: %w", reqCtx.ContextID, err)
 	}
+	if mine {
+		// The conversation waits on this task, so every call it holds
+		// unanswered is the task's, listed or about to be: the run saved
+		// the task as waited on before it let go of the conversation,
+		// and a cancel may come before the status reaches the SDK.
+		listed = map[string]bool{}
+		for _, fc := range unanswered(transcript) {
+			listed[fc.CallID] = true
+		}
+	}
 	// A call of the agent's own that the task did not list is dropped,
 	// as a message's task drops it; one it listed is the task's to
 	// settle, whoever would have answered it.
-	mine := make(map[string]Escalated, len(listed))
+	held := make(map[string]Escalated, len(listed))
 	for id := range listed {
-		mine[id] = Escalated{}
+		held[id] = Escalated{}
 	}
-	transcript, _ = e.closeOwnPending(ctx, transcript, e.callerTools, mine)
+	transcript, _ = e.closeOwnPending(ctx, transcript, e.callerTools, held)
 	pending := unanswered(transcript)
 	if len(pending) == 0 {
 		return nil

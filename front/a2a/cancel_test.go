@@ -312,19 +312,64 @@ func TestCancelSettlesAnEscalatedQuestion(t *testing.T) {
 	}
 }
 
+// forgetsWaiting is a conversation store that keeps the owners and the
+// escalated calls but not the task each conversation waits on.
+type forgetsWaiting struct{ s *MemoryStore }
+
+func (f forgetsWaiting) Load(ctx context.Context, id string) (agentturn.Transcript, error) {
+	return f.s.Load(ctx, id)
+}
+
+func (f forgetsWaiting) Save(ctx context.Context, id string, t agentturn.Transcript) error {
+	return f.s.Save(ctx, id, t)
+}
+
+func (f forgetsWaiting) Owner(ctx context.Context, key string) (string, bool, error) {
+	return f.s.Owner(ctx, key)
+}
+
+func (f forgetsWaiting) Claim(ctx context.Context, key, principal string) (string, error) {
+	return f.s.Claim(ctx, key, principal)
+}
+
+func (f forgetsWaiting) LoadEscalated(ctx context.Context, id string) ([]Escalated, error) {
+	return f.s.LoadEscalated(ctx, id)
+}
+
+func (f forgetsWaiting) SaveEscalated(ctx context.Context, id string, calls []Escalated) error {
+	return f.s.SaveEscalated(ctx, id, calls)
+}
+
 // TestCancelSettlesAfterARestart pins that the settlement needs nothing
 // the process held: a new executor over the same conversation and task
-// stores settles the task the old one left input-required.
+// stores settles the task the old one left input-required, from the
+// task it waits on where the store keeps it, and from the task's status
+// alone where the store does not.
 func TestCancelSettlesAfterARestart(t *testing.T) {
+	for _, keeps := range []bool{true, false} {
+		t.Run(map[bool]string{true: "store keeps the waiting task", false: "store forgets it"}[keeps], func(t *testing.T) {
+			testCancelAfterRestart(t, keeps)
+		})
+	}
+}
+
+func testCancelAfterRestart(t *testing.T, keeps bool) {
 	store, tasks := &MemoryStore{}, &taskStore{}
+	var conversations ConversationStore = store
+	if !keeps {
+		conversations = forgetsWaiting{store}
+	}
 	tokens := map[string]string{"a-token": "alice"}
 	cfg := agentturn.Config{Model: callsThenDone{"remote"}}
-	first := peer(t, New(cfg, WithAuthenticator(BearerTokens(tokens)), WithConversationStore(store), WithCallerTools(remoteTool)), tasks)
+	first := peer(t, New(cfg, WithAuthenticator(BearerTokens(tokens)), WithConversationStore(conversations), WithCallerTools(remoteTool)), tasks)
 	task := send(t, first("a-token"), userMessage("go"))
 	ids := pendingIDs(t, task)
+	if waiting, _ := store.LoadWaiting(context.Background(), task.ContextID); (waiting != "") != keeps {
+		t.Fatalf("the store names %q as waited on", waiting)
+	}
 
 	log := &runLog{}
-	restarted := peer(t, New(cfg, WithAuthenticator(BearerTokens(tokens)), WithConversationStore(store), WithCallerTools(remoteTool), WithRecorderFor(log.attach)), tasks)
+	restarted := peer(t, New(cfg, WithAuthenticator(BearerTokens(tokens)), WithConversationStore(conversations), WithCallerTools(remoteTool), WithRecorderFor(log.attach)), tasks)
 	got, err := restarted("a-token").CancelTask(context.Background(), &a2a.TaskIDParams{ID: task.ID})
 	if err != nil || got.Status.State != a2a.TaskStateCanceled {
 		t.Fatalf("cancel after the restart = %+v, %v", got, err)
@@ -668,5 +713,41 @@ func TestCanceledMarksAgeOut(t *testing.T) {
 	exec.markCanceled("new", "t2", now)
 	if _, ok := exec.canceled["old"]; ok || len(exec.canceled) != 1 {
 		t.Errorf("marks = %v, want the old one dropped", exec.canceled)
+	}
+}
+
+// TestCancelBeforeTheStatusReachesTheSDK pins a cancel that comes after
+// the run let go of the conversation and before its input-required
+// status was written, a caller aborting as the run ends: the SDK's task
+// is still working, and the calls are settled all the same, since the
+// conversation waits on the task.
+func TestCancelBeforeTheStatusReachesTheSDK(t *testing.T) {
+	store := &MemoryStore{}
+	exec := New(agentturn.Config{Model: callsThenDone{"remote"}}, WithConversationStore(store), WithCallerTools(remoteTool))
+	working := &a2a.Task{ID: "t1", ContextID: "c1", Status: a2a.TaskStatus{State: a2a.TaskStateWorking}}
+	var canceled error
+	q := &probe{at: func(ev a2a.Event) {
+		if st, ok := ev.(*a2a.TaskStatusUpdateEvent); ok && st.Status.State == a2a.TaskStateInputRequired {
+			canceled = exec.Cancel(context.Background(), &a2asrv.RequestContext{TaskID: "t1", ContextID: "c1", StoredTask: working}, &capture{})
+		}
+	}}
+	if err := exec.Execute(context.Background(), &a2asrv.RequestContext{Message: userMessage("go"), TaskID: "t1", ContextID: "c1"}, q); err != nil {
+		t.Fatal(err)
+	}
+	if canceled != nil {
+		t.Fatalf("Cancel = %v", canceled)
+	}
+	tr, _ := store.Load(context.Background(), "c1")
+	var outputs []string
+	for _, item := range tr {
+		if out, ok := item.(*openresponses.FunctionCallOutput); ok {
+			outputs = append(outputs, out.Output.Text)
+		}
+	}
+	if len(unanswered(tr)) != 0 || len(outputs) != 1 || outputs[0] != "the caller canceled the task, so this call was not run" {
+		t.Errorf("unanswered = %d, outputs = %q; want the call refused", len(unanswered(tr)), outputs)
+	}
+	if waiting, _ := store.LoadWaiting(context.Background(), "c1"); waiting != "" {
+		t.Errorf("the conversation still waits on %q", waiting)
 	}
 }

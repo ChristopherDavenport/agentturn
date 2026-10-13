@@ -186,10 +186,22 @@
 //
 // A run lets go of its record and of the conversation before it writes
 // the task's final status, so a cancel sent as soon as the caller sees
-// input-required finds no run and settles. The settlement needs nothing
-// the process held, so a cancel after a restart settles the task the
-// old process left. A cancel from a
-// principal that does not own the task, or may not write its
+// input-required finds no run and settles; a cancel that comes before
+// the status reaches the SDK settles too, since the conversation waits
+// on the task by then. The SDK can still answer such a cancel with
+// a2a.ErrTaskNotCancelable: a2a-go v0.3.15 hands a cancel that arrives
+// while it holds the finished execution to that execution, whose result
+// is already input-required (the TODO in its local manager's
+// handleCancelWithConcurrentRun). The conversation is settled then, but
+// the SDK's task store keeps the task input-required: a message on the
+// task within a minute ends canceled, a later one that answers the calls
+// is refused as answering no pending call and one that does not runs as
+// a new turn, and a retried cancel ends the task canceled. The
+// settlement needs nothing the process held, so a cancel after a restart
+// settles the task the old process left, from the task the
+// [ConversationStore] names as waited on ([WaitingStore]) or, under a
+// store that keeps none, from the calls the task's status listed. A
+// cancel from a principal that does not own the task, or may not write its
 // conversation, is refused as not found and writes nothing. A second
 // cancel finds the task canceled and settles nothing. The cancel holds
 // the conversation as a task does, so it never settles while a task

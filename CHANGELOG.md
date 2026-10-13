@@ -32,11 +32,22 @@ versions may break the API.
   cancel settles only that task's calls. `MemoryStore` implements it;
   with a store that does not, the executor keeps it in memory, and after
   a restart a cancel settles the calls the task listed when they are
-  every call the conversation holds unanswered.
+  every call the conversation holds unanswered. A store that outlives
+  the process should implement `WaitingStore` and `EscalationStore`,
+  ideally writing the waiting task with the transcript; the in-memory
+  fallbacks keep one entry per conversation that waits on its caller.
 - Fixed: a `front/a2a` run lets go of its record and its conversation
   before it writes the task's final status, so a cancel sent the moment
   a caller sees input-required finds no run and settles, rather than
-  finding the finished run still registered and settling nothing.
+  finding the finished run still registered and settling nothing. A
+  cancel that comes before the status reaches the SDK settles too, since
+  the conversation waits on the task by then. a2a-go v0.3.15 can still
+  answer a cancel that arrives while it holds the finished execution
+  with `ErrTaskNotCancelable` (the TODO in its local manager's
+  `handleCancelWithConcurrentRun`): the conversation is settled, but the
+  SDK's task store keeps the task input-required, so a later message on
+  it is refused as answering no pending call, or runs as a new turn, and
+  a retried cancel ends it canceled.
 - Fixed: a `front/a2a` message on a task that a cancel ended while the
   message was on its way ends canceled without running, and a cancel
   finds a run from the moment the run holds its conversation. The mark

@@ -60,7 +60,11 @@ var _ a2asrv.AgentExecutor = (*Executor)(nil)
 // Option configures an [Executor].
 type Option func(*Executor)
 
-// WithConversationStore replaces the in-memory conversation store.
+// WithConversationStore replaces the in-memory conversation store. A
+// store that outlives the process should also implement
+// [EscalationStore] and [WaitingStore], as [ConversationStore] says, or
+// a restart loses which calls were put to the caller and which task the
+// conversation waits on.
 func WithConversationStore(s ConversationStore) Option {
 	return func(e *Executor) { e.store = s }
 }

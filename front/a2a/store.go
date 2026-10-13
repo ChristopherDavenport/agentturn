@@ -10,6 +10,16 @@ import (
 // ConversationStore keeps the transcript of each A2A context, so a
 // second message with the same context ID continues the conversation.
 // Load returns nil for an unknown context.
+//
+// A store that outlives the process should also implement
+// [EscalationStore] and [WaitingStore], ideally keeping the waiting task
+// in the same record as the transcript so the two are one write; else a
+// restart loses which calls were put to the caller and which task the
+// conversation waits on, and a cancel then falls back to the calls the
+// task's status listed. The executor finds them by type assertion, so a
+// store that wraps another must implement them itself. Without them the
+// executor keeps both in memory, one entry per conversation that waits
+// on its caller.
 type ConversationStore interface {
 	Load(ctx context.Context, contextID string) (agentturn.Transcript, error)
 	Save(ctx context.Context, contextID string, t agentturn.Transcript) error
