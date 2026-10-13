@@ -9,12 +9,13 @@ import (
 
 // The namespaces of the records a call writes through
 // agenttool.WriteRecord while it runs. A session recorder that knows
-// them turns each into a link entry of the call: a [Callee] into a link
-// with rel "subsession" or "peer" naming the callee in another system,
-// a [CancelSent] into the notice that a cancel was sent for it. One that
-// does not writes each as a custom entry beside the call, as it writes
-// any record. The JSON of each type is the contract, so a recorder reads
-// it without importing this module or a2a-go.
+// them, as agentturn's session.Recorder does, turns each into a
+// link entry of the call: a [Callee] into a link with rel "subsession"
+// or "peer" naming the callee in another system, a [CancelSent] into
+// the notice that a cancel was sent for it. One that does not writes
+// each as a custom entry beside the call, as it writes any record. The
+// JSON of each type is the contract, so a recorder reads it without
+// importing this module or a2a-go.
 const (
 	CalleeNS = "agentturn:a2a_callee"
 	CancelNS = "agentturn:a2a_cancel"
@@ -52,11 +53,13 @@ type Callee struct {
 func (Callee) RecordNS() string { return CalleeNS }
 
 // CancelSent is the record that the call asked the remote agent to stop
-// a task, written when the call was given up before the task ended:
-// tasks/cancel was sent, and the call did not wait for the task to
-// reach canceled, so it says the stop was asked for, not that the work
-// stopped. A peer's task under [WithoutCancelOnAbort] is never
-// cancelled and has none.
+// a task, written for each task the call left unfinished: given up
+// before it ended, or left in input-required or auth-required, the one
+// the call ended on and any the remote agent moved off. tasks/cancel
+// was sent, and the call did not wait for the task to reach canceled,
+// so it says the stop was asked for, not that the work stopped. Each
+// names one task and follows that task's [Callee]. A peer's task under
+// [WithoutCancelOnAbort] is never cancelled and has none.
 type CancelSent struct {
 	URL  string `json:"url"`
 	Task string `json:"task"`

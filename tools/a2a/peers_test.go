@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -247,7 +250,11 @@ func (asking) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q even
 	return q.Write(ctx, ev)
 }
 
-func (asking) Cancel(context.Context, *a2asrv.RequestContext, eventqueue.Queue) error { return nil }
+func (asking) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue) error {
+	ev := a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateCanceled, nil)
+	ev.Final = true
+	return q.Write(ctx, ev)
+}
 
 // TestTheInputRequiredHookAnswersOnTheSameTask pins WithInputRequired:
 // the remote agent's question goes to the hook, its answer is sent on the
@@ -282,6 +289,9 @@ func TestTheInputRequiredHookAnswersOnTheSameTask(t *testing.T) {
 			}
 			if n := len(recs.of(CalleeNS)); n != 1 {
 				t.Errorf("callee records = %d, want 1 for one task", n)
+			}
+			if n := len(recs.of(CancelNS)); n != 0 {
+				t.Errorf("cancel records = %d for a task that completed", n)
 			}
 
 			_, err = New(client, card, opts...).Execute(context.Background(), agenttool.Call{ID: "c2", Args: json.RawMessage(`{"input":"paint"}`)})
@@ -463,15 +473,19 @@ func (messaging) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q e
 	return q.Write(ctx, a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: "done"}))
 }
 
-func (s messaging) Cancel(_ context.Context, reqCtx *a2asrv.RequestContext, _ eventqueue.Queue) error {
+func (s messaging) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue) error {
 	s.cancelled <- reqCtx.TaskID
-	return nil
+	ev := a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateCanceled, nil)
+	ev.Final = true
+	return q.Write(ctx, ev)
 }
 
-// TestAMessageAnswerAfterAnInputRoundCancelsNothing pins that a call
-// whose answered round ends in a message has nothing left running to
-// cancel.
-func TestAMessageAnswerAfterAnInputRoundCancelsNothing(t *testing.T) {
+// TestAMessageAnswerAfterAnInputRoundCancelsTheTask pins that a call
+// whose answered round ends in a message answers with it, recording the
+// message as a callee of its own, and stops the task it last saw asking:
+// the message is no state of the task, which no one asks anything of
+// any more.
+func TestAMessageAnswerAfterAnInputRoundCancelsTheTask(t *testing.T) {
 	remote := messaging{cancelled: make(chan a2a.TaskID, 4)}
 	client, card := serve(t, remote, nil)
 	hook := func(context.Context, TaskInfo, *a2a.Message) ([]a2a.Part, error) {
@@ -485,11 +499,14 @@ func TestAMessageAnswerAfterAnInputRoundCancelsNothing(t *testing.T) {
 	}
 	select {
 	case id := <-remote.cancelled:
-		t.Errorf("task %q was cancelled after a message answer", id)
-	case <-time.After(300 * time.Millisecond):
+		if id != res.Details.(TaskInfo).TaskID {
+			t.Errorf("cancelled %q, want the task %q", id, res.Details.(TaskInfo).TaskID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the remote agent saw no tasks/cancel")
 	}
-	if n := len(recs.of(CancelNS)); n != 0 {
-		t.Errorf("cancel records = %d", n)
+	if got := recs.order(); len(got) != 3 || got[0] != CalleeNS || got[1] != CalleeNS || got[2] != CancelNS {
+		t.Errorf("records = %v, want the task's callee, the message's, then the cancel", got)
 	}
 }
 
@@ -533,5 +550,337 @@ func TestACalleeRecordThatFailedIsWrittenAgain(t *testing.T) {
 	f.mu.Unlock()
 	if len(order) != 2 || order[0] != CalleeNS || order[1] != CancelNS {
 		t.Errorf("records = %v, want the callee written again, then the cancel", order)
+	}
+}
+
+// questioning asks on every message of a task, for input or, with
+// state auth-required, for credentials, and tells the test of each
+// cancel, which it answers once hold, if set, is closed.
+type questioning struct {
+	cancelled chan a2a.TaskID
+	state     a2a.TaskState
+	hold      chan struct{}
+}
+
+func (s questioning) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue) error {
+	state := s.state
+	if state == "" {
+		state = a2a.TaskStateInputRequired
+	}
+	ev := a2a.NewStatusUpdateEvent(reqCtx, state, a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: "which?"}))
+	ev.Final = true
+	return q.Write(ctx, ev)
+}
+
+func (s questioning) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue) error {
+	s.cancelled <- reqCtx.TaskID
+	if s.hold != nil {
+		<-s.hold
+	}
+	ev := a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateCanceled, nil)
+	ev.Final = true
+	return q.Write(ctx, ev)
+}
+
+// order is the namespaces of the records written, in order.
+func (r *records) order() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for _, rec := range r.got {
+		out = append(out, rec.NS)
+	}
+	return out
+}
+
+// TestACallLeftAskingCancelsItsTask pins #253: a subsession call that
+// ends input-required, with no hook, a hook that cannot answer or its
+// rounds spent, or auth-required, gives its task up, since the model's
+// next call starts a new one. It sends tasks/cancel for the task and records CancelSent
+// after the Callee, and returns the same InputRequiredError as before;
+// a peer's task is left asking.
+func TestACallLeftAskingCancelsItsTask(t *testing.T) {
+	var asked int
+	answering := func(context.Context, TaskInfo, *a2a.Message) ([]a2a.Part, error) {
+		asked++
+		return []a2a.Part{a2a.TextPart{Text: "that one"}}, nil
+	}
+	declining := func(context.Context, TaskInfo, *a2a.Message) ([]a2a.Part, error) {
+		asked++
+		return nil, agentturn.ErrInputRequired
+	}
+	for _, tc := range []struct {
+		name   string
+		state  a2a.TaskState
+		opts   []Option
+		cancel bool
+	}{
+		{"no hook", "", nil, true},
+		{"no hook blocking", "", []Option{WithBlocking()}, true},
+		{"hook declines", "", []Option{WithInputRequired(declining)}, true},
+		{"rounds spent", "", []Option{WithInputRequired(answering), WithInputRounds(2)}, true},
+		{"rounds spent blocking", "", []Option{WithBlocking(), WithInputRequired(answering), WithInputRounds(2)}, true},
+		{"peer", "", []Option{WithoutCancelOnAbort()}, false},
+		{"peer hook declines", "", []Option{WithoutCancelOnAbort(), WithInputRequired(declining)}, false},
+		{"auth", a2a.TaskStateAuthRequired, nil, true},
+		{"auth blocking", a2a.TaskStateAuthRequired, []Option{WithBlocking()}, true},
+		{"auth with a hook", a2a.TaskStateAuthRequired, []Option{WithInputRequired(answering)}, true},
+		{"auth peer", a2a.TaskStateAuthRequired, []Option{WithoutCancelOnAbort()}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			asked = 0
+			remote := questioning{cancelled: make(chan a2a.TaskID, 4), state: tc.state}
+			client, card := serve(t, remote, nil)
+			var recs records
+			ctx := agenttool.ContextWithRecorder(context.Background(), recs.fn)
+			res, err := New(client, card, tc.opts...).Execute(ctx, agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"go"}`)})
+			var ir *InputRequiredError
+			if !errors.As(err, &ir) || !errors.Is(err, agentturn.ErrInputRequired) || err.Error() != "the agent needs more input: which?" {
+				t.Fatalf("err = %v, want the agent's question", err)
+			}
+			want := tc.state
+			if want == "" {
+				want = a2a.TaskStateInputRequired
+			}
+			info, _ := res.Details.(TaskInfo)
+			if want == a2a.TaskStateAuthRequired && asked != 0 {
+				t.Errorf("the hook was asked %d times about an auth-required task", asked)
+			}
+			if info.State != want || info.TaskID == "" || info.TaskID != ir.TaskID || res.Output.Text != "" {
+				t.Errorf("result = %+v, error ids %+v", res, ir)
+			}
+			if !tc.cancel {
+				select {
+				case id := <-remote.cancelled:
+					t.Errorf("a peer's task %q was cancelled", id)
+				case <-time.After(300 * time.Millisecond):
+				}
+				if got := recs.order(); len(got) != 1 || got[0] != CalleeNS {
+					t.Errorf("records = %v, want the callee alone", got)
+				}
+				return
+			}
+			select {
+			case id := <-remote.cancelled:
+				if id != ir.TaskID {
+					t.Errorf("cancelled %q, want the call's task %q", id, ir.TaskID)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("the remote agent saw no tasks/cancel")
+			}
+			if got := recs.order(); len(got) != 2 || got[0] != CalleeNS || got[1] != CancelNS {
+				t.Fatalf("records = %v, want the callee then the cancel", got)
+			}
+			var cs CancelSent
+			_ = json.Unmarshal(recs.of(CancelNS)[0], &cs)
+			if cs.Task != string(ir.TaskID) || cs.URL != card.URL {
+				t.Errorf("cancel record = %+v, want task %q url %q", cs, ir.TaskID, card.URL)
+			}
+		})
+	}
+}
+
+// TestAnAbortWhileAskingCancelsOnce pins that the abort path and the
+// input-required path do not both cancel: a call whose context ends
+// while its hook holds the question sends one tasks/cancel and writes
+// one CancelSent, whether the hook then fails with the context's error
+// or says it cannot answer.
+func TestAnAbortWhileAskingCancelsOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ret  func(ctx context.Context) error
+		want error
+	}{
+		{"hook fails", func(ctx context.Context) error { return ctx.Err() }, context.Canceled},
+		{"hook declines", func(context.Context) error { return agentturn.ErrInputRequired }, agentturn.ErrInputRequired},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remote := questioning{cancelled: make(chan a2a.TaskID, 4)}
+			client, card := serve(t, remote, nil)
+			var recs records
+			ctx, cancel := context.WithCancel(agenttool.ContextWithRecorder(context.Background(), recs.fn))
+			defer cancel()
+			hook := func(ctx context.Context, _ TaskInfo, _ *a2a.Message) ([]a2a.Part, error) {
+				cancel()
+				return nil, tc.ret(ctx)
+			}
+			_, err := New(client, card, WithInputRequired(hook)).Execute(ctx, agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"go"}`)})
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+			select {
+			case <-remote.cancelled:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the remote agent saw no tasks/cancel")
+			}
+			select {
+			case id := <-remote.cancelled:
+				t.Errorf("task %q was cancelled twice", id)
+			case <-time.After(300 * time.Millisecond):
+			}
+			if got := recs.order(); len(got) != 2 || got[0] != CalleeNS || got[1] != CancelNS {
+				t.Errorf("records = %v, want one callee then one cancel", got)
+			}
+		})
+	}
+}
+
+// replies is a JSON-RPC A2A agent that answers each message/send with
+// the next of its replies, as no conforming server would when a reply
+// moves off the task it was answered on, and tells the test of each
+// tasks/cancel.
+type replies struct {
+	mu        sync.Mutex
+	next      []a2a.SendMessageResult
+	cancelled chan a2a.TaskID
+}
+
+func (s *replies) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var result any
+	switch req.Method {
+	case "message/send":
+		s.mu.Lock()
+		result, s.next = s.next[0], s.next[1:]
+		s.mu.Unlock()
+	case "tasks/cancel":
+		var p a2a.TaskIDParams
+		_ = json.Unmarshal(req.Params, &p)
+		s.cancelled <- p.ID
+		result = &a2a.Task{ID: p.ID, ContextID: "ctx", Status: a2a.TaskStatus{State: a2a.TaskStateCanceled}}
+	default:
+		http.Error(w, "unexpected method "+req.Method, http.StatusBadRequest)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result})
+}
+
+// TestACallCancelsEveryTaskItLeaves pins that a call stops each task it
+// leaves unfinished, not only the one it ends on: when the reply to an
+// answer moves off the task it answered, onto a new task or into a
+// message, the task left asking is cancelled too, each with its own
+// CancelSent after its own Callee, and no task twice.
+func TestACallCancelsEveryTaskItLeaves(t *testing.T) {
+	asks := func(id a2a.TaskID, state a2a.TaskState) *a2a.Task {
+		return &a2a.Task{ID: id, ContextID: "ctx", Status: a2a.TaskStatus{State: state, Message: a2a.NewMessage(a2a.MessageRoleAgent, a2a.TextPart{Text: "which?"})}}
+	}
+	for _, tc := range []struct {
+		name      string
+		second    a2a.SendMessageResult
+		opts      []Option
+		cancelled []a2a.TaskID
+		records   []string
+		ok        bool
+	}{
+		{"new task asking", asks("t2", a2a.TaskStateInputRequired), nil, []a2a.TaskID{"t1", "t2"}, []string{CalleeNS, CalleeNS, CancelNS, CancelNS}, false},
+		{"new task done", asks("t2", a2a.TaskStateCompleted), nil, []a2a.TaskID{"t1"}, []string{CalleeNS, CalleeNS, CancelNS}, true},
+		{"bare message", a2a.NewMessage(a2a.MessageRoleAgent, a2a.TextPart{Text: "done"}), nil, []a2a.TaskID{"t1"}, []string{CalleeNS, CalleeNS, CancelNS}, true},
+		{"peer", asks("t2", a2a.TaskStateInputRequired), []Option{WithoutCancelOnAbort()}, nil, []string{CalleeNS, CalleeNS}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remote := &replies{next: []a2a.SendMessageResult{asks("t1", a2a.TaskStateInputRequired), tc.second}, cancelled: make(chan a2a.TaskID, 4)}
+			srv := httptest.NewServer(remote)
+			t.Cleanup(srv.Close)
+			card := &a2a.AgentCard{Name: "Remote", URL: srv.URL, PreferredTransport: a2a.TransportProtocolJSONRPC}
+			client, err := a2aclient.NewFromCard(context.Background(), card, a2aclient.WithInterceptors(ObserveEndpoint()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = client.Destroy() })
+			hook := func(context.Context, TaskInfo, *a2a.Message) ([]a2a.Part, error) {
+				return []a2a.Part{a2a.TextPart{Text: "that one"}}, nil
+			}
+			var recs records
+			ctx := agenttool.ContextWithRecorder(context.Background(), recs.fn)
+			opts := append([]Option{WithBlocking(), WithInputRequired(hook), WithInputRounds(1)}, tc.opts...)
+			_, err = New(client, card, opts...).Execute(ctx, agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"go"}`)})
+			if (err == nil) != tc.ok {
+				t.Fatalf("err = %v, want success %v", err, tc.ok)
+			}
+			got := map[a2a.TaskID]int{}
+			for range tc.cancelled {
+				select {
+				case id := <-remote.cancelled:
+					got[id]++
+				case <-time.After(5 * time.Second):
+					t.Fatalf("cancels seen %v, want %v", got, tc.cancelled)
+				}
+			}
+			select {
+			case id := <-remote.cancelled:
+				got[id]++
+			case <-time.After(300 * time.Millisecond):
+			}
+			for _, id := range tc.cancelled {
+				if got[id] != 1 {
+					t.Errorf("task %s cancelled %d times, want once (all: %v)", id, got[id], got)
+				}
+			}
+			if len(got) != len(tc.cancelled) {
+				t.Errorf("cancelled %v, want %v", got, tc.cancelled)
+			}
+			if order := recs.order(); !slices.Equal(order, tc.records) {
+				t.Errorf("records = %v, want %v", order, tc.records)
+			}
+			var sent []a2a.TaskID
+			for _, raw := range recs.of(CancelNS) {
+				var cs CancelSent
+				_ = json.Unmarshal(raw, &cs)
+				sent = append(sent, a2a.TaskID(cs.Task))
+				if cs.URL != srv.URL {
+					t.Errorf("cancel record url = %q, want %q", cs.URL, srv.URL)
+				}
+			}
+			if !slices.Equal(sent, tc.cancelled) {
+				t.Errorf("cancel records name %v, want %v", sent, tc.cancelled)
+			}
+			if _, ok := tc.second.(*a2a.Message); ok {
+				var m Callee
+				_ = json.Unmarshal(recs.of(CalleeNS)[1], &m)
+				if m.Task != "" || m.URL != srv.URL || m.Relation != RelationSubsession {
+					t.Errorf("message callee = %+v, want no task, url %q", m, srv.URL)
+				}
+			}
+		})
+	}
+}
+
+// TestACallLeftAskingDoesNotWaitForTheCancel pins that the cancel of a
+// task left input-required is sent and not awaited: the call returns
+// while the remote agent holds the cancel, and the record is written.
+func TestACallLeftAskingDoesNotWaitForTheCancel(t *testing.T) {
+	remote := questioning{cancelled: make(chan a2a.TaskID, 4), hold: make(chan struct{})}
+	client, card := serve(t, remote, nil)
+	t.Cleanup(func() { close(remote.hold) })
+	var recs records
+	ctx := agenttool.ContextWithRecorder(context.Background(), recs.fn)
+	ret := make(chan error, 1)
+	go func() {
+		_, err := New(client, card).Execute(ctx, agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"go"}`)})
+		ret <- err
+	}()
+	select {
+	case <-remote.cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the remote agent saw no tasks/cancel")
+	}
+	select {
+	case err := <-ret:
+		if !errors.Is(err, agentturn.ErrInputRequired) {
+			t.Errorf("err = %v, want input required", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the call waited on the remote agent's cancel")
+	}
+	if got := recs.order(); len(got) != 2 || got[0] != CalleeNS || got[1] != CancelNS {
+		t.Errorf("records = %v, want the callee then the cancel", got)
 	}
 }

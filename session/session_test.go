@@ -1702,7 +1702,12 @@ func TestPinnedFoldRebuildsWhatWasSent(t *testing.T) {
 		t.Fatal(err)
 	}
 	notice := openresponses.DeveloperText("<system-interrupt>never use Box::leak</system-interrupt>")
-	pin := func(item openresponses.Item) bool { return item == openresponses.Item(notice) }
+	// The pin matches by content: a resumed run's items are read back
+	// from the store, which keeps copies of what was appended.
+	pin := func(item openresponses.Item) bool {
+		m, ok := item.(*openresponses.Message)
+		return ok && m.Role == notice.Role && m.Text() == notice.Text()
+	}
 	tr := compact.NewLocal(&echo.Adapter{}, compact.WithBudget(4), compact.WithKeepLast(2),
 		compact.WithEstimator(countItems), compact.WithOnFold(rec.Fold), compact.WithPin(pin))
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform})

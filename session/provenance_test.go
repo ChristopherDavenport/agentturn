@@ -589,7 +589,7 @@ func TestEntryOfNamesTheItemsEntry(t *testing.T) {
 		if !ok {
 			t.Fatalf("no entry %s", id)
 		}
-		if it, ok := e.(*agentsession.ItemEntry); !ok || it.Item != item {
+		if it, ok := e.(*agentsession.ItemEntry); !ok || !equalJSON(it.Item, item) {
 			t.Errorf("entry %s holds %+v", id, e)
 		}
 	}
