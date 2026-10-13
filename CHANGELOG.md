@@ -7,6 +7,57 @@ versions may break the API.
 
 ## Unreleased
 
+- Fixed: a `front/a2a` cancel of a task its last run left input-required,
+  arriving with no run active, settles what the task left pending in its
+  conversation instead of only marking the task canceled (#255). Each call
+  the task's status message listed, the caller's own and those put to it
+  under `WithEscalation`, the call held beside one included, is refused
+  with `agentturn.Refuse`: the output, and the answer's reason, say "the
+  caller <principal> canceled the task, so this call was not run". The
+  refusal runs on the conversation's agent with what `WithRecorderFor`
+  attached, under the caller's `{Kind: "a2a", Ref: principal}` trigger
+  and naming nobody as the decider, as an `Approval`'s refusal does, so a
+  session recorder writes each as a refusal of the held call, and the run
+  ends without calling the model. The stored conversation holds no
+  unanswered call, the calls put to the caller are forgotten, and the
+  conversation's next message starts clean. The cancel is refused as not
+  found for a principal who may not write the conversation; a
+  conversation another task has moved on in, answering the calls or
+  listing them again under its own task, is left as it is; a cancel with
+  a run active aborts it as before. The settlement runs apart from the
+  cancel's request, so a caller that hangs up after sending it still has
+  the calls settled.
+- Added: `front/a2a`'s `WaitingStore`, kept beside the transcript as
+  `EscalationStore` is, names the task each conversation waits on; a
+  cancel settles only that task's calls. `MemoryStore` implements it;
+  with a store that does not, the executor keeps it in memory, and after
+  a restart a cancel settles the calls the task listed when they are
+  every call the conversation holds unanswered. A store that outlives
+  the process should implement `WaitingStore` and `EscalationStore`,
+  ideally writing the waiting task with the transcript; the in-memory
+  fallbacks keep one entry per conversation that waits on its caller.
+- Fixed: a `front/a2a` run lets go of its record and its conversation
+  before it writes the task's final status, so a cancel sent the moment
+  a caller sees input-required finds no run and settles, rather than
+  finding the finished run still registered and settling nothing. A
+  cancel that comes before the status reaches the SDK settles too, since
+  the conversation waits on the task by then. a2a-go v0.3.15 can still
+  answer a cancel that arrives while it holds the finished execution
+  with `ErrTaskNotCancelable` (the TODO in its local manager's
+  `handleCancelWithConcurrentRun`): the conversation is settled, but the
+  SDK's task store keeps the task input-required, so a later message on
+  it is refused as answering no pending call, or runs as a new turn, and
+  a retried cancel ends it canceled.
+- Fixed: a `front/a2a` message on a task that a cancel ended while the
+  message was on its way ends canceled without running, and a cancel
+  finds a run from the moment the run holds its conversation. The mark
+  that does this serves one message and lasts a minute.
+- Changed: a `front/a2a` message carrying a `function_call_output` when
+  the conversation has no pending call is refused as invalid params,
+  rather than stored as a second output of a call already answered. A
+  caller that retries an answer after the callee lost its conversation
+  now gets invalid params, where its output used to be stored as an
+  orphan the model could not take.
 - Changed: `session` requires agentsession v0.0.24, so the sessions it
   writes are format 0.12, which a reader of 0.11 refuses once the file
   is raised.

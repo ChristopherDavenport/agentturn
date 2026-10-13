@@ -158,6 +158,62 @@
 // watches, whose caller's human plane should decide; without it each
 // system's policy is its own.
 //
+// # Cancel
+//
+// tasks/cancel on a task with a run in flight aborts the run, and the
+// task ends canceled. A task its last run left input-required has no
+// run: its calls are pending in the conversation, the caller's own and
+// those put to it under [WithEscalation], and a caller that gives the
+// task up no longer asks for them. The cancel settles them before the
+// task ends canceled, while the conversation waits on the task
+// ([WaitingStore]): each call the task's status message listed is
+// refused with agentturn.Refuse, its output saying "the caller
+// <principal> canceled the task, so this call was not run", and the
+// answer's reason the same. The refusal is a run of the conversation's
+// agent, which what [WithRecorderFor] attached records, under the
+// caller's trigger {Kind: "a2a", Ref: principal} and naming nobody as
+// the decider, as an [Approval]'s refusal does, so a session recorder
+// writes each as the caller's refusal of the held call, with that
+// reason. The run ends without calling the model, since nobody asks for
+// the work; a call the policy held beside an asked one does not run.
+// The [ConversationStore] then holds no unanswered call, the calls put
+// to the caller are forgotten, and the conversation's next message
+// starts clean, the model reading the refusals with it. A late answer
+// to a settled call is refused as invalid params. A failure to record
+// fails the cancel, as it fails a task. The settlement does not depend
+// on the cancel's request, so a caller that sends the cancel and hangs
+// up still has the calls settled.
+//
+// A run lets go of its record and of the conversation before it writes
+// the task's final status, so a cancel sent as soon as the caller sees
+// input-required finds no run and settles; a cancel that comes before
+// the status reaches the SDK settles too, since the conversation waits
+// on the task by then. The SDK can still answer such a cancel with
+// a2a.ErrTaskNotCancelable: a2a-go v0.3.15 hands a cancel that arrives
+// while it holds the finished execution to that execution, whose result
+// is already input-required (the TODO in its local manager's
+// handleCancelWithConcurrentRun). The conversation is settled then, but
+// the SDK's task store keeps the task input-required: a message on the
+// task within a minute ends canceled, a later one that answers the calls
+// is refused as answering no pending call and one that does not runs as
+// a new turn, and a retried cancel ends the task canceled. The
+// settlement needs nothing the process held, so a cancel after a restart
+// settles the task the old process left, from the task the
+// [ConversationStore] names as waited on ([WaitingStore]) or, under a
+// store that keeps none, from the calls the task's status listed. A
+// cancel from a principal that does not own the task, or may not write its
+// conversation, is refused as not found and writes nothing. A second
+// cancel finds the task canceled and settles nothing. The cancel holds
+// the conversation as a task does, so it never settles while a task
+// runs: when another task is in flight on the conversation, that task
+// answers the calls or lists them as its own, and the cancel settles
+// nothing. Nor does it when a later task has moved the conversation on:
+// a message that answered the calls, or one that answered none of them
+// and so listed them again under its own task, leaves them that task's
+// to answer or cancel. A message on the task that was on its way when
+// the cancel came, let through before the task was canceled, does not
+// run: the task stays canceled.
+//
 // # One task per conversation
 //
 // A context ID runs one task at a time, so a conversation's store and

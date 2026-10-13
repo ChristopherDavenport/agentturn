@@ -39,6 +39,11 @@ type Executor struct {
 	// busy holds the context IDs with a task in flight, so one
 	// conversation runs one task at a time.
 	busy map[string]bool
+	// canceled holds, by context ID, the last task a cancel ended with no
+	// run active, so a message on that task the SDK let through before
+	// the cancel does not run on the conversation the cancel settled.
+	canceled map[string]canceledMark
+	waiting  memoryWaiting
 }
 
 // ErrConversationBusy is the cause of the error a message gets when its
@@ -55,7 +60,11 @@ var _ a2asrv.AgentExecutor = (*Executor)(nil)
 // Option configures an [Executor].
 type Option func(*Executor)
 
-// WithConversationStore replaces the in-memory conversation store.
+// WithConversationStore replaces the in-memory conversation store. A
+// store that outlives the process should also implement
+// [EscalationStore] and [WaitingStore], as [ConversationStore] says, or
+// a restart loses which calls were put to the caller and which task the
+// conversation waits on.
 func WithConversationStore(s ConversationStore) Option {
 	return func(e *Executor) { e.store = s }
 }
@@ -265,6 +274,15 @@ func (e *Executor) escalationStore() EscalationStore {
 	return &e.escalations
 }
 
+// waitingStore is where the task each conversation waits on is kept:
+// the conversation store when it keeps it, else memory.
+func (e *Executor) waitingStore() WaitingStore {
+	if s, ok := e.store.(WaitingStore); ok {
+		return s
+	}
+	return &e.waiting
+}
+
 // Execute runs the loop for one message and translates the run into A2A
 // events. It returns nil after a terminal or input-required status has
 // been written; a returned error, including a failure to write an
@@ -314,8 +332,17 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	// rather than made to wait, so a caller is not left holding a task
 	// it cannot see, and a served agent that sends to its own
 	// conversation fails instead of waiting on itself.
-	release, err := e.claim(reqCtx.ContextID)
+	runCtx, cancel := context.WithCancel(ctx)
+	release, err := e.claim(reqCtx.ContextID, reqCtx.TaskID, cancel)
+	if errors.Is(err, errCanceled) {
+		// A cancel ended the task after the SDK let this message through
+		// and settled the conversation: the task stays canceled.
+		cancel()
+		_ = e.finish(context.WithoutCancel(ctx), reqCtx, q, a2a.TaskStateCanceled, nil)
+		return nil
+	}
 	if err != nil {
+		cancel()
 		return err
 	}
 	defer release()
@@ -323,8 +350,6 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	if err != nil {
 		return fmt.Errorf("load conversation %q: %w", reqCtx.ContextID, err)
 	}
-	runCtx, cancel := context.WithCancel(ctx)
-	defer e.track(reqCtx.TaskID, cancel)()
 	start := e.startFor(runCtx, slices.Concat(transcript, prompts))
 	caller := slices.Concat(e.callerTools, declared)
 	callers := callerNames(caller)
@@ -354,11 +379,27 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 			return fmt.Errorf("%w: function_call_output %q answers a call to %q, the agent's own tool, which the caller cannot answer", a2a.ErrInvalidParams, fco.CallID, closed[fco.CallID])
 		}
 	}
+	if len(unanswered(transcript)) == 0 {
+		for _, item := range prompts {
+			if fco, ok := item.(*openresponses.FunctionCallOutput); ok {
+				// Nothing is pending: the call has its output already, a
+				// cancel's refusal say, and a second would make the
+				// conversation an invalid input.
+				return fmt.Errorf("%w: function_call_output %q answers no pending call", a2a.ErrInvalidParams, fco.CallID)
+			}
+		}
+	}
 	if err := checkAnswers(transcript, prompts, approvals, asked); err != nil {
 		// A follow-up that does not answer the pending calls leaves the
 		// task where it was, input-required, with the calls repeated
 		// and the rule stated; failing the task would make it
-		// unrecoverable.
+		// unrecoverable. The task is the one the conversation waits on,
+		// and the conversation is free before the caller sees the status,
+		// so a cancel that follows it settles the calls.
+		if err := e.waitingStore().SaveWaiting(ctx, reqCtx.ContextID, string(reqCtx.TaskID)); err != nil {
+			return fmt.Errorf("save the task %q waits on: %w", reqCtx.ContextID, err)
+		}
+		release()
 		return e.inputRequired(ctx, reqCtx, q, unanswered(transcript), err.Error(), escalated)
 	}
 	if err := e.checkDeclared(runCtx, declared, start); err != nil {
@@ -381,9 +422,11 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 		opts = append(opts, agentturn.WithPending(seeded))
 	}
 	agent := agentturn.New(e.runConfig(start, caller), opts...)
+	var detach func()
 	if e.recorderFor != nil {
-		rctx, detach, err := e.recorderFor(runCtx, reqCtx.ContextID, agent)
-		if detach != nil {
+		rctx, d, err := e.recorderFor(runCtx, reqCtx.ContextID, agent)
+		if d != nil {
+			detach = sync.OnceFunc(d)
 			defer detach()
 		}
 		if err == nil && rctx == nil {
@@ -440,44 +483,66 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 			return fmt.Errorf("save escalated calls of %q: %w", reqCtx.ContextID, err)
 		}
 	}
+	waiting := ""
+	if out.end.Reason == agentturn.ReasonInputRequired {
+		waiting = string(reqCtx.TaskID)
+	}
+	if err := e.waitingStore().SaveWaiting(ctx, reqCtx.ContextID, waiting); err != nil {
+		return fmt.Errorf("save the task %q waits on: %w", reqCtx.ContextID, err)
+	}
+	// The run is over and stored. The record lets go of the session and
+	// the conversation is free before the caller can see the task's
+	// status, so a cancel that follows the status finds no run and
+	// settles what the run left; detaching first keeps two recorders off
+	// one session.
+	if detach != nil {
+		detach()
+	}
+	release()
 	return e.conclude(ctx, reqCtx, q, out, escalated)
 }
 
-// track registers cancel for the task and returns the function that
-// removes it, so a Cancel arriving during the run finds it.
-func (e *Executor) track(id a2a.TaskID, cancel context.CancelFunc) func() {
-	e.mu.Lock()
-	if e.cancels == nil {
-		e.cancels = map[a2a.TaskID]context.CancelFunc{}
-	}
-	e.cancels[id] = cancel
-	e.mu.Unlock()
-	return func() {
-		e.mu.Lock()
-		delete(e.cancels, id)
-		e.mu.Unlock()
-		cancel()
-	}
-}
+// errCanceled is what claim returns for a task a cancel ended with no
+// run active.
+var errCanceled = errors.New("task canceled")
 
-// claim marks the conversation busy and returns the function that
-// frees it, or the error a message on a busy conversation gets.
-func (e *Executor) claim(contextID string) (func(), error) {
+// claim marks the conversation busy and registers cancel as the task's
+// run, in one step, so a cancel of the task finds the run from the
+// moment it holds the conversation. It returns the function that undoes
+// both and calls cancel, which does so once however often it is called,
+// the error a message on a busy conversation gets, or errCanceled for
+// the task a cancel last ended in the conversation with no run active,
+// whose mark it then removes.
+func (e *Executor) claim(contextID string, task a2a.TaskID, cancel context.CancelFunc) (func(), error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.busy == nil {
 		e.busy = map[string]bool{}
 	}
+	if e.cancels == nil {
+		e.cancels = map[a2a.TaskID]context.CancelFunc{}
+	}
 	if e.busy[contextID] {
 		return nil, a2a.NewError(fmt.Errorf("%w: %w", a2a.ErrInvalidRequest, ErrConversationBusy),
 			fmt.Sprintf("context %q has a task in flight; send again once it has ended", contextID))
 	}
+	if mark, ok := e.canceled[contextID]; ok {
+		// The mark serves one message that was on its way, or the
+		// conversation has moved on to another task.
+		delete(e.canceled, contextID)
+		if mark.task == task {
+			return nil, errCanceled
+		}
+	}
 	e.busy[contextID] = true
-	return func() {
+	e.cancels[task] = cancel
+	return sync.OnceFunc(func() {
 		e.mu.Lock()
 		delete(e.busy, contextID)
+		delete(e.cancels, task)
 		e.mu.Unlock()
-	}, nil
+		cancel()
+	}), nil
 }
 
 // outcome is what relay reports about a run.
@@ -1097,25 +1162,6 @@ func errorMessage(info a2a.TaskInfoProvider, err error) *a2a.Message {
 		err = errors.New("run failed")
 	}
 	return a2a.NewMessageForTask(a2a.MessageRoleAgent, info, a2a.TextPart{Text: err.Error()})
-}
-
-// Cancel aborts the task's run, if one is active, and marks the task
-// canceled.
-func (e *Executor) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue) error {
-	_, principal, err := e.authenticated(ctx)
-	if err != nil {
-		return err
-	}
-	if err := e.owns(ctx, principal, reqCtx.TaskID); err != nil {
-		return err
-	}
-	e.mu.Lock()
-	cancel := e.cancels[reqCtx.TaskID]
-	e.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-	return e.finish(ctx, reqCtx, q, a2a.TaskStateCanceled, nil)
 }
 
 // taskText returns the text of a task's final message or, failing that,
