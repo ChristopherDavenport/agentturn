@@ -7,6 +7,47 @@ versions may break the API.
 
 ## Unreleased
 
+- Changed: `session` requires agentsession v0.0.24, so the sessions it
+  writes are format 0.12, which a reader of 0.11 refuses once the file
+  is raised.
+- Added: `session`'s recorder writes the records `tools/a2a` writes as
+  link entries of the call, where it wrote custom entries: a `Callee`
+  record (`agentturn:a2a_callee`) as the subsession link
+  (`agentsession.NewCalleeSubsessionLink`) for relation `subsession` and
+  the peer link (`NewPeerLink`) for `peer`, naming the URL, task and
+  context; a `CancelSent` record (`agentturn:a2a_cancel`) as the cancel
+  notice (`NewCancelSentLink`) naming the latest link of the call to the
+  same URL and task on the path, so `agentsession.Session.Callees`
+  reads each callee, its dispatch, whether a cancel was sent and whether
+  the output came from it. It reads the records' JSON by namespace and
+  imports neither `tools/a2a` nor a2a-go. A record it cannot write as a
+  link is the custom entry it was, so none is dropped: one that does not
+  decode, carries a member the link has no place for (a newer
+  `tools/a2a`'s), names another relation or none, or names no URL or no
+  call the session holds; one a nested call made through
+  `agentturn.Invoke` wrote, since a link would say the callee answered
+  the outer call; and a cancel whose callee's link is not on the path.
+  A call dispatched again after a restart reaches a new task and gets a
+  link of its own beside the first.
+- Added: an output `session.ReplayAnswers` gives from a branch a rebase
+  left brings that dispatch's callee links with it, as it brought a
+  child's subsession link, each copied whole, members the library does
+  not define included, and each cancel notice is written again naming
+  the copy, since a notice names its link by entry ID. A copy cut short,
+  by a failed append or a crash before the answer, is finished on the
+  next attempt rather than written again. Nothing is copied once the
+  call has a dispatch on the new branch, so a stale answer given after
+  the call ran again there does not file the branch left's links under
+  that dispatch; the same holds for a child's link. The copies precede
+  the answer decision, so `Callees` reads each as belonging to no
+  dispatch of the new branch and not answered: the output is the
+  harness's answer, and the answer's reason ties it to the branch left. A fork copies none of
+  its origin's, as it copies no child's link: it started none of that
+  work and sent none of those cancels, and its `fork_of` reaches the
+  origin, which holds them.
+- Fixed: `session` read a subsession link naming a callee in another
+  system, or a cancel notice, as a link to a child session of the store
+  when it looked for the child a replayed output came from.
 - Changed: a `tools/a2a` subsession call that ends input-required (with
   no `WithInputRequired` hook, a hook that returned
   `agentturn.ErrInputRequired` or its `WithInputRounds` spent) or
