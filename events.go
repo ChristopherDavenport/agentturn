@@ -371,6 +371,18 @@ type ToolStart struct {
 	// no function_call item in the transcript: it is the work of the
 	// call that made it.
 	Parent string
+	// Requested, for a nested call, are the arguments the invoking tool
+	// passed to [Invoke], before a decision rewrote them into Args; nil
+	// for a call the model made, whose function_call item keeps them.
+	// They are what a later execution of the invoking call is matched
+	// on ([InvokedCall]).
+	Requested json.RawMessage
+	// Replayed says the nested call's result is the one an earlier
+	// execution of the invoking call left, repeated without running the
+	// tool or asking BeforeToolCall: the call keeps its ID, raises no
+	// tool_dispatch, and its tool_end carries that result, marked
+	// Replayed too. See [InvokedCall].
+	Replayed bool
 }
 
 // EventType returns "tool_start".
@@ -457,6 +469,16 @@ type ToolEnd struct {
 	// subscriber failed writes so, and the call reads as never started
 	// rather than as one that may have run.
 	Withdrawn bool
+	// Cut says the call was cut off, by a cancellation or by a failure
+	// of the loop's own around it, rather than settled with a result of
+	// its own: Err is the cut, and a call that was dispatched may have
+	// run. A recorder writes it for a nested call, whose cut leaves no
+	// pending call of its own to say so.
+	Cut bool
+	// Replayed says Result is the one an earlier execution of the
+	// invoking call left for this nested call, repeated without running
+	// the tool, as [ToolStart.Replayed] says.
+	Replayed bool
 }
 
 // EventType returns "tool_end".
@@ -724,6 +746,54 @@ type PendingCall struct {
 	// an agent seeded with the pending calls ([WithPending]) appends
 	// them as the one that held them would have.
 	Notes []Note
+	// Invoked are the nested calls the call's tool made through
+	// [Invoke] in the execution that left it pending, in the order they
+	// were made, with the nested calls those made, each naming its
+	// Parent: an execution an abort or a failure cut off, after which
+	// the call may run again. A nested call already made is fixed as a
+	// model's call is once its response is in: when an approval runs
+	// the call again, its tool's k-th Invoke under a parent is the k-th
+	// listed under that parent if it names the same tool with the same
+	// arguments, and keeps that call's ID and key; one that ended
+	// returns its result without running again, one that was dispatched
+	// and not ended is run again only as agenttool's replay rule
+	// allows, and one never dispatched runs as any call does. The first
+	// Invoke under a parent that differs from the list ends the
+	// matching under it, and it and every later one are new calls. An
+	// execution that again leaves the call pending lists what it made,
+	// then the calls it did not reach of a list it never left. The loop
+	// sets it; agentturn/session's Pending sets it from the record. nil
+	// for a call whose tool made no nested call.
+	Invoked []InvokedCall
+}
+
+// InvokedCall is a nested call an execution of a pending call made,
+// as [PendingCall.Invoked] lists it.
+type InvokedCall struct {
+	// CallID is the ID the loop gave the call, and Parent the call
+	// whose tool made it: the pending call, or another nested call.
+	CallID string
+	Parent string
+	Name   string
+	// Args are the arguments the invoking tool passed, which a later
+	// Invoke is matched on, and RanWith those the call was handed to
+	// its tool with when a decision rewrote them, nil otherwise.
+	Args    json.RawMessage
+	RanWith json.RawMessage
+	// IdempotencyKey is the key the call was handed to its tool with,
+	// and empty when it never was or the record does not say. A call
+	// matched again runs under it; with none, under a new one.
+	IdempotencyKey string
+	// Dispatched says the call was handed to its tool, so it may have
+	// run.
+	Dispatched bool
+	// Ended says the call settled with a result of its own, a refusal
+	// or a failure among them, rather than being cut: Result and Err
+	// are what the invoking tool received, which a later Invoke matched
+	// to it receives again.
+	Ended  bool
+	Result agenttool.Result
+	Err    error
 }
 
 // Note is a note waiting on the outputs of its batch: the item and how

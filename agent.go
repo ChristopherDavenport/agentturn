@@ -653,7 +653,7 @@ const OutcomeUnknownReason = "not run again: outcome unknown"
 // model sees that the call may or may not have taken effect and can
 // check before it asks again. It carries [OutcomeUnknownReason].
 func OutcomeUnknown(callID string) Answer {
-	res := agenttool.ErrorResult(errors.New("outcome unknown: the call was cut off after it was handed to its tool, and it may or may not have taken effect; check before calling it again"))
+	res := agenttool.ErrorResult(ErrOutcomeUnknown)
 	a := Output(&openresponses.FunctionCallOutput{CallID: callID, Output: res.Output})
 	a.Reason = OutcomeUnknownReason
 	return a

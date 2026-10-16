@@ -45,10 +45,10 @@ func sampleEvents(t *testing.T) map[string]agentturn.Event {
 		"ItemUpdate":   &agentturn.ItemUpdate{RunID: "run_1", Turn: 1, Item: call, Stream: stream, ResponseID: "resp_1"},
 		"ItemEnd":      &agentturn.ItemEnd{RunID: "run_1", Turn: 1, Item: call, ResponseID: "resp_1", Hidden: true, Trigger: trigger, ModelCallID: "m_1"},
 		"ResponseEnd":  &agentturn.ResponseEnd{RunID: "run_1", Turn: 1, Response: resp, Withheld: true},
-		"ToolStart":    &agentturn.ToolStart{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Args: json.RawMessage(`{"text":"a"}`), Decision: decision, Parent: "call_0"},
+		"ToolStart":    &agentturn.ToolStart{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Args: json.RawMessage(`{"text":"a"}`), Decision: decision, Parent: "call_0", Requested: json.RawMessage(`{"text":"A"}`), Replayed: true},
 		"ToolDispatch": &agentturn.ToolDispatch{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Parent: "call_0", IdempotencyKey: "k"},
 		"ToolUpdate":   &agentturn.ToolUpdate{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Partial: result},
-		"ToolEnd":      &agentturn.ToolEnd{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Result: result, Err: errors.New("boom"), Blocked: true, Deferred: true, Reason: "r", Parent: "call_0", Withdrawn: true},
+		"ToolEnd":      &agentturn.ToolEnd{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Result: result, Err: errors.New("boom"), Blocked: true, Deferred: true, Reason: "r", Parent: "call_0", Withdrawn: true, Cut: true, Replayed: true},
 		"TurnEnd":      &agentturn.TurnEnd{RunID: "run_1", Turn: 1, Response: resp, ToolResults: []agenttool.Result{result}},
 		"RunEnd": &agentturn.RunEnd{RunID: "run_1", Items: openresponses.Items{openresponses.UserText("hi"), call, out}, Reason: agentturn.ReasonInputRequired,
 			Cause: agentturn.StopGuard, Err: agentturn.ErrRunning, Withheld: true, Pending: []agentturn.PendingCall{{
@@ -56,6 +56,10 @@ func sampleEvents(t *testing.T) map[string]agentturn.Event {
 				Ran: out, RanWhere: "branch", Refused: "no", Decision: decision,
 				Notes:    []agentturn.Note{{Item: openresponses.UserText("only the unit tests"), Mode: agentturn.InputResume, Trigger: trigger, CallID: "call_1"}},
 				Question: &agentturn.OpenQuestion{ID: "entry_1", Message: "Allow notify?", Call: &agentturn.AskedCall{Parent: "call_1", CallID: "call_2", Name: "notify"}},
+				Invoked: []agentturn.InvokedCall{
+					{CallID: "call_2", Parent: "call_1", Name: "upper", Args: json.RawMessage(`{"text":"a"}`), RanWith: json.RawMessage(`{"text":"A"}`), IdempotencyKey: "k2", Dispatched: true, Ended: true, Result: result, Err: errors.New("boom")},
+					{CallID: "call_3", Parent: "call_2", Name: "notify", Args: json.RawMessage(`{}`), IdempotencyKey: "k3", Dispatched: true},
+				},
 			}}, Notes: []agentturn.Note{{Item: openresponses.DeveloperText("owed"), Mode: agentturn.InputTool}}},
 		"Queued":         &agentturn.Queued{RunID: "run_1", Item: openresponses.UserText("more"), Mode: agentturn.QueueSteer, Hidden: true, Trigger: trigger},
 		"Question":       &agentturn.Question{ID: "question_1", RunID: "run_1", CallID: "call_0", Call: &agentturn.AskedCall{Parent: "call_0", CallID: "call_1", Name: "upper", Args: json.RawMessage(`{}`), Decision: decision}, Elicitation: agenttool.Elicitation{Message: "ok?", Schema: json.RawMessage(`{"type":"object"}`), URL: "https://example.test"}},

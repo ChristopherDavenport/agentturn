@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -558,6 +559,16 @@ type runner struct {
 	// an accept's note on a nested call it made, and what the user
 	// said answering a question its tool asked.
 	callNotes map[string]openresponses.Items
+	// invokedMu guards invoked and replays, which a nested call reads
+	// and writes from the goroutine of the tool that made it.
+	invokedMu sync.Mutex
+	// invoked holds the run's nested calls in the order they were made,
+	// for the pending list.
+	invoked []*callState
+	// replays holds, by the call whose tool makes them, the nested
+	// calls an earlier execution of a call this run approved made,
+	// which that call's execution now is matched against.
+	replays map[string]*replayQueue
 	// noteKeys are the keys of callNotes in the order each first had a
 	// note, so notes no batch call takes are held in the order said.
 	noteKeys []string
@@ -1103,11 +1114,100 @@ func (r *runner) pending() []PendingCall {
 		if p.Tool == nil {
 			p.Tool = before.Tool
 		}
+		p.Invoked = r.invokedUnder(call.CallID, before.Invoked)
 		out[i] = p
 	}
 	// The notes still waiting go with the calls they wait on.
 	out[len(out)-1].Notes = slices.Clone(r.notes)
 	return out
+}
+
+// invokedUnder is what [PendingCall.Invoked] lists for the call id:
+// the nested calls this run made under it, at any depth, in the order
+// they were made, then those of before, the list it was pending with,
+// that this run did not reach, as carryInvoked keeps them.
+func (r *runner) invokedUnder(id string, before []InvokedCall) []InvokedCall {
+	r.noteMu.Lock()
+	roots := maps.Clone(r.roots)
+	r.noteMu.Unlock()
+	r.invokedMu.Lock()
+	defer r.invokedMu.Unlock()
+	var now []InvokedCall
+	for _, p := range r.invoked {
+		if roots[p.call.CallID] == id {
+			now = append(now, p.invokedCall())
+		}
+	}
+	return CarryInvoked(before, now, id)
+}
+
+// CarryInvoked is what [PendingCall.Invoked] lists for the call root
+// after an execution of it that left it pending again: now, the nested
+// calls that execution made, in order, then the calls of before, the
+// list it was pending with, that it did not reach. A call of before
+// is kept when this execution did not make it again, its parent is
+// root or a call kept, the parent's execution made no call before did
+// not list, which ends the matching under it, and the parent did not
+// end, which leaves nothing under it to run: a call not reached may
+// still run in the next execution, under the ID and key it had. A
+// recorder that rebuilds the list from a record folds each execution
+// in with it, so it reads the record as the loop left the list.
+func CarryInvoked(before, now []InvokedCall, root string) []InvokedCall {
+	if len(now) == 0 {
+		return before
+	}
+	listed := make(map[string]bool, len(before))
+	for _, c := range before {
+		listed[c.CallID] = true
+	}
+	made := make(map[string]bool, len(now))
+	diverged := map[string]bool{}
+	ended := map[string]bool{}
+	for _, c := range now {
+		made[c.CallID] = true
+		if !listed[c.CallID] {
+			diverged[c.Parent] = true
+		}
+		if c.Ended {
+			ended[c.CallID] = true
+		}
+	}
+	out := slices.Clone(now)
+	kept := map[string]bool{root: true}
+	for _, c := range now {
+		kept[c.CallID] = true
+	}
+	for _, c := range before {
+		if made[c.CallID] || diverged[c.Parent] || ended[c.Parent] || !kept[c.Parent] {
+			continue
+		}
+		out = append(out, c)
+		kept[c.CallID] = true
+	}
+	return out
+}
+
+// invokedCall is the nested call p as [PendingCall.Invoked] lists it.
+func (p *callState) invokedCall() InvokedCall {
+	c := InvokedCall{CallID: p.call.CallID, Parent: p.parent, Name: p.call.Name, Args: p.requested, Dispatched: p.dispatched}
+	if !sameArgs(orEmpty(p.args, ""), orEmpty(p.requested, "")) {
+		c.RanWith = p.args
+	}
+	if p.recorded != nil && p.recorded.Dispatched {
+		// Handed over in an earlier execution, it may have run, whatever
+		// this one did with it.
+		c.Dispatched = true
+		if c.RanWith == nil {
+			c.RanWith = p.recorded.RanWith
+		}
+	}
+	if c.Dispatched {
+		c.IdempotencyKey = p.key
+	}
+	if p.ended && !p.cut {
+		c.Ended, c.Result, c.Err = true, p.result, p.err
+	}
+	return c
 }
 
 // source says what the run begins from: a resume when a prompt answers
@@ -2125,6 +2225,13 @@ type callState struct {
 	// read by the loop after the executor has drained.
 	key        string
 	dispatched bool
+	// requested, for a nested call, are the arguments the invoking tool
+	// passed to Invoke. recorded is the call an earlier execution of
+	// the invoking call made that this one was matched to, and replayed
+	// is set when its result is that call's, repeated without running.
+	requested json.RawMessage
+	recorded  *InvokedCall
+	replayed  bool
 	// after is the call before this one in its chain, whose settling
 	// this one's dispatch waits for, and done is closed once the loop
 	// has settled this call's result, when a later call waits for it.
@@ -2381,6 +2488,9 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 			}
 			p.result, p.err = ev.Result, ev.Err
 			p.settled = true
+			// A tool that returned the cancellation was cut off in
+			// flight rather than settled with a result of its own.
+			p.cut = isCancellation(ev.Err, ctx)
 			err = r.settle(ctx, p)
 			// settle ends the call before it delivers, so a call left
 			// unended is one the hook refused.
@@ -2565,6 +2675,7 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 			r.approved = map[string]bool{}
 		}
 		r.approved[ap.call.CallID] = true
+		r.expectInvoked(ap.call.CallID)
 		if ap.key != "" {
 			p.key = ap.key
 		}
@@ -2769,7 +2880,7 @@ func (r *runner) finish(p *callState) error {
 	// delivery that fails is the consumer's failure, and the call is
 	// not ended a second time for it.
 	p.ended = true
-	return r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Reason: p.reason, Parent: p.parent, Withdrawn: p.dispatchErr != nil})
+	return r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Reason: p.reason, Parent: p.parent, Withdrawn: p.dispatchErr != nil, Cut: p.cut, Replayed: p.replayed})
 }
 
 func validObject(raw json.RawMessage) bool {
@@ -2814,11 +2925,19 @@ var ErrNoInvoker = errors.New("agentturn: no loop on the context to invoke a too
 // implements the interface itself and wants the parent named passes
 // agenttool.WithCall. Outside a loop, Invoke returns [ErrNoInvoker].
 //
-// A nested call gets an idempotency key of its own, fresh on every
-// Invoke: nothing derives it from the key of the call that made it, so
-// a parent run again after a restart invokes with new keys, and a
-// keyed tool reached this way deduplicates nothing across the parent's
-// attempts; see the open question in RFC 0001.
+// A nested call gets an ID and an idempotency key of its own. When an
+// approval runs a pending call again, the nested calls its earlier
+// execution made ([PendingCall.Invoked]) are fixed as a model's calls
+// are: the tool's k-th Invoke under a parent that names the same tool
+// with the same arguments as the k-th made under it before is that
+// call, with its ID and key. One that ended returns the same result
+// without running or being decided again, marked Replayed on its
+// events; one that was dispatched and not ended runs again under its
+// key when its tool's replay is safe or keyed, and otherwise is put to
+// the user through the elicitor as a deferred nested call is, its
+// outcome unknown when nobody allows it; one never dispatched runs as
+// any call does. The first Invoke that differs ends the matching under
+// that parent: it and every later one are new calls.
 //
 // Call it from a tool, with the context the tool was given, and not
 // from a hook or a subscriber: BeforeToolCall and AfterToolCall take
@@ -2840,10 +2959,35 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 	if call, ok := agenttool.CallFrom(ctx); ok {
 		parent = call.ID
 	}
-	call := &openresponses.FunctionCall{CallID: openresponses.NewID("call"), Name: name, Arguments: string(args)}
+	rec := r.match(parent, name, args)
+	id := openresponses.NewID("call")
+	if rec != nil {
+		id = rec.CallID
+	}
+	call := &openresponses.FunctionCall{CallID: id, Name: name, Arguments: string(args)}
 	p := r.prepare(tools, turn, call, args)
-	p.parent = parent
+	p.parent, p.requested, p.recorded = parent, args, rec
 	r.adopt(call.CallID, parent)
+	r.invokedMu.Lock()
+	r.invoked = append(r.invoked, p)
+	r.invokedMu.Unlock()
+	if rec != nil && rec.IdempotencyKey != "" {
+		p.key = rec.IdempotencyKey
+	}
+	if rec != nil && rec.RanWith != nil {
+		p.args = rec.RanWith
+	}
+	switch {
+	case rec != nil && rec.Ended:
+		return r.replay(turn, p)
+	case rec != nil && rec.Dispatched:
+		return r.runAgain(ctx, turn, p)
+	}
+	if rec != nil {
+		// Never handed to its tool, so nothing about it is settled: it
+		// is decided and runs as a new call would, under its own ID.
+		p.args = args
+	}
 	var decision *ToolDecision
 	if r.cfg.BeforeToolCall != nil {
 		var err error
@@ -2886,7 +3030,15 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 			}
 		}
 	}
-	if err := r.emit(&ToolStart{RunID: r.runID, Turn: turn, CallID: call.CallID, Name: name, Args: p.args, Decision: decision, Parent: parent}); err != nil {
+	return r.runNested(ctx, turn, p, decision)
+}
+
+// runNested raises a nested call's tool_start with decision, settles
+// it in preflight or runs it, and returns what the invoking tool
+// receives.
+func (r *runner) runNested(ctx context.Context, turn int, p *callState, decision *ToolDecision) (agenttool.Result, error) {
+	call := p.call
+	if err := r.emit(&ToolStart{RunID: r.runID, Turn: turn, CallID: call.CallID, Name: call.Name, Args: p.args, Decision: decision, Parent: p.parent, Requested: p.requested}); err != nil {
 		return agenttool.Result{}, r.endNested(p, err)
 	}
 	if err := r.check(ctx, p); err != nil {
@@ -2905,10 +3057,136 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 	}
 	p.result, p.err = results[0], errs[0]
 	p.settled = true
+	p.cut = isCancellation(p.err, ctx)
 	if err := r.settle(ctx, p); err != nil {
 		return agenttool.Result{}, r.endNested(p, err)
 	}
 	return p.result, p.err
+}
+
+// replayQueue is the nested calls an earlier execution made under one
+// call, which that call's execution now is matched against in order.
+// next is the first not yet matched; diverged is set once an Invoke
+// did not match it, which ends the matching under that call.
+type replayQueue struct {
+	calls    []InvokedCall
+	next     int
+	diverged bool
+}
+
+// expectInvoked sets up the matching of the nested calls the approved
+// call id's earlier execution made, as the agent knew them when the
+// run started.
+func (r *runner) expectInvoked(id string) {
+	for _, pc := range r.prior {
+		if pc.Call == nil || pc.Call.CallID != id || len(pc.Invoked) == 0 {
+			continue
+		}
+		r.invokedMu.Lock()
+		if r.replays == nil {
+			r.replays = map[string]*replayQueue{}
+		}
+		for _, c := range pc.Invoked {
+			q := r.replays[c.Parent]
+			if q == nil {
+				q = &replayQueue{}
+				r.replays[c.Parent] = q
+			}
+			q.calls = append(q.calls, c)
+		}
+		r.invokedMu.Unlock()
+	}
+}
+
+// match returns the nested call an earlier execution made that this
+// Invoke under parent is, the next one made under parent when it names
+// the same tool with the same arguments, and nil otherwise, which ends
+// the matching under parent.
+func (r *runner) match(parent, name string, args json.RawMessage) *InvokedCall {
+	r.invokedMu.Lock()
+	defer r.invokedMu.Unlock()
+	q := r.replays[parent]
+	if q == nil || q.diverged || parent == "" {
+		return nil
+	}
+	if q.next >= len(q.calls) {
+		q.diverged = true
+		return nil
+	}
+	c := q.calls[q.next]
+	if c.Name != name || !sameArgs(orEmpty(c.Args, ""), orEmpty(args, "")) {
+		q.diverged = true
+		return nil
+	}
+	q.next++
+	return &c
+}
+
+// replay settles a nested call matched to one that ended with the
+// result that one returned, without the decision hook, the tool or
+// the after-call hook: the call was decided and ran, and its result is
+// as fixed as a model's call's output in the transcript.
+func (r *runner) replay(turn int, p *callState) (agenttool.Result, error) {
+	rec := p.recorded
+	p.replayed, p.dispatched = true, rec.Dispatched
+	if err := r.emit(&ToolStart{RunID: r.runID, Turn: turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args, Parent: p.parent, Requested: p.requested, Replayed: true}); err != nil {
+		return agenttool.Result{}, r.endNested(p, err)
+	}
+	p.result, p.err = rec.Result, rec.Err
+	p.settled = true
+	if err := r.finish(p); err != nil {
+		// Ended all the same: the result stands, and the failure is the
+		// invoking tool's to answer.
+		return agenttool.Result{}, err
+	}
+	return p.result, p.err
+}
+
+// ErrOutcomeUnknown is the error agenttool's replay rule gives a call
+// that may have run and is not run again: the output [OutcomeUnknown]
+// answers a pending call with, and what a nested call matched to one
+// that may have run returns to the invoking tool when its tool does not
+// say running it again is safe and nobody allowed it. It is the
+// model's text, and not prefixed.
+var ErrOutcomeUnknown = errors.New("outcome unknown: the call was cut off after it was handed to its tool, and it may or may not have taken effect; check before calling it again")
+
+// runAgain runs a nested call matched to one that was dispatched and
+// never ended, which may have run, as agenttool's replay rule allows
+// a call to run again: under the key of that dispatch, with the
+// arguments it ran with, when the tool's replay for them is safe, or
+// keyed and the key is known. Otherwise the user is asked through the
+// invoking tool's elicitor, as a deferred nested call is, and without
+// an allow the call is refused with [NestedOutcomeUnknown]. The
+// decision hook is not asked again: the call was decided before it was
+// dispatched.
+func (r *runner) runAgain(ctx context.Context, turn int, p *callState) (agenttool.Result, error) {
+	rec := p.recorded
+	decision := &ToolDecision{}
+	replay := agenttool.ReplayUnknown
+	if p.tool != nil {
+		replay = agenttool.ReplayOf(agenttool.WithCall(ctx, agenttool.Call{ID: p.call.CallID, Args: p.args, IdempotencyKey: p.key}), p.tool, p.args)
+	}
+	switch {
+	case replay == agenttool.ReplaySafe:
+		decision.Reason = RunAgainSafeReason
+	case replay == agenttool.ReplayKeyed && rec.IdempotencyKey != "":
+		decision.Reason = RunAgainKeyedReason
+	default:
+		held := &ToolDecision{Action: Defer, Reason: OutcomeUnknownReason}
+		d, asked := Ask(ctx, AskedCall{Parent: p.parent, CallID: p.call.CallID, Name: p.call.Name, Args: p.args, Decision: held})
+		if asked && d.Action == Allow {
+			decision = d
+			break
+		}
+		decision = &ToolDecision{Action: Block, Reason: OutcomeUnknownReason}
+		if asked {
+			decision = d
+		}
+		p.blocked = true
+		p.err = ErrOutcomeUnknown
+		p.reason = decision.Reason
+	}
+	return r.runNested(ctx, turn, p, decision)
 }
 
 // endNested gives a nested call whose loop-side handling failed, a

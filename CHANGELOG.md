@@ -30,6 +30,30 @@ versions may break the API.
   cancellation or a failure cuts off has no `turn_end`, and a deferred
   call's place in `turn_end`'s tool results holds an empty result; in a
   sequential batch the cut calls end in the batch's order.
+- Changed: a nested call already made is fixed as a model's call is
+  (#261). A call left pending lists the nested calls its tool made as
+  `PendingCall.Invoked`, and when an approval runs it again, its tool's
+  k-th `Invoke` under a parent is the k-th made under it before if it
+  names the same tool with the same arguments: it keeps that call's ID
+  and key, returns its result without running when it ended, marked
+  `Replayed` on `ToolStart` and `ToolEnd` with no `tool_dispatch`, and
+  runs again under its key only as agenttool's replay rule allows when
+  it was dispatched and cut, the user asked through the elicitor
+  otherwise and `ErrOutcomeUnknown` returned without an allow. The
+  first `Invoke` that differs, and every one after it, is a new call.
+  Before, every nested call of a call run again took a new ID and key,
+  so a keyed tool behind `Invoke` deduplicated nothing and a nested
+  call that had finished ran again. `ToolEnd.Cut` says a call was cut
+  rather than settled, `ToolStart.Requested` carries a nested call's
+  arguments before a decision rewrote them, and `CarryInvoked` is the
+  rule a recorder rebuilds the list with. `session` writes a nested
+  call's dispatch with its key, before its tool runs, and whether its
+  end was cut or replayed, and `session.Pending` reads the list back,
+  so the rule holds across a restart; front/control carries the new
+  members. RFC 0001 draft 0.4 states the rule, drops the open question
+  #145 left, and adds three scenarios, with a `$bind` pattern,
+  per-tool `replay` and `sequence`, and `executions` in the corpus
+  format.
 
 ## v0.0.29 - 2026-10-13
 

@@ -1490,7 +1490,8 @@ func TestAbortCauseIsTheRunsRef(t *testing.T) {
 
 // TestNestedCallsAreRecorded checks that the calls a tool makes through
 // agentturn.Invoke leave the same facts on the record as the model's
-// own: one entry before each runs and one after, so a reader counting
+// own: one entry before each runs, one when it is handed to its tool
+// and one after, so a reader counting
 // the calls of a turn counts three rather than one.
 func TestNestedCallsAreRecorded(t *testing.T) {
 	store := agentsession.NewMemoryStore()
@@ -1534,7 +1535,7 @@ func TestNestedCallsAreRecorded(t *testing.T) {
 		}
 		nested = append(nested, n)
 	}
-	if len(nested) != 4 {
+	if len(nested) != 5 {
 		t.Fatalf("nested call entries = %d", len(nested))
 	}
 	parent := callsOf(t, s)["eval"]
@@ -1549,14 +1550,18 @@ func TestNestedCallsAreRecorded(t *testing.T) {
 	if nested[0].Name != "read" || nested[0].Phase != agentsession.RunStart || string(nested[0].Args) != `{"text":"go.mod"}` {
 		t.Errorf("first entry = %+v", nested[0])
 	}
-	if nested[1].Phase != agentsession.RunEnd || nested[1].Output != "the contents" {
+	if nested[1].Phase != NestedDispatch || nested[1].IdempotencyKey == "" {
 		t.Errorf("second entry = %+v", nested[1])
 	}
-	if nested[2].Name != "bash" || nested[2].Verdict != agentsession.VerdictReject || nested[2].Reason != "denied by bash(rm:*)" || nested[2].By != agentsession.ByPolicy {
+	if nested[2].Phase != agentsession.RunEnd || nested[2].Output != "the contents" {
 		t.Errorf("third entry = %+v", nested[2])
 	}
-	if nested[3].Phase != agentsession.RunEnd || nested[3].Error == "" {
+	// The blocked call never reaches its tool, so it has no dispatch.
+	if nested[3].Name != "bash" || nested[3].Verdict != agentsession.VerdictReject || nested[3].Reason != "denied by bash(rm:*)" || nested[3].By != agentsession.ByPolicy {
 		t.Errorf("fourth entry = %+v", nested[3])
+	}
+	if nested[4].Phase != agentsession.RunEnd || nested[4].Error == "" {
+		t.Errorf("fifth entry = %+v", nested[4])
 	}
 	// The entries land between the call's dispatch and its output, and
 	// the record still verifies.
@@ -1633,9 +1638,14 @@ func TestAskedNestedCallsAreRecorded(t *testing.T) {
 				}
 			}
 			// #213: the question is on the record before it is put, the
-			// answer after, both before the nested call's own entries.
-			if strings.Join(order, " ") != "ask answer start end" {
-				t.Errorf("entries = %v", order)
+			// answer after, both before the nested call's own entries,
+			// which hold a dispatch when the answer let it run.
+			want := "ask answer start end"
+			if tc.action == agenttool.ActionAccept {
+				want = "ask answer start dispatch end"
+			}
+			if strings.Join(order, " ") != want {
+				t.Errorf("entries = %v, want %s", order, want)
 			}
 			if start == nil || start.Verdict != tc.verdict || start.By != agentsession.ByHuman || !strings.Contains(start.Reason, "ask bash(git push:*)") {
 				t.Fatalf("start entry = %+v", start)
