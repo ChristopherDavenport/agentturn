@@ -1,0 +1,52 @@
+{
+  "name": "cancel-mid-batch",
+  "description": "A cancellation during a batch ends every started call with a tool_end, appends the output of the call that finished, leaves the cut call pending as aborted, and delivers run_end last.",
+  "rules": ["#cancellation", "#execution", "#invariants", "#ending-a-run"],
+  "config": {"model": "m", "tool_execution": "sequential"},
+  "tools": [{"name": "read"}, {"name": "build"}],
+  "results": {
+    "call_1": {"output": "contents of a"},
+    "call_2": {"wait": "cancel"}
+  },
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"},
+      {"type": "function_call", "call_id": "call_2", "name": "build", "arguments": "{}"}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read then build"}]}],
+      "cancel_at": {"type": "tool_dispatch", "call_id": "call_2"},
+      "expect": {
+        "events": [
+          {"type": "run_start", "source": "input"},
+          {"type": "item_start", "item": {"type": "message", "role": "user"}},
+          {"type": "item_end", "item": {"type": "message", "role": "user"}},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start", "item": {"type": "function_call", "call_id": "call_1"}},
+          {"type": "item_end", "item": {"type": "function_call", "call_id": "call_1"}},
+          {"type": "item_start", "item": {"type": "function_call", "call_id": "call_2"}},
+          {"type": "item_end", "item": {"type": "function_call", "call_id": "call_2"}},
+          {"type": "response_end", "turn": 1},
+          {"type": "tool_start", "call_id": "call_1"},
+          {"type": "tool_start", "call_id": "call_2"},
+          {"type": "tool_dispatch", "call_id": "call_1"},
+          {"type": "tool_end", "call_id": "call_1", "result": {"output": "contents of a"}, "error": false},
+          {"type": "tool_dispatch", "call_id": "call_2"},
+          {"type": "tool_end", "call_id": "call_2", "error": true},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_1", "output": "contents of a"}},
+          {"type": "run_end", "reason": "aborted", "cause": "", "error": true,
+           "pending": [{"call_id": "call_2", "reason": "aborted"}]}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "function_call", "call_id": "call_1"},
+          {"type": "function_call", "call_id": "call_2"},
+          {"type": "function_call_output", "call_id": "call_1", "output": "contents of a"}
+        ]
+      }
+    }
+  ]
+}

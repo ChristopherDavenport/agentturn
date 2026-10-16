@@ -1,9 +1,11 @@
 # RFC 0001: Agent Loop
 
-Status: draft 0.2
+Status: draft 0.3
 Author: Christopher Davenport
-Discussion: to be opened against this repository. The Go module at its
-root is the reference loop; agenttool RFC 0001 is the tool contract it
+Discussion: to be opened against this repository, then proposed to the
+Open Responses community as a companion specification. The Go module at
+its root is the reference loop and `testdata/loop/` the scenarios any
+loop is checked against; agenttool RFC 0001 is the tool contract it
 executes and agentsession RFC 0001 is the record it writes.
 
 ## Summary
@@ -349,7 +351,10 @@ it raises and the hooks it calls; the events are defined
    model's order.
 8. **`turn_end`** carries the folded response and the tool results in
    the model's order. It is raised whether or not the batch left calls
-   pending.
+   pending; a deferred call's place holds an empty result, so the list
+   is as long as the batch. A batch a cancellation or a failure cut off
+   has no `turn_end`: it is settled as the
+   [cancellation section](#cancellation) says, and the run ends.
 9. **Pending.** If any call of the batch was deferred, the run ends
    with reason `input_required` and the deferred calls listed. Nothing
    below runs: a deferred call is a question to the caller, and the
@@ -903,7 +908,10 @@ stream and the running tools through their contexts, as agenttool RFC
   batch's order, so a call that ran to completion is answered in the
   transcript and only the calls the cancellation actually cut off are
   left pending, with reason `aborted`, or `undispatched` for a call
-  the cancellation reached before its hand-off. The executor is waited for, so
+  the cancellation reached before its hand-off. In a sequential batch
+  the cut calls end in the batch's order, so a call the cancellation
+  reached before its hand-off ends after the call it waited behind.
+  The executor is waited for, so
   every result it holds is received before the run ends.
 - The transcript holds only completed items. An output item the stream
   had opened and not completed is dropped, as under a retry.
@@ -1547,20 +1555,126 @@ pairs every call, a decision's terminate hint on an allowed call, and
 a wire error event before the answer as a retried attempt (#101,
 #102, #103).
 
-Draft 0.2 will add `testdata/loop/`, a directory of scenarios driven by
-a scripted model with no network, each holding the configuration in
-the terms of this document, the model's scripted responses, the tools'
-scripted results, the expected event sequence with each event's
-members that matter, and the expected end: reason, cause, error, the
-pending calls with their reasons, and the transcript. The set the
-motivation's misreadings ask for: a clean `done`; tools then `done`; a
-deferred call and its resume by output and by approval; a cancellation
-mid-batch with one call finished and one cut; a turn limit; unanimous
-and partial terminate; a retry that delivers nothing and then succeeds,
-and one that held a reasoning item; a subscriber that fails during a
-cancellation; a blocked call with a terminate hint; a nested call; a
-steered item and a follow-up. A second implementation runs the corpus
-and compares event by event.
+`testdata/loop/` holds the scenarios a loop is checked against, one
+JSON file each. A scenario drives an agent through one or more runs
+against a scripted model and scripted tools, with no network, and says
+what the agent must deliver: the events of each run, its end and the
+transcript after it. A conforming agent passes every scenario. A second
+implementation writes a runner in its own language that reads the
+files as they are and drives its own agent through them; the
+reference's runner is `conformance_test.go` at the root of this
+repository, and it uses the module's exported API alone.
+
+#### A scenario
+
+| member | holds |
+| --- | --- |
+| `name` | the file's name without `.json` |
+| `description` | the rule the scenario pins, in a sentence |
+| `rules` | the anchors of the sections of this document it exercises, each of which MUST name a heading here |
+| `config` | the configuration: `model`, the model name; `instructions`; `max_turns`; `tool_execution`, `parallel` or `sequential`; `max_parallel_tools`; `retry.max_attempts`. Zero or absent is the member's default |
+| `tools` | the tools of the moment, in order: each a `name`, its `sequential` property, and the `result` it answers a call with when `results` names none for the call |
+| `results` | a scripted result per call ID |
+| `decisions` | the decision hook's decision per call ID: `action`, one of `allow`, `block` and `defer`, with a `reason` and a `terminate` hint. A call the map does not name, and every nested call, is decided none. A scenario without the member has no decision hook |
+| `transcript` | the items the agent starts from |
+| `model` | the model's attempts, consumed in order across every run of the scenario |
+| `runs` | the runs, in order, on one agent |
+| `known_divergence` | the issue that tracks where the reference loop breaks the scenario's rule; a runner reports the scenario skipped and names it |
+
+A **scripted result** is one of: `output`, the text the tool returns,
+with `terminate` setting the result's terminate hint; `error`, a
+message the tool fails with; `wait` with the value `cancel`, a tool
+that returns only when its call's context is cancelled, and then
+returns the cancellation; and `invoke`, a nested call the tool makes
+through the invoker, a `name` and `arguments` object, before it returns
+its `output` or fails with the nested call's failure. A tool given no
+result for a call fails the scenario.
+
+A **scripted attempt** is either an answer, `id`, the response ID, and
+`output`, the items the response holds, streamed as a well-formed Open
+Responses stream and completed; or a failure, `partial`, the items
+streamed before the failure, and `error`, a `message` and whether it is
+`retryable`, with which the attempt fails. A stream opens each item
+with `output_item.added`, sends its text, arguments or summary as one
+delta and closes it with `output_item.done`, between
+`response.created` and `response.completed`. The runner's retry
+policy waits no time between attempts and retries the errors the
+script marks retryable and nothing else. A model called more or fewer
+times than the scenario scripts fails it.
+
+A **run** is a `prompt`, its items; a `continue`, `true`; or a
+`resume`, its answers, each a `call_id` and either an `output`, the
+text of the call's output, or `approve`, `true`, and optionally
+`terminate`. A run MAY name events at which the runner acts, each an
+**event pattern** matched against the event as delivered the way
+expected values are matched below:
+
+- `cancel_at`: the runner cancels the run's context;
+- `fail_at`: the runner's subscriber fails;
+- `steer_at` and `follow_up_at`: an `event` pattern and `items`, which
+  the runner queues as a steer or a follow-up.
+
+The runner subscribes one subscriber before the run, which records each
+event and then acts on it, so the event it fails on is recorded too.
+
+A run's `expect` holds `refused`, true for a run the agent must refuse
+before it starts, delivering no event; `events`; `end`, the run's end
+event; and `transcript`, the agent's transcript after the run. Any of
+them MAY be left out, and what is left out is not compared.
+
+#### Matching
+
+Each event is **projected** to a JSON object whose `type` is the
+event's name and whose members are the event table's, under those
+names, with `turn` on every event of a turn. `error` is a boolean that
+says whether the event carries one, since the text of an error is the
+binding's. A decision is `action`, `reason` and `terminate`, and absent
+when there is none; a result is `output`, as the Open Responses output
+value, and `terminate`; an item, a request and a response are their
+Open Responses JSON; a pending call is `call_id`, `name` and `reason`.
+`turn_start` carries `inputs` as items and `arrived` as a list of
+`item` and `mode`. The end is the `run_end` projection's `reason`,
+`cause`, `error`, `pending` and `withheld`.
+
+The run's events other than `item_update` and `queued` are compared one
+to one, in order, with `expect.events`, and the two lists MUST be the
+same length. The `item_update` events count how a stream was cut, which
+is the model's, and a `queued` report MAY fall between any two events.
+
+An expected value matches when it is a **subset** of the projected one:
+an object matches an object that holds each of its members with a
+matching value, an array matches an array of the same length element by
+element, `null` matches a value that is null or absent, and any other
+value matches an equal one. A scenario therefore pins only what its
+rule says, and never a run ID, a delay, an ID the loop or the stream
+mints, a timestamp or a binding's error text.
+
+A scenario MUST be deterministic under any conforming loop: where the
+completion order of a batch would vary, it runs the batch
+sequentially, gives it one call, or holds a call with `wait`.
+
+#### The scenarios
+
+| scenario | what it pins |
+| --- | --- |
+| `clean-done` | one turn answered by a message ends `done`; the request carries the settings and the loop's transport members |
+| `tools-then-done` | a call runs after `response_end`, its output is appended, and the next request carries it |
+| `preflight-settles` | a call naming no tool and one whose arguments are not an object are settled in preflight with the batch section's error outputs |
+| `deferred-resumed-by-output` | a deferred call ends the run `input_required` with the call pending as `deferred` and an empty result in its place on `turn_end`; a resume's output answers it |
+| `deferred-resumed-by-approval` | an approval runs the call as a batch at turn 0 without the decision hook |
+| `resume-refusal-terminates` | an answer that asks to terminate ends the run `stopped` with cause `refused` without a model call |
+| `pending-refuses-prompt` | a prompt over an unanswered call is refused with no event; one that opens with the call's output is a resume |
+| `blocked-with-terminate` | a blocked call is never dispatched, and a decision's terminate hint ends the run |
+| `terminate-unanimous` | every result terminates: cause `terminate` |
+| `terminate-partial` | some results terminate: every call is answered and the cause is `partial_terminate` |
+| `max-turns` | the turn limit after a turn with calls: cause `max_turns`, the outputs appended |
+| `retry-then-answer` | an attempt that delivered nothing is retried, and the turn has one `turn_start` and one `response_end` |
+| `retry-drops-held-reasoning` | a reasoning item held by a failed attempt is dropped without an `item_end` |
+| `cancel-mid-batch` | a cancellation ends each started call, appends the finished call's output, leaves the cut call `aborted` and raises no `turn_end` |
+| `subscriber-fails-during-cancellation` | a subscriber failing on one cut call's `tool_end` does not cost the others theirs; the run ends `aborted`; a call the cut reached first is `undispatched` |
+| `nested-call` | a nested call's events carry its parent, fall between the parent's dispatch and end, and append nothing |
+| `steer` | a steered item is appended after the batch and `turn_end`, with mode `steer` |
+| `follow-up` | a follow-up is appended when the run would end, and the run takes another turn with mode `follow_up` |
 
 ## Versioning
 
@@ -1568,6 +1682,11 @@ This document is versioned with the Go module. A draft number changes
 when a rule is added or changed; a rule's removal or a change that
 makes a conforming loop non-conforming is a breaking change to the
 module and is listed in the changelog as one.
+
+The scenario corpus is versioned with this document. A scenario is
+added when a rule is, and changes only when the rule it pins does, in
+the same draft; a scenario that a conforming loop fails is a defect in
+the scenario, fixed without a change of rule.
 
 ## Prior art
 

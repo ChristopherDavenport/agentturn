@@ -1,0 +1,51 @@
+{
+  "name": "deferred-resumed-by-approval",
+  "description": "An approval of a deferred call runs it as one batch at turn 0 without asking the decision hook again, appends its output, and then calls the model.",
+  "rules": ["#pending-calls-and-resume", "#order"],
+  "config": {"model": "m"},
+  "tools": [{"name": "delete", "result": {"output": "deleted a"}}],
+  "decisions": {"call_1": {"action": "defer", "reason": "ask the user"}},
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "delete", "arguments": "{\"path\":\"a\"}"}
+    ]},
+    {"id": "resp_2", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "a is gone"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "delete a"}]}],
+      "expect": {
+        "end": {"reason": "input_required", "error": false, "pending": [{"call_id": "call_1", "reason": "deferred"}]}
+      }
+    },
+    {
+      "resume": [{"call_id": "call_1", "approve": true}],
+      "expect": {
+        "events": [
+          {"type": "run_start", "source": "resume"},
+          {"type": "tool_start", "turn": 0, "call_id": "call_1", "name": "delete", "args": {"path": "a"}, "decision": {"action": "allow"}},
+          {"type": "tool_dispatch", "turn": 0, "call_id": "call_1"},
+          {"type": "tool_end", "turn": 0, "call_id": "call_1", "result": {"output": "deleted a"}, "error": false, "deferred": false, "blocked": false},
+          {"type": "item_start", "turn": 0, "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "turn": 0, "item": {"type": "function_call_output", "call_id": "call_1", "output": "deleted a"}},
+          {"type": "turn_start", "turn": 1,
+           "inputs": [{"type": "function_call_output", "call_id": "call_1"}],
+           "arrived": [{"mode": "tool"}]},
+          {"type": "item_start", "item": {"type": "message", "role": "assistant"}},
+          {"type": "item_end", "item": {"type": "message", "role": "assistant"}},
+          {"type": "response_end", "turn": 1, "response": {"id": "resp_2"}},
+          {"type": "turn_end", "turn": 1, "tool_results": []},
+          {"type": "run_end", "reason": "done", "error": false, "pending": []}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "function_call", "call_id": "call_1"},
+          {"type": "function_call_output", "call_id": "call_1", "output": "deleted a"},
+          {"type": "message", "role": "assistant"}
+        ]
+      }
+    }
+  ]
+}

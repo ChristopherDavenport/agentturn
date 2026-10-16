@@ -1,0 +1,35 @@
+{
+  "name": "retry-then-answer",
+  "description": "An attempt that fails before delivering anything is retried inside the turn: model_retry reports it, and turn_start and response_end are delivered once.",
+  "rules": ["#retry", "#order", "#invariants"],
+  "config": {"model": "m", "retry": {"max_attempts": 2}},
+  "model": [
+    {"error": {"message": "overloaded", "retryable": true}},
+    {"id": "resp_2", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+      "expect": {
+        "events": [
+          {"type": "run_start"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "turn_start", "turn": 1},
+          {"type": "model_retry", "turn": 1, "attempt": 1, "error": true,
+           "request": {"input": [{"type": "message", "role": "user"}]}},
+          {"type": "item_start", "item": {"type": "message", "role": "assistant"}, "response_id": "resp_2"},
+          {"type": "item_end", "item": {"type": "message", "role": "assistant"}, "response_id": "resp_2"},
+          {"type": "response_end", "turn": 1, "response": {"id": "resp_2"}},
+          {"type": "turn_end", "turn": 1},
+          {"type": "run_end", "reason": "done", "error": false}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "message", "role": "assistant"}
+        ]
+      }
+    }
+  ]
+}

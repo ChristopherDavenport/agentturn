@@ -1,0 +1,48 @@
+{
+  "name": "follow-up",
+  "description": "A follow-up queued during a turn in which the model called no tools is appended when the run would otherwise end, and the run goes on to another turn with mode follow_up.",
+  "rules": ["#queues", "#the-turn", "#order"],
+  "config": {"model": "m"},
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "one"}]}
+    ]},
+    {"id": "resp_2", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "two"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "count"}]}],
+      "follow_up_at": {
+        "event": {"type": "response_end", "turn": 1},
+        "items": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go on"}]}]
+      },
+      "expect": {
+        "events": [
+          {"type": "run_start"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end", "turn": 1},
+          {"type": "turn_end", "turn": 1},
+          {"type": "item_start", "turn": 1, "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go on"}]}},
+          {"type": "item_end", "turn": 1, "item": {"type": "message", "role": "user"}},
+          {"type": "turn_start", "turn": 2,
+           "inputs": [{"type": "message", "role": "user"}],
+           "arrived": [{"mode": "follow_up"}]},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end", "turn": 2, "response": {"id": "resp_2"}},
+          {"type": "turn_end", "turn": 2},
+          {"type": "run_end", "reason": "done", "error": false}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "one"}]},
+          {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go on"}]},
+          {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "two"}]}
+        ]
+      }
+    }
+  ]
+}

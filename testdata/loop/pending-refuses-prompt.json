@@ -1,0 +1,46 @@
+{
+  "name": "pending-refuses-prompt",
+  "description": "An agent refuses a prompt over a transcript holding an unanswered call that the prompt does not answer, and delivers no event; a resume that answers the call is then accepted.",
+  "rules": ["#starting-a-run", "#the-transcript", "#pending-calls-and-resume"],
+  "config": {"model": "m"},
+  "tools": [{"name": "delete"}],
+  "decisions": {"call_1": {"action": "defer", "reason": "ask the user"}},
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "delete", "arguments": "{}"}
+    ]},
+    {"id": "resp_2", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "delete a"}]}],
+      "expect": {"end": {"reason": "input_required", "pending": [{"call_id": "call_1", "reason": "deferred"}]}}
+    },
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "never mind"}]}],
+      "expect": {"refused": true}
+    },
+    {
+      "prompt": [
+        {"type": "function_call_output", "call_id": "call_1", "output": "not now"},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "never mind"}]}
+      ],
+      "expect": {
+        "events": [
+          {"type": "run_start", "source": "resume"},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_start", "item": {"type": "message", "role": "user"}},
+          {"type": "item_end", "item": {"type": "message", "role": "user"}},
+          {"type": "turn_start", "turn": 1, "arrived": [{"mode": "resume"}, {"mode": "prompt"}]},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end"},
+          {"type": "turn_end"},
+          {"type": "run_end", "reason": "done", "error": false, "pending": []}
+        ]
+      }
+    }
+  ]
+}

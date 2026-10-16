@@ -1,0 +1,44 @@
+{
+  "name": "terminate-unanimous",
+  "description": "When every result of a batch sets the terminate hint, the outputs are appended and the run ends stopped with cause terminate without calling the model again.",
+  "rules": ["#the-turn", "#ending-a-run"],
+  "config": {"model": "m", "tool_execution": "sequential"},
+  "tools": [{"name": "submit"}, {"name": "handoff"}],
+  "results": {
+    "call_1": {"output": "submitted", "terminate": true},
+    "call_2": {"output": "handed off", "terminate": true}
+  },
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "submit", "arguments": "{}"},
+      {"type": "function_call", "call_id": "call_2", "name": "handoff", "arguments": "{}"}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "finish"}]}],
+      "expect": {
+        "events": [
+          {"type": "run_start"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end"},
+          {"type": "tool_start", "call_id": "call_1"},
+          {"type": "tool_start", "call_id": "call_2"},
+          {"type": "tool_dispatch", "call_id": "call_1"},
+          {"type": "tool_end", "call_id": "call_1", "result": {"output": "submitted", "terminate": true}},
+          {"type": "tool_dispatch", "call_id": "call_2"},
+          {"type": "tool_end", "call_id": "call_2", "result": {"output": "handed off", "terminate": true}},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_2"}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_2"}},
+          {"type": "turn_end", "turn": 1, "tool_results": [{"terminate": true}, {"terminate": true}]},
+          {"type": "run_end", "reason": "stopped", "cause": "terminate", "error": false, "pending": []}
+        ]
+      }
+    }
+  ]
+}

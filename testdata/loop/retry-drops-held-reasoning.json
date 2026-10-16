@@ -1,0 +1,41 @@
+{
+  "name": "retry-drops-held-reasoning",
+  "description": "A reasoning item completed before the answer opens is held: an attempt that fails then drops it without an item_end and is retried, and only the answering attempt's reasoning reaches the transcript.",
+  "rules": ["#retry", "#the-model-call", "#invariants"],
+  "config": {"model": "m", "retry": {"max_attempts": 2}},
+  "model": [
+    {"partial": [
+      {"type": "reasoning", "summary": [{"type": "summary_text", "text": "first try"}]}
+    ], "error": {"message": "stream cut", "retryable": true}},
+    {"id": "resp_2", "output": [
+      {"type": "reasoning", "summary": [{"type": "summary_text", "text": "second try"}]},
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+      "expect": {
+        "events": [
+          {"type": "run_start"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start", "item": {"type": "reasoning"}},
+          {"type": "model_retry", "turn": 1, "attempt": 1, "error": true},
+          {"type": "item_start", "item": {"type": "reasoning"}, "response_id": "resp_2"},
+          {"type": "item_end", "item": {"type": "reasoning", "summary": [{"type": "summary_text", "text": "second try"}]}, "response_id": "resp_2"},
+          {"type": "item_start", "item": {"type": "message", "role": "assistant"}},
+          {"type": "item_end", "item": {"type": "message", "role": "assistant"}},
+          {"type": "response_end", "turn": 1, "response": {"id": "resp_2"}},
+          {"type": "turn_end", "turn": 1},
+          {"type": "run_end", "reason": "done", "error": false}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "reasoning", "summary": [{"type": "summary_text", "text": "second try"}]},
+          {"type": "message", "role": "assistant"}
+        ]
+      }
+    }
+  ]
+}
