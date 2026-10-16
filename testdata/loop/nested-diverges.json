@@ -1,0 +1,59 @@
+{
+  "name": "nested-diverges",
+  "description": "When a call run again makes a nested call its earlier execution did not make, that call is new and is decided, dispatched and run, and a later nested call that names the same tool with the same arguments as one made before still is that call, and replays.",
+  "rules": ["#nested-calls", "#pending-calls-and-resume"],
+  "config": {"model": "m"},
+  "tools": [
+    {"name": "run_code", "replay": "safe", "sequence": [
+      {"invoke": [{"name": "read", "arguments": {"path": "a"}}, {"name": "list", "arguments": {}}], "wait": "cancel"},
+      {"invoke": [{"name": "read", "arguments": {"path": "z"}}, {"name": "list", "arguments": {}}], "output": "the script read z and listed"}
+    ]},
+    {"name": "read", "replay": "safe", "result": {"output": "contents"}},
+    {"name": "list", "replay": "safe", "result": {"output": "a z"}}
+  ],
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "run_code", "arguments": "{}"}
+    ]},
+    {"id": "resp_2", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run the script"}]}],
+      "cancel_at": {"type": "tool_end", "name": "list"},
+      "expect": {
+        "end": {"reason": "aborted",
+          "pending": [{"call_id": "call_1", "reason": "aborted", "invoked": [
+            {"name": "read", "args": {"path": "a"}, "dispatched": true, "ended": true},
+            {"call_id": {"$bind": "list"}, "name": "list", "args": {}, "dispatched": true, "ended": true}
+          ]}]}
+      }
+    },
+    {
+      "resume": [{"call_id": "call_1", "approve": true}],
+      "expect": {
+        "events": [
+          {"type": "run_start", "source": "resume"},
+          {"type": "tool_start", "turn": 0, "call_id": "call_1"},
+          {"type": "tool_dispatch", "turn": 0, "call_id": "call_1"},
+          {"type": "tool_start", "turn": 0, "name": "read", "args": {"path": "z"}, "parent": "call_1", "replayed": false},
+          {"type": "tool_dispatch", "turn": 0, "name": "read", "parent": "call_1"},
+          {"type": "tool_end", "turn": 0, "name": "read", "parent": "call_1", "replayed": false, "error": false},
+          {"type": "tool_start", "turn": 0, "call_id": {"$bind": "list"}, "name": "list", "parent": "call_1", "replayed": true},
+          {"type": "tool_end", "turn": 0, "call_id": {"$bind": "list"}, "name": "list", "parent": "call_1", "replayed": true, "error": false, "result": {"output": "a z"}},
+          {"type": "tool_end", "turn": 0, "call_id": "call_1", "error": false, "result": {"output": "the script read z and listed"}},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end", "turn": 1},
+          {"type": "turn_end", "turn": 1},
+          {"type": "run_end", "reason": "done", "error": false, "pending": []}
+        ]
+      }
+    }
+  ],
+  "executions": {"run_code": 2, "read": 2, "list": 1}
+}

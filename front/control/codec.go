@@ -119,7 +119,8 @@ func wireOf(ev agentturn.Event) (any, error) {
 		}
 		return wireResponseEnd{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Response: resp, Withheld: e.Withheld}, nil
 	case *agentturn.ToolStart:
-		return wireToolStart{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, CallID: e.CallID, Name: e.Name, Args: e.Args, Decision: decisionOut(e.Decision), Parent: e.Parent}, nil
+		return wireToolStart{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, CallID: e.CallID, Name: e.Name, Args: e.Args, Decision: decisionOut(e.Decision), Parent: e.Parent,
+			Requested: e.Requested, Replayed: e.Replayed}, nil
 	case *agentturn.ToolDispatch:
 		return wireToolDispatch{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, CallID: e.CallID, Name: e.Name, Parent: e.Parent, IdempotencyKey: e.IdempotencyKey}, nil
 	case *agentturn.ToolUpdate:
@@ -134,7 +135,7 @@ func wireOf(ev agentturn.Event) (any, error) {
 			return nil, err
 		}
 		return wireToolEnd{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, CallID: e.CallID, Name: e.Name, Result: result, Err: errorOut(e.Err),
-			Blocked: e.Blocked, Deferred: e.Deferred, Reason: e.Reason, Parent: e.Parent, Withdrawn: e.Withdrawn}, nil
+			Blocked: e.Blocked, Deferred: e.Deferred, Reason: e.Reason, Parent: e.Parent, Withdrawn: e.Withdrawn, Cut: e.Cut, Replayed: e.Replayed}, nil
 	case *agentturn.TurnEnd:
 		resp, err := responseOut(e.Response)
 		if err != nil {
@@ -287,7 +288,8 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 		if err != nil {
 			return nil, err
 		}
-		return &agentturn.ToolStart{RunID: w.RunID, Turn: w.Turn, CallID: w.CallID, Name: w.Name, Args: w.Args, Decision: d, Parent: w.Parent}, nil
+		return &agentturn.ToolStart{RunID: w.RunID, Turn: w.Turn, CallID: w.CallID, Name: w.Name, Args: w.Args, Decision: d, Parent: w.Parent,
+			Requested: w.Requested, Replayed: w.Replayed}, nil
 	},
 	agentturn.EventToolDispatch: func(data []byte) (agentturn.Event, error) {
 		var w wireToolDispatch
@@ -309,7 +311,7 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 			return nil, err
 		}
 		return &agentturn.ToolEnd{RunID: w.RunID, Turn: w.Turn, CallID: w.CallID, Name: w.Name, Result: resultIn(w.Result), Err: errorIn(w.Err),
-			Blocked: w.Blocked, Deferred: w.Deferred, Reason: w.Reason, Parent: w.Parent, Withdrawn: w.Withdrawn}, nil
+			Blocked: w.Blocked, Deferred: w.Deferred, Reason: w.Reason, Parent: w.Parent, Withdrawn: w.Withdrawn, Cut: w.Cut, Replayed: w.Replayed}, nil
 	},
 	agentturn.EventTurnEnd: func(data []byte) (agentturn.Event, error) {
 		var w wireTurnEnd
@@ -449,14 +451,16 @@ type wireResponseEnd struct {
 }
 
 type wireToolStart struct {
-	Type     string          `json:"type"`
-	RunID    string          `json:"run_id"`
-	Turn     int             `json:"turn"`
-	CallID   string          `json:"call_id"`
-	Name     string          `json:"name"`
-	Args     json.RawMessage `json:"args,omitempty"`
-	Decision *wireDecision   `json:"decision,omitempty"`
-	Parent   string          `json:"parent,omitempty"`
+	Type      string          `json:"type"`
+	RunID     string          `json:"run_id"`
+	Turn      int             `json:"turn"`
+	CallID    string          `json:"call_id"`
+	Name      string          `json:"name"`
+	Args      json.RawMessage `json:"args,omitempty"`
+	Decision  *wireDecision   `json:"decision,omitempty"`
+	Parent    string          `json:"parent,omitempty"`
+	Requested json.RawMessage `json:"requested,omitempty"`
+	Replayed  bool            `json:"replayed,omitempty"`
 }
 
 type wireToolDispatch struct {
@@ -491,6 +495,8 @@ type wireToolEnd struct {
 	Reason    string     `json:"reason,omitempty"`
 	Parent    string     `json:"parent,omitempty"`
 	Withdrawn bool       `json:"withdrawn,omitempty"`
+	Cut       bool       `json:"cut,omitempty"`
+	Replayed  bool       `json:"replayed,omitempty"`
 }
 
 type wireTurnEnd struct {
@@ -730,6 +736,51 @@ type wirePending struct {
 	Decision       *wireDecision        `json:"decision,omitempty"`
 	Question       *wirePendingQuestion `json:"question,omitempty"`
 	Notes          []wireNote           `json:"notes,omitempty"`
+	Invoked        []wireInvoked        `json:"invoked,omitempty"`
+}
+
+// wireInvoked is a pending call's [agentturn.InvokedCall].
+type wireInvoked struct {
+	CallID         string          `json:"call_id"`
+	Parent         string          `json:"parent"`
+	Name           string          `json:"name"`
+	Args           json.RawMessage `json:"args,omitempty"`
+	RanWith        json.RawMessage `json:"ran_with,omitempty"`
+	IdempotencyKey string          `json:"idempotency_key,omitempty"`
+	Dispatched     bool            `json:"dispatched,omitempty"`
+	Ended          bool            `json:"ended,omitempty"`
+	Result         *wireResult     `json:"result,omitempty"`
+	Err            *wireError      `json:"error,omitempty"`
+}
+
+func invokedOut(in []agentturn.InvokedCall) ([]wireInvoked, error) {
+	var out []wireInvoked
+	for _, c := range in {
+		w := wireInvoked{CallID: c.CallID, Parent: c.Parent, Name: c.Name, Args: c.Args, RanWith: c.RanWith,
+			IdempotencyKey: c.IdempotencyKey, Dispatched: c.Dispatched, Ended: c.Ended, Err: errorOut(c.Err)}
+		if c.Ended {
+			r, err := resultOut(c.Result)
+			if err != nil {
+				return nil, err
+			}
+			w.Result = &r
+		}
+		out = append(out, w)
+	}
+	return out, nil
+}
+
+func invokedIn(in []wireInvoked) []agentturn.InvokedCall {
+	var out []agentturn.InvokedCall
+	for _, w := range in {
+		c := agentturn.InvokedCall{CallID: w.CallID, Parent: w.Parent, Name: w.Name, Args: w.Args, RanWith: w.RanWith,
+			IdempotencyKey: w.IdempotencyKey, Dispatched: w.Dispatched, Ended: w.Ended, Err: errorIn(w.Err)}
+		if w.Result != nil {
+			c.Result = resultIn(*w.Result)
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 // wirePendingQuestion is a pending call's [agentturn.OpenQuestion].
@@ -776,6 +827,9 @@ func pendingOut(in []agentturn.PendingCall) ([]wirePending, error) {
 		if w.Notes, err = notesOut(p.Notes); err != nil {
 			return nil, err
 		}
+		if w.Invoked, err = invokedOut(p.Invoked); err != nil {
+			return nil, err
+		}
 		out = append(out, w)
 	}
 	return out, nil
@@ -805,6 +859,7 @@ func pendingIn(in []wirePending) ([]agentturn.PendingCall, error) {
 		if p.Notes, err = notesIn(w.Notes); err != nil {
 			return nil, err
 		}
+		p.Invoked = invokedIn(w.Invoked)
 		out = append(out, p)
 	}
 	return out, nil

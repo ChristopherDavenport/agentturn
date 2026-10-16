@@ -6,6 +6,7 @@ package agentturn_test
 // binding's runner would use its own.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -36,6 +38,7 @@ type scenario struct {
 	Transcript      openresponses.Items         `json:"transcript"`
 	Model           []scriptedAttempt           `json:"model"`
 	Runs            []scenarioRun               `json:"runs"`
+	Executions      map[string]int              `json:"executions"`
 }
 
 type scenarioConfig struct {
@@ -50,9 +53,11 @@ type scenarioConfig struct {
 }
 
 type scenarioTool struct {
-	Name       string          `json:"name"`
-	Sequential bool            `json:"sequential"`
-	Result     *scriptedResult `json:"result"`
+	Name       string            `json:"name"`
+	Sequential bool              `json:"sequential"`
+	Replay     string            `json:"replay"`
+	Result     *scriptedResult   `json:"result"`
+	Sequence   []*scriptedResult `json:"sequence"`
 }
 
 type scriptedResult struct {
@@ -60,12 +65,39 @@ type scriptedResult struct {
 	Terminate bool            `json:"terminate"`
 	Error     string          `json:"error"`
 	Wait      string          `json:"wait"`
-	Invoke    *scriptedInvoke `json:"invoke"`
+	Invoke    scriptedInvokes `json:"invoke"`
 }
 
 type scriptedInvoke struct {
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments"`
+}
+
+// scriptedInvokes is a scripted result's invoke: one nested call, or a
+// list of them made in order.
+type scriptedInvokes []scriptedInvoke
+
+func (s *scriptedInvokes) UnmarshalJSON(b []byte) error {
+	if bytes.HasPrefix(bytes.TrimSpace(b), []byte("[")) {
+		var list []scriptedInvoke
+		if err := strictJSON(b, &list); err != nil {
+			return err
+		}
+		*s = list
+		return nil
+	}
+	var one scriptedInvoke
+	if err := strictJSON(b, &one); err != nil {
+		return err
+	}
+	*s = scriptedInvokes{one}
+	return nil
+}
+
+func strictJSON(b []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
 }
 
 type scriptedDecision struct {
@@ -210,8 +242,16 @@ func runScenario(t *testing.T, sc *scenario) {
 	default:
 		t.Fatalf("tool_execution %q", sc.Config.ToolExecution)
 	}
+	tools := make([]*scriptedTool, 0, len(sc.Tools))
 	for _, st := range sc.Tools {
-		cfg.Tools = append(cfg.Tools, &scriptedTool{spec: st, results: sc.Results})
+		switch st.Replay {
+		case "", "unknown", "safe", "keyed":
+		default:
+			t.Fatalf("tool %s: replay %q", st.Name, st.Replay)
+		}
+		tool := &scriptedTool{spec: st, results: sc.Results}
+		tools = append(tools, tool)
+		cfg.Tools = append(cfg.Tools, tool)
 	}
 	if sc.Decisions != nil {
 		cfg.BeforeToolCall = func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
@@ -238,9 +278,10 @@ func runScenario(t *testing.T, sc *scenario) {
 	}
 	agent := agentturn.New(cfg, opts...)
 
+	b := binds{}
 	for i, run := range sc.Runs {
 		ok := t.Run(fmt.Sprintf("run %d", i+1), func(t *testing.T) {
-			driveRun(t, agent, run)
+			driveRun(t, agent, run, b)
 		})
 		if !ok {
 			return
@@ -249,9 +290,20 @@ func runScenario(t *testing.T, sc *scenario) {
 	if err := model.leftover(); err != nil {
 		t.Error(err)
 	}
+	for _, tool := range tools {
+		want, ok := sc.Executions[tool.spec.Name]
+		if got := tool.executions(); ok && got != want {
+			t.Errorf("%s ran %d times, want %d", tool.spec.Name, got, want)
+		}
+	}
+	for name := range sc.Executions {
+		if !slices.ContainsFunc(tools, func(tool *scriptedTool) bool { return tool.spec.Name == name }) {
+			t.Errorf("executions names %s, which is no tool of the scenario", name)
+		}
+	}
 }
 
-func driveRun(t *testing.T, agent *agentturn.Agent, run scenarioRun) {
+func driveRun(t *testing.T, agent *agentturn.Agent, run scenarioRun, b binds) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var (
@@ -267,7 +319,7 @@ func driveRun(t *testing.T, agent *agentturn.Agent, run scenarioRun) {
 			t.Errorf("scenario: %v", err)
 			return false
 		}
-		return subset(want, ev, "") == ""
+		return binds(nil).subset(want, ev, "") == ""
 	}
 	unsubscribe := agent.Subscribe(func(_ context.Context, ev agentturn.Event) error {
 		p := project(t, ev)
@@ -340,17 +392,17 @@ func driveRun(t *testing.T, agent *agentturn.Agent, run scenarioRun) {
 		t.Fatalf("run refused: %v", err)
 	}
 	if run.Expect.Events != nil {
-		compareEvents(t, run.Expect.Events, got)
+		compareEvents(t, run.Expect.Events, got, b)
 	}
 	if run.Expect.End != nil {
-		check(t, "end", run.Expect.End, toJSON(t, projectEnd(end)))
+		check(t, "end", run.Expect.End, toJSON(t, projectEnd(end)), b)
 	}
 	if run.Expect.Transcript != nil {
-		check(t, "transcript", run.Expect.Transcript, toJSON(t, agent.State().Transcript))
+		check(t, "transcript", run.Expect.Transcript, toJSON(t, agent.State().Transcript), b)
 	}
 }
 
-func compareEvents(t *testing.T, raw json.RawMessage, got []any) {
+func compareEvents(t *testing.T, raw json.RawMessage, got []any, b binds) {
 	t.Helper()
 	var want []any
 	if err := json.Unmarshal(raw, &want); err != nil {
@@ -367,7 +419,7 @@ func compareEvents(t *testing.T, raw json.RawMessage, got []any) {
 			t.Errorf("event %d: missing %s", i, describe(want[i]))
 			failed = true
 		default:
-			if diff := subset(want[i], got[i], ""); diff != "" {
+			if diff := b.subset(want[i], got[i], ""); diff != "" {
 				b, _ := json.Marshal(got[i])
 				t.Errorf("event %d (%s): %s %s", i, describe(got[i]), diff, b)
 				failed = true
@@ -383,15 +435,15 @@ func compareEvents(t *testing.T, raw json.RawMessage, got []any) {
 	}
 }
 
-func check(t *testing.T, what string, raw json.RawMessage, got any) {
+func check(t *testing.T, what string, raw json.RawMessage, got any, b binds) {
 	t.Helper()
 	var want any
 	if err := json.Unmarshal(raw, &want); err != nil {
 		t.Fatalf("scenario: %s: %v", what, err)
 	}
-	if diff := subset(want, got, ""); diff != "" {
-		b, _ := json.MarshalIndent(got, "", "  ")
-		t.Errorf("%s: %s\ngot %s", what, diff, b)
+	if diff := b.subset(want, got, ""); diff != "" {
+		out, _ := json.MarshalIndent(got, "", "  ")
+		t.Errorf("%s: %s\ngot %s", what, diff, out)
 	}
 }
 
@@ -413,13 +465,37 @@ func describe(ev any) string {
 	return s
 }
 
+// binds holds the values the scenario's binding patterns met first,
+// by name, across its runs. A nil binds matches a binding pattern to
+// any value, as an event pattern a run acts at does.
+type binds map[string]any
+
 // subset reports where want is not a subset of got, or "" when it is.
 // An object's listed keys must be present and match, an array matches
 // an array of the same length elementwise, and a null matches a value
-// that is absent or null.
-func subset(want, got any, path string) string {
+// that is absent or null. An object whose one member is $bind is a
+// binding pattern: it binds the name it gives to the value it first
+// meets, which must be present, and matches only that value after.
+func (b binds) subset(want, got any, path string) string {
 	switch w := want.(type) {
 	case map[string]any:
+		if name, ok := w["$bind"].(string); ok && len(w) == 1 {
+			if got == nil {
+				return fmt.Sprintf("%s: want a value to bind to %s, got none", orRoot(path), name)
+			}
+			if b == nil {
+				return ""
+			}
+			bound, seen := b[name]
+			if !seen {
+				b[name] = got
+				return ""
+			}
+			if !reflect.DeepEqual(bound, got) {
+				return fmt.Sprintf("%s: want %v, bound to %s, got %v", orRoot(path), bound, name, got)
+			}
+			return ""
+		}
 		g, ok := got.(map[string]any)
 		if !ok {
 			return fmt.Sprintf("%s: want an object, got %v", orRoot(path), got)
@@ -434,7 +510,7 @@ func subset(want, got any, path string) string {
 			if !present && w[k] != nil {
 				return fmt.Sprintf("%s.%s: missing", path, k)
 			}
-			if diff := subset(w[k], gv, path+"."+k); diff != "" {
+			if diff := b.subset(w[k], gv, path+"."+k); diff != "" {
 				return diff
 			}
 		}
@@ -448,7 +524,7 @@ func subset(want, got any, path string) string {
 			return fmt.Sprintf("%s: want %d elements, got %d", orRoot(path), len(w), len(g))
 		}
 		for i := range w {
-			if diff := subset(w[i], g[i], fmt.Sprintf("%s[%d]", path, i)); diff != "" {
+			if diff := b.subset(w[i], g[i], fmt.Sprintf("%s[%d]", path, i)); diff != "" {
 				return diff
 			}
 		}
@@ -535,6 +611,7 @@ func project(t *testing.T, ev agentturn.Event) map[string]any {
 		m["name"] = e.Name
 		m["args"] = rawJSON(t, e.Args)
 		m["parent"] = e.Parent
+		m["replayed"] = e.Replayed
 		if e.Decision != nil {
 			m["decision"] = map[string]any{
 				"action":    action(e.Decision.Action),
@@ -547,6 +624,7 @@ func project(t *testing.T, ev agentturn.Event) map[string]any {
 		m["call_id"] = e.CallID
 		m["name"] = e.Name
 		m["parent"] = e.Parent
+		m["idempotency_key"] = e.IdempotencyKey
 	case *agentturn.ToolUpdate:
 		m["turn"] = e.Turn
 		m["call_id"] = e.CallID
@@ -561,6 +639,8 @@ func project(t *testing.T, ev agentturn.Event) map[string]any {
 		m["deferred"] = e.Deferred
 		m["reason"] = e.Reason
 		m["parent"] = e.Parent
+		m["cut"] = e.Cut
+		m["replayed"] = e.Replayed
 	case *agentturn.TurnEnd:
 		m["turn"] = e.Turn
 		m["response"] = toJSON(t, e.Response)
@@ -588,6 +668,19 @@ func projectEnd(e *agentturn.RunEnd) map[string]any {
 			entry["call_id"] = p.Call.CallID
 			entry["name"] = p.Call.Name
 		}
+		invoked := []any{}
+		for _, c := range p.Invoked {
+			invoked = append(invoked, map[string]any{
+				"call_id":         c.CallID,
+				"parent":          c.Parent,
+				"name":            c.Name,
+				"args":            json.RawMessage(orObject(c.Args)),
+				"idempotency_key": c.IdempotencyKey,
+				"dispatched":      c.Dispatched,
+				"ended":           c.Ended,
+			})
+		}
+		entry["invoked"] = invoked
 		pending = append(pending, entry)
 	}
 	return map[string]any{
@@ -720,6 +813,25 @@ func stream(em *openresponses.Emitter, item openresponses.Item) error {
 type scriptedTool struct {
 	spec    scenarioTool
 	results map[string]*scriptedResult
+	mu      sync.Mutex
+	ran     int
+}
+
+func (s *scriptedTool) executions() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ran
+}
+
+// Replay is the tool's replay for any arguments, as the scenario says.
+func (s *scriptedTool) Replay(context.Context, json.RawMessage) agenttool.Replay {
+	switch s.spec.Replay {
+	case "safe":
+		return agenttool.ReplaySafe
+	case "keyed":
+		return agenttool.ReplayKeyed
+	}
+	return agenttool.ReplayUnknown
 }
 
 func (s *scriptedTool) Name() string                { return s.spec.Name }
@@ -728,21 +840,28 @@ func (s *scriptedTool) Parameters() json.RawMessage { return json.RawMessage(`{"
 func (s *scriptedTool) Sequential() bool            { return s.spec.Sequential }
 
 func (s *scriptedTool) Execute(ctx context.Context, call agenttool.Call) (agenttool.Result, error) {
+	s.mu.Lock()
+	k := s.ran
+	s.ran++
+	s.mu.Unlock()
 	r := s.results[call.ID]
+	if r == nil && k < len(s.spec.Sequence) {
+		r = s.spec.Sequence[k]
+	}
 	if r == nil {
 		r = s.spec.Result
 	}
 	if r == nil {
 		return agenttool.Result{}, fmt.Errorf("scenario: no result for call %s of %s", call.ID, s.spec.Name)
 	}
+	for _, inv := range r.Invoke {
+		if _, err := agentturn.Invoke(ctx, inv.Name, inv.Arguments); err != nil {
+			return agenttool.Result{}, err
+		}
+	}
 	if r.Wait == "cancel" {
 		<-ctx.Done()
 		return agenttool.Result{}, ctx.Err()
-	}
-	if r.Invoke != nil {
-		if _, err := agentturn.Invoke(ctx, r.Invoke.Name, r.Invoke.Arguments); err != nil {
-			return agenttool.Result{}, err
-		}
 	}
 	if r.Error != "" {
 		return agenttool.Result{}, errors.New(r.Error)
@@ -754,4 +873,12 @@ func (s *scriptedTool) Execute(ctx context.Context, call agenttool.Call) (agentt
 	res := agenttool.Text(out)
 	res.Terminate = r.Terminate
 	return res, nil
+}
+
+// orObject is raw, or an empty object for none.
+func orObject(raw json.RawMessage) []byte {
+	if len(raw) == 0 {
+		return []byte("{}")
+	}
+	return raw
 }
