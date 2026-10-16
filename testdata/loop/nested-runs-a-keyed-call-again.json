@@ -1,0 +1,73 @@
+{
+  "name": "nested-runs-a-keyed-call-again",
+  "description": "A nested call cut after its dispatch is made again under the ID and the idempotency key it had, and its keyed tool runs again under that key without the decision hook being asked.",
+  "rules": ["#nested-calls", "#pending-calls-and-resume", "#cancellation"],
+  "config": {"model": "m"},
+  "tools": [
+    {"name": "run_code", "replay": "safe"},
+    {"name": "charge", "replay": "keyed", "sequence": [
+      {"wait": "cancel"},
+      {"output": "charged 5"}
+    ]}
+  ],
+  "results": {
+    "call_1": {"invoke": {"name": "charge", "arguments": {"amount": 5}}, "output": "the script charged 5"}
+  },
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "run_code", "arguments": "{}"}
+    ]},
+    {"id": "resp_2", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "charge 5"}]}],
+      "cancel_at": {"type": "tool_dispatch", "name": "charge"},
+      "expect": {
+        "events": [
+          {"type": "run_start"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end", "turn": 1},
+          {"type": "tool_start", "call_id": "call_1"},
+          {"type": "tool_dispatch", "call_id": "call_1"},
+          {"type": "tool_start", "call_id": {"$bind": "charge"}, "name": "charge", "parent": "call_1"},
+          {"type": "tool_dispatch", "call_id": {"$bind": "charge"}, "parent": "call_1", "idempotency_key": {"$bind": "key"}},
+          {"type": "tool_end", "call_id": {"$bind": "charge"}, "parent": "call_1", "error": true, "cut": true},
+          {"type": "tool_end", "call_id": "call_1", "error": true, "cut": true},
+          {"type": "run_end", "reason": "aborted", "error": true,
+           "pending": [{"call_id": "call_1", "reason": "aborted", "invoked": [
+             {"call_id": {"$bind": "charge"}, "parent": "call_1", "name": "charge", "args": {"amount": 5},
+              "idempotency_key": {"$bind": "key"}, "dispatched": true, "ended": false}
+           ]}]}
+        ]
+      }
+    },
+    {
+      "resume": [{"call_id": "call_1", "approve": true}],
+      "expect": {
+        "events": [
+          {"type": "run_start", "source": "resume"},
+          {"type": "tool_start", "turn": 0, "call_id": "call_1", "decision": {"action": "allow", "reason": "run again: safe"}},
+          {"type": "tool_dispatch", "turn": 0, "call_id": "call_1"},
+          {"type": "tool_start", "turn": 0, "call_id": {"$bind": "charge"}, "name": "charge", "parent": "call_1", "replayed": false,
+           "decision": {"action": "allow", "reason": "run again: keyed"}},
+          {"type": "tool_dispatch", "turn": 0, "call_id": {"$bind": "charge"}, "parent": "call_1", "idempotency_key": {"$bind": "key"}},
+          {"type": "tool_end", "turn": 0, "call_id": {"$bind": "charge"}, "parent": "call_1", "replayed": false, "error": false, "result": {"output": "charged 5"}},
+          {"type": "tool_end", "turn": 0, "call_id": "call_1", "error": false, "result": {"output": "the script charged 5"}},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end", "turn": 1},
+          {"type": "turn_end", "turn": 1},
+          {"type": "run_end", "reason": "done", "error": false, "pending": []}
+        ]
+      }
+    }
+  ],
+  "executions": {"run_code": 2, "charge": 2}
+}
