@@ -1,0 +1,56 @@
+{
+  "name": "nested-call",
+  "description": "A call a tool invokes through the loop raises tool_start, tool_dispatch and tool_end with its parent named, between the parent's dispatch and end, and appends nothing to the transcript.",
+  "rules": ["#nested-calls", "#order"],
+  "config": {"model": "m"},
+  "tools": [
+    {"name": "run_code"},
+    {"name": "read", "result": {"output": "contents of a"}}
+  ],
+  "results": {
+    "call_1": {"invoke": {"name": "read", "arguments": {"path": "a"}}, "output": "the script printed contents of a"}
+  },
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "run_code", "arguments": "{}"}
+    ]},
+    {"id": "resp_2", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run the script"}]}],
+      "expect": {
+        "events": [
+          {"type": "run_start"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end"},
+          {"type": "tool_start", "call_id": "call_1", "name": "run_code", "parent": ""},
+          {"type": "tool_dispatch", "call_id": "call_1", "parent": ""},
+          {"type": "tool_start", "name": "read", "args": {"path": "a"}, "parent": "call_1"},
+          {"type": "tool_dispatch", "name": "read", "parent": "call_1"},
+          {"type": "tool_end", "name": "read", "parent": "call_1", "error": false, "result": {"output": "contents of a"}},
+          {"type": "tool_end", "call_id": "call_1", "name": "run_code", "parent": "", "error": false,
+           "result": {"output": "the script printed contents of a"}},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "turn_end", "turn": 1, "tool_results": [{"output": "the script printed contents of a"}]},
+          {"type": "turn_start", "turn": 2},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end"},
+          {"type": "turn_end", "turn": 2},
+          {"type": "run_end", "reason": "done", "error": false}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "function_call", "call_id": "call_1"},
+          {"type": "function_call_output", "call_id": "call_1"},
+          {"type": "message", "role": "assistant"}
+        ]
+      }
+    }
+  ]
+}

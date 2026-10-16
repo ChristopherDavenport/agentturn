@@ -1,0 +1,38 @@
+{
+  "name": "clean-done",
+  "description": "A prompt the model answers with a message alone runs one turn and ends done; the request is built from the transcript and the settings with the loop's transport members fixed.",
+  "rules": ["#the-turn", "#the-request", "#order", "#ending-a-run"],
+  "config": {"model": "m", "instructions": "be brief"},
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+      "expect": {
+        "events": [
+          {"type": "run_start", "source": "input"},
+          {"type": "item_start", "turn": 0, "item": {"type": "message", "role": "user"}, "response_id": ""},
+          {"type": "item_end", "turn": 0, "item": {"type": "message", "role": "user"}, "response_id": ""},
+          {"type": "turn_start", "turn": 1,
+           "request": {"model": "m", "instructions": "be brief", "store": false, "stream": true, "previous_response_id": null,
+                       "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]},
+           "inputs": [{"type": "message", "role": "user"}],
+           "arrived": [{"mode": "prompt"}]},
+          {"type": "item_start", "turn": 1, "item": {"type": "message", "role": "assistant"}, "response_id": "resp_1"},
+          {"type": "item_end", "turn": 1, "item": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]}, "response_id": "resp_1"},
+          {"type": "response_end", "turn": 1, "response": {"id": "resp_1", "status": "completed"}, "withheld": false},
+          {"type": "turn_end", "turn": 1, "tool_results": []},
+          {"type": "run_end", "reason": "done", "cause": "", "error": false, "pending": []}
+        ],
+        "end": {"reason": "done", "cause": "", "error": false, "pending": [], "withheld": false},
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]}
+        ]
+      }
+    }
+  ]
+}

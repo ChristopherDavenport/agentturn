@@ -5,6 +5,28 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Added: the scenario corpus RFC 0001 promised, `testdata/loop/`, and
+  RFC 0001 draft 0.3, which specifies it (#259). Each scenario is a
+  JSON file that drives an agent through its runs against a scripted
+  model and scripted tools, with the decisions, the cancellations, the
+  subscriber failures and the queued items it needs, and gives the
+  events, the end and the transcript the agent must deliver, matched as
+  subsets so a scenario pins only what its rule says. The eighteen
+  scenarios cover the set the Conformance section listed and a few its
+  rules need: a clean `done`, tools then `done`, preflight's settled
+  calls, a deferred call resumed by output, by approval and by a
+  refusal that terminates, a prompt refused over a pending call,
+  blocked, unanimous and partial terminate, the turn limit, a retry
+  that delivered nothing and one that held a reasoning item, a
+  cancellation mid-batch, a subscriber failing during one, a nested
+  call, a steer and a follow-up. `TestConformance` runs them against
+  the reference loop through the exported API alone, as another
+  implementation's runner would against its own. The RFC now invites
+  other implementations, and says a scenario changes only with the
+  rule it pins.
+
 ## v0.0.29 - 2026-10-13
 
 - Fixed: a `front/a2a` cancel of a task its last run left input-required,

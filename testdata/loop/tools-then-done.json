@@ -1,0 +1,56 @@
+{
+  "name": "tools-then-done",
+  "description": "A response with a function call runs it after response_end, appends its output, and the next turn's request carries the output; a turn without calls ends the run done.",
+  "rules": ["#the-turn", "#the-batch", "#order", "#invariants"],
+  "config": {"model": "m"},
+  "tools": [{"name": "read", "result": {"output": "contents of a"}}],
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{\"path\":\"a\"}"}
+    ]},
+    {"id": "resp_2", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "a holds contents"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read a"}]}],
+      "expect": {
+        "events": [
+          {"type": "run_start", "source": "input"},
+          {"type": "item_start", "turn": 0, "item": {"type": "message", "role": "user"}},
+          {"type": "item_end", "turn": 0, "item": {"type": "message", "role": "user"}},
+          {"type": "turn_start", "turn": 1, "inputs": [{"type": "message", "role": "user"}]},
+          {"type": "item_start", "turn": 1, "item": {"type": "function_call", "call_id": "call_1"}, "response_id": "resp_1"},
+          {"type": "item_end", "turn": 1, "item": {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{\"path\":\"a\"}"}, "response_id": "resp_1"},
+          {"type": "response_end", "turn": 1, "response": {"id": "resp_1"}},
+          {"type": "tool_start", "turn": 1, "call_id": "call_1", "name": "read", "args": {"path": "a"}, "parent": "", "decision": null},
+          {"type": "tool_dispatch", "turn": 1, "call_id": "call_1", "name": "read", "parent": ""},
+          {"type": "tool_end", "turn": 1, "call_id": "call_1", "name": "read", "result": {"output": "contents of a", "terminate": false}, "error": false, "blocked": false, "deferred": false},
+          {"type": "item_start", "turn": 1, "item": {"type": "function_call_output", "call_id": "call_1"}, "response_id": ""},
+          {"type": "item_end", "turn": 1, "item": {"type": "function_call_output", "call_id": "call_1", "output": "contents of a"}, "response_id": ""},
+          {"type": "turn_end", "turn": 1, "tool_results": [{"output": "contents of a"}]},
+          {"type": "turn_start", "turn": 2,
+           "request": {"input": [
+             {"type": "message", "role": "user"},
+             {"type": "function_call", "call_id": "call_1"},
+             {"type": "function_call_output", "call_id": "call_1", "output": "contents of a"}
+           ]},
+           "inputs": [{"type": "function_call_output", "call_id": "call_1"}],
+           "arrived": [{"mode": "tool"}]},
+          {"type": "item_start", "turn": 2, "item": {"type": "message", "role": "assistant"}},
+          {"type": "item_end", "turn": 2, "item": {"type": "message", "role": "assistant"}},
+          {"type": "response_end", "turn": 2, "response": {"id": "resp_2"}},
+          {"type": "turn_end", "turn": 2, "tool_results": []},
+          {"type": "run_end", "reason": "done", "error": false, "pending": []}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "function_call", "call_id": "call_1"},
+          {"type": "function_call_output", "call_id": "call_1", "output": "contents of a"},
+          {"type": "message", "role": "assistant"}
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "name": "steer",
+  "description": "An item steered in during a batch is appended after the batch's outputs and turn_end, before the next model call, and that turn's inputs carry it with mode steer.",
+  "rules": ["#queues", "#the-turn", "#order"],
+  "config": {"model": "m"},
+  "tools": [{"name": "read", "result": {"output": "contents of a"}}],
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"}
+    ]},
+    {"id": "resp_2", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "a and b"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read a"}]}],
+      "steer_at": {
+        "event": {"type": "tool_start", "call_id": "call_1"},
+        "items": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "and b"}]}]
+      },
+      "expect": {
+        "events": [
+          {"type": "run_start"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end"},
+          {"type": "tool_start", "call_id": "call_1"},
+          {"type": "tool_dispatch", "call_id": "call_1"},
+          {"type": "tool_end", "call_id": "call_1"},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "turn_end", "turn": 1},
+          {"type": "item_start", "turn": 1, "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "and b"}]}},
+          {"type": "item_end", "turn": 1, "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "and b"}]}},
+          {"type": "turn_start", "turn": 2,
+           "inputs": [{"type": "function_call_output", "call_id": "call_1"}, {"type": "message", "role": "user"}],
+           "arrived": [{"mode": "tool"}, {"mode": "steer"}]},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end"},
+          {"type": "turn_end", "turn": 2},
+          {"type": "run_end", "reason": "done", "error": false}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "function_call", "call_id": "call_1"},
+          {"type": "function_call_output", "call_id": "call_1"},
+          {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "and b"}]},
+          {"type": "message", "role": "assistant"}
+        ]
+      }
+    }
+  ]
+}

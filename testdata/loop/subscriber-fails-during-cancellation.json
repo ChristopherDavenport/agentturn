@@ -1,0 +1,60 @@
+{
+  "name": "subscriber-fails-during-cancellation",
+  "description": "A subscriber that fails on a cut call's tool_end does not deprive the other cut calls of theirs, and the run still ends aborted with the failure joined to the cancellation.",
+  "rules": ["#cancellation", "#delivery", "#invariants"],
+  "config": {"model": "m", "tool_execution": "sequential"},
+  "tools": [{"name": "read"}, {"name": "build"}, {"name": "test"}],
+  "results": {
+    "call_1": {"output": "contents of a"},
+    "call_2": {"wait": "cancel"},
+    "call_3": {"output": "never runs"}
+  },
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"},
+      {"type": "function_call", "call_id": "call_2", "name": "build", "arguments": "{}"},
+      {"type": "function_call", "call_id": "call_3", "name": "test", "arguments": "{}"}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read, build, test"}]}],
+      "cancel_at": {"type": "tool_dispatch", "call_id": "call_2"},
+      "fail_at": {"type": "tool_end", "call_id": "call_2"},
+      "expect": {
+        "events": [
+          {"type": "run_start"},
+          {"type": "item_start", "item": {"type": "message", "role": "user"}},
+          {"type": "item_end", "item": {"type": "message", "role": "user"}},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start", "item": {"type": "function_call", "call_id": "call_1"}},
+          {"type": "item_end", "item": {"type": "function_call", "call_id": "call_1"}},
+          {"type": "item_start", "item": {"type": "function_call", "call_id": "call_2"}},
+          {"type": "item_end", "item": {"type": "function_call", "call_id": "call_2"}},
+          {"type": "item_start", "item": {"type": "function_call", "call_id": "call_3"}},
+          {"type": "item_end", "item": {"type": "function_call", "call_id": "call_3"}},
+          {"type": "response_end", "turn": 1},
+          {"type": "tool_start", "call_id": "call_1"},
+          {"type": "tool_start", "call_id": "call_2"},
+          {"type": "tool_start", "call_id": "call_3"},
+          {"type": "tool_dispatch", "call_id": "call_1"},
+          {"type": "tool_end", "call_id": "call_1", "error": false},
+          {"type": "tool_dispatch", "call_id": "call_2"},
+          {"type": "tool_end", "call_id": "call_2", "error": true},
+          {"type": "tool_end", "call_id": "call_3", "error": true},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "run_end", "reason": "aborted", "error": true,
+           "pending": [{"call_id": "call_2", "reason": "aborted"}, {"call_id": "call_3", "reason": "undispatched"}]}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "function_call", "call_id": "call_1"},
+          {"type": "function_call", "call_id": "call_2"},
+          {"type": "function_call", "call_id": "call_3"},
+          {"type": "function_call_output", "call_id": "call_1", "output": "contents of a"}
+        ]
+      }
+    }
+  ]
+}

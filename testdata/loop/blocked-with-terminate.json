@@ -1,0 +1,34 @@
+{
+  "name": "blocked-with-terminate",
+  "description": "A blocked call is settled in preflight with an error output carrying the decision's reason and is never dispatched; the decision's terminate hint rides on its result and ends the run with cause terminate.",
+  "rules": ["#preflight", "#the-turn", "#ending-a-run"],
+  "config": {"model": "m"},
+  "tools": [{"name": "delete"}],
+  "decisions": {"call_1": {"action": "block", "reason": "deleting is not allowed", "terminate": true}},
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "delete", "arguments": "{\"path\":\"a\"}"}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "delete a"}]}],
+      "expect": {
+        "events": [
+          {"type": "run_start"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end"},
+          {"type": "tool_start", "call_id": "call_1", "decision": {"action": "block", "reason": "deleting is not allowed", "terminate": true}},
+          {"type": "tool_end", "call_id": "call_1", "blocked": true, "deferred": false, "reason": "deleting is not allowed",
+           "result": {"output": "Error: deleting is not allowed", "terminate": true}},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_1", "output": "Error: deleting is not allowed"}},
+          {"type": "turn_end", "turn": 1},
+          {"type": "run_end", "reason": "stopped", "cause": "terminate", "error": false, "pending": []}
+        ]
+      }
+    }
+  ]
+}

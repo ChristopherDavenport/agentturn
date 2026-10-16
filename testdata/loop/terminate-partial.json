@@ -1,0 +1,51 @@
+{
+  "name": "terminate-partial",
+  "description": "When some results of a batch set the terminate hint and others do not, every call still runs and is answered, and the run ends stopped with cause partial_terminate.",
+  "rules": ["#the-turn", "#ending-a-run"],
+  "config": {"model": "m", "tool_execution": "sequential"},
+  "tools": [{"name": "search"}, {"name": "read"}],
+  "results": {
+    "call_1": {"output": "found it", "terminate": true},
+    "call_2": {"output": "contents of a"}
+  },
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "search", "arguments": "{}"},
+      {"type": "function_call", "call_id": "call_2", "name": "read", "arguments": "{}"}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "search and read"}]}],
+      "expect": {
+        "events": [
+          {"type": "run_start"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end"},
+          {"type": "tool_start", "call_id": "call_1"},
+          {"type": "tool_start", "call_id": "call_2"},
+          {"type": "tool_dispatch", "call_id": "call_1"},
+          {"type": "tool_end", "call_id": "call_1", "result": {"terminate": true}},
+          {"type": "tool_dispatch", "call_id": "call_2"},
+          {"type": "tool_end", "call_id": "call_2", "result": {"output": "contents of a", "terminate": false}},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_2"}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_2", "output": "contents of a"}},
+          {"type": "turn_end", "turn": 1},
+          {"type": "run_end", "reason": "stopped", "cause": "partial_terminate", "error": false, "pending": []}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "function_call", "call_id": "call_1"},
+          {"type": "function_call", "call_id": "call_2"},
+          {"type": "function_call_output", "call_id": "call_1", "output": "found it"},
+          {"type": "function_call_output", "call_id": "call_2", "output": "contents of a"}
+        ]
+      }
+    }
+  ]
+}

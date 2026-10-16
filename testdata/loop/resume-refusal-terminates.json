@@ -1,0 +1,35 @@
+{
+  "name": "resume-refusal-terminates",
+  "description": "An answer on resume that asks the run to terminate appends its output, so the transcript is valid, and ends the run stopped with cause refused without calling the model.",
+  "rules": ["#pending-calls-and-resume", "#ending-a-run"],
+  "config": {"model": "m"},
+  "tools": [{"name": "delete"}],
+  "decisions": {"call_1": {"action": "defer", "reason": "ask the user"}},
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "delete", "arguments": "{}"}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "delete a"}]}],
+      "expect": {"end": {"reason": "input_required", "pending": [{"call_id": "call_1", "reason": "deferred"}]}}
+    },
+    {
+      "resume": [{"call_id": "call_1", "output": "refused by the user", "terminate": true}],
+      "expect": {
+        "events": [
+          {"type": "run_start", "source": "resume"},
+          {"type": "item_start", "turn": 0, "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "turn": 0, "item": {"type": "function_call_output", "call_id": "call_1", "output": "refused by the user"}},
+          {"type": "run_end", "reason": "stopped", "cause": "refused", "error": false, "pending": []}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "function_call", "call_id": "call_1"},
+          {"type": "function_call_output", "call_id": "call_1", "output": "refused by the user"}
+        ]
+      }
+    }
+  ]
+}

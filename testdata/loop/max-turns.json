@@ -1,0 +1,40 @@
+{
+  "name": "max-turns",
+  "description": "A run that reaches its turn limit after a turn that called tools ends stopped with cause max_turns, after the batch's outputs are appended, with nothing pending.",
+  "rules": ["#the-turn", "#ending-a-run"],
+  "config": {"model": "m", "max_turns": 1},
+  "tools": [{"name": "read", "result": {"output": "contents of a"}}],
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read a"}]}],
+      "expect": {
+        "events": [
+          {"type": "run_start"},
+          {"type": "item_start", "item": {"type": "message", "role": "user"}},
+          {"type": "item_end", "item": {"type": "message", "role": "user"}},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start", "item": {"type": "function_call", "call_id": "call_1"}},
+          {"type": "item_end", "item": {"type": "function_call", "call_id": "call_1"}},
+          {"type": "response_end", "turn": 1},
+          {"type": "tool_start", "call_id": "call_1"},
+          {"type": "tool_dispatch", "call_id": "call_1"},
+          {"type": "tool_end", "call_id": "call_1"},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "turn_end", "turn": 1},
+          {"type": "run_end", "reason": "stopped", "cause": "max_turns", "error": false, "pending": []}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "function_call", "call_id": "call_1"},
+          {"type": "function_call_output", "call_id": "call_1"}
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+{
+  "name": "preflight-settles",
+  "description": "A call naming no tool and a call whose arguments are not a JSON object are settled in preflight with the error outputs the batch section gives, never dispatched, and the model is called again.",
+  "rules": ["#preflight", "#the-batch"],
+  "config": {"model": "m"},
+  "tools": [{"name": "read", "result": {"output": "unused"}}],
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "missing", "arguments": "{}"},
+      {"type": "function_call", "call_id": "call_2", "name": "read", "arguments": "[1,2]"}
+    ]},
+    {"id": "resp_2", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "sorry"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]}],
+      "expect": {
+        "events": [
+          {"type": "run_start"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end"},
+          {"type": "tool_start", "call_id": "call_1", "name": "missing"},
+          {"type": "tool_end", "call_id": "call_1", "error": true, "blocked": false,
+           "result": {"output": "Error: unknown tool \"missing\""}},
+          {"type": "tool_start", "call_id": "call_2", "name": "read"},
+          {"type": "tool_end", "call_id": "call_2", "error": true, "blocked": false,
+           "result": {"output": "Error: invalid arguments: expected a JSON object"}},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_1", "output": "Error: unknown tool \"missing\""}},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_2"}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_2", "output": "Error: invalid arguments: expected a JSON object"}},
+          {"type": "turn_end", "turn": 1},
+          {"type": "turn_start", "turn": 2},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end", "response": {"id": "resp_2"}},
+          {"type": "turn_end", "turn": 2},
+          {"type": "run_end", "reason": "done", "error": false, "pending": []}
+        ]
+      }
+    }
+  ]
+}
