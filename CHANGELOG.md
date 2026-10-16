@@ -49,8 +49,9 @@ versions may break the API.
   rule a recorder rebuilds the list with. `session` writes a nested
   call's dispatch with its key, before its tool runs, and whether its
   end was cut or replayed, and `session.Pending` reads the list back,
-  so the rule holds across a restart; front/control carries the new
-  members. RFC 0001 draft 0.4 states the rule, drops the open question
+  so the rule holds across a restart; a record written before this
+  says neither, and its nested calls run again as new calls under the
+  IDs they had. front/control carries the new members. RFC 0001 draft 0.4 states the rule, drops the open question
   #145 left, and adds three scenarios, with a `$bind` pattern,
   per-tool `replay` and `sequence`, and `executions` in the corpus
   format.

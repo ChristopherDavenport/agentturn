@@ -1188,7 +1188,12 @@ func CarryInvoked(before, now []InvokedCall, root string) []InvokedCall {
 }
 
 // invokedCall is the nested call p as [PendingCall.Invoked] lists it.
+// A replayed call is the call it repeats, ended with its result,
+// whatever its replay's delivery did.
 func (p *callState) invokedCall() InvokedCall {
+	if p.replayed {
+		return *p.recorded
+	}
 	c := InvokedCall{CallID: p.call.CallID, Parent: p.parent, Name: p.call.Name, Args: p.requested, Dispatched: p.dispatched}
 	if !sameArgs(orEmpty(p.args, ""), orEmpty(p.requested, "")) {
 		c.RanWith = p.args
@@ -2488,9 +2493,6 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 			}
 			p.result, p.err = ev.Result, ev.Err
 			p.settled = true
-			// A tool that returned the cancellation was cut off in
-			// flight rather than settled with a result of its own.
-			p.cut = isCancellation(ev.Err, ctx)
 			err = r.settle(ctx, p)
 			// settle ends the call before it delivers, so a call left
 			// unended is one the hook refused.
@@ -2842,7 +2844,9 @@ func (r *runner) check(ctx context.Context, p *callState) error {
 }
 
 // settle applies AfterToolCall, normalises an error into the output the
-// model sees and emits tool_end.
+// model sees and emits tool_end. A call whose final error, after the
+// hook, is the cancellation was cut off in flight rather than settled
+// with a result of its own; one the hook gave a result is settled.
 func (r *runner) settle(ctx context.Context, p *callState) error {
 	if r.cfg.AfterToolCall != nil && !p.blocked {
 		override, err := r.afterToolCall(ctx, ToolResultInfo{RunID: r.runID, Turn: p.turn, Call: p.call, Tool: p.tool, Args: p.args, Result: p.result, Err: p.err})
@@ -2853,6 +2857,7 @@ func (r *runner) settle(ctx context.Context, p *callState) error {
 			p.result, p.err = override.Result, override.Err
 		}
 	}
+	p.cut = isCancellation(p.err, ctx)
 	return r.finish(p)
 }
 
@@ -3057,7 +3062,6 @@ func (r *runner) runNested(ctx context.Context, turn int, p *callState, decision
 	}
 	p.result, p.err = results[0], errs[0]
 	p.settled = true
-	p.cut = isCancellation(p.err, ctx)
 	if err := r.settle(ctx, p); err != nil {
 		return agenttool.Result{}, r.endNested(p, err)
 	}
@@ -3125,15 +3129,19 @@ func (r *runner) match(parent, name string, args json.RawMessage) *InvokedCall {
 // replay settles a nested call matched to one that ended with the
 // result that one returned, without the decision hook, the tool or
 // the after-call hook: the call was decided and ran, and its result is
-// as fixed as a model's call's output in the transcript.
+// as fixed as a model's call's output in the transcript. A consumer
+// that fails on its tool_start does not cut it, since nothing runs: it
+// still ends with that result, and the failure goes to the invoking
+// tool, as for any failure of the loop's own around a nested call.
 func (r *runner) replay(turn int, p *callState) (agenttool.Result, error) {
 	rec := p.recorded
 	p.replayed, p.dispatched = true, rec.Dispatched
-	if err := r.emit(&ToolStart{RunID: r.runID, Turn: turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args, Parent: p.parent, Requested: p.requested, Replayed: true}); err != nil {
-		return agenttool.Result{}, r.endNested(p, err)
-	}
 	p.result, p.err = rec.Result, rec.Err
 	p.settled = true
+	if err := r.emit(&ToolStart{RunID: r.runID, Turn: turn, CallID: p.call.CallID, Name: p.call.Name, Args: p.args, Parent: p.parent, Requested: p.requested, Replayed: true}); err != nil {
+		_ = r.finish(p)
+		return agenttool.Result{}, err
+	}
 	if err := r.finish(p); err != nil {
 		// Ended all the same: the result stands, and the failure is the
 		// invoking tool's to answer.

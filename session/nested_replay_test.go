@@ -205,9 +205,60 @@ func TestNestedCallsSurviveARestart(t *testing.T) {
 		if n.Name != w.name || n.Phase != w.phase || n.Replayed != w.replayed {
 			t.Errorf("entry %d = %+v, want %s %s replayed=%v", i, n, w.name, w.phase, w.replayed)
 		}
+		// An end always says whether it was cut, so it is told from an
+		// end written before the member existed.
+		if n.Phase == agentsession.RunEnd && (n.Cut == nil || *n.Cut) {
+			t.Errorf("entry %d's cut = %v, want false written", i, n.Cut)
+		}
 	}
 	if second[3].IdempotencyKey != keys[0] {
 		t.Errorf("charge dispatched again under %q, want %q", second[3].IdempotencyKey, keys[0])
 	}
 	verifyAll(t, s2)
+}
+
+// TestInvokedOfReadsWhatTheRecordSays pins the review of #261 on the
+// read side: an end entry from before the recorder wrote cut says
+// nothing of whether the call ended, so an old record's nested call is
+// neither dispatched nor ended and runs again as a new call; a
+// replayed call stays the call it repeats, ended, whatever its own
+// entries hold.
+func TestInvokedOfReadsWhatTheRecordSays(t *testing.T) {
+	entry := func(n NestedCall) agentsession.Entry {
+		raw, err := json.Marshal(n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &agentsession.CustomEntry{NS: NestedCallNS, Data: raw, CallID: "call_p"}
+	}
+	dispatch := &agentsession.DispatchEntry{CallID: "call_p"}
+	no, yes := false, true
+	start := NestedCall{Phase: agentsession.RunStart, CallID: "n1", Parent: "call_p", Name: "act", Args: json.RawMessage(`{}`)}
+	sent := NestedCall{Phase: NestedDispatch, CallID: "n1", Parent: "call_p", Name: "act", IdempotencyKey: "k1"}
+	end := func(cut *bool) NestedCall {
+		return NestedCall{Phase: agentsession.RunEnd, CallID: "n1", Parent: "call_p", Name: "act", Output: "context canceled", Error: "context canceled", Cut: cut}
+	}
+	replayedStart := start
+	replayedStart.Replayed = true
+	cases := []struct {
+		name                string
+		path                []agentsession.Entry
+		wantDispatched, end bool
+	}{
+		{"an old record says nothing", []agentsession.Entry{dispatch, entry(start), entry(end(nil))}, false, false},
+		{"a cut end", []agentsession.Entry{dispatch, entry(start), entry(sent), entry(end(&yes))}, true, false},
+		{"a settled end", []agentsession.Entry{dispatch, entry(start), entry(sent), entry(end(&no))}, true, true},
+		{"a replay with no end stays ended", []agentsession.Entry{dispatch, entry(start), entry(sent), entry(end(&no)), dispatch, entry(replayedStart)}, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := invokedOf(tc.path, "call_p")
+			if len(got) != 1 {
+				t.Fatalf("invoked = %+v", got)
+			}
+			if got[0].CallID != "n1" || got[0].Dispatched != tc.wantDispatched || got[0].Ended != tc.end {
+				t.Errorf("invoked = %+v, want dispatched %v, ended %v", got[0], tc.wantDispatched, tc.end)
+			}
+		})
+	}
 }

@@ -326,3 +326,117 @@ func TestCarryInvoked(t *testing.T) {
 		})
 	}
 }
+
+// TestAHookResultIsNotACut pins the review of #261: whether a call was
+// cut is read from its result after the after-call hook. A hook that
+// answers a call the cancellation reached with a result of its own
+// settles it, so a model's call has its output appended and is not
+// pending, and a nested call is listed as ended.
+func TestAHookResultIsNotACut(t *testing.T) {
+	recover := func(name string) func(context.Context, ToolResultInfo) (*ToolOverride, error) {
+		return func(_ context.Context, info ToolResultInfo) (*ToolOverride, error) {
+			if info.Err != nil && info.Call.Name == name {
+				return &ToolOverride{Result: agenttool.Text("recovered")}, nil
+			}
+			return nil, nil
+		}
+	}
+	t.Run("a model's call", func(t *testing.T) {
+		h := &nestedHarness{}
+		h.script = []func(context.Context) (string, error){func(ctx context.Context) (string, error) {
+			<-ctx.Done()
+			return "", ctx.Err()
+		}}
+		a := New(Config{Model: &callThenAnswer{}, Tools: h.tools(agenttool.ReplayUnknown), AfterToolCall: recover("eval")})
+		var ends []*ToolEnd
+		a.Subscribe(func(_ context.Context, ev Event) error {
+			switch e := ev.(type) {
+			case *ToolDispatch:
+				a.Abort()
+			case *ToolEnd:
+				ends = append(ends, e)
+			}
+			return nil
+		})
+		end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+		if err != nil || end.Reason != ReasonAborted || len(end.Pending) != 0 {
+			t.Fatalf("end %+v, err %v", end, err)
+		}
+		if len(ends) != 1 || ends[0].Cut || ends[0].Err != nil {
+			t.Errorf("tool_end = %+v, want settled", ends)
+		}
+		if out, ok := end.Items[len(end.Items)-1].(*openresponses.FunctionCallOutput); !ok || out.Output.Text != "recovered" {
+			t.Errorf("last item = %#v, want the hook's output", end.Items[len(end.Items)-1])
+		}
+	})
+	t.Run("a nested call", func(t *testing.T) {
+		h := &nestedHarness{block: true}
+		h.script = []func(context.Context) (string, error){h.invokes(true, "a")}
+		a := New(Config{Model: &callThenAnswer{}, Tools: h.tools(agenttool.ReplayUnknown), AfterToolCall: recover("act")})
+		a.Subscribe(func(_ context.Context, ev Event) error {
+			if e, ok := ev.(*ToolDispatch); ok && e.Parent != "" {
+				a.Abort()
+			}
+			return nil
+		})
+		end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+		if err != nil || len(end.Pending) != 1 {
+			t.Fatalf("end %+v, err %v", end, err)
+		}
+		inv := end.Pending[0].Invoked
+		if len(inv) != 1 || !inv[0].Ended || inv[0].Err != nil || inv[0].Result.Output.Text != "recovered" {
+			t.Errorf("invoked = %+v, want ended with the hook's result", inv)
+		}
+	})
+}
+
+// TestAReplayAConsumerFailsOnStaysEnded pins the review of #261: a
+// replayed nested call whose tool_start a consumer fails on still ends
+// with the result it repeats, so the list the run leaves holds it as
+// ended, and the next execution replays it again rather than holding
+// it to the replay rule.
+func TestAReplayAConsumerFailsOnStaysEnded(t *testing.T) {
+	h := &nestedHarness{}
+	h.script = []func(context.Context) (string, error){h.invokes(true, "a"), h.invokes(true, "a"), h.invokes(false, "a")}
+	a := New(Config{Model: &callThenAnswer{}, Tools: h.tools(agenttool.ReplayUnknown)})
+	run := 1
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		switch e := ev.(type) {
+		case *ToolStart:
+			if run == 2 && e.Replayed {
+				return errors.New("the consumer fails")
+			}
+		case *ToolEnd:
+			if e.Parent != "" && run < 3 {
+				a.Abort()
+			}
+		}
+		return nil
+	})
+	end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if err != nil || len(end.Pending) != 1 {
+		t.Fatalf("first run: end %+v, err %v", end, err)
+	}
+	run = 2
+	end, err = a.Resume(context.Background(), Approve("call_eval"))
+	if err != nil || len(end.Pending) != 1 {
+		t.Fatalf("second run: end %+v, err %v", end, err)
+	}
+	inv := end.Pending[0].Invoked
+	if len(inv) != 1 || !inv[0].Ended || inv[0].Result.Output.Text != "acted on a" {
+		t.Fatalf("invoked = %+v, want the replayed call ended", inv)
+	}
+	run = 3
+	end, err = a.Resume(context.Background(), Approve("call_eval"))
+	if err != nil || end.Reason != ReasonDone {
+		t.Fatalf("third run: end %+v, err %v", end, err)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.ids) != 1 {
+		t.Errorf("act ran %d times, want once", len(h.ids))
+	}
+	if last := h.errs[len(h.errs)-1]; last != nil || h.results[len(h.results)-1] != "acted on a" {
+		t.Errorf("the third execution got %q, %v, want the replayed result", h.results[len(h.results)-1], last)
+	}
+}

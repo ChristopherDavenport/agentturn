@@ -581,11 +581,15 @@ type NestedCall struct {
 	// the end entry.
 	Output string `json:"output,omitempty"`
 	Error  string `json:"error,omitempty"`
-	// Cut, on the end entry, says the call was cut off rather than
-	// settled with a result of its own, and Withdrawn that its dispatch
-	// was refused, so its tool never ran.
-	Cut       bool `json:"cut,omitempty"`
-	Withdrawn bool `json:"withdrawn,omitempty"`
+	// Cut, on the end entry, says whether the call was cut off rather
+	// than settled with a result of its own, and Withdrawn that its
+	// dispatch was refused, so its tool never ran. The recorder always
+	// writes cut on an end entry, so one without it was written before
+	// it did, by a recorder that wrote no dispatch either, and says
+	// nothing of whether the call ended: [Pending] reads such a call as
+	// neither dispatched nor ended.
+	Cut       *bool `json:"cut,omitempty"`
+	Withdrawn bool  `json:"withdrawn,omitempty"`
 	// Replayed, on the start and the end entry, says the result is the
 	// one an earlier execution of the invoking call left, repeated
 	// without running the tool.
@@ -1840,9 +1844,12 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 // on agentturn.PendingCall.Invoked: each dispatch of the call starts an
 // execution, whose nested calls are folded into the list with
 // agentturn.CarryInvoked, so a call made again keeps what an earlier
-// execution says of it. A call whose record has no dispatch entry, one
-// written before the recorder wrote them, reads as never handed over,
-// and runs again as a new call would under the ID it had.
+// execution says of it. A replayed call is the call it repeats, ended
+// with its result, whatever its own entries hold. A record written
+// before the recorder wrote a nested call's dispatch and its end's cut
+// member holds neither, so its calls read as neither dispatched nor
+// ended, and each runs again as a new call would, decided and under a
+// new key, keeping only the ID it had.
 func invokedOf(path []agentsession.Entry, callID string) []agentturn.InvokedCall {
 	var list, now []agentturn.InvokedCall
 	at := map[string]int{}
@@ -1874,6 +1881,11 @@ func invokedOf(path []agentsession.Entry, callID string) []agentturn.InvokedCall
 			continue
 		}
 		if n.Phase == agentsession.RunStart {
+			if before, ok := earlier(n.CallID); ok && n.Replayed {
+				at[n.CallID] = len(now)
+				now = append(now, before)
+				continue
+			}
 			call := agentturn.InvokedCall{CallID: n.CallID, Parent: n.Parent, Name: n.Name, Args: n.Args}
 			if n.Requested != nil {
 				call.Args, call.RanWith = n.Requested, n.Args
@@ -1898,7 +1910,9 @@ func invokedOf(path []agentsession.Entry, callID string) []agentturn.InvokedCall
 		case NestedDispatch:
 			now[i].Dispatched, now[i].IdempotencyKey = true, n.IdempotencyKey
 		case agentsession.RunEnd:
-			if n.Cut {
+			if n.Replayed || n.Cut == nil || *n.Cut {
+				// A replay keeps the result it repeats; an end with no
+				// cut member is an old record's, which cannot say.
 				continue
 			}
 			now[i].Ended = true
@@ -3791,7 +3805,7 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 			Name:      e.Name,
 			Output:    e.Result.Output.Text,
 			Error:     errText(e.Err),
-			Cut:       e.Cut,
+			Cut:       &e.Cut,
 			Withdrawn: e.Withdrawn,
 			Replayed:  e.Replayed,
 		}, e.Parent); err != nil {
