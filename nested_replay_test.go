@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 
@@ -113,11 +114,11 @@ func (h *nestedHarness) invokes(wait bool, texts ...string) func(ctx context.Con
 // TestANestedCallMadeAgainIsTheCallItWas pins #261: a nested call an
 // earlier execution of the invoking call made is fixed as a model's
 // call is. When an approval runs the invoking call again, the Invoke
-// that names the same tool with the same arguments in the same place
-// keeps that call's ID and key: one that ended returns its result
-// without running, one dispatched and not ended runs again under its
-// key as the replay rule allows, and an Invoke that differs is a new
-// call, as is every one after it.
+// that names the same tool with the same arguments under the same
+// parent keeps that call's ID and key: one that ended returns its
+// result without running, one dispatched and not ended runs again
+// under its key as the replay rule allows, and an Invoke with nothing
+// to match is a new call while the ones after it still match.
 func TestANestedCallMadeAgainIsTheCallItWas(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -187,7 +188,7 @@ func TestANestedCallMadeAgainIsTheCallItWas(t *testing.T) {
 			wantExecs: 2, wantSame: 1,
 		},
 		{
-			name:   "an Invoke that differs is a new call, and so is every one after it",
+			name:   "an Invoke with nothing to match is a new call, and a later one still matches",
 			replay: agenttool.ReplaySafe,
 			first:  func(h *nestedHarness) func(context.Context) (string, error) { return h.invokes(true, "a", "b") },
 			second: func(h *nestedHarness) func(context.Context) (string, error) { return h.invokes(false, "z", "b") },
@@ -195,8 +196,20 @@ func TestANestedCallMadeAgainIsTheCallItWas(t *testing.T) {
 				e, ok := ev.(*ToolEnd)
 				return ok && e.Parent != "" && string(e.Result.Output.Text) == "acted on b"
 			},
-			wantExecs:   4,
+			wantExecs: 3, wantSame: 1, wantReplayed: 1,
 			wantResults: []string{"acted on a", "acted on b", "acted on z", "acted on b"},
+		},
+		{
+			name:   "Invokes that arrive in another order still match",
+			replay: agenttool.ReplayUnknown,
+			first:  func(h *nestedHarness) func(context.Context) (string, error) { return h.invokes(true, "a", "b") },
+			second: func(h *nestedHarness) func(context.Context) (string, error) { return h.invokes(false, "b", "a") },
+			cutAt: func(ev Event) bool {
+				e, ok := ev.(*ToolEnd)
+				return ok && e.Parent != "" && string(e.Result.Output.Text) == "acted on b"
+			},
+			wantExecs: 2, wantSame: 2, wantReplayed: 2,
+			wantResults: []string{"acted on a", "acted on b", "acted on b", "acted on a"},
 		},
 	}
 	for _, tc := range cases {
@@ -253,12 +266,10 @@ func TestANestedCallMadeAgainIsTheCallItWas(t *testing.T) {
 					}
 				}
 			}
-			if tc.wantReplayed > 0 {
-				same += len(replayed)
-				for _, e := range replayed {
-					if e.CallID != first[0].CallID {
-						t.Errorf("replayed %s, want %s", e.CallID, first[0].CallID)
-					}
+			for _, e := range replayed {
+				same++
+				if !slices.ContainsFunc(first, func(c InvokedCall) bool { return c.CallID == e.CallID }) {
+					t.Errorf("replayed %s, which the first execution did not make", e.CallID)
 				}
 			}
 			if same != tc.wantSame {
@@ -309,7 +320,7 @@ func TestCarryInvoked(t *testing.T) {
 	}{
 		{"nothing made keeps the list", []InvokedCall{a, b, c}, nil, []string{"a", "b", "c"}},
 		{"the calls not reached follow", []InvokedCall{a, b, c}, []InvokedCall{aEnded}, []string{"a", "b", "c"}},
-		{"a new call drops the rest under its parent", []InvokedCall{a, b, c}, []InvokedCall{fresh}, []string{"x"}},
+		{"a new call keeps the rest under its parent", []InvokedCall{a, b, c}, []InvokedCall{fresh}, []string{"x", "a", "b", "c"}},
 		{"nothing under an ended call is kept", []InvokedCall{a, b, c}, []InvokedCall{aEnded, bEnded}, []string{"a", "b"}},
 	}
 	for _, tc := range cases {
@@ -438,5 +449,71 @@ func TestAReplayAConsumerFailsOnStaysEnded(t *testing.T) {
 	}
 	if last := h.errs[len(h.errs)-1]; last != nil || h.results[len(h.results)-1] != "acted on a" {
 		t.Errorf("the third execution got %q, %v, want the replayed result", h.results[len(h.results)-1], last)
+	}
+}
+
+// TestConcurrentInvokesMatchWhateverTheirOrder pins the matching rule
+// for sibling Invokes a tool makes at once: each is matched by its
+// parent, name and arguments, never by when it arrived, so two that
+// ended both replay on the rerun however their goroutines are
+// scheduled, and neither tool runs again.
+func TestConcurrentInvokesMatchWhateverTheirOrder(t *testing.T) {
+	both := func(wait bool) func(ctx context.Context) (string, error) {
+		return func(ctx context.Context) (string, error) {
+			var wg sync.WaitGroup
+			for _, text := range []string{"a", "b"} {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					_, _ = Invoke(ctx, "act", json.RawMessage(`{"text":"`+text+`"}`))
+				}()
+			}
+			wg.Wait()
+			if wait {
+				<-ctx.Done()
+			}
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			return "evaluated", nil
+		}
+	}
+	for range 20 {
+		h := &nestedHarness{}
+		h.script = []func(context.Context) (string, error){both(true), both(false)}
+		a := New(Config{Model: &callThenAnswer{}, Tools: h.tools(agenttool.ReplayUnknown)})
+		var mu sync.Mutex
+		ended, replayed := 0, 0
+		a.Subscribe(func(_ context.Context, ev Event) error {
+			e, ok := ev.(*ToolEnd)
+			if !ok || e.Parent == "" {
+				return nil
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if e.Replayed {
+				replayed++
+			}
+			if ended++; ended == 2 {
+				a.Abort()
+			}
+			return nil
+		})
+		end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+		if err != nil || len(end.Pending) != 1 || len(end.Pending[0].Invoked) != 2 {
+			t.Fatalf("first run: end %+v, err %v", end, err)
+		}
+		end, err = a.Resume(context.Background(), Approve("call_eval"))
+		if err != nil || end.Reason != ReasonDone {
+			t.Fatalf("second run: end %+v, err %v", end, err)
+		}
+		h.mu.Lock()
+		ran := len(h.ids)
+		h.mu.Unlock()
+		mu.Lock()
+		defer mu.Unlock()
+		if ran != 2 || replayed != 2 {
+			t.Fatalf("act ran %d times and %d replayed, want 2 and 2", ran, replayed)
+		}
 	}
 }

@@ -1144,30 +1144,21 @@ func (r *runner) invokedUnder(id string, before []InvokedCall) []InvokedCall {
 // CarryInvoked is what [PendingCall.Invoked] lists for the call root
 // after an execution of it that left it pending again: now, the nested
 // calls that execution made, in order, then the calls of before, the
-// list it was pending with, that it did not reach. A call of before
-// is kept when this execution did not make it again, its parent is
-// root or a call kept, the parent's execution made no call before did
-// not list, which ends the matching under it, and the parent did not
-// end, which leaves nothing under it to run: a call not reached may
-// still run in the next execution, under the ID and key it had. A
-// recorder that rebuilds the list from a record folds each execution
-// in with it, so it reads the record as the loop left the list.
+// list it was pending with, that it did not match. A call of before is
+// kept when this execution did not make it again, its parent is root
+// or a call kept, and the parent did not end, which leaves nothing
+// under it to run: a call not matched may still be matched in the next
+// execution, under the ID and key it had. A recorder that rebuilds the
+// list from a record folds each execution in with it, so it reads the
+// record as the loop left the list.
 func CarryInvoked(before, now []InvokedCall, root string) []InvokedCall {
 	if len(now) == 0 {
 		return before
 	}
-	listed := make(map[string]bool, len(before))
-	for _, c := range before {
-		listed[c.CallID] = true
-	}
 	made := make(map[string]bool, len(now))
-	diverged := map[string]bool{}
 	ended := map[string]bool{}
 	for _, c := range now {
 		made[c.CallID] = true
-		if !listed[c.CallID] {
-			diverged[c.Parent] = true
-		}
 		if c.Ended {
 			ended[c.CallID] = true
 		}
@@ -1178,7 +1169,7 @@ func CarryInvoked(before, now []InvokedCall, root string) []InvokedCall {
 		kept[c.CallID] = true
 	}
 	for _, c := range before {
-		if made[c.CallID] || diverged[c.Parent] || ended[c.Parent] || !kept[c.Parent] {
+		if made[c.CallID] || ended[c.Parent] || !kept[c.Parent] {
 			continue
 		}
 		out = append(out, c)
@@ -2933,16 +2924,17 @@ var ErrNoInvoker = errors.New("agentturn: no loop on the context to invoke a too
 // A nested call gets an ID and an idempotency key of its own. When an
 // approval runs a pending call again, the nested calls its earlier
 // execution made ([PendingCall.Invoked]) are fixed as a model's calls
-// are: the tool's k-th Invoke under a parent that names the same tool
-// with the same arguments as the k-th made under it before is that
-// call, with its ID and key. One that ended returns the same result
-// without running or being decided again, marked Replayed on its
-// events; one that was dispatched and not ended runs again under its
-// key when its tool's replay is safe or keyed, and otherwise is put to
-// the user through the elicitor as a deferred nested call is, its
-// outcome unknown when nobody allows it; one never dispatched runs as
-// any call does. The first Invoke that differs ends the matching under
-// that parent: it and every later one are new calls.
+// are: the tool's k-th Invoke under a parent that names a tool with
+// given arguments is the k-th call made under that parent with that
+// name and those arguments, in whatever order the Invokes arrive, and
+// keeps its ID and key. One that ended returns the same result without
+// running or being decided again, marked Replayed on its events; one
+// that was dispatched and not ended runs again under its key when its
+// tool's replay is safe or keyed, and otherwise is put to the user
+// through the elicitor as a deferred nested call is, its outcome
+// unknown when nobody allows it; one never dispatched runs as any call
+// does. An Invoke with no such call left to match is a new call, and
+// the Invokes after it still match.
 //
 // Call it from a tool, with the context the tool was given, and not
 // from a hook or a subscriber: BeforeToolCall and AfterToolCall take
@@ -3069,13 +3061,25 @@ func (r *runner) runNested(ctx context.Context, turn int, p *callState, decision
 }
 
 // replayQueue is the nested calls an earlier execution made under one
-// call, which that call's execution now is matched against in order.
-// next is the first not yet matched; diverged is set once an Invoke
-// did not match it, which ends the matching under that call.
+// call, by tool name and canonical arguments, in the order they were
+// made, which that call's execution now is matched against; next is,
+// for each, the first not yet matched.
 type replayQueue struct {
-	calls    []InvokedCall
-	next     int
-	diverged bool
+	calls map[string][]InvokedCall
+	next  map[string]int
+}
+
+// invocationKey names what an Invoke is matched on: the tool's name and
+// its arguments as a canonical JSON value, so two spellings of one
+// value match.
+func invocationKey(name string, args json.RawMessage) string {
+	canon := string(orEmpty(args, ""))
+	if v, err := decodeNumbers(json.RawMessage(canon)); err == nil {
+		if b, err := json.Marshal(v); err == nil {
+			canon = string(b)
+		}
+	}
+	return name + "\x00" + canon
 }
 
 // expectInvoked sets up the matching of the nested calls the approved
@@ -3093,36 +3097,34 @@ func (r *runner) expectInvoked(id string) {
 		for _, c := range pc.Invoked {
 			q := r.replays[c.Parent]
 			if q == nil {
-				q = &replayQueue{}
+				q = &replayQueue{calls: map[string][]InvokedCall{}, next: map[string]int{}}
 				r.replays[c.Parent] = q
 			}
-			q.calls = append(q.calls, c)
+			key := invocationKey(c.Name, c.Args)
+			q.calls[key] = append(q.calls[key], c)
 		}
 		r.invokedMu.Unlock()
 	}
 }
 
 // match returns the nested call an earlier execution made that this
-// Invoke under parent is, the next one made under parent when it names
-// the same tool with the same arguments, and nil otherwise, which ends
-// the matching under parent.
+// Invoke under parent is: the first not yet matched of those made under
+// parent with the same name and arguments, or nil when none is left,
+// which makes the Invoke a new call.
 func (r *runner) match(parent, name string, args json.RawMessage) *InvokedCall {
 	r.invokedMu.Lock()
 	defer r.invokedMu.Unlock()
 	q := r.replays[parent]
-	if q == nil || q.diverged || parent == "" {
+	if q == nil || parent == "" {
 		return nil
 	}
-	if q.next >= len(q.calls) {
-		q.diverged = true
+	key := invocationKey(name, args)
+	k := q.next[key]
+	if k >= len(q.calls[key]) {
 		return nil
 	}
-	c := q.calls[q.next]
-	if c.Name != name || !sameArgs(orEmpty(c.Args, ""), orEmpty(args, "")) {
-		q.diverged = true
-		return nil
-	}
-	q.next++
+	q.next[key] = k + 1
+	c := q.calls[key][k]
 	return &c
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "nested-diverges",
-  "description": "When a call run again makes a nested call that differs from the one its earlier execution made in that place, that call and every one after it are new: each is decided, dispatched and run, though a later one names the same tool with the same arguments as before.",
+  "description": "When a call run again makes a nested call its earlier execution did not make, that call is new and is decided, dispatched and run, and a later nested call that names the same tool with the same arguments as one made before still is that call, and replays.",
   "rules": ["#nested-calls", "#pending-calls-and-resume"],
   "config": {"model": "m"},
   "tools": [
@@ -27,7 +27,7 @@
         "end": {"reason": "aborted",
           "pending": [{"call_id": "call_1", "reason": "aborted", "invoked": [
             {"name": "read", "args": {"path": "a"}, "dispatched": true, "ended": true},
-            {"name": "list", "args": {}, "dispatched": true, "ended": true}
+            {"call_id": {"$bind": "list"}, "name": "list", "args": {}, "dispatched": true, "ended": true}
           ]}]}
       }
     },
@@ -41,9 +41,8 @@
           {"type": "tool_start", "turn": 0, "name": "read", "args": {"path": "z"}, "parent": "call_1", "replayed": false},
           {"type": "tool_dispatch", "turn": 0, "name": "read", "parent": "call_1"},
           {"type": "tool_end", "turn": 0, "name": "read", "parent": "call_1", "replayed": false, "error": false},
-          {"type": "tool_start", "turn": 0, "name": "list", "parent": "call_1", "replayed": false},
-          {"type": "tool_dispatch", "turn": 0, "name": "list", "parent": "call_1"},
-          {"type": "tool_end", "turn": 0, "name": "list", "parent": "call_1", "replayed": false, "error": false},
+          {"type": "tool_start", "turn": 0, "call_id": {"$bind": "list"}, "name": "list", "parent": "call_1", "replayed": true},
+          {"type": "tool_end", "turn": 0, "call_id": {"$bind": "list"}, "name": "list", "parent": "call_1", "replayed": true, "error": false, "result": {"output": "a z"}},
           {"type": "tool_end", "turn": 0, "call_id": "call_1", "error": false, "result": {"output": "the script read z and listed"}},
           {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_1"}},
           {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_1"}},
@@ -56,5 +55,5 @@
       }
     }
   ],
-  "executions": {"run_code": 2, "read": 2, "list": 2}
+  "executions": {"run_code": 2, "read": 2, "list": 1}
 }

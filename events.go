@@ -752,16 +752,16 @@ type PendingCall struct {
 	// Parent: an execution an abort or a failure cut off, after which
 	// the call may run again. A nested call already made is fixed as a
 	// model's call is once its response is in: when an approval runs
-	// the call again, its tool's k-th Invoke under a parent is the k-th
-	// listed under that parent if it names the same tool with the same
-	// arguments, and keeps that call's ID and key; one that ended
+	// the call again, its tool's k-th Invoke under a parent that names
+	// a tool with given arguments is the k-th listed under that parent
+	// with that name and those arguments, whatever order the Invokes
+	// arrive in, and keeps that call's ID and key; one that ended
 	// returns its result without running again, one that was dispatched
 	// and not ended is run again only as agenttool's replay rule
-	// allows, and one never dispatched runs as any call does. The first
-	// Invoke under a parent that differs from the list ends the
-	// matching under it, and it and every later one are new calls. An
-	// execution that again leaves the call pending lists what it made,
-	// then the calls it did not reach of a list it never left. The loop
+	// allows, and one never dispatched runs as any call does. An Invoke
+	// with nothing left to match is a new call, and later ones still
+	// match. An execution that again leaves the call pending lists what
+	// it made, then the calls of its list it did not match. The loop
 	// sets it; agentturn/session's Pending sets it from the record. nil
 	// for a call whose tool made no nested call.
 	Invoked []InvokedCall

@@ -770,9 +770,9 @@ for one that **ended**, settled with a result of its own rather than
 cut, that result and its error. It is what a run of the call again is
 matched against, as the [nested calls section](#nested-calls) says.
 When that run leaves the call pending again, the list is what the run
-made, then each call of the list it was given that the run did not make
-again, whose parent is the pending call or a call kept, whose parent's
-matching did not end, and whose parent did not end. A recorder that
+made, then each call of the list it was given that the run did not
+match, whose parent is the pending call or a call kept, and whose
+parent did not end. A recorder that
 rebuilds the list from a record folds each execution of the call into
 it the same way, so the list read from a record after a restart is the
 list the loop left.
@@ -1332,12 +1332,16 @@ a model's call is once its response is in: its ID and its key do not
 change, and once it has ended it does not run again. When a resume's
 approval runs a pending call again, its tool's invocations are matched
 against the call's invoked list, one parent at a time: the k-th
-invocation under a parent **matches** the k-th call the list holds
-under that parent when it names the same tool with arguments that are
-the same JSON value, compared parsed and not as bytes, as the ones the
-invoking tool passed then. A matched invocation is that call, with the
-ID it had, and with the key and the arguments it was dispatched with
-when it was dispatched:
+invocation under a parent that names a tool with given arguments
+**matches** the k-th call the list holds under that parent with that
+name and those arguments, the ones the invoking tool passed, compared
+as JSON values, parsed and not as bytes, in whatever order the
+invocations arrive. Sibling invocations a tool makes at once match the
+calls they were whichever reaches the loop first, and identical calls
+under one parent are one operation each time, the first of them the
+first again. A matched invocation is that call, with the ID it had,
+and with the key and the arguments it was dispatched with when it was
+dispatched:
 
 - a call that **ended** returns the result it returned and its error,
   without the decision hook, the tool or the after-call hook: it raises
@@ -1360,10 +1364,14 @@ when it was dispatched:
 - a call that was never dispatched runs as any nested call does, the
   decision hook asked, under the ID it had.
 
-The first invocation under a parent that does not match ends the
-matching under that parent for the execution: it and every later
-invocation under it are new calls, with IDs and keys of their own,
-since the invoking tool took another path. A replayed call stays on
+An invocation with no call of the list left to match is a new call,
+with an ID and a key of its own, and the invocations after it are
+still matched. The cost is plain: an invoking tool that takes another
+path on the rerun but repeats, under the same parent, a call it made
+before with the same name and arguments gets that call's recorded
+result, or runs it again under its key, rather than making it anew,
+since the loop cannot tell a repeat on another path from the same
+operation. A replayed call stays on
 the list as the call it repeats, ended with its result, even when a
 consumer failed on its `tool_start`. A record written before a
 recorder wrote a nested call's dispatch and whether its end was cut
@@ -1758,7 +1766,8 @@ sequentially, gives it one call, or holds a call with `wait`.
 | `nested-call` | a nested call's events carry its parent, fall between the parent's dispatch and end, and append nothing |
 | `nested-replays-an-ended-call` | a cut call's nested call that ended is listed on the pending call; run again, it keeps its ID and returns its result marked replayed, without a dispatch, and its tool runs once |
 | `nested-runs-a-keyed-call-again` | a nested call cut after its dispatch is listed with its key; run again, its keyed tool runs under the same ID and key, decided by the replay rule |
-| `nested-diverges` | an invocation that differs from the list is a new call, and so is every one after it, a later one that names the same call included |
+| `nested-diverges` | an invocation the list does not hold is a new call, decided, dispatched and run, and a later one that names a call the list holds still matches and replays |
+| `nested-matches-out-of-order` | invocations made in another order on the rerun each match the call they were, by parent, name and arguments, and both replay |
 | `steer` | a steered item is appended after the batch and `turn_end`, with mode `steer` |
 | `follow-up` | a follow-up is appended when the run would end, and the run takes another turn with mode `follow_up` |
 

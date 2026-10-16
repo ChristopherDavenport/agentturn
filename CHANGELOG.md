@@ -33,14 +33,18 @@ versions may break the API.
 - Changed: a nested call already made is fixed as a model's call is
   (#261). A call left pending lists the nested calls its tool made as
   `PendingCall.Invoked`, and when an approval runs it again, its tool's
-  k-th `Invoke` under a parent is the k-th made under it before if it
-  names the same tool with the same arguments: it keeps that call's ID
-  and key, returns its result without running when it ended, marked
-  `Replayed` on `ToolStart` and `ToolEnd` with no `tool_dispatch`, and
-  runs again under its key only as agenttool's replay rule allows when
-  it was dispatched and cut, the user asked through the elicitor
-  otherwise and `ErrOutcomeUnknown` returned without an allow. The
-  first `Invoke` that differs, and every one after it, is a new call.
+  k-th `Invoke` under a parent naming a tool with given arguments is
+  the k-th call made under that parent with that name and those
+  arguments, in whatever order the `Invoke`s arrive, so sibling calls
+  made at once match too: it keeps that call's ID and key, returns its
+  result without running when it ended, marked `Replayed` on
+  `ToolStart` and `ToolEnd` with no `tool_dispatch`, and runs again
+  under its key only as agenttool's replay rule allows when it was
+  dispatched and cut, the user asked through the elicitor otherwise
+  and `ErrOutcomeUnknown` returned without an allow. An `Invoke` with
+  nothing left to match is a new call, and later ones still match; a
+  tool that takes another path but repeats an identical call under the
+  same parent gets that call's recorded result.
   Before, every nested call of a call run again took a new ID and key,
   so a keyed tool behind `Invoke` deduplicated nothing and a nested
   call that had finished ran again. `ToolEnd.Cut` says a call was cut
@@ -52,7 +56,7 @@ versions may break the API.
   so the rule holds across a restart; a record written before this
   says neither, and its nested calls run again as new calls under the
   IDs they had. front/control carries the new members. RFC 0001 draft 0.4 states the rule, drops the open question
-  #145 left, and adds three scenarios, with a `$bind` pattern,
+  #145 left, and adds four scenarios, with a `$bind` pattern,
   per-tool `replay` and `sequence`, and `executions` in the corpus
   format.
 
