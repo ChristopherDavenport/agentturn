@@ -27,7 +27,7 @@
           {"type": "response_end", "turn": 1},
           {"type": "tool_start", "call_id": "call_1", "decision": {"action": "defer", "reason": "ask the user"}},
           {"type": "tool_end", "call_id": "call_1", "deferred": true, "blocked": false, "reason": "ask the user", "error": false},
-          {"type": "turn_end", "turn": 1},
+          {"type": "turn_end", "turn": 1, "tool_results": [{}]},
           {"type": "run_end", "reason": "input_required", "cause": "", "error": false,
            "pending": [{"call_id": "call_1", "reason": "deferred"}]}
         ],

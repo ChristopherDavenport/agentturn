@@ -25,7 +25,11 @@ versions may break the API.
   the reference loop through the exported API alone, as another
   implementation's runner would against its own. The RFC now invites
   other implementations, and says a scenario changes only with the
-  rule it pins.
+  rule it pins. Writing the scenarios turned up two rules the reference
+  kept and the draft did not state, now written down: a batch a
+  cancellation or a failure cuts off has no `turn_end`, and a deferred
+  call's place in `turn_end`'s tool results holds an empty result; in a
+  sequential batch the cut calls end in the batch's order.
 
 ## v0.0.29 - 2026-10-13
 

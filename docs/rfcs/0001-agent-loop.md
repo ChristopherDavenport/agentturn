@@ -351,7 +351,10 @@ it raises and the hooks it calls; the events are defined
    model's order.
 8. **`turn_end`** carries the folded response and the tool results in
    the model's order. It is raised whether or not the batch left calls
-   pending.
+   pending; a deferred call's place holds an empty result, so the list
+   is as long as the batch. A batch a cancellation or a failure cut off
+   has no `turn_end`: it is settled as the
+   [cancellation section](#cancellation) says, and the run ends.
 9. **Pending.** If any call of the batch was deferred, the run ends
    with reason `input_required` and the deferred calls listed. Nothing
    below runs: a deferred call is a question to the caller, and the
@@ -905,7 +908,10 @@ stream and the running tools through their contexts, as agenttool RFC
   batch's order, so a call that ran to completion is answered in the
   transcript and only the calls the cancellation actually cut off are
   left pending, with reason `aborted`, or `undispatched` for a call
-  the cancellation reached before its hand-off. The executor is waited for, so
+  the cancellation reached before its hand-off. In a sequential batch
+  the cut calls end in the batch's order, so a call the cancellation
+  reached before its hand-off ends after the call it waited behind.
+  The executor is waited for, so
   every result it holds is received before the run ends.
 - The transcript holds only completed items. An output item the stream
   had opened and not completed is dropped, as under a retry.
@@ -1654,7 +1660,7 @@ sequentially, gives it one call, or holds a call with `wait`.
 | `clean-done` | one turn answered by a message ends `done`; the request carries the settings and the loop's transport members |
 | `tools-then-done` | a call runs after `response_end`, its output is appended, and the next request carries it |
 | `preflight-settles` | a call naming no tool and one whose arguments are not an object are settled in preflight with the batch section's error outputs |
-| `deferred-resumed-by-output` | a deferred call ends the run `input_required` with the call pending as `deferred`; a resume's output answers it |
+| `deferred-resumed-by-output` | a deferred call ends the run `input_required` with the call pending as `deferred` and an empty result in its place on `turn_end`; a resume's output answers it |
 | `deferred-resumed-by-approval` | an approval runs the call as a batch at turn 0 without the decision hook |
 | `resume-refusal-terminates` | an answer that asks to terminate ends the run `stopped` with cause `refused` without a model call |
 | `pending-refuses-prompt` | a prompt over an unanswered call is refused with no event; one that opens with the call's output is a resume |
@@ -1664,7 +1670,7 @@ sequentially, gives it one call, or holds a call with `wait`.
 | `max-turns` | the turn limit after a turn with calls: cause `max_turns`, the outputs appended |
 | `retry-then-answer` | an attempt that delivered nothing is retried, and the turn has one `turn_start` and one `response_end` |
 | `retry-drops-held-reasoning` | a reasoning item held by a failed attempt is dropped without an `item_end` |
-| `cancel-mid-batch` | a cancellation ends each started call, appends the finished call's output and leaves the cut call `aborted` |
+| `cancel-mid-batch` | a cancellation ends each started call, appends the finished call's output, leaves the cut call `aborted` and raises no `turn_end` |
 | `subscriber-fails-during-cancellation` | a subscriber failing on one cut call's `tool_end` does not cost the others theirs; the run ends `aborted`; a call the cut reached first is `undispatched` |
 | `nested-call` | a nested call's events carry its parent, fall between the parent's dispatch and end, and append nothing |
 | `steer` | a steered item is appended after the batch and `turn_end`, with mode `steer` |
