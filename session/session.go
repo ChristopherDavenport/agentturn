@@ -3917,6 +3917,12 @@ func (w *writer) inheritEnv(ctx context.Context) error {
 		return fmt.Errorf("session: env decodes as %s", e.EntryType())
 	}
 	env.EntryBase = agentsession.EntryBase{Unknown: env.Unknown}
+	// The copy is the child's own, appended natively, and the parent's
+	// may be a redacted session's entry: a redacted member the reset
+	// above leaves, one held in Unknown, goes too.
+	if err := agentsession.ClearRedacted(env); err != nil {
+		return fmt.Errorf("session: copy env: %w", err)
+	}
 	if _, err := w.append(ctx, env); err != nil {
 		return err
 	}

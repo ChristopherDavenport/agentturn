@@ -149,7 +149,10 @@ func calleeElsewhere(l *agentsession.LinkEntry) bool {
 // of a link it appended, the entry itself being the store's once
 // appended, and what a link copied onto another branch is built from.
 // A target or cancel member, which a callee link does not carry, is
-// left behind.
+// left behind, and so is a redacted member: the copy is appended
+// natively, and l may be a redacted session's entry, whose member
+// agentsession keeps in Unknown when it was read under a minor before
+// 0.13 or is in a form the format does not define.
 func calleeCopy(l *agentsession.LinkEntry, id string) *agentsession.LinkEntry {
 	c := &agentsession.LinkEntry{Rel: l.Rel, Session: l.Session, CallID: l.CallID, URL: l.URL, Task: l.Task, Context: l.Context}
 	c.ID = id
@@ -157,6 +160,7 @@ func calleeCopy(l *agentsession.LinkEntry, id string) *agentsession.LinkEntry {
 		c.Unknown = maps.Clone(l.Unknown)
 		delete(c.Unknown, "target")
 		delete(c.Unknown, "cancel")
+		_ = agentsession.ClearRedacted(c) // fails only on a nil entry
 	}
 	return c
 }

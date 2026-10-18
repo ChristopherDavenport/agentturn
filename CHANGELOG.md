@@ -30,6 +30,18 @@ versions may break the API.
   cancellation or a failure cuts off has no `turn_end`, and a deferred
   call's place in `turn_end`'s tool results holds an empty result; in a
   sequential batch the cut calls end in the batch's order.
+- Dependencies: `session` requires agentsession v0.0.27, up from
+  v0.0.24, so the sessions it writes are format 0.13, which a reader of
+  0.12 refuses once the file is raised. Every module requires agenttool
+  v0.0.23, up from v0.0.22, and openresponses v0.0.15, up from v0.0.14.
+- Fixed: `session`'s recorder writes no `redacted` member on an entry it
+  appends, so a redacted session it resumes takes its run as native
+  entries. Two entries it copies from ones it read could carry the
+  member when agentsession held it among the members it does not
+  define, as it does one in a form the format does not define: a
+  callee link copied onto another branch, and the copy of the env in
+  force a child is written. Both now clear it
+  (`agentsession.ClearRedacted`).
 
 ## v0.0.29 - 2026-10-13
 
