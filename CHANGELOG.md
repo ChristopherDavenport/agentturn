@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.30 - 2026-10-17
 
 - Added: the scenario corpus RFC 0001 promised, `testdata/loop/`, and
   RFC 0001 draft 0.3, which specifies it (#259). Each scenario is a
