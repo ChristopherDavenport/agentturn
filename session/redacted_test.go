@@ -35,7 +35,9 @@ func holdsRedacted(t *testing.T, e agentsession.Entry) bool {
 // imports it into store, as a redactor and a publisher do: each entry
 // in file order with the secret taken out, its references re-pointed to
 // the entries already written, and marked by mark, which a redactor
-// does with SetRedacted and its position.
+// does with SetRedacted and its position. A redacted session hashes
+// independently, so each response is given the request_hash of the
+// request the redacted session rebuilds for it, never the original's.
 func redactInto(t *testing.T, store *agentsession.MemoryStore, orig *agentsession.Session, mark func(agentsession.Entry, int) error) *agentsession.Session {
 	t.Helper()
 	h := agentsession.Header{
@@ -68,6 +70,11 @@ func redactInto(t *testing.T, store *agentsession.MemoryStore, orig *agentsessio
 		if err := mark(n, i+1); err != nil {
 			t.Fatal(err)
 		}
+		if r, ok := n.(*agentsession.ResponseEntry); ok {
+			if err := red.SetRequestHash(r); err != nil {
+				t.Fatalf("request hash for %s: %v", e.Base().ID, err)
+			}
+		}
 		res, err := red.Commit(n)
 		if err != nil {
 			t.Fatalf("commit %s: %v", e.Base().ID, err)
@@ -95,7 +102,8 @@ func redactInto(t *testing.T, store *agentsession.MemoryStore, orig *agentsessio
 // says a writer clears the member on an entry it appends natively from
 // one it took from a redacted session; agentsession keeps the member in
 // Unknown when it is in a form the format does not define, which is the
-// second case.
+// second case. Every response verifies, the redaction's included, since
+// a redacted session hashes independently.
 func TestResumeARedactedSession(t *testing.T) {
 	ctx := context.Background()
 	for name, mark := range map[string]func(agentsession.Entry, int) error{
@@ -172,10 +180,20 @@ func TestResumeARedactedSession(t *testing.T) {
 			if len(entries) <= made {
 				t.Fatalf("the resumed run appended nothing: %s", entryTypes(s))
 			}
+			redacted := 0
 			for i, e := range entries[:made] {
 				if _, ok := agentsession.RedactedOf(e); !ok && !isEnv(e) {
 					t.Errorf("entry %d (%s), made by the redaction, is no longer redacted", i, e.EntryType())
 				}
+				if _, ok := e.(*agentsession.ResponseEntry); ok {
+					redacted++
+					if err := s.Verify(e.Base().ID); err != nil {
+						t.Errorf("verify the redacted response %s: %v", e.Base().ID, err)
+					}
+				}
+			}
+			if redacted == 0 {
+				t.Errorf("the redaction made no response: %s", entryTypes(s))
 			}
 			responses := 0
 			for _, e := range entries[made:] {
