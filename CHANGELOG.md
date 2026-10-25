@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.32 - 2026-10-25
 
 - Fixed: `session`'s recorder writes through `agentsession.Writer`
   when the store has it, falling back to `Append`, so it learns what
