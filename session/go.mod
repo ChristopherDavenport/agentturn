@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/ChristopherDavenport/agentsession v0.0.28
 	github.com/ChristopherDavenport/agenttool v0.0.24
-	github.com/ChristopherDavenport/agentturn v0.0.30
+	github.com/ChristopherDavenport/agentturn v0.0.31
 	github.com/ChristopherDavenport/openresponses v0.0.15
 )
 

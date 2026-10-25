@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.31 - 2026-10-24
 
 - Changed: a batch's calls wait for the calls agenttool's
   `Executor.Preceding` says they run after, in place of the one before
