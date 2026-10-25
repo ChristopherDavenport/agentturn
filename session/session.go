@@ -801,6 +801,13 @@ func MarkedItem(c *agentsession.CustomEntry) (openresponses.Item, string, bool) 
 // written.
 var ErrRunActive = errors.New("session: a run is active")
 
+// ErrSessionReplaced is returned by [Recorder.Rebase] given a session
+// the store has since replaced: an append the store reported with
+// Reopen (agentsession.Result) left that session out of step, and the
+// recorder opened the session again. The session [WithReopened] was
+// handed is the one to rebase.
+var ErrSessionReplaced = errors.New("session: the store replaced this session")
+
 // sessionTrigger returns the trigger object for t, its Extra as
 // members of its own, or nil when t names nothing. The agent refuses
 // an Extra that cannot be written where the trigger enters; this
@@ -847,6 +854,7 @@ type Recorder struct {
 	children bool
 	env      func(context.Context) (*agentsession.EnvEntry, error)
 	parts    func(context.Context, openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart)
+	reopened func(*agentsession.Session)
 	now      func() time.Time
 	// agent is the agent Attach subscribed to, whose configuration is
 	// taken again at every run_start.
@@ -879,6 +887,10 @@ type Recorder struct {
 	// was seeded from, as [CompactOptions] does for the session: set
 	// wherever the root writer is seeded, nil on a fresh session.
 	compactOpts []compact.Option
+	// current is the root session as the store handed it back after an
+	// append it reported with Reopen, nil until one is; a rebase of any
+	// other session is refused.
+	current *agentsession.Session
 }
 
 // writer is the state of one session being written.
@@ -886,6 +898,9 @@ type writer struct {
 	rec *Recorder
 	id  string
 	cfg *agentturn.Config
+	// reopenOwed is set when the store reported an append with Reopen
+	// and the session has not been opened again since.
+	reopenOwed bool
 	// heldNotes is the data of the last [HeldNotesNS] entry written, nil
 	// until one is or the seeded set is read; seededNotes are the notes
 	// the path's last such entry held when the writer was seeded.
@@ -1440,6 +1455,18 @@ func WithEnv(fn func(context.Context) (*agentsession.EnvEntry, error)) Option {
 // entry under the option carries the text of every part, once.
 func WithInstructionsParts(fn func(ctx context.Context, req openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart)) Option {
 	return func(r *Recorder) { r.parts = fn }
+}
+
+// WithReopened is called with the root session when the store has
+// replaced it: an append the store reported with Reopen
+// (agentsession.Result) is durable, but the session the host holds,
+// the one [Start] or [Resume] returned, could not be brought in step
+// with it, and the recorder has opened the session again. The host
+// uses the session fn is handed from then on, and [Recorder.Rebase]
+// refuses the one it replaced. fn runs while the recorder writes, so
+// it must not call the recorder.
+func WithReopened(fn func(*agentsession.Session)) Option {
+	return func(r *Recorder) { r.reopened = fn }
 }
 
 // New returns a recorder writing to the session with the given ID in
@@ -2400,6 +2427,13 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 	}
 	w := r.root
 	ctx := context.Background()
+	if err := w.reopen(ctx); err != nil {
+		return fmt.Errorf("session: rebase: %w", err)
+	}
+	if r.current != nil && s != r.current {
+		// Its leaf is not the one the store appends at.
+		return fmt.Errorf("session: rebase: %w", ErrSessionReplaced)
+	}
 	// Only what the agent holds carries over; an input the old path
 	// owed and nobody took up stays with it.
 	var held []*inboxItem
@@ -4725,8 +4759,9 @@ const agentRunAgain = "run again"
 
 // toolDispatch writes the call's dispatch: the loop has handed it to
 // its tool, so from here its side effect may have happened. It is
-// durable before this returns, and a failure here stops the call, so
-// no tool runs after a dispatch the record does not hold. A call an
+// durable before this returns, as far as the store's acknowledgement
+// says (see append), and a failure here stops the call, so no tool
+// runs after a dispatch the record does not hold. A call an
 // earlier run dispatched and this one runs again gets a second, so
 // each time the tool may have run is on the path. A nested call has
 // no function_call item to anchor one to and its record is the custom
@@ -5275,10 +5310,42 @@ func isModelOutput(item openresponses.Item) bool {
 	return false
 }
 
+// append writes e through the store's [agentsession.Writer] when it
+// has one, so the recorder learns what the store alone can say, and
+// through Append otherwise.
+//
+// A Reopen in the result is a durable append whose session the store
+// could not bring in step: the recorder opens the session again at
+// once, or, when that fails, before the next entry, which fails with
+// it. Durable is not read. The header the recorder writes names its
+// records (run, dispatch, decision, queued), which the format requires
+// a store to make durable before it acknowledges them whatever its
+// sync policy, as the jsonl and cas stores do; and false is also what
+// a store reports that does not say, such as a remote server over a
+// store without a Writer, so it cannot be told from a lazy append and
+// refusing on it would refuse durable ones. A store's acknowledgement
+// of a dispatch is taken as that promise. Unresolved is not read
+// either: the recorder writes no reference a store resolves, only
+// links to sessions it wrote itself.
 func (w *writer) append(ctx context.Context, e agentsession.Entry) (string, error) {
-	id, err := w.rec.store.Append(ctx, w.id, e)
+	if err := w.reopen(ctx); err != nil {
+		return "", fmt.Errorf("session: append %s: %w", e.EntryType(), err)
+	}
+	var res agentsession.Result
+	var err error
+	if wr, ok := w.rec.store.(agentsession.Writer); ok {
+		res, err = wr.Write(ctx, w.id, e)
+	} else {
+		res.ID, err = w.rec.store.Append(ctx, w.id, e)
+	}
 	if err != nil {
 		return "", fmt.Errorf("session: append %s: %w", e.EntryType(), err)
+	}
+	id := res.ID
+	if res.Reopen {
+		// The append happened; a failed reopen is the next entry's.
+		w.reopenOwed = true
+		_ = w.reopen(ctx)
 	}
 	// The format reads a segment holding a function call output or a
 	// decision as one that answered a call, which is the shape its
@@ -5293,6 +5360,26 @@ func (w *writer) append(ctx context.Context, e agentsession.Entry) (string, erro
 		}
 	}
 	return id, nil
+}
+
+// reopen opens the session again when an append left it owed, and
+// hands the root's to the host.
+func (w *writer) reopen(ctx context.Context) error {
+	if !w.reopenOwed {
+		return nil
+	}
+	s, err := w.rec.store.Open(context.WithoutCancel(ctx), w.id)
+	if err != nil {
+		return fmt.Errorf("reopen session %s: %w", w.id, err)
+	}
+	w.reopenOwed = false
+	if r := w.rec; w == r.root {
+		r.current = s
+		if r.reopened != nil {
+			r.reopened(s)
+		}
+	}
+	return nil
 }
 
 // configDelta returns the config entry that takes prev to next, nil when
