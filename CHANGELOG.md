@@ -7,6 +7,22 @@ versions may break the API.
 
 ## Unreleased
 
+- Changed: a batch's calls wait for the calls agenttool's
+  `Executor.Preceding` says they run after, in place of the one before
+  each in its chain from `Executor.Chains`. A call of an
+  `agenttool.Barrier` tool is dispatched once every call before it in
+  the batch has been settled, `AfterToolCall` included, and the calls
+  after it once it has been; the calls between two barriers run
+  alongside each other. So `read read bash read read`, with a barrier
+  `bash`, takes three steps where a `Sequential` `bash` took five. A
+  batch with no barrier runs as before. RFC 0001's execution and
+  cancellation rules say so, and a new scenario, `cancel-mid-barrier`,
+  pins the cut order: the segment that was running ends first, then
+  the calls of each segment not yet started, in the batch's order. The
+  scenario tools take a `barrier` property.
+- Dependencies: needs the agenttool release that adds `Barrier` and
+  `Executor.Preceding` (agenttool#87); every module's require moves to
+  it once it is released.
 - Dependencies: `session` requires agentsession v0.0.28, up from
   v0.0.27. A redacted session now hashes independently: a redactor
   gives each redacted response the `request_hash` of the request the
