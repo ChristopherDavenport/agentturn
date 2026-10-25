@@ -2125,10 +2125,12 @@ type callState struct {
 	// read by the loop after the executor has drained.
 	key        string
 	dispatched bool
-	// after is the call before this one in its chain, whose settling
-	// this one's dispatch waits for, and done is closed once the loop
-	// has settled this call's result, when a later call waits for it.
-	after *callState
+	// after is the calls before this one that its dispatch waits for
+	// the settling of: the one before it in its chain, or, around an
+	// agenttool.Barrier, every call of the segment before it. done is
+	// closed once the loop has settled this call's result, when a later
+	// call waits for it.
+	after []*callState
 	done  chan struct{}
 }
 
@@ -2320,14 +2322,19 @@ func (r *runner) execute(ctx context.Context, batch []*callState) error {
 		byID[p.call.CallID] = p
 	}
 	exec := r.executor(func(job agenttool.Job) *callState { return byID[job.Call.ID] })
-	// A call waits for the one before it in its chain, as the executor
-	// orders them: the same Executor value that runs the batch below
-	// says which that is, so the two cannot disagree (agenttool#66).
-	for _, chain := range exec.Chains(jobs) {
-		for k := 1; k < len(chain); k++ {
-			prev := batch[jobIndex[chain[k-1]]]
-			prev.done = make(chan struct{})
-			batch[jobIndex[chain[k]]].after = prev
+	// A call waits for the calls the executor runs it after: the one
+	// before it in its chain, or, around a barrier, every call of the
+	// segment before it. The same Executor value that runs the batch
+	// below says which those are, so the two cannot disagree
+	// (agenttool#66).
+	for j, pre := range exec.Preceding(jobs) {
+		for _, k := range pre {
+			prev := batch[jobIndex[k]]
+			if prev.done == nil {
+				prev.done = make(chan struct{})
+			}
+			p := batch[jobIndex[j]]
+			p.after = append(p.after, prev)
 		}
 	}
 	// The batch has a context of its own, so a failure can stop the
@@ -2465,10 +2472,12 @@ func isCancellation(err error, ctx context.Context) bool {
 // that error, so the tool does not run after a dispatch nobody could
 // record.
 //
-// The executor starts a chain's next job once the loop has received
-// the last one's result, before the loop has settled it, so the
-// callback first waits for that: AfterToolCall, and whatever a hook
-// writes there, lands before the next call of the chain is dispatched.
+// The executor starts a job once the loop has received the results of
+// the jobs it runs after (agenttool's Executor.Preceding: the one
+// before it in its chain, or every job of the segment before a
+// barrier), before the loop has settled them, so the callback first
+// waits for every one of those: AfterToolCall, and whatever a hook
+// writes there, lands before the next call is dispatched.
 // The loop's goroutine does the settling and waits on nothing of the
 // job's, so the wait ends; a batch cut off meanwhile ends it with the
 // cancellation, as for a job whose turn never came.
@@ -2482,9 +2491,9 @@ func (r *runner) executor(find func(agenttool.Job) *callState) agenttool.Executo
 			if p == nil {
 				return nil
 			}
-			if p.after != nil {
+			for _, prev := range p.after {
 				select {
-				case <-p.after.done:
+				case <-prev.done:
 				case <-ctx.Done():
 				}
 				if err := ctx.Err(); err != nil {

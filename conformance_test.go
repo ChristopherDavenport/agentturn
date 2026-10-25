@@ -52,6 +52,7 @@ type scenarioConfig struct {
 type scenarioTool struct {
 	Name       string          `json:"name"`
 	Sequential bool            `json:"sequential"`
+	Barrier    bool            `json:"barrier"`
 	Result     *scriptedResult `json:"result"`
 }
 
@@ -726,6 +727,7 @@ func (s *scriptedTool) Name() string                { return s.spec.Name }
 func (s *scriptedTool) Description() string         { return "" }
 func (s *scriptedTool) Parameters() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
 func (s *scriptedTool) Sequential() bool            { return s.spec.Sequential }
+func (s *scriptedTool) Barrier() bool               { return s.spec.Barrier }
 
 func (s *scriptedTool) Execute(ctx context.Context, call agenttool.Call) (agenttool.Result, error) {
 	r := s.results[call.ID]

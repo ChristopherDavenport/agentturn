@@ -1,0 +1,59 @@
+{
+  "name": "cancel-mid-barrier",
+  "description": "In a parallel batch, a barrier call is dispatched only once every call before it has ended, and a cancellation while it runs ends it, then the calls after it, which were never dispatched, in the batch's order.",
+  "rules": ["#cancellation", "#execution", "#invariants", "#ending-a-run"],
+  "config": {"model": "m"},
+  "tools": [{"name": "read"}, {"name": "build", "barrier": true}, {"name": "list"}],
+  "results": {
+    "call_1": {"output": "contents of a"},
+    "call_2": {"wait": "cancel"},
+    "call_3": {"output": "never"}
+  },
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"},
+      {"type": "function_call", "call_id": "call_2", "name": "build", "arguments": "{}"},
+      {"type": "function_call", "call_id": "call_3", "name": "list", "arguments": "{}"}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read, build, then list"}]}],
+      "cancel_at": {"type": "tool_dispatch", "call_id": "call_2"},
+      "expect": {
+        "events": [
+          {"type": "run_start", "source": "input"},
+          {"type": "item_start", "item": {"type": "message", "role": "user"}},
+          {"type": "item_end", "item": {"type": "message", "role": "user"}},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start", "item": {"type": "function_call", "call_id": "call_1"}},
+          {"type": "item_end", "item": {"type": "function_call", "call_id": "call_1"}},
+          {"type": "item_start", "item": {"type": "function_call", "call_id": "call_2"}},
+          {"type": "item_end", "item": {"type": "function_call", "call_id": "call_2"}},
+          {"type": "item_start", "item": {"type": "function_call", "call_id": "call_3"}},
+          {"type": "item_end", "item": {"type": "function_call", "call_id": "call_3"}},
+          {"type": "response_end", "turn": 1},
+          {"type": "tool_start", "call_id": "call_1"},
+          {"type": "tool_start", "call_id": "call_2"},
+          {"type": "tool_start", "call_id": "call_3"},
+          {"type": "tool_dispatch", "call_id": "call_1"},
+          {"type": "tool_end", "call_id": "call_1", "result": {"output": "contents of a"}, "error": false},
+          {"type": "tool_dispatch", "call_id": "call_2"},
+          {"type": "tool_end", "call_id": "call_2", "error": true},
+          {"type": "tool_end", "call_id": "call_3", "error": true},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_1", "output": "contents of a"}},
+          {"type": "run_end", "reason": "aborted", "cause": "", "error": true,
+           "pending": [{"call_id": "call_2", "reason": "aborted"}, {"call_id": "call_3", "reason": "undispatched"}]}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "function_call", "call_id": "call_1"},
+          {"type": "function_call", "call_id": "call_2"},
+          {"type": "function_call", "call_id": "call_3"},
+          {"type": "function_call_output", "call_id": "call_1", "output": "contents of a"}
+        ]
+      }
+    }
+  ]
+}

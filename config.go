@@ -28,7 +28,10 @@ type ExecutionMode int
 const (
 	// ExecParallel runs the calls of a batch concurrently, bounded by
 	// [Config.MaxParallelTools], unless a tool in the batch is
-	// agenttool.Sequential.
+	// agenttool.Sequential. A call of an agenttool.Barrier tool runs
+	// alone in its place: after every call before it has been settled,
+	// AfterToolCall included, and before any call after it is
+	// dispatched; the calls between two barriers run concurrently.
 	ExecParallel ExecutionMode = iota
 	// ExecSequential runs every batch one call at a time in the model's
 	// order.

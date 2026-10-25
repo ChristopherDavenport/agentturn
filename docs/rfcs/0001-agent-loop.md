@@ -636,14 +636,18 @@ batch, with the configuration's execution mode and bound and each
 call's arguments as decided. The executor's rules are agenttool RFC
 0001's: results matched by call, completion order free, one sequential
 tool serialising the batch, a shared resource serialising its calls,
-cancellation waited for. A `tool_dispatch` is raised as each call is
-handed to its tool, after it has taken a slot in the bound and its turn
-in a serial batch or a resource chain, and before the tool runs; a call
-the cut reaches first never reached a tool and raises none. Its turn in
-a chain comes once the call before it has been settled, the after-call
+a barrier call running alone in its place, cancellation waited for. A
+`tool_dispatch` is raised as each call is handed to its tool, after it
+has taken a slot in the bound and its turn in a serial batch, a
+resource chain or around a barrier, and before the tool runs; a call
+the cut reaches first never reached a tool and raises none. Its turn
+comes once every call it runs after has been settled, the after-call
 hook included, not merely completed, so what that hook changes or
-records lands before the next call of the chain is dispatched; a call
-of another chain is not held for it. It is
+records lands before the next call is dispatched: in a chain the call
+before it, and around a barrier every call of the segment before (a
+barrier waits for every call since the previous barrier, and the calls
+after a barrier for the barrier); a call of another chain in the same
+segment is not held for it. It is
 raised on the call's own goroutine, serialised with the run's events,
 and the executor waits on it, so a recorder has the dispatch durable
 before the side effect. A consumer that fails on it stops the call
@@ -910,7 +914,11 @@ stream and the running tools through their contexts, as agenttool RFC
   left pending, with reason `aborted`, or `undispatched` for a call
   the cancellation reached before its hand-off. In a sequential batch
   the cut calls end in the batch's order, so a call the cancellation
-  reached before its hand-off ends after the call it waited behind.
+  reached before its hand-off ends after the call it waited behind. In
+  a batch with a barrier, the calls of the segment that was running
+  when the cancellation came end first, in no fixed order among
+  themselves, then the calls of each segment not yet started, in the
+  batch's order.
   The executor is waited for, so
   every result it holds is received before the run ends.
 - The transcript holds only completed items. An output item the stream
@@ -1573,7 +1581,7 @@ repository, and it uses the module's exported API alone.
 | `description` | the rule the scenario pins, in a sentence |
 | `rules` | the anchors of the sections of this document it exercises, each of which MUST name a heading here |
 | `config` | the configuration: `model`, the model name; `instructions`; `max_turns`; `tool_execution`, `parallel` or `sequential`; `max_parallel_tools`; `retry.max_attempts`. Zero or absent is the member's default |
-| `tools` | the tools of the moment, in order: each a `name`, its `sequential` property, and the `result` it answers a call with when `results` names none for the call |
+| `tools` | the tools of the moment, in order: each a `name`, its `sequential` and `barrier` properties, and the `result` it answers a call with when `results` names none for the call |
 | `results` | a scripted result per call ID |
 | `decisions` | the decision hook's decision per call ID: `action`, one of `allow`, `block` and `defer`, with a `reason` and a `terminate` hint. A call the map does not name, and every nested call, is decided none. A scenario without the member has no decision hook |
 | `transcript` | the items the agent starts from |
@@ -1651,7 +1659,7 @@ mints, a timestamp or a binding's error text.
 
 A scenario MUST be deterministic under any conforming loop: where the
 completion order of a batch would vary, it runs the batch
-sequentially, gives it one call, or holds a call with `wait`.
+sequentially, gives it one call, orders it with a barrier, or holds a call with `wait`.
 
 #### The scenarios
 
