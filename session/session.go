@@ -5364,8 +5364,10 @@ func isModelOutput(item openresponses.Item) bool {
 }
 
 // append writes e through the store's [agentsession.Writer] when it
-// has one, so the recorder learns what the store alone can say, and
-// through Append otherwise.
+// has one, and through Append otherwise. Write also returns the
+// store's [agentsession.Result]: whether the caller must reopen the
+// session, whether the append was durable, and which references the
+// store could not resolve. Append returns only the entry's ID.
 //
 // A Reopen in the result is a durable append whose session the store
 // could not bring in step: the recorder opens the session again at
