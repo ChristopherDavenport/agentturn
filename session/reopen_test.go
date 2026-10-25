@@ -11,6 +11,7 @@ import (
 	"github.com/ChristopherDavenport/agentsession"
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
+	"github.com/ChristopherDavenport/agentturn/tools/agent"
 	"github.com/ChristopherDavenport/openresponses"
 	"github.com/ChristopherDavenport/openresponses/echo"
 )
@@ -23,18 +24,30 @@ import (
 // set, as a store that does not report it leaves it.
 type reopenStore struct {
 	*agentsession.MemoryStore
-	at func(agentsession.Entry) bool
+	at func(id string, e agentsession.Entry) bool
 
 	mu      sync.Mutex
 	cur     map[string]*agentsession.Session
 	reopens int
+	// refuse fails every Open from when it is set.
+	refuse bool
 }
 
-func newReopenStore(at func(agentsession.Entry) bool) *reopenStore {
+func newReopenStore(at func(id string, e agentsession.Entry) bool) *reopenStore {
 	return &reopenStore{MemoryStore: agentsession.NewMemoryStore(), at: at, cur: map[string]*agentsession.Session{}}
 }
 
 func (s *reopenStore) Open(ctx context.Context, id string) (*agentsession.Session, error) {
+	s.mu.Lock()
+	refuse := s.refuse
+	s.mu.Unlock()
+	if refuse {
+		return nil, errors.New("store away")
+	}
+	return s.held(ctx, id)
+}
+
+func (s *reopenStore) held(ctx context.Context, id string) (*agentsession.Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if sess, ok := s.cur[id]; ok {
@@ -57,11 +70,11 @@ func (s *reopenStore) Append(ctx context.Context, id string, e agentsession.Entr
 }
 
 func (s *reopenStore) Write(ctx context.Context, id string, e agentsession.Entry) (agentsession.Result, error) {
-	live, err := s.Open(ctx, id)
+	live, err := s.held(ctx, id)
 	if err != nil {
 		return agentsession.Result{}, err
 	}
-	if !s.at(e) {
+	if !s.at(id, e) {
 		got, err := live.Append(e)
 		return agentsession.Result{ID: got}, err
 	}
@@ -97,7 +110,7 @@ func rebuilt(s *agentsession.Session) (*agentsession.Session, error) {
 // dispatches it acknowledges run their tools.
 func TestAReopenedSessionIsTheOneRebased(t *testing.T) {
 	first := true
-	store := newReopenStore(func(e agentsession.Entry) bool {
+	store := newReopenStore(func(_ string, e agentsession.Entry) bool {
 		_, ok := e.(*agentsession.DispatchEntry)
 		reopen := ok && first
 		if reopen {
@@ -168,7 +181,7 @@ func TestAReopenedSessionIsTheOneRebased(t *testing.T) {
 // which the end and the inputs written again after it are on.
 func TestResumeReturnsTheSessionAReopenLeft(t *testing.T) {
 	armed := false
-	store := newReopenStore(func(e agentsession.Entry) bool {
+	store := newReopenStore(func(_ string, e agentsession.Entry) bool {
 		r, ok := e.(*agentsession.RunEntry)
 		return armed && ok && r.IsEnd()
 	})
@@ -224,6 +237,107 @@ func TestResumeReturnsTheSessionAReopenLeft(t *testing.T) {
 	}
 }
 
+// TestResumeFailsWhenItsReopenFails pins #268: when the store reports
+// the end Resume writes with Reopen and the session cannot be opened
+// again, Resume fails rather than return the session the store
+// replaced, seeded from a path without that end. The cut run owed no
+// input, so the end is the only entry Resume writes.
+func TestResumeFailsWhenItsReopenFails(t *testing.T) {
+	armed := false
+	var store *reopenStore
+	store = newReopenStore(func(_ string, e agentsession.Entry) bool {
+		r, ok := e.(*agentsession.RunEntry)
+		if armed && ok && r.IsEnd() {
+			store.refuse = true
+			return true
+		}
+		return false
+	})
+	ctx := context.Background()
+	cut, err := store.Create(ctx, agentsession.Header{Records: agentsession.AllRecords})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := agentsession.ConfigFromRequest(openresponses.Request{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range []agentsession.Entry{
+		agentsession.NewRunStart("run_cut", agentsession.SourceInput, ""),
+		cfg,
+		&agentsession.ItemEntry{Item: openresponses.UserText("hello")},
+	} {
+		if _, err := store.Append(ctx, cut.ID(), e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	armed = true
+	rec, s, err := Resume(ctx, store, cut.ID())
+	if err == nil || rec != nil || s != nil {
+		t.Fatalf("Resume after a failed reopen: err = %v", err)
+	}
+	if store.reopens != 1 {
+		t.Errorf("reopens = %d", store.reopens)
+	}
+}
+
+// TestAChildSessionsReopenIsTheRecordersOwn pins #268: a Reopen on an
+// entry of a child session has the recorder open that session again,
+// and the host, which holds only the root, is not handed it.
+func TestAChildSessionsReopenIsTheRecordersOwn(t *testing.T) {
+	var root string
+	store := newReopenStore(func(id string, e agentsession.Entry) bool {
+		_, ok := e.(*agentsession.DispatchEntry)
+		return ok && id != root
+	})
+	var handed []*agentsession.Session
+	rec, s, err := Start(context.Background(), store, agentsession.Header{}, WithReopened(func(s *agentsession.Session) {
+		handed = append(handed, s)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root = s.ID()
+	note := agenttool.New("note", "note something", func(context.Context, echoArgs) (string, error) {
+		return "noted", nil
+	})
+	childCfg := agentturn.Config{Name: "specialist", Description: "notes things", Model: &echo.Adapter{}, Tools: []agenttool.Tool{note}}
+	specialist := agent.New(childCfg, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{specialist}})
+	defer rec.Attach(a)()
+	ctx := ContextWithSessionID(context.Background(), rec.SessionID())
+	if _, err := a.Prompt(ctx, openresponses.UserText("delegate")); err != nil {
+		t.Fatal(err)
+	}
+	if store.reopens != 1 || len(handed) != 0 {
+		t.Fatalf("reopens = %d, sessions handed = %d", store.reopens, len(handed))
+	}
+	l := links(s)
+	if len(l) != 1 {
+		t.Fatalf("links = %+v", l)
+	}
+	child, err := store.Open(context.Background(), l[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputs := 0
+	for _, e := range child.Path(child.Leaf()) {
+		if it, ok := e.(*agentsession.ItemEntry); ok {
+			if _, ok := it.Item.(*openresponses.FunctionCallOutput); ok {
+				outputs++
+			}
+		}
+	}
+	if outputs != 1 {
+		t.Errorf("tool outputs on the child's reopened session = %d, want 1", outputs)
+	}
+	verifyAll(t, child)
+	verifyAll(t, s)
+	if err := rec.Rebase(s, s.Leaf()); err != nil {
+		t.Errorf("rebase of the root: %v", err)
+	}
+}
+
 // failingOpenStore reports Reopen for every entry and fails the Opens
 // that follow until fail is cleared.
 type failingOpenStore struct {
@@ -258,7 +372,7 @@ func testNote(text string) agentsession.Entry {
 // reported with Reopen stands when the reopen fails, and the next entry
 // fails, as the session is still out of step.
 func TestAFailedReopenFailsTheNextEntry(t *testing.T) {
-	store := &failingOpenStore{reopenStore: newReopenStore(func(agentsession.Entry) bool { return false }), fail: true}
+	store := &failingOpenStore{reopenStore: newReopenStore(func(string, agentsession.Entry) bool { return false }), fail: true}
 	rec, _, err := Start(context.Background(), store, agentsession.Header{})
 	if err != nil {
 		t.Fatal(err)

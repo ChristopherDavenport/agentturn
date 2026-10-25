@@ -802,11 +802,12 @@ func MarkedItem(c *agentsession.CustomEntry) (openresponses.Item, string, bool) 
 var ErrRunActive = errors.New("session: a run is active")
 
 // ErrSessionReplaced is returned by [Recorder.Rebase] given a session
-// other than the one the store holds: an append the store reported
-// with Reopen (agentsession.Result) left that session out of step, and
-// the store appends at the leaf of the one it opened again. The
-// session to rebase is the one [WithReopened] was handed, or the one
-// the store's Open returns.
+// other than the one the store holds, the one its Open returns. Most
+// often an append the store reported with Reopen
+// (agentsession.Result) left that session out of step, and the store
+// appends at the leaf of the one it opened again, which [WithReopened]
+// was handed; a session the host released, or a copy read with
+// agentsession.Reader, is refused the same way.
 var ErrSessionReplaced = errors.New("session: the store replaced this session")
 
 // sessionTrigger returns the trigger object for t, its Extra as
@@ -1538,7 +1539,9 @@ func Start(ctx context.Context, store agentsession.Store, h agentsession.Header,
 		if err := r.root.closeOpenRun(ctx, s, agentsession.ReasonInterrupted, "fork at "+s.Header().Base, false); err != nil {
 			return nil, nil, err
 		}
-		s = r.held(s)
+		if s, err = r.held(ctx, s); err != nil {
+			return nil, nil, err
+		}
 		if err := r.root.seed(ctx, s, true); err != nil {
 			return nil, nil, err
 		}
@@ -2339,7 +2342,10 @@ func resume(ctx context.Context, s *agentsession.Session, store agentsession.Sto
 	if err := r.root.closeOpenRun(ctx, s, agentsession.ReasonError, "cut off: closed on resume", true); err != nil {
 		return nil, nil, err
 	}
-	s = r.held(s)
+	s, err := r.held(ctx, s)
+	if err != nil {
+		return nil, nil, err
+	}
 	if err := r.root.seed(ctx, s, true); err != nil {
 		return nil, nil, err
 	}
@@ -2397,8 +2403,10 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 // refuses with [ErrRunActive] while a run is being written, and s must
 // be the session the recorder writes, the one the store's Open returns:
 // another, such as one the store replaced behind a reopen
-// ([WithReopened]), is refused with [ErrSessionReplaced]. The agent's transcript is the
-// caller's to set, with Agent.SetTranscript from [Transcript], or from
+// ([WithReopened]), is refused with [ErrSessionReplaced]. That Open
+// takes the store's hold of the session again if it was let go, so a
+// session another process holds fails with the store's error. The
+// agent's transcript is the caller's to set, with Agent.SetTranscript from [Transcript], or from
 // [TranscriptModels] with its models on the next run's context through
 // agentturn.ContextWithReasoningModels, and
 // then Agent.SetPending from [Pending], so a call held on the branch
@@ -2473,7 +2481,11 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 		if err := w.requeue(ctx); err != nil {
 			return err
 		}
-		return r.reserve(r.held(s))
+		s, err := r.held(ctx, s)
+		if err != nil {
+			return err
+		}
+		return r.reserve(s)
 	}
 	if err := s.Branch(entryID); err != nil {
 		return fmt.Errorf("session: rebase: %w", err)
@@ -2482,7 +2494,9 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 	if err := w.closeOpenRun(ctx, s, agentsession.ReasonInterrupted, "rewind to "+entryID, false); err != nil {
 		return err
 	}
-	s = r.held(s)
+	if s, err = r.held(ctx, s); err != nil {
+		return err
+	}
 	owed, err := s.PendingQueued(s.Leaf())
 	if err != nil {
 		return fmt.Errorf("session: queued inputs at leaf: %w", err)
@@ -2499,7 +2513,9 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 	if err := w.requeue(ctx); err != nil {
 		return err
 	}
-	s = r.held(s)
+	if s, err = r.held(ctx, s); err != nil {
+		return err
+	}
 	if err := w.seed(ctx, s, false); err != nil {
 		return err
 	}
@@ -2510,12 +2526,17 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 }
 
 // held is s, or the root session the store replaced it with while the
-// recorder wrote to it.
-func (r *Recorder) held(s *agentsession.Session) *agentsession.Session {
-	if r.current != nil {
-		return r.current
+// recorder wrote to it. A reopen still owed is made first, and its
+// failure is returned: s is then out of step and nothing is to be
+// seeded from it.
+func (r *Recorder) held(ctx context.Context, s *agentsession.Session) (*agentsession.Session, error) {
+	if err := r.root.reopen(ctx); err != nil {
+		return nil, fmt.Errorf("session: %w", err)
 	}
-	return s
+	if r.current != nil {
+		return r.current, nil
+	}
+	return s, nil
 }
 
 // reserve reserves every call ID in the session on the attached agent,
