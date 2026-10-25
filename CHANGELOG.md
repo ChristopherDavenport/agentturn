@@ -20,9 +20,8 @@ versions may break the API.
   pins the cut order: the segment that was running ends first, then
   the calls of each segment not yet started, in the batch's order. The
   scenario tools take a `barrier` property.
-- Dependencies: needs the agenttool release that adds `Barrier` and
-  `Executor.Preceding` (agenttool#87); every module's require moves to
-  it once it is released.
+- Dependencies: agenttool v0.0.24, up from v0.0.23, in every module:
+  the release that adds `Barrier` and `Executor.Preceding`.
 - Dependencies: `session` requires agentsession v0.0.28, up from
   v0.0.27. A redacted session now hashes independently: a redactor
   gives each redacted response the `request_hash` of the request the
