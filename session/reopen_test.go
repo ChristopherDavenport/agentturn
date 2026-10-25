@@ -12,13 +12,15 @@ import (
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/openresponses"
+	"github.com/ChristopherDavenport/openresponses/echo"
 )
 
 // reopenStore is a store whose Write reports Reopen for the entries at
-// picks: the entry is appended, and the session the store holds is then
-// one rebuilt from what it wrote, as a remote client's is when it could
-// not follow the server. The session handed out before stays as it
-// was, and appends go to the rebuilt one.
+// picks, as a remote client's does when its session could not follow
+// the server: the entry goes to a session rebuilt from what the store
+// wrote, which the store holds from then on, and the session handed
+// out before has neither it nor anything after it. Durable is never
+// set, as a store that does not report it leaves it.
 type reopenStore struct {
 	*agentsession.MemoryStore
 	at func(agentsession.Entry) bool
@@ -59,23 +61,23 @@ func (s *reopenStore) Write(ctx context.Context, id string, e agentsession.Entry
 	if err != nil {
 		return agentsession.Result{}, err
 	}
-	got, err := live.Append(e)
+	if !s.at(e) {
+		got, err := live.Append(e)
+		return agentsession.Result{ID: got}, err
+	}
+	fresh, err := rebuilt(live)
 	if err != nil {
 		return agentsession.Result{}, err
 	}
-	r := agentsession.Result{ID: got, Durable: true}
-	if s.at(e) {
-		fresh, err := rebuilt(live)
-		if err != nil {
-			return agentsession.Result{}, err
-		}
-		s.mu.Lock()
-		s.cur[id] = fresh
-		s.reopens++
-		s.mu.Unlock()
-		r.Reopen = true
+	got, err := fresh.Append(e)
+	if err != nil {
+		return agentsession.Result{}, err
 	}
-	return r, nil
+	s.mu.Lock()
+	s.cur[id] = fresh
+	s.reopens++
+	s.mu.Unlock()
+	return agentsession.Result{ID: got, Reopen: true}, nil
 }
 
 // rebuilt is a copy of s read back from its encoding.
@@ -91,7 +93,8 @@ func rebuilt(s *agentsession.Session) (*agentsession.Session, error) {
 // reports with Reopen has the recorder open the session again and hand
 // it to the host, and a rebase of the session the store replaced is
 // refused, since the store would append the next entry at its own leaf
-// and not the rebase's.
+// and not the rebase's. The store never reports Durable, and the
+// dispatches it acknowledges run their tools.
 func TestAReopenedSessionIsTheOneRebased(t *testing.T) {
 	first := true
 	store := newReopenStore(func(e agentsession.Entry) bool {
@@ -121,8 +124,8 @@ func TestAReopenedSessionIsTheOneRebased(t *testing.T) {
 	if open, _ := store.Open(context.Background(), s.ID()); open != live || live == s {
 		t.Fatal("the session handed is not the one the store holds")
 	}
-	if len(live.Entries()) <= len(s.Entries()) {
-		t.Fatalf("the replaced session has %d entries, the store's %d", len(s.Entries()), len(live.Entries()))
+	if _, ok := s.Entry(live.Leaf()); ok {
+		t.Fatal("the replaced session holds the run's end")
 	}
 	var checkpoint string
 	for _, e := range live.Entries() {
@@ -131,6 +134,9 @@ func TestAReopenedSessionIsTheOneRebased(t *testing.T) {
 				checkpoint = e.Base().ID
 			}
 		}
+	}
+	if checkpoint == "" {
+		t.Fatal("no tool output: a dispatch without Durable did not run its tool")
 	}
 	if err := rec.Rebase(s, checkpoint); !errors.Is(err, ErrSessionReplaced) {
 		t.Fatalf("rebase of the replaced session: err = %v", err)
@@ -154,6 +160,68 @@ func TestAReopenedSessionIsTheOneRebased(t *testing.T) {
 		t.Fatal(err)
 	}
 	verifyAll(t, live)
+}
+
+// TestResumeReturnsTheSessionAReopenLeft pins #268: Resume closes a
+// run a cut left open, and when the store reports that end with Reopen
+// it seeds the recorder from, and returns, the session the store holds,
+// which the end and the inputs written again after it are on.
+func TestResumeReturnsTheSessionAReopenLeft(t *testing.T) {
+	armed := false
+	store := newReopenStore(func(e agentsession.Entry) bool {
+		r, ok := e.(*agentsession.RunEntry)
+		return armed && ok && r.IsEnd()
+	})
+	cut := cutRun(t, store)
+	armed = true
+	var handed []*agentsession.Session
+	rec, s, err := Resume(context.Background(), store, cut.ID(), WithReopened(func(s *agentsession.Session) {
+		handed = append(handed, s)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	armed = false
+	open, _ := store.Open(context.Background(), cut.ID())
+	if store.reopens != 1 || len(handed) != 1 || s != handed[0] || s != open || s == cut {
+		t.Fatalf("reopens = %d, handed = %d; Resume returned the store's session: %v", store.reopens, len(handed), s == open)
+	}
+	owed, err := s.PendingQueued(s.Leaf())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(owed) != 1 {
+		t.Fatalf("owed after resume = %+v", owed)
+	}
+	if err := s.VerifyRecords(s.Leaf()); err != nil {
+		t.Errorf("verify records: %v", err)
+	}
+	// The recorder was seeded with the input written again, not the one
+	// the end closed, so Requeue hands back the entry the path owes.
+	cx, err := s.Context()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"}, agentturn.WithTranscript(cx.Items))
+	defer rec.Attach(a)()
+	if n := rec.Requeue(context.Background(), a); n != 1 {
+		t.Fatalf("requeued %d", n)
+	}
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("go on")); err != nil {
+		t.Fatal(err)
+	}
+	var drained *agentsession.ItemEntry
+	for _, e := range s.Entries() {
+		if v, ok := e.(*agentsession.ItemEntry); ok && v.QueuedFrom != "" {
+			drained = v
+		}
+	}
+	if drained == nil || drained.QueuedFrom != owed[0].ID {
+		t.Errorf("drained item = %+v, want queued_from %s", drained, owed[0].ID)
+	}
+	if err := rec.Rebase(s, s.Leaf()); err != nil {
+		t.Errorf("rebase of the returned session: %v", err)
+	}
 }
 
 // failingOpenStore reports Reopen for every entry and fails the Opens

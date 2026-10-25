@@ -802,10 +802,11 @@ func MarkedItem(c *agentsession.CustomEntry) (openresponses.Item, string, bool) 
 var ErrRunActive = errors.New("session: a run is active")
 
 // ErrSessionReplaced is returned by [Recorder.Rebase] given a session
-// the store has since replaced: an append the store reported with
-// Reopen (agentsession.Result) left that session out of step, and the
-// recorder opened the session again. The session [WithReopened] was
-// handed is the one to rebase.
+// other than the one the store holds: an append the store reported
+// with Reopen (agentsession.Result) left that session out of step, and
+// the store appends at the leaf of the one it opened again. The
+// session to rebase is the one [WithReopened] was handed, or the one
+// the store's Open returns.
 var ErrSessionReplaced = errors.New("session: the store replaced this session")
 
 // sessionTrigger returns the trigger object for t, its Extra as
@@ -887,9 +888,9 @@ type Recorder struct {
 	// was seeded from, as [CompactOptions] does for the session: set
 	// wherever the root writer is seeded, nil on a fresh session.
 	compactOpts []compact.Option
-	// current is the root session as the store handed it back after an
-	// append it reported with Reopen, nil until one is; a rebase of any
-	// other session is refused.
+	// current is the root session the store holds as the recorder last
+	// learned it: from a reopen, or from the Open a rebase checks its
+	// session against. nil until either.
 	current *agentsession.Session
 }
 
@@ -1459,12 +1460,20 @@ func WithInstructionsParts(fn func(ctx context.Context, req openresponses.Reques
 
 // WithReopened is called with the root session when the store has
 // replaced it: an append the store reported with Reopen
-// (agentsession.Result) is durable, but the session the host holds,
-// the one [Start] or [Resume] returned, could not be brought in step
-// with it, and the recorder has opened the session again. The host
-// uses the session fn is handed from then on, and [Recorder.Rebase]
-// refuses the one it replaced. fn runs while the recorder writes, so
-// it must not call the recorder.
+// (agentsession.Result) is durable, but the session the host holds
+// could not be brought in step with it, and the recorder has opened
+// the session again. The host uses the session fn is handed from then
+// on; [Recorder.Rebase] refuses the one it replaced. The store's Open
+// returns the same session, for a host that learns of a reopen some
+// other way, such as one reported to an append of its own.
+//
+// fn runs on the goroutine writing the entry, with the recorder's lock
+// held: in the agent's event delivery, or in the call of the host's
+// that wrote it, [Recorder.Rebase], Queue, Fold or Requeue among them.
+// It must not call the recorder, nor wait on a lock the host holds
+// while it calls the recorder. It can run inside [Start], [Resume] and
+// [Continue], whose appends a store can report with Reopen too; the
+// session they return is then the one fn was handed.
 func WithReopened(fn func(*agentsession.Session)) Option {
 	return func(r *Recorder) { r.reopened = fn }
 }
@@ -1529,6 +1538,7 @@ func Start(ctx context.Context, store agentsession.Store, h agentsession.Header,
 		if err := r.root.closeOpenRun(ctx, s, agentsession.ReasonInterrupted, "fork at "+s.Header().Base, false); err != nil {
 			return nil, nil, err
 		}
+		s = r.held(s)
 		if err := r.root.seed(ctx, s, true); err != nil {
 			return nil, nil, err
 		}
@@ -2329,6 +2339,7 @@ func resume(ctx context.Context, s *agentsession.Session, store agentsession.Sto
 	if err := r.root.closeOpenRun(ctx, s, agentsession.ReasonError, "cut off: closed on resume", true); err != nil {
 		return nil, nil, err
 	}
+	s = r.held(s)
 	if err := r.root.seed(ctx, s, true); err != nil {
 		return nil, nil, err
 	}
@@ -2384,7 +2395,9 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 // so the next run records against the settings, items and pending
 // calls of the branch it continues rather than the one it left. It
 // refuses with [ErrRunActive] while a run is being written, and s must
-// be the session the recorder writes. The agent's transcript is the
+// be the session the recorder writes, the one the store's Open returns:
+// another, such as one the store replaced behind a reopen
+// ([WithReopened]), is refused with [ErrSessionReplaced]. The agent's transcript is the
 // caller's to set, with Agent.SetTranscript from [Transcript], or from
 // [TranscriptModels] with its models on the next run's context through
 // agentturn.ContextWithReasoningModels, and
@@ -2430,10 +2443,17 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 	if err := w.reopen(ctx); err != nil {
 		return fmt.Errorf("session: rebase: %w", err)
 	}
-	if r.current != nil && s != r.current {
-		// Its leaf is not the one the store appends at.
+	// The leaf moved has to be the one the store appends at; a session
+	// the store replaced, behind a reopen of the recorder's or one of
+	// an append of the host's own, holds another.
+	opened, err := r.store.Open(ctx, w.id)
+	if err != nil {
+		return fmt.Errorf("session: rebase: %w", err)
+	}
+	if s != opened {
 		return fmt.Errorf("session: rebase: %w", ErrSessionReplaced)
 	}
+	r.current = opened
 	// Only what the agent holds carries over; an input the old path
 	// owed and nobody took up stays with it.
 	var held []*inboxItem
@@ -2453,7 +2473,7 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 		if err := w.requeue(ctx); err != nil {
 			return err
 		}
-		return r.reserve(s)
+		return r.reserve(r.held(s))
 	}
 	if err := s.Branch(entryID); err != nil {
 		return fmt.Errorf("session: rebase: %w", err)
@@ -2462,6 +2482,7 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 	if err := w.closeOpenRun(ctx, s, agentsession.ReasonInterrupted, "rewind to "+entryID, false); err != nil {
 		return err
 	}
+	s = r.held(s)
 	owed, err := s.PendingQueued(s.Leaf())
 	if err != nil {
 		return fmt.Errorf("session: queued inputs at leaf: %w", err)
@@ -2478,6 +2499,7 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 	if err := w.requeue(ctx); err != nil {
 		return err
 	}
+	s = r.held(s)
 	if err := w.seed(ctx, s, false); err != nil {
 		return err
 	}
@@ -2485,6 +2507,15 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 		return err
 	}
 	return r.reserve(s)
+}
+
+// held is s, or the root session the store replaced it with while the
+// recorder wrote to it.
+func (r *Recorder) held(s *agentsession.Session) *agentsession.Session {
+	if r.current != nil {
+		return r.current
+	}
+	return s
 }
 
 // reserve reserves every call ID in the session on the attached agent,
@@ -4758,10 +4789,11 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 const agentRunAgain = "run again"
 
 // toolDispatch writes the call's dispatch: the loop has handed it to
-// its tool, so from here its side effect may have happened. It is
-// durable before this returns, as far as the store's acknowledgement
-// says (see append), and a failure here stops the call, so no tool
-// runs after a dispatch the record does not hold. A call an
+// its tool, so from here its side effect may have happened. Under a
+// header that promises dispatch records, as [Start]'s does by default,
+// the store makes it durable before it acknowledges it (see append),
+// and a failure here stops the call, so no tool runs after a dispatch
+// the record does not hold. A call an
 // earlier run dispatched and this one runs again gets a second, so
 // each time the tool may have run is on the path. A nested call has
 // no function_call item to anchor one to and its record is the custom
@@ -5317,16 +5349,23 @@ func isModelOutput(item openresponses.Item) bool {
 // A Reopen in the result is a durable append whose session the store
 // could not bring in step: the recorder opens the session again at
 // once, or, when that fails, before the next entry, which fails with
-// it. Durable is not read. The header the recorder writes names its
-// records (run, dispatch, decision, queued), which the format requires
-// a store to make durable before it acknowledges them whatever its
-// sync policy, as the jsonl and cas stores do; and false is also what
-// a store reports that does not say, such as a remote server over a
-// store without a Writer, so it cannot be told from a lazy append and
-// refusing on it would refuse durable ones. A store's acknowledgement
-// of a dispatch is taken as that promise. Unresolved is not read
-// either: the recorder writes no reference a store resolves, only
-// links to sessions it wrote itself.
+// it.
+//
+// Durable is not read. A header that names dispatch in its records,
+// as [Start]'s does unless the caller sets Records, promises a reader
+// that a dispatch is durable before its side effect, and the jsonl
+// and cas stores make an entry of a type the header names durable
+// before they acknowledge it, whatever their sync policy. Under a
+// header that does not promise dispatch records the format asks for
+// no such durability, and a lazy store may acknowledge one lazily.
+// False is also what a store reports that does not say, such as a
+// remote server over a store without a Writer, so it cannot be told
+// from a lazy append, and refusing on it would refuse durable ones.
+//
+// Unresolved is not read either. What the store could not resolve is
+// in the entry as the host or a tool gave it, such as an item's
+// sidecar media reference, and is the host's to supply; the append
+// stands.
 func (w *writer) append(ctx context.Context, e agentsession.Entry) (string, error) {
 	if err := w.reopen(ctx); err != nil {
 		return "", fmt.Errorf("session: append %s: %w", e.EntryType(), err)
