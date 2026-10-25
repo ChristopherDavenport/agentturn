@@ -5,6 +5,29 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Fixed: `session`'s recorder writes through `agentsession.Writer`
+  when the store has it, falling back to `Append`, so it learns what
+  the store reports (#268). An append reported with `Reopen` is
+  durable but left the session out of step: the recorder opens the
+  session again at once, or before the next entry, which fails if the
+  reopen still does. Before, `Recorder.Rebase` of the session the
+  store had replaced moved a leaf the store no longer appended at, so
+  the next entry landed at the store's head and not at the rewind; and
+  `Start`, `Resume` and `Continue`, whose appends a store can report
+  with `Reopen` too, seeded from and returned the replaced session.
+  They now use the store's. `Durable` is not read: a header that
+  promises dispatch records, as `Start`'s does by default, has the
+  jsonl and cas stores make a dispatch durable before they acknowledge
+  it, and `false` is also what a store that does not report durability
+  says. `Unresolved` is not read either; what is unresolved is the
+  host's to supply. The recorder's doc says both.
+- Added: `session.WithReopened`, called with the root session the
+  store opened again, for the host to use from then on.
+- Added: `session.ErrSessionReplaced`. `Recorder.Rebase` checks its
+  session against the store's `Open` and refuses any other with it.
+
 ## v0.0.31 - 2026-10-24
 
 - Changed: a batch's calls wait for the calls agenttool's
