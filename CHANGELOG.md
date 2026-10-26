@@ -5,6 +5,31 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Changed: `front/control` and `front/a2a` ship no authentication
+  (breaking). Each says what a request may do and the program decides
+  who it is from. Removed: `control.BearerTokens`, which a program
+  replaces with a `control.Authenticator` of its own over the
+  credentials it issues, returning `control.ErrUnauthenticated` for one
+  it does not accept; `control.WithBearerToken`, which a program
+  replaces with `control.WithHTTPClient` and a `RoundTripper` that adds
+  its Authorization header; and `front/a2a`'s `BearerTokens`, which a
+  program replaces with a `front/a2a` `Authenticator` whose
+  `Principal` checks its tokens and whose `Name` and `Scheme` say what
+  the card declares (`"bearer"` and a2a-go's
+  `a2a.HTTPAuthSecurityScheme{Scheme: "Bearer"}` for what
+  `BearerTokens` declared). Scopes and which method needs which,
+  `Principal`, `Authenticator`, `WithAuthenticator`,
+  `WithInsecureNoAuth`, `PrincipalFrom`, `ErrUnauthenticated` and
+  `ErrForbidden` with their wire codes, the refusal of every request
+  without an authenticator, front/a2a's ownership guard and the
+  `WWW-Authenticate` challenge are unchanged.
+- Changed: `front/a2a`'s `WithAuthenticator` no longer names an
+  `Authenticator` with an empty `Name` "bearer". `Executor.Secure`
+  declares the scheme the program names, and nothing when it names no
+  `Name` or no `Scheme`.
+
 ## v0.0.32 - 2026-10-25
 
 - Fixed: `session`'s recorder writes through `agentsession.Writer`

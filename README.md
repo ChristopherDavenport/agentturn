@@ -353,7 +353,12 @@ another process. `front/control` serves any `agentturn.Control` over
 HTTP, JSON requests for its methods and a server-sent event stream of
 the agent's events, unnarrowed, questions included; `Dial` returns a
 client that is itself a `Control`. Every request is authenticated, and
-answering what a policy asked about needs a scope of its own.
+answering what a policy asked about needs a scope of its own. The
+package ships no authentication: it names the scope each method needs,
+the program's `Authenticator` says who a request is from, and the
+client sends what the `http.Client` it is given adds. `front/a2a` is the
+same: the program authenticates, and states the scheme its card
+declares.
 
 `Config.Name` and `Config.Description` are the single source for how an
 agent presents itself in every one of these.

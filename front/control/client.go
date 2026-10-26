@@ -50,7 +50,6 @@ import (
 type Client struct {
 	base     *url.URL
 	hc       *http.Client
-	token    string
 	onError  func(error)
 	retry    time.Duration
 	wait     time.Duration
@@ -65,12 +64,10 @@ type DialOption func(*Client)
 
 // WithHTTPClient sets the client requests go through; the default is
 // http.DefaultClient. A Prompt or Resume lasts as long as its run, so
-// a client with a Timeout cuts long runs off.
+// a client with a Timeout cuts long runs off. The Client sends no
+// credentials of its own: a program whose [Handler] authenticates adds
+// them here, in hc's Transport, as its [Authenticator] expects them.
 func WithHTTPClient(hc *http.Client) DialOption { return func(c *Client) { c.hc = hc } }
-
-// WithBearerToken sends token as "Authorization: Bearer <token>", as
-// [BearerTokens] reads it.
-func WithBearerToken(token string) DialOption { return func(c *Client) { c.token = token } }
 
 // WithStreamErrors is told of what the contract has no error for: a
 // failed State or Abort, a stream that broke or could not open, an
@@ -152,7 +149,6 @@ func (c *Client) call(ctx context.Context, method, path string, body, out any) e
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	c.authorize(req)
 	resp, err := c.hc.Do(req)
 	if err != nil {
 		return &lostError{err}
@@ -176,12 +172,6 @@ func (c *Client) call(ctx context.Context, method, path string, body, out any) e
 		return nil
 	}
 	return json.Unmarshal(data, out)
-}
-
-func (c *Client) authorize(req *http.Request) {
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
 }
 
 func (c *Client) run(ctx context.Context, path string, body any) (*agentturn.RunEnd, error) {
@@ -380,7 +370,6 @@ func (c *Client) stream(ctx context.Context, deliver func(agentturn.Event), read
 		return err
 	}
 	req.Header.Set("Accept", "text/event-stream")
-	c.authorize(req)
 	resp, err := c.hc.Do(req)
 	if err != nil {
 		return err

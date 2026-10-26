@@ -29,6 +29,10 @@
 // [WithInsecureNoAuth] for tests) and each method needs a scope:
 // read, control, answer (which no other scope implies, since it lets a
 // call run that a policy asked a person about), or command, for a
-// product's own controls ([WithCommands]). Transport security is the
-// host's http.Server's.
+// product's own controls ([WithCommands]). The package ships no
+// authentication: the program's [Authenticator] resolves a request to a
+// [Principal] and its scopes, a handler without one refuses every
+// request, and a [Client] sends the credentials its HTTP client
+// ([WithHTTPClient]) adds. Transport security is the host's
+// http.Server's.
 package control

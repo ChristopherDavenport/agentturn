@@ -2,8 +2,6 @@ package control
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,6 +56,12 @@ var AllScopes = []Scope{ScopeRead, ScopeControl, ScopeAnswer, ScopeCommand}
 
 // Authenticator resolves the principal a request is from. An error
 // refuses the request as unauthenticated; its text is not sent.
+//
+// The package ships none: it says which scope each method needs and
+// refuses a principal without it, and the program decides who a request
+// is from, by whatever credentials it issues, and passes that decision
+// to [WithAuthenticator]. An authenticator that finds no credentials it
+// accepts returns [ErrUnauthenticated], or any error.
 type Authenticator func(r *http.Request) (Principal, error)
 
 // ErrUnauthenticated is a request no authenticator accepted, and
@@ -67,44 +71,6 @@ var (
 	ErrUnauthenticated = errors.New("control: unauthenticated")
 	ErrForbidden       = errors.New("control: the principal lacks the scope this needs")
 )
-
-// BearerTokens is an [Authenticator] over static bearer tokens: a
-// request whose Authorization header is "Bearer <token>" for a token
-// in tokens is that token's principal. Tokens are compared in constant
-// time, through their SHA-256, so neither their contents nor their
-// lengths leak through timing.
-func BearerTokens(tokens map[string]Principal) Authenticator {
-	type entry struct {
-		sum [sha256.Size]byte
-		p   Principal
-	}
-	entries := make([]entry, 0, len(tokens))
-	for tok, p := range tokens {
-		if tok == "" {
-			continue
-		}
-		entries = append(entries, entry{sha256.Sum256([]byte(tok)), p})
-	}
-	return func(r *http.Request) (Principal, error) {
-		h := r.Header.Get("Authorization")
-		tok, ok := strings.CutPrefix(h, "Bearer ")
-		if !ok || tok == "" {
-			return Principal{}, ErrUnauthenticated
-		}
-		sum := sha256.Sum256([]byte(tok))
-		var found Principal
-		matched := 0
-		for _, e := range entries {
-			if subtle.ConstantTimeCompare(sum[:], e.sum[:]) == 1 {
-				found, matched = e.p, 1
-			}
-		}
-		if matched == 0 {
-			return Principal{}, ErrUnauthenticated
-		}
-		return found, nil
-	}
-}
 
 type principalKey struct{}
 

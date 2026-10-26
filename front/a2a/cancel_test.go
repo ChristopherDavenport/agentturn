@@ -207,7 +207,7 @@ func settledAs(t *testing.T, store *MemoryStore, conv string, log *runLog, who s
 func TestCancelSettlesWhatTheTaskLeftPending(t *testing.T) {
 	store, log := &MemoryStore{}, &runLog{}
 	exec := New(agentturn.Config{Model: callsThenDone{"remote"}},
-		WithAuthenticator(BearerTokens(map[string]string{"a-token": "alice", "b-token": "bob"})),
+		WithAuthenticator(tokenAuth(map[string]string{"a-token": "alice", "b-token": "bob"})),
 		WithConversationStore(store), WithCallerTools(remoteTool), WithRecorderFor(log.attach))
 	client := peer(t, exec, &taskStore{})
 	alice, bob := client("a-token"), client("b-token")
@@ -282,7 +282,7 @@ func TestCancelSettlesAnEscalatedQuestion(t *testing.T) {
 	}
 	store, log := &MemoryStore{}, &runLog{}
 	exec := New(agentturn.Config{Model: callsBoth{"deploy", "read"}, Tools: []agenttool.Tool{tool("deploy"), tool("read")}, BeforeToolCall: hook},
-		WithAuthenticator(BearerTokens(map[string]string{"a-token": "alice"})), WithEscalation(),
+		WithAuthenticator(tokenAuth(map[string]string{"a-token": "alice"})), WithEscalation(),
 		WithConversationStore(store), WithRecorderFor(log.attach))
 	alice := peer(t, exec, &taskStore{})("a-token")
 
@@ -361,7 +361,7 @@ func testCancelAfterRestart(t *testing.T, keeps bool) {
 	}
 	tokens := map[string]string{"a-token": "alice"}
 	cfg := agentturn.Config{Model: callsThenDone{"remote"}}
-	first := peer(t, New(cfg, WithAuthenticator(BearerTokens(tokens)), WithConversationStore(conversations), WithCallerTools(remoteTool)), tasks)
+	first := peer(t, New(cfg, WithAuthenticator(tokenAuth(tokens)), WithConversationStore(conversations), WithCallerTools(remoteTool)), tasks)
 	task := send(t, first("a-token"), userMessage("go"))
 	ids := pendingIDs(t, task)
 	if waiting, _ := store.LoadWaiting(context.Background(), task.ContextID); (waiting != "") != keeps {
@@ -369,7 +369,7 @@ func testCancelAfterRestart(t *testing.T, keeps bool) {
 	}
 
 	log := &runLog{}
-	restarted := peer(t, New(cfg, WithAuthenticator(BearerTokens(tokens)), WithConversationStore(conversations), WithCallerTools(remoteTool), WithRecorderFor(log.attach)), tasks)
+	restarted := peer(t, New(cfg, WithAuthenticator(tokenAuth(tokens)), WithConversationStore(conversations), WithCallerTools(remoteTool), WithRecorderFor(log.attach)), tasks)
 	got, err := restarted("a-token").CancelTask(context.Background(), &a2a.TaskIDParams{ID: task.ID})
 	if err != nil || got.Status.State != a2a.TaskStateCanceled {
 		t.Fatalf("cancel after the restart = %+v, %v", got, err)
@@ -559,7 +559,7 @@ func TestCancelSeesTheConversationFree(t *testing.T) {
 			}, err
 		}
 		exec := New(agentturn.Config{Model: callsThenDone{"remote"}},
-			WithAuthenticator(BearerTokens(map[string]string{"a-token": "alice"})),
+			WithAuthenticator(tokenAuth(map[string]string{"a-token": "alice"})),
 			WithConversationStore(store), WithCallerTools(remoteTool), WithRecorderFor(slow))
 		alice := peer(t, exec, &taskStore{})("a-token")
 		task := send(t, alice, userMessage("go"))
@@ -607,7 +607,7 @@ func TestCancelOutlivesItsRequest(t *testing.T) {
 		return ctx, func() { stop(); detach() }, err
 	}
 	exec := New(agentturn.Config{Model: callsThenDone{"remote"}},
-		WithAuthenticator(BearerTokens(map[string]string{"a-token": "alice"})),
+		WithAuthenticator(tokenAuth(map[string]string{"a-token": "alice"})),
 		WithConversationStore(ctxStore{store}), WithCallerTools(remoteTool), WithRecorderFor(record))
 	task := send(t, peer(t, exec, &taskStore{})("a-token"), userMessage("go"))
 	ids := pendingIDs(t, task)

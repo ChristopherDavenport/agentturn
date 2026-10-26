@@ -36,7 +36,8 @@ func (b bearer) Before(ctx context.Context, req *a2aclient.Request) (context.Con
 // case is refused or taken as the token says, with no HTTP middleware;
 // an accepted one runs under the trigger naming its principal; a
 // handler built without the interceptor runs nothing; and Secure
-// declares the scheme once, on a copy.
+// declares the scheme the authenticator names once, on a copy, and none
+// when it names none.
 func TestAnAuthenticatedExecutorNamesItsPrincipal(t *testing.T) {
 	var mu sync.Mutex
 	var triggers []agentturn.Trigger
@@ -51,7 +52,7 @@ func TestAnAuthenticatedExecutorNamesItsPrincipal(t *testing.T) {
 		}), nil
 	}
 	exec := New(agentturn.Config{Name: "echo", Model: &echo.Adapter{}, ModelName: "m"},
-		WithAuthenticator(BearerTokens(map[string]string{"s3cret": "alice"})), WithRecorderFor(record))
+		WithAuthenticator(tokenAuth(map[string]string{"s3cret": "alice"})), WithRecorderFor(record))
 	srv := httptest.NewServer(a2asrv.NewJSONRPCHandler(exec.RequestHandler()))
 	t.Cleanup(srv.Close)
 	plain := AgentCard(context.Background(), agentturn.Config{Name: "echo"}, srv.URL, "1")
@@ -64,6 +65,11 @@ func TestAnAuthenticatedExecutorNamesItsPrincipal(t *testing.T) {
 	}
 	if len(plain.Security) != 0 || len(plain.SecuritySchemes) != 0 {
 		t.Errorf("Secure changed the card it was given: %+v", plain)
+	}
+	bare := New(agentturn.Config{Name: "echo", Model: &echo.Adapter{}, ModelName: "m"},
+		WithAuthenticator(Authenticator{Principal: tokenAuth(nil).Principal}))
+	if got := bare.Secure(plain); got != plain {
+		t.Errorf("an authenticator naming no scheme changed the card: %+v", got)
 	}
 	send := func(opts ...a2aclient.FactoryOption) (a2a.SendMessageResult, error) {
 		client, err := a2aclient.NewFromCard(context.Background(), card, opts...)
@@ -118,7 +124,7 @@ func TestATaskIsItsCreators(t *testing.T) {
 		func(context.Context, agenttool.Call) (agenttool.Result, error) {
 			return agenttool.Text("refunded"), nil
 		})}, BeforeToolCall: holds("issue_refund", "asks")}
-	h := New(cfg, WithAuthenticator(BearerTokens(tokens)), WithEscalation()).RequestHandler()
+	h := New(cfg, WithAuthenticator(tokenAuth(tokens)), WithEscalation()).RequestHandler()
 	res, err := h.OnSendMessage(as("a-token"), &a2a.MessageSendParams{Message: userMessage("refund me")})
 	if err != nil {
 		t.Fatal(err)
@@ -223,7 +229,7 @@ func TestEscalationPutsTheAgentsQuestionToTheCaller(t *testing.T) {
 				}), nil
 			}
 			store := &MemoryStore{}
-			h := New(cfg, WithAuthenticator(BearerTokens(tokens)), WithEscalation(), WithConversationStore(store), WithRecorderFor(record)).RequestHandler()
+			h := New(cfg, WithAuthenticator(tokenAuth(tokens)), WithEscalation(), WithConversationStore(store), WithRecorderFor(record)).RequestHandler()
 			alice := as("a-token")
 			res, err := h.OnSendMessage(alice, &a2a.MessageSendParams{Message: userMessage("refund me")})
 			if err != nil {
@@ -323,7 +329,7 @@ func TestEscalationPutsTheAgentsQuestionToTheCaller(t *testing.T) {
 			func(context.Context, agenttool.Call) (agenttool.Result, error) {
 				return agenttool.Text("refunded"), nil
 			})}, BeforeToolCall: holds("issue_refund", reason)}
-		h := New(cfg, WithAuthenticator(BearerTokens(tokens)), WithEscalation()).RequestHandler()
+		h := New(cfg, WithAuthenticator(tokenAuth(tokens)), WithEscalation()).RequestHandler()
 		alice := as("a-token")
 		res, _ := h.OnSendMessage(alice, &a2a.MessageSendParams{Message: userMessage("refund me")})
 		task := res.(*a2a.Task)
@@ -404,7 +410,7 @@ func TestAConversationOutlivesTheProcessWithItsOwner(t *testing.T) {
 	tokens := map[string]string{"a-token": "alice", "b-token": "bob"}
 	cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"}
 	store := &MemoryStore{}
-	first := New(cfg, WithAuthenticator(BearerTokens(tokens)), WithConversationStore(store)).RequestHandler()
+	first := New(cfg, WithAuthenticator(tokenAuth(tokens)), WithConversationStore(store)).RequestHandler()
 	res, err := first.OnSendMessage(as("a-token"), &a2a.MessageSendParams{Message: userMessage("hello")})
 	if err != nil {
 		t.Fatal(err)
@@ -415,14 +421,14 @@ func TestAConversationOutlivesTheProcessWithItsOwner(t *testing.T) {
 		m.ContextID = conv
 		return m
 	}
-	restarted := New(cfg, WithAuthenticator(BearerTokens(tokens)), WithConversationStore(store)).RequestHandler()
+	restarted := New(cfg, WithAuthenticator(tokenAuth(tokens)), WithConversationStore(store)).RequestHandler()
 	if _, err := restarted.OnSendMessage(as("b-token"), &a2a.MessageSendParams{Message: next("mine now")}); !errors.Is(err, a2a.ErrTaskNotFound) {
 		t.Errorf("bob after the restart: err = %v, want not found", err)
 	}
 	if res, err := restarted.OnSendMessage(as("a-token"), &a2a.MessageSendParams{Message: next("again")}); err != nil || res.(*a2a.Task).Status.State != a2a.TaskStateCompleted {
 		t.Errorf("alice after the restart: %v %v", res, err)
 	}
-	forgetful := New(cfg, WithAuthenticator(BearerTokens(tokens)), WithConversationStore(hidesOwners{store})).RequestHandler()
+	forgetful := New(cfg, WithAuthenticator(tokenAuth(tokens)), WithConversationStore(hidesOwners{store})).RequestHandler()
 	for _, token := range []string{"b-token", "a-token"} {
 		if _, err := forgetful.OnSendMessage(as(token), &a2a.MessageSendParams{Message: next("me")}); !errors.Is(err, a2a.ErrTaskNotFound) {
 			t.Errorf("%s with owners lost: err = %v, want not found", token, err)
@@ -510,7 +516,7 @@ func TestAHeldCallIsReleasedNotAsked(t *testing.T) {
 		}
 		var decisions []*agentturn.ToolDecision
 		cfg := agentturn.Config{Model: callsBoth{"deploy", "read"}, Tools: []agenttool.Tool{tool("deploy"), tool("read")}, BeforeToolCall: hook}
-		h := New(cfg, WithAuthenticator(BearerTokens(map[string]string{"a-token": "alice"})), WithEscalation(), WithRecorderFor(decisionsOf(&decisions))).RequestHandler()
+		h := New(cfg, WithAuthenticator(tokenAuth(map[string]string{"a-token": "alice"})), WithEscalation(), WithRecorderFor(decisionsOf(&decisions))).RequestHandler()
 		alice := as("a-token")
 		res, err := h.OnSendMessage(alice, &a2a.MessageSendParams{Message: userMessage("ship it")})
 		if err != nil {
@@ -553,7 +559,7 @@ func TestAHeldCallIsReleasedNotAsked(t *testing.T) {
 // referencing another's task is refused as not found.
 func TestTheGuardCoversLateClaimsListsAndReferences(t *testing.T) {
 	tokens := map[string]string{"a-token": "alice", "b-token": "bob"}
-	h := New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"}, WithAuthenticator(BearerTokens(tokens))).RequestHandler()
+	h := New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"}, WithAuthenticator(tokenAuth(tokens))).RequestHandler()
 	wait := false
 	res, err := h.OnSendMessage(as("a-token"), &a2a.MessageSendParams{Message: userMessage("hello"), Config: &a2a.MessageSendConfig{Blocking: &wait}})
 	if err != nil {
