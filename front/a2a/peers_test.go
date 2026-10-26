@@ -37,7 +37,7 @@ func (b bearer) Before(ctx context.Context, req *a2aclient.Request) (context.Con
 // an accepted one runs under the trigger naming its principal; a
 // handler built without the interceptor runs nothing; and Secure
 // declares the scheme the authenticator names once, on a copy, and none
-// when it names none.
+// when it names none; New refuses a scheme with no name.
 func TestAnAuthenticatedExecutorNamesItsPrincipal(t *testing.T) {
 	var mu sync.Mutex
 	var triggers []agentturn.Trigger
@@ -71,6 +71,16 @@ func TestAnAuthenticatedExecutorNamesItsPrincipal(t *testing.T) {
 	if got := bare.Secure(plain); got != plain {
 		t.Errorf("an authenticator naming no scheme changed the card: %+v", got)
 	}
+	t.Run("a scheme needs a name", func(t *testing.T) {
+		defer func() {
+			if recover() == nil {
+				t.Error("New took an Authenticator with a Scheme and no Name")
+			}
+		}()
+		auth := tokenAuth(nil)
+		auth.Name = ""
+		New(agentturn.Config{}, WithAuthenticator(auth))
+	})
 	send := func(opts ...a2aclient.FactoryOption) (a2a.SendMessageResult, error) {
 		client, err := a2aclient.NewFromCard(context.Background(), card, opts...)
 		if err != nil {

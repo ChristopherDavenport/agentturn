@@ -262,6 +262,11 @@ func New(cfg agentturn.Config, opts ...Option) *Executor {
 		// caller must be someone.
 		panic("front/a2a: WithEscalation requires WithAuthenticator")
 	}
+	if e.auth != nil && e.auth.Scheme != nil && e.auth.Name == "" {
+		// The card would lose the scheme, and a caller would not learn
+		// what to send.
+		panic("front/a2a: WithAuthenticator's Authenticator has a Scheme and no Name; name the scheme the card declares it under, such as \"bearer\"")
+	}
 	return e
 }
 

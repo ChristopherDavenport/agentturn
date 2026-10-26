@@ -26,9 +26,10 @@ versions may break the API.
   without an authenticator, front/a2a's ownership guard and the
   `WWW-Authenticate` challenge are unchanged.
 - Changed: `front/a2a`'s `WithAuthenticator` no longer names an
-  `Authenticator` with an empty `Name` "bearer". `Executor.Secure`
-  declares the scheme the program names, and nothing when it names no
-  `Name` or no `Scheme`.
+  `Authenticator` with an empty `Name` "bearer". `New` panics on one
+  with a `Scheme` and no `Name`, rather than serve a card that leaves
+  the scheme out; one with neither authenticates and declares nothing.
+  `Executor.Secure` declares the scheme the program names.
 
 ## v0.0.32 - 2026-10-25
 

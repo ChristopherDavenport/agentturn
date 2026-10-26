@@ -28,8 +28,8 @@ import (
 //		Principal: principalOf, // the program's check of its tokens
 //	}
 type Authenticator struct {
-	// Name is the scheme's name on the card. [Executor.Secure]
-	// declares nothing without it.
+	// Name is the scheme's name on the card, which a Scheme needs:
+	// [New] panics on a Scheme with no Name.
 	Name a2a.SecuritySchemeName
 	// Scheme is the security scheme the card declares. An HTTP
 	// scheme's name is the WWW-Authenticate challenge
@@ -74,6 +74,10 @@ type Authenticator struct {
 // [Executor.Secure] declares the scheme on the card, which is served
 // apart, unauthenticated, so a caller can learn it. TLS is the
 // deployment's.
+//
+// An Authenticator with a Scheme must name it: [New] panics on one with
+// a Scheme and no Name, rather than serve a card that leaves the scheme
+// out. One with neither authenticates and declares nothing.
 func WithAuthenticator(auth Authenticator) Option {
 	return func(e *Executor) { e.auth = &auth }
 }
@@ -317,7 +321,7 @@ func notFound() error {
 // scheme as the one every interaction requires; card itself is not
 // changed, and a card that already requires it gets no second
 // requirement. Without the option, or with an [Authenticator] that
-// names no Name or no Scheme, it returns card.
+// declares no Scheme, it returns card.
 func (e *Executor) Secure(card *a2a.AgentCard) *a2a.AgentCard {
 	if e.auth == nil || card == nil || e.auth.Scheme == nil || e.auth.Name == "" {
 		return card
