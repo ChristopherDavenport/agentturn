@@ -5,6 +5,16 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Added: `control.WithChallenge`. A `front/control` handler sends the
+  value as the `WWW-Authenticate` header on every 401 it writes: its
+  authenticator's refusal and the refusal with no authenticator
+  configured. RFC 9110 §15.5.2 requires the challenge on a 401; the
+  package ships no authentication, so the program names its scheme, for
+  example ``WithChallenge(`Bearer realm="dax"`)``. Without the option
+  no challenge is sent, as before.
+
 ## v0.0.33 - 2026-10-25
 
 - Changed: `front/control` and `front/a2a` ship no authentication

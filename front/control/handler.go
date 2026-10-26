@@ -107,6 +107,16 @@ func WithAuthenticator(a Authenticator) Option {
 	return func(h *handler) { h.auth = a }
 }
 
+// WithChallenge sets the WWW-Authenticate challenge sent on every 401
+// the handler writes, whether its authenticator refused the request or
+// no authenticator is configured. RFC 9110 §15.5.2 requires a 401 to
+// carry one; the package ships no authentication, so the scheme is the
+// program's to name, for example WithChallenge(`Bearer realm="dax"`).
+// Without it no challenge is sent.
+func WithChallenge(value string) Option {
+	return func(h *handler) { h.challenge = value }
+}
+
 // WithInsecureNoAuth serves every request as a principal with every
 // scope, for tests and for a socket only the host's user can reach.
 // Answering a call a policy asked about is then open to anyone who can
@@ -155,15 +165,16 @@ func WithEventBuffer(n int) Option {
 }
 
 type handler struct {
-	c        agentturn.Control
-	auth     Authenticator
-	insecure bool
-	chosenBy Scope
-	commands map[string]Command
-	maxBody  int64
-	buffer   int
-	ping     time.Duration
-	mux      *http.ServeMux
+	c         agentturn.Control
+	auth      Authenticator
+	challenge string
+	insecure  bool
+	chosenBy  Scope
+	commands  map[string]Command
+	maxBody   int64
+	buffer    int
+	ping      time.Duration
+	mux       *http.ServeMux
 }
 
 // Handler serves c over HTTP: JSON requests for its methods and a
@@ -232,17 +243,17 @@ func (h *handler) guard(scope Scope, next func(http.ResponseWriter, *http.Reques
 		case h.auth != nil:
 			var err error
 			if p, err = h.auth(r); err != nil {
-				writeFailure(w, http.StatusUnauthorized, ErrUnauthenticated)
+				h.writeFailure(w, http.StatusUnauthorized, ErrUnauthenticated)
 				return
 			}
 		case h.insecure:
 			p = Principal{Scopes: AllScopes}
 		default:
-			writeFailure(w, http.StatusUnauthorized, fmt.Errorf("%w: the handler has no authenticator", ErrUnauthenticated))
+			h.writeFailure(w, http.StatusUnauthorized, fmt.Errorf("%w: the handler has no authenticator", ErrUnauthenticated))
 			return
 		}
 		if scope != "" && !p.Has(scope) {
-			writeFailure(w, http.StatusForbidden, fmt.Errorf("%w: %s", ErrForbidden, scope))
+			h.writeFailure(w, http.StatusForbidden, fmt.Errorf("%w: %s", ErrForbidden, scope))
 			return
 		}
 		ctx := context.WithValue(r.Context(), principalKey{}, p)
@@ -262,7 +273,7 @@ func (h *handler) info(w http.ResponseWriter, _ *http.Request, _ Principal) {
 func (h *handler) state(w http.ResponseWriter, _ *http.Request, _ Principal) {
 	s, err := stateOut(h.c.State())
 	if err != nil {
-		writeFailure(w, http.StatusInternalServerError, err)
+		h.writeFailure(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, s)
@@ -284,7 +295,7 @@ func (h *handler) prompt(w http.ResponseWriter, r *http.Request, _ Principal) {
 	}
 	items, err := itemsIn(req.Items)
 	if err != nil {
-		writeFailure(w, http.StatusBadRequest, err)
+		h.writeFailure(w, http.StatusBadRequest, err)
 		return
 	}
 	h.writeRun(w, func() (*agentturn.RunEnd, error) { return h.c.Prompt(context.WithoutCancel(r.Context()), items...) })
@@ -299,7 +310,7 @@ func (h *handler) resume(w http.ResponseWriter, r *http.Request, p Principal) {
 	}
 	answers, err := answersIn(req.Answers)
 	if err != nil {
-		writeFailure(w, http.StatusBadRequest, err)
+		h.writeFailure(w, http.StatusBadRequest, err)
 		return
 	}
 	if h.chosenBy == "" || !p.Has(h.chosenBy) {
@@ -316,7 +327,7 @@ func (h *handler) writeRun(w http.ResponseWriter, run func() (*agentturn.RunEnd,
 	if end != nil {
 		we, merr := runEndOut(end)
 		if merr != nil {
-			writeFailure(w, http.StatusInternalServerError, merr)
+			h.writeFailure(w, http.StatusInternalServerError, merr)
 			return
 		}
 		out.End = &we
@@ -342,12 +353,12 @@ func (h *handler) queue(w http.ResponseWriter, r *http.Request, _ Principal) {
 	default:
 		// The agent takes any other mode as a follow-up; a client's
 		// typo is refused here rather than quietly becoming one.
-		writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: queue: unknown mode %q", req.Mode))
+		h.writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: queue: unknown mode %q", req.Mode))
 		return
 	}
 	items, err := itemsIn(req.Items)
 	if err != nil {
-		writeFailure(w, http.StatusBadRequest, err)
+		h.writeFailure(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, errReply{errorOut(h.c.Queue(r.Context(), agentturn.QueueMode(req.Mode), items...))})
@@ -370,7 +381,7 @@ func (h *handler) reply(w http.ResponseWriter, r *http.Request, p Principal) {
 	switch a.Action {
 	case agenttool.ActionAccept, agenttool.ActionDecline, agenttool.ActionCancel:
 	default:
-		writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: reply: unknown action %q", a.Action))
+		h.writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: reply: unknown action %q", a.Action))
 		return
 	}
 	// The principal is who answered, as a run it starts names it.
@@ -405,7 +416,7 @@ func (h *handler) runCommand(w http.ResponseWriter, r *http.Request, _ Principal
 	name := r.PathValue("name")
 	c, ok := h.commands[name]
 	if !ok || c.Run == nil {
-		writeFailure(w, http.StatusNotFound, fmt.Errorf("%w: %q", ErrUnknownCommand, name))
+		h.writeFailure(w, http.StatusNotFound, fmt.Errorf("%w: %q", ErrUnknownCommand, name))
 		return
 	}
 	var args json.RawMessage
@@ -429,17 +440,17 @@ func (h *handler) decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
-			writeFailure(w, http.StatusRequestEntityTooLarge, fmt.Errorf("control: request body over %d bytes", h.maxBody))
+			h.writeFailure(w, http.StatusRequestEntityTooLarge, fmt.Errorf("control: request body over %d bytes", h.maxBody))
 			return false
 		}
-		writeFailure(w, http.StatusBadRequest, err)
+		h.writeFailure(w, http.StatusBadRequest, err)
 		return false
 	}
 	if len(strings.TrimSpace(string(body))) == 0 {
 		return true
 	}
 	if err := json.Unmarshal(body, v); err != nil {
-		writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: request body: %w", err))
+		h.writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: request body: %w", err))
 		return false
 	}
 	return true
@@ -449,7 +460,7 @@ func (h *handler) decode(w http.ResponseWriter, r *http.Request, v any) bool {
 func (h *handler) events(w http.ResponseWriter, r *http.Request, _ Principal) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeFailure(w, http.StatusInternalServerError, errors.New("control: the response cannot stream"))
+		h.writeFailure(w, http.StatusInternalServerError, errors.New("control: the response cannot stream"))
 		return
 	}
 	frames := make(chan []byte, h.buffer)
@@ -553,6 +564,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_, _ = w.Write(data)
 }
 
-func writeFailure(w http.ResponseWriter, status int, err error) {
+// writeFailure answers err with status, with the challenge on a 401.
+func (h *handler) writeFailure(w http.ResponseWriter, status int, err error) {
+	if status == http.StatusUnauthorized && h.challenge != "" {
+		w.Header().Set("WWW-Authenticate", h.challenge)
+	}
 	writeJSON(w, status, errReply{errorOut(err)})
 }
