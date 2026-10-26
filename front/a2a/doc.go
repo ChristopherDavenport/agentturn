@@ -122,8 +122,10 @@
 //
 // # Authentication
 //
-// [WithAuthenticator] names a principal on every call and makes each
-// task and conversation its creator's. [Executor.Interceptor], which
+// The package ships no authentication: the program's [Authenticator]
+// decides who sent a request, from credentials it issues, and names the
+// scheme the card declares. [WithAuthenticator] names a principal on
+// every call and makes each task and conversation its creator's. [Executor.Interceptor], which
 // [Executor.RequestHandler] installs, authenticates every call of the
 // A2A handler from its metadata, on every method and transport, and
 // refuses one it does not accept before it reaches the executor or the

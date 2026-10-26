@@ -2,14 +2,10 @@ package a2a
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
-	"errors"
 	"fmt"
 	"maps"
 	"net/http"
 	"slices"
-	"strings"
 	"sync"
 
 	"github.com/ChristopherDavenport/agentturn"
@@ -21,10 +17,23 @@ import (
 // error when the request carries no credentials it accepts. Scheme is
 // what the agent card declares under Name, so a caller knows what to
 // send.
+//
+// The package ships none. The program decides who a request is from,
+// by whatever credentials it issues, and states on the card how a
+// caller presents them; a program taking bearer tokens declares
+//
+//	Authenticator{
+//		Name:      "bearer",
+//		Scheme:    a2a.HTTPAuthSecurityScheme{Scheme: "Bearer"},
+//		Principal: principalOf, // the program's check of its tokens
+//	}
 type Authenticator struct {
-	// Name is the scheme's name on the card, "bearer" when empty.
+	// Name is the scheme's name on the card, which a Scheme needs:
+	// [New] panics on a Scheme with no Name.
 	Name a2a.SecuritySchemeName
-	// Scheme is the security scheme the card declares.
+	// Scheme is the security scheme the card declares. An HTTP
+	// scheme's name is the WWW-Authenticate challenge
+	// [Executor.Handler] answers a refused request with.
 	Scheme a2a.SecurityScheme
 	// Principal authenticates one request from its headers: the HTTP
 	// request's under [Executor.Handler], and under the interceptor
@@ -33,43 +42,6 @@ type Authenticator struct {
 	// else. Its error is not sent to the caller, which is told only that
 	// it is unauthenticated.
 	Principal func(*http.Request) (string, error)
-}
-
-// BearerTokens accepts a request whose Authorization header is
-// "Bearer <token>", the scheme in any case, for one of tokens, and names
-// the principal tokens maps it to. The token is compared with every
-// known one, as hashes and in constant time, so neither which token
-// matched nor its length shows in the time a request takes.
-func BearerTokens(tokens map[string]string) Authenticator {
-	type known struct {
-		sum       [sha256.Size]byte
-		principal string
-	}
-	list := make([]known, 0, len(tokens))
-	for _, token := range slices.Sorted(maps.Keys(tokens)) {
-		list = append(list, known{sum: sha256.Sum256([]byte(token)), principal: tokens[token]})
-	}
-	return Authenticator{
-		Name:   "bearer",
-		Scheme: a2a.HTTPAuthSecurityScheme{Scheme: "Bearer"},
-		Principal: func(r *http.Request) (string, error) {
-			scheme, token, _ := strings.Cut(r.Header.Get("Authorization"), " ")
-			if !strings.EqualFold(scheme, "Bearer") || token == "" {
-				return "", errors.New("no bearer token")
-			}
-			got := sha256.Sum256([]byte(strings.TrimSpace(token)))
-			principal := ""
-			for _, k := range list {
-				if subtle.ConstantTimeCompare(got[:], k.sum[:]) == 1 {
-					principal = k.principal
-				}
-			}
-			if principal == "" {
-				return "", errors.New("unknown bearer token")
-			}
-			return principal, nil
-		},
-	}
 }
 
 // WithAuthenticator makes every request the executor serves name a
@@ -102,13 +74,12 @@ func BearerTokens(tokens map[string]string) Authenticator {
 // [Executor.Secure] declares the scheme on the card, which is served
 // apart, unauthenticated, so a caller can learn it. TLS is the
 // deployment's.
+//
+// An Authenticator with a Scheme must name it: [New] panics on one with
+// a Scheme and no Name, rather than serve a card that leaves the scheme
+// out. One with neither authenticates and declares nothing.
 func WithAuthenticator(auth Authenticator) Option {
-	return func(e *Executor) {
-		if auth.Name == "" {
-			auth.Name = "bearer"
-		}
-		e.auth = &auth
-	}
+	return func(e *Executor) { e.auth = &auth }
 }
 
 // Owners records which principal owns each task and conversation under
@@ -349,9 +320,10 @@ func notFound() error {
 // Secure returns a copy of card that declares the [WithAuthenticator]
 // scheme as the one every interaction requires; card itself is not
 // changed, and a card that already requires it gets no second
-// requirement. Without the option it returns card.
+// requirement. Without the option, or with an [Authenticator] that
+// declares no Scheme, it returns card.
 func (e *Executor) Secure(card *a2a.AgentCard) *a2a.AgentCard {
-	if e.auth == nil || card == nil || e.auth.Scheme == nil {
+	if e.auth == nil || card == nil || e.auth.Scheme == nil || e.auth.Name == "" {
 		return card
 	}
 	out := *card

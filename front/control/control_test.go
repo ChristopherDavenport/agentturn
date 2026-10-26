@@ -427,11 +427,11 @@ func TestScopes(t *testing.T) {
 	for token, p := range tokens {
 		t.Run(token, func(t *testing.T) {
 			r := &recorder{}
-			srv := httptest.NewServer(Handler(r, WithAuthenticator(BearerTokens(tokens)), WithCommands(map[string]Command{
+			srv := httptest.NewServer(Handler(r, WithAuthenticator(tokenAuth(tokens)), WithCommands(map[string]Command{
 				"info": {Run: func(context.Context, json.RawMessage) (json.RawMessage, error) { return json.RawMessage(`{}`), nil }},
 			})))
 			defer srv.Close()
-			c, err := Dial(t.Context(), srv.URL, WithBearerToken(token))
+			c, err := Dial(t.Context(), srv.URL, withToken(token))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -451,9 +451,9 @@ func TestScopes(t *testing.T) {
 	}
 	t.Run("the principal is on the run's context", func(t *testing.T) {
 		r := &recorder{}
-		srv := httptest.NewServer(Handler(r, WithAuthenticator(BearerTokens(tokens))))
+		srv := httptest.NewServer(Handler(r, WithAuthenticator(tokenAuth(tokens))))
 		defer srv.Close()
-		c, err := Dial(t.Context(), srv.URL, WithBearerToken("answers"))
+		c, err := Dial(t.Context(), srv.URL, withToken("answers"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -472,9 +472,9 @@ func TestScopes(t *testing.T) {
 	})
 	t.Run("the principal is on an answer's context", func(t *testing.T) {
 		r := &recorder{}
-		srv := httptest.NewServer(Handler(r, WithAuthenticator(BearerTokens(tokens))))
+		srv := httptest.NewServer(Handler(r, WithAuthenticator(tokenAuth(tokens))))
 		defer srv.Close()
-		c, err := Dial(t.Context(), srv.URL, WithBearerToken("answers"))
+		c, err := Dial(t.Context(), srv.URL, withToken("answers"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -504,8 +504,8 @@ func TestScopes(t *testing.T) {
 			{"engine", "", ""},
 		} {
 			r := &recorder{}
-			srv := httptest.NewServer(Handler(r, WithAuthenticator(BearerTokens(chooser)), WithChosenBy("decide")))
-			c, err := Dial(t.Context(), srv.URL, WithBearerToken(tc.token))
+			srv := httptest.NewServer(Handler(r, WithAuthenticator(tokenAuth(chooser)), WithChosenBy("decide")))
+			c, err := Dial(t.Context(), srv.URL, withToken(tc.token))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -522,10 +522,10 @@ func TestScopes(t *testing.T) {
 		}
 	})
 	t.Run("a wrong token", func(t *testing.T) {
-		srv := httptest.NewServer(Handler(&recorder{}, WithAuthenticator(BearerTokens(tokens))))
+		srv := httptest.NewServer(Handler(&recorder{}, WithAuthenticator(tokenAuth(tokens))))
 		defer srv.Close()
 		for _, tok := range []string{"", "nope", "reader2", "Reader"} {
-			if _, err := Dial(t.Context(), srv.URL, WithBearerToken(tok)); !errors.Is(err, ErrUnauthenticated) {
+			if _, err := Dial(t.Context(), srv.URL, withToken(tok)); !errors.Is(err, ErrUnauthenticated) {
 				t.Errorf("token %q: %v", tok, err)
 			}
 		}
@@ -547,12 +547,12 @@ func TestScopes(t *testing.T) {
 		}
 	})
 	t.Run("a read-only stream", func(t *testing.T) {
-		srv := httptest.NewServer(Handler(&recorder{}, WithAuthenticator(BearerTokens(tokens))))
+		srv := httptest.NewServer(Handler(&recorder{}, WithAuthenticator(tokenAuth(tokens))))
 		defer srv.Close()
 		// The stream's refusal arrives on its own goroutine, after
 		// Subscribe returns: wait for it.
 		first := make(chan error, 1)
-		c, err := Dial(t.Context(), srv.URL, WithBearerToken("answers"), WithStreamErrors(func(err error) {
+		c, err := Dial(t.Context(), srv.URL, withToken("answers"), WithStreamErrors(func(err error) {
 			select {
 			case first <- err:
 			default:
