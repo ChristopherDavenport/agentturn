@@ -790,3 +790,71 @@ func TestATransportFailureIsALostConnection(t *testing.T) {
 		t.Errorf("Resume = %v", err)
 	}
 }
+
+// Every 401 carries the challenge WithChallenge names, as RFC 9110
+// §15.5.2 requires: the authenticator's refusal and no authenticator.
+// No other answer carries it, and without the option none does.
+func TestChallenge(t *testing.T) {
+	const challenge = `Bearer realm="test"`
+	auth := WithAuthenticator(tokenAuth(map[string]Principal{
+		"reader": {Name: "watcher", Scopes: []Scope{ScopeRead}},
+		"all":    {Name: "root", Scopes: AllScopes},
+	}))
+	for _, sv := range []struct {
+		name      string
+		challenge string
+		opts      []Option
+	}{
+		{"with the option", challenge, []Option{WithChallenge(challenge)}},
+		{"without the option", "", nil},
+	} {
+		t.Run(sv.name, func(t *testing.T) {
+			url := func(opts ...Option) string {
+				srv := httptest.NewServer(Handler(&recorder{}, append(slices.Clone(sv.opts), opts...)...))
+				t.Cleanup(srv.Close)
+				return srv.URL
+			}
+			unauthed, authed := url(), url(auth)
+			tests := []struct {
+				name, method, url, token, body string
+				status                         int
+			}{
+				{"no authenticator", http.MethodGet, unauthed + "/", "", "", http.StatusUnauthorized},
+				{"no token", http.MethodGet, authed + "/state", "", "", http.StatusUnauthorized},
+				{"wrong token", http.MethodGet, authed + "/state", "guess", "", http.StatusUnauthorized},
+				{"wrong token, events", http.MethodGet, authed + "/events", "guess", "", http.StatusUnauthorized},
+				{"wrong token, prompt", http.MethodPost, authed + "/prompt", "guess", `{}`, http.StatusUnauthorized},
+				{"no scope", http.MethodPost, authed + "/prompt", "reader", `{}`, http.StatusForbidden},
+				{"bad request", http.MethodPost, authed + "/queue", "all", `{"mode":"sideways"}`, http.StatusBadRequest},
+				{"no route", http.MethodGet, authed + "/nothing", "all", "", http.StatusNotFound},
+				{"state", http.MethodGet, authed + "/state", "reader", "", http.StatusOK},
+			}
+			for _, tc := range tests {
+				t.Run(tc.name, func(t *testing.T) {
+					req, err := http.NewRequestWithContext(t.Context(), tc.method, tc.url, strings.NewReader(tc.body))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if tc.token != "" {
+						req.Header.Set("Authorization", "Bearer "+tc.token)
+					}
+					resp, err := http.DefaultClient.Do(req)
+					if err != nil {
+						t.Fatal(err)
+					}
+					resp.Body.Close()
+					if resp.StatusCode != tc.status {
+						t.Fatalf("status %d, want %d", resp.StatusCode, tc.status)
+					}
+					want := ""
+					if tc.status == http.StatusUnauthorized {
+						want = sv.challenge
+					}
+					if got := resp.Header.Get("WWW-Authenticate"); got != want {
+						t.Errorf("WWW-Authenticate %q, want %q", got, want)
+					}
+				})
+			}
+		})
+	}
+}

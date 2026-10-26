@@ -32,7 +32,8 @@
 // product's own controls ([WithCommands]). The package ships no
 // authentication: the program's [Authenticator] resolves a request to a
 // [Principal] and its scopes, a handler without one refuses every
-// request, and a [Client] sends the credentials its HTTP client
+// request, its 401s carry the WWW-Authenticate challenge the program
+// names with [WithChallenge] (none without it), and a [Client] sends the credentials its HTTP client
 // ([WithHTTPClient]) adds. Transport security is the host's
 // http.Server's.
 package control
