@@ -41,9 +41,9 @@ func sampleEvents(t *testing.T) map[string]agentturn.Event {
 		"TurnStart":    &agentturn.TurnStart{RunID: "run_1", Turn: 1, Request: req, Inputs: openresponses.Items{openresponses.UserText("hi")}, Arrived: []agentturn.TurnInput{{Item: openresponses.UserText("hi"), Mode: agentturn.InputPrompt, Trigger: trigger}}},
 		"ModelRetry":   &agentturn.ModelRetry{RunID: "run_1", Turn: 1, Attempt: 2, Err: agentturn.ErrNoModel, Delay: 1500 * time.Millisecond, Request: req},
 		"ModelBlocked": &agentturn.ModelBlocked{RunID: "run_1", Turn: 1, Request: req, Err: agentturn.ErrGuard},
-		"ItemStart":    &agentturn.ItemStart{RunID: "run_1", Turn: 1, Item: call, ResponseID: "resp_1", Hidden: true},
+		"ItemStart":    &agentturn.ItemStart{RunID: "run_1", Turn: 1, Item: call, ResponseID: "resp_1", Hidden: true, Copied: true},
 		"ItemUpdate":   &agentturn.ItemUpdate{RunID: "run_1", Turn: 1, Item: call, Stream: stream, ResponseID: "resp_1"},
-		"ItemEnd":      &agentturn.ItemEnd{RunID: "run_1", Turn: 1, Item: call, ResponseID: "resp_1", Hidden: true, Trigger: trigger, ModelCallID: "m_1"},
+		"ItemEnd":      &agentturn.ItemEnd{RunID: "run_1", Turn: 1, Item: call, ResponseID: "resp_1", Hidden: true, Copied: true, Trigger: trigger, ModelCallID: "m_1"},
 		"ResponseEnd":  &agentturn.ResponseEnd{RunID: "run_1", Turn: 1, Response: resp, Withheld: true},
 		"ToolStart":    &agentturn.ToolStart{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Args: json.RawMessage(`{"text":"a"}`), Decision: decision, Parent: "call_0", Invoked: json.RawMessage(`{"text":"A"}`), Replayed: true},
 		"ToolDispatch": &agentturn.ToolDispatch{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Parent: "call_0", IdempotencyKey: "k"},
@@ -322,5 +322,30 @@ func TestAQueuedReportSaysHowTheInputArrived(t *testing.T) {
 	}
 	if q := got.(*agentturn.Queued); q.Input != agentturn.InputDeliver {
 		t.Errorf("queued = %+v, want input deliver", q)
+	}
+}
+
+// TestACopiedItemCrossesTheWire pins that a remote view tells an item
+// taken from another conversation from one this one produced (#243).
+func TestACopiedItemCrossesTheWire(t *testing.T) {
+	for _, name := range []string{"ItemStart", "ItemEnd"} {
+		data, err := MarshalEvent(sampleEvents(t)[name])
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := UnmarshalEvent(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch e := got.(type) {
+		case *agentturn.ItemStart:
+			if !e.Copied {
+				t.Errorf("item_start = %+v, want copied", e)
+			}
+		case *agentturn.ItemEnd:
+			if !e.Copied {
+				t.Errorf("item_end = %+v, want copied", e)
+			}
+		}
 	}
 }

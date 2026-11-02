@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1110,11 +1111,18 @@ func TestForkReadsItsOrigin(t *testing.T) {
 				// fork reaches it through the origin's link in its
 				// prefix (agentsession#186's verifier checks the pair).
 				after = append(after, agentsession.NewSubsessionLink("child-of-call-1", call.CallID))
-				after = append(after, &agentsession.ItemEntry{Item: openresponses.NewFunctionCallOutput(call.CallID, "charged")})
+				// The page the charge read was untrusted, which the
+				// fork's copy carries (#237).
+				after = append(after, &agentsession.ItemEntry{Item: openresponses.NewFunctionCallOutput(call.CallID, "charged"), Trust: &agentsession.Trust{Reads: []string{agentsession.TrustUntrusted}}})
 			}
+			ranEntry := ""
 			for _, e := range after {
-				if _, err := store.Append(ctx, origin.ID(), e); err != nil {
+				id, err := store.Append(ctx, origin.ID(), e)
+				if err != nil {
 					t.Fatal(err)
+				}
+				if _, ok := e.(*agentsession.ItemEntry); ok {
+					ranEntry = id
 				}
 			}
 
@@ -1186,6 +1194,17 @@ func TestForkReadsItsOrigin(t *testing.T) {
 						record = append(record, "output")
 						if tc.completed && tc.answer == nil && out.Output.Text != "charged" {
 							t.Errorf("output %q, want the one the origin holds", out.Output.Text)
+						}
+						// #237: an output repeating the origin's names
+						// that entry and carries its trust, so a reader
+						// reaches the origin's child through the
+						// origin's link, which the fork cannot hold.
+						copied := tc.origins && tc.completed && tc.answer == nil
+						if cf := e.CopiedFrom; copied && (cf == nil || cf.Session != origin.ID() || cf.Entry != ranEntry) || !copied && cf != nil {
+							t.Errorf("copied_from = %+v, want the origin's output %s in %s (%v)", cf, ranEntry, origin.ID(), copied)
+						}
+						if copied && (e.Trust == nil || !slices.Contains(e.Trust.Reads, agentsession.TrustUntrusted)) {
+							t.Errorf("trust = %+v, want the origin's untrusted", e.Trust)
 						}
 					}
 				}

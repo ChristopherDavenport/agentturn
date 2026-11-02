@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -198,10 +199,11 @@ func withArgs[T any](strict bool, render func(T) openresponses.Items) Option {
 // was given, which the tool is offered and the child is recorded under;
 // a configuration that renames it fails the call. fn's error fails the
 // call before any run starts. Items fn takes from the parent's
-// transcript go in as the run's prompt, not as a seed, so a recorder
-// writes them as the child's own and can stand behind the request that
-// carries them; [WithTranscript]'s seed, which a recorder did not
-// write, it cannot. A seed set as well still goes before the items.
+// transcript, the very items it was given, go in as the run's prompt,
+// not as a seed, marked agentturn.Copied, so a recorder writes them as
+// copied from the parent's session, not as the child's own work, and
+// can stand behind the request that carries them; [WithTranscript]'s
+// seed, which a recorder did not write, it cannot. A seed set as well still goes before the items.
 func WithCallConfig[T any](fn func(ctx context.Context, args T, parent agentturn.Transcript, cfg agentturn.Config) (agentturn.Config, openresponses.Items, error)) Option {
 	schema, err := agenttool.SchemaFor[T]()
 	if err != nil {
@@ -443,6 +445,9 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	if len(prompts) == 0 {
 		return agenttool.Result{}, fmt.Errorf("agent %q: arguments rendered no items", a.cfg.Name)
 	}
+	if a.opts.call != nil {
+		prompts = markCopied(prompts, parent)
+	}
 	var seed agentturn.Transcript
 	if a.opts.seed != nil {
 		seed = a.opts.seed(parent)
@@ -633,6 +638,37 @@ func (a *agentTool) detached(ctx context.Context, call agenttool.Call, child *ag
 		}
 		return agenttool.Result{}, fmt.Errorf("agent %s: %w", strconv.Quote(a.cfg.Name), err)
 	}
+}
+
+// markCopied returns prompts with each item taken from parent marked
+// agentturn.Copied: the parent's own items and the placeholder outputs
+// answered gave its calls in flight, which are the parent's
+// conversation and not the child's work. An item is taken when it is
+// the same item, not an equal one, so an item fn built is the child's.
+func markCopied(prompts openresponses.Items, parent agentturn.Transcript) openresponses.Items {
+	if len(parent) == 0 {
+		return prompts
+	}
+	from := make(map[openresponses.Item]bool, len(parent))
+	for _, item := range parent {
+		if keyable(item) {
+			from[item] = true
+		}
+	}
+	out := make(openresponses.Items, len(prompts))
+	for i, item := range prompts {
+		out[i] = item
+		if base, _ := agentturn.Unhide(item); keyable(base) && from[base] {
+			out[i] = agentturn.Copied(item)
+		}
+	}
+	return out
+}
+
+// keyable reports whether item can be a map key: a pointer, as
+// every openresponses item type is.
+func keyable(item openresponses.Item) bool {
+	return item != nil && reflect.TypeOf(item).Comparable()
 }
 
 // answered returns a copy of parent in which every function call

@@ -256,6 +256,9 @@ type ItemStart struct {
 	// in the model's context and a renderer should not show it. The
 	// Item is the item itself, unwrapped.
 	Hidden bool
+	// Copied is set for an item the caller marked with [Copied]: taken
+	// from another conversation, not produced in this one.
+	Copied bool
 }
 
 // EventType returns "item_start".
@@ -305,6 +308,11 @@ type ItemEnd struct {
 	// in the model's context and a renderer should not show it. A
 	// session recorder writes its entry with visible false.
 	Hidden bool
+	// Copied is set for an item the caller marked with [Copied]: taken
+	// from another conversation, as a child prompted with its parent's
+	// is. A session recorder writes its entry with copied_from, and no
+	// decision for a call so marked or for its output.
+	Copied bool
 	// Trigger, for an item the run was prompted with, is the run's
 	// [Trigger], so a recorder can write how the input arrived; it is
 	// zero for every other item, a queued input included, whose own

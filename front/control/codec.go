@@ -93,7 +93,7 @@ func wireOf(ev agentturn.Event) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return wireItemStart{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Item: item, ResponseID: e.ResponseID, Hidden: e.Hidden}, nil
+		return wireItemStart{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Item: item, ResponseID: e.ResponseID, Hidden: e.Hidden, Copied: e.Copied}, nil
 	case *agentturn.ItemUpdate:
 		item, err := itemOut(e.Item)
 		if err != nil {
@@ -111,7 +111,7 @@ func wireOf(ev agentturn.Event) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return wireItemEnd{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Item: item, ResponseID: e.ResponseID, Hidden: e.Hidden, Trigger: triggerOut(e.Trigger), ModelCallID: e.ModelCallID}, nil
+		return wireItemEnd{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Item: item, ResponseID: e.ResponseID, Hidden: e.Hidden, Copied: e.Copied, Trigger: triggerOut(e.Trigger), ModelCallID: e.ModelCallID}, nil
 	case *agentturn.ResponseEnd:
 		resp, err := responseOut(e.Response)
 		if err != nil {
@@ -237,7 +237,7 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 		if err != nil {
 			return nil, err
 		}
-		return &agentturn.ItemStart{RunID: w.RunID, Turn: w.Turn, Item: item, ResponseID: w.ResponseID, Hidden: w.Hidden}, nil
+		return &agentturn.ItemStart{RunID: w.RunID, Turn: w.Turn, Item: item, ResponseID: w.ResponseID, Hidden: w.Hidden, Copied: w.Copied}, nil
 	},
 	agentturn.EventItemUpdate: func(data []byte) (agentturn.Event, error) {
 		var w wireItemUpdate
@@ -265,7 +265,7 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 		if err != nil {
 			return nil, err
 		}
-		return &agentturn.ItemEnd{RunID: w.RunID, Turn: w.Turn, Item: item, ResponseID: w.ResponseID, Hidden: w.Hidden, Trigger: triggerIn(w.Trigger), ModelCallID: w.ModelCallID}, nil
+		return &agentturn.ItemEnd{RunID: w.RunID, Turn: w.Turn, Item: item, ResponseID: w.ResponseID, Hidden: w.Hidden, Copied: w.Copied, Trigger: triggerIn(w.Trigger), ModelCallID: w.ModelCallID}, nil
 	},
 	agentturn.EventResponseEnd: func(data []byte) (agentturn.Event, error) {
 		var w wireResponseEnd
@@ -418,6 +418,7 @@ type wireItemStart struct {
 	Item       json.RawMessage `json:"item"`
 	ResponseID string          `json:"response_id,omitempty"`
 	Hidden     bool            `json:"hidden,omitempty"`
+	Copied     bool            `json:"copied,omitempty"`
 }
 
 type wireItemUpdate struct {
@@ -436,6 +437,7 @@ type wireItemEnd struct {
 	Item        json.RawMessage `json:"item"`
 	ResponseID  string          `json:"response_id,omitempty"`
 	Hidden      bool            `json:"hidden,omitempty"`
+	Copied      bool            `json:"copied,omitempty"`
 	Trigger     *wireTrigger    `json:"trigger,omitempty"`
 	ModelCallID string          `json:"model_call_id,omitempty"`
 }

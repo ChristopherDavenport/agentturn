@@ -3,6 +3,8 @@ package agentturn
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/ChristopherDavenport/agenttool"
@@ -53,7 +55,7 @@ func TestHiddenItemsReachTheModelAndAreMarked(t *testing.T) {
 		}
 	}
 	for i, item := range a.State().Transcript {
-		if _, ok := item.(hiddenItem); ok {
+		if _, ok := item.(markedItem); ok {
 			t.Errorf("transcript[%d] is still wrapped", i)
 		}
 	}
@@ -234,5 +236,34 @@ func TestContextWithOrigins(t *testing.T) {
 	}
 	if ContextWithOrigins(context.Background(), nil) != context.Background() {
 		t.Error("clearing a context with none attached allocates")
+	}
+}
+
+// TestACopiedItemIsMarkedOnItsEvents pins the loop's half of #243: an
+// item a caller marks Copied is appended as the item itself, and its
+// item events carry the mark unread, beside Hidden when both are set,
+// so a recorder can write it as taken from another conversation.
+func TestACopiedItemIsMarkedOnItsEvents(t *testing.T) {
+	a := New(Config{Model: &echo.Adapter{}, MaxTurns: 1})
+	var marks []string
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if e, ok := ev.(*ItemEnd); ok && e.ResponseID == "" {
+			marks = append(marks, fmt.Sprintf("%s copied=%v hidden=%v", e.Item.(*openresponses.Message).Text(), e.Copied, e.Hidden))
+		}
+		return nil
+	})
+	copied := Copied(openresponses.UserText("theirs"))
+	both := Hidden(Copied(openresponses.UserText("theirs, hidden")))
+	if _, err := a.Prompt(context.Background(), copied, both, openresponses.UserText("mine")); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"theirs copied=true hidden=false", "theirs, hidden copied=true hidden=true", "mine copied=false hidden=false"}
+	if !slices.Equal(marks, want) {
+		t.Errorf("item_end marks = %q, want %q", marks, want)
+	}
+	for i, item := range a.State().Transcript {
+		if _, ok := item.(markedItem); ok {
+			t.Errorf("transcript[%d] is still wrapped", i)
+		}
 	}
 }

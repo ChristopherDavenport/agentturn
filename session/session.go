@@ -1037,6 +1037,13 @@ type writer struct {
 	// a cancel notice on the path names.
 	callees   []*agentsession.LinkEntry
 	cancelled map[string]bool
+	// copied holds the IDs of the copied calls on the path: calls
+	// another session made, which this one holds as context alone and
+	// writes no decision, dispatch or result for (format 0.15).
+	copied map[string]bool
+	// parentSession is the session of the call that spawned this one,
+	// opened for the trust of the entries a copied item names.
+	parentSession *agentsession.Session
 	// parents maps a nested call, one a tool made through
 	// agentturn.Invoke, to the call whose tool made it, so a record the
 	// nested call writes names a call the path holds.
@@ -1226,6 +1233,11 @@ type callRecord struct {
 	ranEntry   string
 	childOff   string
 	calleesOff []agentsession.CalleeLink
+	// ranSession is the session holding ranEntry when it is not this
+	// one, a fork's origin, and ranTrust that entry's trust: an output
+	// answered with ranEntry as its origin is written copied from it.
+	ranSession string
+	ranTrust   *agentsession.Trust
 	// dispatchEntry is the ID of the last dispatch entry written or
 	// seeded for the call, and lastWithdrawn says it was withdrawn.
 	// handedOff counts the call's hand-offs on the path, those its tool
@@ -1647,7 +1659,7 @@ func New(store agentsession.Store, sessionID string, opts ...Option) *Recorder {
 }
 
 func newWriter(r *Recorder, id string) *writer {
-	return &writer{rec: r, id: id, calls: map[string]*callRecord{}, linked: map[string]bool{}, cancelled: map[string]bool{}, parents: map[string]string{}, appOnly: map[string]bool{}}
+	return &writer{rec: r, id: id, calls: map[string]*callRecord{}, linked: map[string]bool{}, cancelled: map[string]bool{}, parents: map[string]string{}, appOnly: map[string]bool{}, copied: map[string]bool{}}
 }
 
 // Start creates a session from h and returns a recorder for it. When
@@ -2423,9 +2435,12 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // one, naming the copy. In a fork no link is written, since a
 // subsession link names a child of the session that writes it and the
 // child is the origin's, and the callees in another system are the
-// origin's work, whose cancels the origin sent: the fork's record
-// reaches them through the origin, and the answer's Origin names the
-// output it repeats. A call an answer ended before its output was written gets
+// origin's work, whose cancels the origin sent: the recorder writes the
+// output with copied_from naming the origin and the origin's output
+// entry, with that entry's trust, and a reader reaches the child
+// through the origin's link for the call on the origin's path to that
+// entry, which the fork's own prefix lacks when the fork was based at
+// the call. A call an answer ended before its output was written gets
 // [agentturn.OutcomeUnknown] as that output, since the record holds
 // the answer and not the output it gave. A held call is waiting for
 // someone and is the caller's to answer, a call held after its
@@ -3605,7 +3620,14 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 	o.r, _ = w.rec.store.(agentsession.Reader)
 	withdrawn := withdrawnDispatches(s.Path(s.Leaf()))
 	for _, c := range calls {
+		if c.Copied() {
+			// Another session's call, held as context alone.
+			w.copied[c.ID()] = true
+			continue
+		}
 		off := false
+		ranSession := ""
+		var ranTrust *agentsession.Trust
 		ranEntry, childOff := "", ""
 		var calleesOff []agentsession.CalleeLink
 		if c.Output == nil && len(c.Dispatches) == 0 {
@@ -3617,8 +3639,19 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 				if _, ranEntry = outputAfter(at, d, c.Entry.ID); ranEntry != "" && at == s {
 					// A link names a child of this session, so only a
 					// branch of this session can lend one; a fork's
-					// origin holds its own link, in the fork's prefix.
+					// answer names the origin's output by copied_from
+					// instead, and a reader follows the origin's link.
 					childOff = subsessionOn(at, ranEntry, c.ID())
+				}
+				if ranEntry != "" && at != s {
+					// The output is the origin's: one that repeats it
+					// names it, with its trust.
+					ranSession = at.ID()
+					if e, ok := at.Entry(ranEntry); ok {
+						if ie, ok := e.(*agentsession.ItemEntry); ok {
+							ranTrust = ie.Trust
+						}
+					}
 				}
 				if ranEntry != "" && at == s {
 					// Nor does a fork take its origin's callee links:
@@ -3631,6 +3664,7 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 		}
 		rec := callRecordOf(c, s.Header(), off)
 		rec.ranEntry, rec.childOff, rec.calleesOff = ranEntry, childOff, calleesOff
+		rec.ranSession, rec.ranTrust = ranSession, ranTrust
 		rec.dispatchEntry = lastDispatch(c)
 		rec.lastWithdrawn = withdrawn[rec.dispatchEntry]
 		for _, d := range c.Dispatches {
@@ -4144,7 +4178,7 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 		if err != nil {
 			return err
 		}
-		if w.inFlight && e.ResponseID == "" && !e.Hidden && source == nil {
+		if w.inFlight && e.ResponseID == "" && !e.Hidden && !e.Copied && source == nil {
 			// The loop appends nothing of its own while a model call
 			// is in flight, so this is the model's, from a stream that
 			// has not named its response yet: it is written once it
@@ -4152,7 +4186,11 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 			w.unnamed = append(w.unnamed, unnamedItem{item: e.Item, modelCallID: e.ModelCallID})
 			return nil
 		}
-		return w.item(ctx, e.Item, e.ResponseID, e.Hidden, source, e.ModelCallID)
+		var from *copySource
+		if e.Copied {
+			from = w.copiedFrom(ctx, e.Item)
+		}
+		return w.itemFrom(ctx, e.Item, e.ResponseID, e.Hidden, source, e.ModelCallID, from)
 	case *agentturn.ResponseEnd:
 		return w.response(ctx, e)
 	case *agentturn.ToolStart:
@@ -4985,15 +5023,68 @@ func (w *writer) instructionParts(ctx context.Context, req openresponses.Request
 // trigger for an item the run was prompted with, and modelCallID the
 // ID the model gave a call the loop renamed.
 func (w *writer) item(ctx context.Context, item openresponses.Item, responseID string, hidden bool, source *agentsession.Trigger, modelCallID string) error {
+	return w.itemFrom(ctx, item, responseID, hidden, source, modelCallID, nil)
+}
+
+// copySource is where a copied item was taken from: the entry's
+// copied_from and the trust it carries.
+type copySource struct {
+	from  agentsession.CopiedFrom
+	trust *agentsession.Trust
+}
+
+// copiedFrom resolves an item the loop marks copied, one a child was
+// prompted with from the conversation of the session whose call
+// spawned it: that session, and the entry of it holding the very item,
+// with its trust, when there is one, which a placeholder made for the
+// copy is not. It returns nil for a session with no parent, which has
+// no session to name.
+func (w *writer) copiedFrom(ctx context.Context, item openresponses.Item) *copySource {
+	if w.parentID == "" {
+		return nil
+	}
+	src := &copySource{from: agentsession.CopiedFrom{Session: w.parentID}}
+	p := w.parent
+	if p == nil {
+		return src
+	}
+	for i := len(p.values) - 1; i >= 0; i-- {
+		if p.values[i] != item || p.custom[i] {
+			continue
+		}
+		src.from.Entry = p.items[i]
+		if w.parentSession == nil {
+			w.parentSession, _ = w.rec.store.Open(context.WithoutCancel(ctx), w.parentID)
+		}
+		if w.parentSession != nil {
+			if e, ok := w.parentSession.Entry(src.from.Entry); ok {
+				if ie, ok := e.(*agentsession.ItemEntry); ok {
+					src.trust = ie.Trust
+				}
+			}
+		}
+		break
+	}
+	return src
+}
+
+// itemFrom is [writer.item] for an item taken from another session's
+// conversation when from is set: its entry carries copied_from and the
+// source's trust, and a copied call and its output take no decision.
+func (w *writer) itemFrom(ctx context.Context, item openresponses.Item, responseID string, hidden bool, source *agentsession.Trigger, modelCallID string, from *copySource) error {
 	if item == nil {
 		return nil
+	}
+	if out, ok := item.(*openresponses.FunctionCallOutput); ok && from == nil && w.copied[out.CallID] && w.parentID != "" {
+		// An output for a copied call is copied too: made for the copy.
+		from = &copySource{from: agentsession.CopiedFrom{Session: w.parentID}}
 	}
 	// failed marks an output that says the call failed: its tool
 	// reported failure, or the caller answered a call it gave up, such
 	// as one whose outcome is unknown. A refusal, written as a reject,
 	// is not a failure.
 	failed := false
-	if out, ok := item.(*openresponses.FunctionCallOutput); ok && !w.replay {
+	if out, ok := item.(*openresponses.FunctionCallOutput); ok && !w.replay && !w.copied[out.CallID] {
 		c := w.calls[out.CallID]
 		switch {
 		case c != nil && c.answered:
@@ -5049,6 +5140,14 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 				if err := w.copyCallees(ctx, out.CallID, c.calleesOff); err != nil {
 					return err
 				}
+			}
+			if origin := agentturn.OriginFromContext(ctx, out.CallID); origin != "" && origin == c.ranEntry && c.ranSession != "" && from == nil {
+				// The output repeats the one the fork's origin
+				// recorded: it names that entry, through which a
+				// reader reaches the origin's link to the child
+				// session that produced it, which this session's
+				// record cannot hold.
+				from = &copySource{from: agentsession.CopiedFrom{Session: c.ranSession, Entry: origin}, trust: c.ranTrust}
 			}
 			dec := agentsession.NewDecision(out.CallID, c.entry, agentsession.VerdictAnswer, by)
 			if reason != "" {
@@ -5122,6 +5221,10 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		entry = &agentsession.CustomEntry{NS: item.ItemType(), Data: raw, EntryBase: agentsession.EntryBase{Unknown: map[string]json.RawMessage{ResponseIDMember: id}}}
 	} else {
 		e := &agentsession.ItemEntry{Item: recorded, ResponseID: responseID, Failed: failed}
+		if from != nil {
+			cf := from.from
+			e.CopiedFrom, e.Trust = &cf, from.trust
+		}
 		if hidden {
 			visible := false
 			e.Visible = &visible
@@ -5171,6 +5274,13 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 	w.models = append(w.models, model)
 	switch v := item.(type) {
 	case *openresponses.FunctionCall:
+		if from != nil && !appOnly {
+			// Another session's call: context alone, never one of
+			// this session's, so no decision, dispatch or run end
+			// names it.
+			w.copied[v.CallID] = true
+			break
+		}
 		if appOnly {
 			// A custom entry is no function call a decision or a
 			// dispatch can name by target, nor one a run end lists.

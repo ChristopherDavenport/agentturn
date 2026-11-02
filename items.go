@@ -6,19 +6,25 @@ import (
 	"github.com/ChristopherDavenport/openresponses"
 )
 
-// hiddenItem marks an item the model reads and a renderer should not
-// show. It is a wrapper the loop strips when it appends the item, so
-// nothing downstream sees it: the transcript, the request and every
-// type switch on an item work on the item itself. It marshals as the
-// item it wraps, so one that reaches a server or a store anyway is the
-// item and not an envelope.
-type hiddenItem struct{ item openresponses.Item }
+// markedItem marks an item the caller hands the loop: one the model
+// reads and a renderer should not show ([Hidden]), one taken from
+// another conversation ([Copied]), or both. It is a wrapper the loop
+// strips when it appends the item, so nothing downstream sees it: the
+// transcript, the request and every type switch on an item work on the
+// item itself, and only the item events carry the marks. It marshals
+// as the item it wraps, so one that reaches a server or a store anyway
+// is the item and not an envelope.
+type markedItem struct {
+	item   openresponses.Item
+	hidden bool
+	copied bool
+}
 
 // ItemType returns the wrapped item's type.
-func (h hiddenItem) ItemType() string { return h.item.ItemType() }
+func (h markedItem) ItemType() string { return h.item.ItemType() }
 
 // MarshalJSON encodes the wrapped item.
-func (h hiddenItem) MarshalJSON() ([]byte, error) { return json.Marshal(h.item) }
+func (h markedItem) MarshalJSON() ([]byte, error) { return json.Marshal(h.item) }
 
 // Hidden marks item as part of the model's context that a renderer
 // should hide: a stream rule's interrupt report, an advisory, a notice
@@ -42,19 +48,50 @@ func Hidden(item openresponses.Item) openresponses.Item {
 	if item == nil {
 		return nil
 	}
-	if _, ok := item.(hiddenItem); ok {
-		return item
+	m, _ := item.(markedItem)
+	if m.item == nil {
+		m.item = item
 	}
-	return hiddenItem{item: item}
+	m.hidden = true
+	return m
 }
 
-// Unhide returns the item [Hidden] wrapped and whether it was hidden.
-// An item that was never hidden comes back unchanged.
+// Unhide returns the item [Hidden] or [Copied] wrapped and whether it
+// was hidden. An item never marked comes back unchanged.
 func Unhide(item openresponses.Item) (openresponses.Item, bool) {
-	if h, ok := item.(hiddenItem); ok {
-		return h.item, true
+	if m, ok := item.(markedItem); ok {
+		return m.item, m.hidden
 	}
 	return item, false
+}
+
+// Copied marks item as taken from another conversation rather than
+// produced in this one: a child prompted with its parent's
+// conversation, as tools/agent's WithCallConfig does. The model reads
+// it as any item; the loop carries the mark unread on its item events
+// ([ItemEnd.Copied]), and a session recorder writes the item's entry
+// with agentsession RFC 0001's copied_from, naming where it came from,
+// and writes no decision for a call so marked or its output, since the
+// call is not this session's. Use it where [Hidden] may be used; the
+// two compose, and [Unhide] strips both.
+func Copied(item openresponses.Item) openresponses.Item {
+	if item == nil {
+		return nil
+	}
+	m, _ := item.(markedItem)
+	if m.item == nil {
+		m.item = item
+	}
+	m.copied = true
+	return m
+}
+
+// marks returns the item the marks wrap, and the marks.
+func marks(item openresponses.Item) (base openresponses.Item, hidden, copied bool) {
+	if m, ok := item.(markedItem); ok {
+		return m.item, m.hidden, m.copied
+	}
+	return item, false, false
 }
 
 // unhideAll returns items with every hidden mark stripped, and whether
@@ -62,8 +99,8 @@ func Unhide(item openresponses.Item) (openresponses.Item, bool) {
 func unhideAll(items openresponses.Items) openresponses.Items {
 	var out openresponses.Items
 	for i, item := range items {
-		base, hidden := Unhide(item)
-		if !hidden {
+		base, _, _ := marks(item)
+		if base == item {
 			continue
 		}
 		if out == nil {

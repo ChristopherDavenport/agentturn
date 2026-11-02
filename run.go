@@ -1508,14 +1508,14 @@ func (r *runner) appendOne(item openresponses.Item, mode InputMode, trigger, end
 	if item == nil {
 		return nil
 	}
-	item, hidden := Unhide(item)
-	if err := r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden}); err != nil {
+	item, hidden, copied := marks(item)
+	if err := r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden, Copied: copied}); err != nil {
 		return err
 	}
 	r.transcript = append(r.transcript, item)
 	r.added = append(r.added, item)
 	r.arrived = append(r.arrived, TurnInput{Item: item, Mode: mode, Trigger: trigger})
-	if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden, Trigger: endTrigger}); err != nil {
+	if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden, Copied: copied, Trigger: endTrigger}); err != nil {
 		return err
 	}
 	return nil

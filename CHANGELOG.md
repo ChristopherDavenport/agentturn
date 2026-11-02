@@ -273,6 +273,23 @@ versions may break the API.
   record whether or not the child runs again; before, it waited for a
   run that might never come.
 
+- Fixed: a child opened with its parent's conversation records that
+  conversation as copied, not as its own. The new `Copied(item)` mark,
+  carried unread as `Copied` on the item events, is set by
+  `tools/agent`'s `WithCallConfig` on the items it takes from the
+  parent, the placeholder outputs of the calls in flight among them;
+  `session`'s recorder writes them with format 0.15's `copied_from`,
+  naming the parent session and the entry each repeats, with its
+  `trust`, and writes no decision for the copied call, where it wrote a
+  `reject` for its placeholder output before. agentsession's ATIF export
+  then reads them as copied context. (#243)
+- Fixed: an answer a fork gives a call in its prefix with the output
+  its origin recorded writes that output with `copied_from` naming the
+  origin's entry and carrying its `trust`, so a reader reaches the
+  origin's child session for the call, which the fork's own record
+  cannot link. (#237)
+- Changed: `front/control` carries `copied` on the item events.
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the
