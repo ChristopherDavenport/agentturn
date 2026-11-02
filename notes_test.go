@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -195,8 +196,22 @@ func TestACutCallsNoteWaitsForItsAnswer(t *testing.T) {
 		return nil, nil
 	}
 	a := New(Config{Model: &twoCalls{}, Tools: []agenttool.Tool{slow, agenttool.New("b", "", upper)}, BeforeToolCall: note, MaxTurns: 1})
+	// The abort waits for b to settle as well as for a to start: b runs
+	// beside a, and an abort that reached it before its hand-off would
+	// leave it pending as undispatched, as Cancellation has it, which is
+	// another scenario than the one this pins (#264).
+	bDone := make(chan struct{})
+	var once sync.Once
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if e, ok := ev.(*ToolEnd); ok && e.Name == "b" {
+			// The resume's turn calls b again.
+			once.Do(func() { close(bDone) })
+		}
+		return nil
+	})
 	go func() {
 		<-started
+		<-bDone
 		a.Abort()
 	}()
 	end, err := a.Prompt(context.Background(), openresponses.UserText("x"))
