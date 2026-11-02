@@ -63,7 +63,7 @@ func TestAChildOpenedWithItsParentsConversationRecordsItAsCopied(t *testing.T) {
 			}
 		}
 	}
-	var copied, own []string
+	var copied []string
 	for _, e := range child.Path(child.Leaf()) {
 		switch v := e.(type) {
 		case *agentsession.DecisionEntry:
@@ -91,8 +91,6 @@ func TestAChildOpenedWithItsParentsConversationRecordsItAsCopied(t *testing.T) {
 			}
 			if cf != nil {
 				copied = append(copied, v.Item.ItemType())
-			} else {
-				own = append(own, v.Item.ItemType())
 			}
 		}
 	}
