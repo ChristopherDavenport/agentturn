@@ -123,3 +123,64 @@ func TestAChildOpenedWithItsParentsConversationRecordsItAsCopied(t *testing.T) {
 		t.Errorf("the child's own agent steps = %d, want its one answer", agentSteps)
 	}
 }
+
+// TestACopyThatNamesNoEntryCarriesItsPathsTrust pins format 0.15's
+// trust rule for a copy (#243): an item copied that names no entry, the
+// placeholder output made for the call in flight among them, carries
+// the trust of the path it was copied from, so a label the parent read
+// reaches the child.
+func TestACopyThatNamesNoEntryCarriesItsPathsTrust(t *testing.T) {
+	type taskArgs struct {
+		Input string `json:"input"`
+	}
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	_, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The parent read a web page before this process took it up.
+	untrusted := &agentsession.Trust{Reads: []string{agentsession.TrustUntrusted}}
+	if _, err := store.Append(ctx, s.ID(), &agentsession.ItemEntry{Item: openresponses.UserText("a page from the web"), Trust: untrusted}); err != nil {
+		t.Fatal(err)
+	}
+	rec, s, err := Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := agent.New(agentturn.Config{Name: "helper", Description: "helps", Model: &echo.Adapter{}, ModelName: "child"},
+		agent.WithCallConfig(func(_ context.Context, a taskArgs, parent agentturn.Transcript, cfg agentturn.Config) (agentturn.Config, openresponses.Items, error) {
+			return cfg, append(append(openresponses.Items(nil), parent...), openresponses.UserText(a.Input)), nil
+		}),
+		agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+	opts, err := AgentOptions(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: scriptedCalls{{"helper", `{"input":"summarise"}`}}, ModelName: "parent", Tools: []agenttool.Tool{helper}}, opts...)
+	defer rec.Attach(a)()
+	if end, err := a.Prompt(ctx, openresponses.UserText("delegate")); err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	l := links(s)
+	if len(l) != 1 {
+		t.Fatalf("links = %+v", l)
+	}
+	child, err := store.Open(ctx, l[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range child.Path(child.Leaf()) {
+		ie, ok := e.(*agentsession.ItemEntry)
+		if !ok || ie.CopiedFrom == nil || ie.CopiedFrom.Entry != "" {
+			continue
+		}
+		if !ie.Trust.Untrusted() {
+			t.Errorf("%s copied with no entry carries trust %+v, want the parent path's untrusted", ie.Item.ItemType(), ie.Trust)
+		}
+	}
+	if err := child.VerifyCopies(func(id string) (*agentsession.Session, error) { return store.Open(ctx, id) }); err != nil {
+		t.Errorf("verify copies: %v", err)
+	}
+	verifyAll(t, child)
+}

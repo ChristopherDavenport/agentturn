@@ -4221,7 +4221,9 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 		}
 		var from *copySource
 		if e.Copied {
-			from = w.copiedFrom(ctx, e.Item)
+			if from, err = w.copiedFrom(ctx, e.Item); err != nil {
+				return err
+			}
 		}
 		return w.itemFrom(ctx, e.Item, e.ResponseID, e.Hidden, source, e.ModelCallID, from)
 	case *agentturn.ResponseEnd:
@@ -5064,41 +5066,69 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 type copySource struct {
 	from  agentsession.CopiedFrom
 	trust *agentsession.Trust
+	// pathTrust is the trust of the path the item was copied from,
+	// which a copy naming no entry carries (format 0.15).
+	pathTrust *agentsession.Trust
 }
 
 // copiedFrom resolves an item the loop marks copied, one a child was
 // prompted with from the conversation of the session whose call
 // spawned it: that session, and the entry of it holding the very item,
-// with its trust, when there is one, which a placeholder made for the
-// copy is not. It returns nil for a session with no parent, which has
-// no session to name.
-func (w *writer) copiedFrom(ctx context.Context, item openresponses.Item) *copySource {
+// with that entry's trust, when there is one; a copy naming no entry,
+// a placeholder made for the copy among them, carries the trust of the
+// parent's path. It returns nil for a session with no parent, which has
+// no session to name, and an error when the parent session cannot be
+// read, since a copy must not name an entry without its trust.
+func (w *writer) copiedFrom(ctx context.Context, item openresponses.Item) (*copySource, error) {
 	if w.parentID == "" {
-		return nil
+		return nil, nil
 	}
-	src := &copySource{from: agentsession.CopiedFrom{Session: w.parentID}}
+	ps, err := w.parentPath(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	src := &copySource{from: agentsession.CopiedFrom{Session: w.parentID}, pathTrust: agentsession.PathTrust(ps.Path(ps.Leaf()))}
+	src.trust = src.pathTrust
 	p := w.parent
-	if p == nil {
-		return src
+	if p == nil || item == nil {
+		return src, nil
 	}
 	for i := len(p.values) - 1; i >= 0; i-- {
 		if p.values[i] != item || p.custom[i] {
 			continue
 		}
-		src.from.Entry = p.items[i]
-		if w.parentSession == nil {
-			w.parentSession, _ = w.rec.store.Open(context.WithoutCancel(ctx), w.parentID)
-		}
-		if w.parentSession != nil {
-			if e, ok := w.parentSession.Entry(src.from.Entry); ok {
-				if ie, ok := e.(*agentsession.ItemEntry); ok {
-					src.trust = ie.Trust
-				}
+		e, ok := ps.Entry(p.items[i])
+		if !ok {
+			// Written since the parent was read: read it again.
+			if ps, err = w.parentPath(ctx, true); err != nil {
+				return nil, err
 			}
+			src.pathTrust = agentsession.PathTrust(ps.Path(ps.Leaf()))
+			src.trust = src.pathTrust
+			if e, ok = ps.Entry(p.items[i]); !ok {
+				break
+			}
+		}
+		if ie, ok := e.(*agentsession.ItemEntry); ok {
+			src.from.Entry, src.trust = p.items[i], ie.Trust
 		}
 		break
 	}
-	return src
+	return src, nil
+}
+
+// parentPath is the session whose call spawned this one, read once, or
+// again when fresh is set.
+func (w *writer) parentPath(ctx context.Context, fresh bool) (*agentsession.Session, error) {
+	if w.parentSession != nil && !fresh {
+		return w.parentSession, nil
+	}
+	s, err := w.rec.store.Open(context.WithoutCancel(ctx), w.parentID)
+	if err != nil {
+		return nil, fmt.Errorf("session: read parent session %s for a copied item: %w", w.parentID, err)
+	}
+	w.parentSession = s
+	return s, nil
 }
 
 // itemFrom is [writer.item] for an item taken from another session's
@@ -5109,8 +5139,12 @@ func (w *writer) itemFrom(ctx context.Context, item openresponses.Item, response
 		return nil
 	}
 	if out, ok := item.(*openresponses.FunctionCallOutput); ok && from == nil && w.copied[out.CallID] && w.parentID != "" {
-		// An output for a copied call is copied too: made for the copy.
-		from = &copySource{from: agentsession.CopiedFrom{Session: w.parentID}}
+		// An output for a copied call is copied too: made for the copy,
+		// it names no entry.
+		var err error
+		if from, err = w.copiedFrom(ctx, nil); err != nil {
+			return err
+		}
 	}
 	// failed marks an output that says the call failed: its tool
 	// reported failure, or the caller answered a call it gave up, such

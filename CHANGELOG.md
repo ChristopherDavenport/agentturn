@@ -308,6 +308,13 @@ versions may break the API.
   `Recorder.Queue` does the same for a refused queue. `front/control`
   carries `held` on the state. (#244)
 
+- Fixed: a copied item that names no entry, such as the placeholder
+  output a child's copy gives a call in flight, carries the trust of the
+  parent path it was copied from, as format 0.15 asks, so a label the
+  parent read reaches the child. The recorder reads the parent session
+  for it, and fails the write rather than name an entry without its
+  trust when it cannot. (#243)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the
