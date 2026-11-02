@@ -1715,8 +1715,10 @@ An agent stands in four places inside another system:
   continues the agent with it after a run that ended without taking
   it, as a delivery's own continue would; a run that stops for input
   leaves it for the message that answers the calls, whose run takes it
-  after the answered batch, as the Queues section has it; one that
-  fails or is cancelled drops it with the task. A message carrying
+  after the answered batch, as the Queues section has it, and a cancel
+  of that task drops it; one that fails or is cancelled drops it with
+  the task. A front bounds the deliveries a task holds untaken and
+  refuses one past the bound. A message carrying
   answers to pending calls, or any data part, is refused while the
   task runs, since nothing it answers has been asked. The consuming
   tool offers a way to send to a working task, the task a detached

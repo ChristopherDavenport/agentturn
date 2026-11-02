@@ -52,7 +52,7 @@ type Executor struct {
 	// left queued when it stopped for input, for the task that answers.
 	deliverBusy bool
 	running     map[a2a.TaskID]*running
-	owed        map[string][]steer
+	owed        map[string]owedSteers
 }
 
 // ErrConversationBusy is the cause of the error a message gets when its

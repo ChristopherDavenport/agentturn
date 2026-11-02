@@ -345,3 +345,75 @@ func finalOrAsking(t *testing.T, h a2asrv.RequestHandler, id a2a.TaskID) *a2a.Ta
 	t.Fatalf("task %s never stopped", id)
 	return nil
 }
+
+// TestACancelDropsAnOwedSteer pins the review of #287: a steer left for
+// the message answering a task's calls is dropped with the task when
+// the caller cancels it, so the conversation's next task never reads
+// it.
+func TestACancelDropsAnOwedSteer(t *testing.T) {
+	model := &asksTheCaller{entered: make(chan struct{}), release: make(chan struct{})}
+	h := New(agentturn.Config{Model: model}, WithDeliverWhileBusy(),
+		WithCallerTools(openresponses.NewFunctionTool("remote", "caller side", json.RawMessage(`{"type":"object"}`)))).RequestHandler()
+	first := userMessage("lint the repo")
+	first.ContextID = "c1"
+	res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: first, Config: nonBlocking})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := res.(*a2a.Task)
+	<-model.entered
+	steer := a2a.NewMessageForTask(a2a.MessageRoleUser, task, a2a.TextPart{Text: "also check the cache"})
+	if _, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: steer, Config: nonBlocking}); err != nil {
+		t.Fatalf("steer: %v", err)
+	}
+	close(model.release)
+	if asking := finalOrAsking(t, h, task.ID); asking.Status.State != a2a.TaskStateInputRequired {
+		t.Fatalf("task = %s, want input-required", asking.Status.State)
+	}
+	if _, err := h.OnCancelTask(context.Background(), &a2a.TaskIDParams{ID: task.ID}); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	next := userMessage("start over")
+	next.ContextID = "c1"
+	if done := sendTask(t, h, next); done.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("next task = %s", done.Status.State)
+	}
+	for _, users := range model.seen() {
+		if strings.Contains(strings.Join(users, "|"), "also check the cache") {
+			t.Errorf("the next task read the canceled task's steer: %q", users)
+		}
+	}
+}
+
+// TestSteersAreBounded pins the review of #287: a working task takes at
+// most MaxSteers steers not yet taken, and refuses the next.
+func TestSteersAreBounded(t *testing.T) {
+	model := &worksOnce{}
+	entered, release := make(chan struct{}), make(chan struct{})
+	work := agenttool.New("work", "works until released", func(ctx context.Context, _ struct{}) (string, error) {
+		close(entered)
+		<-release
+		return "worked", nil
+	})
+	h := New(agentturn.Config{Model: model, Tools: []agenttool.Tool{work}}, WithDeliverWhileBusy()).RequestHandler()
+	first := userMessage("lint the repo")
+	first.ContextID = "c1"
+	res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: first, Config: nonBlocking})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := res.(*a2a.Task)
+	<-entered
+	defer func() { finalTask(t, h, task.ID) }()
+	defer close(release)
+	for i := range MaxSteers + 1 {
+		steer := a2a.NewMessageForTask(a2a.MessageRoleUser, task, a2a.TextPart{Text: "more"})
+		_, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: steer, Config: nonBlocking})
+		if i < MaxSteers && err != nil {
+			t.Fatalf("steer %d: %v", i, err)
+		}
+		if i == MaxSteers && !errors.Is(err, a2a.ErrInvalidRequest) {
+			t.Errorf("steer past the bound: %v, want refused", err)
+		}
+	}
+}

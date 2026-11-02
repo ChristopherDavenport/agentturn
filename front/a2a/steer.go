@@ -23,8 +23,9 @@ import (
 // delivery starts belongs to the same task and the task does not end
 // while the delivery is outstanding. A run that ends waiting on calls
 // leaves it for the message that answers them, which takes it after
-// the answered batch; one that fails or is cancelled drops it, with
-// the task.
+// the answered batch, unless the task is cancelled first; one that
+// fails or is cancelled drops it, with the task. A task holds at most
+// [MaxSteers] steers it has not taken.
 //
 // The conversation still runs one task at a time. A message naming
 // only the context, which the A2A server makes a new task, is still
@@ -42,15 +43,29 @@ import (
 // option every message on a busy conversation is refused.
 func WithDeliverWhileBusy() Option { return func(e *Executor) { e.deliverBusy = true } }
 
+// MaxSteers is how many steers a working task holds that its agent has
+// not taken yet, the ones it keeps for the message answering its calls
+// included; [WithDeliverWhileBusy] refuses the next with
+// a2a.ErrInvalidRequest until the agent takes one.
+const MaxSteers = 16
+
 // running is a task whose run is in flight: its agent, and the steers
 // callers delivered into it.
 type running struct {
+	task      a2a.TaskID
 	contextID string
 	agent     *agentturn.Agent
 	// open is whether the task still takes a steer; it is closed in the
 	// same step as the check that finds none outstanding.
 	open    bool
 	steered []steer
+}
+
+// owedSteers are the steers a task left queued when it stopped for
+// input, for the message that answers its calls.
+type owedSteers struct {
+	task   a2a.TaskID
+	steers []steer
 }
 
 // steer is an item a caller delivered into a running task, with the
@@ -69,8 +84,8 @@ func (e *Executor) track(ctx context.Context, task a2a.TaskID, contextID string,
 	if e.running == nil {
 		e.running = map[a2a.TaskID]*running{}
 	}
-	rt := &running{contextID: contextID, agent: agent, open: true}
-	for _, s := range e.owed[contextID] {
+	rt := &running{task: task, contextID: contextID, agent: agent, open: true}
+	for _, s := range e.owed[contextID].steers {
 		if agent.Redeliver(agentturn.ContextWithTrigger(ctx, s.trigger), s.item) == nil {
 			rt.steered = append(rt.steered, s)
 		}
@@ -120,11 +135,22 @@ func (e *Executor) outstanding(rt *running, end *agentturn.RunEnd) (agentturn.Tr
 	rt.open = false
 	if len(left) > 0 && end != nil && end.Reason == agentturn.ReasonInputRequired {
 		if e.owed == nil {
-			e.owed = map[string][]steer{}
+			e.owed = map[string]owedSteers{}
 		}
-		e.owed[rt.contextID] = append(e.owed[rt.contextID], left...)
+		e.owed[rt.contextID] = owedSteers{task: rt.task, steers: left}
 	}
 	return agentturn.Trigger{}, false
+}
+
+// dropOwed drops the steers task left for the message answering its
+// calls, for a cancel of the task: the caller gave the task up, and its
+// steers with it.
+func (e *Executor) dropOwed(contextID string, task a2a.TaskID) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.owed[contextID].task == task {
+		delete(e.owed, contextID)
+	}
 }
 
 // deliver hands msg to the running agent of the task it names, under
@@ -165,6 +191,9 @@ func (e *Executor) deliver(ctx context.Context, msg *a2a.Message) (bool, error) 
 	defer e.mu.Unlock()
 	if !rt.open {
 		return false, nil
+	}
+	if len(rt.steered)+len(items) > MaxSteers {
+		return false, a2a.NewError(fmt.Errorf("%w: the task holds %d steers it has not taken", a2a.ErrInvalidRequest, len(rt.steered)), "the task holds as many steers as it takes; send again once it has taken one")
 	}
 	if err := rt.agent.Redeliver(ctx, items...); err != nil {
 		return false, err

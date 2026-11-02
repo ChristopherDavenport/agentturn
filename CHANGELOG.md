@@ -635,7 +635,9 @@ versions may break the API.
   a delivery under the caller's trigger and answered with the task; the
   task continues the agent while the delivery is still queued after a
   run, keeps it for the answering message when the run stops for input,
-  and drops it when the run fails or is cancelled. A message naming
+  and drops it when the run fails or is cancelled, or the input-required
+  task is cancelled; a task holds at most `MaxSteers` (16) steers not yet
+  taken and refuses the next. A message naming
   only the context is still refused as busy; a data part or declared
   caller tools are refused while the task runs. The steer is served by
   `Executor.RequestHandler`, which now wraps the A2A server's handler
