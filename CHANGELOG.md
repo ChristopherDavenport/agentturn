@@ -497,6 +497,12 @@ versions may break the API.
   naming the transfer, the sender and the receiver; `handoff.Team.Run`
   does so. (#276)
 
+- Fixed: `session.Recorder.Elicitor` writes the decider the answer
+  names (`agenttool.Answer.By`) on the answer entry, and the label it
+  was built with only when the answer names none; a rule's answer was
+  recorded under the wrapper's label while its decision said `policy`.
+  (#267)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

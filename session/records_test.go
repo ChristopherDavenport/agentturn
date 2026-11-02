@@ -3111,3 +3111,42 @@ func TestANoteSurvivesACrashBeforeItsItem(t *testing.T) {
 		})
 	}
 }
+
+// TestAnElicitationAnswerIsByTheDeciderItNames pins #267 for the
+// record: the answer entry names the decider the answer names, and the
+// label the elicitor was built with only when the answer names none.
+func TestAnElicitationAnswerIsByTheDeciderItNames(t *testing.T) {
+	for _, tc := range []struct{ by, want string }{
+		{agenttool.ByPolicy, agentsession.ByPolicy},
+		{"", agentsession.ByHuman},
+	} {
+		ctx := context.Background()
+		rec, s, err := Start(ctx, agentsession.NewMemoryStore(), agentsession.Header{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		answer := func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+			return agenttool.Answer{Action: agenttool.ActionAccept, By: tc.by}, nil
+		}
+		tool := agenttool.New("prune", "", func(ctx context.Context, _ echoArgs) (string, error) {
+			ask, _ := agenttool.ElicitorFrom(ctx)
+			if _, err := ask(ctx, agenttool.Elicitation{Message: "delete the branch?"}); err != nil {
+				return "", err
+			}
+			return "pruned", nil
+		})
+		a := agentturn.New(agentturn.Config{Model: allCalls{}, MaxTurns: 1, Tools: []agenttool.Tool{tool}, ToolElicitor: rec.Elicitor(agentsession.ByHuman, answer)})
+		unsub := rec.Attach(a)
+		if _, err := a.Prompt(ctx, openresponses.UserText("go")); err != nil {
+			t.Fatal(err)
+		}
+		unsub()
+		entries := customs(s, ElicitationNS)
+		if len(entries) != 2 {
+			t.Fatalf("elicitation entries = %d", len(entries))
+		}
+		if got := elicitationOf(t, entries[1]); got.Phase != ElicitationAnswer || got.By != tc.want {
+			t.Errorf("answer by %q recorded by %q, want %q", tc.by, got.By, tc.want)
+		}
+	}
+}

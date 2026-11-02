@@ -3536,8 +3536,9 @@ func (r *Recorder) RecordFunc() agenttool.RecordFunc {
 // writes it as two [ElicitationNS] custom entries under the call that
 // asked: the question, with phase ask, before it is put to fn, and its
 // answer, with phase answer and asked naming the first entry, before
-// the answer returns to the tool; by names who answers, in the session
-// format's terms. When fn is an agent's QuestionElicitor answered
+// the answer returns to the tool; the answer entry names the decider
+// the answer names (agenttool.Answer.By), and by, in the session
+// format's terms, when it names none. When fn is an agent's QuestionElicitor answered
 // through Reply with a trigger on its context, such as front/control's
 // principal, the answer entry names it as its Source
 // (agentturn.WatchAnswerer, named by the replier with
@@ -3591,7 +3592,12 @@ func (r *Recorder) Elicitor(by string, fn agenttool.Elicitor) agenttool.Elicitor
 		if fn != nil {
 			actx, answerer := agentturn.WatchAnswerer(ctx)
 			ans, err = fn(actx, q)
+			// The answer names its decider; by is who answers when
+			// it names none.
 			who, source = by, answerer()
+			if ans.By != "" {
+				who = ans.By
+			}
 		}
 		data.Phase, data.Asked = ElicitationAnswer, asked
 		if err != nil {
