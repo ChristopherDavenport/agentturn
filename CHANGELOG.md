@@ -82,6 +82,15 @@ versions may break the API.
 - Added: `session.WithMedia(bw)`, the blob writer a sidecar session's
   media is stored with when it is not the store's. (#284)
 
+- Changed: the session recorder no longer encodes the whole transcript
+  several times a turn. It keeps each recorded item's canonical JSON
+  and builds a turn's request hash from those bytes, matches an item
+  the request carries by identity before encoding it, keeps the
+  request's settings without its input for the retry comparison, and
+  leaves the input out before it builds a config entry. A turn's
+  recording cost is its settings, its new items and one SHA-256 pass
+  over the cached bytes. (#282)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

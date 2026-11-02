@@ -993,6 +993,9 @@ type writer struct {
 	// holds them, which differ from foldSummary and foldPinned in a
 	// sidecar session.
 	foldRecorded openresponses.Items
+	// foldCanon holds the canonical JSON of each of foldRecorded, as
+	// itemMeta.canon does an item's.
+	foldCanon [][]byte
 	// calls maps a call ID to what the path holds for it, for the calls
 	// this writer wrote or Resume found pending.
 	calls map[string]*callRecord
@@ -1042,10 +1045,14 @@ type writer struct {
 	// so a run whose configuration changed settles it before any of its
 	// items.
 	base string
-	// attempt is the canonical request of the model call in flight,
-	// encoded when it was reported and before a retry policy could edit
-	// its maps in place, so a retry can say whether Revise changed it.
-	attempt []byte
+	// attempt is the request of the model call in flight less its
+	// input, encoded when it was reported and before a retry policy
+	// could edit its maps in place, and attemptInput its input, so a
+	// retry can say whether Revise changed it without encoding the
+	// whole transcript at every turn (#282): a policy that changes the
+	// input builds a new one.
+	attempt      []byte
+	attemptInput openresponses.Items
 	// attemptModel is the model that request named.
 	attemptModel string
 	// retries is the number of attempts of the call in flight that
@@ -1085,6 +1092,10 @@ type itemMeta struct {
 	// item the loop holds: in a sidecar session, with its media as
 	// sidecar references. nil when they are the same.
 	recorded openresponses.Item
+	// canon is the canonical JSON of the item as the path holds it,
+	// encoded the first time a request is compared with or hashed over
+	// it.
+	canon []byte
 }
 
 // unnamedItem is an item_end of the call in flight that named no
@@ -3245,7 +3256,7 @@ func (w *writer) reset() {
 	w.unhashed, w.noted = nil, nil
 	w.unnamed = nil
 	w.items, w.values, w.custom, w.models, w.meta = nil, nil, nil, nil, nil
-	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned, w.foldRecorded = false, 0, nil, nil, nil
+	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned, w.foldRecorded, w.foldCanon = false, 0, nil, nil, nil, nil
 	w.calls = map[string]*callRecord{}
 	// The links written are on the branch left: a call whose child is
 	// linked there and answered here gets the link again.
@@ -3253,7 +3264,7 @@ func (w *writer) reset() {
 	w.callees, w.cancelled = nil, map[string]bool{}
 	w.env = nil
 	w.base = ""
-	w.attempt, w.attemptModel, w.retries = nil, "", 0
+	w.attempt, w.attemptInput, w.attemptModel, w.retries = nil, nil, "", 0
 	w.parents = map[string]string{}
 	w.appOnly = map[string]bool{}
 	w.heldNotes, w.seededNotes = nil, nil
@@ -4283,15 +4294,40 @@ func (w *writer) turnStart(ctx context.Context, e *agentturn.TurnStart) error {
 		return err
 	}
 	w.settleReq, w.settleOmit = &req, omit
-	if w.attempt, err = json.Marshal(req); err != nil {
-		return fmt.Errorf("session: encode request: %w", err)
+	if w.attempt, err = settingsJSON(req); err != nil {
+		return err
 	}
+	w.attemptInput = req.Input
 	w.attemptModel, w.retries = req.Model, 0
 	w.inFlight = true
 	w.pending, w.unhashed = hash, unhashed
 	w.started = w.rec.now()
 	w.inFlightID = ""
 	return nil
+}
+
+// settingsJSON is req encoded without its input.
+func settingsJSON(req openresponses.Request) ([]byte, error) {
+	req.Input = nil
+	data, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("session: encode request: %w", err)
+	}
+	return data, nil
+}
+
+// sameItems reports whether a and b hold the same items: the very items,
+// or ones that encode alike.
+func sameItems(a, b openresponses.Items) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] && !equalJSON(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // attempts is the attempts member of the response entry of the call in
@@ -4317,13 +4353,13 @@ func (w *writer) retry(ctx context.Context, e *agentturn.ModelRetry) error {
 	if err != nil {
 		return err
 	}
-	next, err := json.Marshal(req)
+	next, err := settingsJSON(req)
 	if err != nil {
-		return fmt.Errorf("session: encode request: %w", err)
+		return err
 	}
 	rec := ModelRetry{Attempt: e.Attempt, Error: errText(e.Err), DelayMS: e.Delay.Milliseconds(), Model: w.attemptModel}
 	if w.attempt != nil {
-		rec.Revised = !bytes.Equal(w.attempt, next)
+		rec.Revised = !bytes.Equal(w.attempt, next) || !sameItems(w.attemptInput, req.Input)
 	}
 	raw, err := json.Marshal(rec)
 	if err != nil {
@@ -4341,7 +4377,7 @@ func (w *writer) retry(ctx context.Context, e *agentturn.ModelRetry) error {
 	if _, err := w.append(ctx, &agentsession.CustomEntry{NS: ModelRetryNS, Data: raw}); err != nil {
 		return err
 	}
-	w.attempt, w.attemptModel, w.retries = next, req.Model, e.Attempt
+	w.attempt, w.attemptInput, w.attemptModel, w.retries = next, req.Input, req.Model, e.Attempt
 	w.settleReq, w.settleOmit = &req, omit
 	w.inFlight = true
 	w.pending, w.unhashed = hash, unhashed
@@ -4402,14 +4438,7 @@ func (w *writer) hash(req openresponses.Request) (string, agentsession.Omit, *Un
 	// hashed with that input, item for item as the path holds it: in a
 	// sidecar session with each sidecar: URL as the item records it,
 	// which is the form a reader rebuilds (#284).
-	hashed := req
-	if len(expected) > 0 {
-		hashed.Input = make(openresponses.Items, len(expected))
-		for k, r := range expected {
-			hashed.Input[k] = r.item
-		}
-	}
-	hash, err := RequestHash(hashed)
+	hash, err := w.hashOf(req, expected)
 	return hash, omit, nil, err
 }
 
@@ -4547,6 +4576,10 @@ func (w *writer) blocked(ctx context.Context, e *agentturn.ModelBlocked) error {
 // request's, and what was left out.
 func (w *writer) settle(ctx context.Context, req openresponses.Request, want agentsession.Omit) error {
 	parts, omitted := w.instructionParts(ctx, req)
+	// The settings are the request's less its input, which a config
+	// entry does not hold: it is left out before encoding rather than
+	// encoded and dropped (#282).
+	req.Input = nil
 	full, err := agentsession.ConfigFromRequestParts(req, parts...)
 	if err != nil {
 		return fmt.Errorf("session: %w", err)
@@ -5450,7 +5483,7 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 		}
 		recorded = append(recorded, r)
 	}
-	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned, w.foldRecorded = true, split, f.Summary, f.Pinned, recorded
+	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned, w.foldRecorded, w.foldCanon = true, split, f.Summary, f.Pinned, recorded, nil
 	entry := &agentsession.CompactionEntry{
 		FirstKept:    w.items[split],
 		Summary:      recorded[0],

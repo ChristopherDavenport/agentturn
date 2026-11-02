@@ -216,3 +216,60 @@ func formatNumber(f float64) (string, error) {
 	}
 	return sb.String(), nil
 }
+
+// requestHashOf is [RequestHash] of req with its input the items whose
+// canonical forms input holds, in order, computed without encoding
+// them again: the request less its input is put in canonical form, and
+// the input's array is written from the items' canonical bytes where
+// its member falls in the sorted order. A writer that keeps each item's
+// canonical bytes from the turn it was recorded hashes each turn's
+// request at the cost of its settings and its new items. An empty input
+// is hashed as RequestHash hashes it.
+func requestHashOf(req openresponses.Request, input [][]byte) (string, error) {
+	if len(input) == 0 {
+		req.Input = nil
+		return RequestHash(req)
+	}
+	req.Input = nil
+	data, err := json.Marshal(req)
+	if err != nil {
+		return "", fmt.Errorf("session: encode request: %w", err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var members map[string]any
+	if err := dec.Decode(&members); err != nil {
+		return "", fmt.Errorf("session: canonicalize request: %w", err)
+	}
+	// The input stands where its name sorts; its value is written below.
+	members["input"] = nil
+	h := sha256.New()
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, k := range sortedKeys(members) {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		writeCanonicalString(&buf, k)
+		buf.WriteByte(':')
+		if k != "input" {
+			if err := writeCanonical(&buf, members[k]); err != nil {
+				return "", fmt.Errorf("session: canonicalize request: %w", err)
+			}
+			continue
+		}
+		buf.WriteByte('[')
+		h.Write(buf.Bytes())
+		buf.Reset()
+		for j, item := range input {
+			if j > 0 {
+				h.Write([]byte{','})
+			}
+			h.Write(item)
+		}
+		buf.WriteByte(']')
+	}
+	buf.WriteByte('}')
+	h.Write(buf.Bytes())
+	return HashPrefix + hex.EncodeToString(h.Sum(nil)), nil
+}

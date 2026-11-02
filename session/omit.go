@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -110,12 +111,57 @@ func (w *writer) foldHead() []rebuiltItem {
 	head := append(openresponses.Items{w.foldSummary}, w.foldPinned...)
 	out := make([]rebuiltItem, len(head))
 	for k, item := range head {
-		out[k] = rebuiltItem{item: item, orig: item, at: -1}
+		out[k] = rebuiltItem{item: item, orig: item, at: -1 - k}
 		if k < len(w.foldRecorded) {
 			out[k].item = w.foldRecorded[k]
 		}
 	}
 	return out
+}
+
+// canon returns the canonical JSON of r's item, the form the request
+// hash covers, kept with the writer's item for the next request when r
+// is one as the path holds it, so an item is encoded once while it
+// stays in the context rather than at every turn (#282). A fold's
+// summary and pins are kept until the next fold.
+func (w *writer) canon(r rebuiltItem) ([]byte, bool) {
+	if r.orig == nil {
+		return canonicalValue(r.item)
+	}
+	var slot *[]byte
+	switch {
+	case r.at >= 0:
+		slot = &w.meta[r.at].canon
+	default:
+		k := -1 - r.at
+		if len(w.foldCanon) != len(w.foldPinned)+1 {
+			w.foldCanon = make([][]byte, len(w.foldPinned)+1)
+		}
+		slot = &w.foldCanon[k]
+	}
+	if *slot == nil {
+		c, ok := canonicalValue(r.item)
+		if !ok {
+			return nil, false
+		}
+		*slot = c
+	}
+	return *slot, true
+}
+
+// hashOf is the request hash of req with input, the input the path
+// rebuilds, as [requestHashOf] computes it from each item's kept
+// canonical form.
+func (w *writer) hashOf(req openresponses.Request, input []rebuiltItem) (string, error) {
+	canon := make([][]byte, len(input))
+	for k, r := range input {
+		c, ok := w.canon(r)
+		if !ok {
+			return "", fmt.Errorf("session: encode request item %d", k)
+		}
+		canon[k] = c
+	}
+	return requestHashOf(req, canon)
 }
 
 // rebuiltAt is the writer's i-th item as the input the path rebuilds
@@ -159,7 +205,12 @@ func (w *writer) same(sent openresponses.Item, r rebuiltItem) bool {
 	if r.orig != nil && sent == r.orig {
 		return true
 	}
-	return equalJSON(w.recordForm(sent), r.item)
+	have, ok := canonicalValue(w.recordForm(sent))
+	if !ok {
+		return false
+	}
+	want, ok := w.canon(r)
+	return ok && bytes.Equal(have, want)
 }
 
 // describe returns the omit setting under which the stored path
