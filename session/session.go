@@ -5338,7 +5338,7 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 // run's end entry, with the reason in the format's terms and the run's
 // calls left open.
 func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
-	if err := w.endInFlight(ctx, e.Err); err != nil {
+	if err := w.endInFlight(ctx, e.Err, e.Reason == agentturn.ReasonStopped && e.Cause == agentturn.StopGuard); err != nil {
 		return err
 	}
 	if w.run == "" {
@@ -5402,8 +5402,9 @@ func (w *writer) holdNotes(ctx context.Context, notes []agentturn.Note) error {
 // stream named, written failed with cause, and the context algorithm
 // strips the items it produced. A response an OutputGuard withheld a
 // message of is not one of these: the loop raises its response_end.
-func (w *writer) endInFlight(ctx context.Context, cause error) error {
+func (w *writer) endInFlight(ctx context.Context, cause error, guard bool) error {
 	hash, inFlight, responseID, unhashed := w.pending, w.inFlight, w.inFlightID, w.unhashed
+	model := w.attemptModel
 	latency, attempts := w.latency(), w.attempts()
 	// The items the call completed before it was cut off go first, as
 	// its output, named by the response the stream named, if any.
@@ -5423,6 +5424,18 @@ func (w *writer) endInFlight(ctx context.Context, cause error) error {
 		unhashed = &Unhashed{Reason: unnamedReason}
 	}
 	if err := w.noteUnhashed(ctx, unhashed); err != nil {
+		return err
+	}
+	if guard && !unnamed {
+		// A guard refused the call before anything of its answer
+		// reached the transcript: the run stopped rather than failed,
+		// and the refused call is recorded as one BeforeModelCall
+		// refused, not as a failed or an empty withheld response.
+		raw, err := json.Marshal(ModelBlocked{Error: errText(cause), RequestHash: hash, Model: model})
+		if err != nil {
+			return fmt.Errorf("session: encode model blocked: %w", err)
+		}
+		_, err = w.append(ctx, &agentsession.CustomEntry{NS: ModelBlockedNS, Data: raw})
 		return err
 	}
 	w.responses++

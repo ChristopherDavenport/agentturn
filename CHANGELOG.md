@@ -224,6 +224,12 @@ versions may break the API.
   moved and moves it back writes no duplicate `queued` entry and leaves
   the leaf where it was. (#220)
 
+- Fixed: a model call refused with a guard's error before the attempt
+  committed to an answer no longer delivers an empty withheld
+  `response_end`; the session recorder writes the refused call as an
+  `agentturn:model_blocked` record with the request's hash, as for a
+  `BeforeModelCall` guard, rather than an empty response.
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

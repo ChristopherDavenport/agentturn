@@ -1583,12 +1583,16 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 		if errors.Is(err, ErrGuard) {
 			// The model, or a wrapper around it, refused the call with
 			// an error marked as a guard's: a policy stop, never retried,
-			// and recorded as an output guard's is. The response it had
-			// begun goes on record withheld, with what the transcript
-			// took from it, and the calls it made are closed, so the
-			// transcript is a valid input for the next run.
+			// and recorded as an output guard's is. A response the
+			// attempt had committed to goes on record withheld, with
+			// what the transcript took from it, and the calls it made
+			// are closed, so the transcript is a valid input for the
+			// next run. One refused before anything of the answer opened
+			// left nothing in the transcript and has no response_end: a
+			// recorder writes the refused call as it writes one
+			// BeforeModelCall refused.
 			halt := &errStop{reason: ReasonStopped, cause: StopGuard, err: err}
-			if resp != nil {
+			if resp != nil && committed {
 				resp.Output = openresponses.Items(r.transcript[start:]).Clone()
 				if err := r.emit(&ResponseEnd{RunID: r.runID, Turn: r.turn, Response: resp, Withheld: true}); err != nil {
 					return nil, err

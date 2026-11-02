@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/ChristopherDavenport/agentsession"
@@ -250,6 +251,67 @@ func TestAModelGuardStopIsRecordedAsAWithheldResponse(t *testing.T) {
 				t.Errorf("decision = %+v, want the policy's reject", v)
 			}
 		}
+	}
+	if err := s.VerifyRecords(s.Leaf()); err != nil {
+		t.Errorf("verify: %v", err)
+	}
+}
+
+// guardBeforeAnswer opens its response, completes a reasoning item and
+// then fails with an error marked as a guard's, before any message or
+// call has opened: nothing of the answer was committed.
+type guardBeforeAnswer struct{}
+
+func (guardBeforeAnswer) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	r, err := em.Reasoning()
+	if err != nil {
+		return err
+	}
+	r.EncryptedContent("thinking")
+	if err := r.Close(); err != nil {
+		return err
+	}
+	return fmt.Errorf("moderation: %w", agentturn.ErrGuard)
+}
+
+// TestAModelGuardBeforeTheAnswerIsRecordedAsARefusedCall pins the
+// other half of a model guard's record: a guard error before the
+// attempt committed to an answer leaves nothing of the response in the
+// transcript, so no response entry is written for it, which would be an
+// empty withheld one; the refused call is the model_blocked record, as
+// for a BeforeModelCall guard, with the request's hash, and the record
+// verifies.
+func TestAModelGuardBeforeTheAnswerIsRecordedAsARefusedCall(t *testing.T) {
+	ctx := context.Background()
+	rec, s, err := Start(ctx, agentsession.NewMemoryStore(), agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: guardBeforeAnswer{}, ModelName: "m"})
+	defer rec.Attach(a)()
+	end, err := a.Prompt(ctx, openresponses.UserText("go"))
+	if err != nil || end.Reason != agentturn.ReasonStopped || end.Cause != agentturn.StopGuard {
+		t.Fatalf("end = %+v, err = %v", end, err)
+	}
+	if got, want := entryTypes(s), "run config item:user custom run"; got != want {
+		t.Errorf("entries = %q, want %q", got, want)
+	}
+	blocked := 0
+	for _, e := range s.Entries() {
+		if c, ok := e.(*agentsession.CustomEntry); ok && c.NS == ModelBlockedNS {
+			var mb ModelBlocked
+			if err := json.Unmarshal(c.Data, &mb); err != nil {
+				t.Fatal(err)
+			}
+			if mb.RequestHash == "" || !strings.Contains(mb.Error, "moderation") || mb.Model != "m" {
+				t.Errorf("model_blocked = %+v", mb)
+			}
+			blocked++
+		}
+	}
+	if blocked != 1 {
+		t.Errorf("model_blocked records = %d, want 1", blocked)
 	}
 	if err := s.VerifyRecords(s.Leaf()); err != nil {
 		t.Errorf("verify: %v", err)
