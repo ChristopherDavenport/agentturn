@@ -120,6 +120,13 @@ versions may break the API.
   run with `ReasonStopped` and `StopGuard` and the error on `RunEnd.Err`,
   without a retry, and closes the calls the stream completed before it
   with `WithheldCallOutput`. It ended `ReasonError` before. (#275)
+- Fixed: a model guard error after the response began is the output
+  guard's stop in the record too: the loop delivers that response's
+  `ResponseEnd` marked withheld before the outputs that close its calls
+  and marks the end withheld, so the recorder writes the response
+  incomplete with `content_filter` and the outputs as `policy`'s rejects
+  after it. It wrote anonymous rejects before a failed response, and the
+  run end disagreed with its segment. (#275)
 - Added: `compact.MarkFold` and `compact.IsFold`. The model call a fold
   makes for itself, `NewLocal`'s summary and `New`'s compaction call,
   runs on a context marked so, and a model, a wrapping streamer or a

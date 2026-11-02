@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/ChristopherDavenport/agentsession"
@@ -177,6 +178,78 @@ func TestAWithdrawalAnEarlierVersionWroteStillReads(t *testing.T) {
 	}
 	if len(answers) != 1 || answers[0].Output != nil {
 		t.Errorf("answers = %+v, want an approval", answers)
+	}
+	if err := s.VerifyRecords(s.Leaf()); err != nil {
+		t.Errorf("verify: %v", err)
+	}
+}
+
+// callThenGuard completes a function call, opens a message and then
+// fails the call with an error marked as a guard's, as a moderation
+// wrapper around the model refuses an answer it has begun.
+type callThenGuard struct{}
+
+func (callThenGuard) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	fc, err := em.FunctionCall("", "notify")
+	if err != nil {
+		return err
+	}
+	if err := fc.Arguments(`{"text":"t"}`); err != nil {
+		return err
+	}
+	if err := fc.Close(); err != nil {
+		return err
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("the secret is"); err != nil {
+		return err
+	}
+	return fmt.Errorf("moderation: %w", agentturn.ErrGuard)
+}
+
+// TestAModelGuardStopIsRecordedAsAWithheldResponse pins the record of
+// #275's model guard stop: the response is written withheld, incomplete
+// with content_filter, before the outputs that close the calls it made,
+// and those are the policy's rejects, as for an output guard's stop.
+func TestAModelGuardStopIsRecordedAsAWithheldResponse(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ran := 0
+	notify := agenttool.New("notify", "", func(context.Context, echoArgs) (string, error) {
+		ran++
+		return "sent", nil
+	})
+	a := agentturn.New(agentturn.Config{Model: callThenGuard{}, ModelName: "m", Tools: []agenttool.Tool{notify}})
+	defer rec.Attach(a)()
+	end, err := a.Prompt(ctx, openresponses.UserText("go"))
+	if err != nil || end.Reason != agentturn.ReasonStopped || end.Cause != agentturn.StopGuard {
+		t.Fatalf("end = %+v, err = %v", end, err)
+	}
+	if ran != 0 {
+		t.Error("the guarded response's call ran")
+	}
+	if got, want := entryTypes(s), "run config item:user item:function_call* response decision item:function_call_output run"; got != want {
+		t.Errorf("entries = %q, want %q", got, want)
+	}
+	for _, e := range s.Entries() {
+		switch v := e.(type) {
+		case *agentsession.ResponseEntry:
+			if v.Incomplete == nil || v.Incomplete.Reason != openresponses.IncompleteReasonContentFilter || v.Error != nil {
+				t.Errorf("response = %+v, want incomplete with content_filter and no error", v)
+			}
+		case *agentsession.DecisionEntry:
+			if v.Verdict != agentsession.VerdictReject || v.By != agentsession.ByPolicy {
+				t.Errorf("decision = %+v, want the policy's reject", v)
+			}
+		}
 	}
 	if err := s.VerifyRecords(s.Leaf()); err != nil {
 		t.Errorf("verify: %v", err)

@@ -575,8 +575,9 @@ type RunEnd struct {
 	// calls pending the notes are on [PendingCall.Notes] instead.
 	Notes []Note
 	// Withheld says the run ended because [Config.OutputGuard]
-	// withheld a message, with Reason ReasonStopped and Cause
-	// StopGuard: the model's last word was kept from the transcript,
+	// withheld a message, or the model call failed with an error
+	// wrapping [ErrGuard] after its response began, with Reason
+	// ReasonStopped and Cause StopGuard: the model's last word was kept from the transcript,
 	// so whatever message Items end with was said before it and is no
 	// answer, and Answer reports none.
 	Withheld bool

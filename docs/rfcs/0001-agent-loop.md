@@ -555,9 +555,14 @@ committed attempt MUST NOT be retried, because the transcript or a
 recorder may already hold part of it. A model call that fails with an
 error marked as a guard's, as a moderation layer around the model marks
 its refusal, is a guard stop whether or not the attempt committed: it
-MUST NOT be retried, the calls the stream completed before it are
-answered as a withheld response's are, with the fixed text, and the
-run stops with cause `guard` and the error on the end event (#275). An item the model completes
+MUST NOT be retried, and it is the output guard's stop in every other
+respect. When the stream had begun a response, its `response_end` is
+delivered marked withheld, with what the transcript took from it,
+before the calls the stream completed are answered with the fixed
+text, so a recorder writes it incomplete with `content_filter` and the
+outputs as the policy's rejects after it, and the end is marked
+withheld; the run stops with cause `guard` and the error on the end
+event (#275). An item the model completes
 before the attempt commits — the reasoning summary a reasoning model
 writes before its first token — is **held**: it reaches the consumer as
 `item_start` and `item_update`, so a front renders it live, and it is
@@ -739,7 +744,7 @@ calls** with why each is pending.
 | --- | --- |
 | `max_turns` | the turn limit was reached with tools called or items queued; the queued items wait for the next run |
 | `hook` | the stop hook ended the run |
-| `guard` | the stop hook, the before-turn hook, the before-model-call hook or the output guard ended the run with an error marked as a guard's, or the model call failed with one; the error is on the end event. Stopped before the model call, the turn has no `turn_start`; stopped by the output guard, its `response_end` is marked withheld, it has no `turn_end`, the calls the withheld response made are answered with an output of fixed text, and the end is marked withheld, which is no answer |
+| `guard` | the stop hook, the before-turn hook, the before-model-call hook or the output guard ended the run with an error marked as a guard's, or the model call failed with one; the error is on the end event. A model call's guard error after its response began is recorded as the output guard's stop is. Stopped before the model call, the turn has no `turn_start`; stopped by the output guard, its `response_end` is marked withheld, it has no `turn_end`, the calls the withheld response made are answered with an output of fixed text, and the end is marked withheld, which is no answer |
 | `terminate` | every result of the batch set the terminate hint |
 | `partial_terminate` | some results of the batch set it and others did not |
 | `refused` | an answer on resume asked the run to end without calling the model |
