@@ -139,9 +139,12 @@ type Config struct {
 
 	// BeforeModelCall runs on the fully built request of each turn, just
 	// before it is sent and before turn_start reports it. It may change
-	// anything. A change to Input is one the record cannot describe, so
-	// a session recorder writes that call without a request hash; a
-	// change to a setting is recorded as a config delta. A hook that
+	// anything. A change to Input that the session format's omit can
+	// describe, items left out in order, outputs or images sent as a
+	// placeholder, is written as one by a session recorder and the call
+	// keeps its request hash, an item edited in place included; any other
+	// change to Input costs the call its hash. A change to a setting is
+	// recorded as a config delta. A hook that
 	// refuses the call ends the run with ReasonError after a
 	// [ModelBlocked] event carrying the request as built; an error that
 	// wraps [ErrGuard] is a policy stopping the run before the call,
