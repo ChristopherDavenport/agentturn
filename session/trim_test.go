@@ -62,6 +62,46 @@ func dropImages(t agentturn.Transcript) agentturn.Transcript {
 	return out
 }
 
+// dropOlderImages sends every image part of t but the last as one
+// placeholder text, as a host that keeps only the latest screenshot
+// does.
+func dropOlderImages(t agentturn.Transcript) agentturn.Transcript {
+	last := -1
+	for i, item := range t {
+		if m, ok := item.(*openresponses.Message); ok {
+			for _, p := range m.Content {
+				if _, ok := p.(*openresponses.InputImage); ok {
+					last = i
+				}
+			}
+		}
+	}
+	out := make(agentturn.Transcript, len(t))
+	for i, item := range t {
+		out[i] = item
+		m, ok := item.(*openresponses.Message)
+		if !ok {
+			continue
+		}
+		sent := *m
+		sent.Content = append(openresponses.Contents(nil), m.Content...)
+		images := 0
+		for _, p := range m.Content {
+			if _, ok := p.(*openresponses.InputImage); ok {
+				images++
+			}
+		}
+		for k, p := range sent.Content {
+			if _, ok := p.(*openresponses.InputImage); ok && (i != last || images > 1) {
+				sent.Content[k] = &openresponses.InputText{Text: "[image]"}
+				out[i] = &sent
+				images--
+			}
+		}
+	}
+	return out
+}
+
 // rewrite changes the text of the first user message of t, which the
 // session format cannot describe.
 func rewrite(t agentturn.Transcript) agentturn.Transcript {
@@ -109,6 +149,12 @@ func TestATrimTheFormatDescribesKeepsEveryResponseVerifiable(t *testing.T) {
 				return len(o.Items) == 0 && o.Images != nil && o.Images.Keep == 0 && o.Images.Placeholder == "[image]"
 			}},
 		// The second trim leaves out the tools' items of both runs.
+		{name: "older images pruned, the last kept", trim: dropOlderImages,
+			check: func(o agentsession.Omit) bool {
+				return o.Images != nil && o.Images.Keep == 1 && o.Images.Placeholder == "[image]"
+			}},
+		{name: "a restart keeps older images pruned", trim: dropOlderImages, restart: true, keep: true,
+			check: func(o agentsession.Omit) bool { return o.Images != nil && o.Images.Keep == 1 }},
 		{name: "a restart after the trim", trim: trimTools, restart: true,
 			check: func(o agentsession.Omit) bool { return len(o.Items) == 4 }},
 		{name: "a restart keeps the tools' items left out", trim: trimTools, restart: true, keep: true,
@@ -135,6 +181,7 @@ func TestATrimTheFormatDescribesKeepsEveryResponseVerifiable(t *testing.T) {
 			first := openresponses.UserMessage(
 				&openresponses.InputText{Text: "look"},
 				&openresponses.InputImage{ImageURL: "data:image/png;base64,iVBORw0KGgo="},
+				&openresponses.InputImage{ImageURL: "data:image/png;base64,iVBORw0KGgp="},
 			)
 			if _, err := a.Prompt(ctx, first); err != nil {
 				t.Fatal(err)
