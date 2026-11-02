@@ -664,6 +664,9 @@ type ModelBlocked struct {
 	// path rebuilds its input, and Model the model it named.
 	RequestHash string `json:"request_hash,omitempty"`
 	Model       string `json:"model,omitempty"`
+	// Usage is what the provider reported for a call the model's guard
+	// refused after it was sent, absent for one never sent.
+	Usage *openresponses.Usage `json:"usage,omitempty"`
 }
 
 // ElicitationNS is the namespace of the custom entry written for a
@@ -4998,11 +5001,15 @@ func (w *writer) blocked(ctx context.Context, e *agentturn.ModelBlocked) error {
 	if err := w.noteUnhashed(ctx, unhashed); err != nil {
 		return err
 	}
+	// A call the model's guard refused after turn_start was in flight:
+	// it ends here, with this record, not as a failed response at the
+	// run's end.
+	w.inFlight, w.pending, w.started, w.inFlightID, w.retries, w.unhashed = false, "", time.Time{}, "", 0, nil
 	if errors.Is(e.Err, agentturn.ErrGuard) {
 		// A policy stopped the run: the refused request is a record of
 		// its own, since a failed response would read as the run
-		// failing.
-		raw, err := json.Marshal(ModelBlocked{Error: errText(e.Err), RequestHash: hash, Model: req.Model})
+		// failing. What the provider billed for it is counted.
+		raw, err := json.Marshal(ModelBlocked{Error: errText(e.Err), RequestHash: hash, Model: req.Model, Usage: e.Usage})
 		if err != nil {
 			return fmt.Errorf("session: encode model blocked: %w", err)
 		}
@@ -5837,7 +5844,7 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 // run's end entry, with the reason in the format's terms and the run's
 // calls left open.
 func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
-	if err := w.endInFlight(ctx, e.Err, e.Reason == agentturn.ReasonStopped && e.Cause == agentturn.StopGuard); err != nil {
+	if err := w.endInFlight(ctx, e.Err); err != nil {
 		return err
 	}
 	if w.run == "" {
@@ -5901,9 +5908,8 @@ func (w *writer) holdNotes(ctx context.Context, notes []agentturn.Note) error {
 // stream named, written failed with cause, and the context algorithm
 // strips the items it produced. A response an OutputGuard withheld a
 // message of is not one of these: the loop raises its response_end.
-func (w *writer) endInFlight(ctx context.Context, cause error, guard bool) error {
+func (w *writer) endInFlight(ctx context.Context, cause error) error {
 	hash, inFlight, responseID, unhashed := w.pending, w.inFlight, w.inFlightID, w.unhashed
-	model := w.attemptModel
 	latency, attempts := w.latency(), w.attempts()
 	// The items the call completed before it was cut off go first, as
 	// its output, named by the response the stream named, if any.
@@ -5923,18 +5929,6 @@ func (w *writer) endInFlight(ctx context.Context, cause error, guard bool) error
 		unhashed = &Unhashed{Reason: unnamedReason}
 	}
 	if err := w.noteUnhashed(ctx, unhashed); err != nil {
-		return err
-	}
-	if guard && !unnamed {
-		// A guard refused the call before anything of its answer
-		// reached the transcript: the run stopped rather than failed,
-		// and the refused call is recorded as one BeforeModelCall
-		// refused, not as a failed or an empty withheld response.
-		raw, err := json.Marshal(ModelBlocked{Error: errText(cause), RequestHash: hash, Model: model})
-		if err != nil {
-			return fmt.Errorf("session: encode model blocked: %w", err)
-		}
-		_, err = w.append(ctx, &agentsession.CustomEntry{NS: ModelBlockedNS, Data: raw})
 		return err
 	}
 	w.responses++

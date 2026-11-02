@@ -87,7 +87,7 @@ func wireOf(ev agentturn.Event) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return wireModelBlocked{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Request: req, Err: errorOut(e.Err)}, nil
+		return wireModelBlocked{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Request: req, Err: errorOut(e.Err), Usage: e.Usage}, nil
 	case *agentturn.ItemStart:
 		item, err := itemOut(e.Item)
 		if err != nil {
@@ -226,7 +226,7 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 		if err != nil {
 			return nil, err
 		}
-		return &agentturn.ModelBlocked{RunID: w.RunID, Turn: w.Turn, Request: req, Err: errorIn(w.Err)}, nil
+		return &agentturn.ModelBlocked{RunID: w.RunID, Turn: w.Turn, Request: req, Err: errorIn(w.Err), Usage: w.Usage}, nil
 	},
 	agentturn.EventItemStart: func(data []byte) (agentturn.Event, error) {
 		var w wireItemStart
@@ -404,11 +404,12 @@ type wireModelRetry struct {
 }
 
 type wireModelBlocked struct {
-	Type    string          `json:"type"`
-	RunID   string          `json:"run_id"`
-	Turn    int             `json:"turn"`
-	Request json.RawMessage `json:"request"`
-	Err     *wireError      `json:"error,omitempty"`
+	Type    string               `json:"type"`
+	RunID   string               `json:"run_id"`
+	Turn    int                  `json:"turn"`
+	Request json.RawMessage      `json:"request"`
+	Err     *wireError           `json:"error,omitempty"`
+	Usage   *openresponses.Usage `json:"usage,omitempty"`
 }
 
 type wireItemStart struct {

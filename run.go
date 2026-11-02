@@ -1862,6 +1862,16 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 					return nil, err
 				}
 				halt.withheld = true
+			} else {
+				// Nothing of the answer is in the transcript: the call
+				// is reported refused, with what the provider billed.
+				blocked := &ModelBlocked{RunID: r.runID, Turn: r.turn, Request: req, Err: err}
+				if resp != nil {
+					blocked.Usage = resp.Usage
+				}
+				if err := r.emit(blocked); err != nil {
+					return nil, err
+				}
 			}
 			if err := r.closeWithheld(r.transcript[start:]); err != nil {
 				return nil, err

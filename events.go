@@ -241,11 +241,22 @@ func (*ModelRetry) EventType() string { return EventModelRetry }
 // a recorder can write the call that was refused as distinct from one
 // that was made and failed. The run ends with ReasonError, or with
 // ReasonStopped and StopGuard when Err wraps [ErrGuard].
+//
+// It also reports a call the model, or a wrapper around it, refused
+// with an error marked as a guard's before the attempt committed to an
+// answer: then it follows the turn's turn_start, in place of the
+// response_end, Request is the request sent, and Usage is what the
+// provider reported for the call, nil when it reported none, so a call
+// that may have been billed is counted. The run ends with
+// ReasonStopped and StopGuard.
 type ModelBlocked struct {
 	RunID   string
 	Turn    int
 	Request openresponses.Request
 	Err     error
+	// Usage is what the provider reported for a call the model's guard
+	// refused, nil otherwise.
+	Usage *openresponses.Usage
 }
 
 // EventType returns "model_blocked".

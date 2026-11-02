@@ -317,3 +317,63 @@ func TestAModelGuardBeforeTheAnswerIsRecordedAsARefusedCall(t *testing.T) {
 		t.Errorf("verify: %v", err)
 	}
 }
+
+// billedThenGuard opens a response that already reports usage, as a
+// provider that bills the prompt up front does, and then fails with an
+// error marked as a guard's before any answer opened.
+type billedThenGuard struct{}
+
+func (billedThenGuard) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	resp := openresponses.NewResponse(req)
+	resp.Usage = &openresponses.Usage{InputTokens: 7, TotalTokens: 7}
+	em := openresponses.NewEmitter(sink, resp)
+	r, err := em.Reasoning()
+	if err != nil {
+		return err
+	}
+	r.EncryptedContent("thinking")
+	if err := r.Close(); err != nil {
+		return err
+	}
+	return fmt.Errorf("moderation: %w", agentturn.ErrGuard)
+}
+
+// TestAModelGuardsRefusalCarriesTheUsageReported pins that the
+// model_blocked record of a call a model's guard refused before its
+// answer carries the usage the provider reported, so a call that may
+// have been billed is counted.
+func TestAModelGuardsRefusalCarriesTheUsageReported(t *testing.T) {
+	ctx := context.Background()
+	rec, s, err := Start(ctx, agentsession.NewMemoryStore(), agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: billedThenGuard{}, ModelName: "m"})
+	defer rec.Attach(a)()
+	if end, err := a.Prompt(ctx, openresponses.UserText("go")); err != nil || end.Cause != agentturn.StopGuard {
+		t.Fatalf("end = %+v, err = %v", end, err)
+	}
+	found := false
+	for _, e := range s.Entries() {
+		c, ok := e.(*agentsession.CustomEntry)
+		if !ok || c.NS != ModelBlockedNS {
+			continue
+		}
+		found = true
+		var data struct {
+			Usage *openresponses.Usage `json:"usage"`
+		}
+		if err := json.Unmarshal(c.Data, &data); err != nil {
+			t.Fatal(err)
+		}
+		if data.Usage == nil || data.Usage.InputTokens != 7 {
+			t.Errorf("model_blocked usage = %+v, want the 7 input tokens reported: %s", data.Usage, c.Data)
+		}
+	}
+	if !found {
+		t.Fatalf("no model_blocked record: %s", entryTypes(s))
+	}
+	if err := s.VerifyRecords(s.Leaf()); err != nil {
+		t.Errorf("verify: %v", err)
+	}
+}

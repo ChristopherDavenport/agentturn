@@ -7,6 +7,12 @@ versions may break the API.
 
 ## Unreleased
 
+- Changed: a model call refused with a guard's error before the attempt
+  committed now raises `ModelBlocked` in place of its `response_end`,
+  carrying the request sent and the new `ModelBlocked.Usage`, what the
+  provider reported, and the recorder's `agentturn:model_blocked` record
+  carries that usage, so a call that may have been billed is counted.
+  `front/control` carries `usage` on the wire.
 - Fixed: `front/responses`' single turn, a request carrying the caller's
   tools, calls its transform under `agentturn.ContextWithRequest` with
   the settings the request will carry, the caller's tools included, as
