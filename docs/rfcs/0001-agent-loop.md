@@ -1591,7 +1591,9 @@ An agent stands in four places inside another system:
   parent's call, whose answer is the decision on the child's call, by
   the decider the answer names, so the child goes on and its model
   reads what the answerer said; a call held only beside an asked one
-  is released, since the batch no longer waits on anyone. The call
+  is not asked about, and its fate is its batch's answers: it is
+  released, as the policy decided it, once every call asked about in
+  its batch was accepted, and a decline of one leaves it held. The call
   fails with input-required only when there is nobody to ask, no
   elicitor, a failure to ask or a cancel: an error that says so and
   names the calls, so the parent's model sees it as an error output.

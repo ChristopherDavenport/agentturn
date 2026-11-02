@@ -518,6 +518,14 @@ versions may break the API.
   `Config.ToolElicitor`, or puts it on the context the run is prompted
   with, instead. RFC 0001 Nested calls.
 
+- Fixed: under `tools/agent.WithAskParent` a call the child's policy
+  held only beside an asked one is released only once every call asked
+  about in its batch was accepted, by a resume of the child approving
+  it as the policy decided; a decline leaves it held and the call fails
+  input-required naming it. It was released, and ran, whatever the
+  person said, and a held call beside no asked one was released too.
+  `ChildInfo.Items` holds the items of every run of the call. (#84)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

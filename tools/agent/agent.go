@@ -122,8 +122,11 @@ func (e *InputRequiredError) PendingCalls() []agentturn.WaitingCall {
 // answer's decision, by the decider it names, is the child's hook's
 // verdict, so an accept runs the call and a decline refuses it inside
 // the child, whose model reads what the answerer said. A call the hook
-// holds only beside an asked one (ToolDecision.Held) is released as
-// the policy allowed it, since the batch no longer waits on anyone.
+// holds only beside an asked one (ToolDecision.Held) is not asked
+// about: its batch's answers decide it, and it is released, approved
+// as the policy decided it with a resume of the child, once every call
+// asked about in its batch was accepted. A decline of one of them
+// leaves it held.
 // Only when there is nobody to ask, no elicitor on the call's context,
 // a failure to ask or a cancel, does the deferral stand, the child end
 // input-required and the call fail with an [*InputRequiredError]. The
@@ -131,23 +134,57 @@ func (e *InputRequiredError) PendingCalls() []agentturn.WaitingCall {
 // these.
 func WithAskParent() Option { return func(o *options) { o.askParent = true } }
 
-// askParent wraps hook so that a deferral of a call the child's model
-// made is put to elicit, the elicitor of the call that started the
-// child. A nested call's deferral is left to the loop, which asks the
-// invoking tool's elicitor itself.
-func askParent(hook func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error), elicit agenttool.Elicitor) func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+// askLog wraps a child's BeforeToolCall for [WithAskParent] and keeps
+// what the asking decided, batch by batch, so a call the policy held
+// only beside asked ones is released when, and only when, every call
+// asked about in its batch was accepted.
+type askLog struct {
+	mu sync.Mutex
+	// batches counts, by batch, the calls asked about and those
+	// accepted.
+	batches map[string]*askedBatch
+	// held maps a held call's ID to its batch.
+	held map[string]string
+}
+
+type askedBatch struct{ asked, accepted int }
+
+// batchKey names the batch a call is decided in: its first call.
+func batchKey(info agentturn.ToolCallInfo) string {
+	if len(info.Batch) > 0 && info.Batch[0] != nil {
+		return info.Batch[0].CallID
+	}
+	return info.Call.CallID
+}
+
+// wrap returns hook with a deferral of a call the child's model made
+// put to elicit, the elicitor of the call that started the child. A
+// nested call's deferral is left to the loop, which asks the run's
+// elicitor itself. A held deferral is returned as it is, and noted.
+func (l *askLog) wrap(hook func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error), elicit agenttool.Elicitor) func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
 	return func(ctx context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
 		d, err := hook(ctx, info)
 		if err != nil || d == nil || d.Action != agentturn.Defer || info.Parent != "" {
 			return d, err
 		}
-		if d.Held {
-			// Nobody waits at the batch's end: the calls asked about
-			// are asked here, one at a time.
-			released := *d
-			released.Action, released.Held = agentturn.Allow, false
-			return &released, nil
+		key := batchKey(info)
+		l.mu.Lock()
+		if l.batches == nil {
+			l.batches, l.held = map[string]*askedBatch{}, map[string]string{}
 		}
+		b := l.batches[key]
+		if b == nil {
+			b = &askedBatch{}
+			l.batches[key] = b
+		}
+		if d.Held {
+			// Its fate is the batch's answer, not its own question.
+			l.held[info.Call.CallID] = key
+			l.mu.Unlock()
+			return d, nil
+		}
+		b.asked++
+		l.mu.Unlock()
 		if elicit == nil {
 			return d, nil
 		}
@@ -159,11 +196,49 @@ func askParent(hook func(context.Context, agentturn.ToolCallInfo) (*agentturn.To
 			args = d.Args
 		}
 		asked := agentturn.AskedCall{CallID: info.Call.CallID, Name: info.Call.Name, Args: args, Decision: d}
-		if decided, ok := agentturn.Ask(agenttool.ContextWithElicitor(ctx, elicit), asked); ok {
-			return decided, nil
+		decided, ok := agentturn.Ask(agenttool.ContextWithElicitor(ctx, elicit), asked)
+		if !ok {
+			return d, nil
 		}
-		return d, nil
+		if decided.Action == agentturn.Allow {
+			l.mu.Lock()
+			b.accepted++
+			l.mu.Unlock()
+		}
+		return decided, nil
 	}
+}
+
+// releases returns the approvals that release pending, when every call
+// pending is one the policy held and every call asked about in its
+// batch was accepted; false otherwise, the run's end standing.
+func (l *askLog) releases(pending []agentturn.PendingCall) ([]agentturn.Answer, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(pending) == 0 {
+		return nil, false
+	}
+	answers := make([]agentturn.Answer, 0, len(pending))
+	for _, p := range pending {
+		if p.Call == nil || p.Decision == nil || !p.Decision.Held {
+			return nil, false
+		}
+		key, ok := l.held[p.Call.CallID]
+		b := l.batches[key]
+		if !ok || b == nil || b.asked == 0 || b.accepted != b.asked {
+			return nil, false
+		}
+		ans := agentturn.Approve(p.Call.CallID)
+		if p.Decision.Args != nil {
+			ans = agentturn.ApproveWith(p.Call.CallID, p.Decision.Args)
+		}
+		by := p.Decision.By
+		if by == "" {
+			by = agenttool.ByPolicy
+		}
+		answers = append(answers, ans.WithBy(by).WithReason("released: "+p.Decision.Reason))
+	}
+	return answers, true
 }
 
 // Option configures the tool built by [New].
@@ -536,11 +611,13 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		opts = append(opts, agentturn.WithTranscript(seed))
 	}
 	runCfg := cfg
+	var asks *askLog
 	if a.opts.askParent && cfg.BeforeToolCall != nil {
 		// The elicitor of the call that started the child, which the
 		// parent's loop put on the call's context.
 		elicit, _ := agenttool.ElicitorFrom(ctx)
-		runCfg.BeforeToolCall = askParent(cfg.BeforeToolCall, elicit)
+		asks = &askLog{}
+		runCfg.BeforeToolCall = asks.wrap(cfg.BeforeToolCall, elicit)
 	}
 	child := agentturn.New(runCfg, opts...)
 	var mu sync.Mutex
@@ -636,6 +713,27 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		})
 	}
 	end, err := child.Prompt(ctx, prompts...)
+	var items agentturn.Transcript
+	if end != nil {
+		items = end.Items
+	}
+	// Calls the child's policy held only beside asked ones are released
+	// once every call asked about in their batch was accepted, as a
+	// front releases them with the answers; the release continues the
+	// same call's work at the leaf, so it is not marked a retry.
+	for err == nil && asks != nil && end != nil && end.Reason == agentturn.ReasonInputRequired {
+		answers, ok := asks.releases(end.Pending)
+		if !ok {
+			break
+		}
+		next, rerr := child.Resume(context.WithValue(ctx, retryKey{}, false), answers...)
+		if next == nil {
+			err = rerr
+			break
+		}
+		end, err = next, rerr
+		items = append(items, end.Items...)
+	}
 	mu.Lock()
 	done = true
 	mu.Unlock()
@@ -645,7 +743,7 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		}
 		return agenttool.Result{}, fmt.Errorf("agent %s: %w", strconv.Quote(a.cfg.Name), err)
 	}
-	info := ChildInfo{Agent: a.cfg.Name, RunID: end.RunID, Items: end.Items, Reason: end.Reason, Cause: end.Cause, Pending: end.Pending}
+	info := ChildInfo{Agent: a.cfg.Name, RunID: end.RunID, Items: items, Reason: end.Reason, Cause: end.Cause, Pending: end.Pending}
 	switch end.Reason {
 	case agentturn.ReasonInputRequired:
 		return agenttool.Result{Details: info}, &InputRequiredError{Agent: a.cfg.Name, RunID: end.RunID, Pending: end.Pending}

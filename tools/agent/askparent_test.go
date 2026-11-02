@@ -42,7 +42,7 @@ func TestAChildsDeferralAsksTheParentsElicitor(t *testing.T) {
 		{name: "declined", ask: true, answer: &agenttool.Answer{Action: agenttool.ActionDecline}, want: "Tool result: Error: declined when asked: a person approves lookups", asked: true},
 		{name: "nobody to ask", ask: true, input: true},
 		{name: "a cancel", ask: true, answer: &agenttool.Answer{Action: agenttool.ActionCancel}, input: true, asked: true},
-		{name: "a held call is released", ask: true, held: true, answer: &agenttool.Answer{Action: agenttool.ActionAccept}, want: "Tool result: FOUND"},
+		{name: "a held call beside no asked one stays held", ask: true, held: true, answer: &agenttool.Answer{Action: agenttool.ActionAccept}, input: true},
 		{name: "without the option", answer: &agenttool.Answer{Action: agenttool.ActionAccept}, input: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -154,5 +154,102 @@ func TestAnAskedChildCallIsByTheAnswersDecider(t *testing.T) {
 	last := reqs[1][len(reqs[1])-1]
 	if m, ok := last.(*openresponses.Message); !ok || m.Role != openresponses.RoleDeveloper || m.Text() != "n" {
 		t.Errorf("child's second request ends with %+v, want the developer message n", last)
+	}
+}
+
+// twoCalls calls first and second in one response, then answers "done"
+// once the input holds an output.
+type twoCalls struct{ first, second string }
+
+func (m twoCalls) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	for _, item := range req.Input {
+		if _, ok := item.(*openresponses.FunctionCallOutput); ok {
+			if err := em.Item(openresponses.AssistantText("done")); err != nil {
+				return err
+			}
+			return em.Complete()
+		}
+	}
+	for _, name := range []string{m.first, m.second} {
+		w, err := em.FunctionCall("", name)
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(`{}`); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+	}
+	return em.Complete()
+}
+
+// TestAHeldSiblingFollowsTheAnswer pins that a call the child's policy
+// holds only beside an asked one runs when the asked call is accepted,
+// in either order, and is not released when it is declined: it stays
+// held, and the call fails input-required naming it.
+func TestAHeldSiblingFollowsTheAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		heldFirst  bool
+		action     agenttool.Action
+		wantRan    int
+		wantFailed bool
+	}{
+		{"accepted, held second", false, agenttool.ActionAccept, 1, false},
+		{"accepted, held first", true, agenttool.ActionAccept, 1, false},
+		{"declined, held second", false, agenttool.ActionDecline, 0, true},
+		{"declined, held first", true, agenttool.ActionDecline, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ran := 0
+			lookup := agenttool.NewFunc("lookup", "", nil, func(context.Context, agenttool.Call) (agenttool.Result, error) {
+				return agenttool.Text("FOUND"), nil
+			})
+			note := agenttool.NewFunc("note", "", nil, func(context.Context, agenttool.Call) (agenttool.Result, error) {
+				ran++
+				return agenttool.Text("noted"), nil
+			})
+			model := twoCalls{"lookup", "note"}
+			if tc.heldFirst {
+				model = twoCalls{"note", "lookup"}
+			}
+			childCfg := agentturn.Config{Name: "child", Model: model, Tools: []agenttool.Tool{lookup, note},
+				BeforeToolCall: func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+					if info.Call.Name == "lookup" {
+						return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "a person approves lookups", By: "policy"}, nil
+					}
+					return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "held beside lookup", By: "policy", Held: true}, nil
+				}}
+			parent := agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{New(childCfg, WithAskParent())}, MaxTurns: 1,
+				ToolElicitor: func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+					return agenttool.Answer{Action: tc.action}, nil
+				}}
+			var end *agentturn.ToolEnd
+			for ev := range agentturn.Run(context.Background(), nil, openresponses.Items{openresponses.UserText("find")}, parent) {
+				if e, ok := ev.(*agentturn.ToolEnd); ok {
+					end = e
+				}
+			}
+			if end == nil {
+				t.Fatal("the child never ran")
+			}
+			if ran != tc.wantRan {
+				t.Errorf("the held call ran %d times, want %d", ran, tc.wantRan)
+			}
+			var waiting agentturn.InputRequired
+			if failed := errors.As(end.Err, &waiting); failed != tc.wantFailed {
+				t.Fatalf("parent's call = %q, %v; want input required %v", end.Result.Output.Text, end.Err, tc.wantFailed)
+			}
+			if tc.wantFailed {
+				if items := waiting.PendingCalls(); len(items) != 1 || items[0].Name != "note" {
+					t.Errorf("waiting = %+v, want the held note", items)
+				}
+			} else if end.Result.Output.Text != "done" {
+				t.Errorf("parent's call = %q, want the child's answer", end.Result.Output.Text)
+			}
+		})
 	}
 }
