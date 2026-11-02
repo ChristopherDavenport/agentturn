@@ -720,6 +720,15 @@ type openedItem struct {
 	// itemID and modelCallID are the function call's as the model sent
 	// them, "" for none; done carries the call ID the loop decided.
 	itemID, modelCallID string
+	// call says the item opened as a function call, and callID is the
+	// call ID decided as it opened, which the call keeps when only the
+	// terminal response completes it.
+	call   bool
+	callID string
+	// fromResponse says done is a function call the terminal response
+	// completed, which the stream opened and never completed or never
+	// opened at all: the attempt appends it after renameCalls (#236).
+	fromResponse bool
 }
 
 // heldItem is a completed item waiting for its attempt to commit.
@@ -1737,6 +1746,12 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 		if err := r.flushHeld(); err != nil {
 			return nil, true, err
 		}
+		// A function call only the response completed joins the
+		// transcript now, under the ID it opened with, so the batch runs
+		// no call the transcript does not hold (#236).
+		if err := r.appendFromResponse(resp.ID); err != nil {
+			return nil, true, err
+		}
 	}
 	if err := r.emit(&ResponseEnd{RunID: r.runID, Turn: r.turn, Response: resp}); err != nil {
 		return nil, true, err
@@ -1804,7 +1819,9 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 			// The call's ID is decided as it opens, so its item_start,
 			// every item_update and its item_end carry the same one.
 			r.decideCallID(call, e.OutputIndex)
-			r.opened[len(r.opened)-1].itemID, r.opened[len(r.opened)-1].modelCallID = call.ID, call.CallID
+			o := &r.opened[len(r.opened)-1]
+			o.itemID, o.modelCallID = call.ID, call.CallID
+			o.call, o.callID = true, r.callAt[e.OutputIndex].id
 			item = r.withCallID(item, e.OutputIndex)
 		}
 		commits := !committed && commitsAttempt(item)
@@ -2064,39 +2081,51 @@ func (r *runner) openedAt(index int) int {
 }
 
 // renameCalls returns the response the turn acts on: resp with each of
-// its function calls replaced by the one the attempt completed for it,
-// which carries the call ID decideCallID gave it and the arguments it
+// its function calls replaced by the one the transcript holds for it,
+// which carries the call ID the loop decided and the arguments it
 // completed with, so the calls the batch runs are the ones the
-// transcript holds. The completed calls are in the order they opened,
-// which is the order the response lists them in, and each call of the response is
-// paired with one of them: by item ID when both carry one, else by the
-// call ID the model gave it among the completed calls not yet paired,
-// else by order. When a completed call is left unpaired, which a
-// terminal response built one item per output index leaves out when a
-// later call took the index, the response's calls give way, as a group,
-// to the completed calls in the order they opened, so every call the
-// transcript holds is run and answered, in the transcript's order. Renaming by output index alone, as before #210, named
-// the last call opened at an index for every call the response listed
-// there, so a stream that opened every call at index 0 with no item
-// IDs ran one call twice, or each with the other's output. An item that
-// is not a function call, and a function call the stream never
-// completed, which the response alone lists, keep today's name: the
-// call ID decided at their output index, when one was.
+// transcript holds. The calls the attempt opened or completed are in
+// the order they opened, which is the order the response lists them
+// in, and each call of the response is paired with one of them: by item
+// ID when both carry one, else by the call ID the model gave it among
+// those not yet paired, else by order; never by its position in the
+// response, which after a reused output index names another call. A
+// call the stream opened and never completed is completed from the
+// response it is paired with, under the ID decided as it opened, and a
+// call the response lists that the stream never opened is decided now;
+// both are marked fromResponse for the attempt to append before
+// response_end (#236). A failed response completes nothing: the run
+// ends with its error, and a call it alone lists keeps the ID decided
+// at its output index, as before. When a completed call is left
+// unpaired, which a terminal response built one item per output index
+// leaves out when a later call took the index, the response's calls
+// give way, as a group, to the transcript's calls in the order they
+// opened, so every call the transcript holds is run and answered, in
+// the transcript's order. Renaming by output index alone, as before
+// #210, named the last call opened at an index for every call the
+// response listed there, so a stream that opened every call at index 0
+// with no item IDs ran one call twice, or each with the other's output.
+// An item that is not a function call is left as the response gave it.
 func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Response {
-	var completed []*openedItem
-	for i := range r.opened {
-		if _, ok := r.opened[i].done.(*openresponses.FunctionCall); ok {
-			completed = append(completed, &r.opened[i])
+	complete := resp.Status != openresponses.ResponseStatusFailed
+	// calls are positions in r.opened: every function call the attempt
+	// completed, and, when the response completes calls, every one it
+	// opened and never completed.
+	var calls []int
+	for i, o := range r.opened {
+		_, done := o.done.(*openresponses.FunctionCall)
+		if done || (complete && o.done == nil && o.call) {
+			calls = append(calls, i)
 		}
 	}
 	paired := make([]int, len(resp.Output))
 	for i := range paired {
 		paired[i] = -1
 	}
-	taken := make([]bool, len(completed))
+	taken := make([]bool, len(calls))
 	pair := func(index int, match func(*openedItem) bool) {
-		for j, c := range completed {
-			if !taken[j] && match(c) {
+		for j, at := range calls {
+			if !taken[j] && match(&r.opened[at]) {
 				paired[index], taken[j] = j, true
 				return
 			}
@@ -2117,17 +2146,59 @@ func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Respon
 			pair(index, func(*openedItem) bool { return true })
 		}
 	}
-	if slices.Contains(taken, false) {
+	if complete {
+		for index, item := range resp.Output {
+			call, ok := item.(*openresponses.FunctionCall)
+			if !ok {
+				continue
+			}
+			if j := paired[index]; j >= 0 {
+				if o := &r.opened[calls[j]]; o.done == nil {
+					// Opened and never completed: the response completes
+					// it, under the ID it opened with.
+					o.done, o.fromResponse = completedCall(call, o.callID, o.itemID), true
+					if o.modelCallID == "" {
+						o.modelCallID = call.CallID
+					}
+				}
+				continue
+			}
+			// The stream never opened it: decided as a call first seen
+			// as it completes is.
+			r.decideCallID(call, index)
+			id := r.callAt[index].id
+			r.opened = append(r.opened, openedItem{index: index, done: completedCall(call, id, ""), itemID: call.ID, modelCallID: call.CallID, call: true, callID: id, fromResponse: true})
+			calls = append(calls, len(r.opened)-1)
+			taken = append(taken, true)
+			paired[index] = len(calls) - 1
+		}
+	}
+	// A call the stream opened and the response does not list is not in
+	// the transcript and is not run: its item_start has no item_end, as
+	// for an item an attempt dropped.
+	unpaired := false
+	for j, at := range calls {
+		if !taken[j] && r.opened[at].done != nil {
+			unpaired = true
+		}
+	}
+	if unpaired {
 		// A completed call the response does not list, because the
 		// server built its terminal response one item per output index
 		// and a later call took the index, is in the transcript all the
 		// same and owed an output. Every call the response lists is
 		// paired by now, so the listed calls, as a group, give way to
-		// the completed calls in the order they opened, which is the
+		// the transcript's calls in the order they opened, which is the
 		// transcript's order, where the first of them stood; an item
 		// that is not a call keeps its place.
+		var held openresponses.Items
+		for _, at := range calls {
+			if done := r.opened[at].done; done != nil {
+				held = append(held, done)
+			}
+		}
 		copied := *resp
-		copied.Output = make(openresponses.Items, 0, len(resp.Output)+len(completed))
+		copied.Output = make(openresponses.Items, 0, len(resp.Output)+len(held))
 		placed := false
 		for _, item := range resp.Output {
 			if _, ok := item.(*openresponses.FunctionCall); !ok {
@@ -2135,24 +2206,20 @@ func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Respon
 				continue
 			}
 			if !placed {
-				for _, c := range completed {
-					copied.Output = append(copied.Output, c.done)
-				}
+				copied.Output = append(copied.Output, held...)
 				placed = true
 			}
 		}
 		if !placed {
-			for _, c := range completed {
-				copied.Output = append(copied.Output, c.done)
-			}
+			copied.Output = append(copied.Output, held...)
 		}
 		return &copied
 	}
 	var out *openresponses.Response
 	for index, item := range resp.Output {
 		renamed := item
-		if j := paired[index]; j >= 0 {
-			renamed = completed[j].done
+		if j := paired[index]; j >= 0 && r.opened[calls[j]].done != nil {
+			renamed = r.opened[calls[j]].done
 		} else {
 			renamed = r.withCallID(item, index)
 		}
@@ -2170,6 +2237,39 @@ func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Respon
 		return resp
 	}
 	return out
+}
+
+// completedCall is call, as the terminal response lists it, under the
+// call ID id, carrying itemID when it carries no item ID of its own.
+func completedCall(call *openresponses.FunctionCall, id, itemID string) *openresponses.FunctionCall {
+	c := *call
+	c.CallID = id
+	if c.ID == "" {
+		c.ID = itemID
+	}
+	return &c
+}
+
+// appendFromResponse appends, in the order they opened, the function
+// calls renameCalls completed from the terminal response, each with its
+// item_end, which keeps the model's call ID beside the item when the
+// loop gave it another.
+func (r *runner) appendFromResponse(responseID string) error {
+	for _, o := range r.opened {
+		if !o.fromResponse {
+			continue
+		}
+		modelCallID := ""
+		if o.modelCallID != o.callID {
+			modelCallID = o.modelCallID
+		}
+		r.transcript = append(r.transcript, o.done)
+		r.added = append(r.added, o.done)
+		if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: o.done, ResponseID: responseID, ModelCallID: modelCallID}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // wireError carries an error event off the stream, so the attempt can

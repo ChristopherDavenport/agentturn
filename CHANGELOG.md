@@ -337,6 +337,17 @@ versions may break the API.
   so a remote delivery made while the agent waits on an approval
   survives a quit. (#244)
 
+- Fixed: a function call the stream opened and never completed, which
+  only the terminal response lists whole, is put in the transcript with
+  its `item_end` before `response_end`, under the ID decided when it
+  opened, and a call the response lists that the stream never opened is
+  decided and put there the same way. Before, the batch ran such a call
+  though the transcript did not hold it, and after a reused output index
+  ran it under another call's ID, so the next request sent an output
+  with no call and a recorder failed the run. The response's calls pair
+  with the attempt's by item ID, the model's call ID or open order,
+  never by output index. RFC 0001 The model call and Invariants. (#236)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

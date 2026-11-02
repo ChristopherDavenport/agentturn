@@ -535,10 +535,23 @@ the transcript.
   transcript's order, by item ID when both carry one, else by the call
   ID the model gave it among the completed calls not yet paired, else
   by order, and the completed call, with the ID the loop decided and
-  the arguments it completed with, stands in the response's place. A
-  function call the response lists that the stream never completed
-  keeps the ID decided at its output index, and an item that is not a
-  function call is left as the response gave it. A completed call no
+  the arguments it completed with, stands in the response's place.
+  Every function call the batch runs MUST be one the transcript holds,
+  under the ID the transcript holds it by. A function call the
+  completed response lists that the stream opened and never completed
+  is completed from the response: it takes the ID decided when it
+  opened, paired as above by item ID or else by open order among the
+  calls the attempt opened, never by its position in the response,
+  which after a reused output index names another call, and it is
+  appended with its `item_end` before `response_end`. A listed call the
+  stream never opened is decided and appended the same way at that
+  point, so every call the response lists is paired or decided and
+  none runs that the transcript does not hold. A call the stream opened
+  that the response does not list is not in the transcript and is not
+  run; its `item_start` has no `item_end`, as for an item an attempt
+  dropped. A response that arrived failed completes nothing, since the
+  run ends with its error. An item that is not a function call is left
+  as the response gave it (#236). A completed call no
   call of the response pairs with, which a terminal response built one
   item per output index leaves out when a later call took the index,
   makes the response's calls give way, as a group, to the completed
@@ -1135,9 +1148,10 @@ A conforming loop holds these over every run, however it ends:
   call at the output index of the first still gives each its own ID,
   and a call opened without an item ID and completed with one keeps
   the ID it opened with; the response the turn acts on holds the
-  completed calls, paired with the response's as the
-  [model call section](#the-model-call) says, so the batch never runs
-  a call under another's ID. The
+  calls the transcript holds, paired with the response's as the
+  [model call section](#the-model-call) says, one only the response
+  completed included, so the batch never runs a call the transcript
+  does not hold or a call under another's ID. The
   IDs a transcript held stay
   reserved when `SetTranscript` replaces it. A host that seeds the
   loop with less than a whole session, a context after a fold or a
