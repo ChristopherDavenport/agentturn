@@ -40,6 +40,79 @@ versions may break the API.
   session, so the drained item carries `queued_from` and its trigger as
   `source`. Before, the observer dropped them and the item was written
   bare. (#289)
+- Fixed: with the instructions recorded as parts, the recorder writes a
+  configuration change as a delta whenever one describes it, rather than
+  a replace whenever the delta is no shorter. A switch between agents
+  with disjoint tools was a replace, which starts the parts afresh, so
+  the hand-back after it repeated every part's text; it now names them
+  by hash. (#235)
+- Added: `Answer.Failed`, `Answer.WithFailed`, `ContextWithFailures`
+  and `FailedFromContext`. An output answer may say it reports that the
+  call failed; `OutcomeUnknown` sets it, and `Agent.Resume` carries it
+  unread on the run's context, as it carries an answer's reason and
+  origin. `front/control` carries it on the wire as `failed`.
+- Changed: `session`'s recorder marks an output's item entry `failed`
+  (format 0.14) when the call's `tool_end` carried the tool's error, or
+  when the answer it is reports a failure, as an outcome-unknown output
+  does, whether a host gives it or `ReplayAnswers` does. A refusal, a
+  block or the loop's own for an unknown tool or bad arguments, is
+  recorded by its reject and not marked. (#278)
+- Changed: a dispatch a later subscriber refuses is withdrawn with the
+  format's withdrawal, a `reject` carrying `withdrawn: true` with the
+  refusal as its reason, in place of the `agentturn:withdrawn` custom
+  entry, so any reader of format 0.14 reads the call as never started.
+  `Pending` and the recorder still read the custom entry on paths an
+  earlier version wrote, and no longer read a withdrawn dispatch on the
+  path as one off it. RFC 0001's open question on such a dispatch is
+  closed. (#119, #278)
+- Added: `ToolEnd.Cut`, set when a cancellation or a failure cut the
+  call off before it had a result of its own, so its output is not
+  appended; `front/control` carries it as `cut`.
+- Changed: `session`'s recorder writes format 0.15's `result` for a call
+  whose tool returned while another call of its batch still runs,
+  durable before its `tool_end` returns, since the batch appends the
+  outputs only once every call has settled; the last call of a batch to
+  settle, and a batch of one, write none. `ReplayAnswers` answers a call
+  with a result and no output with that output, so a process that dies
+  mid-batch no longer runs a finished call again, and the recorder
+  appends it with no decision before it. An answer `ReplayAnswers` takes
+  from a branch's output, or from a result, is marked failed when that
+  output was. (#273)
+- Docs: `Config.ToolProvider` says the loop never closes what a
+  provider returns, and that a provider building tools that own a
+  resource caches them per session and closes them itself; RFC 0001's
+  configuration section states it as a SHOULD and its open question on
+  who closes a provided tool is closed. (#95)
+- Added: `RunEnd.Failure`. A subscriber or a hook that fails for a
+  reason of its own while the run is being aborted is still joined into
+  `Err` beside the cause, and is now reported on its own as well, so a
+  consumer that reads the reason still finds a recorder that could not
+  write. `front/control` carries it as `failure`; RFC 0001 states the
+  member and closes its open question on it. (#83)
+- Fixed: the item an `ItemStart` or `ItemUpdate` of a streamed item
+  carries is a snapshot of it as accumulated at that event. It was the
+  accumulator's own copy, so a subscriber that kept the event, as a
+  view's render queue does, drew the item as later deltas left it: an
+  assistant message's `ItemStart`, sent empty, drew the whole answer.
+  The copy shares strings and copies the item, its content lists and
+  their streamed parts, nothing proportional to the text. RFC 0001's
+  Events states the rule. (#218)
+- Added: `ContextWithTurn` and `TurnFromContext`. The context of
+  everything a turn calls, its hooks, the transform, the model and the
+  tools, carries the turn's number beside the run ID; it is 0 outside a
+  turn and in a resume's approved batch. (#275)
+- Changed: a model call that fails with an error wrapping `ErrGuard`,
+  as a moderation wrapper around the model marks its refusal, stops the
+  run with `ReasonStopped` and `StopGuard` and the error on `RunEnd.Err`,
+  without a retry, and closes the calls the stream completed before it
+  with `WithheldCallOutput`. It ended `ReasonError` before. (#275)
+- Added: `compact.MarkFold` and `compact.IsFold`. The model call a fold
+  makes for itself, `NewLocal`'s summary and `New`'s compaction call,
+  runs on a context marked so, and a model, a wrapping streamer or a
+  replay tells it from a turn's by `IsFold` when the call arrives,
+  rather than by a request with no tools and no instructions.
+  `WithRequest` no longer asks callers to leave those empty. RFC 0001
+  states the rule and closes its open question. (#88)
 
 ## v0.0.34 - 2026-10-26
 
