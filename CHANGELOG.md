@@ -572,6 +572,12 @@ versions may break the API.
   is answered with a refusal, unrun, by `policy`. It was released, and
   ran, whatever the caller answered.
 
+- Fixed: under `tools/agent.WithAskParent` a held call whose batch's
+  asked call was declined is refused, unrun, by `policy`, and the child
+  goes on, where it stayed held and the call failed input-required
+  though someone had answered. Only when nobody answered does it stay
+  held. (#84)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

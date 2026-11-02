@@ -1634,7 +1634,9 @@ An agent stands in four places inside another system:
   reads what the answerer said; a call held only beside an asked one
   is not asked about, and its fate is its batch's answers: it is
   released, as the policy decided it, once every call asked about in
-  its batch was accepted, and a decline of one leaves it held. The call
+  its batch was accepted, and refused unrun, by the policy, once one
+  was declined; a front that escalates held calls to its caller
+  settles them the same way. The call
   fails with input-required only when there is nobody to ask, no
   elicitor, a failure to ask or a cancel: an error that says so and
   names the calls, so the parent's model sees it as an error output.

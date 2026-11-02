@@ -188,8 +188,9 @@ func (m twoCalls) CreateStream(_ context.Context, req openresponses.Request, sin
 
 // TestAHeldSiblingFollowsTheAnswer pins that a call the child's policy
 // holds only beside an asked one runs when the asked call is accepted,
-// in either order, and is not released when it is declined: it stays
-// held, and the call fails input-required naming it.
+// in either order, and is refused unrun when it is declined, the child
+// going on; only when nobody answered does it stay held, the call
+// failing input-required naming it.
 func TestAHeldSiblingFollowsTheAnswer(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -200,8 +201,9 @@ func TestAHeldSiblingFollowsTheAnswer(t *testing.T) {
 	}{
 		{"accepted, held second", false, agenttool.ActionAccept, 1, false},
 		{"accepted, held first", true, agenttool.ActionAccept, 1, false},
-		{"declined, held second", false, agenttool.ActionDecline, 0, true},
-		{"declined, held first", true, agenttool.ActionDecline, 0, true},
+		{"declined, held second", false, agenttool.ActionDecline, 0, false},
+		{"declined, held first", true, agenttool.ActionDecline, 0, false},
+		{"nobody answered, held second", false, agenttool.ActionCancel, 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ran := 0
@@ -244,8 +246,8 @@ func TestAHeldSiblingFollowsTheAnswer(t *testing.T) {
 				t.Fatalf("parent's call = %q, %v; want input required %v", end.Result.Output.Text, end.Err, tc.wantFailed)
 			}
 			if tc.wantFailed {
-				if items := waiting.PendingCalls(); len(items) != 1 || items[0].Name != "note" {
-					t.Errorf("waiting = %+v, want the held note", items)
+				if items := waiting.PendingCalls(); len(items) != 2 {
+					t.Errorf("waiting = %+v, want the asked lookup and the held note", items)
 				}
 			} else if end.Result.Output.Text != "done" {
 				t.Errorf("parent's call = %q, want the child's answer", end.Result.Output.Text)

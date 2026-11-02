@@ -125,8 +125,9 @@ func (e *InputRequiredError) PendingCalls() []agentturn.WaitingCall {
 // holds only beside an asked one (ToolDecision.Held) is not asked
 // about: its batch's answers decide it, and it is released, approved
 // as the policy decided it with a resume of the child, once every call
-// asked about in its batch was accepted. A decline of one of them
-// leaves it held.
+// asked about in its batch was accepted, or refused unrun, by the
+// policy, once one was declined. Only when nobody answered does it stay
+// held.
 // Only when there is nobody to ask, no elicitor on the call's context,
 // a failure to ask or a cancel, does the deferral stand, the child end
 // input-required and the call fail with an [*InputRequiredError]. The
@@ -137,7 +138,8 @@ func WithAskParent() Option { return func(o *options) { o.askParent = true } }
 // askLog wraps a child's BeforeToolCall for [WithAskParent] and keeps
 // what the asking decided, batch by batch, so a call the policy held
 // only beside asked ones is released when, and only when, every call
-// asked about in its batch was accepted.
+// asked about in its batch was accepted, and refused when one was
+// declined.
 type askLog struct {
 	mu sync.Mutex
 	// batches counts, by batch, the calls asked about and those
@@ -147,7 +149,7 @@ type askLog struct {
 	held map[string]string
 }
 
-type askedBatch struct{ asked, accepted int }
+type askedBatch struct{ asked, accepted, declined int }
 
 // batchKey names the batch a call is decided in: its first call.
 func batchKey(info agentturn.ToolCallInfo) string {
@@ -200,18 +202,22 @@ func (l *askLog) wrap(hook func(context.Context, agentturn.ToolCallInfo) (*agent
 		if !ok {
 			return d, nil
 		}
+		l.mu.Lock()
 		if decided.Action == agentturn.Allow {
-			l.mu.Lock()
 			b.accepted++
-			l.mu.Unlock()
+		} else {
+			b.declined++
 		}
+		l.mu.Unlock()
 		return decided, nil
 	}
 }
 
-// releases returns the approvals that release pending, when every call
+// releases returns the answers that settle pending, when every call
 // pending is one the policy held and every call asked about in its
-// batch was accepted; false otherwise, the run's end standing.
+// batch was answered: an approval as the policy decided when all were
+// accepted, and a refusal, unrun, by the policy, when one was declined.
+// false otherwise, nobody having answered, the run's end standing.
 func (l *askLog) releases(pending []agentturn.PendingCall) ([]agentturn.Answer, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -225,8 +231,13 @@ func (l *askLog) releases(pending []agentturn.PendingCall) ([]agentturn.Answer, 
 		}
 		key, ok := l.held[p.Call.CallID]
 		b := l.batches[key]
-		if !ok || b == nil || b.asked == 0 || b.accepted != b.asked {
+		if !ok || b == nil || b.asked == 0 || b.accepted+b.declined != b.asked {
 			return nil, false
+		}
+		if b.declined > 0 {
+			text := "not run: the call this one was held beside was declined when asked"
+			answers = append(answers, agentturn.Output(&openresponses.FunctionCallOutput{CallID: p.Call.CallID, Output: openresponses.FunctionCallOutputData{Text: text}}).WithBy(agenttool.ByPolicy).WithReason(text))
+			continue
 		}
 		ans := agentturn.Approve(p.Call.CallID)
 		if p.Decision.Args != nil {
@@ -718,9 +729,10 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		items = end.Items
 	}
 	// Calls the child's policy held only beside asked ones are released
-	// once every call asked about in their batch was accepted, as a
-	// front releases them with the answers; the release continues the
-	// same call's work at the leaf, so it is not marked a retry.
+	// once every call asked about in their batch was accepted, and
+	// refused once one was declined, as a front settles them with the
+	// answers; the resume continues the same call's work at the leaf,
+	// so it is not marked a retry.
 	for err == nil && asks != nil && end != nil && end.Reason == agentturn.ReasonInputRequired {
 		answers, ok := asks.releases(end.Pending)
 		if !ok {
