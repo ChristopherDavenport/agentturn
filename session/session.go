@@ -307,6 +307,13 @@
 //     the output is the harness's answer, and the answer's reason ties
 //     it to the branch left. A fork copies none, as it copies no
 //     child's link: the fork started none of that work.
+//   - a peer's late result: an input that arrived under
+//     agentturn.CalleeTrigger, a detached tools/a2a call's answer the
+//     host delivered, is written with format 0.15's from_link naming
+//     the latest peer link of that call on the path, to the task the
+//     trigger names when it names one, and none when there is no such
+//     link. The trigger rides on the queued entry, so an input owed
+//     across a restart names the link too.
 //
 // # Header
 //
@@ -5415,6 +5422,9 @@ func (w *writer) itemFrom(ctx context.Context, item openresponses.Item, response
 			e.Source = in.trigger.Clone()
 		} else if e, ok := entry.(*agentsession.ItemEntry); ok && in == nil && source != nil {
 			e.Source = source
+		}
+		if e, ok := entry.(*agentsession.ItemEntry); ok {
+			e.FromLink = w.fromLink(e.Source)
 		}
 	}
 	id, err := w.append(ctx, entry)

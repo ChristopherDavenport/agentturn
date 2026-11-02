@@ -139,6 +139,28 @@ func (t Trigger) IsZero() bool {
 	return t.Kind == "" && t.Ref == "" && t.Source == "" && len(t.Extra) == 0
 }
 
+// TriggerCallee is the kind of a [Trigger] naming the call whose
+// callee's late result an input carries: a detached call's, whose
+// output said the callee was working, its answer delivered turns
+// later. Ref is the call's ID, and the Extra member "task", when
+// present, the callee's task. A session recorder writes an item
+// delivered or queued under it with from_link naming that call's peer
+// link (RFC 0001 Composition, as a peer). [CalleeTrigger] builds one.
+const TriggerCallee = "callee"
+
+// CalleeTrigger returns the [TriggerCallee] trigger for the late result
+// of the call callID, from its callee's task when task is not empty. A
+// host delivers a detached call's result under it:
+//
+//	a.Deliver(agentturn.ContextWithTrigger(ctx, agentturn.CalleeTrigger(callID, task)), item)
+func CalleeTrigger(callID, task string) Trigger {
+	t := Trigger{Kind: TriggerCallee, Ref: callID}
+	if task != "" {
+		t.Extra = map[string]any{"task": task}
+	}
+	return t
+}
+
 // String returns "kind:ref", or whichever of the two is set.
 func (t Trigger) String() string {
 	switch {

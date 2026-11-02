@@ -586,6 +586,20 @@ versions may break the API.
   history whole for routing. Before, a later task showed the receiver
   the sender's tool history again. RFC 0001 Composition states it.
   (#276)
+- Added: `tools/a2a.WithDetach(fn)`, the background remote call. A
+  detached call returns once the remote agent names a task it has not
+  finished, with an output saying it is running; its callee is recorded
+  as a peer; the task is followed on the run context, by its stream or,
+  under `WithBlocking`, by a send that returns at once and `tasks/get`
+  every `WithPollInterval`, and `fn` gets its end. An abort of the
+  parent's run cuts it (tasks/cancel, recorded); the batch or the run
+  ending does not. `tools/a2a.Answer(final)` is the output a call would
+  have returned. The host delivers the result with `Agent.Deliver`
+  under the new `agentturn.CalleeTrigger(callID, task)` (kind
+  `TriggerCallee`), and `session.Recorder` writes an item that arrived
+  under it with format 0.15's `from_link` naming the call's `peer`
+  link, after a restart too. RFC 0001 Composition and the record's
+  `item_end` row state it. (#290)
 
 ## v0.0.34 - 2026-10-26
 

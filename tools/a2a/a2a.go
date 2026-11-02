@@ -11,7 +11,9 @@
 // does one left in auth-required. [WithInputRequired] answers the
 // question inside the call instead, on the same task. The task and
 // context IDs travel in Result.Details; a host that wants to resume a
-// task itself makes the callee a peer.
+// task itself makes the callee a peer. [WithDetach] makes a call the
+// background task: it returns once the task runs, and the task's end
+// goes to a host function that delivers it to the parent.
 //
 // The call records the callee it reaches as soon as it knows it, with
 // agenttool.WriteRecord: a [Callee] naming the URL it called, the task
@@ -33,6 +35,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -199,6 +202,62 @@ const DefaultInputRounds = 8
 // it would without the hook. The default is [DefaultInputRounds].
 func WithInputRounds(n int) Option { return func(r *remote) { r.inputRounds = n } }
 
+// WithDetach makes a call the background task (RFC 0001 Composition,
+// as a peer): the call returns as soon as the remote agent names a task
+// it has not finished, with an output saying the task is running and a
+// [TaskInfo] naming it, and the task is followed on, by the stream the
+// message was sent on or, under [WithBlocking], by a send that returns
+// once the task exists (A2A §3.2.2) and tasks/get every
+// [WithPollInterval] (§3.1.7). When the task is final, or waits on
+// input [WithInputRequired] did not give, fn gets the call's ID, the
+// task's [TaskInfo], the task as last seen and the error the call would
+// have returned, nil when it completed; [Answer] is the output it
+// would have returned. fn runs on the goroutine following the task, so
+// the host delivers the answer to the parent from it with
+// agentturn.Agent.Deliver, under agentturn.CalleeTrigger naming the
+// call and the task, which a session recorder writes as the item's
+// from_link to the call's peer link.
+//
+// The callee is a peer, whose work outlives the call: its [Callee]
+// record names [RelationPeer], and the call's end leaves the task
+// running. The task is followed on agentturn.RunContext of the call, so
+// an abort of the parent's run cuts it, sending tasks/cancel and
+// recording [CancelSent], and the parent's batch or run ending by
+// itself does not; the records written after the call returned name
+// the call. [WithInputRequired] still answers the task's questions
+// while it is followed. A call whose answer is final before the task
+// runs, a message answer or a task that ended at once, or that fails
+// first, returns as any call does, and fn is not called. Progress
+// updates stop when the call returns.
+func WithDetach(fn func(callID string, info TaskInfo, final *a2a.Task, err error)) Option {
+	return func(r *remote) { r.detach = fn }
+}
+
+// DefaultPollInterval is how often a detached call under
+// [WithBlocking] asks for its task with tasks/get.
+const DefaultPollInterval = time.Second
+
+// WithPollInterval sets how often a detached call under [WithBlocking]
+// asks for its task; the default is [DefaultPollInterval].
+func WithPollInterval(d time.Duration) Option {
+	return func(r *remote) {
+		if d > 0 {
+			r.pollInterval = d
+		}
+	}
+}
+
+// Answer is the output a call returns for a task that completed, the
+// agent's text and the files of its artifacts, for the final task a
+// [WithDetach] function gets: what a host delivers to the parent.
+func Answer(final *a2a.Task) openresponses.FunctionCallOutputData {
+	if final == nil {
+		return openresponses.FunctionCallOutputData{}
+	}
+	o := outcome{status: final.Status.Message, artifacts: final.Artifacts}
+	return output(o.text(), o.fileParts())
+}
+
 // New wraps a remote agent as a tool. The client is usually built from
 // the same card with a2aclient.NewFromCard. Build it with the
 // [ObserveEndpoint] interceptor, however it is built, so a call records
@@ -206,7 +265,7 @@ func WithInputRounds(n int) Option { return func(r *remote) { r.inputRounds = n 
 // without the interceptor a call records no URL, since the tool cannot
 // tell which endpoint a client it did not build calls.
 func New(client *a2aclient.Client, card *a2a.AgentCard, opts ...Option) agenttool.Tool {
-	r := &remote{client: client, inputRounds: DefaultInputRounds}
+	r := &remote{client: client, inputRounds: DefaultInputRounds, pollInterval: DefaultPollInterval}
 	if card != nil {
 		r.name = functionName(card.Name)
 		r.description = describe(card)
@@ -244,6 +303,8 @@ type remote struct {
 	peer          bool
 	inputRequired InputRequired
 	inputRounds   int
+	detach        func(callID string, info TaskInfo, final *a2a.Task, err error)
+	pollInterval  time.Duration
 	schema        json.RawMessage
 }
 
@@ -263,15 +324,31 @@ func (r *remote) Execute(ctx context.Context, call agenttool.Call) (agenttool.Re
 	msg.ContextID = r.contextID
 
 	ep := &endpoint{}
-	ctx = context.WithValue(ctx, endpointKey{}, ep)
 	c := &callState{remote: r, ep: ep}
+	if r.detach != nil {
+		return r.detached(ctx, call, msg, c)
+	}
 	var out outcome
+	return r.follow(context.WithValue(ctx, endpointKey{}, ep), call, msg, &out, c)
+}
+
+// follow sends msg, follows the task it starts to a final state,
+// answering its questions through [WithInputRequired], and returns the
+// call's result, out holding the task as it was last seen.
+func (r *remote) follow(ctx context.Context, call agenttool.Call, msg *a2a.Message, out *outcome, c *callState) (agenttool.Result, error) {
 	for rounds := 0; ; rounds++ {
-		err := r.send(ctx, call, &a2a.MessageSendParams{Message: msg}, &out, c)
+		err := r.send(ctx, call, &a2a.MessageSendParams{Message: msg}, out, c)
 		if err != nil {
+			if c.detached && ctx.Err() != nil {
+				// The parent's run was aborted: a detached call's task
+				// is cut with it, the peer though it is, and the abort
+				// is what ended it.
+				c.stop(ctx, out)
+				return agenttool.Result{}, fmt.Errorf("a2a: %w", context.Cause(ctx))
+			}
 			// The call gives up the tasks that have not ended, aborted or
 			// failed alike: its own work is stopped.
-			c.leave(ctx, &out)
+			c.leave(ctx, out)
 			return agenttool.Result{}, err
 		}
 		if out.state != a2a.TaskStateInputRequired || r.inputRequired == nil || out.taskID == "" || rounds >= r.inputRounds {
@@ -288,7 +365,7 @@ func (r *remote) Execute(ctx context.Context, call agenttool.Call) (agenttool.Re
 		}
 		if err != nil {
 			// The call gives the task up: its own work is stopped.
-			c.leave(ctx, &out)
+			c.leave(ctx, out)
 			return agenttool.Result{Details: info}, err
 		}
 		msg = a2a.NewMessageForTask(a2a.MessageRoleUser, a2a.TaskInfo{TaskID: out.taskID, ContextID: out.contextID}, answer...)
@@ -301,8 +378,52 @@ func (r *remote) Execute(ctx context.Context, call agenttool.Call) (agenttool.Re
 	// call returned, before it ended; an earlier task the remote agent
 	// moved off with its reply to an answer. Each is stopped as an abort
 	// stops it.
-	c.leave(ctx, &out)
+	c.leave(ctx, out)
 	return out.result()
+}
+
+// detached sends msg and returns once the remote agent names a task it
+// has not finished, with an output saying the task is running, and
+// follows the task on the run context, handing its end to the
+// [WithDetach] function. A call whose answer is final before then, a
+// message or a task already ended, or that fails first, returns as a
+// call that is not detached does, and fn is not called.
+func (r *remote) detached(ctx context.Context, call agenttool.Call, msg *a2a.Message, c *callState) (agenttool.Result, error) {
+	// The task outlives the call: it is followed on the run's context,
+	// with the call on it, so its records name the call after the call
+	// has returned, and an abort of the run still cuts it.
+	fctx := ctx
+	if rc, ok := agentturn.RunContext(ctx); ok {
+		fctx = agenttool.WithCall(rc, call)
+	}
+	fctx = context.WithValue(fctx, endpointKey{}, c.ep)
+	started := make(chan TaskInfo, 1)
+	c.detached = true
+	c.started = func(info TaskInfo) { started <- info }
+	type ended struct {
+		res agenttool.Result
+		err error
+	}
+	done := make(chan ended, 1)
+	go func() {
+		var out outcome
+		res, err := r.follow(fctx, call, msg, &out, c)
+		if c.started == nil {
+			// The call returned saying the task runs: its end is fn's.
+			r.detach(call.ID, out.info(), out.task(), err)
+			return
+		}
+		done <- ended{res, err}
+	}()
+	select {
+	case info := <-started:
+		return agenttool.Result{
+			Output:  openresponses.FunctionCallOutputData{Text: fmt.Sprintf("agent %s is working on it in the background as task %s; its answer will follow", strconv.Quote(r.name), info.TaskID)},
+			Details: info,
+		}, nil
+	case e := <-done:
+		return e.res, e.err
+	}
 }
 
 // callState is what one call knows about the callee it reached.
@@ -314,6 +435,12 @@ type callState struct {
 	// reportedM is whether the [Callee] record of a message answer is
 	// written.
 	reportedM bool
+	// detached is whether the call is [WithDetach]'s; started, until
+	// the call returns, is called once the remote agent names a task it
+	// has not finished, and is nil from then on: the call has returned,
+	// and its progress updates have nowhere to go.
+	detached bool
+	started  func(TaskInfo)
 }
 
 // task is one task a call reached.
@@ -363,7 +490,7 @@ func (c *callState) seen(out *outcome) *task {
 
 // relation is the link the call's callee is.
 func (c *callState) relation() string {
-	if c.remote.peer {
+	if c.remote.peer || c.detached {
 		return RelationPeer
 	}
 	return RelationSubsession
@@ -424,9 +551,16 @@ func (c *callState) callee(ctx context.Context, t *task) error {
 // context that outlives the call by at most [CancelTimeout], and the
 // record says the stop was asked for, not that the work stopped.
 func (c *callState) leave(ctx context.Context, out *outcome) {
-	if c.remote.peer {
+	if c.relation() == RelationPeer {
 		return
 	}
+	c.stop(ctx, out)
+}
+
+// stop sends tasks/cancel for each task the call leaves unfinished, as
+// leave does, whatever the callee's relation: a detached call's task,
+// a peer's, is stopped so when the parent's run is aborted.
+func (c *callState) stop(ctx context.Context, out *outcome) {
 	c.seen(out)
 	for _, t := range c.tasks {
 		if t.cancelled || !t.running || t.state.Terminal() {
@@ -455,12 +589,21 @@ func (c *callState) leave(ctx context.Context, out *outcome) {
 // [TaskInfo.RecordErr].
 func (r *remote) send(ctx context.Context, call agenttool.Call, params *a2a.MessageSendParams, out *outcome, c *callState) error {
 	if r.blocking {
+		if c.detached {
+			// The send returns once the task exists (A2A §3.2.2), and the
+			// task is followed by tasks/get (§3.1.7).
+			params.Config = &a2a.MessageSendConfig{Blocking: new(bool)}
+		}
 		res, err := r.client.SendMessage(ctx, params)
 		if err != nil {
 			return fmt.Errorf("a2a: %w", err)
 		}
 		final := out.absorb(res)
-		return out.recorded(c.report(ctx, out), final)
+		if err := out.recorded(c.report(ctx, out), final); err != nil || final || !c.detached || out.taskID == "" {
+			return err
+		}
+		c.start(out)
+		return r.poll(ctx, out, c)
 	}
 	for ev, err := range r.client.SendStreamingMessage(ctx, params) {
 		if err != nil {
@@ -473,7 +616,8 @@ func (r *remote) send(ctx context.Context, call agenttool.Call, params *a2a.Mess
 		if final {
 			break
 		}
-		if _, ok := ev.(*a2a.TaskArtifactUpdateEvent); ok {
+		c.start(out)
+		if _, ok := ev.(*a2a.TaskArtifactUpdateEvent); ok && !c.detached {
 			call.Update(agenttool.Text(out.progress()))
 		}
 	}
@@ -481,6 +625,38 @@ func (r *remote) send(ctx context.Context, call agenttool.Call, params *a2a.Mess
 		return fmt.Errorf("a2a: %w", err)
 	}
 	return nil
+}
+
+// start tells a detached call's Execute, once, that the remote agent
+// named a task it has not finished, so the call returns.
+func (c *callState) start(out *outcome) {
+	if c.started == nil || out.taskID == "" {
+		return
+	}
+	started := c.started
+	c.started = nil
+	started(out.info())
+}
+
+// poll follows a task a non-blocking send left unfinished with
+// tasks/get, every [WithPollInterval], until it is final or waits on
+// input.
+func (r *remote) poll(ctx context.Context, out *outcome, c *callState) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("a2a: %w", ctx.Err())
+		case <-time.After(r.pollInterval):
+		}
+		task, err := r.client.GetTask(ctx, &a2a.TaskQueryParams{ID: out.taskID})
+		if err != nil {
+			return fmt.Errorf("a2a: %w", err)
+		}
+		final := out.absorb(task)
+		if err := out.recorded(c.report(ctx, out), final); err != nil || final {
+			return err
+		}
+	}
 }
 
 // recorded applies a failure to write the [Callee] record: it fails the
@@ -609,9 +785,28 @@ func (o *outcome) text() string {
 	return b.String()
 }
 
+// info is the [TaskInfo] of the task as last seen.
+func (o *outcome) info() TaskInfo {
+	return TaskInfo{TaskID: o.taskID, ContextID: o.contextID, State: o.state, RecordErr: o.recordErr}
+}
+
+// task is the task as last seen, for a detached call's end: its state,
+// its status message, or the agent's closing message when the agent
+// answered with a message, and its artifacts; nil when the agent named
+// no task.
+func (o *outcome) task() *a2a.Task {
+	if o.taskID == "" && o.message == nil {
+		return nil
+	}
+	status := o.status
+	if o.message != nil {
+		status = o.message
+	}
+	return &a2a.Task{ID: o.taskID, ContextID: o.contextID, Status: a2a.TaskStatus{State: o.state, Message: status}, Artifacts: o.artifacts}
+}
+
 func (o *outcome) result() (agenttool.Result, error) {
-	details := TaskInfo{TaskID: o.taskID, ContextID: o.contextID, State: o.state, RecordErr: o.recordErr}
-	res := agenttool.Result{Details: details}
+	res := agenttool.Result{Details: o.info()}
 	if o.message != nil && o.state == "" {
 		// A bare message reply, no task.
 		res.Output = output(o.text(), o.fileParts())
