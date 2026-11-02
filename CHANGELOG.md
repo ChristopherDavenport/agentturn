@@ -297,6 +297,17 @@ versions may break the API.
   refused with `ErrCannotContinue`. `Recorder.Requeue` returns, beside
   the count, whether a delivery is among what it handed back. (#244)
 
+- Fixed: a delivery the agent refuses leaves nothing owed. `Agent.Deliver`
+  refuses during a `WhileIdle` hold with the new `ErrHeld` (still
+  `ErrRunning` to `errors.Is`), and `State.Held` says a hold is in
+  force; `Recorder.Deliver` writes no `queued` entry then, and an input
+  whose entry was written before the agent refused it, or before a
+  write failed, is neither handed back by `Requeue` nor written again
+  after the next run end. Before, it was owed after every run end and
+  delivered again after a restart, twice when the caller had retried.
+  `Recorder.Queue` does the same for a refused queue. `front/control`
+  carries `held` on the state. (#244)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

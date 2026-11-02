@@ -182,3 +182,58 @@ func TestAnOwedDeliveryStartsTheRunThatTakesIt(t *testing.T) {
 	}
 	verifyAll(t, s)
 }
+
+// TestARefusedDeliveryLeavesNothingOwed pins Recorder.Deliver's side of
+// #244: a delivery the agent refuses, held idle by WhileIdle, writes no
+// queued entry, so nothing is owed for it: not after the next run's end,
+// and not after a restart, where a retry the caller made already
+// delivered it once.
+func TestARefusedDeliveryLeavesNothingOwed(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1}
+	a := agentturn.New(cfg)
+	unsub := rec.Attach(a)
+	if err := a.WhileIdle(func() error {
+		_, _, err := rec.Deliver(ctx, a, openresponses.UserText("the build passed"))
+		if !errors.Is(err, agentturn.ErrRunning) {
+			t.Errorf("a delivery during the hold: err = %v, want ErrRunning", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The caller retries once the hold is over, and the run takes it.
+	if _, _, err := rec.Deliver(ctx, a, openresponses.UserText("the build passed")); err != nil {
+		t.Fatal(err)
+	}
+	unsub()
+	n := 0
+	for _, e := range s.Entries() {
+		if _, ok := e.(*agentsession.QueuedEntry); ok {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("%d queued entries, want the retry's alone", n)
+	}
+
+	rec, s, err = Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts, err := AgentOptions(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := agentturn.New(cfg, opts...)
+	defer rec.Attach(b)()
+	if n, _ := rec.Requeue(ctx, b); n != 0 {
+		t.Errorf("Requeue handed back %d inputs after the restart, want none", n)
+	}
+	verifyAll(t, s)
+}

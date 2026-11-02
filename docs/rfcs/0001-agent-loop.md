@@ -1299,7 +1299,11 @@ with nothing else to start a run is the host's to start one for, as
 the delivery would have, with a continue. A recorder
 offers a delivery that writes the `queued` entry before the agent
 accepts the input, as it does for a queue, so a delivery that arrives
-while the agent waits on an approval survives a quit (#244).
+while the agent waits on an approval survives a quit (#244). An input
+the agent refuses, held idle, MUST leave nothing owed: the recorder
+writes no entry for it when it can tell the agent will refuse, and
+otherwise neither hands it back nor writes it again after the next
+run end.
 
 A steered item is appended with its own item events. A subscriber that
 steers in reaction to an event the steered item itself produces feeds
@@ -1656,7 +1660,7 @@ maps onto it as follows:
 | low-level loop | `Run(ctx, t, prompts, cfg)`, `Continue(ctx, t, cfg)` → `iter.Seq[Event]`; `EventBuffer`; `CanContinue` |
 | delivery a control offers | `Deliverer`, which `*Agent` and `front/control`'s `Client` implement; `front/control` serves it as `POST /deliver`, `ErrNoDelivery` when the control offers none |
 | agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`, `WithPending`, `SetPending`, `WithReservedCallIDs`, `ReserveCallIDs`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Deliver`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `WhileIdle`, `State`, `SetConfig`, `SetTranscript`, `SetReasoningModels`, `Config` |
-| refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning`, `ErrAmbiguousCall`, `ErrCallAnswered`, `ErrTriggerExtra` (`Trigger.Validate`) |
+| refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning` (`ErrHeld` for a delivery during a hold, `State.Held`), `ErrAmbiguousCall`, `ErrCallAnswered`, `ErrTriggerExtra` (`Trigger.Validate`) |
 | run ID, turn, trigger, transcript on the context | `ContextWithRunID`/`RunIDFromContext`, `ContextWithTurn`/`TurnFromContext`, `ContextWithTrigger`/`TriggerFromContext`, `ContextWithTranscript`/`TranscriptFromContext`, `ContextWithReservedCallIDs` |
 | run context, steer signal | `RunContext(ctx)`, `Steered(ctx)` |
 | source | `Source`: `SourceInput`, `SourceResume` |

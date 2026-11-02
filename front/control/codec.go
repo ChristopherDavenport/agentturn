@@ -1026,11 +1026,12 @@ type wireState struct {
 	Steered    json.RawMessage `json:"steered,omitempty"`
 	Queued     json.RawMessage `json:"queued,omitempty"`
 	Pending    []wirePending   `json:"pending,omitempty"`
+	Held       bool            `json:"held,omitempty"`
 	Notes      []wireNote      `json:"notes,omitempty"`
 }
 
 func stateOut(s agentturn.State) (wireState, error) {
-	w := wireState{Running: s.Running, RunID: s.RunID, Turn: s.Turn, Steering: s.Steering, FollowUps: s.FollowUps}
+	w := wireState{Running: s.Running, RunID: s.RunID, Turn: s.Turn, Steering: s.Steering, FollowUps: s.FollowUps, Held: s.Held}
 	var err error
 	if w.Transcript, err = itemsOut(s.Transcript); err != nil {
 		return w, err
@@ -1049,7 +1050,7 @@ func stateOut(s agentturn.State) (wireState, error) {
 }
 
 func stateIn(w wireState) (agentturn.State, error) {
-	s := agentturn.State{Running: w.Running, RunID: w.RunID, Turn: w.Turn, Steering: w.Steering, FollowUps: w.FollowUps}
+	s := agentturn.State{Running: w.Running, RunID: w.RunID, Turn: w.Turn, Steering: w.Steering, FollowUps: w.FollowUps, Held: w.Held}
 	var err error
 	if s.Transcript, err = itemsIn(w.Transcript); err != nil {
 		return s, err

@@ -1163,6 +1163,10 @@ type inboxItem struct {
 	// awaiting is set while an input Requeue handed back waits for its
 	// queued event, which then writes nothing: the path holds it.
 	awaiting bool
+	// declined is set for an input whose entry was written and which
+	// the agent then refused: nobody holds it, Requeue does not hand it
+	// back, and the next run end drops it.
+	declined bool
 }
 
 // heldReport is a queued report of an observed child that named no
@@ -2999,8 +3003,13 @@ func (r *Recorder) Queue(ctx context.Context, a *agentturn.Agent, mode agentturn
 			return err
 		}
 		// The trigger was checked above, so the agent does not refuse
-		// it.
-		_ = a.Queue(ctx, mode, item)
+		// it; should it, the input is the caller's again.
+		if err := a.Queue(ctx, mode, item); err != nil {
+			r.mu.Lock()
+			decline([]*inboxItem{in})
+			r.mu.Unlock()
+			return err
+		}
 	}
 	return nil
 }
@@ -3019,6 +3028,11 @@ func (r *Recorder) Deliver(ctx context.Context, a *agentturn.Agent, items ...ope
 	if err != nil {
 		return false, nil, err
 	}
+	if a.State().Held {
+		// The agent would refuse it before queueing anything: nothing
+		// is written, so nothing is owed for an input nobody took.
+		return false, nil, agentturn.ErrHeld
+	}
 	r.mu.Lock()
 	n := len(r.root.inbox)
 	for _, item := range items {
@@ -3028,17 +3042,34 @@ func (r *Recorder) Deliver(ctx context.Context, a *agentturn.Agent, items ...ope
 		base, _ := agentturn.Unhide(item)
 		r.root.inbox = append(r.root.inbox, &inboxItem{item: base, mode: agentsession.ModeSteer, deliver: true, held: true, awaiting: true, trigger: trigger.Clone()})
 	}
+	added := slices.Clone(r.root.inbox[n:])
 	if err := r.root.requeue(context.WithoutCancel(ctx)); err != nil {
-		// The entries written stay on the path, owed, as a crash would
-		// leave them; the agent holds none of the items.
-		for _, in := range r.root.inbox[n:] {
-			in.held, in.awaiting = false, false
-		}
+		// The entries written stay on the path until the next run end
+		// closes them; the agent holds none of the items, and a caller
+		// that retries delivers them anew.
+		decline(added)
 		r.mu.Unlock()
 		return false, nil, err
 	}
 	r.mu.Unlock()
-	return a.Deliver(ctx, items...)
+	joined, end, err := a.Deliver(ctx, items...)
+	if errors.Is(err, agentturn.ErrHeld) {
+		// A hold began after the check: the agent took nothing.
+		r.mu.Lock()
+		decline(added)
+		r.mu.Unlock()
+	}
+	return joined, end, err
+}
+
+// decline marks inputs whose entries were written and which the agent
+// did not take: nobody holds them, Requeue does not hand them back, and
+// the next run end drops them. A process that dies before that end
+// leaves them owed on the path, which a restart reads as owed.
+func decline(ins []*inboxItem) {
+	for _, in := range ins {
+		in.held, in.awaiting, in.declined = false, false, true
+	}
 }
 
 // Requeue hands the agent the inputs the session owes, the ones queued
@@ -3066,7 +3097,7 @@ func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) (n int, deli
 	r.mu.Lock()
 	var owed []*inboxItem
 	for _, in := range r.root.inbox {
-		if !in.held && in.entry != "" {
+		if !in.held && !in.declined && in.entry != "" {
 			in.held, in.awaiting = true, true
 			owed = append(owed, in)
 		}

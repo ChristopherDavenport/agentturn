@@ -19,6 +19,11 @@ var (
 	// ErrRunning is returned when Prompt, Continue, Resume, SetConfig or
 	// SetTranscript is called while a run is active.
 	ErrRunning = errors.New("agentturn: agent is already running")
+	// ErrHeld is [ErrRunning] for an agent held idle by
+	// [Agent.WhileIdle]: [Agent.Deliver] refuses so before it queues
+	// anything, so a host that wrote the input first knows to take it
+	// back.
+	ErrHeld = fmt.Errorf("%w: it is held idle", ErrRunning)
 	// ErrInputRequired is returned when the last run left calls
 	// unanswered, deferred to the caller or cut off by an abort or a
 	// failure; answer them through [Agent.Resume], or open the next
@@ -445,6 +450,9 @@ type State struct {
 	// transcript. Continue refuses until Resume has answered them, and
 	// Prompt unless it opens with their outputs.
 	Pending []PendingCall
+	// Held is true while [Agent.WhileIdle] holds the agent: no run
+	// starts and [Agent.Deliver] refuses with [ErrHeld].
+	Held bool
 	// Notes are the notes the last run owed after outputs already in the
 	// transcript and could not append ([RunEnd.Notes]), which the next
 	// run appends first.
@@ -465,6 +473,7 @@ func (a *Agent) State() State {
 		Steered:    queuedItems(a.steer),
 		Queued:     queuedItems(a.followUp),
 		Pending:    append([]PendingCall(nil), a.pending...),
+		Held:       a.held,
 		Notes:      slices.Clone(a.notes),
 	}
 }
@@ -1469,7 +1478,7 @@ func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joine
 		// whatever the hold made of the agent: refused before anything
 		// is queued.
 		a.mu.Unlock()
-		return false, nil, ErrRunning
+		return false, nil, ErrHeld
 	}
 	drains, before := a.drains, len(a.steer)
 	a.queue(TriggerFromContext(ctx), QueueSteer, InputDeliver, items)
