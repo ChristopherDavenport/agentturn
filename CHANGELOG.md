@@ -183,13 +183,15 @@ versions may break the API.
   media is stored with when it is not the store's. (#284)
 
 - Changed: the session recorder no longer encodes the whole transcript
-  several times a turn. It keeps each recorded item's canonical JSON
-  and builds a turn's request hash from those bytes, matches an item
-  the request carries by identity before encoding it, keeps the
-  request's settings without its input for the retry comparison, and
-  leaves the input out before it builds a config entry. A turn's
-  recording cost is its settings, its new items and one SHA-256 pass
-  over the cached bytes. (#282)
+  several times a turn. It keeps the canonical JSON of each item as it
+  recorded it, encodes each item a request carries at most once a turn
+  and compares the two, builds the request hash from those bytes, keeps
+  the request's settings without its input for the retry comparison,
+  and leaves the input out before it builds a config entry. An item a
+  hook edits in place after it was recorded is compared and hashed as
+  it was sent, never as the bytes recorded before the edit. The kept
+  bytes of items a fold or an `omit` takes out of the context are let
+  go. (#282)
 
 - Added: `Agent.WhileIdle(fn)`, which runs fn while no run is active
   and refuses every run start until fn returns, the check one step with

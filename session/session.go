@@ -4443,8 +4443,9 @@ func (w *writer) hash(req openresponses.Request) (string, agentsession.Omit, *Un
 	if !ok {
 		return "", omit, &Unhashed{Reason: "the last fold recorded keeps more items than the recorder holds"}, nil
 	}
-	if !w.matches(req.Input, expected) {
-		described, got, ok := w.describe(req.Input, req.Model)
+	sent := newSentInput(req.Input)
+	if !w.matches(sent, expected) {
+		described, _, ok := w.describe(sent, req.Model)
 		if !ok {
 			items := make(openresponses.Items, len(expected))
 			for k, r := range expected {
@@ -4452,13 +4453,13 @@ func (w *writer) hash(req openresponses.Request) (string, agentsession.Omit, *Un
 			}
 			return "", omit, divergence(req.Input, items), nil
 		}
-		omit, expected = described, got
+		omit = described
 	}
 	// The input matches the one the path rebuilds, so the request is
 	// hashed with that input, item for item as the path holds it: in a
 	// sidecar session with each sidecar: URL as the item records it,
 	// which is the form a reader rebuilds (#284).
-	hash, err := w.hashOf(req, expected)
+	hash, err := w.hashOf(req, sent)
 	return hash, omit, nil, err
 }
 
@@ -4656,9 +4657,27 @@ func (w *writer) settle(ctx context.Context, req openresponses.Request, want age
 		// and parts it put in force by.
 		entry.ID = id
 		w.settings = w.settings.Apply(entry)
+		if entry.Omit != nil {
+			w.forgetLeftOut()
+		}
 	}
 	w.wroteConfig = true
 	return nil
+}
+
+// forgetLeftOut lets go of the kept bytes of the items the omit in force
+// leaves out, which no request carries while it stays in force; one sent
+// again is encoded afresh.
+func (w *writer) forgetLeftOut() {
+	listed := idSet(w.settings.Omit.Items)
+	if len(listed) == 0 {
+		return
+	}
+	for i, id := range w.items {
+		if listed[id] && !w.meta[i].folded {
+			w.meta[i].canon = nil
+		}
+	}
 }
 
 // instructionParts asks the host for the parts of req's instructions
@@ -4882,6 +4901,9 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 	if recorded != item {
 		meta.recorded = recorded
 	}
+	// The bytes the entry holds, kept now: the loop shares the item, and
+	// an edit in place later is not what the record says was sent.
+	meta.canon, _ = canonicalValue(recorded)
 	w.meta = append(w.meta, meta)
 	model := ""
 	if _, ok := item.(*openresponses.ReasoningItem); ok && responseID != "" {
@@ -5517,6 +5539,14 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 		recorded = append(recorded, r)
 	}
 	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned, w.foldRecorded, w.foldCanon = true, split, f.Summary, f.Pinned, recorded, nil
+	w.foldCanon = make([][]byte, len(recorded))
+	for k, item := range recorded {
+		w.foldCanon[k], _ = canonicalValue(item)
+	}
+	// The items folded away are compared with nothing again.
+	for i := 0; i < split && i < len(w.meta); i++ {
+		w.meta[i].canon = nil
+	}
 	entry := &agentsession.CompactionEntry{
 		FirstKept:    w.items[split],
 		Summary:      recorded[0],

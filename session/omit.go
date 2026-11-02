@@ -58,7 +58,7 @@ func (w *writer) rebuild(model string, omit agentsession.Omit) ([]rebuiltItem, b
 			if r.at < 0 || w.meta[r.at].folded || !outs[w.items[r.at]] {
 				continue
 			}
-			if o, ok := r.item.(*openresponses.FunctionCallOutput); ok {
+			if o, ok := w.recordedItem(r.at).(*openresponses.FunctionCallOutput); ok {
 				out[k].item, out[k].orig = outputPlaceholder(o, omit.Outputs.Text), nil
 			}
 		}
@@ -99,7 +99,7 @@ func (w *writer) rebuild(model string, omit agentsession.Omit) ([]rebuiltItem, b
 			n++
 		}
 		if len(replace) > 0 {
-			out[k].item, out[k].orig = withPlaceholders(r.item, replace, im.Placeholder), nil
+			out[k].item, out[k].orig = withPlaceholders(w.recordedItem(r.at), replace, im.Placeholder), nil
 		}
 	}
 	return out, true
@@ -119,11 +119,12 @@ func (w *writer) foldHead() []rebuiltItem {
 	return out
 }
 
-// canon returns the canonical JSON of r's item, the form the request
-// hash covers, kept with the writer's item for the next request when r
-// is one as the path holds it, so an item is encoded once while it
-// stays in the context rather than at every turn (#282). A fold's
-// summary and pins are kept until the next fold.
+// canon returns the canonical JSON of r's item as the path holds it:
+// for an item as recorded, the bytes kept when it was written, so an
+// item the loop or a hook edits in place afterwards is compared with
+// what the record holds rather than with itself; for an item a
+// placeholder edited, encoded now. A seeded item, which nothing else
+// holds, is encoded the first time it is asked for.
 func (w *writer) canon(r rebuiltItem) ([]byte, bool) {
 	if r.orig == nil {
 		return canonicalValue(r.item)
@@ -149,19 +150,61 @@ func (w *writer) canon(r rebuiltItem) ([]byte, bool) {
 	return *slot, true
 }
 
-// hashOf is the request hash of req with input, the input the path
-// rebuilds, as [requestHashOf] computes it from each item's kept
-// canonical form.
-func (w *writer) hashOf(req openresponses.Request, input []rebuiltItem) (string, error) {
-	canon := make([][]byte, len(input))
-	for k, r := range input {
-		c, ok := w.canon(r)
+// sentInput is a request's input as the writer compares and hashes it:
+// each item in the form the session records it, encoded at most once a
+// turn and only when asked for, so the hash always covers what was
+// sent, an item edited in place since it was recorded included (#282).
+type sentInput struct {
+	items openresponses.Items
+	canon [][]byte
+	enc   []bool
+}
+
+func newSentInput(items openresponses.Items) *sentInput {
+	return &sentInput{items: items, canon: make([][]byte, len(items)), enc: make([]bool, len(items))}
+}
+
+// canonAt is the canonical JSON of the k-th item sent.
+func (w *writer) canonAt(s *sentInput, k int) ([]byte, bool) {
+	if !s.enc[k] {
+		s.canon[k], _ = canonicalValue(w.recordForm(s.items[k]))
+		s.enc[k] = true
+	}
+	return s.canon[k], s.canon[k] != nil
+}
+
+// hashOf is the request hash of req with the input sent, built by
+// [requestHashOf] from each item's canonical form as the turn encoded
+// it.
+func (w *writer) hashOf(req openresponses.Request, sent *sentInput) (string, error) {
+	canon := make([][]byte, len(sent.items))
+	for k := range sent.items {
+		c, ok := w.canonAt(sent, k)
 		if !ok {
 			return "", fmt.Errorf("session: encode request item %d", k)
 		}
 		canon[k] = c
 	}
 	return requestHashOf(req, canon)
+}
+
+// recordedItem is the writer's i-th item as its entry holds it: the
+// item itself, unless it was edited in place since it was written, in
+// which case it is decoded from the bytes kept then. What a placeholder
+// stands in for is the recorded item, not the edited one.
+func (w *writer) recordedItem(i int) openresponses.Item {
+	r := w.rebuiltAt(i)
+	kept, ok := w.canon(r)
+	if !ok {
+		return r.item
+	}
+	if now, ok := canonicalValue(r.item); ok && bytes.Equal(now, kept) {
+		return r.item
+	}
+	if item, err := openresponses.UnmarshalItem(kept); err == nil {
+		return item
+	}
+	return r.item
 }
 
 // rebuiltAt is the writer's i-th item as the input the path rebuilds
@@ -186,26 +229,24 @@ func recordedPins(pinned, recorded openresponses.Items) openresponses.Items {
 
 // matches reports whether sent, a request's input, is the input
 // rebuilt, item for item.
-func (w *writer) matches(sent openresponses.Items, rebuilt []rebuiltItem) bool {
-	if len(sent) != len(rebuilt) {
+func (w *writer) matches(sent *sentInput, rebuilt []rebuiltItem) bool {
+	if len(sent.items) != len(rebuilt) {
 		return false
 	}
 	for k, r := range rebuilt {
-		if !w.same(sent[k], r) {
+		if !w.same(sent, k, r) {
 			return false
 		}
 	}
 	return true
 }
 
-// same reports whether sent is the item r: the item the writer holds,
-// by identity, or one that encodes, as the session records it, to what
-// r encodes to.
-func (w *writer) same(sent openresponses.Item, r rebuiltItem) bool {
-	if r.orig != nil && sent == r.orig {
-		return true
-	}
-	have, ok := canonicalValue(w.recordForm(sent))
+// same reports whether the k-th item sent encodes, as the session
+// records it, to what r encodes to as the path holds it. Identity is
+// not enough: an item may have been edited in place since it was
+// recorded.
+func (w *writer) same(sent *sentInput, k int, r rebuiltItem) bool {
+	have, ok := w.canonAt(sent, k)
 	if !ok {
 		return false
 	}
@@ -223,7 +264,7 @@ func (w *writer) same(sent openresponses.Item, r rebuiltItem) bool {
 // config delta carries, and then for one that starts afresh, which only
 // a replace does. A setting it finds is checked by rebuilding the input
 // under it, so what it returns is one the path rebuilds sent from.
-func (w *writer) describe(sent openresponses.Items, model string) (agentsession.Omit, []rebuiltItem, bool) {
+func (w *writer) describe(sent *sentInput, model string) (agentsession.Omit, []rebuiltItem, bool) {
 	base := w.omitFor(model)
 	if want, got, ok := w.describeOver(sent, model, base); ok {
 		return want, got, true
@@ -232,7 +273,8 @@ func (w *writer) describe(sent openresponses.Items, model string) (agentsession.
 }
 
 // describeOver is describe for a setting that adds to base.
-func (w *writer) describeOver(sent openresponses.Items, model string, base agentsession.Omit) (agentsession.Omit, []rebuiltItem, bool) {
+func (w *writer) describeOver(in *sentInput, model string, base agentsession.Omit) (agentsession.Omit, []rebuiltItem, bool) {
+	sent := in.items
 	from, j := 0, 0
 	if w.foldSet {
 		if w.foldSplit > len(w.values) {
@@ -246,7 +288,7 @@ func (w *writer) describeOver(sent openresponses.Items, model string, base agent
 			return agentsession.Omit{}, nil, false
 		}
 		for k, r := range head {
-			if !w.same(sent[k], r) {
+			if !w.same(in, k, r) {
 				return agentsession.Omit{}, nil, false
 			}
 		}
@@ -272,7 +314,7 @@ func (w *writer) describeOver(sent openresponses.Items, model string, base agent
 		if w.meta[i].folded {
 			// Items a compaction contributes, seeded from a path that
 			// holds it, are the fold's summary and pins.
-			if j < len(sent) && w.same(sent[j], w.rebuiltAt(i)) {
+			if j < len(sent) && w.same(in, j, w.rebuiltAt(i)) {
 				j++
 				continue
 			}
@@ -282,13 +324,15 @@ func (w *writer) describeOver(sent openresponses.Items, model string, base agent
 			continue
 		}
 		at := w.rebuiltAt(i)
-		rec, orig := at.item, at.orig
+		at.item = w.recordedItem(i)
+		rec := at.item
 		out, isOutput := rec.(*openresponses.FunctionCallOutput)
 		if isOutput && outs[w.items[i]] {
-			rec, orig = outputPlaceholder(out, outText), nil
+			rec = outputPlaceholder(out, outText)
+			at = rebuiltItem{item: rec, at: i}
 		}
 		if j < len(sent) {
-			if w.same(sent[j], rebuiltItem{item: rec, orig: orig, at: i}) {
+			if w.same(in, j, at) {
 				if !isOutput || !outs[w.items[i]] {
 					images = append(images, make([]bool, len(imageParts(rec)))...)
 				}
@@ -341,7 +385,7 @@ func (w *writer) describeOver(sent openresponses.Items, model string, base agent
 		want.Images = base.Images
 	}
 	got, ok := w.rebuild(model, want)
-	if !ok || !w.matches(sent, got) {
+	if !ok || !w.matches(in, got) {
 		return agentsession.Omit{}, nil, false
 	}
 	return want, got, true
