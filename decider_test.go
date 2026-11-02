@@ -97,3 +97,31 @@ func TestAnAnswerIsByTheDeciderItNames(t *testing.T) {
 		})
 	}
 }
+
+// TestAToolsQuestionRefusesAnUnknownDecider pins agenttool RFC 0001's
+// MUST for a tool's own question: an answer naming a decider the
+// session format does not know is refused, the tool getting the
+// harness's failure, and its note never reaches the model.
+func TestAToolsQuestionRefusesAnUnknownDecider(t *testing.T) {
+	var got agenttool.Answer
+	var askErr error
+	confirm := agenttool.New("confirm", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		elicit, _ := agenttool.ElicitorFrom(ctx)
+		got, askErr = elicit(ctx, agenttool.Elicitation{Message: "go ahead?"})
+		return "asked", nil
+	})
+	answer := func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+		return agenttool.Answer{Action: agenttool.ActionAccept, Note: "only go.mod", By: "system"}, nil
+	}
+	cfg := Config{Model: callsNamed{names: []string{"confirm"}}, Tools: []agenttool.Tool{confirm}, ToolElicitor: answer, MaxTurns: 1}
+	_, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if askErr == nil || !strings.Contains(askErr.Error(), "unknown decider") || got.Action == agenttool.ActionAccept {
+		t.Errorf("the tool got %+v, %v; want the answer refused", got, askErr)
+	}
+	if msgs := strings.Join(texts(end.Items), "|"); msgs != "user: x" {
+		t.Errorf("messages = %q, want no note from a refused answer", msgs)
+	}
+}

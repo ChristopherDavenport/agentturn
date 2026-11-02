@@ -89,13 +89,12 @@ func Ask(ctx context.Context, call AskedCall) (*ToolDecision, bool) {
 	// The answer names its decider; one that names nobody is the
 	// user's. A name the format does not know is refused, never read
 	// as the user's.
-	by := ans.By
-	switch by {
-	case "":
-		by = agenttool.ByHuman
-	case agenttool.ByHuman, agenttool.ByPolicy, agenttool.ByAgent:
-	default:
+	if knownDecider(ans.By) != nil {
 		return nil, false
+	}
+	by := ans.By
+	if by == "" {
+		by = agenttool.ByHuman
 	}
 	decided := *call.Decision
 	decided.By = by

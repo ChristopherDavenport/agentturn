@@ -503,6 +503,12 @@ versions may break the API.
   recorded under the wrapper's label while its decision said `policy`.
   (#267)
 
+- Fixed: an answer to a tool's own question that names a decider the
+  session format does not know is refused, as agenttool RFC 0001
+  requires and as `Ask` already did: the tool gets an error, and the
+  note is not said, where it was passed to the tool and its note said
+  as a developer message. (#267)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

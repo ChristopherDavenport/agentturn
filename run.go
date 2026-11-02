@@ -1077,7 +1077,10 @@ type notedKey struct{}
 // noteElicitor wraps the elicitor a run's tools ask through so that what
 // the answerer says answering a tool's own question reaches the model,
 // after the outputs of the call's batch, in its voice ([answerNoteItem]):
-// the tool may not pass it on. A question [Ask] puts about a call
+// the tool may not pass it on. An answer naming a decider the session
+// format does not know is refused, as agenttool RFC 0001 requires: the
+// tool gets an error, the harness failing to ask, and the note is not
+// said. A question [Ask] puts about a call
 // carries its note on the decision instead. A run inside a tool, a
 // child agent's, wraps the elicitor it finds on its context, its
 // parent's, so the note goes to the run whose tool asked: the
@@ -1089,7 +1092,15 @@ func (r *runner) noteElicitor(elicit agenttool.Elicitor) agenttool.Elicitor {
 			ctx = context.WithValue(ctx, notedKey{}, true)
 		}
 		ans, err := elicit(ctx, q)
-		if err != nil || ans.Note == "" || !mine {
+		if err != nil {
+			return ans, err
+		}
+		if err := knownDecider(ans.By); err != nil {
+			// Refused, never read as anyone's: the tool meets the
+			// harness failing to ask.
+			return agenttool.Answer{}, err
+		}
+		if ans.Note == "" || !mine {
 			return ans, err
 		}
 		if _, asked := AskedCallFrom(ctx); asked {
@@ -1103,6 +1114,16 @@ func (r *runner) noteElicitor(elicit agenttool.Elicitor) agenttool.Elicitor {
 		}
 		return ans, err
 	}
+}
+
+// knownDecider refuses a decider an answer names that the session
+// format does not know; empty names nobody, the user.
+func knownDecider(by string) error {
+	switch by {
+	case "", agenttool.ByHuman, agenttool.ByPolicy, agenttool.ByAgent:
+		return nil
+	}
+	return fmt.Errorf("agentturn: the answer names an unknown decider %q: an answer is by human, policy or agent, or names nobody", by)
 }
 
 // saidBy is how a note given with an answer reads to the model, named
