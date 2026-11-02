@@ -447,19 +447,34 @@ func ContextWithRequest(ctx context.Context, req openresponses.Request) context.
 }
 
 // RequestFromContext returns the settings [ContextWithRequest] attached
-// to ctx, and whether there were any. The request is a copy, its tool
-// list and maps included, so a transform reads it and changes nothing
-// the loop sends.
+// to ctx, and whether there were any. The request is a copy, each tool
+// definition, the include list and the maps included, so a transform
+// reads it and changes nothing the loop sends.
 func RequestFromContext(ctx context.Context) (openresponses.Request, bool) {
 	req, ok := ctx.Value(requestKey{}).(openresponses.Request)
 	if !ok {
 		return openresponses.Request{}, false
 	}
-	req.Tools = slices.Clone(req.Tools)
+	req.Tools = cloneTools(req.Tools)
 	req.Include = slices.Clone(req.Include)
 	req.Metadata = maps.Clone(req.Metadata)
 	req.Extra = maps.Clone(req.Extra)
 	return req, true
+}
+
+// cloneTools returns a copy of tools that shares nothing with it, each
+// definition decoded again from its wire form.
+func cloneTools(tools openresponses.Tools) openresponses.Tools {
+	if tools == nil {
+		return nil
+	}
+	data, err := json.Marshal(tools)
+	var out openresponses.Tools
+	if err != nil || json.Unmarshal(data, &out) != nil {
+		// A definition that does not round-trip is shared, as given.
+		return slices.Clone(tools)
+	}
+	return out
 }
 
 type foldRequestKey struct{}
@@ -1684,18 +1699,19 @@ func (r *runner) inputFor(model string, filtered Transcript) openresponses.Items
 	return r.quarantine.apply(r.reasoning.For(model, filtered))
 }
 
-// sameItems reports whether a and b hold the very same items, in order:
-// one pointer, or an equal value; an item of a type that cannot be
-// compared, as an extension's may be, is compared by its contents.
+// sameItems reports whether a and b hold the same items, in order: the
+// very items, or items alike in every member, such as the placeholder
+// the quarantine makes afresh for one output on every request, so a
+// request rebuilt to the same content reads as unchanged.
 func sameItems(a, b openresponses.Items) bool {
 	return slices.EqualFunc(a, b, func(x, y openresponses.Item) bool {
 		if x == nil || y == nil || reflect.TypeOf(x) != reflect.TypeOf(y) {
 			return x == nil && y == nil
 		}
-		if !reflect.TypeOf(x).Comparable() {
-			return reflect.DeepEqual(x, y)
+		if reflect.TypeOf(x).Comparable() && x == y {
+			return true
 		}
-		return x == y
+		return reflect.DeepEqual(x, y)
 	})
 }
 
