@@ -78,6 +78,24 @@ type Config struct {
 	//		_ = remote.Await(ctx)
 	//		return remote.Tools()
 	//	}
+	//
+	// The loop never closes what a provider returns: io.Closer on a
+	// tool is the host's, and a provider is called once per turn. A
+	// provider that builds tools owning anything, a pty, a container
+	// client or a pool, is responsible for releasing them, and should
+	// build them once per session and return the same values on each
+	// turn rather than a new set per turn, closing them when the
+	// session ends:
+	//
+	//	var built []agenttool.Tool
+	//	cfg.ToolProvider = func(ctx context.Context) []agenttool.Tool {
+	//		if built == nil {
+	//			built = tools.Builtins(ws)
+	//		}
+	//		return built
+	//	}
+	//	// … and when the session ends:
+	//	_ = agenttool.Set(built).Close()
 	ToolProvider func(ctx context.Context) []agenttool.Tool
 
 	// Reasoning is the reasoning field of every request: effort and

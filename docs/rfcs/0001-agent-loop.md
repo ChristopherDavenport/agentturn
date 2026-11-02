@@ -224,8 +224,10 @@ itself, bounded by its context. A set of tools MUST have distinct
 names; a fixed list is checked once before the run and a provided list
 once per turn, and a duplicate refuses the run or fails the run. The
 loop never closes a tool: close belongs to the host, as agenttool RFC
-0001 says, and a provider that builds tools per turn is responsible for
-what it built (#95).
+0001 says. A provider is called once per turn, and a provider that
+builds tools owning a resource is responsible for releasing them; it
+SHOULD build them once per session and return the same values on each
+turn (#95).
 
 A configuration MAY be replaced between runs. The transcript is kept,
 so the next run continues the same conversation under other
@@ -1762,10 +1764,6 @@ the scenario, fixed without a change of rule.
   parent's and the nested call's position, or letting the invoking
   tool pass one, are the options.
 
-- **Who closes a provided tool** (#95). The host closes what it built,
-  and under a tool provider the host never holds the value. Documenting
-  that a provider caches per session, or a release hook called after
-  each turn, are the options.
 - **The stop decision as data** (#82). A guard stop is an error
   wrapping a sentinel, and a hook that returns a bare error records a
   failure and is retried by a supervisor that honours policy stops.
