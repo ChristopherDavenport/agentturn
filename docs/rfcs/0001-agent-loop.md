@@ -548,7 +548,12 @@ error event the server sends before the answer opens does not commit:
 it is a failed attempt like a cut stream, and the retry policy sees
 the wire error itself; one sent after the answer opened is final. A
 committed attempt MUST NOT be retried, because the transcript or a
-recorder may already hold part of it. An item the model completes
+recorder may already hold part of it. A model call that fails with an
+error marked as a guard's, as a moderation layer around the model marks
+its refusal, is a guard stop whether or not the attempt committed: it
+MUST NOT be retried, the calls the stream completed before it are
+answered as a withheld response's are, with the fixed text, and the
+run stops with cause `guard` and the error on the end event (#275). An item the model completes
 before the attempt commits — the reasoning summary a reasoning model
 writes before its first token — is **held**: it reaches the consumer as
 `item_start` and `item_update`, so a front renders it live, and it is
@@ -706,7 +711,7 @@ with the call on the context, and the start callback that raises
 `tool_dispatch`.
 
 The context every hook and tool of the batch runs under carries the run
-ID, a snapshot of the working transcript as it stood when the batch
+ID, the turn's number, none for the batch a resume approved, a snapshot of the working transcript as it stood when the batch
 started with the batch's calls included, and the invoker for
 [nested calls](#nested-calls). A tool that composes another agent seeds
 it from the conversation without the host threading anything through.
@@ -730,7 +735,7 @@ calls** with why each is pending.
 | --- | --- |
 | `max_turns` | the turn limit was reached with tools called or items queued; the queued items wait for the next run |
 | `hook` | the stop hook ended the run |
-| `guard` | the stop hook, the before-turn hook, the before-model-call hook or the output guard ended the run with an error marked as a guard's; the error is on the end event. Stopped before the model call, the turn has no `turn_start`; stopped by the output guard, its `response_end` is marked withheld, it has no `turn_end`, the calls the withheld response made are answered with an output of fixed text, and the end is marked withheld, which is no answer |
+| `guard` | the stop hook, the before-turn hook, the before-model-call hook or the output guard ended the run with an error marked as a guard's, or the model call failed with one; the error is on the end event. Stopped before the model call, the turn has no `turn_start`; stopped by the output guard, its `response_end` is marked withheld, it has no `turn_end`, the calls the withheld response made are answered with an output of fixed text, and the end is marked withheld, which is no answer |
 | `terminate` | every result of the batch set the terminate hint |
 | `partial_terminate` | some results of the batch set it and others did not |
 | `refused` | an answer on resume asked the run to end without calling the model |
@@ -1279,9 +1284,12 @@ A layer that must see every turn, a meter for one, belongs in a
 subscriber rather than in the stop hook, which stops at the first hook
 that stops.
 
-The hooks run with the run's context, which carries the run ID and,
-for the decision and after-call hooks, the batch's transcript snapshot
-and the invoker. A hook MUST NOT make a nested call: the decision hook
+The hooks run with the run's context, which carries the run ID, the
+number of the turn in progress for a hook a turn calls, and, for the
+decision and after-call hooks, the batch's transcript snapshot and the
+invoker. The context of everything a run calls, the transform, the
+hooks, the model and the tools, MUST carry the run ID, and within a
+turn the turn's number, the one its events carry (#275). A hook MUST NOT make a nested call: the decision hook
 takes one call at a time and would wait for itself.
 
 ## Nested calls
@@ -1533,7 +1541,7 @@ maps onto it as follows:
 | low-level loop | `Run(ctx, t, prompts, cfg)`, `Continue(ctx, t, cfg)` → `iter.Seq[Event]`; `EventBuffer`; `CanContinue` |
 | agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`, `WithPending`, `SetPending`, `WithReservedCallIDs`, `ReserveCallIDs`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Deliver`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `State`, `SetConfig`, `SetTranscript`, `Config` |
 | refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning`, `ErrAmbiguousCall`, `ErrCallAnswered`, `ErrTriggerExtra` (`Trigger.Validate`) |
-| run ID, trigger, transcript on the context | `ContextWithRunID`/`RunIDFromContext`, `ContextWithTrigger`/`TriggerFromContext`, `ContextWithTranscript`/`TranscriptFromContext`, `ContextWithReservedCallIDs` |
+| run ID, turn, trigger, transcript on the context | `ContextWithRunID`/`RunIDFromContext`, `ContextWithTurn`/`TurnFromContext`, `ContextWithTrigger`/`TriggerFromContext`, `ContextWithTranscript`/`TranscriptFromContext`, `ContextWithReservedCallIDs` |
 | run context, steer signal | `RunContext(ctx)`, `Steered(ctx)` |
 | source | `Source`: `SourceInput`, `SourceResume` |
 | events | `Event` with `EventType()`; `RunStart`, `TurnStart`, `ModelRetry`, `ModelBlocked`, `ItemStart`, `ItemUpdate`, `ItemEnd`, `ResponseEnd`, `ToolStart`, `ToolDispatch`, `ToolUpdate`, `ToolEnd`, `TurnEnd`, `RunEnd`, `Queued`; the `Event*` name constants |
@@ -1545,7 +1553,7 @@ maps onto it as follows:
 | decision | `ToolDecision{Action, Reason, Terminate, Args, By, Note}`; `ToolAction` (`Allow`, `Block`, `Defer`) |
 | answer | `Answer{CallID, Output, Args, Note, Terminate, By, Reason, Origin, Failed, IdempotencyKey, RunAgain}`; `Output`, `Approve`, `ApproveWith`, `Refuse`, `OutcomeUnknown`, `WithNote`, `WithBy`, `WithReason`, `WithOrigin`, `WithFailed`, `WithIdempotencyKey`, `WithRunAgain`, `RunAgainReason`, `OutcomeUnknownReason`; `ContextWithDeciders`/`DeciderFromContext`, `ContextWithReasons`/`ReasonFromContext`, `ContextWithOrigins`/`OriginFromContext` and `ContextWithFailures`/`FailedFromContext` for a host driving `Run` |
 | hooks | `Config.BeforeTurn`, `BeforeModelCall`, `OutputGuard`, `BeforeToolCall`, `AfterToolCall`, `ShouldStopAfterTurn` |
-| guard stop | an error wrapping `ErrGuard` from `ShouldStopAfterTurn`, `BeforeTurn`, `BeforeModelCall` or `OutputGuard`; the output of a call a withheld response made is `WithheldCallOutput` |
+| guard stop | an error wrapping `ErrGuard` from `ShouldStopAfterTurn`, `BeforeTurn`, `BeforeModelCall`, `OutputGuard` or the model; the output of a call a withheld response made is `WithheldCallOutput` |
 | chains | `ChainBeforeTurn`, `ChainBeforeModelCall`, `ChainOutputGuard`, `ChainBeforeToolCall`, `ChainShouldStopAfterTurn`, `ChainTransform` |
 | nested call | `Invoke(ctx, name, args)`; `ErrNoInvoker`; `Parent` on the tool events |
 | queue mode | `QueueMode`: `QueueSteer`, `QueueFollowUp` |

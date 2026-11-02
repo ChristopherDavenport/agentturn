@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/ChristopherDavenport/agenttool"
@@ -517,5 +518,88 @@ func TestAFailureDuringAnAbortIsReportedOnItsOwn(t *testing.T) {
 	}()
 	if end, _ := quiet.Prompt(context.Background(), openresponses.UserText("go")); end == nil || end.Failure != nil {
 		t.Errorf("end = %+v, want no failure", end)
+	}
+}
+
+// guardingModel fails the call with an error marked as a guard's after
+// its answer has opened, as a provider-side moderation wrapper does,
+// and counts its calls.
+type guardingModel struct{ calls *int }
+
+func (m guardingModel) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	*m.calls++
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("the sec"); err != nil {
+		return err
+	}
+	return fmt.Errorf("moderation: %w", ErrGuard)
+}
+
+// TestAModelErrorMarkedAsAGuardsStops pins RFC 0001's The model call
+// (#275): a model call that fails with an error marked as a guard's is
+// a guard stop, not retried, with the error on the end.
+func TestAModelErrorMarkedAsAGuardsStops(t *testing.T) {
+	calls := 0
+	ag := New(Config{Model: guardingModel{&calls}, Retry: Retry{MaxAttempts: 3, Retryable: func(error) bool { return true }}})
+	end, err := ag.Prompt(context.Background(), openresponses.UserText("go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if end.Reason != ReasonStopped || end.Cause != StopGuard || !errors.Is(end.Err, ErrGuard) {
+		t.Errorf("end = %s/%s %v, want stopped by the guard with its error", end.Reason, end.Cause, end.Err)
+	}
+	if calls != 1 {
+		t.Errorf("the model was called %d times, want once", calls)
+	}
+	if _, ok := end.Answer(); ok {
+		t.Error("a guard's stop answered")
+	}
+}
+
+// TestTheTurnIsOnTheContext pins RFC 0001's Starting a run (#275): the
+// context of everything a turn calls carries the turn number beside
+// the run ID.
+func TestTheTurnIsOnTheContext(t *testing.T) {
+	seen := map[string][]int{}
+	note := func(where string) func(ctx context.Context) {
+		return func(ctx context.Context) { seen[where] = append(seen[where], TurnFromContext(ctx)) }
+	}
+	tool := agenttool.New("upper", "", func(ctx context.Context, a echoArgs) (string, error) {
+		note("tool")(ctx)
+		return upper(ctx, a)
+	})
+	ag := New(Config{
+		Model: &twoCalls{}, Tools: []agenttool.Tool{tool}, MaxTurns: 2,
+		BeforeTurn: func(ctx context.Context, _ TurnStartInfo) (openresponses.Items, error) {
+			note("before turn")(ctx)
+			return nil, nil
+		},
+		BeforeModelCall: func(ctx context.Context, _ *openresponses.Request) error {
+			note("before model call")(ctx)
+			return nil
+		},
+		BeforeToolCall: func(ctx context.Context, _ ToolCallInfo) (*ToolDecision, error) {
+			note("before tool call")(ctx)
+			return nil, nil
+		},
+		ShouldStopAfterTurn: func(ctx context.Context, _ TurnInfo) (bool, error) {
+			note("should stop")(ctx)
+			return false, nil
+		},
+	})
+	if _, err := ag.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
+		t.Fatal(err)
+	}
+	for _, where := range []string{"before turn", "before model call", "before tool call", "tool", "should stop"} {
+		if got := seen[where]; !slices.Equal(got, []int{1, 2}) {
+			t.Errorf("%s saw turns %v, want [1 2]", where, got)
+		}
+	}
+	if n := TurnFromContext(context.Background()); n != 0 {
+		t.Errorf("outside a run: turn %d", n)
 	}
 }

@@ -29,7 +29,9 @@ var (
 	// ErrGuard is what a guard wraps to end the run as a policy stop
 	// rather than a failure: ReasonStopped with StopGuard, the error on
 	// RunEnd.Err. BeforeTurn, BeforeModelCall, OutputGuard and
-	// ShouldStopAfterTurn each read it so.
+	// ShouldStopAfterTurn each read it so, and so does the loop of an
+	// error the model call fails with, which a moderation wrapper around
+	// the model marks: it is not retried.
 	ErrGuard = errors.New("agentturn: guard stopped the run")
 )
 
@@ -210,6 +212,7 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 
 type transcriptKey struct{}
 type runIDKey struct{}
+type turnKey struct{}
 type runContextKey struct{}
 type steeredKey struct{}
 type triggerKey struct{}
@@ -406,6 +409,23 @@ func ContextWithRunID(ctx context.Context, runID string) context.Context {
 func RunIDFromContext(ctx context.Context) string {
 	id, _ := ctx.Value(runIDKey{}).(string)
 	return id
+}
+
+// ContextWithTurn attaches a turn number to ctx. The loop does this
+// with the turn in progress for everything the turn calls, its hooks,
+// the transform, the model and the tools, beside the run ID.
+func ContextWithTurn(ctx context.Context, turn int) context.Context {
+	return context.WithValue(ctx, turnKey{}, turn)
+}
+
+// TurnFromContext returns the number of the turn whose hook, model
+// call or tool call the context belongs to, as the turn's events carry
+// it, or 0 outside a turn: before a run's first turn, in the batch of
+// calls a resume approved, whose events carry turn 0, and outside a
+// loop.
+func TurnFromContext(ctx context.Context) int {
+	turn, _ := ctx.Value(turnKey{}).(int)
+	return turn
 }
 
 // RunContext returns the context of the run a tool call, a hook, the
@@ -1262,6 +1282,9 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 			return stop(ReasonAborted, context.Cause(ctx))
 		}
 		r.turn++
+		// Everything the turn calls can tell which turn it serves.
+		ctx := ContextWithTurn(ctx, r.turn)
+		r.ctx = ctx
 		if r.cfg.BeforeTurn != nil {
 			items, err := r.cfg.BeforeTurn(ctx, TurnStartInfo{RunID: r.runID, Turn: r.turn, Transcript: r.transcript, Inputs: append([]TurnInput(nil), r.arrived...)})
 			if err != nil {
@@ -1554,6 +1577,17 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 		}
 		if ctx.Err() != nil {
 			return nil, stop(ReasonAborted, context.Cause(ctx))
+		}
+		if errors.Is(err, ErrGuard) {
+			// The model, or a wrapper around it, refused the call with
+			// an error marked as a guard's: a policy stop, never retried.
+			// The calls the stream completed before it are closed, as a
+			// withheld response's are, so the transcript is a valid
+			// input for the next run.
+			if err := r.closeWithheld(r.transcript[start:]); err != nil {
+				return nil, err
+			}
+			return nil, stopped(StopGuard, err)
 		}
 		if committed || attempt >= r.cfg.Retry.MaxAttempts || !r.cfg.Retry.retryable(err) {
 			return nil, fmt.Errorf("agentturn: model: %w", err)
