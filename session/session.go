@@ -1557,9 +1557,10 @@ func newWriter(r *Recorder, id string) *writer {
 }
 
 // Start creates a session from h and returns a recorder for it. When
-// h.Records is nil the header promises the run, dispatch, decision and
-// queued records, which this recorder writes whenever their event
-// occurs. A header with no harness takes the one [WithHarness] names,
+// h.Records is nil the header promises the run, dispatch, decision,
+// queued and result records, which this recorder writes whenever their
+// event occurs: a result for every call whose output settles while the
+// rest of its batch runs. A header with no harness takes the one [WithHarness] names,
 // so the root names its writer as every child does; child sessions
 // name h.Harness as their writer unless [WithHarness] says otherwise.
 // The caller keeps store for Sync, Release and Close.
@@ -1579,7 +1580,7 @@ func newWriter(r *Recorder, id string) *writer {
 // [AgentOptions] and [ReplayAnswers] so they read it too.
 func Start(ctx context.Context, store agentsession.Store, h agentsession.Header, opts ...Option) (*Recorder, *agentsession.Session, error) {
 	if h.Records == nil {
-		h.Records = append(append([]string(nil), agentsession.AllRecords...), agentsession.TypeQueued)
+		h.Records = append(append([]string(nil), agentsession.AllRecords...), agentsession.TypeQueued, agentsession.TypeResult)
 	}
 	r := New(store, "", opts...)
 	if h.Harness == nil {
@@ -3693,7 +3694,7 @@ func (r *Recorder) Fold(ctx context.Context, f compact.Fold) error {
 func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, live bool, name string) (*writer, error) {
 	h := agentsession.Header{ParentSession: parent.id, Harness: r.harness, SpawnedBy: callID, CWD: parent.cwd, Media: parent.media}
 	if live {
-		h.Records = append([]string(nil), agentsession.AllRecords...)
+		h.Records = append(append([]string(nil), agentsession.AllRecords...), agentsession.TypeResult)
 	}
 	if callID != "" {
 		h.ID = agentsession.SubsessionID(parent.id, callID)

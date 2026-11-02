@@ -1517,7 +1517,11 @@ run under a named configuration, such as a child the loop-as-a-tool
 runs, MUST carry that name as its display name, an `info` entry before
 the run's first entry, unless the host names the session otherwise; a
 session reopened for a later run keeps the name it has, so a name a
-person set since stands.
+person set since stands. A recorder that writes `result` as the
+`tool_end` row has it SHOULD name `result` in the `records` of every
+session it creates and writes from events, so a reader takes a call
+with a `dispatch`, no `result` and no output as one whose tool had not
+returned when the record stopped.
 
 A recorder that continues a path on which a run is open that it is
 not running owns that run and closes it before it writes anything

@@ -92,6 +92,12 @@ versions may break the API.
   `ErrCallReturned`, so its tool does not run again. A host that
   answers pending calls itself answers a returned call with `Ran`.
   (#273)
+- Changed: the header `session.Start` writes when the caller's names no
+  records, and a child session written from its events, promise `result`
+  as well, since the recorder writes one for every call that settles
+  while the rest of its batch runs: a reader may take a dispatched call
+  with neither a result nor an output as one whose tool had not
+  returned. (#273)
 - Docs: `Config.ToolProvider` says the loop never closes what a
   provider returns, and that a provider building tools that own a
   resource caches them per session and closes them itself; RFC 0001's
