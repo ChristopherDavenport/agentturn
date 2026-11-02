@@ -197,6 +197,17 @@ from it; a session recorder writes it.
   item the filter removes is out of the model's context and a recorder
   writes it as a record entry, never as context. Marking such an item
   hidden adds nothing.
+- An item or content part under a provider's slug, such as Claude's
+  `anthropic.redacted_thinking` block, is the model's output, not a
+  harness's: the filter keeps it and the request carries it as the
+  transcript holds it, for whichever model is configured. Leaving it
+  out for another provider is the adapter's, as openresponses
+  docs/extensions.md section 1.6 says, and not the loop's, so the
+  request and its hash stay what the record rebuilds; a host switching
+  models needs no attribution for it. An adapter that forwards to an
+  upstream it cannot see behind, such as openresponses' `ClientAdapter`,
+  applies that rule only once told which providers' slugs the upstream
+  accepts, so a host configures it so (#285).
 
 ## The configuration
 

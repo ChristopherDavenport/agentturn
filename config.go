@@ -49,6 +49,17 @@ type Config struct {
 	Description string
 
 	// Model streams responses. Required.
+	//
+	// The request carries every item the filter keeps, an item under a
+	// provider's slug such as anthropic.redacted_thinking included, for
+	// whichever model is configured: leaving out another provider's is
+	// the adapter's (openresponses docs/extensions.md section 1.6). The
+	// provider adapters do so. An openresponses.ClientAdapter forwards
+	// every item unless it was built with openresponses.WithProviderSlugs
+	// naming the providers its upstream accepts, so a host whose model
+	// is a provider's own Open Responses API, OpenAI's or a router's,
+	// builds it with WithProviderSlugs() and none, or a conversation
+	// that moves to it from Claude or Gemini is refused (#285).
 	Model Model
 	// ModelName is the model field of every request.
 	ModelName string

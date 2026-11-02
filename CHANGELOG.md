@@ -388,6 +388,16 @@ versions may break the API.
   screenshot no longer folds the transcript at every step. RFC 0001
   The request step 2. (#279)
 
+- Changed: RFC 0001 The transcript says an item under a provider's
+  slug, such as `anthropic.redacted_thinking`, is kept by the filter and
+  sent for whichever model is configured, and that leaving it out for
+  another provider is the adapter's (openresponses v0.0.18,
+  docs/extensions.md section 1.6). `Config.Model`'s doc says a host
+  whose model is an `openresponses.ClientAdapter` over a provider's own
+  API builds it with `WithProviderSlugs`, without which it forwards such
+  an item and the provider refuses the request. Nothing in the loop or
+  the record changes. (#285)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the
