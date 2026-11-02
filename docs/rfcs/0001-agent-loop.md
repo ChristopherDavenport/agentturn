@@ -208,7 +208,7 @@ A configuration is what a run reads and nothing else is. It carries:
 | model | required; a run over a configuration with no model is refused |
 | model name, instructions, reasoning, text | the corresponding request members, set on every request when set |
 | request base | every other request member — tool choice, parallel tool calls, max output tokens, temperature, truncation, include, cache key, service tier, passthrough extras — copied onto every request. The loop owns input, tools, store, stream, stream options and previous response ID and overwrites them |
-| tools, or a tool provider | the tools of the moment, resolved once per turn |
+| tools, or a tool provider | the tools of the moment, resolved once per turn and wherever else the loop needs them |
 | execution mode, parallel bound | the batch rules of agenttool RFC 0001: sequential, or parallel up to the bound |
 | max turns | a limit after which the run stops |
 | filter, transform | what the model sees; see the request |
@@ -224,10 +224,13 @@ itself, bounded by its context. A set of tools MUST have distinct
 names; a fixed list is checked once before the run and a provided list
 once per turn, and a duplicate refuses the run or fails the run. The
 loop never closes a tool: close belongs to the host, as agenttool RFC
-0001 says. A provider is called once per turn, and a provider that
-builds tools owning a resource is responsible for releasing them; it
-SHOULD build them once per session and return the same values on each
-turn (#95).
+0001 says. A provider is called whenever the tools are resolved: once
+for each turn, once for the batch a resume approved, once for each
+approval a resume holds to the replay rule, and whenever a host or a
+recorder asks for the request base, so a provider called twice for one
+turn's worth of work is no defect. A provider that builds tools owning
+a resource is responsible for releasing them; it SHOULD build them
+once per session and return the same values on every call (#95).
 
 A configuration MAY be replaced between runs. The transcript is kept,
 so the next run continues the same conversation under other
