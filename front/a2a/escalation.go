@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/openresponses"
 	"github.com/a2aproject/a2a-go/a2a"
@@ -30,20 +31,44 @@ const (
 // function_call_output items of any calls to its own tools, one answer
 // per pending call.
 //
-// Who decided is the authenticated principal, never what the caller
-// claims: the run the answer resumes is prompted under the principal's
-// trigger, and the decision names nobody in the session format's terms
-// (By ""), since the executor cannot tell a person on the caller's side
-// from a program. A note is the caller's words, untrusted: an
-// approval's reaches the model after the batch's outputs as a user
-// message, "The caller <principal> said: <note>", never in the
-// developer's voice; a refusal's is part of the refusal the model reads
-// as the call's output.
+// Who answered is the authenticated principal: the run the answer
+// resumes is prompted under the principal's trigger. Who decided, in
+// the session format's terms, is By: empty, the decision names nobody,
+// since the executor cannot tell a person on the caller's side from a
+// program; "human", "policy" or "agent" only from a principal the host
+// lets name one ([WithChosenBy]), and an approval naming one otherwise
+// is refused, never recorded. A note is the caller's words, untrusted:
+// an approval's reaches the model after the batch's outputs as "The
+// caller <principal> said: <note>", a user message unless By names a
+// rule or another model, whose words are a developer message, and
+// never the serving side's own instructions; a refusal's is part of
+// the refusal the model reads as the call's output.
 type Approval struct {
 	CallID string `json:"call_id"`
 	// Approve runs the call; false refuses it.
 	Approve bool   `json:"approve"`
 	Note    string `json:"note,omitempty"`
+	// By is who decided, "human", "policy" or "agent", taken only
+	// under [WithChosenBy]; empty names nobody.
+	By string `json:"by,omitempty"`
+}
+
+// WithChosenBy lets a principal the host names say who decided its
+// approvals, with [Approval.By]: a policy engine or another agent that
+// answers for its own side, whose host has a reason to believe it.
+// chosen is the host's check, called with the request's context and
+// the authenticated principal for each approval that names a decider.
+// Without it, or when it says no, an approval that names a decider is
+// refused and the message with it: the executor cannot tell a person
+// on the caller's side from a program, and an unchecked claim is never
+// recorded. An approval that names nobody is recorded as decided by
+// nobody, this front's default, whatever the option. A host whose
+// policy needs a person makes its check, or its BeforeToolCall, refuse
+// an approval not by "human"; the package ships no such policy. A2A
+// has no field for who answered (identity stays at the protocol
+// layer), so the decider is a member of agentturn's own approval part.
+func WithChosenBy(chosen func(ctx context.Context, principal string) bool) Option {
+	return func(e *Executor) { e.chosenBy = chosen }
 }
 
 // ApprovalPart encodes an approval as the data part a message carries.
@@ -51,6 +76,9 @@ func ApprovalPart(a Approval) a2a.DataPart {
 	data := map[string]any{"type": ApprovalType, "call_id": a.CallID, "approve": a.Approve}
 	if a.Note != "" {
 		data["note"] = a.Note
+	}
+	if a.By != "" {
+		data["by"] = a.By
 	}
 	return a2a.DataPart{Data: data}
 }
@@ -134,9 +162,6 @@ func approvalsOf(msg *a2a.Message) ([]Approval, *a2a.Message, error) {
 			rest.Parts = append(rest.Parts, part)
 			continue
 		}
-		if _, ok := dp.Data["by"]; ok {
-			return nil, nil, fmt.Errorf("parts[%d]: an approval names who decided; the executor records the authenticated principal", i)
-		}
 		raw, err := json.Marshal(dp.Data)
 		if err != nil {
 			return nil, nil, fmt.Errorf("parts[%d]: %w", i, err)
@@ -148,9 +173,28 @@ func approvalsOf(msg *a2a.Message) ([]Approval, *a2a.Message, error) {
 		if a.CallID == "" {
 			return nil, nil, fmt.Errorf("parts[%d]: an approval names no call_id", i)
 		}
+		switch a.By {
+		case "", agenttool.ByHuman, agenttool.ByPolicy, agenttool.ByAgent:
+		default:
+			return nil, nil, fmt.Errorf("parts[%d]: unknown decider %q: an approval is by human, policy or agent, or names nobody", i, a.By)
+		}
 		out = append(out, a)
 	}
 	return out, &rest, nil
+}
+
+// checkChosen refuses an approval that names who decided unless the
+// host lets principal name one ([WithChosenBy]).
+func (e *Executor) checkChosen(ctx context.Context, principal string, approvals []Approval) error {
+	for _, a := range approvals {
+		if a.By == "" {
+			continue
+		}
+		if e.chosenBy == nil || !e.chosenBy(ctx, principal) {
+			return fmt.Errorf("approval %q names who decided, and the host does not let %s say; the executor records the authenticated principal", a.CallID, principal)
+		}
+	}
+	return nil
 }
 
 // answer is the agentturn answer an approval of call makes, said by
@@ -163,10 +207,12 @@ func (a Approval) answer(call Escalated, principal string) agentturn.Answer {
 		if call.Decision != nil && call.Decision.Args != nil {
 			ans = agentturn.ApproveWith(a.CallID, call.Decision.Args)
 		}
-		ans = ans.WithReason("approved by the caller " + principal)
+		ans = ans.WithReason("approved by the caller " + principal).WithBy(a.By)
 		if a.Note != "" {
-			// By "" says it in the user's voice: the caller's words,
-			// never the developer's.
+			// The loop says it in the decider's voice: the user's for
+			// a person or nobody, the developer's for a rule or
+			// another model the host let the caller name. Never the
+			// serving side's own instructions: it is quoted.
 			ans = ans.WithNote("The caller " + principal + " said: " + a.Note)
 		}
 		return ans
@@ -175,7 +221,7 @@ func (a Approval) answer(call Escalated, principal string) agentturn.Answer {
 	if a.Note != "" {
 		text += "; the caller said: " + a.Note
 	}
-	return agentturn.Output(&openresponses.FunctionCallOutput{CallID: a.CallID, Output: openresponses.FunctionCallOutputData{Text: text}})
+	return agentturn.Output(&openresponses.FunctionCallOutput{CallID: a.CallID, Output: openresponses.FunctionCallOutputData{Text: text}}).WithBy(a.By)
 }
 
 // asked reports whether c is put to the caller rather than held beside

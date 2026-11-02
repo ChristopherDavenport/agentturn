@@ -26,6 +26,7 @@ type Executor struct {
 	chunkSize   int
 	callerTools []*openresponses.FunctionTool
 	recorderFor RecorderFor
+	chosenBy    func(ctx context.Context, principal string) bool
 	handoff     func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool)
 	start       func(context.Context, agentturn.Transcript) (agentturn.Config, bool)
 	route       Route
@@ -309,6 +310,9 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	}
 	if len(approvals) > 0 && !e.escalate {
 		return fmt.Errorf("%w: the message carries approvals, and this agent puts no call to its caller", a2a.ErrInvalidParams)
+	}
+	if err := e.checkChosen(ctx, principal, approvals); err != nil {
+		return fmt.Errorf("%w: %w", a2a.ErrInvalidParams, err)
 	}
 	prompts, err := ItemsFromMessage(rest)
 	if err != nil {

@@ -157,7 +157,11 @@
 // beside an asked one is not put to the caller; the policy releases it
 // with the caller's answers. The run the answer resumes is under the caller's principal,
 // and the caller's note reaches the model as the caller's words, in the
-// user's voice, never the developer's. It is for a headless agent nobody
+// user's voice, never as the serving side's instructions. Who decided
+// is recorded as nobody, unless the host lets the principal name a
+// decider with [WithChosenBy], when [Approval.By] is taken and a rule's
+// or another model's note is a developer message; an approval naming a
+// decider otherwise is refused. It is for a headless agent nobody
 // watches, whose caller's human plane should decide; without it each
 // system's policy is its own.
 //

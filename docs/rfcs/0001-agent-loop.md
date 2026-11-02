@@ -925,8 +925,12 @@ takes answers from a remote party, to pending calls or to the questions
 an elicitor asks, MUST record the decider that party names only when
 the host has authorised that principal to name one; otherwise it MUST
 record the front's stated default, `human` for a control front, where
-a person at a client is who answers. An unchecked claim is never
-recorded (#267). An answer MAY
+a person at a client is who answers, and none, an anonymous decision,
+for a peer front, which cannot tell a person on the caller's side from
+a program. An unchecked claim is never recorded (#267, #291). A2A has
+no field for who answered, since identity stays at the protocol layer,
+so the A2A front carries the decider as a member of its own approval
+data part. An answer MAY
 ask the run to **terminate** once every answer is in, for a refusal
 that should end the turn so the user can say what to do instead; the
 outputs are still appended, so the transcript stays valid.

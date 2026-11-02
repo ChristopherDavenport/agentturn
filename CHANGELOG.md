@@ -427,6 +427,16 @@ versions may break the API.
   know is refused on both routes. RFC 0001 Nested calls, Pending calls
   and resume. (#267)
 
+- Added: `front/a2a`'s `WithChosenBy(func(ctx, principal) bool)` lets
+  a host name the principals that may say who decided an approval, as
+  `front/control`'s `WithChosenBy` does. `Approval.By` (`human`,
+  `policy`, `agent`), a `by` member of the `agentturn.approval` data
+  part, is recorded on the decision only when the host's check passes;
+  without the option, or when it says no, an approval naming a decider
+  is refused as before, and an unknown decider is refused always. A
+  rule's or another model's approval note reaches the model as a
+  developer message. RFC 0001 Pending calls and resume. (#291)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

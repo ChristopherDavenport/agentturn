@@ -204,15 +204,24 @@ func rewrites(name, reason, note string, args json.RawMessage) func(context.Cont
 func TestEscalationPutsTheAgentsQuestionToTheCaller(t *testing.T) {
 	const reason = "a person approves refunds"
 	tokens := map[string]string{"a-token": "alice"}
+	// #291: a host may let a principal say who decided, and only then
+	// is the approval's by recorded.
+	letsAlice := WithChosenBy(func(_ context.Context, principal string) bool { return principal == "alice" })
 	for _, tc := range []struct {
 		name     string
 		approval Approval
 		ran      int
 		output   string
 		note     string
+		opts     []Option
+		// by is the decider the approval's decision is recorded with.
+		by string
 	}{
-		{"approved", Approval{Approve: true, Note: "only this once"}, 1, "refunded 10", "The caller alice said: only this once"},
-		{"refused", Approval{Note: "not today"}, 0, "the caller alice refused this call; the caller said: not today", ""},
+		{name: "approved", approval: Approval{Approve: true, Note: "only this once"}, ran: 1, output: "refunded 10", note: "The caller alice said: only this once"},
+		{name: "refused", approval: Approval{Note: "not today"}, output: "the caller alice refused this call; the caller said: not today"},
+		{name: "approved by a rule the host lets alice name", approval: Approval{Approve: true, Note: "only this once", By: "policy"}, ran: 1, output: "refunded 10", note: "The caller alice said: only this once", opts: []Option{letsAlice}, by: "policy"},
+		{name: "approved by a person the host lets alice name", approval: Approval{Approve: true, Note: "only this once", By: "human"}, ran: 1, output: "refunded 10", note: "The caller alice said: only this once", opts: []Option{letsAlice}, by: "human"},
+		{name: "refused by a person the host lets alice name", approval: Approval{Note: "not today", By: "human"}, output: "the caller alice refused this call; the caller said: not today", opts: []Option{letsAlice}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var ran int
@@ -239,7 +248,8 @@ func TestEscalationPutsTheAgentsQuestionToTheCaller(t *testing.T) {
 				}), nil
 			}
 			store := &MemoryStore{}
-			h := New(cfg, WithAuthenticator(tokenAuth(tokens)), WithEscalation(), WithConversationStore(store), WithRecorderFor(record)).RequestHandler()
+			opts := append([]Option{WithAuthenticator(tokenAuth(tokens)), WithEscalation(), WithConversationStore(store), WithRecorderFor(record)}, tc.opts...)
+			h := New(cfg, opts...).RequestHandler()
 			alice := as("a-token")
 			res, err := h.OnSendMessage(alice, &a2a.MessageSendParams{Message: userMessage("refund me")})
 			if err != nil {
@@ -308,16 +318,22 @@ func TestEscalationPutsTheAgentsQuestionToTheCaller(t *testing.T) {
 						}
 					}
 				}
-				if !slices.Contains(user, tc.note) {
-					t.Errorf("user messages after the output = %q, want %q", user, tc.note)
-				}
 				if !slices.Contains(developer, "capped at 10") {
 					t.Errorf("developer messages after the output = %q, want the policy's note", developer)
 				}
-				for _, d := range developer {
-					if strings.Contains(d, tc.approval.Note) {
-						t.Errorf("the caller's note in the developer's voice: %q", d)
+				// The caller's words are the user's unless the host let
+				// it name a rule or another model.
+				if tc.by == "" || tc.by == "human" {
+					if !slices.Contains(user, tc.note) {
+						t.Errorf("user messages after the output = %q, want %q", user, tc.note)
 					}
+					for _, d := range developer {
+						if strings.Contains(d, tc.approval.Note) {
+							t.Errorf("the caller's note in the developer's voice: %q", d)
+						}
+					}
+				} else if !slices.Contains(developer, tc.note) || slices.Contains(user, tc.note) {
+					t.Errorf("user %q, developer %q: want %q as a developer message", user, developer, tc.note)
 				}
 				var d *agentturn.ToolDecision
 				for _, dec := range decisions {
@@ -325,8 +341,8 @@ func TestEscalationPutsTheAgentsQuestionToTheCaller(t *testing.T) {
 						d = dec
 					}
 				}
-				if d == nil || d.By != "" || !strings.Contains(d.Reason, "alice") {
-					t.Errorf("approval decision = %+v, want by nobody, the reason naming alice", d)
+				if d == nil || d.By != tc.by || !strings.Contains(d.Reason, "alice") {
+					t.Errorf("approval decision = %+v, want by %q, the reason naming alice", d, tc.by)
 				}
 			}
 			if left, _ := store.LoadEscalated(context.Background(), task.ContextID); len(left) != 0 {
@@ -355,12 +371,45 @@ func TestEscalationPutsTheAgentsQuestionToTheCaller(t *testing.T) {
 		if esc := again.Status.Message.Metadata[MetaEscalatedCalls].([]any); esc[0].(map[string]any)["reason"] != reason {
 			t.Errorf("the re-ask lost the policy's reason: %v", esc)
 		}
-		// A caller does not say who decided.
+		// A caller does not say who decided unless its host lets it.
 		res, err = h.OnSendMessage(alice, &a2a.MessageSendParams{Message: a2a.NewMessageForTask(a2a.MessageRoleUser, task, a2a.DataPart{Data: map[string]any{"type": ApprovalType, "call_id": callID, "approve": true, "by": "human"}})})
 		if err == nil {
 			if got, ok := res.(*a2a.Task); !ok || got.Status.State != a2a.TaskStateFailed {
 				t.Errorf("an approval naming its decider was taken: %+v", res)
 			}
+		}
+	})
+	t.Run("a decider the host does not let the caller name", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			chosen func(context.Context, string) bool
+			by     string
+		}{
+			{"a principal the host does not let choose", func(_ context.Context, p string) bool { return p == "bob" }, "policy"},
+			{"a decider nobody knows", func(context.Context, string) bool { return true }, "system"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var ran int
+				cfg := agentturn.Config{Model: callsOnce{"issue_refund"}, Tools: []agenttool.Tool{agenttool.NewFunc("issue_refund", "", json.RawMessage(`{"type":"object"}`),
+					func(context.Context, agenttool.Call) (agenttool.Result, error) {
+						ran++
+						return agenttool.Text("refunded"), nil
+					})}, BeforeToolCall: holds("issue_refund", reason)}
+				h := New(cfg, WithAuthenticator(tokenAuth(tokens)), WithEscalation(), WithChosenBy(tc.chosen)).RequestHandler()
+				alice := as("a-token")
+				res, _ := h.OnSendMessage(alice, &a2a.MessageSendParams{Message: userMessage("refund me")})
+				task := res.(*a2a.Task)
+				callID := task.Status.Message.Metadata[MetaEscalatedCalls].([]any)[0].(map[string]any)["call_id"].(string)
+				res, err := h.OnSendMessage(alice, &a2a.MessageSendParams{Message: a2a.NewMessageForTask(a2a.MessageRoleUser, task, ApprovalPart(Approval{CallID: callID, Approve: true, By: tc.by}))})
+				if err == nil {
+					if got, ok := res.(*a2a.Task); !ok || got.Status.State != a2a.TaskStateFailed {
+						t.Errorf("an approval by %q was taken: %+v", tc.by, res)
+					}
+				}
+				if ran != 0 {
+					t.Errorf("the call ran %d times", ran)
+				}
+			})
 		}
 	})
 	t.Run("escalation requires authentication", func(t *testing.T) {
