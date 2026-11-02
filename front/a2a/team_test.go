@@ -96,7 +96,8 @@ var issueRefundTool = agenttool.NewFunc("issue_refund", "refunds a charge", nil,
 // and Trim: a transfer within a task is relayed to the receiver with
 // the handoff's filter applied, so its first request holds no tool call
 // and ends in the note naming the handoff, while the stored
-// conversation keeps the history whole.
+// conversation keeps the history whole; the receiver's later tasks see
+// the conversation trimmed the same way (#276).
 func TestATeamTrimsWithinATask(t *testing.T) {
 	var inputs []string
 	team, err := handoff.New(
@@ -121,5 +122,15 @@ func TestATeamTrimsWithinATask(t *testing.T) {
 	stored, _ := store.Load(context.Background(), task.ContextID)
 	if got := itemTypes(stored); !strings.Contains(got, "function_call function_call_output") {
 		t.Errorf("stored conversation = %s, want the transfer kept", got)
+	}
+	// The trim holds for the receiver's later tasks: the next message
+	// starts under it, and it sees the conversation as trimmed.
+	next := userMessage("when is the refund")
+	next.ContextID = task.ContextID
+	if task := sendTask(t, h, next); task.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("next task = %s %q", task.Status.State, taskText(task))
+	}
+	if len(inputs) != 2 || inputs[1] != "user assistant developer assistant user" {
+		t.Errorf("receiver's inputs = %v, want the next task's trimmed too", inputs)
 	}
 }

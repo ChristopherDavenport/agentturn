@@ -1697,6 +1697,13 @@ An agent stands in four places inside another system:
   preamble once its call is trimmed out, the host appends a developer
   message that names the transfer, the sender and the receiver, so the
   receiver's first request ends in input the model can answer (#276).
+  A trim holds for the rest of the conversation: a front that keeps
+  the history whole, or is sent it whole, so it can find the handoffs
+  in it, MUST give the receiver's later requests or tasks the
+  conversation trimmed at each handoff as it was when the handoff was
+  taken, so what an agent sees does not depend on whether it took the
+  handoff in process or over a wire, and the transcript it continues
+  stays continuable.
   The loop's refusal to continue from a model output stands. A
   recorder writes the switch as a config delta, so the settings any
   response was produced under are on its path. A terminating tool

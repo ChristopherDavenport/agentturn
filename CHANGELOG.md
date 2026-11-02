@@ -578,6 +578,15 @@ versions may break the API.
   though someone had answered. Only when nobody answered does it stay
   held. (#84)
 
+- Fixed: a handoff's trim through a front holds for the receiver's
+  later tasks and requests. Under `WithTransfers` and `WithHandoffTrim`
+  each starts from the conversation trimmed at every handoff the route
+  finds (`front/responses.TrimHandedOff`), as the receiver saw it when
+  it took the handoff, while the stored or sent conversation keeps the
+  history whole for routing. Before, a later task showed the receiver
+  the sender's tool history again. RFC 0001 Composition states it.
+  (#276)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

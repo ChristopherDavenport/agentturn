@@ -405,8 +405,9 @@ func TestATeamTrimsOverAFront(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	front := responses.New(team.Config("Triage agent"), responses.WithTransfers(team.Route()), responses.WithHandoff(team.Handoff), responses.WithHandoffTrim(team.Trim))
-	sink, err := streamtest.Run(context.Background(), front, openresponses.Request{Model: "m", Input: openresponses.Items{openresponses.UserText("I was double charged")}})
+	front := responses.New(team.Config("Triage agent"), responses.WithTransfers(team.Route()), responses.WithHandoff(team.Handoff), responses.WithHandoffTrim(team.Trim), responses.WithToolItems())
+	first := openresponses.Request{Model: "m", Input: openresponses.Items{openresponses.UserText("I was double charged")}}
+	sink, err := streamtest.Run(context.Background(), front, first)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,5 +416,13 @@ func TestATeamTrimsOverAFront(t *testing.T) {
 	}
 	if len(refundReqs.seen) != 1 || itemTypes(refundReqs.seen[0].Input) != "user assistant developer" {
 		t.Fatalf("receiver's requests = %d, first input %v", len(refundReqs.seen), refundReqs.seen)
+	}
+	// The trim holds for the receiver's later requests (#276).
+	next := openresponses.Request{Model: "m", Input: append(append(first.Input, sink.Response().Output...), openresponses.UserText("well?"))}
+	if _, err := streamtest.Run(context.Background(), front, next); err != nil {
+		t.Fatal(err)
+	}
+	if len(refundReqs.seen) != 2 || itemTypes(refundReqs.seen[1].Input) != "user assistant developer assistant user" {
+		t.Errorf("receiver's next input = %v, want it trimmed as the first", refundReqs.seen)
 	}
 }

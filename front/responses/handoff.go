@@ -1,6 +1,8 @@
 package responses
 
 import (
+	"context"
+
 	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/openresponses"
 )
@@ -90,4 +92,28 @@ func Attribute(t agentturn.Transcript, start agentturn.Config, handoffs []Handof
 	}
 	m.Attribute(name, t[from:])
 	return m
+}
+
+// TrimHandedOff returns t as the agent that has it saw it: at each of
+// the [Handoffs] route finds in t, in order, the conversation up to
+// the transfer's output is trimmed by trim, given the configuration
+// that had the conversation, start before the first handoff, and the
+// receiver, and the items after it follow unchanged. It is how a front
+// keeps a handoff's trim for the receiver's later requests or tasks,
+// as an agent that took the handoff in process keeps its trimmed
+// transcript, while the stored or sent conversation keeps the history
+// whole, so the handoffs can still be found in it. Its items are t's;
+// a note trim adds is new.
+func TrimHandedOff(ctx context.Context, t agentturn.Transcript, start agentturn.Config, route Route, trim func(ctx context.Context, from, to agentturn.Config, t agentturn.Transcript) agentturn.Transcript) agentturn.Transcript {
+	hs := Handoffs(t, route)
+	if len(hs) == 0 || trim == nil {
+		return t
+	}
+	var out agentturn.Transcript
+	from, pos := start, 0
+	for _, h := range hs {
+		out = trim(ctx, from, h.To, append(out, t[pos:h.Output+1]...))
+		from, pos = h.To, h.Output+1
+	}
+	return append(out, t[pos:]...)
 }

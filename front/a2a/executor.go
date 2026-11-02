@@ -205,9 +205,11 @@ var ErrTooManyHandoffs = responses.ErrTooManyHandoffs
 // Agent.SetTranscript, so what [WithRecorderFor] attached records the
 // trim. It must be one the loop can continue (agentturn.CanContinue),
 // or the task fails. The trim applies to the receiver's runs within the
-// task: the [ConversationStore] keeps the history whole, since the next
-// task finds its agent by the transfer in it. agentturn/handoff's
-// Team.Trim is one.
+// task and, under [WithTransfers], the receiver's later tasks: each
+// starts from the conversation trimmed at every handoff the route finds
+// in it (responses.TrimHandedOff), while the [ConversationStore] keeps
+// the history whole, since the next task finds its agent by the
+// transfer in it. agentturn/handoff's Team.Trim is one.
 func WithHandoffTrim(fn func(ctx context.Context, from, to agentturn.Config, t agentturn.Transcript) agentturn.Transcript) Option {
 	return func(e *Executor) { e.trim = fn }
 }
@@ -460,7 +462,14 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	if e.route != nil {
 		models = responses.Attribute(transcript, e.cfg, Handoffs(transcript, e.route))
 	}
-	opts := []agentturn.Option{agentturn.WithTranscript(transcript), agentturn.WithReasoningModels(models)}
+	// The agent sees the conversation trimmed as each handoff's trim
+	// left it, the receiver's later tasks included (#276); the store
+	// keeps it whole, for the route to find the handoffs in.
+	seen := transcript
+	if e.route != nil && e.trim != nil {
+		seen = responses.TrimHandedOff(runCtx, transcript, e.cfg, e.route, e.trim)
+	}
+	opts := []agentturn.Option{agentturn.WithTranscript(seen), agentturn.WithReasoningModels(models)}
 	if len(approvals) > 0 {
 		// The calls the last run deferred, the caller's and the escalated
 		// ones alike, were never handed to a tool; an escalated one

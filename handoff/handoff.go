@@ -31,11 +31,12 @@
 // and front/a2a takes the same options. Route alone starts the next
 // request or task under the receiver, by the rules
 // front/responses.Handoffs states for which call handed off, but
-// neither relays a transfer within one nor trims. A front's trim
-// applies to the receiver's runs in the request or task that took the
-// handoff: the conversation a front keeps, or a caller sends back,
-// holds the history whole, since the next request finds its agent by
-// the transfer in it. The fronts bound the handoffs one request or
+// neither relays a transfer within one nor trims. A front's trim holds
+// for the receiver's later requests and tasks too: the conversation a
+// front keeps, or a caller sends back, holds the history whole, since
+// the next request finds its agent by the transfer in it, and the
+// front trims it at each handoff again
+// (front/responses.TrimHandedOff) before the receiver sees it. The fronts bound the handoffs one request or
 // task follows themselves (WithMaxHandoffs).
 package handoff
 
