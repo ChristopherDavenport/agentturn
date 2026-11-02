@@ -367,8 +367,11 @@ func TestAbortRecordsInterruptedAndFinishedCalls(t *testing.T) {
 		t.Fatalf("end = %+v", end)
 	}
 	// The fast call returned while the slow one ran, so its result is on
-	// the record before the batch appends its output (#273).
-	if got := entryTypes(s); got != "run config item:user item:function_call* item:function_call* response dispatch dispatch result item:function_call_output run" {
+	// the record before the batch appends its output (#273). The batch is
+	// parallel, so the fast call may return before the slow one is handed
+	// to its tool: its result is before or after the slow dispatch.
+	if got := entryTypes(s); got != "run config item:user item:function_call* item:function_call* response dispatch dispatch result item:function_call_output run" &&
+		got != "run config item:user item:function_call* item:function_call* response dispatch result dispatch item:function_call_output run" {
 		t.Errorf("entries = %q", got)
 	}
 	verifyAll(t, s)
