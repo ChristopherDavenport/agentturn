@@ -416,10 +416,14 @@ that a recorder holding the transcript and the settings rebuilds it:
    signature only its own provider accepts. The model's own reasoning
    items stay, since a provider may require them back on a turn that
    called a tool, and so does one whose producer the loop does not
-   know. The loop learns the producer of each reasoning item a
-   response adds, under the model name in force, and a host gives it
-   the producers of a transcript it rebuilt; the working transcript
-   keeps every item. The context a hook or a tool runs under MUST
+   know. The model a request names is the model its input is built
+   for: a before-model-call hook or a retry's revision that names
+   another model and keeps the input the loop built has that input
+   rebuilt for the model it names before it is sent. The loop MUST
+   credit the items an attempt produced to the model that attempt's
+   request named, not to the configuration's, and a host gives it the
+   producers of a transcript it rebuilt; the working transcript keeps
+   every item (#286). The context a hook or a tool runs under MUST
    carry the run's attribution, so a run a tool starts over the
    parent's items, a child the loop-as-a-tool opens with the
    conversation so far included, leaves out the reasoning another
@@ -626,7 +630,13 @@ setting, which is how a fallback chain lives in the loop rather than
 under it: the revised request is on the `model_retry` event, a recorder
 takes its settings, and the path names the model that answered rather
 than the one that did not, beside a record of each attempt that
-failed. A fallback written as a model under the loop still works and
+failed. When the revision names another model and keeps the input the
+loop built, the loop MUST rebuild that input for the revised model
+before sending it, as [the request](#the-request) step 3 says, so the
+revised model is sent no reasoning another model produced and the
+record's rule for other models' reasoning rebuilds what was sent; what
+the attempt produces is credited to the revised model. A revision that
+replaces the input is sent as it is. A fallback written as a model under the loop still works and
 still says nothing.
 
 ### The batch

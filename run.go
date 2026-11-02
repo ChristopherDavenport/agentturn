@@ -1531,8 +1531,12 @@ func (r *runner) appendOne(item openresponses.Item, mode InputMode, trigger, end
 }
 
 // request builds the request for this turn from config and the
-// filtered, transformed transcript.
-func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponses.Request, error) {
+// filtered, transformed transcript, and returns beside it that list
+// before the reasoning of other models was left out, from which a retry
+// moved to another model rebuilds the input for that model, and the
+// input the loop set, which the request still carries when the
+// before-model-call hook kept it.
+func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponses.Request, built, error) {
 	// The transform and BeforeModelCall run under the attribution too.
 	ctx = r.attributed(ctx)
 	input := Transcript(append(openresponses.Items(nil), r.transcript...))
@@ -1540,33 +1544,68 @@ func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponse
 		var err error
 		input, err = r.cfg.Transform(ctx, input)
 		if err != nil {
-			return openresponses.Request{}, fmt.Errorf("agentturn: transform: %w", err)
+			return openresponses.Request{}, built{}, fmt.Errorf("agentturn: transform: %w", err)
 		}
 	}
 	req := r.cfg.baseRequest(tools)
-	req.Input = r.reasoning.For(r.cfg.ModelName, r.cfg.filter()(input))
+	b := built{filtered: r.cfg.filter()(input)}
+	req.Input = r.reasoning.For(req.Model, b.filtered)
+	b.input = req.Input
 	if r.cfg.BeforeModelCall != nil {
+		before := req
 		if err := r.cfg.BeforeModelCall(ctx, &req); err != nil {
 			// The call was never made; the request as built is the
 			// record of what was refused, whether a policy stopped the
 			// run or the hook failed.
 			if eerr := r.emit(&ModelBlocked{RunID: r.runID, Turn: r.turn, Request: req, Err: err}); eerr != nil {
-				return openresponses.Request{}, eerr
+				return openresponses.Request{}, built{}, eerr
 			}
 			if errors.Is(err, ErrGuard) {
-				return openresponses.Request{}, stopped(StopGuard, err)
+				return openresponses.Request{}, built{}, stopped(StopGuard, err)
 			}
-			return openresponses.Request{}, fmt.Errorf("agentturn: before-model-call hook: %w", err)
+			return openresponses.Request{}, built{}, fmt.Errorf("agentturn: before-model-call hook: %w", err)
 		}
+		// A hook that moved the call to another model and kept the
+		// loop's input is sent that input as built for the model.
+		req = b.forModel(r, before, req)
 	}
-	return req, nil
+	return req, b, nil
+}
+
+// built is what request built a turn's input from: filtered, the
+// transformed, filtered list, and input, the list the loop set as the
+// request's input, for filtered's model.
+type built struct {
+	filtered Transcript
+	input    openresponses.Items
+}
+
+// forModel returns req with its input rebuilt for model when req still
+// carries the input the loop built and names another model than the
+// one it was built for, so a retry the policy moved to another model
+// sends no reasoning another model produced (#286). A request whose
+// input a hook or the revision replaced is the hook's, and is returned
+// as it is.
+func (b *built) forModel(r *runner, prev, req openresponses.Request) openresponses.Request {
+	if req.Model == prev.Model || !sameSlice(req.Input, b.input) || !sameSlice(prev.Input, b.input) {
+		return req
+	}
+	req.Input = r.reasoning.For(req.Model, b.filtered)
+	b.input = req.Input
+	return req
+}
+
+// sameSlice reports whether a and b are the same slice: one backing
+// array, one length.
+func sameSlice(a, b openresponses.Items) bool {
+	return len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0])
 }
 
 // modelTurn sends the turn's request, retrying a transient failure
 // under Config.Retry, emitting item events, and appends the completed
 // items to the transcript.
 func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openresponses.Response, error) {
-	req, err := r.request(ctx, tools)
+	req, b, err := r.request(ctx, tools)
 	if err != nil {
 		return nil, err
 	}
@@ -1577,8 +1616,9 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 	start := len(r.transcript)
 	for attempt := 1; ; attempt++ {
 		resp, committed, err := r.stream(ctx, req)
-		// What the attempt kept is this model's, however it ended.
-		r.attribute(r.transcript[start:])
+		// What the attempt kept is the model its request named, however
+		// it ended: after a revision, not the configuration's (#286).
+		r.attribute(req.Model, r.transcript[start:])
 		if err == nil {
 			// The next turn's inputs are what joins from here.
 			r.mark, r.arrived = len(r.transcript), nil
@@ -1640,7 +1680,9 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 			if out := revise(attempt, &next, err); out != nil {
 				next = *out
 			}
-			req = next
+			// The model a request names is the model its input is built
+			// for: a move to another model rebuilds the loop's input.
+			req = b.forModel(r, req, next)
 		}
 		if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: attempt, Err: err, Delay: delay, Request: req}); err != nil {
 			return nil, err

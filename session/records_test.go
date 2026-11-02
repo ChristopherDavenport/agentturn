@@ -1922,6 +1922,87 @@ func TestRevisedRetryIsAConfigDelta(t *testing.T) {
 	}
 }
 
+// fallbackReasoner answers every request with a reasoning item signed
+// for the requested model, then a call to the first tool until the input
+// holds two outputs, and a message after; it records the model and the
+// reasoning of every request and fails the second with an overloaded
+// server error, before anything of an answer.
+type fallbackReasoner struct {
+	n    int
+	sent []string
+}
+
+func (m *fallbackReasoner) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.n++
+	var sigs []string
+	outputs := 0
+	for _, item := range req.Input {
+		switch it := item.(type) {
+		case *openresponses.ReasoningItem:
+			sigs = append(sigs, it.EncryptedContent)
+		case *openresponses.FunctionCallOutput:
+			outputs++
+		}
+	}
+	m.sent = append(m.sent, req.Model+" "+fmt.Sprint(sigs))
+	if m.n == 2 {
+		return openresponses.ServerError("overloaded", "overloaded")
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if err := em.Item(&openresponses.ReasoningItem{Summary: openresponses.Contents{}, EncryptedContent: "sig:" + req.Model}); err != nil {
+		return err
+	}
+	if outputs < 2 {
+		w, err := em.FunctionCall("", req.Tools[0].(*openresponses.FunctionTool).Name)
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(`{"text":"x"}`); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	if err := em.Item(openresponses.AssistantText("ok")); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestARevisedRetryIsRecordedAsTheModelThatAnswered pins agentturn #286
+// on the record: a turn the retry policy moved from a to b after an
+// overloaded error sends b no reasoning of a's, the next turn on a sends
+// none of b's, and every response verifies, since the record's
+// other_models rule rebuilds each input for the model in force at it.
+func TestARevisedRetryIsRecordedAsTheModelThatAnswered(t *testing.T) {
+	rec, s, err := Start(context.Background(), agentsession.NewMemoryStore(), agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &fallbackReasoner{}
+	a := agentturn.New(agentturn.Config{Model: m, ModelName: "a", Tools: []agenttool.Tool{upper}, Retry: agentturn.Retry{
+		MaxAttempts: 2,
+		Backoff:     func(int, error) time.Duration { return 0 },
+		Revise: func(_ int, req *openresponses.Request, _ error) *openresponses.Request {
+			req.Model = "b"
+			return nil
+		},
+	}})
+	defer rec.Attach(a)()
+	end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("err=%v end=%+v", err, end)
+	}
+	if want := []string{"a []", "a [sig:a]", "b []", "a [sig:a]"}; !slices.Equal(m.sent, want) {
+		t.Errorf("requests = %q, want %q", m.sent, want)
+	}
+	if n := verifyAll(t, s); n != 3 {
+		t.Errorf("responses = %d, want 3", n)
+	}
+}
+
 // chainLeg streams a reasoning item and then fails, unless the request
 // names the last leg of the chain, in which case it answers: a
 // provider under load behind a fallback chain.

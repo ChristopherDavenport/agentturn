@@ -348,6 +348,17 @@ versions may break the API.
   with the attempt's by item ID, the model's call ID or open order,
   never by output index. RFC 0001 The model call and Invariants. (#236)
 
+- Fixed: a retry the policy's `Revise` moves to another model, and a
+  `BeforeModelCall` hook that does, keeping the input the loop built,
+  sends that input rebuilt for the model the request names, without the
+  reasoning another model produced; and the reasoning an attempt
+  produced is credited to the model its request named, not to
+  `Config.ModelName`. Before, the fallback was sent the primary's
+  reasoning, the next turn on the primary was sent the fallback's, and
+  a recorder left both responses unhashed. Provider refusals of another
+  issuer's reasoning were already answered by openresponses v0.0.18.
+  RFC 0001 The request step 3 and Retry. (#286)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the
