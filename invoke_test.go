@@ -443,7 +443,7 @@ func TestANestedCallKeepsItsIdentityWhenItsParentRunsAgain(t *testing.T) {
 	if n := end.Pending[0].Nested; len(n) != 1 || !n[0].Ended || !n[0].Dispatched || n[0].Result.Output.Text != "read 1" {
 		t.Errorf("pending nested = %+v, want read ended with its result", n)
 	}
-	end, err = a.Resume(context.Background(), Approve(end.Pending[0].Call.CallID))
+	_, err = a.Resume(context.Background(), Approve(end.Pending[0].Call.CallID))
 	if err != nil {
 		t.Fatal(err)
 	}
