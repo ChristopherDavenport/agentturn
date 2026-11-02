@@ -11,9 +11,10 @@ import (
 )
 
 // rebuiltItem is one item of the input the stored path rebuilds for a
-// request: the item as the request carries it, and the item the loop
-// handed the writer for it when the request carries that one as it is,
-// so an input holding the very item matches it without encoding either.
+// request: the item as the path holds it, which is the item the request
+// hash covers, and the item the loop handed the writer for it when the
+// request carries that one as it is, so an input holding the very item
+// matches it without encoding either.
 type rebuiltItem struct {
 	item openresponses.Item
 	// orig is the writer's own item, nil when a placeholder replaced
@@ -41,17 +42,14 @@ func (w *writer) rebuild(model string, omit agentsession.Omit) ([]rebuiltItem, b
 			return nil, false
 		}
 		from = w.foldSplit
-		out = append(out, rebuiltItem{item: w.foldSummary, orig: w.foldSummary, at: -1})
-		for _, p := range w.foldPinned {
-			out = append(out, rebuiltItem{item: p, orig: p, at: -1})
-		}
+		out = append(out, w.foldHead()...)
 	}
 	listed := idSet(omit.Items)
 	for i := from; i < len(w.values); i++ {
 		if w.custom[i] || !w.meta[i].folded && listed[w.items[i]] || w.leftOut(i, model, omit) {
 			continue
 		}
-		out = append(out, rebuiltItem{item: w.values[i], orig: w.values[i], at: i})
+		out = append(out, w.rebuiltAt(i))
 	}
 	if omit.Outputs != nil && len(omit.Outputs.Items) > 0 {
 		outs := idSet(omit.Outputs.Items)
@@ -106,6 +104,40 @@ func (w *writer) rebuild(model string, omit agentsession.Omit) ([]rebuiltItem, b
 	return out, true
 }
 
+// foldHead is the summary and the pins of the last fold recorded, which
+// open the input the path rebuilds.
+func (w *writer) foldHead() []rebuiltItem {
+	head := append(openresponses.Items{w.foldSummary}, w.foldPinned...)
+	out := make([]rebuiltItem, len(head))
+	for k, item := range head {
+		out[k] = rebuiltItem{item: item, orig: item, at: -1}
+		if k < len(w.foldRecorded) {
+			out[k].item = w.foldRecorded[k]
+		}
+	}
+	return out
+}
+
+// rebuiltAt is the writer's i-th item as the input the path rebuilds
+// holds it, before any placeholder.
+func (w *writer) rebuiltAt(i int) rebuiltItem {
+	r := rebuiltItem{item: w.values[i], orig: w.values[i], at: i}
+	if rec := w.meta[i].recorded; rec != nil {
+		r.item = rec
+	}
+	return r
+}
+
+// recordedPins is the pins of a fold as its entry holds them: recorded,
+// or pinned itself when there are none, so an entry with no pins
+// encodes as it did.
+func recordedPins(pinned, recorded openresponses.Items) openresponses.Items {
+	if len(pinned) == 0 {
+		return pinned
+	}
+	return recorded
+}
+
 // matches reports whether sent, a request's input, is the input
 // rebuilt, item for item.
 func (w *writer) matches(sent openresponses.Items, rebuilt []rebuiltItem) bool {
@@ -121,12 +153,13 @@ func (w *writer) matches(sent openresponses.Items, rebuilt []rebuiltItem) bool {
 }
 
 // same reports whether sent is the item r: the item the writer holds,
-// by identity, or one that encodes to what r encodes to.
+// by identity, or one that encodes, as the session records it, to what
+// r encodes to.
 func (w *writer) same(sent openresponses.Item, r rebuiltItem) bool {
 	if r.orig != nil && sent == r.orig {
 		return true
 	}
-	return equalJSON(sent, r.item)
+	return equalJSON(w.recordForm(sent), r.item)
 }
 
 // describe returns the omit setting under which the stored path
@@ -139,31 +172,31 @@ func (w *writer) same(sent openresponses.Item, r rebuiltItem) bool {
 // config delta carries, and then for one that starts afresh, which only
 // a replace does. A setting it finds is checked by rebuilding the input
 // under it, so what it returns is one the path rebuilds sent from.
-func (w *writer) describe(sent openresponses.Items, model string) (agentsession.Omit, bool) {
+func (w *writer) describe(sent openresponses.Items, model string) (agentsession.Omit, []rebuiltItem, bool) {
 	base := w.omitFor(model)
-	if want, ok := w.describeOver(sent, model, base); ok {
-		return want, true
+	if want, got, ok := w.describeOver(sent, model, base); ok {
+		return want, got, true
 	}
 	return w.describeOver(sent, model, agentsession.Omit{Reasoning: base.Reasoning})
 }
 
 // describeOver is describe for a setting that adds to base.
-func (w *writer) describeOver(sent openresponses.Items, model string, base agentsession.Omit) (agentsession.Omit, bool) {
+func (w *writer) describeOver(sent openresponses.Items, model string, base agentsession.Omit) (agentsession.Omit, []rebuiltItem, bool) {
 	from, j := 0, 0
 	if w.foldSet {
 		if w.foldSplit > len(w.values) {
-			return agentsession.Omit{}, false
+			return agentsession.Omit{}, nil, false
 		}
 		// A fold's summary and pins are no item entry omit reaches: the
 		// request opens with them as they are.
 		from = w.foldSplit
-		head := append(openresponses.Items{w.foldSummary}, w.foldPinned...)
+		head := w.foldHead()
 		if len(sent) < len(head) {
-			return agentsession.Omit{}, false
+			return agentsession.Omit{}, nil, false
 		}
-		for k, item := range head {
-			if !w.same(sent[k], rebuiltItem{item: item, orig: item, at: -1}) {
-				return agentsession.Omit{}, false
+		for k, r := range head {
+			if !w.same(sent[k], r) {
+				return agentsession.Omit{}, nil, false
 			}
 		}
 		j = len(head)
@@ -188,16 +221,17 @@ func (w *writer) describeOver(sent openresponses.Items, model string, base agent
 		if w.meta[i].folded {
 			// Items a compaction contributes, seeded from a path that
 			// holds it, are the fold's summary and pins.
-			if j < len(sent) && w.same(sent[j], rebuiltItem{item: w.values[i], orig: w.values[i], at: i}) {
+			if j < len(sent) && w.same(sent[j], w.rebuiltAt(i)) {
 				j++
 				continue
 			}
-			return agentsession.Omit{}, false
+			return agentsession.Omit{}, nil, false
 		}
 		if listed[w.items[i]] || w.leftOut(i, model, base) {
 			continue
 		}
-		rec, orig := w.values[i], w.values[i]
+		at := w.rebuiltAt(i)
+		rec, orig := at.item, at.orig
 		out, isOutput := rec.(*openresponses.FunctionCallOutput)
 		if isOutput && outs[w.items[i]] {
 			rec, orig = outputPlaceholder(out, outText), nil
@@ -210,13 +244,14 @@ func (w *writer) describeOver(sent openresponses.Items, model string, base agent
 				j++
 				continue
 			}
-			if text, ok := sentAsPlaceholder(sent[j], rec); ok && !outs[w.items[i]] && (!textSet || text == outText) {
+			conv := w.recordForm(sent[j])
+			if text, ok := sentAsPlaceholder(conv, rec); ok && !outs[w.items[i]] && (!textSet || text == outText) {
 				outText, textSet = text, true
 				newOuts = append(newOuts, w.items[i])
 				j++
 				continue
 			}
-			if replaced, text, ok := imagesAsPlaceholder(sent[j], rec); ok && (placeholder == "" || text == placeholder) {
+			if replaced, text, ok := imagesAsPlaceholder(conv, rec); ok && (placeholder == "" || text == placeholder) {
 				placeholder = text
 				images = append(images, replaced...)
 				j++
@@ -226,7 +261,7 @@ func (w *writer) describeOver(sent openresponses.Items, model string, base agent
 		want.Items = append(want.Items, w.items[i])
 	}
 	if j != len(sent) {
-		return agentsession.Omit{}, false
+		return agentsession.Omit{}, nil, false
 	}
 	if base.Outputs != nil || len(newOuts) > 0 {
 		var kept []string
@@ -243,7 +278,7 @@ func (w *writer) describeOver(sent openresponses.Items, model string, base agent
 		r++
 	}
 	if slices.Contains(images[r:], true) {
-		return agentsession.Omit{}, false
+		return agentsession.Omit{}, nil, false
 	}
 	switch {
 	case r > 0:
@@ -256,9 +291,9 @@ func (w *writer) describeOver(sent openresponses.Items, model string, base agent
 	}
 	got, ok := w.rebuild(model, want)
 	if !ok || !w.matches(sent, got) {
-		return agentsession.Omit{}, false
+		return agentsession.Omit{}, nil, false
 	}
-	return want, true
+	return want, got, true
 }
 
 // outputPlaceholder is out sent with text in place of its output.

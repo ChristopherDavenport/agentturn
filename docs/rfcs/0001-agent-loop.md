@@ -1516,7 +1516,15 @@ harness MUST write that harness in the header of every session it
 creates, unless the host names a different one for that session. A
 child session MUST take the media form, `inline` or `sidecar`, of the
 session whose call spawned it, unless the host names another, so the
-blobs of a tree of sessions are kept one way. A session created for a
+blobs of a tree of sessions are kept one way. In a sidecar session the
+recorder converts media as it writes, since agentsession RFC 0001 makes
+converting an item's media the writer's: it MUST store each inline
+image or file it records, in item, queued, result and compaction
+entries alike, as a blob before the entry, write the entry with the
+blob's `sidecar:` reference, and compute the request hash over the
+request with the same substitution, the form a reader rebuilds. The
+loop and the model keep the inline form, so no `sidecar:` URL the
+recorder writes reaches a provider (#284). A session created for a
 run under a named configuration, such as a child the loop-as-a-tool
 runs, MUST carry that name as its display name, an `info` entry before
 the run's first entry, unless the host names the session otherwise; a
@@ -1580,7 +1588,7 @@ maps onto it as follows:
 | handoffs a front takes | `WithHandoff`, `WithStart`, `WithTransfers(route)` in both fronts; `front/responses.Route`, `Handoffs`, `HandedTo`, `Attribute`, re-exported by `front/a2a` but for `Attribute` |
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)` |
-| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Requeue`, `Rebase`; `WithInstructionsParts`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`; the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
+| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Requeue`, `Rebase`; `WithInstructionsParts`, `WithMedia`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`; the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
 
 Every error the package returns to its caller, sentinel or wrapped,
 begins with `agentturn:`; the error texts a call's output carries,

@@ -858,6 +858,11 @@ type Recorder struct {
 	parts    func(context.Context, openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart)
 	reopened func(*agentsession.Session)
 	now      func() time.Time
+	// blobs is the writer [WithMedia] names, nil for the store's; stored
+	// holds the hash of each blob put, so a blob is stored once however
+	// many items name it.
+	blobs  agentsession.BlobWriter
+	stored map[string]bool
 	// agent is the agent Attach subscribed to, whose configuration is
 	// taken again at every run_start.
 	agent *agentturn.Agent
@@ -984,6 +989,10 @@ type writer struct {
 	foldSplit   int
 	foldSummary openresponses.Item
 	foldPinned  openresponses.Items
+	// foldRecorded is the summary and the pins as the compaction entry
+	// holds them, which differ from foldSummary and foldPinned in a
+	// sidecar session.
+	foldRecorded openresponses.Items
 	// calls maps a call ID to what the path holds for it, for the calls
 	// this writer wrote or Resume found pending.
 	calls map[string]*callRecord
@@ -1072,6 +1081,10 @@ type itemMeta struct {
 	// pin, on a path the writer was seeded from: no item entry, so no
 	// omit reaches it.
 	folded bool
+	// recorded is the item as its entry holds it when that is not the
+	// item the loop holds: in a sidecar session, with its media as
+	// sidecar references. nil when they are the same.
+	recorded openresponses.Item
 }
 
 // unnamedItem is an item_end of the call in flight that named no
@@ -1559,6 +1572,7 @@ func New(store agentsession.Store, sessionID string, opts ...Option) *Recorder {
 		now:      time.Now,
 		runs:     map[string]*writer{},
 		ended:    map[string]string{},
+		stored:   map[string]bool{},
 	}
 	r.root = newWriter(r, sessionID)
 	for _, opt := range opts {
@@ -2704,7 +2718,11 @@ func (w *writer) requeue(ctx context.Context) error {
 		if in.entry != "" {
 			continue
 		}
-		q := agentsession.NewQueued(in.item, in.mode)
+		item, err := w.sidecar(ctx, in.item)
+		if err != nil {
+			return err
+		}
+		q := agentsession.NewQueued(item, in.mode)
 		q.Trigger = in.trigger.Clone()
 		id, err := w.append(ctx, q)
 		if err != nil {
@@ -3227,7 +3245,7 @@ func (w *writer) reset() {
 	w.unhashed, w.noted = nil, nil
 	w.unnamed = nil
 	w.items, w.values, w.custom, w.models, w.meta = nil, nil, nil, nil, nil
-	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = false, 0, nil, nil
+	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned, w.foldRecorded = false, 0, nil, nil, nil
 	w.calls = map[string]*callRecord{}
 	// The links written are on the branch left: a call whose child is
 	// linked there and answered here gets the link again.
@@ -3942,7 +3960,11 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 			// settled, and others still run: what the tool returned is
 			// durable before this event returns, so a process that
 			// dies before the batch is in does not run it again.
-			r := agentsession.NewResult(e.CallID, c.entry, &openresponses.FunctionCallOutput{CallID: e.CallID, Output: e.Result.Output})
+			out, err := w.sidecar(ctx, &openresponses.FunctionCallOutput{CallID: e.CallID, Output: e.Result.Output})
+			if err != nil {
+				return err
+			}
+			r := agentsession.NewResult(e.CallID, c.entry, out.(*openresponses.FunctionCallOutput))
 			r.Failed = c.failed
 			if _, err := w.append(ctx, r); err != nil {
 				return err
@@ -4366,7 +4388,7 @@ func (w *writer) hash(req openresponses.Request) (string, agentsession.Omit, *Un
 		return "", omit, &Unhashed{Reason: "the last fold recorded keeps more items than the recorder holds"}, nil
 	}
 	if !w.matches(req.Input, expected) {
-		described, ok := w.describe(req.Input, req.Model)
+		described, got, ok := w.describe(req.Input, req.Model)
 		if !ok {
 			items := make(openresponses.Items, len(expected))
 			for k, r := range expected {
@@ -4374,9 +4396,20 @@ func (w *writer) hash(req openresponses.Request) (string, agentsession.Omit, *Un
 			}
 			return "", omit, divergence(req.Input, items), nil
 		}
-		omit = described
+		omit, expected = described, got
 	}
-	hash, err := RequestHash(req)
+	// The input matches the one the path rebuilds, so the request is
+	// hashed with that input, item for item as the path holds it: in a
+	// sidecar session with each sidecar: URL as the item records it,
+	// which is the form a reader rebuilds (#284).
+	hashed := req
+	if len(expected) > 0 {
+		hashed.Input = make(openresponses.Items, len(expected))
+		for k, r := range expected {
+			hashed.Input[k] = r.item
+		}
+	}
+	hash, err := RequestHash(hashed)
 	return hash, omit, nil, err
 }
 
@@ -4644,7 +4677,7 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		case c.rejected:
 			// The call's reject is on the path: only its output, the
 			// refusal, may follow.
-		case c.result != nil && equalJSON(c.result.Item, out):
+		case c.result != nil && equalJSON(c.result.Item, w.recordForm(out)):
 			// The tool returned before the record stopped, and this is
 			// what it returned: the result is the record, and the
 			// output appends it.
@@ -4734,6 +4767,12 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		}
 	}
 	var entry agentsession.Entry
+	// In a sidecar session the entry names the item's media by
+	// reference, stored as blobs first; the loop keeps the inline item.
+	recorded, err := w.sidecar(ctx, item)
+	if err != nil {
+		return err
+	}
 	// An item the filter in force drops never reached the model, so it
 	// is outside the context and outside the item entries; the hidden
 	// mark is about a renderer and adds nothing to it. A model's output
@@ -4741,7 +4780,7 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 	// others, is the same, and names its response beside it.
 	appOnly := len(w.filter()(agentturn.Transcript{item})) == 0
 	if appOnly {
-		raw, err := json.Marshal(item)
+		raw, err := json.Marshal(recorded)
 		if err != nil {
 			return fmt.Errorf("session: encode %s item: %w", item.ItemType(), err)
 		}
@@ -4751,7 +4790,7 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		}
 		entry = &agentsession.CustomEntry{NS: item.ItemType(), Data: raw, EntryBase: agentsession.EntryBase{Unknown: map[string]json.RawMessage{ResponseIDMember: id}}}
 	} else {
-		e := &agentsession.ItemEntry{Item: item, ResponseID: responseID, Failed: failed}
+		e := &agentsession.ItemEntry{Item: recorded, ResponseID: responseID, Failed: failed}
 		if hidden {
 			visible := false
 			e.Visible = &visible
@@ -4786,7 +4825,11 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 	w.items = append(w.items, id)
 	w.values = append(w.values, item)
 	w.custom = append(w.custom, appOnly)
-	w.meta = append(w.meta, itemMeta{})
+	meta := itemMeta{}
+	if recorded != item {
+		meta.recorded = recorded
+	}
+	w.meta = append(w.meta, meta)
 	model := ""
 	if _, ok := item.(*openresponses.ReasoningItem); ok && responseID != "" {
 		model = w.settings.Model
@@ -5399,11 +5442,19 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 		_, err = w.append(ctx, &agentsession.CustomEntry{NS: UnplacedFoldNS, Data: raw})
 		return err
 	}
-	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = true, split, f.Summary, f.Pinned
+	recorded := make(openresponses.Items, 0, 1+len(f.Pinned))
+	for _, item := range append(openresponses.Items{f.Summary}, f.Pinned...) {
+		r, err := w.sidecar(ctx, item)
+		if err != nil {
+			return err
+		}
+		recorded = append(recorded, r)
+	}
+	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned, w.foldRecorded = true, split, f.Summary, f.Pinned, recorded
 	entry := &agentsession.CompactionEntry{
 		FirstKept:    w.items[split],
-		Summary:      f.Summary,
-		Pinned:       f.Pinned,
+		Summary:      recorded[0],
+		Pinned:       recordedPins(f.Pinned, recorded[1:]),
 		Config:       w.settings,
 		TokensBefore: f.TokensBefore,
 		Usage:        f.Usage,

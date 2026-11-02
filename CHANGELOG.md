@@ -71,6 +71,17 @@ versions may break the API.
   provider that refuses it. The child's recorder describes the
   omission with `omit.items`, so its request still verifies. (#242)
 
+- Fixed: in a sidecar session the recorder converts media as it
+  writes. Each inline image or file an item, queued, result or
+  compaction entry holds, a base64 data URL, is stored as a blob before
+  the entry and named by its `sidecar:` reference, and the request hash
+  is computed over the request with the same substitution. The loop and
+  the model keep the data URLs. A host no longer converts media in an
+  after-call hook and resolves it again in a model wrapper. Each blob
+  is put once per recorder. (#284)
+- Added: `session.WithMedia(bw)`, the blob writer a sidecar session's
+  media is stored with when it is not the store's. (#284)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the
