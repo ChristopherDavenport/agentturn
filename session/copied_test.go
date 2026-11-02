@@ -97,6 +97,9 @@ func TestAChildOpenedWithItsParentsConversationRecordsItAsCopied(t *testing.T) {
 	if len(copied) != 3 {
 		t.Errorf("copied items = %v, want the parent's message, call and placeholder", copied)
 	}
+	if err := child.VerifyCopies(func(id string) (*agentsession.Session, error) { return store.Open(ctx, id) }); err != nil {
+		t.Errorf("verify copies: %v", err)
+	}
 	verifyAll(t, child)
 
 	tr, err := export.At(child, child.Leaf())

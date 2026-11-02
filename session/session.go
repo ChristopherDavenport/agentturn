@@ -1240,8 +1240,10 @@ type callRecord struct {
 	// ranSession is the session holding ranEntry when it is not this
 	// one, a fork's origin, and ranTrust that entry's trust: an output
 	// answered with ranEntry as its origin is written copied from it.
-	ranSession string
-	ranTrust   *agentsession.Trust
+	ranSession   string
+	ranTrust     *agentsession.Trust
+	ranPathTrust *agentsession.Trust
+	ranItem      openresponses.Item
 	// dispatchEntry is the ID of the last dispatch entry written or
 	// seeded for the call, and lastWithdrawn says it was withdrawn.
 	// handedOff counts the call's hand-offs on the path, those its tool
@@ -2484,8 +2486,16 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 		default:
 			if p.Ran != nil {
 				// The call ran on the branch its dispatch is on, and the
-				// session holds what it returned: that is its outcome.
-				ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Status: p.Ran.Status, Output: p.Ran.Output}).WithReason(p.RanWhere).WithOrigin(ranAt[id].entry)
+				// session holds what it returned: that is its outcome. One
+				// the session a fork was made from holds is given whole,
+				// its item ID and members of its own included, since the
+				// fork's recorder writes it as a copy of that entry.
+				out := &openresponses.FunctionCallOutput{CallID: id, Status: p.Ran.Status, Output: p.Ran.Output}
+				if p.RanWhere == ranInOriginReason {
+					whole := *p.Ran
+					out = &whole
+				}
+				ans = agentturn.Output(out).WithReason(p.RanWhere).WithOrigin(ranAt[id].entry)
 				if ranAt[id].failed {
 					ans = ans.WithFailed()
 				}
@@ -3660,7 +3670,8 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 		}
 		off := false
 		ranSession := ""
-		var ranTrust *agentsession.Trust
+		var ranTrust, ranPathTrust *agentsession.Trust
+		var ranItem openresponses.Item
 		ranEntry, childOff := "", ""
 		var calleesOff []agentsession.CalleeLink
 		if c.Output == nil && len(c.Dispatches) == 0 {
@@ -3680,9 +3691,10 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 					// The output is the origin's: one that repeats it
 					// names it, with its trust.
 					ranSession = at.ID()
+					ranPathTrust = agentsession.PathTrust(at.Path(ranEntry))
 					if e, ok := at.Entry(ranEntry); ok {
 						if ie, ok := e.(*agentsession.ItemEntry); ok {
-							ranTrust = ie.Trust
+							ranTrust, ranItem = ie.Trust, ie.Item
 						}
 					}
 				}
@@ -3697,7 +3709,7 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 		}
 		rec := callRecordOf(c, s.Header(), off)
 		rec.ranEntry, rec.childOff, rec.calleesOff = ranEntry, childOff, calleesOff
-		rec.ranSession, rec.ranTrust = ranSession, ranTrust
+		rec.ranSession, rec.ranTrust, rec.ranPathTrust, rec.ranItem = ranSession, ranTrust, ranPathTrust, ranItem
 		rec.dispatchEntry = lastDispatch(c)
 		rec.lastWithdrawn = withdrawn[rec.dispatchEntry]
 		for _, d := range c.Dispatches {
@@ -5067,8 +5079,11 @@ type copySource struct {
 	from  agentsession.CopiedFrom
 	trust *agentsession.Trust
 	// pathTrust is the trust of the path the item was copied from,
-	// which a copy naming no entry carries (format 0.15).
+	// which a copy naming no entry carries (format 0.15), and item the
+	// named entry's item: a copy names the entry only when it writes
+	// that item unchanged.
 	pathTrust *agentsession.Trust
+	item      openresponses.Item
 }
 
 // copiedFrom resolves an item the loop marks copied, one a child was
@@ -5110,7 +5125,7 @@ func (w *writer) copiedFrom(ctx context.Context, item openresponses.Item) (*copy
 			}
 		}
 		if ie, ok := e.(*agentsession.ItemEntry); ok {
-			src.from.Entry, src.trust = p.items[i], ie.Trust
+			src.from.Entry, src.trust, src.item = p.items[i], ie.Trust, ie.Item
 		}
 		break
 	}
@@ -5214,7 +5229,7 @@ func (w *writer) itemFrom(ctx context.Context, item openresponses.Item, response
 				// reader reaches the origin's link to the child
 				// session that produced it, which this session's
 				// record cannot hold.
-				from = &copySource{from: agentsession.CopiedFrom{Session: c.ranSession, Entry: origin}, trust: c.ranTrust}
+				from = &copySource{from: agentsession.CopiedFrom{Session: c.ranSession, Entry: origin}, trust: c.ranTrust, pathTrust: c.ranPathTrust, item: c.ranItem}
 			}
 			dec := agentsession.NewDecision(out.CallID, c.entry, agentsession.VerdictAnswer, by)
 			if reason != "" {
@@ -5289,8 +5304,13 @@ func (w *writer) itemFrom(ctx context.Context, item openresponses.Item, response
 	} else {
 		e := &agentsession.ItemEntry{Item: recorded, ResponseID: responseID, Failed: failed}
 		if from != nil {
-			cf := from.from
-			e.CopiedFrom, e.Trust = &cf, from.trust
+			cf, trust := from.from, from.trust
+			if cf.Entry != "" && (from.item == nil || !equalJSON(from.item, recorded)) {
+				// Not the entry's item member for member: the copy
+				// names the session alone, with its path's trust.
+				cf.Entry, trust = "", from.pathTrust
+			}
+			e.CopiedFrom, e.Trust = &cf, trust
 		}
 		if hidden {
 			visible := false

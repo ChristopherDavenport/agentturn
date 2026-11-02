@@ -1113,7 +1113,9 @@ func TestForkReadsItsOrigin(t *testing.T) {
 				after = append(after, agentsession.NewSubsessionLink("child-of-call-1", call.CallID))
 				// The page the charge read was untrusted, which the
 				// fork's copy carries (#237).
-				after = append(after, &agentsession.ItemEntry{Item: openresponses.NewFunctionCallOutput(call.CallID, "charged"), Trust: &agentsession.Trust{Reads: []string{agentsession.TrustUntrusted}}})
+				ranOut := openresponses.NewFunctionCallOutput(call.CallID, "charged")
+				ranOut.ID = "fco_1" // the provider's item ID, which a copy keeps
+				after = append(after, &agentsession.ItemEntry{Item: ranOut, Trust: &agentsession.Trust{Reads: []string{agentsession.TrustUntrusted}}})
 			}
 			ranEntry := ""
 			for _, e := range after {
@@ -1214,6 +1216,11 @@ func TestForkReadsItsOrigin(t *testing.T) {
 			}
 			if last == nil || last.Reason != tc.wantReason {
 				t.Errorf("last decision = %+v, want reason %q", last, tc.wantReason)
+			}
+			// The copy names an entry only with the item that entry
+			// holds and its trust.
+			if err := fork.VerifyCopies(func(id string) (*agentsession.Session, error) { return store.Open(ctx, id) }); err != nil {
+				t.Errorf("verify copies: %v", err)
 			}
 			if err := fork.VerifyRecords(fork.Leaf()); err != nil {
 				t.Errorf("verify records: %v", err)

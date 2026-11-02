@@ -315,6 +315,12 @@ versions may break the API.
   for it, and fails the write rather than name an entry without its
   trust when it cannot. (#243)
 
+- Fixed: `ReplayAnswers` gives an output a fork's origin recorded whole,
+  its item ID and members of its own included, so the fork's copy is the
+  entry it names; the recorder names a copy's entry only when it writes
+  that entry's item unchanged, and otherwise the session alone with its
+  path's trust, so `VerifyCopies` holds. (#237)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the
