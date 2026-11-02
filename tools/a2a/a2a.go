@@ -237,13 +237,15 @@ func WithDetach(fn func(callID string, info TaskInfo, final *a2a.Task, err error
 // [WithBlocking] asks for its task with tasks/get.
 const DefaultPollInterval = time.Second
 
+// MinPollInterval is the shortest interval [WithPollInterval] takes.
+const MinPollInterval = 50 * time.Millisecond
+
 // WithPollInterval sets how often a detached call under [WithBlocking]
-// asks for its task; the default is [DefaultPollInterval].
+// asks for its task; the default is [DefaultPollInterval], and an
+// interval shorter than [MinPollInterval] is raised to it.
 func WithPollInterval(d time.Duration) Option {
 	return func(r *remote) {
-		if d > 0 {
-			r.pollInterval = d
-		}
+		r.pollInterval = max(d, MinPollInterval)
 	}
 }
 

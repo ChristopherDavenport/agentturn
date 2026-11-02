@@ -127,7 +127,7 @@ func TestDetachedCallsLeaveTheBatch(t *testing.T) {
 		opts []Option
 	}{
 		{name: "streaming"},
-		{name: "blocking", opts: []Option{WithBlocking(), WithPollInterval(20 * time.Millisecond)}},
+		{name: "blocking", opts: []Option{WithBlocking(), WithPollInterval(MinPollInterval)}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			remote := newGated("lint", "test")
@@ -389,5 +389,53 @@ func TestSteerAWorkingTask(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the task never ended")
+	}
+}
+
+// countingGets counts the tasks/get requests a client sends.
+type countingGets struct {
+	a2aclient.PassthroughInterceptor
+	mu sync.Mutex
+	n  int
+}
+
+func (c *countingGets) Before(ctx context.Context, req *a2aclient.Request) (context.Context, error) {
+	if _, ok := req.Payload.(*a2a.TaskQueryParams); ok {
+		c.mu.Lock()
+		c.n++
+		c.mu.Unlock()
+	}
+	return ctx, nil
+}
+
+func (c *countingGets) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+// TestThePollIntervalHasALowerBound pins the review of #290: an
+// interval below MinPollInterval is raised to it, so a detached call
+// does not ask for its task in a tight loop.
+func TestThePollIntervalHasALowerBound(t *testing.T) {
+	remote := newGated("lint")
+	_, card := serve(t, remote, nil)
+	gets := &countingGets{}
+	client, err := a2aclient.NewFromCard(context.Background(), card, a2aclient.WithInterceptors(gets))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Destroy() })
+	ends := make(chan struct{})
+	tool := New(client, card, WithName("lint"), WithBlocking(), WithPollInterval(time.Nanosecond), WithDetach(func(string, TaskInfo, *a2a.Task, error) { close(ends) }))
+	if _, err := tool.Execute(context.Background(), agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"lint"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(4 * MinPollInterval)
+	n := gets.count()
+	remote.open("lint")
+	<-ends
+	if n > 5 {
+		t.Errorf("tasks/get sent %d times in 4 minimum intervals", n)
 	}
 }
