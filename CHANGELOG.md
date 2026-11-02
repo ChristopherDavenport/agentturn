@@ -5,6 +5,16 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Dependencies: every module requires openresponses v0.0.18, up from
+  v0.0.15, and agenttool v0.0.28, up from v0.0.24; `session` requires
+  agentsession v0.0.32, up from v0.0.28, so the sessions it writes are
+  format 0.15, which a reader of 0.14 refuses once the file is raised.
+  openresponses' `Reasoning` now carries members of its own, so the
+  recorder compares two reasoning settings by their JSON when it writes a
+  config delta.
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

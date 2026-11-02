@@ -5497,7 +5497,7 @@ func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntr
 		s := next.Instructions
 		d.Instructions = &s
 	}
-	if next.Reasoning != prev.Reasoning {
+	if !equalJSON(prev.Reasoning, next.Reasoning) {
 		rc := next.Reasoning
 		d.Reasoning = &rc
 	}
