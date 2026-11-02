@@ -722,7 +722,7 @@ func TestChildRunProducesLink(t *testing.T) {
 	if h.ParentSession != s.ID() || h.Harness == nil || h.Harness.Name != "test" {
 		t.Errorf("child header = %+v", h)
 	}
-	if got := entryTypes(childSession); got != "item:user item:assistant*" {
+	if got := entryTypes(childSession); got != "info item:user item:assistant*" {
 		t.Errorf("child entries = %q", got)
 	}
 	verifyAll(t, s)
@@ -1256,7 +1256,7 @@ func TestObservedChildIsWrittenLive(t *testing.T) {
 	if h := cs.Header(); h.ParentSession != s.ID() || h.Harness == nil || h.Harness.Name != "test" {
 		t.Errorf("child header = %+v", h)
 	}
-	if got := entryTypes(cs); got != "run config item:user item:function_call* response dispatch link item:function_call_output item:assistant* response run" {
+	if got := entryTypes(cs); got != "info run config item:user item:function_call* response dispatch link item:function_call_output item:assistant* response run" {
 		t.Fatalf("child entries = %q", got)
 	}
 	if n := verifyAll(t, cs); n != 2 {
@@ -1280,7 +1280,7 @@ func TestObservedChildIsWrittenLive(t *testing.T) {
 	if h := gs.Header(); h.ParentSession != cs.ID() {
 		t.Errorf("grandchild header = %+v", h)
 	}
-	if got := entryTypes(gs); got != "run config item:user item:function_call* response dispatch item:function_call_output item:assistant* response run" {
+	if got := entryTypes(gs); got != "info run config item:user item:function_call* response dispatch item:function_call_output item:assistant* response run" {
 		t.Fatalf("grandchild entries = %q", got)
 	}
 	if n := verifyAll(t, gs); n != 2 {
@@ -1368,7 +1368,7 @@ func TestAbortDuringChildRunStillLinks(t *testing.T) {
 	}
 	// The child's cut-off call has its tool_end; its run_end wrote
 	// nothing more since no model call was in flight.
-	if got := entryTypes(cs); got != "run config item:user item:function_call* response dispatch run" {
+	if got := entryTypes(cs); got != "info run config item:user item:function_call* response dispatch run" {
 		t.Errorf("child entries = %q", got)
 	}
 	if verifyAll(t, cs) != 1 {

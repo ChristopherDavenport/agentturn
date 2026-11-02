@@ -3456,11 +3456,12 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 		if call, ok := agenttool.CallFrom(ctx); ok {
 			callID = call.ID
 		}
-		w, err := r.newChild(ctx, parent, callID, true)
+		cfg, hasCfg := agent.ConfigFromContext(ctx)
+		w, err := r.newChild(ctx, parent, callID, true, cfg.Name)
 		if err != nil {
 			return
 		}
-		if cfg, ok := agent.ConfigFromContext(ctx); ok {
+		if hasCfg {
 			w.cfg = &cfg
 		}
 		r.runs[e.RunID] = w
@@ -3540,8 +3541,11 @@ func (r *Recorder) Fold(ctx context.Context, f compact.Fold) error {
 //
 // live says the child is written from its events, so the header
 // promises the record entries; a child replayed from its items
-// promises nothing.
-func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, live bool) (*writer, error) {
+// promises nothing. name is the configuration the child ran under: a
+// session created for it is named so, by an info entry before anything
+// else, and one reopened keeps whatever name it has, so a name a
+// person set later stands.
+func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, live bool, name string) (*writer, error) {
 	h := agentsession.Header{ParentSession: parent.id, Harness: r.harness, SpawnedBy: callID, CWD: parent.cwd, Media: parent.media}
 	if live {
 		h.Records = append([]string(nil), agentsession.AllRecords...)
@@ -3579,6 +3583,11 @@ func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, 
 	w := newWriter(r, s.ID())
 	w.cwd, w.media = parent.cwd, parent.media
 	w.parent, w.parentID = parent, parent.id
+	if name != "" {
+		if _, err := w.append(ctx, &agentsession.InfoEntry{Name: name}); err != nil {
+			return nil, err
+		}
+	}
 	return w, nil
 }
 
@@ -5335,7 +5344,7 @@ func (w *writer) child(ctx context.Context, callID string, info agent.ChildInfo)
 	if running {
 		return nil
 	}
-	cw, err := r.newChild(ctx, w, callID, false)
+	cw, err := r.newChild(ctx, w, callID, false, info.Agent)
 	if err != nil {
 		return err
 	}

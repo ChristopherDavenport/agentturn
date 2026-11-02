@@ -843,7 +843,8 @@ func TestEnvInAChild(t *testing.T) {
 		if got := envNodes(child.Entries()); got != "node-1,node-2" {
 			t.Errorf("child env entries = %q, want node-1,node-2", got)
 		}
-		if first := child.Entries()[1]; !isEnv(first) {
+		// The child's name is first, then its run start.
+		if first := child.Entries()[2]; !isEnv(first) {
 			t.Errorf("the child's run start is followed by %s, want its env", first.EntryType())
 		}
 		if leaf, _ := child.Entry(child.Leaf()); !isEnv(leaf) {
@@ -1019,7 +1020,7 @@ func TestChildWithItsOwnWorkspace(t *testing.T) {
 				t.Errorf("child env entries = %q, want %q", got, tc.wantChild)
 			}
 			if tc.wantFirst {
-				if first := child.Entries()[1]; !isEnv(first) {
+				if first := child.Entries()[2]; !isEnv(first) {
 					t.Errorf("the child's run start is followed by %s, want its env", first.EntryType())
 				}
 				// The dispatch is filed under the env the child ran in.
@@ -2234,7 +2235,7 @@ func TestEnvSurvivesACompaction(t *testing.T) {
 
 			var w *writer
 			if tc.child {
-				if w, err = rec.newChild(ctx, rec.root, callID, false); err != nil {
+				if w, err = rec.newChild(ctx, rec.root, callID, false, ""); err != nil {
 					t.Fatal(err)
 				}
 			} else {

@@ -429,3 +429,61 @@ func (m *twoCalls) CreateStream(_ context.Context, req openresponses.Request, si
 	}
 	return em.Complete()
 }
+
+// TestChildSessionIsNamedAfterItsConfiguration pins RFC 0001's The
+// record: a session a recorder creates for a run under a named
+// configuration carries that name as its display name, an info entry
+// before the run's first entry, whether the child run was observed or
+// written from its items (#292).
+func TestChildSessionIsNamedAfterItsConfiguration(t *testing.T) {
+	for _, observed := range []bool{true, false} {
+		name := "unobserved"
+		if observed {
+			name = "observed"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			childCfg := agentturn.Config{Name: "alice", Description: "a teammate", Model: &echo.Adapter{}}
+			var opts []agent.Option
+			if observed {
+				opts = append(opts, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+			}
+			alice := agent.New(childCfg, opts...)
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{alice}})
+			defer rec.Attach(a)()
+			if _, err := a.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
+				t.Fatal(err)
+			}
+			l := links(s)
+			if len(l) != 1 {
+				t.Fatalf("links = %+v", l)
+			}
+			child, err := store.Open(context.Background(), l[0].Session)
+			if err != nil {
+				t.Fatal(err)
+			}
+			es := child.Entries()
+			if len(es) == 0 {
+				t.Fatal("child session is empty")
+			}
+			info, ok := es[0].(*agentsession.InfoEntry)
+			if !ok || info.Name != "alice" {
+				t.Errorf("child's first entry = %#v, want info named alice; entries %q", es[0], entryTypes(child))
+			}
+			n := 0
+			for _, e := range es {
+				if _, ok := e.(*agentsession.InfoEntry); ok {
+					n++
+				}
+			}
+			if n != 1 {
+				t.Errorf("child holds %d info entries, want 1", n)
+			}
+			verifyAll(t, child)
+		})
+	}
+}

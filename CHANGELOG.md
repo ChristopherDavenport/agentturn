@@ -28,6 +28,11 @@ versions may break the API.
 - Fixed: a child session the recorder creates takes the media form of
   the session whose call spawned it, so a sidecar parent's child is a
   sidecar session too. (#283)
+- Changed: a child session the recorder creates for a named
+  configuration starts with an `info` entry carrying `Config.Name`, so
+  a store lists children by name; a child session reopened for a later
+  run keeps the name it has. Observed children and children written
+  from their items alike. (#292)
 
 ## v0.0.34 - 2026-10-26
 
