@@ -763,7 +763,7 @@ func TestLocalSummaryOutputLimit(t *testing.T) {
 			}
 			// The fold itself, so the budget shapes the request whatever
 			// the transcript's size.
-			if _, err := NewLocal(s, opts...).fold(context.Background(), openresponses.Items(items(4))); err != nil {
+			if _, err := NewLocal(s, opts...).fold(context.Background(), openresponses.Items(items(4)), ""); err != nil {
 				t.Fatal(err)
 			}
 			got := 0
@@ -1188,5 +1188,121 @@ func TestAFoldsOwnCallIsMarked(t *testing.T) {
 	}
 	if IsFold(context.Background()) {
 		t.Error("an unmarked context reads as a fold's")
+	}
+}
+
+// TestFoldNextFoldsWithItsInstructions pins #277's fold on request: the
+// call after FoldNext folds a transcript within its budget, sends the
+// instructions after the summary prompt, and reports the fold as asked
+// for; the call after it is back to the budget, and reuses the fold.
+func TestFoldNextFoldsWithItsInstructions(t *testing.T) {
+	s := &summarizer{reply: "They talked about things."}
+	var folds []Fold
+	tr := NewLocal(s, WithBudget(100), WithKeepLast(1), WithEstimator(count), WithMinFold(0),
+		WithOnFold(func(_ context.Context, f Fold) error { folds = append(folds, f); return nil }))
+	if out, err := tr.Transform(context.Background(), items(6)); err != nil || len(out) != 6 || len(s.reqs) != 0 {
+		t.Fatalf("within budget: out = %d items, err = %v, summaries = %d", len(out), err, len(s.reqs))
+	}
+	tr.FoldNext("Keep every file name.")
+	out, err := tr.Transform(context.Background(), items(6))
+	if err != nil || len(out) != 2 || len(s.reqs) != 1 {
+		t.Fatalf("asked: out = %d items, err = %v, summaries = %d", len(out), err, len(s.reqs))
+	}
+	in := s.reqs[0].Input
+	if got, want := in[len(in)-1].(*openresponses.Message).Text(), DefaultSummaryPrompt+"\n\nKeep every file name."; got != want {
+		t.Errorf("summary prompt = %q, want %q", got, want)
+	}
+	if len(folds) != 1 || !folds[0].Forced || folds[0].Instructions != "Keep every file name." || folds[0].Summary == nil {
+		t.Errorf("folds = %+v", folds)
+	}
+	// The request is taken: the next call is within budget again and
+	// sends the remembered fold, asking nothing.
+	if out, err := tr.Transform(context.Background(), items(7)); err != nil || len(out) != 3 || len(s.reqs) != 1 {
+		t.Errorf("after: out = %d items, err = %v, summaries = %d", len(out), err, len(s.reqs))
+	}
+	// A request the loop marks folds as one FoldNext asked for does.
+	if out, err := tr.Transform(agentturn.ContextWithFoldRequest(context.Background()), items(9)); err != nil || len(out) != 2 || len(s.reqs) != 2 {
+		t.Errorf("marked: out = %d items, err = %v, summaries = %d", len(out), err, len(s.reqs))
+	}
+}
+
+// overflowing refuses, as a provider does through openresponses, every
+// request whose input holds more than limit items as longer than the
+// model's context window, and answers the rest with a message.
+type overflowing struct {
+	limit int
+	sent  []int
+}
+
+func (m *overflowing) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.sent = append(m.sent, len(req.Input))
+	if len(req.Input) > m.limit {
+		return openresponses.ContextLengthExceeded("prompt is too long")
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("ok"); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestAnOverflowFoldsOnceAndRetries pins #277's overflow rule: a request
+// the server refuses as context_length_exceeded is never sent again
+// unchanged. The loop rebuilds it through the transform with a fold
+// asked for and sends it once as a retry, retry policy or not; a
+// transform that cannot shorten it, or no transform, ends the run with
+// the error after the one call, and a fold that still overflows is not
+// folded again.
+func TestAnOverflowFoldsOnceAndRetries(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		limit     int
+		transform bool
+		minFold   int
+		want      agentturn.Reason
+		sent      []int
+	}{
+		{name: "the fold fits", limit: 3, transform: true, want: agentturn.ReasonDone, sent: []int{7, 2}},
+		{name: "the fold still overflows", limit: 1, transform: true, want: agentturn.ReasonError, sent: []int{7, 2}},
+		{name: "nothing to fold", limit: 3, transform: true, minFold: 1000, want: agentturn.ReasonError, sent: []int{7}},
+		{name: "no transform", limit: 3, want: agentturn.ReasonError, sent: []int{7}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &summarizer{reply: "They talked about things."}
+			m := &overflowing{limit: tc.limit}
+			cfg := agentturn.Config{Model: m, ModelName: "m"}
+			if tc.transform {
+				cfg.Transform = NewLocal(s, WithBudget(100), WithKeepLast(1), WithEstimator(count), WithMinFold(tc.minFold)).Transform
+			}
+			var retries []*agentturn.ModelRetry
+			var end *agentturn.RunEnd
+			for ev := range agentturn.Run(context.Background(), items(6), openresponses.Items{openresponses.UserText("latest")}, cfg) {
+				switch e := ev.(type) {
+				case *agentturn.ModelRetry:
+					retries = append(retries, e)
+				case *agentturn.RunEnd:
+					end = e
+				}
+			}
+			if end == nil || end.Reason != tc.want {
+				t.Fatalf("end = %+v", end)
+			}
+			if !slices.Equal(m.sent, tc.sent) {
+				t.Errorf("inputs sent = %v, want %v", m.sent, tc.sent)
+			}
+			if wantRetries := len(tc.sent) - 1; len(retries) != wantRetries {
+				t.Fatalf("model_retry = %d, want %d", len(retries), wantRetries)
+			}
+			if len(retries) == 1 && (len(retries[0].Request.Input) != 2 || !openresponses.IsContextLengthExceeded(retries[0].Err)) {
+				t.Errorf("model_retry = %+v", retries[0])
+			}
+			if tc.want == agentturn.ReasonError && !openresponses.IsContextLengthExceeded(end.Err) {
+				t.Errorf("run error = %v", end.Err)
+			}
+		})
 	}
 }

@@ -257,6 +257,12 @@ type Fold struct {
 	// path; a recorder that keeps it must mark it as the fold's own
 	// call. nil for [New], whose compaction request is not a Request.
 	Request *openresponses.Request
+	// Forced says the fold was asked for, by [Transform.FoldNext] or by
+	// the loop after the server refused a request as too long, rather
+	// than made because the estimate passed the budget. Instructions are
+	// the ones FoldNext gave for it, "" for none.
+	Forced       bool
+	Instructions string
 	// PrefixHash is the [PrefixHash] of the transcript's first Split
 	// items when the fold failed and the transform backs off from that
 	// prefix, as [Transform.Transform] describes, and empty otherwise:
@@ -311,7 +317,7 @@ func WithSummaryItem(fn func(summary string) openresponses.Item) Option {
 // fold or skips a fold because the other's failed; it only folds more
 // often than one per conversation would, as each forgets the other's.
 type Transform struct {
-	fold        func(ctx context.Context, input openresponses.Items) (folded, error)
+	fold        func(ctx context.Context, input openresponses.Items, instructions string) (folded, error)
 	onFold      []func(context.Context, Fold) error
 	budget      int
 	keepLast    int
@@ -325,6 +331,10 @@ type Transform struct {
 	request     func(*openresponses.Request)
 
 	mu sync.Mutex
+	// next says FoldNext asked the next call to fold whatever its
+	// budget, with nextInstructions for that fold alone.
+	next             bool
+	nextInstructions string
 	// prefixLen items of the transcript are represented by output. An
 	// empty prefixHash means no memory.
 	prefixLen  int
@@ -350,7 +360,7 @@ func New(c Compactor, opts ...Option) *Transform {
 	if t.minFold < 0 {
 		t.minFold = 0
 	}
-	t.fold = func(ctx context.Context, input openresponses.Items) (folded, error) {
+	t.fold = func(ctx context.Context, input openresponses.Items, _ string) (folded, error) {
 		resp, err := c.Compact(MarkFold(ctx), openresponses.CompactRequest{Model: t.model, Input: input})
 		if err != nil {
 			return folded{attempts: 1}, fmt.Errorf("compact: %w", err)
@@ -435,12 +445,12 @@ func NewLocal(model openresponses.Streamer, opts ...Option) *Transform {
 	if t.minFold < 0 {
 		t.minFold = max(2*t.estimate(openresponses.Items{t.summaryItem("")}), t.budget/8)
 	}
-	t.fold = func(ctx context.Context, input openresponses.Items) (folded, error) {
-		f, err := t.summarize(ctx, model, input)
+	t.fold = func(ctx context.Context, input openresponses.Items, instructions string) (folded, error) {
+		f, err := t.summarize(ctx, model, input, instructions)
 		f.attempts = 1
 		if unfolded(err) {
 			first := f.usage
-			f, err = t.summarize(ctx, model, input)
+			f, err = t.summarize(ctx, model, input, instructions)
 			f.attempts = 2
 			f.usage = addUsage(first, f.usage)
 		}
@@ -506,14 +516,19 @@ func unfolded(err error) bool {
 	return errors.Is(err, ErrSummaryNoText) || errors.Is(err, ErrSummaryIncomplete) || errors.Is(err, ErrSummaryTooLarge)
 }
 
-// summarize asks model once for a summary of input.
-func (t *Transform) summarize(ctx context.Context, model openresponses.Streamer, input openresponses.Items) (folded, error) {
+// summarize asks model once for a summary of input, with instructions,
+// when there are any, after the summary prompt.
+func (t *Transform) summarize(ctx context.Context, model openresponses.Streamer, input openresponses.Items, instructions string) (folded, error) {
 	// The summary is the fold's own call, and says so to the model.
 	ctx = MarkFold(ctx)
 	store := false
+	prompt := t.prompt
+	if instructions != "" {
+		prompt += "\n\n" + instructions
+	}
 	req := openresponses.Request{
 		Model: t.model,
-		Input: append(withoutReasoning(input), openresponses.UserText(t.prompt)),
+		Input: append(withoutReasoning(input), openresponses.UserText(prompt)),
 		Store: &store,
 	}
 	if limit := min(t.budget/2, DefaultSummaryMaxOutputTokens); limit > 0 {
@@ -615,10 +630,32 @@ func (t *Transform) Last() openresponses.Item {
 	return t.last
 }
 
+// FoldNext asks the next call to [Transform.Transform] to fold whatever
+// its budget, with instructions, when not empty, for that fold alone:
+// [NewLocal] sends them after the summary prompt, and [New], whose
+// compaction endpoint takes no prompt, ignores them. The fold is the
+// one a call over budget makes, kept tail and [WithPin] included, and
+// is reported to [WithOnFold] as any other, so a recorder writes it.
+// [WithMinFold] still guards it: a prefix too small to fold is left as
+// it is, and so is a transcript whose older part the remembered fold
+// already covers. The back-off after a failed fold does not hold a
+// fold asked for. The request is taken by the next call whether or not
+// it folds; a later FoldNext before that call replaces its
+// instructions. It is how a host compacts on request, such as a
+// /compact command, between runs or during one.
+func (t *Transform) FoldNext(instructions string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.next, t.nextInstructions = true, instructions
+}
+
 // Transform returns the transcript to send for this call: unchanged
 // when it fits the budget or when its older part is smaller than
 // [WithMinFold], otherwise the fold of its older part followed by the
-// recent items.
+// recent items. A call after [Transform.FoldNext], or one whose context
+// the loop marked with agentturn.ContextWithFoldRequest, as it does to
+// rebuild a request the server refused as too long, folds whatever the
+// budget.
 //
 // A fold that failed with [ErrSummaryTooLarge], [ErrSummaryIncomplete]
 // or [ErrSummaryNoText] sends the transcript unfolded, and the
@@ -635,14 +672,16 @@ func (t *Transform) Last() openresponses.Item {
 // [WithBackOff] turns the back-off off.
 func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (agentturn.Transcript, error) {
 	t.mu.Lock()
+	forced, instructions := t.next || agentturn.FoldRequested(ctx), t.nextInstructions
+	t.next, t.nextInstructions = false, ""
 	view, base := t.view(items)
 	tokens := t.estimate(view)
-	if tokens <= t.budget {
+	if tokens <= t.budget && !forced {
 		t.mu.Unlock()
 		return view, nil
 	}
 	split := t.split(items)
-	if split <= base || t.backOff(items, split, tokens) {
+	if split <= base || (!forced && t.backOff(items, split, tokens)) {
 		t.mu.Unlock()
 		return view, nil
 	}
@@ -660,9 +699,9 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 
 	// The model call runs unlocked so concurrent callers do not
 	// serialise on the network.
-	f, err := t.fold(ctx, input)
+	f, err := t.fold(ctx, input, instructions)
 	if err != nil {
-		failed := Fold{Split: split, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Err: err}
+		failed := Fold{Split: split, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Forced: forced, Instructions: instructions, Err: err}
 		if unfolded(err) {
 			failed.PrefixHash = PrefixHash(items[:split])
 		}
@@ -706,7 +745,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	t.mu.Unlock()
 	// The fold's own output and the pinned items, as locals: the memory
 	// they were written to belongs to the lock that was just released.
-	if err := t.report(ctx, Fold{Split: split, First: first, Output: f.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request}); err != nil {
+	if err := t.report(ctx, Fold{Split: split, First: first, Output: f.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Forced: forced, Instructions: instructions}); err != nil {
 		return nil, err
 	}
 	return out, nil

@@ -359,6 +359,21 @@ versions may break the API.
   issuer's reasoning were already answered by openresponses v0.0.18.
   RFC 0001 The request step 3 and Retry. (#286)
 
+- Added: `(*compact.Transform).FoldNext(instructions)` makes the next
+  `Transform` call fold whatever its budget, with instructions for that
+  fold alone, which `NewLocal` sends after the summary prompt; the fold
+  is reported to `WithOnFold`, so a recorder writes it, and
+  `Fold.Forced` and `Fold.Instructions` say it was asked for.
+  `WithMinFold` still guards it; the back-off after a failed fold does
+  not. It is what a host's compact-on-request command calls. (#277)
+- Added: an attempt the server refuses as `context_length_exceeded` is
+  never sent again unchanged. With a transform configured, the loop
+  rebuilds the request once with a fold asked for, marking the
+  transform's context with `ContextWithFoldRequest` (`FoldRequested`),
+  and sends it as a retry reported by `model_retry`, whatever the retry
+  policy; a transform that cannot shorten it ends the run with the
+  refusal, as before. RFC 0001 The request step 2 and Retry. (#277)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

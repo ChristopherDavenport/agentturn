@@ -1919,3 +1919,56 @@ func TestPinnedFoldRebuildsWhatWasSent(t *testing.T) {
 		t.Errorf("responses after the resume = %d, hashed = %d", n, hashed(s2))
 	}
 }
+
+// overflowing refuses every request whose input holds more than limit
+// items as longer than the model's context window, as an adapter
+// reports a provider's refusal, and answers the rest with a message.
+type overflowing struct {
+	limit int
+	sent  []int
+}
+
+func (m *overflowing) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.sent = append(m.sent, len(req.Input))
+	if len(req.Input) > m.limit {
+		return openresponses.ContextLengthExceeded("prompt is too long")
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("ok"); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestAnOverflowIsRecordedAsAFoldThenTheAttempt pins agentturn #277 on
+// the record: a request the server refused as too long is folded and
+// sent again, and the record holds the refused attempt's retry, the
+// fold, and the response to the folded request, which verifies.
+func TestAnOverflowIsRecordedAsAFoldThenTheAttempt(t *testing.T) {
+	rec, s, err := Start(context.Background(), agentsession.NewMemoryStore(), agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &overflowing{limit: 2}
+	tr := compact.NewLocal(&echo.Adapter{}, compact.WithBudget(100), compact.WithKeepLast(1), compact.WithMinFold(0), compact.WithEstimator(countItems), compact.WithOnFold(rec.Fold))
+	a := agentturn.New(agentturn.Config{Model: m, ModelName: "m", Transform: tr.Transform})
+	defer rec.Attach(a)()
+	for _, text := range []string{"one", "two"} {
+		if end, err := a.Prompt(context.Background(), openresponses.UserText(text)); err != nil || end.Reason != agentturn.ReasonDone {
+			t.Fatalf("%s: end = %+v, err = %v", text, end, err)
+		}
+	}
+	if want := []int{1, 3, 2}; !slices.Equal(m.sent, want) {
+		t.Errorf("inputs sent = %v, want %v", m.sent, want)
+	}
+	if got, want := entryTypes(s), "run config item:user item:assistant* response run run item:user compaction custom item:assistant* response run"; got != want {
+		t.Errorf("entries = %q\nwant      %q", got, want)
+	}
+	if n := verifyAll(t, s); n != 2 {
+		t.Errorf("responses = %d, want 2", n)
+	}
+}

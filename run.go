@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -426,6 +427,28 @@ func ContextWithTurn(ctx context.Context, turn int) context.Context {
 func TurnFromContext(ctx context.Context) int {
 	turn, _ := ctx.Value(turnKey{}).(int)
 	return turn
+}
+
+type foldRequestKey struct{}
+
+// ContextWithFoldRequest marks ctx as the context of a transform call
+// asked to fold whatever its budget. The loop marks the transform's
+// context so when it rebuilds a request the server refused as longer
+// than the model's context window: an attempt refused with
+// openresponses.CodeContextLengthExceeded is not sent again unchanged
+// (RFC 0001 Retry, #277). A host asks a transform of its own for a fold
+// on the next request through that transform, as compact's FoldNext
+// does.
+func ContextWithFoldRequest(ctx context.Context) context.Context {
+	return context.WithValue(ctx, foldRequestKey{}, true)
+}
+
+// FoldRequested reports whether ctx was marked by
+// [ContextWithFoldRequest]: a transform that folds against a budget
+// folds on this call whatever the estimate, as far as it can.
+func FoldRequested(ctx context.Context) bool {
+	v, _ := ctx.Value(foldRequestKey{}).(bool)
+	return v
 }
 
 // RunContext returns the context of the run a tool call, a hook, the
@@ -1595,6 +1618,21 @@ func (b *built) forModel(r *runner, prev, req openresponses.Request) openrespons
 	return req
 }
 
+// sameItems reports whether a and b hold the very same items, in order:
+// one pointer, or an equal value; an item of a type that cannot be
+// compared, as an extension's may be, is compared by its contents.
+func sameItems(a, b openresponses.Items) bool {
+	return slices.EqualFunc(a, b, func(x, y openresponses.Item) bool {
+		if x == nil || y == nil || reflect.TypeOf(x) != reflect.TypeOf(y) {
+			return x == nil && y == nil
+		}
+		if !reflect.TypeOf(x).Comparable() {
+			return reflect.DeepEqual(x, y)
+		}
+		return x == y
+	})
+}
+
 // sameSlice reports whether a and b are the same slice: one backing
 // array, one length.
 func sameSlice(a, b openresponses.Items) bool {
@@ -1614,6 +1652,7 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 		return nil, err
 	}
 	start := len(r.transcript)
+	folded := false
 	for attempt := 1; ; attempt++ {
 		resp, committed, err := r.stream(ctx, req)
 		// What the attempt kept is the model its request named, however
@@ -1668,6 +1707,26 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 				return nil, err
 			}
 			return nil, halt
+		}
+		if !committed && !folded && r.cfg.Transform != nil && openresponses.IsContextLengthExceeded(err) {
+			// The server refused the request as longer than the model's
+			// window. It is never sent again unchanged: the request is
+			// rebuilt once through the transform with a fold asked for,
+			// and sent as a retry when the fold changed the input. The
+			// fold is reported and recorded as any other, before the
+			// attempt it shortened (#277).
+			folded = true
+			next, nb, rerr := r.request(ContextWithFoldRequest(ctx), tools)
+			if rerr != nil {
+				return nil, rerr
+			}
+			if !sameItems(next.Input, req.Input) {
+				if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: attempt, Err: err, Request: next}); err != nil {
+					return nil, err
+				}
+				req, b = next, nb
+				continue
+			}
 		}
 		if committed || attempt >= r.cfg.Retry.MaxAttempts || !r.cfg.Retry.retryable(err) {
 			return nil, fmt.Errorf("agentturn: model: %w", err)

@@ -409,7 +409,13 @@ that a recorder holding the transcript and the settings rebuilds it:
    own purposes, such as a fold's summary, MUST be distinguishable from
    a turn's call by the model it calls, without reading the request:
    the binding carries the mark beside the request, not on it, so
-   neither the provider nor the request hash sees it (#88).
+   neither the provider nor the request hash sees it (#88). A host MAY
+   ask a transform that folds to fold on the next request whatever its
+   budget, with instructions for that fold alone; the fold is reported
+   and recorded as any other. The loop asks the same, with no
+   instructions, when it rebuilds a request the server refused as too
+   long, as [Retry](#retry) says, by a mark on the transform's
+   context (#277).
 3. Apply the **filter** to the result, which removes what the model
    must not see. Then leave out every reasoning item the loop knows a
    model under another model name produced: a reasoning item carries a
@@ -616,6 +622,18 @@ held, so a failure between the reasoning and the first token is retried
 and leaves nothing behind. A front that renders from `item_start` drops
 what it was rendering when a `model_retry`, or a `run_end` with an
 error or an abort, follows with no `item_end` for it.
+
+An attempt the server refused as longer than the model's context
+window, the `invalid_request` error with code `context_length_exceeded`
+that openresponses' adapters report for every provider, MUST NOT be
+sent again unchanged. When the configuration has a transform, the loop
+SHOULD rebuild the request through it with a fold asked for, as the
+request's step 2 says, and send it once, as a retry: `model_retry`
+reports the refusal and carries the rebuilt request, so a record shows
+the fold and then the attempt. It does so whatever the retry policy,
+whose attempts it does not count, and never twice in one turn. A
+rebuilt request whose input is the one refused, because the transform
+could not fold, is not sent, and the run ends with the refusal (#277).
 
 Retry is off unless the policy names more than one attempt. The
 default predicate retries the transient statuses (408, 409, 429 and
@@ -1678,7 +1696,7 @@ maps onto it as follows:
 | copied item | `Copied(item)`, which `tools/agent`'s `WithCallConfig` sets on the items it takes from the parent; `Copied` on the item events |
 | filter | `Config.Filter`; `DefaultFilter`, `VisibleFilter(types…)` |
 | reasoning another model produced | `ReasoningModels` (`Attribute`, `For`); `WithReasoningModels` for an agent, `ContextWithReasoningModels` for `Run` and `Continue`, and on every hook's and tool's context |
-| transform | `Config.Transform`; `compact.New`, `compact.NewLocal` as the reference; `compact.MarkFold`/`compact.IsFold` for a fold's own model call |
+| transform | `Config.Transform`; `compact.New`, `compact.NewLocal` as the reference; `compact.MarkFold`/`compact.IsFold` for a fold's own model call; `(*compact.Transform).FoldNext(instructions)` for a fold on request, `ContextWithFoldRequest`/`FoldRequested` for the loop's after an overflow, `compact.Fold.Forced`/`Instructions` |
 | configuration | `Config`; `Config.BaseRequest`, `Config.ResolveTools` |
 | tools of the moment | `Config.Tools`, `Config.ToolProvider` |
 | execution mode, bound | `Config.ToolExecution` (`ExecParallel`, `ExecSequential`), `Config.MaxParallelTools` |
