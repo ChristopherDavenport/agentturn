@@ -2634,7 +2634,9 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 // that run had queued and not appended is left behind with the rest
 // of the branch. And an input the agent holds, queued and not
 // appended, is written as a queued entry on the new branch unless the
-// entry that holds it is still pending there.
+// entry that holds it, or one the branch owes that holds the same input
+// in the same mode, is pending there, so a move back to where the input
+// was queued writes it no second time.
 //
 // The empty entry ID is the reset a product's /clear makes: the
 // session's leaf is reset so the next append starts a new root
@@ -2712,9 +2714,27 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 	for _, q := range owed {
 		pending[q.ID] = true
 	}
+	claimed := map[string]bool{}
 	for _, in := range w.inbox {
-		if !pending[in.entry] {
-			in.entry = ""
+		if pending[in.entry] {
+			claimed[in.entry] = true
+		}
+	}
+	for _, in := range w.inbox {
+		if pending[in.entry] {
+			continue
+		}
+		// An entry the new branch owes that holds this very input, in
+		// its mode, is its entry there: a move back to a branch the
+		// input was queued on before, as an undone rewind makes, writes
+		// it no second time.
+		in.entry = ""
+		rec := w.recordForm(in.item)
+		for _, q := range owed {
+			if !claimed[q.ID] && q.Mode == in.mode && equalJSON(q.Item, rec) {
+				in.entry, claimed[q.ID] = q.ID, true
+				break
+			}
 		}
 	}
 	if err := w.requeue(ctx); err != nil {

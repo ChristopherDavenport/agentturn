@@ -215,6 +215,12 @@ versions may break the API.
   back, and the error names an undo only when the undo failed. It
   replaces the five calls a host made by hand. (#220)
 
+- Fixed: `Recorder.Rebase` takes an input the agent holds as already
+  queued on the new branch when the branch owes an entry holding the
+  same input in the same mode, so a `MoveTo` that fails after the record
+  moved and moves it back writes no duplicate `queued` entry and leaves
+  the leaf where it was. (#220)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

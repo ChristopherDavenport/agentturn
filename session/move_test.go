@@ -24,13 +24,23 @@ type moveStore struct {
 	hold        chan struct{}
 	entered     chan struct{}
 	failAppends int
+	// failOpen, when set, fails the failOpen-th Open from now.
+	failOpen int
 }
 
 func (m *moveStore) Open(ctx context.Context, id string) (*agentsession.Session, error) {
 	m.mu.Lock()
 	hold, entered := m.hold, m.entered
 	m.hold = nil
+	fail := false
+	if m.failOpen > 0 {
+		m.failOpen--
+		fail = m.failOpen == 0
+	}
 	m.mu.Unlock()
+	if fail {
+		return nil, errInjected
+	}
 	if hold != nil {
 		close(entered)
 		<-hold
@@ -163,5 +173,41 @@ func TestARewindIsOneOperation(t *testing.T) {
 			t.Fatalf("prompt after the failed move: err=%v end=%+v", err, end)
 		}
 		verifyAll(t, s)
+	})
+
+	t.Run("an input the agent holds is not queued twice by the undo", func(t *testing.T) {
+		ctx := context.Background()
+		store, rec, a, end, _ := setup(t)
+		// Accepted after the last run, so the agent holds it and the
+		// path owes it.
+		if err := rec.Queue(ctx, a, agentturn.QueueFollowUp, openresponses.UserText("later")); err != nil {
+			t.Fatal(err)
+		}
+		s, err := store.Open(ctx, rec.SessionID())
+		if err != nil {
+			t.Fatal(err)
+		}
+		from := s.Leaf()
+		// MoveTo opens the session, Rebase opens it again, and the third
+		// Open, after the record moved, fails.
+		store.mu.Lock()
+		store.failOpen = 3
+		store.mu.Unlock()
+		if err := MoveTo(ctx, a, rec, end); !errors.Is(err, errInjected) {
+			t.Fatalf("move: %v, want the store's failure", err)
+		}
+		if s, err = store.Open(ctx, rec.SessionID()); err != nil {
+			t.Fatal(err)
+		}
+		if s.Leaf() != from {
+			t.Errorf("leaf = %s, want it back at %s: %s", s.Leaf(), from, entryTypes(s))
+		}
+		owed, err := s.PendingQueued(s.Leaf())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(owed) != 1 {
+			t.Errorf("the path owes %d inputs, want the one the agent holds", len(owed))
+		}
 	})
 }
