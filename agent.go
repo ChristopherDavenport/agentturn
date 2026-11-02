@@ -311,8 +311,8 @@ func (a *Agent) Config() Config { return a.cfg }
 // switches back to that model is sent them again. A configuration with
 // an empty ModelName names no model, so nothing is attributed to it
 // and nothing is left out of its requests. A session recorder
-// cannot write a request that leaves items out of the middle of its
-// history, so the responses after such a change carry no request hash.
+// describes what a request leaves out with the format's omit setting,
+// so the responses after such a change keep their request hash.
 func (a *Agent) SetConfig(cfg Config) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -326,11 +326,11 @@ func (a *Agent) SetConfig(cfg Config) error {
 // SetTranscript replaces the transcript, as when switching to another
 // branch of a session, or when a handoff trims what the receiving
 // configuration sees, between runs and once. It returns [ErrRunning]
-// while a run is active. A session recorder writing the agent is moved
-// to match with its Rebase: to the entry of the last item kept, for a
-// trim that keeps a prefix, whose responses then carry hashes; a trim
-// from the middle runs as well and leaves the next responses without
-// one. A handoff to another model need not trim the previous model's
+// while a run is active. A session recorder writing the agent describes
+// a trim the format can describe, items left out with their order kept,
+// outputs or images sent as a placeholder, with an omit before the next
+// response, which keeps its hash; one that moves to another branch of
+// the record is the session package's MoveTo. A handoff to another model need not trim the previous model's
 // reasoning items: the loop leaves them out of each request, as
 // [Agent.SetConfig] says, for every item it attributed, which the new
 // transcript keeps when it holds the same item. A transcript rebuilt
