@@ -5505,7 +5505,9 @@ func (w *writer) reopen(ctx context.Context) error {
 // web_search) after the first tool out of place, is written as a
 // replace; any other tool list change is a delta (see toolDelta).
 // parts, when set, are the parts next's instructions are composed of,
-// and the instructions change is written as the parts that moved;
+// and the instructions change is written as the parts that moved, and
+// the change is a delta whatever its length, since a replace would
+// start the parts afresh and cost a later hand-back their hashes;
 // otherwise it is the joined string, and parts on the path whose join
 // is unchanged are left in place. omitted is what the host left out:
 // settle writes it, whole on a replace and as what moved on a delta,
@@ -5573,6 +5575,12 @@ func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntr
 	}
 	if equalJSON(d, &agentsession.ConfigEntry{}) {
 		return nil
+	}
+	if len(parts) > 0 {
+		// A replace starts the path's parts afresh, so a later
+		// hand-back could no longer name them by hash: with parts in
+		// play, length alone is no reason to replace (#235).
+		return d
 	}
 	dl, fl := *d, *full
 	dl.InstructionsOmitted = omittedDelta

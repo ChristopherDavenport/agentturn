@@ -716,3 +716,61 @@ func TestOmittedDeltaKeepsRuns(t *testing.T) {
 		t.Errorf("no fold in %q", entryTypes(s2))
 	}
 }
+
+// TestHandBackNamesItsPartsByHash pins RFC 0001's The record: with the
+// instructions recorded as parts, a switch between configurations whose
+// tools are disjoint is a delta, though the delta's list of removed
+// tools makes it longer than a replace, so the hand-back after it names
+// its part by hash rather than repeating the text (#235).
+func TestHandBackNamesItsPartsByHash(t *testing.T) {
+	big := func(s string) string { return strings.Repeat(s, 4000) }
+	tool := func(name string) agenttool.Tool {
+		return agenttool.New(name, "does "+name, func(context.Context, echoArgs) (string, error) { return name, nil })
+	}
+	var tools []agenttool.Tool
+	for i := range 12 {
+		tools = append(tools, tool(fmt.Sprintf("tool_with_a_long_descriptive_name_%02d", i)))
+	}
+	triage := agentturn.Config{Name: "triage", Model: &echo.Adapter{}, ModelName: "m", Instructions: big("t"), Tools: tools[:6]}
+	billing := agentturn.Config{Name: "billing", Model: &echo.Adapter{}, ModelName: "m", Instructions: "Billing.", Tools: tools[6:]}
+	partsOf := func(_ context.Context, req openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
+		return []agentsession.InstructionPart{{ID: "product", Text: req.Instructions}}, nil
+	}
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{}, WithInstructionsParts(partsOf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(triage)
+	defer rec.Attach(a)()
+	for i, cfg := range []agentturn.Config{triage, billing, triage} {
+		if err := a.SetConfig(cfg); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.Prompt(context.Background(), openresponses.UserText("turn")); err != nil {
+			t.Fatalf("prompt %d: %v", i, err)
+		}
+	}
+	cs := configs(s)
+	if len(cs) != 3 {
+		t.Fatalf("config entries = %d", len(cs))
+	}
+	if cs[1].Replace {
+		t.Errorf("the switch to billing is a replace, want a delta")
+	}
+	if cs[2].Replace {
+		t.Fatalf("the hand-back is a replace (%d bytes), want a delta", jsonLen(cs[2]))
+	}
+	ps := cs[2].InstructionsParts
+	if len(ps) != 1 || ps[0].ID != "product" || ps[0].Hash == "" || ps[0].Text != "" {
+		t.Errorf("hand-back parts = %d, want product by hash", len(ps))
+	}
+	verifyAll(t, s)
+	cx, err := s.Context()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cx.Settings.Instructions != triage.Instructions || len(cx.Settings.Tools) != 6 {
+		t.Errorf("the path replays to %d bytes of instructions and %d tools", len(cx.Settings.Instructions), len(cx.Settings.Tools))
+	}
+}
