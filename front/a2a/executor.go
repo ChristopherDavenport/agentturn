@@ -183,7 +183,10 @@ func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*
 // task's context ID with the message's items after it. A configuration
 // it returns is used in place of the executor's, with the caller-owned
 // tools offered under it as under the executor's own; false keeps the
-// executor's. It is how the receiver of a handoff answers the
+// executor's. A configuration it returns is given the executor's
+// ToolRecorder and ToolElicitor where it leaves them nil, as a
+// [WithHandoff] receiver is given the sender's, so a call its hook
+// holds is put to the same people. It is how the receiver of a handoff answers the
 // conversation's later messages. The executor keeps no configuration
 // between tasks, so the conversation, which holds the transfer call
 // and its output, says who has it. A host whose handoff tools are
@@ -222,7 +225,8 @@ func WithStart(fn func(ctx context.Context, t agentturn.Transcript) (agentturn.C
 // WithTransfers says the conversation's handoffs are the transfer
 // calls route names, as [Handoffs] finds them. Without [WithStart] a
 // task starts where the last of them left the conversation, as
-// WithStart does with [HandedTo]; with it, WithStart picks the start,
+// WithStart does with [HandedTo], the receiver given the executor's
+// ToolRecorder and ToolElicitor where it has none of its own; with it, WithStart picks the start,
 // in whichever order the two are given, and the rest of this option
 // applies all the same. A message that declares a caller-owned tool
 // route takes is refused as invalid params, as is one declaring a
@@ -359,7 +363,11 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	if err != nil {
 		return fmt.Errorf("load conversation %q: %w", reqCtx.ContextID, err)
 	}
-	start := e.startFor(runCtx, slices.Concat(transcript, prompts))
+	// A task started under another configuration, the receiver the
+	// conversation was handed to, puts its questions and records its
+	// tools' writes where the executor's own does, as a WithHandoff
+	// switch within a task does (#234).
+	start := inherit(e.startFor(runCtx, slices.Concat(transcript, prompts)), e.cfg)
 	caller := slices.Concat(e.callerTools, declared)
 	callers := callerNames(caller)
 	// The calls this task put to its caller, which an approval may run
@@ -653,13 +661,7 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 		// The receiver inherits what the sender's configuration holds
 		// before the run's hook is built, so the hook's fallback
 		// elicitor is the inherited one.
-		if next.ToolRecorder == nil {
-			next.ToolRecorder = prev.ToolRecorder
-		}
-		if next.ToolElicitor == nil {
-			next.ToolElicitor = prev.ToolElicitor
-		}
-		cfg := e.runConfig(next, caller)
+		cfg := e.runConfig(inherit(next, prev), caller)
 		if err = agent.SetConfig(cfg); err == nil {
 			guarded = cfg.OutputGuard != nil
 			end, err = agent.Continue(agentturn.ContextWithTrigger(runCtx, agentturn.Trigger{Kind: "handoff", Ref: prev.Name}))
@@ -858,6 +860,22 @@ func (e *Executor) closeOwnPending(ctx context.Context, t agentturn.Transcript, 
 		out = append(out, item)
 	}
 	return out, closed
+}
+
+// inherit returns next with the question and tool record channels of
+// from wherever next has none of its own: a configuration a run starts
+// or continues under that is not the one the serving side set up, a
+// handoff's receiver or the agent a later task starts under, puts a
+// held call to the same people and records its tools' writes in the
+// same place.
+func inherit(next, from agentturn.Config) agentturn.Config {
+	if next.ToolRecorder == nil {
+		next.ToolRecorder = from.ToolRecorder
+	}
+	if next.ToolElicitor == nil {
+		next.ToolElicitor = from.ToolElicitor
+	}
+	return next
 }
 
 // startFor returns the configuration a task over t starts under:

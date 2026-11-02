@@ -152,7 +152,8 @@ func WithToolItems() Option {
 // Ref: sender.Name}), the sender being the configuration whose run
 // stopped, so the receiver's BeforeTurn context and its run_start say
 // why it ran, as they do for a host that continues the receiver in
-// process.
+// process. A ToolElicitor or ToolRecorder the receiver leaves nil is
+// the sender's.
 //
 // The handoff lasts for the response. The caller's next request is
 // started by [WithStart], or under the adapter's own configuration
@@ -165,7 +166,8 @@ func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*
 // conversation, the request's input with the message that opens it
 // last. A configuration it returns is used in place of the adapter's,
 // in both modes and under the request's model and instructions as the
-// adapter's own is; false keeps the adapter's. It is how the receiver
+// adapter's own is, with the adapter's ToolElicitor and ToolRecorder
+// where it leaves them nil; false keeps the adapter's. It is how the receiver
 // of a handoff answers the conversation's later requests: the adapter
 // keeps no state between requests, so the conversation says who has
 // it.
@@ -273,6 +275,10 @@ func (a *Adapter) CreateStream(ctx context.Context, req openresponses.Request, s
 	if a.route != nil {
 		models = a.attribute(transcript, req)
 	}
+	// A request started under another configuration, the receiver the
+	// conversation was handed to, asks and records where the adapter's
+	// own does (#234).
+	base = inherit(base, a.cfg)
 	if base.Model == nil {
 		return openresponses.ServerError("no_model", "agent has no model")
 	}
@@ -324,7 +330,7 @@ func (a *Adapter) fullRun(ctx context.Context, base agentturn.Config, req openre
 		models.Attribute(cfg.ModelName, end.Items)
 		transcript = append(transcript, end.Items...)
 		runCtx = agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff", Ref: cfg.Name})
-		cfg = a.perRequest(next, req)
+		cfg = a.perRequest(inherit(next, cfg), req)
 	}
 	switch end.Reason {
 	case agentturn.ReasonError:
@@ -449,6 +455,20 @@ func (a *Adapter) handsOff(ctx context.Context, end *agentturn.RunEnd, results [
 		return agentturn.Config{}, false
 	}
 	return a.handoff(ctx, end, results)
+}
+
+// inherit returns next with from's ToolElicitor and ToolRecorder
+// wherever next has none of its own, so a receiver of a handoff, within
+// a request or at the start of a later one, puts its tools' questions
+// to the same people and records their writes in the same place.
+func inherit(next, from agentturn.Config) agentturn.Config {
+	if next.ToolRecorder == nil {
+		next.ToolRecorder = from.ToolRecorder
+	}
+	if next.ToolElicitor == nil {
+		next.ToolElicitor = from.ToolElicitor
+	}
+	return next
 }
 
 // perRequest returns cfg under the request's model and instructions.

@@ -339,3 +339,107 @@ func TestReasoningAcrossHandoff(t *testing.T) {
 		})
 	}
 }
+
+// TestAReceiverInheritsTheQuestionChannel pins #234 over this front: a
+// receiver without a ToolElicitor or ToolRecorder of its own, whether a
+// WithHandoff switch within the request or the configuration a later
+// request starts under by WithTransfers, puts its tools' questions to
+// the adapter's own elicitor, and one with its own keeps it.
+func TestAReceiverInheritsTheQuestionChannel(t *testing.T) {
+	confirm := agenttool.NewFunc("confirm", "confirms the refund", json.RawMessage(`{"type":"object"}`),
+		func(ctx context.Context, _ agenttool.Call) (agenttool.Result, error) {
+			elicit, ok := agenttool.ElicitorFrom(ctx)
+			if !ok {
+				return agenttool.Text("nobody asked"), nil
+			}
+			if _, err := elicit(ctx, agenttool.Elicitation{Message: "refund?"}); err != nil {
+				return agenttool.Result{}, err
+			}
+			return agenttool.Text("confirmed"), nil
+		})
+	route := func(billing agentturn.Config) Route {
+		return func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+			return billing, "transferred", call.Name == "transfer_to_billing"
+		}
+	}
+	for _, tc := range []struct {
+		name     string
+		next     bool
+		ownAsker bool
+	}{
+		{name: "a handoff within the request"},
+		{name: "the next request's start", next: true},
+		{name: "a receiver with its own", next: true, ownAsker: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var asked, askedOwn int
+			billing := agentturn.Config{Name: "billing", Model: callsOnce{"confirm"}, Tools: []agenttool.Tool{confirm}}
+			if tc.ownAsker {
+				billing.ToolElicitor = func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+					askedOwn++
+					return agenttool.Answer{Action: agenttool.ActionAccept}, nil
+				}
+			}
+			triage := agentturn.Config{Name: "triage", Model: preamble{}, ModelName: "m", Tools: []agenttool.Tool{transfer},
+				ToolElicitor: func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+					asked++
+					return agenttool.Answer{Action: agenttool.ActionAccept}, nil
+				}}
+			req := request(openresponses.UserText("I was double charged"))
+			opts := []Option{WithHandoff(func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool) {
+				return billing, true
+			})}
+			if tc.next {
+				opts = []Option{WithTransfers(route(billing))}
+				call := &openresponses.FunctionCall{CallID: "call_t", Name: "transfer_to_billing", Arguments: "{}"}
+				req = request(openresponses.UserText("I was double charged"), call, openresponses.NewFunctionCallOutput("call_t", "transferred"), openresponses.UserText("refund it"))
+			}
+			sink, err := streamtest.Run(context.Background(), New(triage, opts...), req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := sink.Response().OutputText(); !strings.HasSuffix(got, "Tool result: confirmed") {
+				t.Errorf("answer = %q, want the receiver's tool to have asked", got)
+			}
+			wantOwn, wantServing := 0, 1
+			if tc.ownAsker {
+				wantOwn, wantServing = 1, 0
+			}
+			if asked != wantServing || askedOwn != wantOwn {
+				t.Errorf("asked the adapter's elicitor %d times and the receiver's %d, want %d and %d", asked, askedOwn, wantServing, wantOwn)
+			}
+		})
+	}
+}
+
+// callsOnce calls name once, with no arguments, and echoes once the
+// call has its output.
+type callsOnce struct{ name string }
+
+func (m callsOnce) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	calls := map[string]bool{}
+	for _, item := range req.Input {
+		switch it := item.(type) {
+		case *openresponses.FunctionCall:
+			if it.Name == m.name {
+				calls[it.CallID] = true
+			}
+		case *openresponses.FunctionCallOutput:
+			if calls[it.CallID] {
+				return (&echo.Adapter{}).CreateStream(ctx, req, sink)
+			}
+		}
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.FunctionCall("", m.name)
+	if err != nil {
+		return err
+	}
+	if err := w.Arguments(`{}`); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}

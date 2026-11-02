@@ -453,6 +453,15 @@ versions may break the API.
   0001 Composition (as a tool, as a peer) states the rule, and its open
   question "Input required as an interface" is closed. (#84)
 
+- Fixed: a task `front/a2a` starts under `WithStart`'s or
+  `WithTransfers`' receiver, the conversation's next message after a
+  transfer, gives the receiver the executor's `ToolElicitor` and
+  `ToolRecorder` when it has none, as a `WithHandoff` switch within a
+  task already did, so a call its hook holds is asked rather than
+  refused. `front/responses` does the same for a request's start and
+  for a `WithHandoff` receiver, which inherited neither. RFC 0001
+  Composition. (#234)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

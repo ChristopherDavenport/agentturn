@@ -1630,7 +1630,13 @@ An agent stands in four places inside another system:
   takes the handoff within the one request: both fronts ask a host
   function for the receiver's configuration when a run stops on a
   terminating result, and relay the receiver's run in the same
-  response or task. A transcript holds whatever
+  response or task. A front that starts a run under a configuration
+  other than its own, a handoff's receiver within a task or the
+  configuration a later task or request starts under, gives that
+  configuration the serving side's question channel (its elicitor) and
+  tool record channel when it has none of its own, so a held call is
+  put to the same people however the conversation reached its current
+  agent (#234). A transcript holds whatever
   the previous model produced, reasoning items included, and a
   reasoning item carries a signature its own provider issued; a
   handoff that changes the model MUST leave them out of the receiver's

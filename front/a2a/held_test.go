@@ -435,3 +435,57 @@ func TestHeldOwnCallAfterHandoffAsksSendersElicitor(t *testing.T) {
 		t.Errorf("issue_refund ran %d times, elicitor asked about %+v; want once each", ran, asked)
 	}
 }
+
+// TestHeldCallInTheNextTaskAsksTheServingSide pins #234: a task that
+// starts under the route's receiver, the conversation's next message
+// after a transfer, gives the receiver the serving side's elicitor
+// when it has none of its own, as a WithHandoff switch does, so a call
+// its hook holds is put to the same people however the conversation
+// reached it (the probe's scenario 26). A receiver with an elicitor of
+// its own keeps it.
+func TestHeldCallInTheNextTaskAsksTheServingSide(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		own  bool
+	}{
+		{"a receiver without an elicitor", false},
+		{"a receiver with its own", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var ran int
+			refund := agenttool.NewFunc("issue_refund", "refunds a charge", json.RawMessage(`{"type":"object"}`),
+				func(context.Context, agenttool.Call) (agenttool.Result, error) {
+					ran++
+					return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: "refunded"}}, nil
+				})
+			var asked, askedOwn []agentturn.AskedCall
+			billing := agentturn.Config{Name: "billing", Model: callsOnce{"issue_refund"}, Tools: []agenttool.Tool{refund},
+				BeforeToolCall: holds("issue_refund", "a person approves refunds")}
+			if tc.own {
+				billing.ToolElicitor = answering(agenttool.ActionAccept, &askedOwn)
+			}
+			route := func(call *openresponses.FunctionCall) (agentturn.Config, string, bool) {
+				return billing, "transferred", call.Name == "transfer_to_billing"
+			}
+			triage := agentturn.Config{Name: "triage", Model: preamble{}, Tools: []agenttool.Tool{transferToBilling}, ToolElicitor: answering(agenttool.ActionAccept, &asked)}
+			h := a2asrv.NewHandler(New(triage, WithTransfers(route)))
+			first := sendTask(t, h, userMessage("I was double charged"))
+			if first.Status.State != a2a.TaskStateCompleted {
+				t.Fatalf("first task = %s %q", first.Status.State, taskText(first))
+			}
+			next := userMessage("please refund it")
+			next.ContextID = first.ContextID
+			task := sendTask(t, h, next)
+			if task.Status.State != a2a.TaskStateCompleted || taskText(task) != "Tool result: refunded" {
+				t.Fatalf("second task = %s %q, want completed with the refund's output", task.Status.State, taskText(task))
+			}
+			want, other := asked, askedOwn
+			if tc.own {
+				want, other = askedOwn, asked
+			}
+			if ran != 1 || len(want) != 1 || want[0].Name != "issue_refund" || len(other) != 0 {
+				t.Errorf("issue_refund ran %d times; asked the serving side %+v, the receiver's own %+v", ran, asked, askedOwn)
+			}
+		})
+	}
+}
