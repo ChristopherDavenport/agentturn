@@ -1491,3 +1491,66 @@ func TestPendingCarriesTheHold(t *testing.T) {
 		})
 	}
 }
+
+// TestAForkThatWithdrewItsOwnDispatchStillReadsTheOrigin pins the
+// review's L1: a withdrawal takes the fork's own dispatch off its path,
+// so a call in the fork's prefix is what the origin says it is, and a
+// call that completed in the origin is read with its output there,
+// not as one the file cannot say about.
+func TestAForkThatWithdrewItsOwnDispatchStillReadsTheOrigin(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	origin, err := store.Create(ctx, agentsession.Header{Records: agentsession.AllRecords})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append(ctx, origin.ID(), &agentsession.ItemEntry{Item: openresponses.UserText("charge me")}); err != nil {
+		t.Fatal(err)
+	}
+	call := &openresponses.FunctionCall{CallID: "call_1", Name: "charge", Arguments: `{"text":"t"}`}
+	target, err := store.Append(ctx, origin.ID(), &agentsession.ItemEntry{Item: call, ResponseID: "resp_1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := store.Append(ctx, origin.ID(), &agentsession.ResponseEntry{ResponseID: "resp_1", Status: openresponses.ResponseStatusCompleted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range []agentsession.Entry{
+		agentsession.NewDispatch(call.CallID, target).WithIdempotencyKey("k1"),
+		&agentsession.ItemEntry{Item: openresponses.NewFunctionCallOutput(call.CallID, "charged")},
+	} {
+		if _, err := store.Append(ctx, origin.ID(), e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec, fork, err := Start(ctx, store, agentsession.Header{Base: base, ParentSession: origin.ID()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fork handed the call off and withdrew the hand-off.
+	for _, e := range []agentsession.Entry{
+		agentsession.NewDispatch(call.CallID, target).WithIdempotencyKey("k2"),
+		agentsession.NewWithdrawal(call.CallID, target, "", "the audit log is down"),
+	} {
+		if _, err := store.Append(ctx, fork.ID(), e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if fork, err = store.Open(ctx, fork.ID()); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := Pending(fork, rec.ReadOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Reason != agentturn.PendingAborted || pending[0].IdempotencyKey != "k1" {
+		t.Fatalf("pending = %+v, want the origin's hand-off under k1", pending)
+	}
+	if p := pending[0]; p.Ran == nil || p.Ran.Output.Text != "charged" || p.RanWhere != ranInOriginReason {
+		t.Errorf("Ran = %+v where %q, want the origin's output", p.Ran, p.RanWhere)
+	}
+	if err := fork.VerifyRecords(fork.Leaf()); err != nil {
+		t.Errorf("verify: %v", err)
+	}
+}

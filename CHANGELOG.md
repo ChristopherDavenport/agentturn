@@ -65,6 +65,11 @@ versions may break the API.
   earlier version wrote, and no longer read a withdrawn dispatch on the
   path as one off it. RFC 0001's open question on such a dispatch is
   closed. (#119, #278)
+- Fixed: in a fork whose own dispatch of a call in its prefix was
+  withdrawn, `Pending` reads the call from the session the fork was made
+  from, as for a call the fork never dispatched, with the origin's key
+  and, when it completed there, its output as `Ran`. It read the call as
+  one the file cannot say about.
 - Added: `ToolEnd.Cut`, set when a cancellation or a failure cut the
   call off before it had a result of its own, so its output is not
   appended; `front/control` carries it as `cut`.

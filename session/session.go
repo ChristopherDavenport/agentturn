@@ -1805,6 +1805,29 @@ func (o *origins) dispatchOff(s *agentsession.Session, callEntry string) (*agent
 			on[e.Base().ID] = true
 		}
 		ds = slices.DeleteFunc(ds, func(d *agentsession.DispatchEntry) bool { return on[d.ID] })
+		if len(ds) == 0 && s.Prefix(callEntry) && o.r != nil && s.Header().ParentSession != "" {
+			// Every dispatch s holds is on its path, withdrawn: a call
+			// in a fork's prefix is then what the session the fork was
+			// made from says it is, as for one s never dispatched.
+			origin, err := o.r.Read(o.ctx, s.Header().ParentSession)
+			if errors.Is(err, agentsession.ErrNoSession) {
+				return nil, nil, nil
+			}
+			if err != nil {
+				if o.lenient {
+					return nil, nil, nil
+				}
+				return nil, nil, fmt.Errorf("session: read origin %s: %w", s.Header().ParentSession, err)
+			}
+			// The origin's own dispatches are off the fork's path, so
+			// they are read as they stand.
+			if at, ds, err = agentsession.OriginDispatches(o.ctx, o.r, origin, callEntry); err != nil {
+				if o.lenient {
+					return nil, nil, nil
+				}
+				return nil, nil, fmt.Errorf("session: %w", err)
+			}
+		}
 	}
 	if len(ds) == 0 {
 		return nil, nil, nil
