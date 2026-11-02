@@ -2278,29 +2278,62 @@ func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Respon
 		paired[i] = -1
 	}
 	taken := make([]bool, len(calls))
-	pair := func(index int, match func(*openedItem) bool) {
+	// pair pairs the call at index of the response with the first call
+	// of the attempt not yet paired that match accepts, among the
+	// completed ones when completed is set and among those never
+	// completed otherwise.
+	pair := func(index int, completed bool, match func(*openedItem) bool) {
 		for j, at := range calls {
-			if !taken[j] && match(&r.opened[at]) {
+			if o := &r.opened[at]; !taken[j] && (o.done != nil) == completed && match(o) {
 				paired[index], taken[j] = j, true
 				return
 			}
 		}
 	}
-	for index, item := range resp.Output {
-		if call, ok := item.(*openresponses.FunctionCall); ok && call.ID != "" {
-			pair(index, func(c *openedItem) bool { return c.itemID == call.ID })
+	// each runs pass over the response's calls not yet paired.
+	each := func(pass func(index int, call *openresponses.FunctionCall)) {
+		for index, item := range resp.Output {
+			if call, ok := item.(*openresponses.FunctionCall); ok && paired[index] < 0 {
+				pass(index, call)
+			}
 		}
 	}
-	for index, item := range resp.Output {
-		if call, ok := item.(*openresponses.FunctionCall); ok && paired[index] < 0 && call.CallID != "" {
-			pair(index, func(c *openedItem) bool { return c.modelCallID == call.CallID })
+	// An item ID names one call, completed or not.
+	each(func(index int, call *openresponses.FunctionCall) {
+		if call.ID != "" {
+			pair(index, true, func(c *openedItem) bool { return c.itemID == call.ID })
 		}
-	}
-	for index, item := range resp.Output {
-		if _, ok := item.(*openresponses.FunctionCall); ok && paired[index] < 0 {
-			pair(index, func(*openedItem) bool { return true })
+		if call.ID != "" && paired[index] < 0 {
+			pair(index, false, func(c *openedItem) bool { return c.itemID == call.ID })
 		}
-	}
+	})
+	// A completed call is the one the response lists with its call ID
+	// and its arguments; one never completed has no arguments to match,
+	// so it is paired by its call ID next, before a completed call that
+	// shares only the call ID would take its place, and the rest by
+	// their call ID and then by order, the completed ones first (#236).
+	each(func(index int, call *openresponses.FunctionCall) {
+		pair(index, true, func(c *openedItem) bool {
+			done := c.done.(*openresponses.FunctionCall)
+			return call.CallID != "" && c.modelCallID == call.CallID && done.Arguments == call.Arguments
+		})
+	})
+	each(func(index int, call *openresponses.FunctionCall) {
+		if call.CallID != "" {
+			pair(index, false, func(c *openedItem) bool { return c.modelCallID == call.CallID })
+		}
+	})
+	each(func(index int, call *openresponses.FunctionCall) {
+		if call.CallID != "" {
+			pair(index, true, func(c *openedItem) bool { return c.modelCallID == call.CallID })
+		}
+	})
+	each(func(index int, _ *openresponses.FunctionCall) {
+		pair(index, true, func(*openedItem) bool { return true })
+	})
+	each(func(index int, _ *openresponses.FunctionCall) {
+		pair(index, false, func(*openedItem) bool { return true })
+	})
 	if complete {
 		for index, item := range resp.Output {
 			call, ok := item.(*openresponses.FunctionCall)
@@ -2337,6 +2370,25 @@ func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Respon
 			unpaired = true
 		}
 	}
+	// The transcript holds the calls the stream completed in the order
+	// they opened and then the ones only the response completed, so a
+	// response that lists one of the latter before one of the former is
+	// out of the transcript's order. rank is a call's place there.
+	rank := func(j int) int {
+		if r.opened[calls[j]].fromResponse {
+			return len(calls) + j
+		}
+		return j
+	}
+	last := -1
+	for index := range resp.Output {
+		if j := paired[index]; j >= 0 {
+			if rank(j) < last {
+				unpaired = true
+			}
+			last = rank(j)
+		}
+	}
 	if unpaired {
 		// A completed call the response does not list, because the
 		// server built its terminal response one item per output index
@@ -2345,13 +2397,19 @@ func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Respon
 		// paired by now, so the listed calls, as a group, give way to
 		// the transcript's calls in the order they opened, which is the
 		// transcript's order, where the first of them stood; an item
-		// that is not a call keeps its place.
-		var held openresponses.Items
+		// that is not a call keeps its place. So do listed calls out of
+		// the transcript's order, a call only the response completed
+		// listed before one the stream completed.
+		var held, late openresponses.Items
 		for _, at := range calls {
-			if done := r.opened[at].done; done != nil {
-				held = append(held, done)
+			switch o := r.opened[at]; {
+			case o.fromResponse:
+				late = append(late, o.done)
+			case o.done != nil:
+				held = append(held, o.done)
 			}
 		}
+		held = append(held, late...)
 		copied := *resp
 		copied.Output = make(openresponses.Items, 0, len(resp.Output)+len(held))
 		placed := false

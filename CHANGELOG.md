@@ -346,7 +346,10 @@ versions may break the API.
   ran it under another call's ID, so the next request sent an output
   with no call and a recorder failed the run. The response's calls pair
   with the attempt's by item ID, the model's call ID or open order,
-  never by output index. RFC 0001 The model call and Invariants. (#236)
+  never by output index, the completed calls first, by item ID or by
+  call ID and arguments, so a call completed at an index another call
+  opened at first runs once, under its own ID. RFC 0001 The model call
+  and Invariants. (#236)
 
 - Fixed: a retry the policy's `Revise` moves to another model, and a
   `BeforeModelCall` hook that does, keeping the input the loop built,

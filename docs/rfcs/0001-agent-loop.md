@@ -587,10 +587,17 @@ the transcript.
   under the ID the transcript holds it by. A function call the
   completed response lists that the stream opened and never completed
   is completed from the response: it takes the ID decided when it
-  opened, paired as above by item ID or else by open order among the
-  calls the attempt opened, never by its position in the response,
-  which after a reused output index names another call, and it is
-  appended with its `item_end` before `response_end`. A listed call the
+  opened, paired by item ID or else by open order among the calls the
+  attempt opened, never by its position in the response, which after a
+  reused output index names another call, and it is appended with its
+  `item_end` before `response_end`. The completed calls are paired
+  first: a listed call whose item ID, or whose call ID and arguments,
+  match a completed call is that call, and only a listed call left
+  over pairs with a call never completed, by call ID and then by order,
+  so a completed call is never taken for one that shares only its call
+  ID. The response the turn acts on lists the calls in the
+  transcript's order, the ones only the response completed after the
+  ones the stream completed. A listed call the
   stream never opened is decided and appended the same way at that
   point, so every call the response lists is paired or decided and
   none runs that the transcript does not hold. A call the stream opened

@@ -1513,6 +1513,8 @@ const (
 	lastWhole lastCall = iota
 	lastNoDone
 	lastUnopened
+	// firstNoDone leaves out the first call's output_item.done instead.
+	firstNoDone
 )
 
 func (m *reusedIndexModel) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
@@ -1539,8 +1541,11 @@ func (m *reusedIndexModel) CreateStream(_ context.Context, req openresponses.Req
 				skipping = m.last == lastUnopened && opened == len(m.calls)
 			}
 		case *openresponses.OutputItemDoneEvent:
-			if _, ok := e.Item.(*openresponses.FunctionCall); ok && m.last != lastWhole && opened == len(m.calls) {
+			if _, ok := e.Item.(*openresponses.FunctionCall); ok && (m.last == lastNoDone || m.last == lastUnopened) && opened == len(m.calls) {
 				skipping = false
+				return nil
+			}
+			if _, ok := e.Item.(*openresponses.FunctionCall); ok && m.last == firstNoDone && opened == 1 {
 				return nil
 			}
 		}
@@ -1779,6 +1784,9 @@ func TestBatchRunsTheCallsTheTranscriptHolds(t *testing.T) {
 		noID      idPlaces
 		accShaped bool
 		last      lastCall
+		// ran is how many calls the transcript holds and the batch runs,
+		// when not every call the stream opened: 0 means all of them.
+		ran int
 	}{
 		{name: "a: one index, no item IDs", calls: []string{"call_a", "call_b"}, atZero: true, noID: all},
 		{name: "one index, no item IDs, terminal response lists the last call alone", calls: []string{"call_a", "call_b"}, atZero: true, noID: all, accShaped: true},
@@ -1806,6 +1814,11 @@ func TestBatchRunsTheCallsTheTranscriptHolds(t *testing.T) {
 		{name: "own indexes, last never opened", calls: []string{"call_a", "call_b"}, noID: all, last: lastUnopened},
 		{name: "own indexes, one call ID, last never opened", calls: []string{"call_0", "call_0"}, noID: all, last: lastUnopened},
 		{name: "one index, one call ID, last never opened", calls: []string{"call_0", "call_0"}, atZero: true, noID: all, last: lastUnopened},
+		// A call never completed whose index a completed call took, and
+		// which the response does not list, is not run, and the
+		// completed call runs once, under its own ID.
+		{name: "one index, one call ID, first with no output_item.done, response lists the last", calls: []string{"call_0", "call_0"}, atZero: true, noID: all, accShaped: true, last: firstNoDone, ran: 1},
+		{name: "own indexes, one call ID, first with no output_item.done", calls: []string{"call_0", "call_0"}, noID: all, last: firstNoDone},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1832,8 +1845,12 @@ func TestBatchRunsTheCallsTheTranscriptHolds(t *testing.T) {
 					outputs[it.CallID] = append(outputs[it.CallID], it.Output.String())
 				}
 			}
-			if len(order) != len(tc.calls) {
-				t.Fatalf("calls %v, want %d", order, len(tc.calls))
+			wantCalls := len(tc.calls)
+			if tc.ran != 0 {
+				wantCalls = tc.ran
+			}
+			if len(order) != wantCalls {
+				t.Fatalf("calls %v, want %d", order, wantCalls)
 			}
 			for id, a := range args {
 				var in echoArgs
