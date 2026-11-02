@@ -321,6 +321,9 @@ versions may break the API.
   that entry's item unchanged, and otherwise the session alone with its
   path's trust, so `VerifyCopies` holds. (#237)
 
+- Fixed: a prompt holding an item type that cannot be compared no
+  longer panics the loop when the hidden and copied marks are stripped.
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

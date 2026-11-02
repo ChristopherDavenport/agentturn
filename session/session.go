@@ -443,6 +443,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"sync"
 	"time"
@@ -5105,7 +5106,8 @@ func (w *writer) copiedFrom(ctx context.Context, item openresponses.Item) (*copy
 	src := &copySource{from: agentsession.CopiedFrom{Session: w.parentID}, pathTrust: agentsession.PathTrust(ps.Path(ps.Leaf()))}
 	src.trust = src.pathTrust
 	p := w.parent
-	if p == nil || item == nil {
+	if p == nil || item == nil || !reflect.TypeOf(item).Comparable() {
+		// An item type that cannot be compared is matched by no entry.
 		return src, nil
 	}
 	for i := len(p.values) - 1; i >= 0; i-- {

@@ -99,10 +99,13 @@ func marks(item openresponses.Item) (base openresponses.Item, hidden, copied boo
 func unhideAll(items openresponses.Items) openresponses.Items {
 	var out openresponses.Items
 	for i, item := range items {
-		base, _, _ := marks(item)
-		if base == item {
+		// The marks are checked by type: an item type that cannot be
+		// compared would panic an equality test.
+		m, marked := item.(markedItem)
+		if !marked {
 			continue
 		}
+		base := m.item
 		if out == nil {
 			out = append(openresponses.Items(nil), items...)
 		}

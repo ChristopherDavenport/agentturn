@@ -267,3 +267,23 @@ func TestACopiedItemIsMarkedOnItsEvents(t *testing.T) {
 		}
 	}
 }
+
+// valueItem is an item type held by value that cannot be compared, as
+// an extension's item may be.
+type valueItem struct{ parts []string }
+
+func (valueItem) ItemType() string { return "x.value" }
+
+// TestAnIncomparableItemIsNotCompared pins that stripping the marks
+// never compares items, so an item type that cannot be compared does
+// not panic the loop.
+func TestAnIncomparableItemIsNotCompared(t *testing.T) {
+	items := openresponses.Items{valueItem{parts: []string{"a"}}, Hidden(valueItem{parts: []string{"b"}})}
+	out := unhideAll(items)
+	if _, ok := out[1].(valueItem); !ok {
+		t.Errorf("out[1] = %T, want the item itself", out[1])
+	}
+	if _, ok := out[0].(valueItem); !ok {
+		t.Errorf("out[0] = %T", out[0])
+	}
+}
