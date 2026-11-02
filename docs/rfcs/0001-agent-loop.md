@@ -615,10 +615,11 @@ the transcript.
   reused output index names another call, and it is appended with its
   `item_end` before `response_end`. The completed calls are paired
   first: a listed call whose item ID, or whose call ID and arguments,
-  match a completed call is that call, and only a listed call left
-  over pairs with a call never completed, by call ID and then by order,
-  so a completed call is never taken for one that shares only its call
-  ID. The response the turn acts on lists the calls in the
+  match a completed call is that call. A listed call left over pairs by
+  its call ID with the calls of that ID in the order they opened,
+  completed or not, and then by order, the completed calls first, so
+  neither a completed call nor one never completed is taken for
+  another that only shares its call ID. The response the turn acts on lists the calls in the
   transcript's order, the ones only the response completed after the
   ones the stream completed. A listed call the
   stream never opened is decided and appended the same way at that

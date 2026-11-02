@@ -2389,24 +2389,26 @@ func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Respon
 		}
 	})
 	// A completed call is the one the response lists with its call ID
-	// and its arguments; one never completed has no arguments to match,
-	// so it is paired by its call ID next, before a completed call that
-	// shares only the call ID would take its place, and the rest by
-	// their call ID and then by order, the completed ones first (#236).
+	// and its arguments. A call ID the model gave more than one call
+	// names them in the order they opened, completed or not: a call
+	// never completed has no arguments to match, and a completed one
+	// whose arguments the response gives otherwise matches none, so
+	// neither takes the other's place by sharing the ID (#236).
 	each(func(index int, call *openresponses.FunctionCall) {
 		pair(index, true, func(c *openedItem) bool {
 			done := c.done.(*openresponses.FunctionCall)
-			return call.CallID != "" && c.modelCallID == call.CallID && done.Arguments == call.Arguments
+			return c.modelCallID == call.CallID && done.Arguments == call.Arguments
 		})
 	})
 	each(func(index int, call *openresponses.FunctionCall) {
-		if call.CallID != "" {
-			pair(index, false, func(c *openedItem) bool { return c.modelCallID == call.CallID })
+		if call.CallID == "" {
+			return
 		}
-	})
-	each(func(index int, call *openresponses.FunctionCall) {
-		if call.CallID != "" {
-			pair(index, true, func(c *openedItem) bool { return c.modelCallID == call.CallID })
+		for j, at := range calls {
+			if o := &r.opened[at]; !taken[j] && o.modelCallID == call.CallID {
+				paired[index], taken[j] = j, true
+				return
+			}
 		}
 	})
 	each(func(index int, _ *openresponses.FunctionCall) {
