@@ -173,7 +173,7 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 				transcript: append(Transcript(nil), t...),
 				runCtx:     runCtx,
 				reasoning:  reasoningFromContext(ctx).merged(nil),
-				quarantine: inheritQuarantine(ctx, &quarantine{}),
+				quarantine: runQuarantine(ctx),
 				// Every event is sent, cancelled or not: the consumer
 				// below drains the channel until the run returns, so a
 				// send never blocks for good, and the events an abort
@@ -1619,7 +1619,16 @@ func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponse
 // configuration's: a retry's revision that moved the turn to another
 // model is weighed as that model's request.
 func (r *runner) requestWith(ctx context.Context, tools agenttool.Set, settings *openresponses.Request) (openresponses.Request, built, error) {
-	// The transform and BeforeModelCall run under the attribution too.
+	return r.build(ctx, tools, settings, true)
+}
+
+// build is requestWith, building the request once more, when again is
+// set, if the before-model-call hook quarantined an item the transform
+// had folded into it, so the fold is made again without it.
+func (r *runner) build(ctx context.Context, tools agenttool.Set, settings *openresponses.Request, again bool) (openresponses.Request, built, error) {
+	outer := ctx
+	// The transform and BeforeModelCall run under the attribution and
+	// the quarantine too.
 	ctx = r.attributed(ctx)
 	// The settings come first, so the transform can weigh what the
 	// request will carry beside the input (#279).
@@ -1656,6 +1665,12 @@ func (r *runner) requestWith(ctx context.Context, tools agenttool.Set, settings 
 		// A hook that moved the call to another model and kept the
 		// loop's input is sent that input as built for the model.
 		req = b.forModel(r, before, req)
+		if r.quarantine.generation() != gen && again && r.cfg.Transform != nil && foldedAway(r.quarantine, r.transcript, input) {
+			// The hook quarantined an item the transform had folded
+			// into this request, a summary of it say: the request is
+			// built again, so the fold is made without it (#281).
+			return r.build(outer, tools, settings, false)
+		}
 		if r.quarantine.generation() != gen {
 			// The hook quarantined items: the request it returns
 			// leaves them out already.
@@ -1667,6 +1682,24 @@ func (r *runner) requestWith(ctx context.Context, tools agenttool.Set, settings 
 		}
 	}
 	return req, b, nil
+}
+
+// foldedAway reports whether an item of transcript the quarantine holds
+// is not among what the transform returned, sent: the transform folded
+// it, or left it out, so what it returned may still carry its content.
+func foldedAway(q *quarantine, transcript, sent Transcript) bool {
+	kept := make(map[openresponses.Item]bool, len(sent))
+	for _, item := range sent {
+		if item != nil && reflect.TypeOf(item).Comparable() {
+			kept[item] = true
+		}
+	}
+	for _, item := range transcript {
+		if item != nil && reflect.TypeOf(item).Comparable() && !kept[item] && q.has(item) {
+			return true
+		}
+	}
+	return false
 }
 
 // built is what request built a turn's input from: filtered, the
@@ -2694,7 +2727,9 @@ func (r *runner) attributed(ctx context.Context) context.Context {
 // and the invoker that runs another of the turn's tools through the
 // loop.
 func (r *runner) toolContext(ctx context.Context, tools agenttool.Set) context.Context {
-	ctx = ContextWithTranscript(ctx, append(Transcript(nil), r.transcript...))
+	// A tool reads the conversation as a request carries it: what the
+	// quarantine leaves out is not there (#281).
+	ctx = ContextWithTranscript(ctx, Transcript(r.quarantine.apply(append(openresponses.Items(nil), r.transcript...))))
 	ctx = r.attributed(ctx)
 	// [Ask] says a person's accept note through the run whose hook or
 	// tool asked.

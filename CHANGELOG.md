@@ -416,8 +416,19 @@ versions may break the API.
   hook was given, and passes it to runs a tool starts over the
   conversation. The session recorder writes it as `omit.outputs` and
   `omit.items`, so every later response still verifies.
-  `Agent.Quarantined` lists the items. RFC 0001 The request step 3.
-  (#281)
+  `Agent.Quarantined` lists the items. A quarantine covers everything
+  a request is built from: the transform reads it,
+  `QuarantinedFromContext`, and `compact` leaves quarantined items out
+  of what a fold sends its summarizer and folds again when a quarantine
+  reaches a prefix it already summarised; when a `BeforeModelCall`
+  guard quarantines an item the transform folded into that request,
+  the loop builds the request once more. A tool's
+  `TranscriptFromContext` is the quarantined view. A run a tool starts
+  takes the quarantine as it stands then. `QuarantineSet` with
+  `ContextWithQuarantineSet` carries one through `Run` and `Continue`,
+  and `front/responses` carries one across a handoff's legs. The record
+  and its exports keep the items as they arrived. RFC 0001 The request
+  step 3. (#281)
 
 ## v0.0.34 - 2026-10-26
 

@@ -287,7 +287,10 @@ func (a *Adapter) CreateStream(ctx context.Context, req openresponses.Request, s
 	if len(callerTools) > 0 {
 		return a.oneTurn(ctx, base, req, transcript, models, callerTools, rl)
 	}
-	return a.fullRun(ctx, base, req, transcript, models, rl)
+	// Every leg of a handoff continues one conversation, so what a leg's
+	// guard quarantined the next leg's requests leave out too (#281).
+	quarantined, _ := agentturn.NewQuarantineSet()
+	return a.fullRun(agentturn.ContextWithQuarantineSet(ctx, quarantined), base, req, transcript, models, rl)
 }
 
 // attribute says which model produced each reasoning item of the
