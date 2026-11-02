@@ -440,7 +440,9 @@ An agent can stand in three places inside another system.
 - **As itself, under new settings.** `Agent.SetConfig` replaces the
   configuration and keeps the transcript, so the next `Continue` runs
   the same conversation under another agent's instructions, tools and
-  model: the handoff of the agent frameworks, with no package. A
+  model: the handoff of the agent frameworks, with no concept of it
+  in the loop; the `handoff` package beside the fronts is the switch
+  loop around it (#274). A
   session recorder writes the switch as a config delta, so `ContextAt`
   at any response gives the settings it was produced under. A
   terminating tool result is the usual trigger: the loop stops with
@@ -450,7 +452,8 @@ An agent can stand in three places inside another system.
   and `front/a2a` carry the pattern across their protocols with
   `WithHandoff`, `WithStart` and `WithTransfers`. A one-shot trim of
   the history for the receiver is `Agent.SetTranscript` between runs,
-  never `Transform`, which runs on every call (issue #96).
+  never `Transform`, which runs on every call (issue #96), and must
+  leave a transcript the loop can continue (#276).
 
 ### Both directions for every protocol
 

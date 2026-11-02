@@ -469,6 +469,34 @@ versions may break the API.
   calls it left pending again under a new task. A test pins that path.
   RFC 0001 Composition (as a peer) states the rule. (#257)
 
+- Added: the `handoff` package, the in-process handoff every product
+  with more than one agent wrote again. `handoff.New(agents…)` builds a
+  `Team`, each agent's configuration gaining a terminating
+  `transfer_to_<agent>` tool (`ToolName`) per handoff it offers
+  (`To{Agent, Filter, Enabled}`); `Team.Run` prompts an agent and
+  follows each transfer: it applies the handoff's filter once with
+  `SetTranscript` (`RemoveAllTools` is the Agents SDK's
+  `remove_all_tools`), switches with `SetConfig`, the receiver
+  inheriting the sender's `ToolElicitor` and `ToolRecorder` where it
+  has none, and continues under a `handoff` trigger naming the sender,
+  returning the path of agents; after `MaxHandoffs` (default 10) it
+  returns `ErrTooManyHandoffs`. `Team.Route` is the
+  `front/responses.Route` both fronts' `WithTransfers` take, so the same
+  team is served over either. This reverses #96's "a handoff needs no
+  package". RFC 0001 Composition states the rules a host taking a
+  handoff meets, and its open question on the handoff is closed. (#274)
+- Changed: `front/a2a` and `front/responses` bound the `WithHandoff`
+  switches one task or request follows, `WithMaxHandoffs(n)`,
+  `DefaultMaxHandoffs` (10) by default, where a pair of agents handing
+  back and forth ran until the host declined or the task was canceled;
+  past the bound the task or response ends as when `WithHandoff`
+  declines. (#274)
+- Fixed: RFC 0001, the README and `Agent.SetTranscript` say a handoff's
+  trim between runs must leave a transcript the loop can continue, and
+  that a trim leaving a model output last appends a developer message
+  naming the transfer, the sender and the receiver; `handoff.Team.Run`
+  does so. (#276)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

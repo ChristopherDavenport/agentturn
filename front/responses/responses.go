@@ -107,6 +107,7 @@ type Adapter struct {
 	handoff             func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool)
 	start               func(context.Context, agentturn.Transcript) (agentturn.Config, bool)
 	route               Route
+	maxHandoffs         int
 }
 
 var _ openresponses.Adapter = (*Adapter)(nil)
@@ -143,9 +144,10 @@ func WithToolItems() Option {
 // destination is in a result's Details, which the model never sees,
 // or in end.Items, the terminating call and its output. It is asked
 // again each time a run it started stops the same way, so a pair of
-// agents that hand back and forth runs until fn declines or the
-// request's context ends; a host that wants a bound counts on a value
-// it puts on that context.
+// agents that hand back and forth runs until fn declines, the
+// request's context ends or the request has followed
+// [WithMaxHandoffs] of them, [DefaultMaxHandoffs] by default, after
+// which the response ends as when fn declines.
 //
 // The receiver's run is continued under
 // agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff",
@@ -220,6 +222,17 @@ func WithTransfers(route Route) Option {
 		a.route = route
 	}
 }
+
+// DefaultMaxHandoffs is the bound on the [WithHandoff] switches one
+// request follows when [WithMaxHandoffs] gives none.
+const DefaultMaxHandoffs = 10
+
+// WithMaxHandoffs bounds the [WithHandoff] switches one request
+// follows, as RFC 0001 requires of a host that takes handoffs: a run
+// that stops on a terminating result after n of them ends the response
+// as one WithHandoff declined would. n of 0 or less means
+// [DefaultMaxHandoffs].
+func WithMaxHandoffs(n int) Option { return func(a *Adapter) { a.maxHandoffs = n } }
 
 // New builds an adapter over cfg.
 func New(cfg agentturn.Config, opts ...Option) *Adapter {
@@ -316,10 +329,17 @@ func (a *Adapter) fullRun(ctx context.Context, base agentturn.Config, req openre
 	var usage openresponses.Usage
 	var end *agentturn.RunEnd
 	var results []*agentturn.ToolEnd
-	for {
+	limit := a.maxHandoffs
+	if limit <= 0 {
+		limit = DefaultMaxHandoffs
+	}
+	for handoffs := 0; ; handoffs++ {
 		var err error
 		if end, results, err = a.relayRun(agentturn.ContextWithReasoningModels(runCtx, models), transcript, cfg, rl, &usage); err != nil {
 			return err
+		}
+		if handoffs == limit {
+			break
 		}
 		next, ok := a.handsOff(ctx, end, results)
 		if !ok {

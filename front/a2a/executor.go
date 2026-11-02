@@ -28,6 +28,7 @@ type Executor struct {
 	recorderFor RecorderFor
 	chosenBy    func(ctx context.Context, principal string) bool
 	handoff     func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool)
+	maxHandoffs int
 	start       func(context.Context, agentturn.Transcript) (agentturn.Config, bool)
 	route       Route
 	auth        *Authenticator
@@ -155,9 +156,9 @@ func WithRecorderFor(fn RecorderFor) Option {
 // in a result's Details, which the model never sees, or in end.Items,
 // the terminating call and its output. It is asked again each time a
 // run it started stops the same way, so a pair of agents that hand
-// back and forth runs until fn declines or the task is canceled; a
-// host that wants a bound counts on a value it puts on the context
-// RecorderFor returns, which fn is given.
+// back and forth runs until fn declines, the task is canceled or the
+// task has followed [WithMaxHandoffs] of them, [DefaultMaxHandoffs]
+// by default, after which the task ends as when fn declines.
 //
 // The receiver's run is continued under
 // agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff",
@@ -177,6 +178,17 @@ func WithRecorderFor(fn RecorderFor) Option {
 func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*agentturn.ToolEnd) (agentturn.Config, bool)) Option {
 	return func(e *Executor) { e.handoff = fn }
 }
+
+// DefaultMaxHandoffs is the bound on the [WithHandoff] switches one
+// task follows when [WithMaxHandoffs] gives none.
+const DefaultMaxHandoffs = 10
+
+// WithMaxHandoffs bounds the [WithHandoff] switches one task follows,
+// as RFC 0001 requires of a host that takes handoffs: a run that stops
+// on a terminating result after n of them ends the task as one
+// WithHandoff declined would. n of 0 or less means
+// [DefaultMaxHandoffs].
+func WithMaxHandoffs(n int) Option { return func(e *Executor) { e.maxHandoffs = n } }
 
 // WithStart picks the configuration a task starts under from the
 // conversation: the transcript the [ConversationStore] holds for the
@@ -642,7 +654,11 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 	})
 	defer unsubscribe()
 	end, err := run(runCtx)
-	for {
+	limit := e.maxHandoffs
+	if limit <= 0 {
+		limit = DefaultMaxHandoffs
+	}
+	for handoffs := 0; ; handoffs++ {
 		if end == nil {
 			// The run never started: a misuse the loop refused before
 			// any event, which fails the task as a run would.
@@ -650,7 +666,7 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 		}
 		out.end = end
 		out.items = append(out.items, end.Items...)
-		if out.writeErr != nil || e.handoff == nil || !terminated(end) {
+		if out.writeErr != nil || e.handoff == nil || !terminated(end) || handoffs == limit {
 			return out
 		}
 		next, ok := e.handoff(runCtx, end, out.results)

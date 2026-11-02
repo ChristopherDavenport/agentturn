@@ -320,7 +320,7 @@ earns a place only with a serve side and a consume side:
 
 The MCP row lives in `agenttool` because MCP is about tools, not about
 the loop: `mcpserver` serves any `agenttool.Tool`, and `mcpclient`
-produces them. An agent stands in three places inside another system:
+produces them. An agent stands in four places inside another system:
 
 - **As a model.** `front/responses` makes a loop an
   `openresponses.Adapter`; `openresponses.NewHandler` serves it; another
@@ -334,20 +334,29 @@ produces them. An agent stands in three places inside another system:
   the child run a context of the host's making.
 - **As a peer.** `front/a2a` exposes a loop to A2A callers; `tools/a2a`
   wraps a remote A2A agent as a `Tool`.
-- **As itself, under new settings.** A handoff needs no package:
-  `Agent.SetConfig` replaces the configuration and keeps the transcript,
-  so the next `Continue` runs the same conversation under another
-  agent's instructions, tools and model. A terminating tool result is
-  the usual trigger, the loop stopping with `StopTerminate` or
-  `StopPartialTerminate` and the destination travelling in
-  `Result.Details`, where the model cannot see it;
-  `front/responses.Handoffs` reads the transfers a transcript took. A
-  session recorder writes the switch as a config delta. A one-shot trim
-  of what the receiver sees belongs in `Agent.SetTranscript` between
-  runs, not in `Config.Transform`, which runs on every call; a trim from
-  the middle of the history costs the responses after it their request
-  hash. The loop leaves another model's reasoning items out of each
-  request on its own, so a change of model needs no trim.
+- **As itself, under new settings.** `Agent.SetConfig` replaces the
+  configuration and keeps the transcript, so the next `Continue` runs
+  the same conversation under another agent's instructions, tools and
+  model. A terminating tool result is the usual trigger, the loop
+  stopping with `StopTerminate` or `StopPartialTerminate` and the
+  destination travelling in `Result.Details`, where the model cannot
+  see it; `front/responses.Handoffs` reads the transfers a transcript
+  took. The `handoff` package is that switch loop: `handoff.New` adds a
+  `transfer_to_<agent>` tool per handoff, `Team.Run` follows the
+  transfers, applies each handoff's filter, switches and continues the
+  receiver under a `handoff` trigger naming the sender, bounded by
+  `MaxHandoffs`, and `Team.Route` serves the same team over either
+  front's `WithTransfers`. A session recorder writes the switch as a
+  config delta. A one-shot trim of what the receiver sees belongs in
+  `Agent.SetTranscript` between runs, not in `Config.Transform`, which
+  runs on every call, and must leave a transcript the loop can
+  continue: a trim that leaves a model output last, a transfer's
+  preamble once its call is gone, appends a developer message naming
+  the transfer, the sender and the receiver, as `Team.Run` does. The
+  recorder describes such a trim with the format's `omit`, so the
+  responses after it keep their hash. The loop leaves another model's
+  reasoning items out of each request on its own, so a change of model
+  needs no trim.
 
 The control row is not a composition: it is the human plane, a person
 at a client or a controller that answers by rule, driving an agent from

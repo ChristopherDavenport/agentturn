@@ -367,8 +367,12 @@ func (a *Agent) SetConfig(cfg Config) error {
 
 // SetTranscript replaces the transcript, as when switching to another
 // branch of a session, or when a handoff trims what the receiving
-// configuration sees, between runs and once. It returns [ErrRunning]
-// while a run is active. A session recorder writing the agent describes
+// configuration sees, between runs and once. A handoff's trim must
+// leave a transcript the receiver can continue ([CanContinue]): one
+// that would leave a model output last, a transfer's preamble once its
+// call is trimmed, appends a developer message naming the transfer, the
+// sender and the receiver, as the handoff package does. It returns
+// [ErrRunning] while a run is active. A session recorder writing the agent describes
 // a trim the format can describe, items left out with their order kept,
 // outputs or images sent as a placeholder, with an omit before the next
 // response, which keeps its hash; one that moves to another branch of

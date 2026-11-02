@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
@@ -430,6 +431,64 @@ func (m callsOnce) CreateStream(ctx context.Context, req openresponses.Request, 
 			}
 		}
 	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.FunctionCall("", m.name)
+	if err != nil {
+		return err
+	}
+	if err := w.Arguments(`{}`); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestHandoffsWithinARequestAreBounded pins RFC 0001's MUST: a pair of
+// agents that hand a request back and forth stop after the adapter's
+// bound, WithMaxHandoffs or the default, and the response completes
+// rather than running until the request's context ends.
+func TestHandoffsWithinARequestAreBounded(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []Option
+		want int
+	}{
+		{"the default", nil, 10},
+		{"WithMaxHandoffs", []Option{WithMaxHandoffs(3)}, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := agentturn.Config{Name: "a", Model: callsAlways{"transfer_to_billing"}, Tools: []agenttool.Tool{transfer}}
+			b := agentturn.Config{Name: "b", Model: callsAlways{"transfer_to_billing"}, Tools: []agenttool.Tool{transfer}}
+			asked := 0
+			opts := append([]Option{WithHandoff(func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool) {
+				asked++
+				if asked%2 == 1 {
+					return b, true
+				}
+				return a, true
+			})}, tc.opts...)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			sink, err := streamtest.Run(ctx, New(a, opts...), request(openresponses.UserText("go")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st := sink.Response().Status; st != openresponses.ResponseStatusCompleted {
+				t.Errorf("response = %s", st)
+			}
+			if asked != tc.want {
+				t.Errorf("handoffs taken = %d, want %d", asked, tc.want)
+			}
+		})
+	}
+}
+
+// callsAlways calls name on every request.
+type callsAlways struct{ name string }
+
+func (m callsAlways) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
 	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
 	w, err := em.FunctionCall("", m.name)
 	if err != nil {

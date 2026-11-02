@@ -246,7 +246,8 @@ once per session and return the same values on every call (#95).
 A configuration MAY be replaced between runs. The transcript is kept,
 so the next run continues the same conversation under other
 instructions, tools, hooks or model. This is the fourth way an agent
-composes, [below](#composition), and the one that needs no package.
+composes, [below](#composition): the loop needs nothing more for it,
+and the switch around it is the host's.
 
 ## A run
 
@@ -1629,7 +1630,22 @@ An agent stands in four places inside another system:
 - **As itself, under new settings.** The configuration replaced and the
   transcript kept, so the next run continues the same conversation
   under another agent's instructions, tools and model. This is what an
-  agent framework calls a handoff, and it needs no package (#96). A
+  agent framework calls a handoff. The loop learns no handoff concept:
+  the switch around it, the transfer tools, reading the transfer after
+  a terminating stop, the trim, replacing the configuration and
+  continuing, is the host's, and a host that takes a handoff continues
+  the receiver under a trigger of kind `handoff` whose ref names the
+  sender; it MUST bound the handoffs one input may cause, so two agents
+  that hand a conversation back and forth stop; it applies a trim
+  once, between runs, leaving a transcript the loop can continue; and
+  a receiver started without its own question and record channels
+  inherits the sender's (#274). A trim between runs that hands a
+  conversation to a receiver MUST leave a transcript the loop can
+  continue: when the trim would leave a model output last, a transfer's
+  preamble once its call is trimmed out, the host appends a developer
+  message that names the transfer, the sender and the receiver, so the
+  receiver's first request ends in input the model can answer (#276).
+  The loop's refusal to continue from a model output stands. A
   recorder writes the switch as a config delta, so the settings any
   response was produced under are on its path. A terminating tool
   result is the usual trigger, with the destination in the result's
@@ -1637,7 +1653,8 @@ An agent stands in four places inside another system:
   takes the handoff within the one request: both fronts ask a host
   function for the receiver's configuration when a run stops on a
   terminating result, and relay the receiver's run in the same
-  response or task. A front that starts a run under a configuration
+  response or task, up to a bound on the handoffs one task or request
+  follows. A front that starts a run under a configuration
   other than its own, a handoff's receiver within a task or the
   configuration a later task or request starts under, gives that
   configuration the serving side's question channel (its elicitor) and
@@ -1811,6 +1828,7 @@ maps onto it as follows:
 | queue mode | `QueueMode`: `QueueSteer`, `QueueFollowUp`; `Queued.Input` (`InputSteer`, `InputFollowUp`, `InputDeliver`); `Agent.Redeliver` for a delivery a record owes |
 | the loop as a model | `front/responses.New(cfg)` → `openresponses.Adapter` |
 | handoffs a front takes | `WithHandoff`, `WithStart`, `WithTransfers(route)` in both fronts; `front/responses.Route`, `Handoffs`, `HandedTo`, `Attribute`, re-exported by `front/a2a` but for `Attribute` |
+| the handoff | `handoff.New(agents…)` → `*Team` (`Agent{Config, Handoffs []To}`, `To{Agent, Filter, Enabled}`); `Team.Config`, `Team.Route` (a `front/responses.Route`, which both fronts' `WithTransfers` take), `Team.Run` (→ end, path), `Team.MaxHandoffs`, `ErrTooManyHandoffs`, `ToolName`, `RemoveAllTools`, `Dest`; the fronts' `WithMaxHandoffs` |
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`, which implements `agentturn.InputRequired` (`PendingCalls() []WaitingCall`), as `tools/a2a`'s does; `WithAskParent`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)` |
 | quarantine | `Agent.Quarantine`, `Agent.Quarantined`; `Quarantine(ctx, items…)` from a hook or a tool, `ErrNoQuarantine`, `ErrNotQuarantinable`; `QuarantinedOutput`, the placeholder |
@@ -2041,11 +2059,6 @@ the scenario, fixed without a change of rule.
   failure and is retried by a supervisor that honours policy stops.
   Returning a decision with a cause instead, with the sentinel kept as
   sugar, is proposed.
-- **The handoff** (#96). The fourth composition is the cheapest and
-  the least documented. The loop leaves another model's reasoning
-  items out of each turn's request (#91), and a recorder describes that
-  omission, and a trim from the middle of the history, with the
-  format's `omit` (agentsession#56, #233), so neither costs a hash.
 - **A second execution under one call** (#87, resolved). A child tool
   builds a fresh agent per call while the recorder continued the child
   session at its leaf, so the second run's path rebuilt a context the
