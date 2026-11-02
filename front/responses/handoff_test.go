@@ -3,6 +3,7 @@ package responses
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"slices"
 	"strings"
@@ -455,8 +456,10 @@ func TestHandoffsWithinARequestAreBounded(t *testing.T) {
 		opts []Option
 		want int
 	}{
-		{"the default", nil, 10},
-		{"WithMaxHandoffs", []Option{WithMaxHandoffs(3)}, 3},
+		// WithHandoff is asked once past the bound, which is how the
+		// front knows the agents would go on.
+		{"the default", nil, 11},
+		{"WithMaxHandoffs", []Option{WithMaxHandoffs(3)}, 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := agentturn.Config{Name: "a", Model: callsAlways{"transfer_to_billing"}, Tools: []agenttool.Tool{transfer}}
@@ -471,12 +474,10 @@ func TestHandoffsWithinARequestAreBounded(t *testing.T) {
 			})}, tc.opts...)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			sink, err := streamtest.Run(ctx, New(a, opts...), request(openresponses.UserText("go")))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if st := sink.Response().Status; st != openresponses.ResponseStatusCompleted {
-				t.Errorf("response = %s", st)
+			_, err := streamtest.Run(ctx, New(a, opts...), request(openresponses.UserText("go")))
+			// The caller is told the agents stopped at the bound.
+			if err == nil || openresponses.AsError(err).Code != "too_many_handoffs" || !errors.Is(err, ErrTooManyHandoffs) {
+				t.Errorf("err = %v, want too_many_handoffs", err)
 			}
 			if asked != tc.want {
 				t.Errorf("handoffs taken = %d, want %d", asked, tc.want)

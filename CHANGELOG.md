@@ -536,6 +536,16 @@ versions may break the API.
   that request or task; the stored conversation keeps the history whole.
   (#274)
 
+- Changed: at the handoff bound the caller is told. `front/a2a` fails
+  the task with a status message, and `front/responses` fails the
+  response with a `model_error` of code `too_many_handoffs`, both
+  matching `ErrTooManyHandoffs` (front/responses', which front/a2a and
+  `handoff` share), where they ended as if the handoff had been
+  declined. `handoff.Team.Run` at its bound now takes the last transfer
+  without running the receiver, so the next input goes to the agent the
+  transcript names, as a front's `WithTransfers` starts it; it left the
+  agent with the sender. (#274)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

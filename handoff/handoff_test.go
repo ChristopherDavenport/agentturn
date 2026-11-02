@@ -193,12 +193,19 @@ func TestHandoffsAreBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	team.MaxHandoffs = 3
-	_, path, err := team.Run(context.Background(), agentturn.New(team.Config("A")), openresponses.UserText("go"))
+	a := agentturn.New(team.Config("A"))
+	_, path, err := team.Run(context.Background(), a, openresponses.UserText("go"))
 	if !errors.Is(err, ErrTooManyHandoffs) {
 		t.Fatalf("err = %v, want ErrTooManyHandoffs", err)
 	}
-	if strings.Join(path, ",") != "A,B,A,B" {
-		t.Errorf("path = %v, want three switches", path)
+	// The agent agrees with a front's WithTransfers: the last transfer
+	// handed the conversation on, so its receiver has it, unrun.
+	if strings.Join(path, ",") != "A,B,A,B,A" {
+		t.Errorf("path = %v, want three switches followed and the fourth taken", path)
+	}
+	to, _ := responses.HandedTo(a.State().Transcript, team.Route())
+	if a.Config().Name != to.Name {
+		t.Errorf("the agent is %s, the transcript hands to %s", a.Config().Name, to.Name)
 	}
 }
 

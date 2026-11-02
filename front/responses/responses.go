@@ -148,7 +148,7 @@ func WithToolItems() Option {
 // agents that hand back and forth runs until fn declines, the
 // request's context ends or the request has followed
 // [WithMaxHandoffs] of them, [DefaultMaxHandoffs] by default, after
-// which the response ends as when fn declines.
+// which the response fails with [ErrTooManyHandoffs].
 //
 // The receiver's run is continued under
 // agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff",
@@ -224,14 +224,25 @@ func WithTransfers(route Route) Option {
 	}
 }
 
+// ErrTooManyHandoffs says a request, a task or an input was handed
+// from agent to agent more times than its bound allows: the agents
+// handed the conversation back and forth. The receiver of the last
+// transfer has the conversation, unrun; the caller is told rather than
+// answered. agentturn/handoff and front/a2a return it too.
+var ErrTooManyHandoffs = errors.New("too many handoffs for one input")
+
 // DefaultMaxHandoffs is the bound on the [WithHandoff] switches one
 // request follows when [WithMaxHandoffs] gives none.
 const DefaultMaxHandoffs = 10
 
 // WithMaxHandoffs bounds the [WithHandoff] switches one request
-// follows, as RFC 0001 requires of a host that takes handoffs: a run
-// that stops on a terminating result after n of them ends the response
-// as one WithHandoff declined would. n of 0 or less means
+// follows, as RFC 0001 requires of a host that takes handoffs: when a
+// run after n of them ends on one more that WithHandoff takes, the
+// response fails with a model_error of code too_many_handoffs, the
+// returned error matching [ErrTooManyHandoffs], so the caller is told
+// rather than answered with a transfer's text. Its next request starts
+// where [WithStart] or [WithTransfers] finds the conversation, with
+// the receiver of the last transfer. n of 0 or less means
 // [DefaultMaxHandoffs].
 func WithMaxHandoffs(n int) Option { return func(a *Adapter) { a.maxHandoffs = n } }
 
@@ -351,12 +362,15 @@ func (a *Adapter) fullRun(ctx context.Context, base agentturn.Config, req openre
 		if end, results, err = a.relayRun(agentturn.ContextWithReasoningModels(runCtx, models), transcript, cfg, rl, &usage); err != nil {
 			return err
 		}
-		if handoffs == limit {
-			break
-		}
 		next, ok := a.handsOff(ctx, end, results)
 		if !ok {
 			break
+		}
+		if handoffs == limit {
+			// The caller is told, not answered with the transfer's
+			// text: the agents handed the request back and forth.
+			msg := fmt.Sprintf("the agents handed the request on %d times and %s would hand it to %s again; stopped", limit, cfg.Name, next.Name)
+			return fmt.Errorf("%w: %w", ErrTooManyHandoffs, openresponses.ModelError("too_many_handoffs", msg))
 		}
 		// The receiver's requests leave the sender's reasoning out when
 		// it runs another model.

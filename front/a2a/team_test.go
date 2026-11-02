@@ -51,16 +51,18 @@ func TestATeamIsServedByItsRoute(t *testing.T) {
 
 // TestHandoffsWithinATaskAreBounded pins RFC 0001's MUST: a pair of
 // agents that hand a task back and forth stop after the front's bound,
-// WithMaxHandoffs or the default, and the task completes rather than
-// running until it is canceled.
+// WithMaxHandoffs or the default, and the task fails saying so rather
+// than running until it is canceled or ending as if answered.
 func TestHandoffsWithinATaskAreBounded(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		opts []Option
 		want int
 	}{
-		{"the default", nil, 10},
-		{"WithMaxHandoffs", []Option{WithMaxHandoffs(3)}, 3},
+		// WithHandoff is asked once past the bound, which is how the
+		// front knows the agents would go on.
+		{"the default", nil, 11},
+		{"WithMaxHandoffs", []Option{WithMaxHandoffs(3)}, 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := agentturn.Config{Name: "a", Model: alwaysCalls{"transfer_to_billing"}, Tools: []agenttool.Tool{transferToBilling}}
@@ -74,8 +76,9 @@ func TestHandoffsWithinATaskAreBounded(t *testing.T) {
 				return a, true
 			})}, tc.opts...)
 			task := sendTask(t, a2asrv.NewHandler(New(a, opts...)), userMessage("go"))
-			if task.Status.State != a2a.TaskStateCompleted {
-				t.Fatalf("task = %s %q", task.Status.State, taskText(task))
+			// The caller is told the agents stopped at the bound.
+			if task.Status.State != a2a.TaskStateFailed || !strings.Contains(taskText(task), "handoffs") {
+				t.Fatalf("task = %s %q, want failed naming the handoffs", task.Status.State, taskText(task))
 			}
 			if asked != tc.want {
 				t.Errorf("handoffs taken = %d, want %d", asked, tc.want)

@@ -159,7 +159,7 @@ func WithRecorderFor(fn RecorderFor) Option {
 // run it started stops the same way, so a pair of agents that hand
 // back and forth runs until fn declines, the task is canceled or the
 // task has followed [WithMaxHandoffs] of them, [DefaultMaxHandoffs]
-// by default, after which the task ends as when fn declines.
+// by default, after which the task fails with [ErrTooManyHandoffs].
 //
 // The receiver's run is continued under
 // agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff",
@@ -185,11 +185,18 @@ func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*
 const DefaultMaxHandoffs = 10
 
 // WithMaxHandoffs bounds the [WithHandoff] switches one task follows,
-// as RFC 0001 requires of a host that takes handoffs: a run that stops
-// on a terminating result after n of them ends the task as one
-// WithHandoff declined would. n of 0 or less means
+// as RFC 0001 requires of a host that takes handoffs: when a run after
+// n of them ends on one more that WithHandoff takes, the task fails
+// with a status message saying so ([ErrTooManyHandoffs]), rather than
+// completing with a transfer's text. The conversation keeps the
+// transfer, so under [WithTransfers] its next task starts with the
+// receiver of the last one. n of 0 or less means
 // [DefaultMaxHandoffs].
 func WithMaxHandoffs(n int) Option { return func(e *Executor) { e.maxHandoffs = n } }
+
+// ErrTooManyHandoffs is front/responses' [responses.ErrTooManyHandoffs],
+// which a task stopped at [WithMaxHandoffs]' bound fails with.
+var ErrTooManyHandoffs = responses.ErrTooManyHandoffs
 
 // WithHandoffTrim trims what the receiver of a [WithHandoff] switch
 // sees, once, between the sender's run and the receiver's: fn is given
@@ -601,6 +608,9 @@ type outcome struct {
 	// writeErr is the first failure to write an event to the queue; it
 	// aborted the run.
 	writeErr error
+	// bounded says the task stopped at WithMaxHandoffs' bound, with a
+	// handoff left untaken.
+	bounded error
 }
 
 // relay prompts the agent and streams assistant text into artifacts
@@ -681,11 +691,17 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 		}
 		out.end = end
 		out.items = append(out.items, end.Items...)
-		if out.writeErr != nil || e.handoff == nil || !terminated(end) || handoffs == limit {
+		if out.writeErr != nil || e.handoff == nil || !terminated(end) {
 			return out
 		}
 		next, ok := e.handoff(runCtx, end, out.results)
 		if !ok {
+			return out
+		}
+		if handoffs == limit {
+			// The caller is told, not answered with the transfer's
+			// text: the agents handed the task back and forth.
+			out.bounded = fmt.Errorf("%w: the agents handed the task on %d times and %s would hand it to %s again; stopped", ErrTooManyHandoffs, limit, agent.Config().Name, next.Name)
 			return out
 		}
 		prev := agent.Config()
@@ -773,6 +789,9 @@ func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, 
 	case agentturn.ReasonInputRequired:
 		return e.inputRequired(ctx, reqCtx, q, agentturn.PendingCalls(out.end.Pending), "", escalated)
 	case agentturn.ReasonDone, agentturn.ReasonStopped:
+		if out.bounded != nil {
+			return e.finish(ctx, reqCtx, q, a2a.TaskStateFailed, errorMessage(reqCtx, out.bounded))
+		}
 		if _, ok := out.end.Answer(); out.end.Cause == agentturn.StopGuard && !ok {
 			// A guard stopped the run before the agent answered, at
 			// whichever hook: the agent refused the task, which neither

@@ -1641,7 +1641,11 @@ An agent stands in four places inside another system:
   continuing, is the host's, and a host that takes a handoff continues
   the receiver under a trigger of kind `handoff` whose ref names the
   sender; it MUST bound the handoffs one input may cause, so two agents
-  that hand a conversation back and forth stop; it applies a trim
+  that hand a conversation back and forth stop, and at the bound it
+  tells its caller so rather than answering with a transfer's text,
+  the last transfer taken but its receiver not run, so the next input
+  goes to the agent the conversation names, in process and served
+  alike; it applies a trim
   once, between runs, leaving a transcript the loop can continue; and
   a receiver started without its own question and record channels
   inherits the sender's (#274). A trim between runs that hands a

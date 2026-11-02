@@ -57,12 +57,16 @@ import (
 // follows when [Team.MaxHandoffs] is 0.
 const DefaultMaxHandoffs = 10
 
-// ErrTooManyHandoffs is returned by [Team.Run] when a run ends on a
-// transfer after the team has followed [Team.MaxHandoffs] of them for
-// one input: two agents that hand the conversation back and forth stop
-// there, the agent left with the last sender and the transcript ending
-// in the transfer's output, so the next prompt continues it.
-var ErrTooManyHandoffs = errors.New("handoff: too many handoffs for one input")
+// ErrTooManyHandoffs is returned by [Team.Run] and [Team.Resume] when a
+// run ends on a transfer after the team has followed
+// [Team.MaxHandoffs] of them for one input: two agents that hand the
+// conversation back and forth stop there. The last transfer is taken,
+// unrun: the agent is switched to its receiver, with the handoff's
+// trim, as a front's WithTransfers starts the next input with the
+// receiver the transcript names, so the next prompt goes to the same
+// agent either way. It is front/responses' ErrTooManyHandoffs, which
+// the fronts return at their own bound.
+var ErrTooManyHandoffs = responses.ErrTooManyHandoffs
 
 // To is one handoff an agent offers.
 type To struct {
@@ -260,7 +264,8 @@ func (t *Team) Route() responses.Route {
 //
 // A receiver with no ToolElicitor or ToolRecorder of its own is given
 // the sender's. After [Team.MaxHandoffs] handoffs a run that ends on
-// another returns [ErrTooManyHandoffs], a left with the sender.
+// another returns [ErrTooManyHandoffs], that handoff taken but its
+// receiver not run.
 func (t *Team) Run(ctx context.Context, a *agentturn.Agent, items ...openresponses.Item) (*agentturn.RunEnd, []string, error) {
 	path := []string{a.Config().Name}
 	end, err := a.Prompt(ctx, items...)
@@ -287,9 +292,6 @@ func (t *Team) follow(ctx context.Context, a *agentturn.Agent, path []string, en
 		if !ok {
 			break
 		}
-		if n == limit {
-			return end, path, fmt.Errorf("%w: %d followed", ErrTooManyHandoffs, limit)
-		}
 		from := a.Config()
 		if _, filtered := t.filters[[2]string{from.Name, to.Name}]; filtered {
 			if err := a.SetTranscript(t.Trim(ctx, from, to, a.State().Transcript)); err != nil {
@@ -300,6 +302,11 @@ func (t *Team) follow(ctx context.Context, a *agentturn.Agent, path []string, en
 			return end, path, err
 		}
 		path = append(path, to.Name)
+		if n == limit {
+			// Taken, not run: the receiver has the conversation, as
+			// the transcript says, and answers the next input.
+			return end, path, fmt.Errorf("%w: %d followed, and %s would hand to %s again", ErrTooManyHandoffs, limit, from.Name, to.Name)
+		}
 		end, err = a.Continue(agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff", Ref: from.Name}))
 	}
 	return end, path, err
