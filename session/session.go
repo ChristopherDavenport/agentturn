@@ -1597,9 +1597,10 @@ func newWriter(r *Recorder, id string) *writer {
 }
 
 // Start creates a session from h and returns a recorder for it. When
-// h.Records is nil the header promises the run, dispatch, decision and
-// queued records, which this recorder writes whenever their event
-// occurs. A header with no harness takes the one [WithHarness] names,
+// h.Records is nil the header promises the run, dispatch, decision,
+// queued and result records, which this recorder writes whenever their
+// event occurs: a result for every call whose output settles while the
+// rest of its batch runs. A header with no harness takes the one [WithHarness] names,
 // so the root names its writer as every child does; child sessions
 // name h.Harness as their writer unless [WithHarness] says otherwise.
 // The caller keeps store for Sync, Release and Close.
@@ -1619,7 +1620,7 @@ func newWriter(r *Recorder, id string) *writer {
 // [AgentOptions] and [ReplayAnswers] so they read it too.
 func Start(ctx context.Context, store agentsession.Store, h agentsession.Header, opts ...Option) (*Recorder, *agentsession.Session, error) {
 	if h.Records == nil {
-		h.Records = append(append([]string(nil), agentsession.AllRecords...), agentsession.TypeQueued)
+		h.Records = append(append([]string(nil), agentsession.AllRecords...), agentsession.TypeQueued, agentsession.TypeResult)
 	}
 	r := New(store, "", opts...)
 	if h.Harness == nil {
@@ -1845,6 +1846,29 @@ func (o *origins) dispatchOff(s *agentsession.Session, callEntry string) (*agent
 			on[e.Base().ID] = true
 		}
 		ds = slices.DeleteFunc(ds, func(d *agentsession.DispatchEntry) bool { return on[d.ID] })
+		if len(ds) == 0 && s.Prefix(callEntry) && o.r != nil && s.Header().ParentSession != "" {
+			// Every dispatch s holds is on its path, withdrawn: a call
+			// in a fork's prefix is then what the session the fork was
+			// made from says it is, as for one s never dispatched.
+			origin, err := o.r.Read(o.ctx, s.Header().ParentSession)
+			if errors.Is(err, agentsession.ErrNoSession) {
+				return nil, nil, nil
+			}
+			if err != nil {
+				if o.lenient {
+					return nil, nil, nil
+				}
+				return nil, nil, fmt.Errorf("session: read origin %s: %w", s.Header().ParentSession, err)
+			}
+			// The origin's own dispatches are off the fork's path, so
+			// they are read as they stand.
+			if at, ds, err = agentsession.OriginDispatches(o.ctx, o.r, origin, callEntry); err != nil {
+				if o.lenient {
+					return nil, nil, nil
+				}
+				return nil, nil, fmt.Errorf("session: %w", err)
+			}
+		}
 	}
 	if len(ds) == 0 {
 		return nil, nil, nil
@@ -1901,9 +1925,9 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 			p.Reason = agentturn.PendingUndispatched
 		case agentsession.CallReturned:
 			// Its tool returned before its output joined the path: the
-			// result on the path is its outcome, and it is not run
-			// again.
-			p.Reason = agentturn.PendingAborted
+			// result on the path is its outcome, owed as its output, and
+			// it is not run again.
+			p.Reason = agentturn.PendingReturned
 			if out, ok := c.Result.Item.(*openresponses.FunctionCallOutput); ok {
 				p.Ran, p.RanWhere = out, returnedReason
 				ranAt[p.Call.CallID] = ranFrom{entry: c.Result.ID, failed: c.Result.Failed}
@@ -2263,6 +2287,12 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 			ans = agentturn.Approve(id)
 		case agentturn.PendingAnswered:
 			ans = agentturn.OutcomeUnknown(id)
+		case agentturn.PendingReturned:
+			// The result is the call's outcome; see the default case.
+			ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Status: p.Ran.Status, Output: p.Ran.Output}).WithReason(p.RanWhere).WithOrigin(ranAt[id].entry)
+			if ranAt[id].failed {
+				ans = ans.WithFailed()
+			}
 		case agentturn.PendingRejected:
 			ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Output: openresponses.FunctionCallOutputData{Text: p.Refused}})
 		default:
@@ -3707,7 +3737,7 @@ func (r *Recorder) Fold(ctx context.Context, f compact.Fold) error {
 func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, live bool, name string) (*writer, error) {
 	h := agentsession.Header{ParentSession: parent.id, Harness: r.harness, SpawnedBy: callID, CWD: parent.cwd, Media: parent.media}
 	if live {
-		h.Records = append([]string(nil), agentsession.AllRecords...)
+		h.Records = append(append([]string(nil), agentsession.AllRecords...), agentsession.TypeResult)
 	}
 	if callID != "" {
 		h.ID = agentsession.SubsessionID(parent.id, callID)
@@ -3969,6 +3999,7 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 			if _, err := w.append(ctx, r); err != nil {
 				return err
 			}
+			c.result = r
 		}
 	}
 	if e.Parent != "" {
@@ -4970,6 +5001,13 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 		// go on the path.
 		return fmt.Errorf("session: decision on call %s: %w", e.CallID, agentsession.ErrCallCompleted)
 	}
+	if c.result != nil {
+		// Its tool returned and the result is on the path: the format
+		// takes no proceed, hold or reject after it, and the call is
+		// owed that output, so a harness deciding on it again has lost
+		// track of it and the tool must not run.
+		return fmt.Errorf("session: decision on call %s: %w", e.CallID, agentsession.ErrCallReturned)
+	}
 	if c.rejected || c.ended {
 		// The call's fate is on the path: only its output may follow.
 		return nil
@@ -5098,6 +5136,12 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 		// The output ended the call, and the format reads a tool run
 		// after it as a new call: refusing the dispatch stops the tool.
 		return fmt.Errorf("session: dispatch of call %s: %w", e.CallID, agentsession.ErrCallCompleted)
+	}
+	if c.result != nil {
+		// A result is on the path, and the format reads a hand-off
+		// after it as running a call that returned: refusing the
+		// dispatch stops the tool.
+		return fmt.Errorf("session: dispatch of call %s: %w", e.CallID, agentsession.ErrCallReturned)
 	}
 	if c.again != nil {
 		// Running a call again is the harness's choice, and the format

@@ -575,8 +575,9 @@ type RunEnd struct {
 	// calls pending the notes are on [PendingCall.Notes] instead.
 	Notes []Note
 	// Withheld says the run ended because [Config.OutputGuard]
-	// withheld a message, with Reason ReasonStopped and Cause
-	// StopGuard: the model's last word was kept from the transcript,
+	// withheld a message, or the model call failed with an error
+	// wrapping [ErrGuard] after its response began, with Reason
+	// ReasonStopped and Cause StopGuard: the model's last word was kept from the transcript,
 	// so whatever message Items end with was said before it and is no
 	// answer, and Answer reports none.
 	Withheld bool
@@ -657,6 +658,15 @@ const (
 	// [ErrCallAnswered]. Only [WithPending] and [Agent.SetPending] give
 	// it; a live run never leaves one.
 	PendingRejected PendingReason = "rejected"
+	// PendingReturned: a record says the call's tool returned, a
+	// result, before its output joined the transcript: a crash while
+	// the rest of its batch ran. Its outcome is known and is in Ran, so
+	// it is owed that output, or another the caller writes in its
+	// place, and nothing else: [Agent.Resume] refuses an approval of it
+	// with [ErrCallAnswered], and it is never run again. Only
+	// [WithPending] and [Agent.SetPending] give it; a live run never
+	// leaves one.
+	PendingReturned PendingReason = "returned"
 )
 
 // PendingCall is a function call with no output and the reason it has
@@ -692,12 +702,14 @@ type PendingCall struct {
 	// unless the answer carries its own.
 	Args json.RawMessage
 	// Ran is the output the call has where it ran, when a record shows
-	// it dispatched and completed off the path the agent continues: on
-	// a branch a rebase left, or in the session this one forks. The
-	// loop never sets it; agentturn/session's Pending does, from the
-	// record, and its ReplayAnswers answers the call with it rather
-	// than running the call again, as a host answering the call itself
-	// should. nil for every other call.
+	// it dispatched and completed off the path the agent continues, on
+	// a branch a rebase left or in the session this one forks, or shows
+	// its tool returned before its output joined the path, a call
+	// pending as [PendingReturned]. The loop never sets it;
+	// agentturn/session's Pending does, from the record, and its
+	// ReplayAnswers answers the call with it rather than running the
+	// call again, as a host answering the call itself should. nil for
+	// every other call.
 	Ran *openresponses.FunctionCallOutput
 	// RanWhere says where the call ran, for a call with Ran: the reason
 	// an answer giving that output carries.
@@ -820,9 +832,9 @@ func (q *OpenQuestion) Reason() string {
 // MayHaveRun reports whether the call may have run and an approval of
 // it is held to agenttool's replay rule: it is pending as
 // [PendingAborted] or [PendingUnknown], or deferred after it was
-// dispatched. A call pending as [PendingAnswered] may have run too,
-// but it is owed an output and no approval, as one pending as
-// [PendingRejected] is.
+// dispatched. A call pending as [PendingAnswered] or [PendingReturned]
+// may have run too, or did, but it is owed an output and no approval,
+// as one pending as [PendingRejected] is.
 func (p PendingCall) MayHaveRun() bool {
 	return p.Reason == PendingAborted || p.Reason == PendingUnknown || p.Reason == PendingDeferred && p.Dispatched
 }

@@ -63,7 +63,9 @@ type Config struct {
 	// MCP server, is picked up on the next turn. It is called once per
 	// turn, before the model call, and the same list serves the turn's
 	// tool batch, so a call resolves against the tools the model was
-	// offered.
+	// offered. It is called as well wherever else the tools are
+	// resolved: for the batch a resume approved, for each approval a
+	// resume holds to the replay rule, and by [Config.BaseRequest].
 	//
 	// A provider that returns a snapshot offers a change one turn late
 	// when the change is still in flight as the turn starts: a tool
@@ -80,12 +82,12 @@ type Config struct {
 	//	}
 	//
 	// The loop never closes what a provider returns: io.Closer on a
-	// tool is the host's, and a provider is called once per turn. A
-	// provider that builds tools owning anything, a pty, a container
-	// client or a pool, is responsible for releasing them, and should
-	// build them once per session and return the same values on each
-	// turn rather than a new set per turn, closing them when the
-	// session ends:
+	// tool is the host's, and a provider is called at least once per
+	// turn. A provider that builds tools owning anything, a pty, a
+	// container client or a pool, is responsible for releasing them,
+	// and should build them once per session and return the same values
+	// on every call rather than a new set each time, closing them when
+	// the session ends:
 	//
 	//	var built []agenttool.Tool
 	//	cfg.ToolProvider = func(ctx context.Context) []agenttool.Tool {
@@ -664,8 +666,9 @@ func (c Config) tools(ctx context.Context) agenttool.Set {
 
 // ResolveTools returns the tools of the moment: ToolProvider's answer
 // when it is set, Tools otherwise. The loop consults it once per turn,
-// before the model call; a front that builds its own request uses it
-// so the provider fallback lives in one place.
+// before the model call, and for a resume's approvals and the batch it
+// approves; a front that builds its own request uses it so the
+// provider fallback lives in one place.
 func (c Config) ResolveTools(ctx context.Context) []agenttool.Tool {
 	if c.ToolProvider != nil {
 		return c.ToolProvider(ctx)

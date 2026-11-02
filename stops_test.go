@@ -572,8 +572,21 @@ func TestTheTurnIsOnTheContext(t *testing.T) {
 		note("tool")(ctx)
 		return upper(ctx, a)
 	})
+	model := noting{note: note("model")}
 	ag := New(Config{
-		Model: &twoCalls{}, Tools: []agenttool.Tool{tool}, MaxTurns: 2,
+		Model: model, Tools: []agenttool.Tool{tool}, MaxTurns: 2,
+		Transform: func(ctx context.Context, items Transcript) (Transcript, error) {
+			note("transform")(ctx)
+			return items, nil
+		},
+		OutputGuard: func(ctx context.Context, _ OutputInfo) (*openresponses.Message, error) {
+			note("output guard")(ctx)
+			return nil, nil
+		},
+		AfterToolCall: func(ctx context.Context, _ ToolResultInfo) (*ToolOverride, error) {
+			note("after tool call")(ctx)
+			return nil, nil
+		},
 		BeforeTurn: func(ctx context.Context, _ TurnStartInfo) (openresponses.Items, error) {
 			note("before turn")(ctx)
 			return nil, nil
@@ -594,12 +607,51 @@ func TestTheTurnIsOnTheContext(t *testing.T) {
 	if _, err := ag.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
 		t.Fatal(err)
 	}
-	for _, where := range []string{"before turn", "before model call", "before tool call", "tool", "should stop"} {
-		if got := seen[where]; !slices.Equal(got, []int{1, 2}) {
-			t.Errorf("%s saw turns %v, want [1 2]", where, got)
+	// The first turn calls the tool and the second answers.
+	want := map[string][]int{
+		"before turn": {1, 2}, "transform": {1, 2}, "before model call": {1, 2}, "model": {1, 2}, "should stop": {1, 2},
+		"before tool call": {1}, "tool": {1}, "after tool call": {1},
+		"output guard": {2},
+	}
+	for where, turns := range want {
+		if got := seen[where]; !slices.Equal(got, turns) {
+			t.Errorf("%s saw turns %v, want %v", where, got, turns)
 		}
 	}
 	if n := TurnFromContext(context.Background()); n != 0 {
 		t.Errorf("outside a run: turn %d", n)
 	}
+}
+
+// noting calls upper until a tool has answered, then answers, and
+// notes the context of each call.
+type noting struct{ note func(context.Context) }
+
+func (m noting) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.note(ctx)
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if _, ok := req.Input[len(req.Input)-1].(*openresponses.FunctionCallOutput); !ok {
+		w, err := em.FunctionCall("", "upper")
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(`{"text":"t"}`); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("done"); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
 }

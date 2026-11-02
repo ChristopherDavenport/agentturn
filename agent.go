@@ -43,9 +43,10 @@ var (
 	// [Answer.WithRunAgain].
 	ErrAmbiguousCall = errors.New("agentturn: a call that may have run cannot run again")
 	// ErrCallAnswered is returned when Resume was asked to approve a
-	// call pending as [PendingAnswered] or [PendingRejected]: a record
-	// answered it without running it again, or refused it, and only its
-	// output may follow.
+	// call pending as [PendingAnswered], [PendingRejected] or
+	// [PendingReturned]: a record answered it without running it again,
+	// refused it, or holds what its tool returned, and only its output
+	// may follow.
 	ErrCallAnswered = errors.New("agentturn: an answered call is owed its output and nothing else")
 )
 
@@ -877,7 +878,7 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 			}
 			continue
 		}
-		if p.Reason == PendingAnswered || p.Reason == PendingRejected {
+		if p.Reason == PendingAnswered || p.Reason == PendingRejected || p.Reason == PendingReturned {
 			return nil, fmt.Errorf("%w: %q", ErrCallAnswered, ans.CallID)
 		}
 		key := ans.IdempotencyKey

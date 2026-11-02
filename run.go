@@ -1580,14 +1580,23 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 		}
 		if errors.Is(err, ErrGuard) {
 			// The model, or a wrapper around it, refused the call with
-			// an error marked as a guard's: a policy stop, never retried.
-			// The calls the stream completed before it are closed, as a
-			// withheld response's are, so the transcript is a valid
-			// input for the next run.
+			// an error marked as a guard's: a policy stop, never retried,
+			// and recorded as an output guard's is. The response it had
+			// begun goes on record withheld, with what the transcript
+			// took from it, and the calls it made are closed, so the
+			// transcript is a valid input for the next run.
+			halt := &errStop{reason: ReasonStopped, cause: StopGuard, err: err}
+			if resp != nil {
+				resp.Output = openresponses.Items(r.transcript[start:]).Clone()
+				if err := r.emit(&ResponseEnd{RunID: r.runID, Turn: r.turn, Response: resp, Withheld: true}); err != nil {
+					return nil, err
+				}
+				halt.withheld = true
+			}
 			if err := r.closeWithheld(r.transcript[start:]); err != nil {
 				return nil, err
 			}
-			return nil, stopped(StopGuard, err)
+			return nil, halt
 		}
 		if committed || attempt >= r.cfg.Retry.MaxAttempts || !r.cfg.Retry.retryable(err) {
 			return nil, fmt.Errorf("agentturn: model: %w", err)
@@ -1665,7 +1674,7 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 			continue
 		}
 		if err != nil {
-			return nil, committed, err
+			return guardedResponse(&acc, err), committed, err
 		}
 		acc.Add(ev)
 		commits, err := r.streamEvent(ev, &acc, committed)
@@ -1680,7 +1689,7 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 				// The server reported the failure as an event. Before
 				// the answer opened it is a failed attempt like a cut
 				// stream, and retried as one; after, it is final.
-				return nil, committed, wire.err
+				return guardedResponse(&acc, wire.err), committed, wire.err
 			}
 			return nil, true, err
 		}
@@ -1717,6 +1726,16 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 		return nil, true, errors.New("response failed")
 	}
 	return resp, true, nil
+}
+
+// guardedResponse is the response a model call failed with an error
+// marked as a guard's had begun, withheld as an OutputGuard's is, or
+// nil for any other error or for a stream that named no response.
+func guardedResponse(acc *openresponses.Accumulator, err error) *openresponses.Response {
+	if !errors.Is(err, ErrGuard) || acc.Response() == nil {
+		return nil
+	}
+	return withheldResponse(acc, nil)
 }
 
 // withheldResponse is the response an OutputGuard withheld a message
