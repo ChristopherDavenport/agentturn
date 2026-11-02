@@ -1403,13 +1403,20 @@ An agent stands in four places inside another system:
   by the handoffs the conversation took, those before the first to the
   configuration it started under and those after each to the
   receiver, and gives the loop that attribution; the loop never learns
-  what a handoff is. A recorder cannot write a request that leaves
-  items out of the middle of its history, so the responses after one
-  carry no request hash. A handoff that trims what the receiver
+  what a handoff is. The record can describe a request that leaves
+  items out of the middle of its history: agentsession RFC 0001's
+  `omit` names the item entries left out, their order kept, since
+  format 0.11, and tool outputs and image parts sent as placeholders
+  (`omit.outputs`, `omit.images`) since 0.14. A recorder that writes
+  that `omit` before the response hashes the request against the path
+  as edited, and only an input the format cannot describe leaves the
+  responses after it unhashed. The reference recorder writes the
+  reasoning rule alone so far, and a trim it does not describe costs
+  the hash (#233). A handoff that trims what the receiver
   sees does it once, between runs, by replacing the transcript; a
   recorder moved to the last entry kept keeps every later response
-  verifiable when the trim takes a prefix, and a trim from the middle
-  leaves them unhashed. Where each agent keeps a session of its own,
+  verifiable when the trim takes a prefix, and one that describes a
+  trim from the middle as an `omit` keeps them verifiable too. Where each agent keeps a session of its own,
   the receiver's is a fork of the sender's at the handoff's last entry,
   a session whose header names that entry as its base, and every hash
   on the fork's path verifies when the receiver starts from the fork's

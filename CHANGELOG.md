@@ -14,6 +14,12 @@ versions may break the API.
   openresponses' `Reasoning` now carries members of its own, so the
   recorder compares two reasoning settings by their JSON when it writes a
   config delta.
+- Fixed: RFC 0001's Composition no longer says a recorder cannot write
+  a request that leaves items out of the middle of its history. Format
+  0.11's `omit.items`, and 0.14's `omit.outputs` and `omit.images`,
+  describe such a request, and only an input the format cannot describe
+  costs the responses after it their hash; the reference recorder
+  writing those omissions is #233.
 
 ## v0.0.34 - 2026-10-26
 
