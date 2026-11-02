@@ -597,6 +597,7 @@ func projectEnd(e *agentturn.RunEnd) map[string]any {
 		"reason":   string(e.Reason),
 		"cause":    string(e.Cause),
 		"error":    e.Err != nil,
+		"failure":  e.Failure != nil,
 		"pending":  pending,
 		"withheld": e.Withheld,
 	}

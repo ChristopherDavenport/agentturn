@@ -1045,6 +1045,9 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 			// the run ended, and the failure rides on it rather than
 			// vanishing.
 			end.Err = fmt.Errorf("%w: %w", context.Cause(ctx), err)
+			// And it is reported on its own, so a consumer that stops
+			// reading at the reason still finds it.
+			end.Failure = err
 		}
 	default:
 		end.Reason = ReasonError

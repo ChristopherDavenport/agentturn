@@ -543,8 +543,15 @@ type RunEnd struct {
 	// context.Canceled when there was none, wrapping the failure of a
 	// subscriber or a hook when one failed for a reason of its own
 	// while the run was being aborted; and to the guard's error when
-	// Reason is ReasonStopped with Cause StopGuard.
+	// Reason is ReasonStopped with Cause StopGuard. The failure also
+	// rides on its own, as Failure.
 	Err error
+	// Failure is the failure of a subscriber or a hook that failed for
+	// a reason of its own while the run was being aborted, the one Err
+	// wraps beside the cause, and nil otherwise. A front renders the
+	// reason; a host that keeps a record checks Failure, since a
+	// non-nil one means the record of the run may be short.
+	Failure error
 	// Pending lists the function calls in the transcript with no
 	// function_call_output, in transcript order, each with why: the
 	// calls a deferred decision handed to the caller when Reason is

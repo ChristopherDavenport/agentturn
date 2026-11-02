@@ -1,6 +1,6 @@
 {
   "name": "subscriber-fails-during-cancellation",
-  "description": "A subscriber that fails on a cut call's tool_end does not deprive the other cut calls of theirs, and the run still ends aborted with the failure joined to the cancellation.",
+  "description": "A subscriber that fails on a cut call's tool_end does not deprive the other cut calls of theirs, and the run still ends aborted with the failure joined to the cancellation and reported on its own as the end's failure.",
   "rules": ["#cancellation", "#delivery", "#invariants"],
   "config": {"model": "m", "tool_execution": "sequential"},
   "tools": [{"name": "read"}, {"name": "build"}, {"name": "test"}],
@@ -44,7 +44,7 @@
           {"type": "tool_end", "call_id": "call_3", "error": true},
           {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_1"}},
           {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_1"}},
-          {"type": "run_end", "reason": "aborted", "error": true,
+          {"type": "run_end", "reason": "aborted", "error": true, "failure": true,
            "pending": [{"call_id": "call_2", "reason": "aborted"}, {"call_id": "call_3", "reason": "undispatched"}]}
         ],
         "transcript": [

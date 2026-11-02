@@ -509,6 +509,7 @@ type wireRunEnd struct {
 	Reason   string          `json:"reason"`
 	Cause    string          `json:"cause,omitempty"`
 	Err      *wireError      `json:"error,omitempty"`
+	Failure  *wireError      `json:"failure,omitempty"`
 	Pending  []wirePending   `json:"pending,omitempty"`
 	Notes    []wireNote      `json:"notes,omitempty"`
 	Withheld bool            `json:"withheld,omitempty"`
@@ -991,11 +992,11 @@ func runEndOut(e *agentturn.RunEnd) (wireRunEnd, error) {
 		return wireRunEnd{}, err
 	}
 	return wireRunEnd{Type: e.EventType(), RunID: e.RunID, Items: items, Reason: string(e.Reason), Cause: string(e.Cause),
-		Err: errorOut(e.Err), Pending: pending, Notes: notes, Withheld: e.Withheld}, nil
+		Err: errorOut(e.Err), Failure: errorOut(e.Failure), Pending: pending, Notes: notes, Withheld: e.Withheld}, nil
 }
 
 func runEndIn(w wireRunEnd) (*agentturn.RunEnd, error) {
-	e := &agentturn.RunEnd{RunID: w.RunID, Reason: agentturn.Reason(w.Reason), Cause: agentturn.StopCause(w.Cause), Err: errorIn(w.Err), Withheld: w.Withheld}
+	e := &agentturn.RunEnd{RunID: w.RunID, Reason: agentturn.Reason(w.Reason), Cause: agentturn.StopCause(w.Cause), Err: errorIn(w.Err), Failure: errorIn(w.Failure), Withheld: w.Withheld}
 	var err error
 	if e.Items, err = itemsIn(w.Items); err != nil {
 		return nil, err

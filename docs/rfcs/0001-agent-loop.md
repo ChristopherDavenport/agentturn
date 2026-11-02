@@ -969,8 +969,13 @@ cancellation is lifted, so a subscriber that writes durable state has a
 context it can use. A subscriber that fails for a reason of its own
 while the run is being cancelled ends it with reason `aborted` and its
 error joined to the cancellation on the end event, so the failure rides
-on the abort rather than vanishing; whether it should also be reported
-on its own is open (#83).
+on the abort rather than vanishing, and `run_end` MUST carry that
+failure as a member of its own, `failure`, as well; `failure` is empty
+otherwise. A consumer that matches the reason stops reading there, and
+the failure that matters, a recorder that could not write, would go
+unseen: a front renders the reason, and a host that keeps a record
+checks `failure`, since a non-empty one means the record of the run may
+be short (#83).
 
 ## Events
 
@@ -992,7 +997,7 @@ turn number. The catalogue, with the members beyond those two:
 | `tool_update` | `call_id`, `name`, `partial` | a progress update from a running tool |
 | `tool_end` | `call_id`, `name`, `result`, `error`, `blocked`, `deferred`, `reason`, `parent`, `withdrawn`, `cut` | the call settled, in completion order; `reason` is the decision's for a blocked or deferred call; `withdrawn` when a consumer refused its `tool_dispatch`, so its tool never ran; `cut` when a cancellation or a failure cut it off before it had a result of its own, so its output is not appended and it stays pending |
 | `turn_end` | `response`, `tool_results` | after the batch's outputs are appended |
-| `run_end` | `items`, `reason`, `cause`, `error`, `pending`, `withheld` | last event of a run; `withheld` when the output guard's stop ended it |
+| `run_end` | `items`, `reason`, `cause`, `error`, `failure`, `pending`, `withheld` | last event of a run; `withheld` when the output guard's stop ended it; `failure` when a consumer or a hook failed for a reason of its own while the run was being cancelled |
 | `queued` | `item`, `mode`, `hidden` | an item accepted into a queue; belongs to no run |
 
 `response_id` is the provider's response identifier for an item the
@@ -1769,9 +1774,6 @@ the scenario, fixed without a change of rule.
   failure and is retried by a supervisor that honours policy stops.
   Returning a decision with a cause instead, with the sentinel kept as
   sugar, is proposed.
-- **The failure beside a cancellation** (#83). A subscriber's failure
-  during a cancellation is joined into the cancellation on the end
-  event and nothing reads it. A separate member for it is proposed.
 - **Input required as an interface** (#84). The child tools' errors
   match one sentinel, and the pending calls are reached by a type
   switch per implementation. An interface both satisfy is proposed.

@@ -473,3 +473,49 @@ func TestOutputGuardWithheldResponse(t *testing.T) {
 		})
 	}
 }
+
+// TestAFailureDuringAnAbortIsReportedOnItsOwn pins the run_end member
+// failure (#83): a subscriber that fails on a cut call's tool_end while
+// the run is being aborted ends it aborted, with the cancellation still
+// its error and the subscriber's failure on the end as Failure.
+func TestAFailureDuringAnAbortIsReportedOnItsOwn(t *testing.T) {
+	started := make(chan struct{})
+	slow := agenttool.New("a", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		close(started)
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	ag := New(Config{Model: &twoCalls{}, Tools: []agenttool.Tool{slow}, MaxTurns: 1})
+	disk := errors.New("the record could not be written")
+	ag.Subscribe(func(_ context.Context, ev Event) error {
+		if _, ok := ev.(*ToolEnd); ok {
+			return disk
+		}
+		return nil
+	})
+	go func() {
+		<-started
+		ag.Abort()
+	}()
+	end, _ := ag.Prompt(context.Background(), openresponses.UserText("go"))
+	if end == nil || end.Reason != ReasonAborted {
+		t.Fatalf("end = %+v", end)
+	}
+	if !errors.Is(end.Err, context.Canceled) {
+		t.Errorf("err = %v, want the cancellation", end.Err)
+	}
+	if !errors.Is(end.Failure, disk) {
+		t.Errorf("failure = %v, want the subscriber's", end.Failure)
+	}
+
+	// An abort nothing failed on has none.
+	started = make(chan struct{})
+	quiet := New(Config{Model: &twoCalls{}, Tools: []agenttool.Tool{slow}, MaxTurns: 1})
+	go func() {
+		<-started
+		quiet.Abort()
+	}()
+	if end, _ := quiet.Prompt(context.Background(), openresponses.UserText("go")); end == nil || end.Failure != nil {
+		t.Errorf("end = %+v, want no failure", end)
+	}
+}

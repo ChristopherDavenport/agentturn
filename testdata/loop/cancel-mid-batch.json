@@ -37,7 +37,7 @@
           {"type": "tool_end", "call_id": "call_2", "error": true, "cut": true},
           {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_1"}},
           {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_1", "output": "contents of a"}},
-          {"type": "run_end", "reason": "aborted", "cause": "", "error": true,
+          {"type": "run_end", "reason": "aborted", "cause": "", "error": true, "failure": false,
            "pending": [{"call_id": "call_2", "reason": "aborted"}]}
         ],
         "transcript": [
