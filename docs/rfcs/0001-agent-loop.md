@@ -1906,8 +1906,6 @@ the scenario, fixed without a change of rule.
 
 ## Open questions
 
-
-
 - **The stop decision as data** (#82). A guard stop is an error
   wrapping a sentinel, and a hook that returns a bare error records a
   failure and is retried by a supervisor that honours policy stops.
