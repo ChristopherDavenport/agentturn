@@ -2044,19 +2044,7 @@ func callAt(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry st
 // leaves another model's out of each request after a resume, as it
 // does for the items its own runs produced.
 func AgentOptions(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Option, error) {
-	items, models, err := TranscriptModels(s)
-	if err != nil {
-		return nil, err
-	}
-	pending, err := Pending(s, opts...)
-	if err != nil {
-		return nil, err
-	}
-	ids, err := CallIDs(s)
-	if err != nil {
-		return nil, err
-	}
-	owed, err := OwedNotes(s)
+	items, models, pending, owed, ids, err := agentState(s, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -2564,7 +2552,8 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 // is approved as a held call and one that may have run is held to the
 // replay rule, with the notes waiting on those calls, and
 // Agent.SetNotes from [OwedNotes], the notes the branch owes after
-// outputs already on it; [Recorder.CompactOptions] gives what seeds a transform
+// outputs already on it; [MoveTo] does all of it as one operation that
+// no run can interleave with. [Recorder.CompactOptions] gives what seeds a transform
 // built for the branch. Rebase reserves every call ID in the session, [CallIDs],
 // on the agent [Recorder.Attach] attached, so a call the model makes
 // does not take the ID of one the context leaves out or the branch

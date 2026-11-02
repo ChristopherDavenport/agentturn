@@ -768,3 +768,59 @@ func TestAgentPromptAnswersPending(t *testing.T) {
 		t.Errorf("model saw %q", got)
 	}
 }
+
+// TestWhileIdleHoldsTheRunSlot pins #220's loop half: WhileIdle runs its
+// function with no run active and refuses every run start until it
+// returns, the check and the hold one step, while the setters a rewind
+// needs work inside it; a WhileIdle during a run, or inside another, is
+// refused without calling its function.
+func TestWhileIdleHoldsTheRunSlot(t *testing.T) {
+	ctx := context.Background()
+	a := New(Config{Model: &echo.Adapter{}})
+	if _, err := a.Prompt(ctx, openresponses.UserText("one")); err != nil {
+		t.Fatal(err)
+	}
+	inside, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- a.WhileIdle(func() error {
+			close(inside)
+			<-release
+			return a.SetTranscript(Transcript{openresponses.UserText("rewound")})
+		})
+	}()
+	<-inside
+	if _, err := a.Prompt(ctx, openresponses.UserText("raced")); !errors.Is(err, ErrRunning) {
+		t.Errorf("a prompt during WhileIdle: %v, want ErrRunning", err)
+	}
+	if err := a.WhileIdle(func() error { t.Error("a second WhileIdle ran"); return nil }); !errors.Is(err, ErrRunning) {
+		t.Errorf("a second WhileIdle: %v, want ErrRunning", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := a.State().Transcript; len(got) != 1 {
+		t.Errorf("transcript after the hold = %d items, want the one set inside it", len(got))
+	}
+	if _, err := a.Prompt(ctx, openresponses.UserText("after")); err != nil {
+		t.Errorf("a prompt after the hold: %v", err)
+	}
+
+	// During a run, WhileIdle is refused and its function never runs.
+	started, finish := make(chan struct{}), make(chan struct{})
+	b := New(Config{Model: &echo.Adapter{}, BeforeTurn: func(context.Context, TurnStartInfo) (openresponses.Items, error) {
+		close(started)
+		<-finish
+		return nil, nil
+	}})
+	go func() { _, _ = b.Prompt(ctx, openresponses.UserText("busy")) }()
+	<-started
+	if err := b.WhileIdle(func() error { t.Error("WhileIdle ran during a run"); return nil }); !errors.Is(err, ErrRunning) {
+		t.Errorf("WhileIdle during a run: %v, want ErrRunning", err)
+	}
+	close(finish)
+	if err := b.WaitForIdle(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

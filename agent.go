@@ -84,6 +84,9 @@ type Agent struct {
 	steer      []queuedItem
 	followUp   []queuedItem
 	running    bool
+	// held is set while [Agent.WhileIdle] runs its function: no run
+	// starts, and nothing else is refused.
+	held bool
 	// closing is set once the run in flight is past its last drain of
 	// the queues, before its run_end: an item steered after it waits
 	// for the next run, so Deliver starts one rather than joining.
@@ -475,6 +478,50 @@ func (a *Agent) State() State {
 // item is left out.
 func WithNotes(notes []Note) Option {
 	return func(a *Agent) { a.notes = liveNotes(notes) }
+}
+
+// WhileIdle runs fn while no run is active and none can start: a
+// prompt, a continue, a resume or a delivery that would start a run is
+// refused with [ErrRunning] until fn returns. The check that the agent
+// is idle and the hold are one step, as a run's start is, so fn sees no
+// run begin between the two. It returns [ErrRunning] without calling fn
+// while a run is active or another WhileIdle holds the agent, and
+// otherwise what fn returns. fn may call the agent's setters,
+// [Agent.SetTranscript], [Agent.SetPending], [Agent.SetNotes],
+// [Agent.SetReasoningModels] and the others, which a run would refuse;
+// it must not start a run, which is refused. This is how a host makes a
+// change of several steps one operation, such as a rewind that moves a
+// record and the agent with it (#220).
+func (a *Agent) WhileIdle(fn func() error) error {
+	a.mu.Lock()
+	if a.running || a.held {
+		a.mu.Unlock()
+		return ErrRunning
+	}
+	a.held = true
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.held = false
+		a.mu.Unlock()
+	}()
+	return fn()
+}
+
+// SetReasoningModels says which model produced the reasoning items of
+// the transcript, as [WithReasoningModels] does for a new agent: after
+// [Agent.SetTranscript] to a branch of a session, with what the session
+// package's TranscriptModels reads there. What it says is added to what
+// the agent knows, item by item. It returns [ErrRunning] while a run is
+// active.
+func (a *Agent) SetReasoningModels(m ReasoningModels) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		return ErrRunning
+	}
+	a.reasoning = a.reasoning.merged(m)
+	return nil
 }
 
 // SetNotes replaces the notes the next run appends first, as
@@ -997,7 +1044,7 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, notes []
 	if err := a.cfg.validate(); err != nil {
 		return nil, err
 	}
-	if a.running {
+	if a.running || a.held {
 		return nil, ErrRunning
 	}
 	if err := TriggerFromContext(ctx).Validate(); err != nil {

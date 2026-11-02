@@ -91,6 +91,19 @@ versions may break the API.
   recording cost is its settings, its new items and one SHA-256 pass
   over the cached bytes. (#282)
 
+- Added: `Agent.WhileIdle(fn)`, which runs fn while no run is active
+  and refuses every run start until fn returns, the check one step with
+  a run's start, and `Agent.SetReasoningModels`, the setter beside
+  `WithReasoningModels`. (#220)
+- Added: `session.MoveTo(ctx, agent, recorder, entryID)`, a rewind as
+  one operation: it rebases the record and replaces the agent's
+  transcript, pending calls, owed notes, reasoning attribution and
+  reserved call IDs with what the record holds at the entry, under
+  `WhileIdle`, so a prompt raced into it is refused rather than
+  failing the move. A failure after the record moved puts the record
+  back, and the error names an undo only when the undo failed. It
+  replaces the five calls a host made by hand. (#220)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the
