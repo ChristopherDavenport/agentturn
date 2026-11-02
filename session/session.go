@@ -997,6 +997,11 @@ type writer struct {
 	// entry to name and is not written, and a dispatch for any other
 	// call the writer does not know is refused.
 	appOnly map[string]bool
+	// unsettled holds the model calls of the run's batch that have had
+	// their tool_start and not their tool_end. A call that settles while
+	// one is left has an output that cannot join the path until the
+	// batch is in, so its result is recorded at its tool_end.
+	unsettled map[string]bool
 	// detached is set for a child whose call returned while its run went
 	// on, so the writer is released at that run's end rather than at the
 	// call's.
@@ -1152,6 +1157,12 @@ type callRecord struct {
 	// marked failed. A refusal, the loop's or a hook's, is not a
 	// failure: its reject records it.
 	failed bool
+	// result is the result entry a call seeded from the path returned
+	// with, its tool done and its output not yet on the path: the
+	// output that appends it is the call's own, with no decision, as
+	// the format has it, and only an output that differs from it is an
+	// answer.
+	result *agentsession.ResultEntry
 }
 
 // dispatchState is what a dispatch changes in a callRecord.
@@ -1806,7 +1817,7 @@ func (o *origins) dispatchOff(s *agentsession.Session, callEntry string) (*agent
 // it. The origins are read under the context the last [WithContext] in
 // opts gives, which [ReplayAnswers] appends its own as, and under
 // context.Background() without one.
-func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.PendingCall, map[string]string, error) {
+func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.PendingCall, map[string]ranFrom, error) {
 	if s.Leaf() == "" {
 		return nil, nil, nil
 	}
@@ -1821,7 +1832,7 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 		return nil, nil, fmt.Errorf("session: pending calls at leaf: %w", err)
 	}
 	var out []agentturn.PendingCall
-	ranAt := map[string]string{}
+	ranAt := map[string]ranFrom{}
 	path := s.Path(s.Leaf())
 	withdrawn := withdrawnDispatches(path)
 	open := openQuestions(path)
@@ -1848,6 +1859,15 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 			}
 		case agentsession.CallNeverStarted:
 			p.Reason = agentturn.PendingUndispatched
+		case agentsession.CallReturned:
+			// Its tool returned before its output joined the path: the
+			// result on the path is its outcome, and it is not run
+			// again.
+			p.Reason = agentturn.PendingAborted
+			if out, ok := c.Result.Item.(*openresponses.FunctionCallOutput); ok {
+				p.Ran, p.RanWhere = out, returnedReason
+				ranAt[p.Call.CallID] = ranFrom{entry: c.Result.ID, failed: c.Result.Failed}
+			}
 		}
 		// A call with no dispatch on the path may have one on a branch
 		// a rebase left, or in the session a fork was made from: it was
@@ -1866,8 +1886,9 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 				// The call ran where its dispatch is when its output
 				// follows it there: that is its outcome.
 				var entry string
-				if p.Ran, entry = outputAfter(at, d, c.Entry.ID); p.Ran != nil {
-					ranAt[p.Call.CallID], p.RanWhere = entry, ranOffReason
+				var failed bool
+				if p.Ran, entry, failed = outputAfterFailed(at, d, c.Entry.ID); p.Ran != nil {
+					ranAt[p.Call.CallID], p.RanWhere = ranFrom{entry: entry, failed: failed}, ranOffReason
 					if at != s {
 						p.RanWhere = ranInOriginReason
 					}
@@ -1912,8 +1933,15 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 // call returned but what someone said of it, an outcome unknown among
 // them, and is passed over.
 func outputAfter(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry string) (*openresponses.FunctionCallOutput, string) {
+	out, entry, _ := outputAfterFailed(s, d, callEntry)
+	return out, entry
+}
+
+// outputAfterFailed is [outputAfter], and whether that output's entry
+// is marked failed.
+func outputAfterFailed(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry string) (*openresponses.FunctionCallOutput, string, bool) {
 	var out *openresponses.FunctionCallOutput
-	entry := ""
+	entry, failed := "", false
 	for _, e := range s.Entries() {
 		ie, ok := e.(*agentsession.ItemEntry)
 		if !ok {
@@ -1924,11 +1952,11 @@ func outputAfter(s *agentsession.Session, d *agentsession.DispatchEntry, callEnt
 		}
 		for _, c := range agentsession.Calls(s.Path(ie.ID)) {
 			if c.Entry.ID == callEntry && c.Output == ie && slices.Contains(c.Dispatches, d) && !c.Answered() {
-				out, entry = ie.Item.(*openresponses.FunctionCallOutput), ie.ID
+				out, entry, failed = ie.Item.(*openresponses.FunctionCallOutput), ie.ID, ie.Failed
 			}
 		}
 	}
-	return out, entry
+	return out, entry, failed
 }
 
 // subsessionOn is the child session the path to entry links to the
@@ -2206,7 +2234,10 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 			if p.Ran != nil {
 				// The call ran on the branch its dispatch is on, and the
 				// session holds what it returned: that is its outcome.
-				ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Status: p.Ran.Status, Output: p.Ran.Output}).WithReason(p.RanWhere).WithOrigin(ranAt[id])
+				ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Status: p.Ran.Status, Output: p.Ran.Output}).WithReason(p.RanWhere).WithOrigin(ranAt[id].entry)
+				if ranAt[id].failed {
+					ans = ans.WithFailed()
+				}
 				break
 			}
 			ans = replayAnswer(ctx, set, p)
@@ -2277,6 +2308,18 @@ const ranOffReason = "ran on a branch the rebase left"
 // call in a fork's prefix that completed in the session the fork was
 // made from.
 const ranInOriginReason = "ran in the session this one forks"
+
+// returnedReason is the reason of the answer [ReplayAnswers] gives a
+// call whose tool returned, a result on the path, before its output
+// joined it.
+const returnedReason = "returned before the record stopped"
+
+// ranFrom is the entry a call's Ran was read from, and whether it was
+// marked failed.
+type ranFrom struct {
+	entry  string
+	failed bool
+}
 
 // refusal is the reason of the last reject decision the session's
 // path holds for the call.
@@ -3324,11 +3367,15 @@ func callRecordOf(c *agentsession.Call, h agentsession.Header, off bool) *callRe
 	if sameJSON(json.RawMessage(decided), c.Call.Arguments) {
 		decided = ""
 	}
-	return &callRecord{
+	rec := &callRecord{
 		entry: c.Entry.Base().ID, args: c.Call.Arguments, decided: decided,
 		held: c.Held(), dispatched: len(c.Dispatches) > 0, rejected: c.Rejected(), ended: c.Answered(),
 		unknown: c.State(h) == agentsession.CallUnknown || off,
 	}
+	if c.Returned() {
+		rec.result = c.Result
+	}
+	return rec
 }
 
 // hasConfig reports whether a config entry is on the path.
@@ -3857,10 +3904,25 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 		}
 		c.withdraw()
 	}
+	if e.Parent == "" {
+		delete(w.unsettled, e.CallID)
+	}
 	if c := w.calls[e.CallID]; c != nil && e.Parent == "" {
 		// The tool reported failure, after a hand-off of this run that
 		// stood: a block and the loop's own refusals are rejects.
-		c.failed = e.Err != nil && !e.Blocked && !e.Withdrawn && c.dispatched && c.dispatchRun == w.run
+		ran := !e.Blocked && !e.Deferred && !e.Withdrawn && !e.Cut && c.dispatched && c.dispatchRun == w.run
+		c.failed = ran && e.Err != nil
+		if ran && len(w.unsettled) > 0 {
+			// The batch appends the outputs once every call has
+			// settled, and others still run: what the tool returned is
+			// durable before this event returns, so a process that
+			// dies before the batch is in does not run it again.
+			r := agentsession.NewResult(e.CallID, c.entry, &openresponses.FunctionCallOutput{CallID: e.CallID, Output: e.Result.Output})
+			r.Failed = c.failed
+			if _, err := w.append(ctx, r); err != nil {
+				return err
+			}
+		}
 	}
 	if e.Parent != "" {
 		if err := w.nested(ctx, NestedCall{
@@ -3951,6 +4013,7 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 		return err
 	}
 	w.run = e.RunID
+	w.unsettled = nil
 	w.open = nil
 	w.responses = 0
 	w.lastCalls = false
@@ -4570,6 +4633,11 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		case c.rejected:
 			// The call's reject is on the path: only its output, the
 			// refusal, may follow.
+		case c.result != nil && equalJSON(c.result.Item, out):
+			// The tool returned before the record stopped, and this is
+			// what it returned: the result is the record, and the
+			// output appends it.
+			failed = c.result.Failed
 		case c.dispatched && c.dispatchRun != "" && c.dispatchRun == w.run:
 			// The tool's own output: the dispatch is the record.
 			failed = c.failed
@@ -4782,6 +4850,12 @@ func outputText(out *openresponses.FunctionCallOutput) string {
 // was. The dispatch is written when the call is handed to its tool,
 // which tool_dispatch reports.
 func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
+	if e.Parent == "" {
+		if w.unsettled == nil {
+			w.unsettled = map[string]bool{}
+		}
+		w.unsettled[e.CallID] = true
+	}
 	if e.Parent != "" {
 		w.parents[e.CallID] = e.Parent
 		return w.nested(ctx, NestedCall{

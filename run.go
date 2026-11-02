@@ -2780,6 +2780,11 @@ func (r *runner) settle(ctx context.Context, p *callState) error {
 			p.result, p.err = override.Result, override.Err
 		}
 	}
+	if isCancellation(p.err, ctx) {
+		// The tool returned the cancellation: it was cut off in flight,
+		// and has no result of its own to append.
+		p.cut = true
+	}
 	return r.finish(p)
 }
 
@@ -2807,7 +2812,7 @@ func (r *runner) finish(p *callState) error {
 	// delivery that fails is the consumer's failure, and the call is
 	// not ended a second time for it.
 	p.ended = true
-	return r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Reason: p.reason, Parent: p.parent, Withdrawn: p.dispatchErr != nil})
+	return r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Reason: p.reason, Parent: p.parent, Withdrawn: p.dispatchErr != nil, Cut: p.cut})
 }
 
 func validObject(raw json.RawMessage) bool {

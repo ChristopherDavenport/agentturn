@@ -1844,3 +1844,49 @@ func TestBatchRunsTheCallsTheTranscriptHolds(t *testing.T) {
 		})
 	}
 }
+
+// TestToolEndSaysWhichCallsWereCut pins the tool_end member cut (#273):
+// a call the cancellation cut off before it had a result of its own is
+// marked, so a recorder never keeps the cancellation as its result,
+// and a call that returned before the cut is not.
+func TestToolEndSaysWhichCallsWereCut(t *testing.T) {
+	fast := agenttool.New("a", "", func(context.Context, echoArgs) (string, error) { return "a", nil })
+	slow := agenttool.New("b", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	ag := New(Config{Model: &twoCalls{}, Tools: []agenttool.Tool{fast, slow}, MaxTurns: 1})
+	ends := map[string]*ToolEnd{}
+	fastDone, slowDispatched := make(chan struct{}), make(chan struct{})
+	ag.Subscribe(func(_ context.Context, ev Event) error {
+		switch e := ev.(type) {
+		case *ToolEnd:
+			ends[e.Name] = e
+			if e.Name == "a" {
+				close(fastDone)
+			}
+		case *ToolDispatch:
+			if e.Name == "b" {
+				close(slowDispatched)
+			}
+		}
+		return nil
+	})
+	done := make(chan *RunEnd, 1)
+	go func() {
+		end, _ := ag.Prompt(context.Background(), openresponses.UserText("go"))
+		done <- end
+	}()
+	<-fastDone
+	<-slowDispatched
+	ag.Abort()
+	if end := <-done; end == nil || end.Reason != ReasonAborted {
+		t.Fatalf("end = %+v", end)
+	}
+	if e := ends["a"]; e == nil || e.Cut {
+		t.Errorf("a = %+v, want it settled, not cut", e)
+	}
+	if e := ends["b"]; e == nil || !e.Cut {
+		t.Errorf("b = %+v, want it cut", e)
+	}
+}

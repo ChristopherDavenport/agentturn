@@ -562,6 +562,8 @@ func project(t *testing.T, ev agentturn.Event) map[string]any {
 		m["deferred"] = e.Deferred
 		m["reason"] = e.Reason
 		m["parent"] = e.Parent
+		m["withdrawn"] = e.Withdrawn
+		m["cut"] = e.Cut
 	case *agentturn.TurnEnd:
 		m["turn"] = e.Turn
 		m["response"] = toJSON(t, e.Response)

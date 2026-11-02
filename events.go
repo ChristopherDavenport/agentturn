@@ -457,6 +457,15 @@ type ToolEnd struct {
 	// subscriber failed writes so, and the call reads as never started
 	// rather than as one that may have run.
 	Withdrawn bool
+	// Cut says the call was cut off, by a cancellation or by a failure
+	// of the run, before it had a result of its own: Err is the
+	// cancellation or the failure, its output is not appended, and the
+	// call is left pending. A call that settled with a result of its own
+	// is not cut, and the batch appends its output with the others: a
+	// recorder that sees such a call settle while other calls of the
+	// batch still run keeps its result, so a process that dies before
+	// the batch's outputs are appended does not run it again.
+	Cut bool
 }
 
 // EventType returns "tool_end".

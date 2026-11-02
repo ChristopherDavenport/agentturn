@@ -366,7 +366,9 @@ func TestAbortRecordsInterruptedAndFinishedCalls(t *testing.T) {
 	if end == nil || end.Reason != agentturn.ReasonAborted || len(end.Pending) != 1 || end.Pending[0].Call.Name != "slow" || end.Pending[0].Reason != agentturn.PendingAborted {
 		t.Fatalf("end = %+v", end)
 	}
-	if got := entryTypes(s); got != "run config item:user item:function_call* item:function_call* response dispatch dispatch item:function_call_output run" {
+	// The fast call returned while the slow one ran, so its result is on
+	// the record before the batch appends its output (#273).
+	if got := entryTypes(s); got != "run config item:user item:function_call* item:function_call* response dispatch dispatch result item:function_call_output run" {
 		t.Errorf("entries = %q", got)
 	}
 	verifyAll(t, s)
@@ -1417,10 +1419,11 @@ func TestRecordableDetailsBecomeACustomEntry(t *testing.T) {
 	}
 	// Only the recordable value is written, after its call's dispatch
 	// and before the outputs; a Details value for subscribers alone is
-	// not.
+	// not. The first call settles while the second waits its turn, so
+	// its result comes with it (#273).
 	switch got := entryTypes(s); got {
-	case "run config item:user item:function_call* item:function_call* response dispatch dispatch custom item:function_call_output item:function_call_output item:assistant* response run",
-		"run config item:user item:function_call* item:function_call* response dispatch custom dispatch item:function_call_output item:function_call_output item:assistant* response run":
+	case "run config item:user item:function_call* item:function_call* response dispatch dispatch result custom item:function_call_output item:function_call_output item:assistant* response run",
+		"run config item:user item:function_call* item:function_call* response dispatch result custom dispatch item:function_call_output item:function_call_output item:assistant* response run":
 	default:
 		t.Errorf("entries = %q", got)
 	}
