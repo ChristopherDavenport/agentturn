@@ -619,7 +619,10 @@ versions may break the API.
   gets its end, the task completed, failed or waiting on input or
   credentials. An abort of the
   parent's run cuts it (tasks/cancel, recorded); the batch or the run
-  ending does not. `tools/a2a.Answer(final)` is the output a call would
+  ending does not. Until it returns on a running task the call is an
+  ordinary one: its own context ends it, its callee is its subsession,
+  and a task it fails on is cancelled. The `WithInputRequired` hook is
+  called on the run's context. `tools/a2a.Answer(final)` is the output a call would
   have returned. The host delivers the result with `Agent.Deliver`
   under the new `agentturn.CalleeTrigger(callID, task)` (kind
   `TriggerCallee`), and `session.Recorder` writes an item that arrived

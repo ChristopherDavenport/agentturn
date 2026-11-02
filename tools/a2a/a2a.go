@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
@@ -225,7 +226,13 @@ func WithInputRounds(n int) Option { return func(r *remote) { r.inputRounds = n 
 // recording [CancelSent], and the parent's batch or run ending by
 // itself does not; the records written after the call returned name
 // the call. [WithInputRequired] still answers the task's questions
-// while it is followed. A call whose answer is final before the task
+// while it is followed, called on the run's context with the call on
+// it, before the call returns as after, not on the call's own context:
+// what the executor puts there, the elicitor agenttool.ElicitorFrom
+// returns among it, is not on the hook's, so a hook that asks someone
+// carries its own way to. Until the call returns on a running task it
+// is the call's, and its own context ending, a per-call timeout say,
+// ends it as it ends a call that is not detached. A call whose answer is final before the task
 // runs, a message answer or a task that ended at once, or that fails
 // first, returns as any call does, and fn is not called: its callee is
 // the call's own subsession, and a task it fails on is cancelled. Progress
@@ -427,15 +434,28 @@ func (r *remote) detached(ctx context.Context, call agenttool.Call, msg *a2a.Mes
 		fctx = agenttool.WithCall(rc, call)
 	}
 	fctx = context.WithValue(fctx, endpointKey{}, c.ep)
+	// Until it returns on a running task the call is the call's: its
+	// own context ending, a per-call timeout say, ends it.
+	fctx, cut := context.WithCancelCause(fctx)
 	started := make(chan TaskInfo, 1)
 	c.detached = true
 	c.started = func(info TaskInfo) { started <- info }
+	stopCut := context.AfterFunc(ctx, func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if !c.returned {
+			c.cut = true
+			cut(context.Cause(ctx))
+		}
+	})
 	type ended struct {
 		res agenttool.Result
 		err error
 	}
 	done := make(chan ended, 1)
 	go func() {
+		defer cut(nil)
+		defer stopCut()
 		var out outcome
 		res, err := r.follow(fctx, call, msg, &out, c)
 		if c.started == nil {
@@ -476,6 +496,11 @@ type callState struct {
 	// call that returns before then, its answer final at once or a
 	// failure first, is an ordinary call, and its task the call's own.
 	detaching bool
+	// mu guards returned, whether the call has returned on a running
+	// task, and cut, whether the call's context ended first.
+	mu       sync.Mutex
+	returned bool
+	cut      bool
 }
 
 // detachOn notes, for a detached call that has not returned, whether
@@ -687,6 +712,14 @@ func (c *callState) start(out *outcome) {
 	if c.started == nil || out.taskID == "" {
 		return
 	}
+	c.mu.Lock()
+	if c.cut {
+		// The call's context ended first: the follow is ending.
+		c.mu.Unlock()
+		return
+	}
+	c.returned = true
+	c.mu.Unlock()
 	started := c.started
 	c.started = nil
 	started(out.info())

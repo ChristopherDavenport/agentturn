@@ -531,3 +531,57 @@ func TestADetachedCallThatNeverDetachesIsAnOrdinaryCall(t *testing.T) {
 		}
 	})
 }
+
+// slowStart is a remote agent that names its task only once its gate
+// opens.
+type slowStart struct{ gate chan struct{} }
+
+func (s slowStart) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue) error {
+	select {
+	case <-s.gate:
+	case <-ctx.Done():
+		return nil
+	case <-time.After(8 * time.Second):
+	}
+	ev := a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateCompleted, nil)
+	ev.Final = true
+	return q.Write(ctx, ev)
+}
+
+func (slowStart) Cancel(context.Context, *a2asrv.RequestContext, eventqueue.Queue) error { return nil }
+
+// TestADetachedCallHonoursItsContext pins the review of #290: until the
+// call returns on a running task it is the call's, so its own context
+// ending, a per-call timeout inside a run say, ends it, though the task
+// would be followed on the run's context, and fn is not called.
+func TestADetachedCallHonoursItsContext(t *testing.T) {
+	remote := slowStart{gate: make(chan struct{})}
+	defer close(remote.gate)
+	client, card := serve(t, remote, nil)
+	inner := New(client, card, WithDetach(func(string, TaskInfo, *a2a.Task, error) { t.Error("fn was called for a call that never detached") }))
+	timed := agenttool.NewFunc("work", "works", inner.Parameters(), func(ctx context.Context, call agenttool.Call) (agenttool.Result, error) {
+		ctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		defer cancel()
+		return inner.Execute(ctx, call)
+	})
+	parent := agentturn.New(agentturn.Config{Model: callsAll{}, ModelName: "local", Tools: []agenttool.Tool{timed}})
+	ret := make(chan *agentturn.RunEnd, 1)
+	go func() {
+		end, _ := parent.Prompt(context.Background(), openresponses.UserText("work"))
+		ret <- end
+	}()
+	select {
+	case end := <-ret:
+		var out *openresponses.FunctionCallOutput
+		for _, item := range end.Items {
+			if o, ok := item.(*openresponses.FunctionCallOutput); ok {
+				out = o
+			}
+		}
+		if out == nil || !strings.Contains(out.Output.String(), "deadline") {
+			t.Errorf("the call's output = %+v, want the call's deadline", out)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the call outlived its context")
+	}
+}
