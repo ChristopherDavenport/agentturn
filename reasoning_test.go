@@ -226,3 +226,45 @@ func TestAToolsRunLeavesOutTheParentsReasoning(t *testing.T) {
 		})
 	}
 }
+
+// TestEveryHookContextCarriesTheAttribution pins RFC 0001 The request
+// step 3 for hooks as well as tools: BeforeTurn, the transform,
+// BeforeModelCall, OutputGuard and ShouldStopAfterTurn run under a
+// context that carries the run's reasoning attribution (#242).
+func TestEveryHookContextCarriesTheAttribution(t *testing.T) {
+	seen := map[string]int{}
+	note := func(name string, ctx context.Context) { seen[name] = len(reasoningFromContext(ctx)) }
+	cfg := Config{Model: thinker{}, ModelName: "a",
+		BeforeTurn: func(ctx context.Context, _ TurnStartInfo) (openresponses.Items, error) {
+			note("before_turn", ctx)
+			return nil, nil
+		},
+		Transform: func(ctx context.Context, t Transcript) (Transcript, error) {
+			note("transform", ctx)
+			return t, nil
+		},
+		BeforeModelCall: func(ctx context.Context, _ *openresponses.Request) error {
+			note("before_model_call", ctx)
+			return nil
+		},
+		OutputGuard: func(ctx context.Context, _ OutputInfo) (*openresponses.Message, error) {
+			note("output_guard", ctx)
+			return nil, nil
+		},
+		ShouldStopAfterTurn: func(ctx context.Context, _ TurnInfo) (bool, error) {
+			note("should_stop", ctx)
+			return false, nil
+		},
+	}
+	a := New(cfg)
+	for _, text := range []string{"one", "two"} {
+		if _, err := a.Prompt(context.Background(), openresponses.UserText(text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, hook := range []string{"before_turn", "transform", "before_model_call", "output_guard", "should_stop"} {
+		if seen[hook] == 0 {
+			t.Errorf("%s ran under no reasoning attribution on the second run", hook)
+		}
+	}
+}

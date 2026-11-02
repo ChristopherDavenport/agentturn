@@ -1286,7 +1286,7 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 		ctx := ContextWithTurn(ctx, r.turn)
 		r.ctx = ctx
 		if r.cfg.BeforeTurn != nil {
-			items, err := r.cfg.BeforeTurn(ctx, TurnStartInfo{RunID: r.runID, Turn: r.turn, Transcript: r.transcript, Inputs: append([]TurnInput(nil), r.arrived...)})
+			items, err := r.cfg.BeforeTurn(r.attributed(ctx), TurnStartInfo{RunID: r.runID, Turn: r.turn, Transcript: r.transcript, Inputs: append([]TurnInput(nil), r.arrived...)})
 			if err != nil {
 				if errors.Is(err, ErrGuard) {
 					return stopped(StopGuard, err)
@@ -1327,7 +1327,7 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 			return stop(ReasonInputRequired, nil)
 		}
 		if r.cfg.ShouldStopAfterTurn != nil {
-			halt, err := r.cfg.ShouldStopAfterTurn(ctx, TurnInfo{RunID: r.runID, Turn: r.turn, Response: resp, ToolResults: results, Final: len(calls) == 0, Transcript: r.transcript})
+			halt, err := r.cfg.ShouldStopAfterTurn(r.attributed(ctx), TurnInfo{RunID: r.runID, Turn: r.turn, Response: resp, ToolResults: results, Final: len(calls) == 0, Transcript: r.transcript})
 			if err != nil {
 				r.ending()
 				if errors.Is(err, ErrGuard) {
@@ -1508,6 +1508,8 @@ func (r *runner) appendOne(item openresponses.Item, mode InputMode, trigger, end
 // request builds the request for this turn from config and the
 // filtered, transformed transcript.
 func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponses.Request, error) {
+	// The transform and BeforeModelCall run under the attribution too.
+	ctx = r.attributed(ctx)
 	input := Transcript(append(openresponses.Items(nil), r.transcript...))
 	if r.cfg.Transform != nil {
 		var err error
@@ -1837,7 +1839,7 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 					}
 				}
 			}
-			replacement, err := r.cfg.OutputGuard(r.ctx, OutputInfo{RunID: r.runID, Turn: r.turn, ResponseID: responseID, Message: m, Output: before})
+			replacement, err := r.cfg.OutputGuard(r.attributed(r.ctx), OutputInfo{RunID: r.runID, Turn: r.turn, ResponseID: responseID, Message: m, Output: before})
 			if err != nil {
 				if errors.Is(err, ErrGuard) {
 					// A policy stop: the message is kept from the
@@ -2296,6 +2298,14 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 	return r.collect(batch)
 }
 
+// attributed is ctx carrying the run's reasoning attribution as it
+// stands, which the context of every hook and tool carries, so a run one
+// of them starts over the run's items leaves out the reasoning another
+// model produced (#242).
+func (r *runner) attributed(ctx context.Context) context.Context {
+	return ContextWithReasoningModels(ctx, r.reasoning)
+}
+
 // toolContext is the context hooks and tools run under: ctx with a
 // snapshot of the working transcript attached, the run's reasoning
 // attribution, so a run a tool starts over the parent's items leaves
@@ -2304,7 +2314,7 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 // loop.
 func (r *runner) toolContext(ctx context.Context, tools agenttool.Set) context.Context {
 	ctx = ContextWithTranscript(ctx, append(Transcript(nil), r.transcript...))
-	ctx = ContextWithReasoningModels(ctx, r.reasoning)
+	ctx = r.attributed(ctx)
 	// [Ask] says a person's accept note through the run whose hook or
 	// tool asked.
 	ctx = context.WithValue(ctx, noteSinkKey{}, r)

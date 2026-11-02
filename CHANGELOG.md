@@ -176,7 +176,10 @@ versions may break the API.
   `WithCallConfig` opens with the conversation so far, leaves out the
   reasoning the parent's model produced instead of sending it to a
   provider that refuses it. The child's recorder describes the
-  omission with `omit.items`, so its request still verifies. (#242)
+  omission with `omit.items`, so its request still verifies. The
+  hooks' contexts carry it as well, `BeforeTurn`, the transform,
+  `BeforeModelCall`, `OutputGuard` and `ShouldStopAfterTurn` beside the
+  tool hooks. (#242)
 
 - Fixed: in a sidecar session the recorder converts media as it
   writes. Each inline medium an item, queued, result or compaction
