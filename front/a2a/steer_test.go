@@ -159,9 +159,7 @@ func TestASteerReachesTheWorkingTask(t *testing.T) {
 			entered, release := make(chan struct{}), make(chan struct{})
 			work := agenttool.New("work", "works until released", func(ctx context.Context, _ struct{}) (string, error) {
 				close(entered)
-				if !tc.atEnd {
-					<-release
-				}
+				<-release
 				return "worked", nil
 			})
 			store := &MemoryStore{}
@@ -169,6 +167,13 @@ func TestASteerReachesTheWorkingTask(t *testing.T) {
 			var steered *a2a.Task
 			var steerErr error
 			var once sync.Once
+			// atEnd's steer is sent from the run's goroutine, and handed
+			// back here.
+			type sent struct {
+				task *a2a.Task
+				err  error
+			}
+			atEnd := make(chan sent, 1)
 			opts := append([]Option{WithConversationStore(store)}, tc.opts...)
 			var started *a2a.Task
 			if tc.atEnd {
@@ -177,8 +182,8 @@ func TestASteerReachesTheWorkingTask(t *testing.T) {
 						if _, ok := ev.(*agentturn.RunEnd); ok {
 							once.Do(func() {
 								res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: tc.steer(started), Config: nonBlocking})
-								steered, _ = res.(*a2a.Task)
-								steerErr = err
+								task, _ := res.(*a2a.Task)
+								atEnd <- sent{task, err}
 							})
 						}
 						return nil
@@ -194,7 +199,11 @@ func TestASteerReachesTheWorkingTask(t *testing.T) {
 			}
 			started = res.(*a2a.Task)
 			<-entered
-			if !tc.atEnd {
+			if tc.atEnd {
+				// The tool returns once the task is known here, so the
+				// run's end, which steers, reads it.
+				close(release)
+			} else {
 				// A refusal comes at once, a blocking send's included.
 				cfg := nonBlocking
 				if tc.refused {
@@ -206,6 +215,10 @@ func TestASteerReachesTheWorkingTask(t *testing.T) {
 				close(release)
 			}
 			final := finalTask(t, h, started.ID)
+			if tc.atEnd {
+				s := <-atEnd
+				steered, steerErr = s.task, s.err
+			}
 			if final.Status.State != a2a.TaskStateCompleted {
 				t.Fatalf("task ended %s", final.Status.State)
 			}
