@@ -227,7 +227,8 @@ func WithInputRounds(n int) Option { return func(r *remote) { r.inputRounds = n 
 // the call. [WithInputRequired] still answers the task's questions
 // while it is followed. A call whose answer is final before the task
 // runs, a message answer or a task that ended at once, or that fails
-// first, returns as any call does, and fn is not called. Progress
+// first, returns as any call does, and fn is not called: its callee is
+// the call's own subsession, and a task it fails on is cancelled. Progress
 // updates stop when the call returns.
 func WithDetach(fn func(callID string, info TaskInfo, final *a2a.Task, err error)) Option {
 	return func(r *remote) { r.detach = fn }
@@ -373,7 +374,9 @@ func (r *remote) follow(ctx context.Context, call agenttool.Call, msg *a2a.Messa
 				return agenttool.Result{}, fmt.Errorf("a2a: %w", context.Cause(ctx))
 			}
 			// The call gives up the tasks that have not ended, aborted or
-			// failed alike: its own work is stopped.
+			// failed alike: its own work is stopped, a detached call's
+			// too when it fails before it returns.
+			c.undetach()
 			c.leave(ctx, out)
 			return agenttool.Result{}, err
 		}
@@ -391,6 +394,7 @@ func (r *remote) follow(ctx context.Context, call agenttool.Call, msg *a2a.Messa
 		}
 		if err != nil {
 			// The call gives the task up: its own work is stopped.
+			c.undetach()
 			c.leave(ctx, out)
 			return agenttool.Result{Details: info}, err
 		}
@@ -467,6 +471,28 @@ type callState struct {
 	// and its progress updates have nowhere to go.
 	detached bool
 	started  func(TaskInfo)
+	// detaching is whether a detached call's callee is a peer: the task
+	// it is about to return on, or has returned on, runs on. A detached
+	// call that returns before then, its answer final at once or a
+	// failure first, is an ordinary call, and its task the call's own.
+	detaching bool
+}
+
+// detachOn notes, for a detached call that has not returned, whether
+// the answer it just read leaves a task running, on which it returns.
+func (c *callState) detachOn(out *outcome, final bool) {
+	if c.detached && c.started != nil {
+		c.detaching = !final && out.taskID != ""
+	}
+}
+
+// undetach makes a detached call that has not returned an ordinary
+// call, for a failure before it returns: the task it leaves is stopped
+// as a call that is not detached stops it.
+func (c *callState) undetach() {
+	if c.detached && c.started != nil {
+		c.detaching = false
+	}
 }
 
 // task is one task a call reached.
@@ -516,7 +542,7 @@ func (c *callState) seen(out *outcome) *task {
 
 // relation is the link the call's callee is.
 func (c *callState) relation() string {
-	if c.remote.peer || c.detached {
+	if c.remote.peer || c.detaching {
 		return RelationPeer
 	}
 	return RelationSubsession
@@ -625,6 +651,7 @@ func (r *remote) send(ctx context.Context, call agenttool.Call, params *a2a.Mess
 			return fmt.Errorf("a2a: %w", err)
 		}
 		final := out.absorb(res)
+		c.detachOn(out, final)
 		if err := out.recorded(c.report(ctx, out), final); err != nil || final || !c.detached || out.taskID == "" {
 			return err
 		}
@@ -636,6 +663,7 @@ func (r *remote) send(ctx context.Context, call agenttool.Call, params *a2a.Mess
 			return fmt.Errorf("a2a: %w", err)
 		}
 		final := out.absorb(ev)
+		c.detachOn(out, final)
 		if err := out.recorded(c.report(ctx, out), final); err != nil {
 			return err
 		}

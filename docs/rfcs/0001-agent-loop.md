@@ -1690,7 +1690,9 @@ An agent stands in four places inside another system:
   the parent's run cuts it, the follow ending and the task cancelled
   with a cancel notice recorded, and the parent's batch or run ending
   by itself does not. A call whose answer is final before the task
-  runs returns as a call that is not detached does. The final result
+  runs, or that fails before it returns, returns as a call that is not
+  detached does: its callee is the call's own, and a task it leaves is
+  stopped. The final result
   reaches the parent through the agent's delivery, as a detached
   child's does, under a trigger of kind `callee` whose ref is the
   call's ID and whose `task` member names the callee's task, and a

@@ -493,3 +493,41 @@ func TestADetachedCallEndsOnAuthRequired(t *testing.T) {
 		t.Fatal("the follow never ended on auth-required")
 	}
 }
+
+// TestADetachedCallThatNeverDetachesIsAnOrdinaryCall pins the review of
+// #290: a detached call that returns before its task runs on returns
+// as a call that is not detached does. An answer final at once is
+// recorded as the call's own callee, a subsession, not a peer, and a
+// call that fails before it returns, here on a callee record it cannot
+// write, stops the task it leaves rather than leaving it to run with
+// nobody following it.
+func TestADetachedCallThatNeverDetachesIsAnOrdinaryCall(t *testing.T) {
+	never := WithDetach(func(string, TaskInfo, *a2a.Task, error) { t.Error("fn was called for a call that never detached") })
+	t.Run("final at once", func(t *testing.T) {
+		client, card := serve(t, scripted{reply: true, message: "hi"}, nil)
+		var recs records
+		ctx := agenttool.ContextWithRecorder(context.Background(), recs.fn)
+		res, err := New(client, card, never).Execute(ctx, agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"hello"}`)})
+		if err != nil || res.Output.Text != "hi" {
+			t.Fatalf("call = %+v, %v", res.Output, err)
+		}
+		var c Callee
+		_ = json.Unmarshal(recs.of(CalleeNS)[0], &c)
+		if c.Relation != RelationSubsession {
+			t.Errorf("callee = %+v, want the call's own subsession", c)
+		}
+	})
+	t.Run("failed before it returned", func(t *testing.T) {
+		remote := working{cancelled: make(chan a2a.TaskID, 4)}
+		client, card := serve(t, remote, nil)
+		ctx := agenttool.ContextWithRecorder(context.Background(), failing)
+		if _, err := New(client, card, never).Execute(ctx, agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"work"}`)}); err == nil {
+			t.Fatal("the call succeeded with no callee record")
+		}
+		select {
+		case <-remote.cancelled:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the task the call left was not cancelled")
+		}
+	})
+}
