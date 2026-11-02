@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -122,5 +123,62 @@ func TestAnOutcomeUnknownIsMarkedFailed(t *testing.T) {
 				t.Errorf("the cut call's outcome-unknown output is not marked failed")
 			}
 		})
+	}
+}
+
+// TestAWithdrawalAnEarlierVersionWroteStillReads pins the reading of
+// the agentturn:withdrawn entry agentturn v0.0.34 and earlier wrote in
+// place of the format's withdrawal (#278): the call whose only dispatch
+// it withdrew never started, is approved by the replay rule, and the
+// file still verifies.
+func TestAWithdrawalAnEarlierVersionWroteStillReads(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	s, err := store.Create(ctx, agentsession.Header{Records: agentsession.AllRecords})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append(ctx, s.ID(), &agentsession.ItemEntry{Item: openresponses.UserText("notify")}); err != nil {
+		t.Fatal(err)
+	}
+	call := &openresponses.FunctionCall{CallID: "call_1", Name: "notify", Arguments: `{"text":"t"}`}
+	target, err := store.Append(ctx, s.ID(), &agentsession.ItemEntry{Item: call, ResponseID: "resp_1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append(ctx, s.ID(), &agentsession.ResponseEntry{ResponseID: "resp_1", Status: openresponses.ResponseStatusCompleted}); err != nil {
+		t.Fatal(err)
+	}
+	d, err := store.Append(ctx, s.ID(), agentsession.NewDispatch(call.CallID, target))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(Withdrawn{Dispatch: d, Reason: "the audit log is down"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append(ctx, s.ID(), &agentsession.CustomEntry{NS: WithdrawnNS, Data: data, CallID: call.CallID}); err != nil {
+		t.Fatal(err)
+	}
+	if s, err = store.Open(ctx, s.ID()); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := Pending(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Reason != agentturn.PendingUndispatched || pending[0].MayHaveRun() {
+		t.Fatalf("pending = %+v, want the call never started", pending)
+	}
+	notify := agenttool.New("notify", "", func(context.Context, echoArgs) (string, error) { return "sent", nil })
+	answers, err := ReplayAnswers(ctx, s, []agenttool.Tool{notify})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(answers) != 1 || answers[0].Output != nil {
+		t.Errorf("answers = %+v, want an approval", answers)
+	}
+	if err := s.VerifyRecords(s.Leaf()); err != nil {
+		t.Errorf("verify: %v", err)
 	}
 }
