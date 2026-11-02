@@ -309,7 +309,7 @@
 //     child's link: the fork started none of that work.
 //   - a peer's late result: an input that arrived under
 //     agentturn.CalleeTrigger, a detached tools/a2a call's answer the
-//     host delivered, is written with format 0.15's from_link naming
+//     host delivered, is written with format 0.14's from_link naming
 //     the latest peer link of that call on the path, to the task the
 //     trigger names when it names one, and none when there is no such
 //     link. The trigger rides on the queued entry, so an input owed

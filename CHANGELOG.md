@@ -626,7 +626,7 @@ versions may break the API.
   have returned. The host delivers the result with `Agent.Deliver`
   under the new `agentturn.CalleeTrigger(callID, task)` (kind
   `TriggerCallee`), and `session.Recorder` writes an item that arrived
-  under it with format 0.15's `from_link` naming the call's `peer`
+  under it with format 0.14's `from_link` naming the call's `peer`
   link, after a restart too. RFC 0001 Composition and the record's
   `item_end` row state it. (#290)
 - Added: `front/a2a.WithDeliverWhileBusy()`, an opt-in steer of a
