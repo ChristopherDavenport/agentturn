@@ -509,6 +509,15 @@ versions may break the API.
   note is not said, where it was passed to the tool and its note said
   as a developer message. (#267)
 
+- Security: a nested call a tool makes with `Invoke` that the policy
+  defers is put to the run's elicitor, and its decision hook sees the
+  run's elicitor, never one the invoking tool put on its own context.
+  A tool could install an elicitor of its own and approve the call its
+  policy deferred, under any decider it named. A host that relied on a
+  tool's own elicitor answering its nested calls sets
+  `Config.ToolElicitor`, or puts it on the context the run is prompted
+  with, instead. RFC 0001 Nested calls.
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

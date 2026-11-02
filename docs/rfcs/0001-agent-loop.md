@@ -1467,7 +1467,10 @@ as if the model had asked for it under the call in flight:
   call and knows the deferral it returns is settled below rather than
   left for a resume. A nested call cannot be handed to the caller, since it belongs to a
   tool that is running, so a deferred one is put to the user through
-  the invoking tool's elicitor when it has one, as a question naming
+  the run's elicitor when it has one, never one the invoking tool put
+  in place of it, since a tool must not answer for the policy that
+  holds its calls, and the decision hook sees the run's elicitor too;
+  the question names
   the call, its arguments, the first 500 bytes of them, and the
   decision's reason, asked on the
   invoking tool's context so it is filed under that call, with the

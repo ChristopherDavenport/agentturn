@@ -2634,10 +2634,18 @@ func (r *runner) toolContext(ctx context.Context, tools agenttool.Set) context.C
 	// [Ask] says a person's accept note through the run whose hook or
 	// tool asked.
 	ctx = context.WithValue(ctx, noteSinkKey{}, r)
+	// runAsk is the run's elicitor, the one a nested call's deferral is
+	// put to, whatever elicitor the invoking tool puts on its own
+	// context: a tool does not answer for the policy that holds its
+	// calls. nil when the run asks nobody.
+	var runAsk agenttool.Elicitor
 	if r.cfg.ToolElicitor != nil {
-		ctx = agenttool.ContextWithElicitor(ctx, r.noteElicitor(r.cfg.ToolElicitor))
+		runAsk = r.noteElicitor(r.cfg.ToolElicitor)
 	} else if inherited, ok := agenttool.ElicitorFrom(ctx); ok {
-		ctx = agenttool.ContextWithElicitor(ctx, r.noteElicitor(inherited))
+		runAsk = r.noteElicitor(inherited)
+	}
+	if runAsk != nil {
+		ctx = agenttool.ContextWithElicitor(ctx, runAsk)
 	}
 	if r.steered != nil {
 		ctx = context.WithValue(ctx, steeredKey{}, r.steered())
@@ -2647,7 +2655,7 @@ func (r *runner) toolContext(ctx context.Context, tools agenttool.Set) context.C
 	// its own must not read a turn the loop is writing.
 	turn := r.turn
 	return context.WithValue(ctx, invokerKey{}, invoker(func(ctx context.Context, name string, args json.RawMessage) (agenttool.Result, error) {
-		return r.invoke(ctx, tools, turn, name, args)
+		return r.invoke(ctx, tools, turn, name, args, runAsk)
 	}))
 }
 
@@ -3287,7 +3295,10 @@ var ErrNoInvoker = errors.New("agentturn: no loop on the context to invoke a too
 // not an object, or a call the hook refused, whose Reason is the error.
 // A nested call cannot be handed to the caller, since it belongs to a
 // tool that is running, so one the hook defers is put to the user
-// through the agenttool.Elicitor on ctx, when there is one, with [Ask]:
+// through the run's agenttool.Elicitor, when it has one, with [Ask],
+// never through one the tool put on ctx itself, which would let a tool
+// approve a call its policy deferred; the decision hook sees the run's
+// elicitor too:
 // the question names the call, and the elicitor's context carries it
 // as an [AskedCall], its ID, name, whole arguments and the deferral,
 // for [AskedCallFrom]. An accept runs it and a decline refuses it, and
@@ -3331,7 +3342,7 @@ func Invoke(ctx context.Context, name string, args json.RawMessage) (agenttool.R
 // invoke runs a nested call through the turn's hooks, events and
 // executor. It never touches the transcript: the call is the work of
 // the call that made it.
-func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name string, args json.RawMessage) (agenttool.Result, error) {
+func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name string, args json.RawMessage, runAsk agenttool.Elicitor) (agenttool.Result, error) {
 	parent := ""
 	if call, ok := agenttool.CallFrom(ctx); ok {
 		parent = call.ID
@@ -3357,7 +3368,11 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 	var decision *ToolDecision
 	if r.cfg.BeforeToolCall != nil {
 		var err error
-		decision, err = r.beforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: turn, Call: call, Tool: p.tool, Args: p.args, Batch: []*openresponses.FunctionCall{call}, Index: 0, Parent: parent})
+		// The hook, and the question a deferral puts, see the run's
+		// elicitor, not one the invoking tool installed: a tool must
+		// not approve a call its policy deferred by answering itself.
+		decideCtx := agenttool.ContextWithElicitor(ctx, runAsk)
+		decision, err = r.beforeToolCall(decideCtx, ToolCallInfo{RunID: r.runID, Turn: turn, Call: call, Tool: p.tool, Args: p.args, Batch: []*openresponses.FunctionCall{call}, Index: 0, Parent: parent})
 		if err != nil {
 			return agenttool.Result{}, fmt.Errorf("agentturn: before-tool-call hook: %w", err)
 		}
@@ -3367,10 +3382,10 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 			}
 			if decision.Action == Defer {
 				// A nested call cannot be handed to the caller, so the
-				// user is asked through the invoking tool's elicitor;
-				// without one, or with no answer, the deferral stands
-				// and refuses the call below.
-				if d, ok := Ask(ctx, AskedCall{Parent: parent, CallID: call.CallID, Name: name, Args: p.args, Decision: decision}); ok {
+				// user is asked through the run's elicitor; without
+				// one, or with no answer, the deferral stands and
+				// refuses the call below.
+				if d, ok := Ask(decideCtx, AskedCall{Parent: parent, CallID: call.CallID, Name: name, Args: p.args, Decision: decision}); ok {
 					decision = d
 				}
 			}
