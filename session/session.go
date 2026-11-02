@@ -2823,7 +2823,7 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 // of the branch. And an input the agent holds, queued and not
 // appended, is written as a queued entry on the new branch unless the
 // entry that holds it, or one the branch owes that holds the same input
-// in the same mode, is pending there, so a move back to where the input
+// in the same mode under the same trigger, is pending there, so a move back to where the input
 // was queued writes it no second time.
 //
 // The empty entry ID is the reset a product's /clear makes: the
@@ -2913,13 +2913,13 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 			continue
 		}
 		// An entry the new branch owes that holds this very input, in
-		// its mode, is its entry there: a move back to a branch the
+		// its mode and brought by the same trigger, is its entry there: a move back to a branch the
 		// input was queued on before, as an undone rewind makes, writes
 		// it no second time.
 		in.entry = ""
 		rec := w.recordForm(in.item)
 		for _, q := range owed {
-			if !claimed[q.ID] && q.Mode == in.mode && q.Deliver == in.deliver && equalJSON(q.Item, rec) {
+			if !claimed[q.ID] && q.Mode == in.mode && q.Deliver == in.deliver && equalJSON(q.Trigger, in.trigger) && equalJSON(q.Item, rec) {
 				in.entry, claimed[q.ID] = q.ID, true
 				break
 			}

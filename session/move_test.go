@@ -211,3 +211,55 @@ func TestARewindIsOneOperation(t *testing.T) {
 		}
 	})
 }
+
+// TestARebaseTakesAnOwedEntryOnlyWithItsTrigger pins that a rebase
+// takes an entry the new branch owes as an input's own only when it
+// holds the same input with the same trigger: an entry for the same
+// item brought by something else is not the input's, and the input is
+// queued on its own entry, with its trigger.
+func TestARebaseTakesAnOwedEntryOnlyWithItsTrigger(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: answers{}, ModelName: "m"})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(ctx, openresponses.UserText("one")); err != nil {
+		t.Fatal(err)
+	}
+	byCron := agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "cron", Ref: "nightly"})
+	if err := rec.Queue(byCron, a, agentturn.QueueFollowUp, openresponses.UserText("later")); err != nil {
+		t.Fatal(err)
+	}
+	if s, err = store.Open(ctx, s.ID()); err != nil {
+		t.Fatal(err)
+	}
+	leaf := s.Leaf()
+	// The agent's input is the same item brought by a person instead,
+	// and its entry is closed: the owed cron entry is not its own.
+	rec.mu.Lock()
+	in := rec.root.inbox[0]
+	in.trigger, in.entry = &agentsession.Trigger{Kind: "user", Ref: "alice"}, ""
+	rec.mu.Unlock()
+	if err := rec.Rebase(s, leaf); err != nil {
+		t.Fatal(err)
+	}
+	if s, err = store.Open(ctx, s.ID()); err != nil {
+		t.Fatal(err)
+	}
+	owed, err := s.PendingQueued(s.Leaf())
+	if err != nil {
+		t.Fatal(err)
+	}
+	user := 0
+	for _, q := range owed {
+		if q.Trigger != nil && q.Trigger.Kind == "user" {
+			user++
+		}
+	}
+	if user != 1 {
+		t.Errorf("owed entries with the person's trigger = %d, want the input queued on its own: %s", user, entryTypes(s))
+	}
+}

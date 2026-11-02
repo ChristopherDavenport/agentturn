@@ -7,6 +7,11 @@ versions may break the API.
 
 ## Unreleased
 
+- Fixed: `Recorder.Rebase` takes an entry the new branch owes as an
+  input's own only when it holds the same input in the same mode under
+  the same trigger; an entry for the same item that something else
+  brought is left to that input, and this one is queued on its own
+  entry with its trigger. (#220)
 - Changed: a model call refused with a guard's error before the attempt
   committed now raises `ModelBlocked` in place of its `response_end`,
   carrying the request sent and the new `ModelBlocked.Usage`, what the
