@@ -1364,7 +1364,9 @@ func WithFilter(f func(agentturn.Transcript) agentturn.Transcript) Option {
 	return func(r *Recorder) { r.filter = f }
 }
 
-// WithHarness names the writer in the header of child sessions.
+// WithHarness names the writer in the header of every session the
+// recorder creates: the root a [Start] creates when its header names
+// no harness, and each child session.
 func WithHarness(name, version string) Option {
 	return func(r *Recorder) { r.harness = &agentsession.Harness{Name: name, Version: version} }
 }
@@ -1505,9 +1507,10 @@ func newWriter(r *Recorder, id string) *writer {
 // Start creates a session from h and returns a recorder for it. When
 // h.Records is nil the header promises the run, dispatch, decision and
 // queued records, which this recorder writes whenever their event
-// occurs. Child sessions name h.Harness as their writer unless
-// [WithHarness] says otherwise. The caller keeps store for Sync,
-// Release and Close.
+// occurs. A header with no harness takes the one [WithHarness] names,
+// so the root names its writer as every child does; child sessions
+// name h.Harness as their writer unless [WithHarness] says otherwise.
+// The caller keeps store for Sync, Release and Close.
 //
 // A header with a Base forks the session that holds it: the store
 // writes the prefix, and the recorder is seeded from the context at
@@ -1526,11 +1529,16 @@ func Start(ctx context.Context, store agentsession.Store, h agentsession.Header,
 	if h.Records == nil {
 		h.Records = append(append([]string(nil), agentsession.AllRecords...), agentsession.TypeQueued)
 	}
+	r := New(store, "", opts...)
+	if h.Harness == nil {
+		// The root names the recorder's harness, as each child does.
+		h.Harness = r.harness
+	}
 	s, err := store.Create(ctx, h)
 	if err != nil {
 		return nil, nil, fmt.Errorf("session: create: %w", err)
 	}
-	r := New(store, s.ID(), opts...)
+	r.root.id = s.ID()
 	if r.harness == nil {
 		r.harness = s.Header().Harness
 	}

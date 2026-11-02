@@ -1,6 +1,6 @@
 # RFC 0001: Agent Loop
 
-Status: draft 0.3
+Status: draft 0.4
 Author: Christopher Davenport
 Discussion: to be opened against this repository, then proposed to the
 Open Responses community as a companion specification. The Go module at
@@ -1460,6 +1460,11 @@ that records one, so a call the cut reached first, or one the loop
 refused itself, has none and reads as never started. And every entry a
 cancellation leaves to write is written, because every event after a
 cancellation is delivered with a usable context.
+
+The sessions a recorder creates, the root and each child session it
+opens for a tool's run, are described alike. A recorder that names its
+harness MUST write that harness in the header of every session it
+creates, unless the host names a different one for that session.
 
 A recorder that continues a path on which a run is open that it is
 not running owns that run and closes it before it writes anything

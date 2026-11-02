@@ -599,6 +599,59 @@ func TestSlowAppendDelaysToolPreflight(t *testing.T) {
 	}
 }
 
+// TestStartNamesTheHarnessInTheRootHeader pins RFC 0001's The record:
+// a recorder that names its harness writes it in the header of every
+// session it creates, the root as well as each child, unless the host
+// names a different one for that session (#219).
+func TestStartNamesTheHarnessInTheRootHeader(t *testing.T) {
+	cases := []struct {
+		name   string
+		header agentsession.Header
+		root   string
+	}{
+		{"empty header takes the recorder's", agentsession.Header{}, "test"},
+		{"a header's own stands", agentsession.Header{Harness: &agentsession.Harness{Name: "host", Version: "2"}}, "host"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, tc.header, WithHarness("test", "1"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			child := agent.New(agentturn.Config{Name: "specialist", Description: "a child", Model: &echo.Adapter{}})
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{child}})
+			defer rec.Attach(a)()
+			if _, err := a.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
+				t.Fatal(err)
+			}
+			root, err := store.Open(context.Background(), s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if h := root.Header().Harness; h == nil || h.Name != tc.root {
+				t.Errorf("root harness = %+v, want %q", h, tc.root)
+			}
+			var link *agentsession.LinkEntry
+			for _, e := range root.Entries() {
+				if l, ok := e.(*agentsession.LinkEntry); ok {
+					link = l
+				}
+			}
+			if link == nil {
+				t.Fatalf("no link entry in %q", entryTypes(root))
+			}
+			cs, err := store.Open(context.Background(), link.Session)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if h := cs.Header().Harness; h == nil || h.Name != "test" || h.Version != "1" {
+				t.Errorf("child harness = %+v, want test 1", h)
+			}
+		})
+	}
+}
+
 func TestChildRunProducesLink(t *testing.T) {
 	store := agentsession.NewMemoryStore()
 	rec, s, err := Start(context.Background(), store, agentsession.Header{}, WithHarness("test", "1"))

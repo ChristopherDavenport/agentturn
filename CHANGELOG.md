@@ -20,6 +20,11 @@ versions may break the API.
   describe such a request, and only an input the format cannot describe
   costs the responses after it their hash; the reference recorder
   writing those omissions is #233.
+- Changed: RFC 0001 is draft 0.4. The record states how the sessions a
+  recorder creates are described, the root and each child alike.
+- Fixed: `session.Start` writes the harness `WithHarness` names in the
+  root session's header when the header names none, as every child
+  session's already did; a header that names one keeps it. (#219)
 
 ## v0.0.34 - 2026-10-26
 
