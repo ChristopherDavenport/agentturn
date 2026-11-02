@@ -331,6 +331,12 @@ versions may break the API.
   recorder writes them on the nested call's end entry. The error's Go
   type does not survive the record; its text does. (#261)
 
+- Added: `session.Recorder.Control(a)`, the agent's `Control` with
+  `Queue` and `Deliver` going through the recorder's, which write the
+  `queued` entry first. A host serves it with `front/control.Handler`,
+  so a remote delivery made while the agent waits on an approval
+  survives a quit. (#244)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

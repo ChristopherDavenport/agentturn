@@ -3,12 +3,14 @@ package session
 import (
 	"context"
 	"errors"
+	"net/http/httptest"
 	"slices"
 	"testing"
 
 	"github.com/ChristopherDavenport/agentsession"
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
+	"github.com/ChristopherDavenport/agentturn/front/control"
 	"github.com/ChristopherDavenport/openresponses"
 )
 
@@ -236,4 +238,38 @@ func TestARefusedDeliveryLeavesNothingOwed(t *testing.T) {
 		t.Errorf("Requeue handed back %d inputs after the restart, want none", n)
 	}
 	verifyAll(t, s)
+}
+
+// TestARemoteDeliveryAtAnApprovalPromptIsWrittenFirst pins #244 over
+// the wire: a front serving the recorder's Control writes a delivery's
+// queued entry before the agent takes it, as Recorder.Deliver does, so
+// one a remote party makes while the agent waits on an approval is on
+// the record before any run takes it, and survives a quit.
+func TestARemoteDeliveryAtAnApprovalPromptIsWrittenFirst(t *testing.T) {
+	ctx := context.Background()
+	rec, s, err := Start(ctx, agentsession.NewMemoryStore(), agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hold := func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+		return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask"}, nil
+	}
+	tools := []agenttool.Tool{agenttool.New("deploy", "", func(context.Context, echoArgs) (string, error) { return "deployed", nil })}
+	a := agentturn.New(agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools, BeforeToolCall: hold})
+	defer rec.Attach(a)()
+	if end, err := a.Prompt(ctx, openresponses.UserText("deploy")); err != nil || end.Reason != agentturn.ReasonInputRequired {
+		t.Fatalf("first run: %v, %+v", err, end)
+	}
+	srv := httptest.NewServer(control.Handler(rec.Control(a), control.WithInsecureNoAuth()))
+	defer srv.Close()
+	c, err := control.Dial(ctx, srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := c.Deliver(ctx, openresponses.UserText("the build passed")); !errors.Is(err, agentturn.ErrInputRequired) {
+		t.Errorf("remote delivery at the prompt: err = %v, want ErrInputRequired", err)
+	}
+	if d := deliveries(s)["the build passed"]; d == nil || !d.Deliver {
+		t.Errorf("the delivery's entry = %+v, want it written with deliver before any run", d)
+	}
 }

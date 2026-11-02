@@ -182,7 +182,9 @@ type handler struct {
 }
 
 // Handler serves c over HTTP: JSON requests for its methods and a
-// server-sent event stream for Subscribe. Mount it under a path with
+// server-sent event stream for Subscribe. A host that records the agent
+// serves agentturn/session's Recorder.Control(agent), so a queued or
+// delivered input is written before the agent takes it. Mount it under a path with
 // http.StripPrefix. The routes, relative to that path:
 //
 //	GET  /                 the protocol, for Dial            any scope

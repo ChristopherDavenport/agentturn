@@ -3091,6 +3091,42 @@ func (r *Recorder) Deliver(ctx context.Context, a *agentturn.Agent, items ...ope
 	return joined, end, err
 }
 
+// RecordedControl is the agentturn.Control a recorder offers for an
+// agent it records, with the delivery beside it: what a front serving
+// the agent to remote parties, front/control's Handler among them, is
+// given, so input queued or delivered over the wire is written before
+// the agent takes it.
+type RecordedControl interface {
+	agentturn.Control
+	agentturn.Deliverer
+}
+
+// Control returns a's Control with its Queue going through
+// [Recorder.Queue] and its Deliver through [Recorder.Deliver], so an
+// input a remote party hands in while the agent is idle or waits on an
+// approval is on the record before the agent takes it and survives a
+// quit. Every other method is a's own.
+func (r *Recorder) Control(a *agentturn.Agent) RecordedControl {
+	return recordedControl{Agent: a, r: r}
+}
+
+// recordedControl is [Recorder.Control]'s value.
+type recordedControl struct {
+	*agentturn.Agent
+	r *Recorder
+}
+
+// Queue writes each item's queued entry, then queues it.
+func (c recordedControl) Queue(ctx context.Context, mode agentturn.QueueMode, items ...openresponses.Item) error {
+	return c.r.Queue(ctx, c.Agent, mode, items...)
+}
+
+// Deliver writes each item's queued entry, carrying deliver, then
+// delivers it.
+func (c recordedControl) Deliver(ctx context.Context, items ...openresponses.Item) (bool, *agentturn.RunEnd, error) {
+	return c.r.Deliver(ctx, c.Agent, items...)
+}
+
 // decline marks inputs whose entries were written and which the agent
 // did not take: nobody holds them, Requeue does not hand them back, and
 // the next run end drops them. A process that dies before that end
