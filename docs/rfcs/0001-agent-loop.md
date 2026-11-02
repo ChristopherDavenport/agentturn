@@ -675,7 +675,12 @@ SHOULD rebuild the request through it with a fold asked for, as the
 request's step 2 says, and send it once, as a retry: `model_retry`
 reports the refusal and carries the rebuilt request, so a record shows
 the fold and then the attempt. It does so whatever the retry policy,
-whose attempts it does not count, and never twice in one turn. A
+whose attempts it does not count: the attempt number the policy's
+limit, backoff and revision are given counts the policy's own retries
+alone, while `model_retry` numbers every call. A request a revision
+made keeps the revision's model and settings when it is rebuilt, and
+the transform weighs those, so an overflow on a smaller fallback is
+folded for the fallback. It happens never twice in one turn. A
 rebuilt request whose input is the one refused, because the transform
 could not fold, is not sent, and the run ends with the refusal (#277).
 

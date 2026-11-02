@@ -1596,15 +1596,27 @@ func (r *runner) appendOne(item openresponses.Item, mode InputMode, trigger, end
 // input the loop set, which the request still carries when the
 // before-model-call hook kept it.
 func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponses.Request, built, error) {
+	return r.requestWith(ctx, tools, nil)
+}
+
+// requestWith is request with the transform given settings, when not
+// nil, as the settings the request will carry in place of the
+// configuration's: a retry's revision that moved the turn to another
+// model is weighed as that model's request.
+func (r *runner) requestWith(ctx context.Context, tools agenttool.Set, settings *openresponses.Request) (openresponses.Request, built, error) {
 	// The transform and BeforeModelCall run under the attribution too.
 	ctx = r.attributed(ctx)
 	// The settings come first, so the transform can weigh what the
 	// request will carry beside the input (#279).
 	req := r.cfg.baseRequest(tools)
+	weighed := req
+	if settings != nil {
+		weighed = *settings
+	}
 	input := Transcript(append(openresponses.Items(nil), r.transcript...))
 	if r.cfg.Transform != nil {
 		var err error
-		input, err = r.cfg.Transform(ContextWithRequest(ctx, req), input)
+		input, err = r.cfg.Transform(ContextWithRequest(ctx, weighed), input)
 		if err != nil {
 			return openresponses.Request{}, built{}, fmt.Errorf("agentturn: transform: %w", err)
 		}
@@ -1706,8 +1718,12 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 		return nil, err
 	}
 	start := len(r.transcript)
-	folded := false
-	for attempt := 1; ; attempt++ {
+	// call numbers the calls made, as model_retry reports them; attempt
+	// numbers the ones the retry policy counts, which a fold after a
+	// context-length refusal is not (#277). revised says the policy's
+	// revision made the request in flight.
+	folded, revised := false, false
+	for call, attempt := 1, 1; ; call++ {
 		resp, committed, err := r.stream(ctx, req)
 		// What the attempt kept is the model its request named, however
 		// it ended: after a revision, not the configuration's (#286).
@@ -1770,12 +1786,27 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 			// fold is reported and recorded as any other, before the
 			// attempt it shortened (#277).
 			folded = true
-			next, nb, rerr := r.request(ContextWithFoldRequest(ctx), tools)
+			var settings *openresponses.Request
+			if revised {
+				// The revision's model and settings stay, and the
+				// transform weighs them, not the configuration's.
+				settings = &req
+			}
+			next, nb, rerr := r.requestWith(ContextWithFoldRequest(ctx), tools, settings)
 			if rerr != nil {
 				return nil, rerr
 			}
+			if revised {
+				input := next.Input
+				if sameSlice(next.Input, nb.input) {
+					input = r.inputFor(req.Model, nb.filtered)
+					nb.input = input
+				}
+				next = req
+				next.Input = input
+			}
 			if !sameItems(next.Input, req.Input) {
-				if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: attempt, Err: err, Request: next}); err != nil {
+				if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: call, Err: err, Request: next}); err != nil {
 					return nil, err
 				}
 				req, b = next, nb
@@ -1795,14 +1826,15 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 			}
 			// The model a request names is the model its input is built
 			// for: a move to another model rebuilds the loop's input.
-			req = b.forModel(r, req, next)
+			req, revised = b.forModel(r, req, next), true
 		}
-		if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: attempt, Err: err, Delay: delay, Request: req}); err != nil {
+		if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: call, Err: err, Delay: delay, Request: req}); err != nil {
 			return nil, err
 		}
 		if err := sleep(ctx, delay); err != nil {
 			return nil, stop(ReasonAborted, context.Cause(ctx))
 		}
+		attempt++
 	}
 }
 

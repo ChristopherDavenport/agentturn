@@ -7,11 +7,13 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
@@ -1402,5 +1404,94 @@ func TestAScreenshotWeighsItsVisualCost(t *testing.T) {
 	tr := NewLocal(s, WithKeepLast(1))
 	if _, err := tr.Transform(context.Background(), agentturn.Transcript(transcript)); err != nil || len(s.reqs) != 0 {
 		t.Errorf("err = %v, summaries asked = %d, want none within the default budget", err, len(s.reqs))
+	}
+}
+
+// failsBy fails the calls fail names, by call number from 1, with their
+// error, refuses as too long every request on a model in short whose
+// input holds more than limit items, and answers the rest; it records
+// the model and the input size of each call.
+type failsBy struct {
+	fail  map[int]error
+	short map[string]bool
+	limit int
+	sent  []string
+}
+
+func (m *failsBy) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.sent = append(m.sent, fmt.Sprintf("%s:%d", req.Model, len(req.Input)))
+	if err := m.fail[len(m.sent)]; err != nil {
+		return err
+	}
+	if m.short[req.Model] && len(req.Input) > m.limit {
+		return openresponses.ContextLengthExceeded("prompt is too long")
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("ok"); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestAnOverflowFoldIsNotAPolicyAttempt pins #277's review: the
+// fold-retry after a context-length refusal is not one of the retry
+// policy's attempts, so it neither uses up MaxAttempts nor shifts the
+// attempt Revise and the backoff are given, and a fold after a revision
+// keeps the revision's model rather than going back to the
+// configuration's.
+func TestAnOverflowFoldIsNotAPolicyAttempt(t *testing.T) {
+	limited := openresponses.TooManyRequests("rate", "rate limited")
+	for _, tc := range []struct {
+		name    string
+		model   *failsBy
+		sent    []string
+		revised []int
+	}{
+		{name: "a fold, then a rate limit the policy retries on the fallback",
+			model: &failsBy{fail: map[int]error{2: limited}, short: map[string]bool{"a": true}, limit: 3},
+			sent:  []string{"a:7", "a:2", "b:2"}, revised: []int{1}},
+		{name: "a rate limit moves to a smaller fallback, which folds",
+			model: &failsBy{fail: map[int]error{1: limited}, short: map[string]bool{"b": true}, limit: 3},
+			sent:  []string{"a:7", "b:7", "b:2"}, revised: []int{1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &summarizer{reply: "They talked about things."}
+			var revised []int
+			cfg := agentturn.Config{Model: tc.model, ModelName: "a",
+				Transform: NewLocal(s, WithBudget(100), WithKeepLast(1), WithEstimator(count), WithMinFold(0)).Transform,
+				Retry: agentturn.Retry{MaxAttempts: 2, Backoff: func(int, error) time.Duration { return 0 },
+					Revise: func(attempt int, req *openresponses.Request, _ error) *openresponses.Request {
+						revised = append(revised, attempt)
+						req.Model = "b"
+						return nil
+					}}}
+			var end *agentturn.RunEnd
+			var retries []int
+			for ev := range agentturn.Run(context.Background(), items(6), openresponses.Items{openresponses.UserText("latest")}, cfg) {
+				switch e := ev.(type) {
+				case *agentturn.ModelRetry:
+					retries = append(retries, e.Attempt)
+				case *agentturn.RunEnd:
+					end = e
+				}
+			}
+			if end == nil || end.Reason != agentturn.ReasonDone {
+				t.Fatalf("end = %+v", end)
+			}
+			if !slices.Equal(tc.model.sent, tc.sent) {
+				t.Errorf("calls = %v, want %v", tc.model.sent, tc.sent)
+			}
+			if !slices.Equal(revised, tc.revised) {
+				t.Errorf("Revise given attempts %v, want %v", revised, tc.revised)
+			}
+			// model_retry numbers the calls, as a recorder counts them.
+			if !slices.Equal(retries, []int{1, 2}) {
+				t.Errorf("model_retry attempts = %v, want [1 2]", retries)
+			}
+		})
 	}
 }

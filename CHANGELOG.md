@@ -374,8 +374,12 @@ versions may break the API.
   rebuilds the request once with a fold asked for, marking the
   transform's context with `ContextWithFoldRequest` (`FoldRequested`),
   and sends it as a retry reported by `model_retry`, whatever the retry
-  policy; a transform that cannot shorten it ends the run with the
-  refusal, as before. RFC 0001 The request step 2 and Retry. (#277)
+  policy and without counting against it: `MaxAttempts`, the backoff
+  and `Revise` see the policy's attempts alone, while `model_retry`
+  numbers every call. After a `Revise` the fold-retry keeps the revised
+  model and settings, which the transform weighs. A transform that
+  cannot shorten it ends the run with the refusal, as before. RFC 0001
+  The request step 2 and Retry. (#277)
 
 - Changed: the transform's context carries the settings the request
   will carry, built before the transform runs, as
