@@ -915,9 +915,12 @@ type Recorder struct {
 	ended map[string]string
 	// heldQueued holds, by the call the child runs under, the queued
 	// reports of an observed child that named no run: inputs accepted
-	// while it was idle, written to the session of the run that takes
-	// them, at its start.
-	heldQueued map[string][]*agentturn.Queued
+	// while it was idle, for the run that takes them. One for a call
+	// whose child has a session already is written there when it is
+	// reported, so it is on the record whether or not the child runs
+	// again; one for a call with none yet is written at the start of
+	// the run that takes it.
+	heldQueued map[string][]*heldReport
 	// childIDs holds the ID of every child session the recorder has
 	// written, so a record naming one by [SessionIDFromContext] after
 	// its run ended is filed there rather than at the root.
@@ -1137,6 +1140,10 @@ type inboxItem struct {
 	item    openresponses.Item
 	mode    string
 	trigger *agentsession.Trigger
+	// deliver says the input arrived as a delivery, which its queued
+	// entry carries as deliver, so one owed after a restart is handed
+	// back as one.
+	deliver bool
 	// entry is the ID of the queued entry holding the input on the
 	// current path, "" when a run end or a rewind has closed the one
 	// that did.
@@ -1149,6 +1156,26 @@ type inboxItem struct {
 	// awaiting is set while an input Requeue handed back waits for its
 	// queued event, which then writes nothing: the path holds it.
 	awaiting bool
+}
+
+// heldReport is a queued report of an observed child that named no
+// run, and, when it was written to the child's session as it was
+// reported, that session and the entry.
+type heldReport struct {
+	q       *agentturn.Queued
+	session string
+	entry   string
+}
+
+// inbox is the input the report's entry holds, for the run that takes
+// it up.
+func (h *heldReport) inbox() *inboxItem {
+	mode := agentsession.ModeFollowUp
+	if h.q.Mode == agentturn.QueueSteer {
+		mode = agentsession.ModeSteer
+	}
+	trigger, _ := sessionTrigger(h.q.Trigger)
+	return &inboxItem{item: h.q.Item, mode: mode, trigger: trigger, deliver: h.q.Input == agentturn.InputDeliver, entry: h.entry, held: true}
 }
 
 // callRecord is what the path holds for one function call.
@@ -2834,7 +2861,7 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 		in.entry = ""
 		rec := w.recordForm(in.item)
 		for _, q := range owed {
-			if !claimed[q.ID] && q.Mode == in.mode && equalJSON(q.Item, rec) {
+			if !claimed[q.ID] && q.Mode == in.mode && q.Deliver == in.deliver && equalJSON(q.Item, rec) {
 				in.entry, claimed[q.ID] = q.ID, true
 				break
 			}
@@ -2913,6 +2940,7 @@ func (w *writer) requeue(ctx context.Context) error {
 			return err
 		}
 		q := agentsession.NewQueued(item, in.mode)
+		q.Deliver = in.deliver && in.mode == agentsession.ModeSteer
 		q.Trigger = in.trigger.Clone()
 		id, err := w.append(ctx, q)
 		if err != nil {
@@ -2962,10 +2990,53 @@ func (r *Recorder) Queue(ctx context.Context, a *agentturn.Agent, mode agentturn
 	return nil
 }
 
+// Deliver delivers items to a, as agentturn.Agent.Deliver does with
+// ctx's trigger, after writing each as a queued entry carrying deliver
+// at the session's leaf, durably, before the agent accepts it: the way
+// to take a background task's result that must not be lost, one that
+// arrives while the agent waits on an approval among them, whose
+// queued event would otherwise wait for the next run. The event then
+// writes nothing. An item whose entry cannot be written is not
+// delivered, and the error says so; nothing is delivered then. It
+// returns what Deliver returns.
+func (r *Recorder) Deliver(ctx context.Context, a *agentturn.Agent, items ...openresponses.Item) (bool, *agentturn.RunEnd, error) {
+	trigger, err := sessionTrigger(agentturn.TriggerFromContext(ctx))
+	if err != nil {
+		return false, nil, err
+	}
+	r.mu.Lock()
+	n := len(r.root.inbox)
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		base, _ := agentturn.Unhide(item)
+		r.root.inbox = append(r.root.inbox, &inboxItem{item: base, mode: agentsession.ModeSteer, deliver: true, held: true, awaiting: true, trigger: trigger.Clone()})
+	}
+	if err := r.root.requeue(context.WithoutCancel(ctx)); err != nil {
+		// The entries written stay on the path, owed, as a crash would
+		// leave them; the agent holds none of the items.
+		for _, in := range r.root.inbox[n:] {
+			in.held, in.awaiting = false, false
+		}
+		r.mu.Unlock()
+		return false, nil, err
+	}
+	r.mu.Unlock()
+	return a.Deliver(ctx, items...)
+}
+
 // Requeue hands the agent the inputs the session owes, the ones queued
 // on the path at [Resume], or at a [Start] on a base, and not yet
 // appended, in the order they were accepted and each in its own mode
-// and with its trigger, and returns how many. The path already holds
+// and with its trigger, and returns how many. Each is handed back the
+// way it arrived: a delivery, whose entry carries deliver, with
+// agentturn.Agent.Redeliver, so the turn that takes it reads it as one,
+// and a steer or a follow-up with Queue. An owed delivery must reach
+// the model: when nothing else starts a run, the host starts the one
+// that takes it with agentturn.Agent.Continue, and while calls are
+// pending the resume takes it after its batch; an owed steer waits for
+// the next input. The path already holds
 // each, so their queued events write nothing and the item that drains
 // each names its entry. Call it after Resume and before the agent's
 // first run: an input nobody has taken up when a run ends is closed by
@@ -2996,6 +3067,10 @@ func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) int {
 		}
 		// A trigger read back from the path was written, so the agent
 		// does not refuse it.
+		if in.deliver {
+			_ = a.Redeliver(qctx, in.item)
+			continue
+		}
 		_ = a.Queue(qctx, mode, in.item)
 	}
 	return len(owed)
@@ -3502,7 +3577,7 @@ func (w *writer) seed(ctx context.Context, s *agentsession.Session, owed bool) e
 			return fmt.Errorf("session: queued inputs at leaf: %w", err)
 		}
 		for _, q := range queued {
-			w.inbox = append(w.inbox, &inboxItem{item: q.Item, mode: q.Mode, trigger: q.Trigger, entry: q.ID})
+			w.inbox = append(w.inbox, &inboxItem{item: q.Item, mode: q.Mode, trigger: q.Trigger, entry: q.ID, deliver: q.Deliver})
 		}
 	}
 	// Every call on the path, a call with its output included, so a
@@ -3783,9 +3858,21 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 			callID = call.ID
 		}
 		if r.heldQueued == nil {
-			r.heldQueued = map[string][]*agentturn.Queued{}
+			r.heldQueued = map[string][]*heldReport{}
 		}
-		r.heldQueued[callID] = append(r.heldQueued[callID], e)
+		h := &heldReport{q: e}
+		parent := r.root
+		if p, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
+			parent = p
+		}
+		if id := agentsession.SubsessionID(parent.id, callID); callID != "" && r.childIDs[id] {
+			// The child's session continues at its leaf: the input is
+			// owed there from now, after the run that ended.
+			if w, err := r.reopenID(ctx, id); err == nil && w != nil && w.queued(ctx, e) == nil && len(w.inbox) > 0 {
+				h.session, h.entry = id, w.inbox[len(w.inbox)-1].entry
+			}
+		}
+		r.heldQueued[callID] = append(r.heldQueued[callID], h)
 		return
 	}
 	if e, ok := ev.(*agentturn.RunStart); ok {
@@ -3813,8 +3900,15 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 		}
 		held := r.heldQueued[callID]
 		delete(r.heldQueued, callID)
-		for _, q := range held {
-			if err := w.handle(ctx, q); err != nil {
+		retry := agent.RetryFromContext(ctx)
+		for _, h := range held {
+			if h.entry != "" && h.session == w.id && !retry {
+				// Written when it was reported, at the leaf this run
+				// continues from: the run takes it up.
+				w.inbox = append(w.inbox, h.inbox())
+				continue
+			}
+			if err := w.handle(ctx, h.q); err != nil {
 				r.release(e.RunID, w)
 				return
 			}
@@ -3897,7 +3991,9 @@ func (r *Recorder) Fold(ctx context.Context, f compact.Fold) error {
 func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, live bool, name string) (*writer, error) {
 	h := agentsession.Header{ParentSession: parent.id, Harness: r.harness, SpawnedBy: callID, CWD: parent.cwd, Media: parent.media}
 	if live {
-		h.Records = append(append([]string(nil), agentsession.AllRecords...), agentsession.TypeResult)
+		// Written from its events, the child's queued reports among
+		// them, as the root is.
+		h.Records = append(append([]string(nil), agentsession.AllRecords...), agentsession.TypeQueued, agentsession.TypeResult)
 	}
 	if callID != "" {
 		h.ID = agentsession.SubsessionID(parent.id, callID)
@@ -4096,7 +4192,7 @@ func (w *writer) queued(ctx context.Context, e *agentturn.Queued) error {
 	if err != nil {
 		return err
 	}
-	in := &inboxItem{item: e.Item, mode: mode, held: true, trigger: trigger}
+	in := &inboxItem{item: e.Item, mode: mode, held: true, trigger: trigger, deliver: e.Input == agentturn.InputDeliver}
 	w.inbox = append(w.inbox, in)
 	return w.requeue(ctx)
 }

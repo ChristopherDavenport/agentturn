@@ -1390,6 +1390,26 @@ func (a *Agent) Queue(ctx context.Context, mode QueueMode, items ...openresponse
 	return nil
 }
 
+// Redeliver queues items as [Agent.Deliver] queues them, a steer that
+// reaches the turn that takes it as [InputDeliver] and is reported with
+// that Input, with the [Trigger] on ctx, but neither waits nor starts a
+// run: it is how a host hands back a delivery a record owes, before
+// the agent's first run, as agentturn/session's Requeue does. The host
+// then starts the run that takes it when nothing else will, with
+// [Agent.Continue], or leaves it for the resume while calls are
+// pending. A trigger whose Extra cannot be written is refused with
+// [ErrTriggerExtra], and nothing is queued.
+func (a *Agent) Redeliver(ctx context.Context, items ...openresponses.Item) error {
+	trigger := TriggerFromContext(ctx)
+	if err := trigger.Validate(); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.queue(trigger, QueueSteer, InputDeliver, items)
+	return nil
+}
+
 // Deliver hands items to the model, for an input that arrives on its
 // own time: a background task's result, a detached child's answer. The
 // items are queued as [Agent.Queue] queues a steer, with the [Trigger]
@@ -1576,7 +1596,7 @@ func (a *Agent) queue(trigger Trigger, mode QueueMode, how InputMode, items open
 		} else {
 			a.followUp = append(a.followUp, entry)
 		}
-		a.queued = append(a.queued, &Queued{RunID: runID, Item: base, Mode: mode, Hidden: hidden, Trigger: trigger})
+		a.queued = append(a.queued, &Queued{RunID: runID, Item: base, Mode: mode, Input: how, Hidden: hidden, Trigger: trigger})
 	}
 }
 

@@ -160,7 +160,7 @@ func wireOf(ev agentturn.Event) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return wireQueued{Type: e.EventType(), RunID: e.RunID, Item: item, Mode: string(e.Mode), Hidden: e.Hidden, Trigger: triggerOut(e.Trigger)}, nil
+		return wireQueued{Type: e.EventType(), RunID: e.RunID, Item: item, Mode: string(e.Mode), Input: string(e.Input), Hidden: e.Hidden, Trigger: triggerOut(e.Trigger)}, nil
 	case *agentturn.Question:
 		return wireQuestion{Type: e.EventType(), ID: e.ID, RunID: e.RunID, CallID: e.CallID, Call: askedCallOut(e.Call), Elicitation: elicitationOut(e.Elicitation)}, nil
 	case *agentturn.QuestionClosed:
@@ -342,7 +342,7 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 		if err != nil {
 			return nil, err
 		}
-		return &agentturn.Queued{RunID: w.RunID, Item: item, Mode: agentturn.QueueMode(w.Mode), Hidden: w.Hidden, Trigger: triggerIn(w.Trigger)}, nil
+		return &agentturn.Queued{RunID: w.RunID, Item: item, Mode: agentturn.QueueMode(w.Mode), Input: agentturn.InputMode(w.Input), Hidden: w.Hidden, Trigger: triggerIn(w.Trigger)}, nil
 	},
 	agentturn.EventNotesHeld: func(data []byte) (agentturn.Event, error) {
 		var w wireNotesHeld
@@ -523,6 +523,7 @@ type wireQueued struct {
 	RunID   string          `json:"run_id,omitempty"`
 	Item    json.RawMessage `json:"item"`
 	Mode    string          `json:"mode"`
+	Input   string          `json:"input,omitempty"`
 	Hidden  bool            `json:"hidden,omitempty"`
 	Trigger *wireTrigger    `json:"trigger,omitempty"`
 }

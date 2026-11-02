@@ -939,6 +939,12 @@ type Queued struct {
 	// since how an item arrived is a fact about the turn, and the queue
 	// it waited in a fact about the agent.
 	Mode QueueMode
+	// Input says how the item arrived: [InputSteer] or [InputFollowUp]
+	// for an item queued, and [InputDeliver] for one delivered, which
+	// must reach the model and for which [Agent.Deliver] starts a run
+	// when none takes it. A recorder writes it on the queued entry, so
+	// an input owed after a restart is handed back the way it arrived.
+	Input InputMode
 	// Hidden is set for an item the caller marked with [Hidden].
 	Hidden bool
 	// Trigger is what brought the item in, from the context given to

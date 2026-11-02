@@ -255,6 +255,24 @@ versions may break the API.
   answers `ErrNoDelivery`. A remote party cannot tell from `/queue` and
   `/state` whether a run will still take a steer. (#288)
 
+- Fixed: a delivery is recorded as one. `Queued.Input` says how an input
+  arrived, and `session`'s recorder writes format 0.15's `deliver: true`
+  on a delivered input's `queued` entry, again after a run end that
+  closed it. `Recorder.Deliver` writes the entry before the agent takes
+  the input, as `Recorder.Queue` does, so a delivery that arrives while
+  the agent waits on an approval survives a quit. `Recorder.Requeue`
+  hands an owed delivery back with the new `Agent.Redeliver`, so the
+  turn that takes it reads it as `deliver`, not as a steer; the host
+  starts the run that takes it with `Continue` when nothing else will.
+  `front/control` carries `input` on the queued report. (#244)
+- Fixed: a child session written from an observed child's events
+  promises `queued` in its header, as the root does, since the recorder
+  writes the child's queued reports. An input an observed child accepts
+  while its run's end is being delivered, reported naming no run, is
+  written to the child's session when it is reported, so it is on the
+  record whether or not the child runs again; before, it waited for a
+  run that might never come.
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

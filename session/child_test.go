@@ -563,6 +563,59 @@ func TestObservedChildRecordsItsQueuedInputs(t *testing.T) {
 	if d := drained["idle"]; d != nil && (d.Source == nil || d.Source.Kind != "timer" || d.Source.Ref != "t1") {
 		t.Errorf("idle delivery's source = %+v, want timer:t1", d.Source)
 	}
+	// The delivery is recorded as one (#244), and the child's header
+	// promises the queued entries it is written with.
+	if q := queued["idle"]; q != nil && !q.Deliver {
+		t.Errorf("idle delivery's entry = %+v, want deliver", q)
+	}
+	if q := queued["before"]; q != nil && q.Deliver {
+		t.Errorf("steer's entry = %+v, want no deliver", q)
+	}
+	if !slices.Contains(cs.Header().Records, agentsession.TypeQueued) {
+		t.Errorf("child header promises %v, want queued among them", cs.Header().Records)
+	}
+	verifyAll(t, cs)
+}
+
+// TestAnObservedChildsLateInputIsWrittenThoughItNeverRunsAgain pins
+// RFC 0001's tool_end row for an observed child: an input the child
+// accepts while its run's end is being delivered is reported after
+// that end, naming no run, and is written to the child's session when
+// it is reported, so it is on the record although the child never runs
+// again to take it.
+func TestAnObservedChildsLateInputIsWrittenThoughItNeverRunsAgain(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := agent.New(agentturn.Config{Name: "helper", Model: &echo.Adapter{}},
+		agent.WithObserver(rec.Observe),
+		agent.WithRunContext(rec.ChildContext),
+		agent.WithSpawn(func(_ string, c *agentturn.Agent) {
+			c.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+				if _, ok := ev.(*agentturn.RunEnd); ok {
+					c.Steer(openresponses.UserText("late"))
+				}
+				return nil
+			})
+		}))
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{helper}, MaxTurns: 1})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
+		t.Fatal(err)
+	}
+	l := links(s)
+	if len(l) != 1 {
+		t.Fatalf("links = %+v", l)
+	}
+	cs, err := store.Open(context.Background(), l[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deliveries(cs)["late"] == nil {
+		t.Errorf("no queued entry for the late input in %q", entryTypes(cs))
+	}
 	verifyAll(t, cs)
 }
 

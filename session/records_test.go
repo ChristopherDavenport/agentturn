@@ -1149,7 +1149,7 @@ func TestChildSessionIDIsDerivedFromTheCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h := cs.Header(); h.SpawnedBy != l[0].CallID || h.ParentSession != s.ID() || strings.Join(h.Records, ",") != "run,dispatch,decision,result" {
+	if h := cs.Header(); h.SpawnedBy != l[0].CallID || h.ParentSession != s.ID() || strings.Join(h.Records, ",") != "run,dispatch,decision,queued,result" {
 		t.Errorf("child header = %+v", h)
 	}
 	if n := verifyAll(t, cs); n != 1 {
