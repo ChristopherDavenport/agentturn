@@ -816,6 +816,31 @@ type NestedRecord struct {
 	Ended  bool
 	Result agenttool.Result
 	Err    string
+	// Blocked says a decision refused the call, and Reason is that
+	// refusal's reason, which a replayed tool_end carries again.
+	Blocked bool
+	Reason  string
+}
+
+// RecordedDetails is a Details value as a record kept it: the namespace
+// and the JSON of an agenttool.Recordable, given back on the result of
+// a nested call replayed from a record, so a recorder reading it, or
+// agenttool.RecordOf, gets the record it was. The Go value it was made
+// from does not survive the record.
+type RecordedDetails struct {
+	NS   string
+	Data json.RawMessage
+}
+
+// RecordNS returns the namespace the record was kept under.
+func (d RecordedDetails) RecordNS() string { return d.NS }
+
+// MarshalJSON returns the record's JSON as kept.
+func (d RecordedDetails) MarshalJSON() ([]byte, error) {
+	if len(d.Data) == 0 {
+		return []byte("null"), nil
+	}
+	return d.Data, nil
 }
 
 // Note is a note waiting on the outputs of its batch: the item and how

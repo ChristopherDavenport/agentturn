@@ -324,6 +324,13 @@ versions may break the API.
 - Fixed: a prompt holding an item type that cannot be compared no
   longer panics the loop when the hidden and copied marks are stripped.
 
+- Fixed: a nested call given its recorded result after a restart gets it
+  whole: the terminate hint, its recordable details as
+  `RecordedDetails`, and for a refusal `Blocked` and its reason on the
+  replayed `tool_end`, beside the output and the error's text. The
+  recorder writes them on the nested call's end entry. The error's Go
+  type does not survive the record; its text does. (#261)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

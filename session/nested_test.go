@@ -168,3 +168,107 @@ func TestANestedCallMadeAgainAfterARestartKeepsItsIDAndKey(t *testing.T) {
 	}
 	verifyAll(t, s)
 }
+
+// lookupTool answers with a terminate hint and app data a recorder can
+// keep, which a replayed result must give back as they were.
+type lookupTool struct{ runs *int }
+
+func (lookupTool) Name() string                { return "lookup" }
+func (lookupTool) Description() string         { return "" }
+func (lookupTool) Parameters() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
+func (l lookupTool) Execute(context.Context, agenttool.Call) (agenttool.Result, error) {
+	*l.runs++
+	return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: "found"}, Terminate: true, Details: pgRecord{PGID: 7}}, nil
+}
+
+// TestAReplayedNestedCallGivesItsResultWhole pins #261's replay: a
+// nested call given its recorded result after a restart gets it as it
+// ended, the terminate hint, the app data a recorder keeps and, for one
+// a hook refused, the refusal with its reason, not only the text.
+func TestAReplayedNestedCallGivesItsResultWhole(t *testing.T) {
+	ctx := context.Background()
+	store := &cutStore{Store: agentsession.NewMemoryStore()}
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs := 0
+	type seen struct {
+		lookup agenttool.Result
+		rmErr  error
+	}
+	var got []seen
+	tools := []agenttool.Tool{
+		agenttool.New("run_code", "", func(ctx context.Context, _ echoArgs) (string, error) {
+			res, err := agentturn.Invoke(ctx, "lookup", json.RawMessage(`{}`))
+			if err != nil {
+				return "", err
+			}
+			_, rmErr := agentturn.Invoke(ctx, "rm", json.RawMessage(`{"text":"/"}`))
+			got = append(got, seen{res, rmErr})
+			if len(got) == 1 {
+				store.cut.Store(true) // the process dies before run_code returns
+			}
+			return "ran", nil
+		}, agenttool.WithReplay(func(context.Context, json.RawMessage) agenttool.Replay { return agenttool.ReplaySafe })),
+		lookupTool{runs: &runs},
+		agenttool.New("rm", "", func(context.Context, echoArgs) (string, error) { return "removed", nil }),
+	}
+	policy := func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+		if info.Call.Name == "rm" {
+			return &agentturn.ToolDecision{Action: agentturn.Block, Reason: "not the root", By: agentsession.ByPolicy}, nil
+		}
+		return nil, nil
+	}
+	cfg := agentturn.Config{Model: callsRunCode{}, ModelName: "m", MaxTurns: 2, Tools: tools, BeforeToolCall: policy}
+	a := agentturn.New(cfg)
+	unsub := rec.Attach(a)
+	if end, err := a.Prompt(ctx, openresponses.UserText("go")); err == nil {
+		t.Fatalf("the run survived the crash: %+v", end)
+	}
+	unsub()
+	store.cut.Store(false)
+
+	rec, s, err = Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	answers, err := ReplayAnswers(ctx, s, tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts, err := AgentOptions(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := agentturn.New(cfg, opts...)
+	defer rec.Attach(b)()
+	var ends []*agentturn.ToolEnd
+	b.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if e, ok := ev.(*agentturn.ToolEnd); ok && e.Replayed {
+			ends = append(ends, e)
+		}
+		return nil
+	})
+	if _, err := b.Resume(ctx, answers...); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 1 || len(got) != 2 || len(ends) != 2 {
+		t.Fatalf("lookup ran %d times, run_code %d, %d replayed; want 1, 2, 2", runs, len(got), len(ends))
+	}
+	first, again := got[0], got[1]
+	if !again.lookup.Terminate || again.lookup.Output.Text != "found" {
+		t.Errorf("replayed lookup = %+v, want its text and terminate hint", again.lookup)
+	}
+	if r, err := agenttool.RecordOf(again.lookup.Details); err != nil || r == nil || r.NS != "shell:process-group" || string(r.Data) != `{"PGID":7}` {
+		t.Errorf("replayed lookup's details = %#v (%v, %v), want the recorded process group", again.lookup.Details, r, err)
+	}
+	if again.rmErr == nil || first.rmErr == nil || again.rmErr.Error() != first.rmErr.Error() {
+		t.Errorf("replayed rm error = %v, want %v", again.rmErr, first.rmErr)
+	}
+	for _, e := range ends {
+		if e.Name == "rm" && (!e.Blocked || e.Reason != "not the root") {
+			t.Errorf("replayed rm's tool_end = %+v, want it blocked with its reason", e)
+		}
+	}
+}

@@ -3146,7 +3146,7 @@ func (r *runner) replayNested(turn int, call *openresponses.FunctionCall, parent
 		return agenttool.Result{}, e
 	}
 	r.recordNested(parent, *rec)
-	if e := r.emit(&ToolEnd{RunID: r.runID, Turn: turn, CallID: call.CallID, Name: call.Name, Result: rec.Result, Err: err, Parent: parent, Replayed: true}); e != nil {
+	if e := r.emit(&ToolEnd{RunID: r.runID, Turn: turn, CallID: call.CallID, Name: call.Name, Result: rec.Result, Err: err, Blocked: rec.Blocked, Reason: rec.Reason, Parent: parent, Replayed: true}); e != nil {
 		return agenttool.Result{}, e
 	}
 	return rec.Result, err
@@ -3210,7 +3210,7 @@ func (r *runner) ranNested(p *callState, args json.RawMessage) {
 		}
 	}
 	if !p.cut {
-		rec.Ended, rec.Result = true, p.result
+		rec.Ended, rec.Result, rec.Blocked, rec.Reason = true, p.result, p.blocked, p.reason
 		if p.err != nil {
 			rec.Err = p.err.Error()
 		}

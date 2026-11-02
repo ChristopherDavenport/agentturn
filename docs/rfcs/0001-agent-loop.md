@@ -1414,7 +1414,8 @@ decision rewrote them, matches the k-th recorded nested call of that
 tool with those arguments, whatever order they arrive in, and takes
 its ID. A matched call that ended, with a result of its own or a
 refusal rather than cut off, returns its recorded result without
-running: `tool_start` and `tool_end` are raised, both marked
+running, whole: the output, the failure, a refusal with its reason, the
+terminate hint and the details a recorder keeps: `tool_start` and `tool_end` are raised, both marked
 `replayed`, with no decision and no `tool_dispatch`. A matched call
 that was handed to its tool and never ended may have run, so it is
 decided as any nested call and then held to agenttool RFC 0001's rule
@@ -1675,7 +1676,7 @@ maps onto it as follows:
 | hooks | `Config.BeforeTurn`, `BeforeModelCall`, `OutputGuard`, `BeforeToolCall`, `AfterToolCall`, `ShouldStopAfterTurn` |
 | guard stop | an error wrapping `ErrGuard` from `ShouldStopAfterTurn`, `BeforeTurn`, `BeforeModelCall`, `OutputGuard` or the model; the output of a call a withheld response made is `WithheldCallOutput` |
 | chains | `ChainBeforeTurn`, `ChainBeforeModelCall`, `ChainOutputGuard`, `ChainBeforeToolCall`, `ChainShouldStopAfterTurn`, `ChainTransform` |
-| nested call | `Invoke(ctx, name, args)`; `ErrNoInvoker`; `Parent` on the tool events, `ToolStart.Invoked`, `Replayed` on `ToolStart` and `ToolEnd`; `PendingCall.Nested` holding `NestedRecord{CallID, Parent, Name, Args, Dispatched, IdempotencyKey, DispatchArgs, Ended, Result, Err}` |
+| nested call | `Invoke(ctx, name, args)`; `ErrNoInvoker`; `Parent` on the tool events, `ToolStart.Invoked`, `Replayed` on `ToolStart` and `ToolEnd`; `PendingCall.Nested` holding `NestedRecord{CallID, Parent, Name, Args, Dispatched, IdempotencyKey, DispatchArgs, Ended, Result, Err, Blocked, Reason}`, `RecordedDetails` for the details a replayed result gives back |
 | queue mode | `QueueMode`: `QueueSteer`, `QueueFollowUp`; `Queued.Input` (`InputSteer`, `InputFollowUp`, `InputDeliver`); `Agent.Redeliver` for a delivery a record owes |
 | the loop as a model | `front/responses.New(cfg)` → `openresponses.Adapter` |
 | handoffs a front takes | `WithHandoff`, `WithStart`, `WithTransfers(route)` in both fronts; `front/responses.Route`, `Handoffs`, `HandedTo`, `Attribute`, re-exported by `front/a2a` but for `Attribute` |

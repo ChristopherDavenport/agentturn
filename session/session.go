@@ -572,7 +572,8 @@ type NestedCall struct {
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 	// Verdict, Reason and By are what a hook decided about the call,
 	// or the user it deferred the call to through the elicitor, in the
-	// format's terms, on the start entry: proceed for a call allowed
+	// format's terms, on the start entry, and Reason the refusal's again
+	// on the end entry of a call refused: proceed for a call allowed
 	// with rewritten arguments or a reason, reject for one refused.
 	Verdict string `json:"verdict,omitempty"`
 	Reason  string `json:"reason,omitempty"`
@@ -583,12 +584,26 @@ type NestedCall struct {
 	Output string                 `json:"output,omitempty"`
 	Parts  openresponses.Contents `json:"parts,omitempty"`
 	Error  string                 `json:"error,omitempty"`
+	// Terminate is the result's terminate hint, Blocked says a decision
+	// refused the call, with Reason its reason, and Details is the
+	// result's agenttool.Recordable details, on the end entry: what a
+	// replayed result gives back beside the output and the error.
+	Terminate bool           `json:"terminate,omitempty"`
+	Blocked   bool           `json:"blocked,omitempty"`
+	Details   *NestedDetails `json:"details,omitempty"`
 	// Cut says, on the end entry, that the call was cut off before it
 	// had a result of its own, and Withdrawn that a consumer refused its
 	// hand-off, so its tool never ran: neither is an end of the call's
 	// own, and a call run again is not given it.
 	Cut       bool `json:"cut,omitempty"`
 	Withdrawn bool `json:"withdrawn,omitempty"`
+}
+
+// NestedDetails is a nested call's recordable details on its end
+// entry: the namespace and the JSON agenttool.RecordOf gives.
+type NestedDetails struct {
+	NS   string          `json:"ns"`
+	Data json.RawMessage `json:"data"`
 }
 
 // nestedDispatch is the phase of the [NestedCallNS] entry written when
@@ -2112,8 +2127,11 @@ func nestedRecords(path []agentsession.Entry) map[string][]agentturn.NestedRecor
 			}
 			if !n.Cut && !n.Withdrawn {
 				st.rec.Ended = true
-				st.rec.Result = agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: n.Output, Parts: n.Parts}}
-				st.rec.Err = n.Error
+				st.rec.Result = agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: n.Output, Parts: n.Parts}, Terminate: n.Terminate}
+				if n.Details != nil {
+					st.rec.Result.Details = agentturn.RecordedDetails{NS: n.Details.NS, Data: n.Details.Data}
+				}
+				st.rec.Err, st.rec.Blocked, st.rec.Reason = n.Error, n.Blocked, n.Reason
 			}
 		}
 	}
@@ -4344,7 +4362,19 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 			c.result = r
 		}
 	}
-	if e.Parent != "" && !e.Replayed {
+	if e.Parent != "" && e.Replayed {
+		// Its record is on the path already, its details among it.
+		return nil
+	}
+	if e.Parent != "" {
+		var details *NestedDetails
+		if r, err := agenttool.RecordOf(e.Result.Details); err == nil && r != nil {
+			details = &NestedDetails{NS: r.NS, Data: r.Data}
+		}
+		reason := ""
+		if e.Blocked {
+			reason = e.Reason
+		}
 		if err := w.nested(ctx, NestedCall{
 			Phase:     agentsession.RunEnd,
 			CallID:    e.CallID,
@@ -4355,6 +4385,10 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 			Error:     errText(e.Err),
 			Cut:       e.Cut,
 			Withdrawn: e.Withdrawn,
+			Terminate: e.Result.Terminate,
+			Blocked:   e.Blocked,
+			Reason:    reason,
+			Details:   details,
 		}, e.Parent); err != nil {
 			return err
 		}
