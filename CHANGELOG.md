@@ -600,6 +600,20 @@ versions may break the API.
   under it with format 0.15's `from_link` naming the call's `peer`
   link, after a restart too. RFC 0001 Composition and the record's
   `item_end` row state it. (#290)
+- Added: `front/a2a.WithDeliverWhileBusy()`, an opt-in steer of a
+  working task (A2A §3.3.3); refusing a busy conversation stays the
+  default. A message naming the working task is handed to its agent as
+  a delivery under the caller's trigger and answered with the task; the
+  task continues the agent while the delivery is still queued after a
+  run, keeps it for the answering message when the run stops for input,
+  and drops it when the run fails or is cancelled. A message naming
+  only the context is still refused as busy; a data part or declared
+  caller tools are refused while the task runs. The steer is served by
+  `Executor.RequestHandler`, which now wraps the A2A server's handler
+  inside the interceptors; a handler built with `a2asrv.NewHandler`
+  refuses it, as before. `tools/a2a.Steer(ctx, client, info, parts...)`
+  sends one, to the task a `WithDetach` call follows among others. RFC
+  0001 Composition, as a peer, states it. (#287)
 
 ## v0.0.34 - 2026-10-26
 

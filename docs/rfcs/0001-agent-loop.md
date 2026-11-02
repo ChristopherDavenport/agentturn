@@ -1692,7 +1692,28 @@ An agent stands in four places inside another system:
   recorder writes the delivered item with agentsession RFC 0001's
   `from_link` naming the latest `peer` link of that call, to that task
   when the trigger names one, and none when the path holds no such
-  link (#290).
+  link (#290). A front serving the loop as a peer MAY accept a message
+  for a task that is still working, the steer A2A allows (§3.3.3); it
+  is opt-in, and refusing a message on a conversation with a task in
+  flight stays the default. A front that accepts it takes a message
+  that names the working task, hands its text and files to the running
+  agent as a delivery under the trigger of the caller that sent it,
+  after the owner check any message gets, and answers with that task.
+  The conversation still runs one task at a time: a message naming
+  only the context starts a new task in A2A, and joining it to the
+  running one is a further choice a front states; the reference front
+  refuses it as busy, since its caller would hold a task that never
+  runs. A run the delivery starts belongs to the same task, and the
+  task does not end while the delivery is outstanding: the front
+  continues the agent with it after a run that ended without taking
+  it, as a delivery's own continue would; a run that stops for input
+  leaves it for the message that answers the calls, whose run takes it
+  after the answered batch, as the Queues section has it; one that
+  fails or is cancelled drops it with the task. A message carrying
+  answers to pending calls, or any data part, is refused while the
+  task runs, since nothing it answers has been asked. The consuming
+  tool offers a way to send to a working task, the task a detached
+  call follows among them (#287).
 - **As itself, under new settings.** The configuration replaced and the
   transcript kept, so the next run continues the same conversation
   under another agent's instructions, tools and model. This is what an
@@ -1907,7 +1928,7 @@ maps onto it as follows:
 | handoffs a front takes | `WithHandoff`, `WithStart`, `WithTransfers(route)` in both fronts; `front/responses.Route`, `Handoffs`, `HandedTo`, `Attribute`, re-exported by `front/a2a` but for `Attribute` |
 | the handoff | `handoff.New(agents…)` → `*Team` (`Agent{Config, Handoffs []To}`, `To{Agent, Filter, Enabled}`); `Team.Config`, `Team.Route` (a `front/responses.Route`, which both fronts' `WithTransfers` take), `Team.Run` (→ end, path), `Team.Resume`, `Team.Handoff` and `Team.Trim` (for the fronts' `WithHandoff` and `WithHandoffTrim`), `Team.MaxHandoffs`, `ErrTooManyHandoffs`, `ToolName`, `RemoveAllTools`, `Dest`; the fronts' `WithMaxHandoffs` and `WithHandoffTrim` |
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`, which implements `agentturn.InputRequired` (`PendingCalls() []WaitingCall`), as `tools/a2a`'s does; `WithAskParent`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
-| the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)`; a detached call: `tools/a2a.WithDetach(fn)`, `WithPollInterval`, `Answer(final)`, and `CalleeTrigger(callID, task)` (`TriggerCallee`) to deliver its result under |
+| the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)`; a detached call: `tools/a2a.WithDetach(fn)`, `WithPollInterval`, `Answer(final)`, and `CalleeTrigger(callID, task)` (`TriggerCallee`) to deliver its result under; a steer of a working task: `front/a2a.WithDeliverWhileBusy()`, served by `Executor.RequestHandler`, and `tools/a2a.Steer(ctx, client, info, parts…)` |
 | quarantine | `Agent.Quarantine`, `Agent.Quarantined`; `Quarantine(ctx, items…)` from a hook or a tool, `ErrNoQuarantine`, `ErrNotQuarantinable`; `QuarantinedOutput`, the placeholder; `QuarantinedFromContext` (`Has`, `Generation`, `Apply`) for a transform, which `compact` reads; `QuarantineSet`, `ContextWithQuarantineSet` for a host carrying one through `Run` and `Continue`, as `front/responses` does across a handoff's legs |
 | the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Queue`, `Deliver`, `Control` (`RecordedControl`, for a front), `Requeue`, `Rebase`; `session.MoveTo` for a rewind; `WithInstructionsParts`, `WithMedia`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`; the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
 

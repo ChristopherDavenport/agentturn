@@ -258,6 +258,30 @@ func Answer(final *a2a.Task) openresponses.FunctionCallOutputData {
 	return output(o.text(), o.fileParts())
 }
 
+// Steer sends parts to a task that is still working, such as the one a
+// [WithDetach] call follows, which info names: a message naming the
+// task, the steer A2A allows an agent to accept (§3.3.3), as
+// front/a2a's WithDeliverWhileBusy does. The send does not wait for the
+// task (§3.2.2); it returns the task as the remote agent answered with
+// it, and the call that follows the task reads the rest. A remote agent
+// that refuses a message for a working task returns its error, and one
+// that answers with a message rather than the task an error saying so.
+func Steer(ctx context.Context, client *a2aclient.Client, info TaskInfo, parts ...a2a.Part) (*a2a.Task, error) {
+	if info.TaskID == "" {
+		return nil, errors.New("a2a: steer: no task")
+	}
+	msg := a2a.NewMessageForTask(a2a.MessageRoleUser, a2a.TaskInfo{TaskID: info.TaskID, ContextID: info.ContextID}, parts...)
+	res, err := client.SendMessage(ctx, &a2a.MessageSendParams{Message: msg, Config: &a2a.MessageSendConfig{Blocking: new(bool)}})
+	if err != nil {
+		return nil, fmt.Errorf("a2a: steer: %w", err)
+	}
+	task, ok := res.(*a2a.Task)
+	if !ok {
+		return nil, fmt.Errorf("a2a: steer: the agent answered with %T, not the task", res)
+	}
+	return task, nil
+}
+
 // New wraps a remote agent as a tool. The client is usually built from
 // the same card with a2aclient.NewFromCard. Build it with the
 // [ObserveEndpoint] interceptor, however it is built, so a call records

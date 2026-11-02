@@ -47,6 +47,12 @@ type Executor struct {
 	// the cancel does not run on the conversation the cancel settled.
 	canceled map[string]canceledMark
 	waiting  memoryWaiting
+	// deliverBusy is [WithDeliverWhileBusy]; running holds the tasks
+	// whose run is in flight, and owed, by context ID, the steers a task
+	// left queued when it stopped for input, for the task that answers.
+	deliverBusy bool
+	running     map[a2a.TaskID]*running
+	owed        map[string][]steer
 }
 
 // ErrConversationBusy is the cause of the error a message gets when its
@@ -482,6 +488,11 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 		opts = append(opts, agentturn.WithPending(seeded))
 	}
 	agent := agentturn.New(e.runConfig(start, caller), opts...)
+	var rt *running
+	if e.deliverBusy {
+		rt = e.track(runCtx, reqCtx.TaskID, reqCtx.ContextID, agent)
+		defer e.untrack(reqCtx.TaskID)
+	}
 	var detach func()
 	if e.recorderFor != nil {
 		rctx, d, err := e.recorderFor(runCtx, reqCtx.ContextID, agent)
@@ -528,7 +539,7 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 		}
 		run = func(ctx context.Context) (*agentturn.RunEnd, error) { return agent.Resume(ctx, answers...) }
 	}
-	out := e.relay(ctx, runCtx, cancel, reqCtx, q, agent, run, caller)
+	out := e.relay(ctx, runCtx, cancel, reqCtx, q, agent, run, caller, rt)
 	if err := e.persist(ctx, reqCtx.ContextID, transcript, out); err != nil {
 		return err
 	}
@@ -636,13 +647,16 @@ type outcome struct {
 
 // relay prompts the agent and streams assistant text into artifacts
 // from a subscriber, after whatever RecorderFor subscribed, and
-// continues it under each configuration WithHandoff returns. Under a
+// continues it under each configuration WithHandoff returns, and,
+// under [WithDeliverWhileBusy], while a steer a caller delivered into
+// the task is still queued after a run, as a delivery's own continue
+// would. Under a
 // configuration with an OutputGuard a message's artifact is written
 // whole from its item_end, the guard's replacement, so text the guard
 // withheld never enters the task's artifacts. A failed write aborts
 // the run through cancel and is reported on the outcome; the run's
 // own end and error are reported alongside.
-func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc, reqCtx *a2asrv.RequestContext, q eventqueue.Queue, agent *agentturn.Agent, run func(context.Context) (*agentturn.RunEnd, error), caller []*openresponses.FunctionTool) outcome {
+func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc, reqCtx *a2asrv.RequestContext, q eventqueue.Queue, agent *agentturn.Agent, run func(context.Context) (*agentturn.RunEnd, error), caller []*openresponses.FunctionTool, rt *running) outcome {
 	var out outcome
 	var writer *artifactWriter
 	// guarded says the configuration running has an OutputGuard, whose
@@ -704,7 +718,7 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 	if limit <= 0 {
 		limit = DefaultMaxHandoffs
 	}
-	for handoffs := 0; ; handoffs++ {
+	for handoffs := 0; ; {
 		if end == nil {
 			// The run never started: a misuse the loop refused before
 			// any event, which fails the task as a run would.
@@ -712,19 +726,32 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 		}
 		out.end = end
 		out.items = append(out.items, end.Items...)
-		if out.writeErr != nil || e.handoff == nil || !terminated(end) {
+		if out.writeErr != nil {
+			e.outstanding(rt, nil)
 			return out
 		}
-		next, ok := e.handoff(runCtx, end, out.results)
+		var next agentturn.Config
+		ok := false
+		if e.handoff != nil && terminated(end) {
+			next, ok = e.handoff(runCtx, end, out.results)
+		}
 		if !ok {
+			// A steer delivered into the task and not yet taken keeps
+			// the task going: the run it starts is the task's.
+			if trigger, more := e.outstanding(rt, end); more {
+				end, err = agent.Continue(agentturn.ContextWithTrigger(runCtx, trigger))
+				continue
+			}
 			return out
 		}
 		if handoffs == limit {
 			// The caller is told, not answered with the transfer's
 			// text: the agents handed the task back and forth.
 			out.bounded = fmt.Errorf("%w: the agents handed the task on %d times and %s would hand it to %s again; stopped", ErrTooManyHandoffs, limit, agent.Config().Name, next.Name)
+			e.outstanding(rt, nil)
 			return out
 		}
+		handoffs++
 		prev := agent.Config()
 		if e.trim != nil {
 			if err = agent.SetTranscript(e.trim(runCtx, prev, next, agent.State().Transcript)); err != nil {

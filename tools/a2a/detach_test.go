@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -11,8 +12,10 @@ import (
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
+	fronta2a "github.com/ChristopherDavenport/agentturn/front/a2a"
 	"github.com/ChristopherDavenport/openresponses"
 	"github.com/a2aproject/a2a-go/a2a"
+	"github.com/a2aproject/a2a-go/a2aclient"
 	"github.com/a2aproject/a2a-go/a2asrv"
 	"github.com/a2aproject/a2a-go/a2asrv/eventqueue"
 )
@@ -286,5 +289,105 @@ func TestAnAbortCutsADetachedCall(t *testing.T) {
 	}
 	if n := len(recs.of(CancelNS)); n != 1 {
 		t.Errorf("cancel records = %d, want 1", n)
+	}
+}
+
+// worksThenReads calls work until an output is in, then answers with
+// the user's messages it was sent.
+type worksThenReads struct{}
+
+func (worksThenReads) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	var users []string
+	answered := false
+	for _, item := range req.Input {
+		switch v := item.(type) {
+		case *openresponses.Message:
+			if v.Role == openresponses.RoleUser {
+				users = append(users, v.Text())
+			}
+		case *openresponses.FunctionCallOutput:
+			answered = true
+		}
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if !answered {
+		w, err := em.FunctionCall("", "work")
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(`{}`); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("read: " + strings.Join(users, " | ")); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestSteerAWorkingTask pins the consume side of #287 with #290's
+// handle: Steer sends to the task a detached call follows, a front
+// under WithDeliverWhileBusy hands it to the working agent, and the
+// task's answer, which reaches fn, read it.
+func TestSteerAWorkingTask(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	work := agenttool.New("work", "works until released", func(ctx context.Context, _ struct{}) (string, error) {
+		close(entered)
+		<-release
+		return "worked", nil
+	})
+	exec := fronta2a.New(agentturn.Config{Name: "Worker", Model: worksThenReads{}, Tools: []agenttool.Tool{work}}, fronta2a.WithDeliverWhileBusy())
+	srv := httptest.NewServer(a2asrv.NewJSONRPCHandler(exec.RequestHandler()))
+	t.Cleanup(srv.Close)
+	card := &a2a.AgentCard{Name: "Worker", URL: srv.URL, PreferredTransport: a2a.TransportProtocolJSONRPC, Capabilities: a2a.AgentCapabilities{Streaming: true}}
+	client, err := a2aclient.NewFromCard(context.Background(), card, a2aclient.WithInterceptors(ObserveEndpoint()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Destroy() })
+	// A test that fails before releasing the tool releases it as it
+	// ends, so the server can close.
+	var releaseOnce sync.Once
+	releaseWork := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseWork)
+	ends := make(chan *a2a.Task, 1)
+	tool := New(client, card, WithDetach(func(_ string, _ TaskInfo, final *a2a.Task, err error) {
+		if err != nil {
+			t.Errorf("the task ended with %v", err)
+		}
+		ends <- final
+	}))
+	res, err := tool.Execute(context.Background(), agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"lint the repo"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := res.Details.(TaskInfo)
+	<-entered
+	task, err := Steer(context.Background(), client, info, a2a.TextPart{Text: "also check the cache"})
+	if err != nil {
+		t.Fatalf("steer: %v", err)
+	}
+	if task.ID != info.TaskID || task.Status.State.Terminal() {
+		t.Errorf("the steer was answered with %s %s, want the working task %s", task.ID, task.Status.State, info.TaskID)
+	}
+	releaseWork()
+	select {
+	case final := <-ends:
+		if got := Answer(final).Text; got != "read: lint the repo | also check the cache" {
+			t.Errorf("answer = %q, want it to read the steer", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the task never ended")
 	}
 }

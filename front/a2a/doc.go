@@ -233,6 +233,14 @@
 // to its own conversation gets the error rather than waiting on
 // itself.
 //
+// [WithDeliverWhileBusy] lets a caller steer a working task: a message
+// that names the task, which [Executor.RequestHandler]'s handler hands
+// to the running agent as a delivery under the caller's trigger, its
+// text and files only, answering with the task, which runs on until
+// the delivery is taken. A message naming only the context is still
+// refused, and the conversation still runs one task at a time.
+// tools/a2a's Steer sends one.
+//
 // # Durability
 //
 // Two stores keep what a conversation needs, and both are the host's.

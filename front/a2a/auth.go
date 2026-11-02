@@ -174,9 +174,15 @@ func (e *Executor) Handler(next http.Handler) http.Handler {
 }
 
 // RequestHandler returns the A2A request handler for the executor, with
-// [Executor.Interceptor] installed after opts' own interceptors.
+// [Executor.Interceptor] installed after opts' own interceptors, and
+// serving, inside them, a message to a working task under
+// [WithDeliverWhileBusy].
 func (e *Executor) RequestHandler(opts ...a2asrv.RequestHandlerOption) a2asrv.RequestHandler {
-	return a2asrv.NewHandler(e, append(opts, a2asrv.WithCallInterceptor(e.Interceptor()))...)
+	h := a2asrv.NewHandler(e, append(opts, a2asrv.WithCallInterceptor(e.Interceptor()))...)
+	if ih, ok := h.(*a2asrv.InterceptedHandler); ok {
+		ih.Handler = steering{RequestHandler: ih.Handler, e: e}
+	}
+	return h
 }
 
 // Interceptor returns the call interceptor that authenticates and
