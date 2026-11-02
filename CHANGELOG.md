@@ -172,8 +172,10 @@ versions may break the API.
   omission with `omit.items`, so its request still verifies. (#242)
 
 - Fixed: in a sidecar session the recorder converts media as it
-  writes. Each inline image or file an item, queued, result or
-  compaction entry holds, a base64 data URL, is stored as a blob before
+  writes. Each inline medium an item, queued, result or compaction
+  entry holds, an image, video or file carried as a data URL, base64 or
+  percent-encoded, in a message, a tool output or an item type the
+  library does not model such as `computer_call_output`, is stored as a blob before
   the entry and named by its `sidecar:` reference, and the request hash
   is computed over the request with the same substitution. The loop and
   the model keep the data URLs. A host no longer converts media in an

@@ -1,9 +1,12 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"net/url"
 	"slices"
 	"strings"
 
@@ -79,28 +82,94 @@ func (w *writer) recordForm(item openresponses.Item) openresponses.Item {
 	return conv
 }
 
-// sidecarForm returns a copy of item with each inline image or file
-// among its parts, a base64 data URL, replaced by the sidecar:
-// reference to its bytes, and those bytes, in order; item itself and no
-// bytes when it holds none.
+// mediaKeys are the members that carry a medium by URL or by data in
+// an item's JSON: an image's, a video's and a file's.
+var mediaKeys = map[string]bool{"image_url": true, "video_url": true, "file_url": true, "file_data": true}
+
+// sidecarForm returns a copy of item with each inline medium it carries,
+// a data URL in an image, video or file part or in any member those
+// names give an item type the library does not model, replaced by the
+// sidecar: reference to its bytes, and those bytes, in order; item
+// itself and no bytes when it carries none.
 func sidecarForm(item openresponses.Item) (openresponses.Item, [][]byte) {
-	parts := contentOf(item)
+	switch v := item.(type) {
+	case *openresponses.Message:
+		parts, blobs := sidecarParts(v.Content)
+		if blobs == nil {
+			return item, nil
+		}
+		cp := *v
+		cp.Content = parts
+		return &cp, blobs
+	case *openresponses.FunctionCallOutput:
+		if v.Output.Parts == nil {
+			return item, nil
+		}
+		parts, blobs := sidecarParts(v.Output.Parts)
+		if blobs == nil {
+			return item, nil
+		}
+		cp := *v
+		cp.Output = openresponses.FunctionCallOutputData{Parts: parts}
+		return &cp, blobs
+	}
+	// Any other item, a provider's computer_call_output among them, by
+	// its JSON: the members that carry media are named alike.
+	data, err := json.Marshal(item)
+	if err != nil || !bytes.Contains(data, []byte(`"data:`)) {
+		return item, nil
+	}
+	raw, blobs := sidecarJSON(data)
+	if blobs == nil {
+		return item, nil
+	}
+	conv, err := openresponses.UnmarshalItem(raw)
+	if err != nil {
+		return item, nil
+	}
+	return conv, blobs
+}
+
+// sidecarParts is parts with each inline medium replaced, as
+// sidecarForm does, and nil bytes when none was.
+func sidecarParts(parts openresponses.Contents) (openresponses.Contents, [][]byte) {
 	var out openresponses.Contents
 	var blobs [][]byte
+	ref := func(url string) (string, bool) {
+		data, ok := dataURLBytes(url)
+		if !ok {
+			return url, false
+		}
+		blobs = append(blobs, data)
+		return sidecarScheme + agentsession.HashBytes(data), true
+	}
 	for k, p := range parts {
 		var conv openresponses.Content
 		switch v := p.(type) {
 		case *openresponses.InputImage:
-			if data, ok := dataURLBytes(v.ImageURL); ok {
+			if u, ok := ref(v.ImageURL); ok {
 				cp := *v
-				cp.ImageURL = sidecarScheme + agentsession.HashBytes(data)
-				conv, blobs = &cp, append(blobs, data)
+				cp.ImageURL = u
+				conv = &cp
+			}
+		case *openresponses.InputVideo:
+			if u, ok := ref(v.VideoURL); ok {
+				cp := *v
+				cp.VideoURL = u
+				conv = &cp
 			}
 		case *openresponses.InputFile:
-			if data, ok := dataURLBytes(v.FileData); ok {
-				cp := *v
-				cp.FileData = sidecarScheme + agentsession.HashBytes(data)
-				conv, blobs = &cp, append(blobs, data)
+			cp := *v
+			d, okData := ref(v.FileData)
+			u, okURL := ref(v.FileURL)
+			if okData || okURL {
+				cp.FileData, cp.FileURL = d, u
+				conv = &cp
+			}
+		case *openresponses.UnknownContent:
+			if raw, b := sidecarJSON(v.Raw); b != nil {
+				blobs = append(blobs, b...)
+				conv = &openresponses.UnknownContent{Type: v.Type, Raw: raw}
 			}
 		}
 		if conv == nil {
@@ -112,35 +181,77 @@ func sidecarForm(item openresponses.Item) (openresponses.Item, [][]byte) {
 		out[k] = conv
 	}
 	if out == nil {
-		return item, nil
+		return parts, nil
 	}
-	switch v := item.(type) {
-	case *openresponses.Message:
-		cp := *v
-		cp.Content = out
-		return &cp, blobs
-	case *openresponses.FunctionCallOutput:
-		cp := *v
-		cp.Output = openresponses.FunctionCallOutputData{Parts: out}
-		return &cp, blobs
-	}
-	return item, nil
+	return out, blobs
 }
 
-// dataURLBytes returns the bytes a base64 data URL carries, and false
-// for anything else.
+// sidecarJSON is a JSON value with each data URL a media member holds,
+// at any depth, replaced by its sidecar: reference, and the bytes, in
+// document order; the value as given and nil when it holds none.
+func sidecarJSON(raw []byte) ([]byte, [][]byte) {
+	if !bytes.Contains(raw, []byte(`"data:`)) {
+		return raw, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return raw, nil
+	}
+	var blobs [][]byte
+	var walk func(any)
+	walk = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			for _, k := range sortedKeys(x) {
+				if s, ok := x[k].(string); ok && mediaKeys[k] {
+					if data, ok := dataURLBytes(s); ok {
+						x[k] = sidecarScheme + agentsession.HashBytes(data)
+						blobs = append(blobs, data)
+					}
+					continue
+				}
+				walk(x[k])
+			}
+		case []any:
+			for _, e := range x {
+				walk(e)
+			}
+		}
+	}
+	walk(v)
+	if blobs == nil {
+		return raw, nil
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return raw, nil
+	}
+	return out, blobs
+}
+
+// dataURLBytes returns the bytes a data URL carries, base64 or
+// percent-encoded, and false for anything else.
 func dataURLBytes(s string) ([]byte, bool) {
 	rest, ok := strings.CutPrefix(s, "data:")
 	if !ok {
 		return nil, false
 	}
 	meta, payload, ok := strings.Cut(rest, ",")
-	if !ok || !strings.HasSuffix(meta, ";base64") {
+	if !ok {
 		return nil, false
 	}
-	data, err := base64.StdEncoding.DecodeString(payload)
+	if strings.HasSuffix(meta, ";base64") {
+		data, err := base64.StdEncoding.DecodeString(payload)
+		if err != nil {
+			return nil, false
+		}
+		return data, true
+	}
+	data, err := url.PathUnescape(payload)
 	if err != nil {
 		return nil, false
 	}
-	return data, true
+	return []byte(data), true
 }

@@ -1534,8 +1534,10 @@ session whose call spawned it, unless the host names another, so the
 blobs of a tree of sessions are kept one way. In a sidecar session the
 recorder converts media as it writes, since agentsession RFC 0001 makes
 converting an item's media the writer's: it MUST store each inline
-image or file it records, in item, queued, result and compaction
-entries alike, as a blob before the entry, write the entry with the
+medium it records, an image, a video or a file carried as a data URL,
+base64 or percent-encoded, in any item type that carries one, and in
+item, queued, result and compaction entries alike, as a blob before
+the entry, write the entry with the
 blob's `sidecar:` reference, and compute the request hash over the
 request with the same substitution, the form a reader rebuilds. The
 loop and the model keep the inline form, so no `sidecar:` URL the

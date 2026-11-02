@@ -232,3 +232,43 @@ func TestAChildOfASidecarSessionStoresItsMediaThroughWithMedia(t *testing.T) {
 		}
 	}
 }
+
+// TestEveryInlineMediaFormIsStoredAsABlob pins the rest of #284's rule:
+// every inline medium an item can carry is stored as a blob in a sidecar
+// session, a video and a file URL as well as an image and file data, a
+// data URL that is not base64 as well as one that is, and media in an
+// item type the library does not model, a computer_call_output's
+// screenshot, as well as in a message.
+func TestEveryInlineMediaFormIsStoredAsABlob(t *testing.T) {
+	ctx := context.Background()
+	store := &countingBlobs{MemoryStore: agentsession.NewMemoryStore()}
+	rec, s, err := Start(ctx, store, agentsession.Header{Media: agentsession.MediaSidecar})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: answers{}, ModelName: "m"})
+	defer rec.Attach(a)()
+	screenshot := &openresponses.UnknownItem{Type: "computer_call_output", Raw: []byte(`{"type":"computer_call_output","call_id":"cu_1","output":{"type":"computer_screenshot","image_url":"` + pngURL([]byte("\x89PNG desktop")) + `"}}`)}
+	prompt := openresponses.UserMessage(
+		&openresponses.InputText{Text: "all of these"},
+		&openresponses.InputVideo{VideoURL: "data:video/mp4;base64," + base64.StdEncoding.EncodeToString([]byte("a video"))},
+		&openresponses.InputFile{Filename: "a.pdf", FileURL: "data:application/pdf;base64," + base64.StdEncoding.EncodeToString([]byte("%PDF a file"))},
+		&openresponses.InputImage{ImageURL: "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%2F%3E"},
+	)
+	if end, err := a.Prompt(ctx, screenshot, prompt); err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	verifyAll(t, s)
+	for _, e := range s.Entries() {
+		line, err := agentsession.MarshalEntry(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(line, []byte(`"data:`)) {
+			t.Errorf("%s entry holds inline media: %s", e.EntryType(), line)
+		}
+	}
+	if store.puts != 4 {
+		t.Errorf("%d blobs were put, want the screenshot, the video, the file and the image", store.puts)
+	}
+}
