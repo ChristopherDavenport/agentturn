@@ -476,9 +476,12 @@ that a recorder holding the transcript and the settings rebuilds it:
    summary, MUST build it again when the quarantine has grown to reach
    that part, since what it remembers may carry the item; it keeps its
    own split of the conversation, so the quarantine is a predicate it
-   reads rather than a list it is given shortened. A quarantine a
-   before-model-call hook makes applies to the request it was given,
-   as the hook returns; when the transform had folded an item the hook
+   reads rather than a list it is given shortened. The loop applies
+   the quarantine again to whatever input the before-model-call hook
+   returns, so a hook that puts a quarantined item back, by replacing
+   the input with items from elsewhere, sends it as the quarantine
+   says. A quarantine that hook makes applies to the request it was
+   given, as the hook returns; when the transform had folded an item the hook
    quarantined into that request, the loop builds the request once
    more, transform and hook included, so the fold is made without it.
    The transcript a tool reads from its context is the conversation as

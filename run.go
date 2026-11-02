@@ -1671,14 +1671,14 @@ func (r *runner) build(ctx context.Context, tools agenttool.Set, settings *openr
 			// built again, so the fold is made without it (#281).
 			return r.build(outer, tools, settings, false)
 		}
-		if r.quarantine.generation() != gen {
-			// The hook quarantined items: the request it returns
-			// leaves them out already.
-			own := sameSlice(req.Input, b.input)
-			req.Input = r.quarantine.apply(req.Input)
-			if own {
-				b.input = req.Input
-			}
+		// The quarantine holds whatever input the hook returns: the
+		// items it quarantined now, and quarantined items it put back,
+		// as a hook that replaces the input with items from elsewhere
+		// may. Applying it to the loop's own input changes nothing.
+		own := sameSlice(req.Input, b.input)
+		req.Input = r.quarantine.apply(req.Input)
+		if own {
+			b.input = req.Input
 		}
 	}
 	return req, b, nil
