@@ -1740,7 +1740,7 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 				return true, err
 			}
 		}
-		return commits, r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, ResponseID: responseID})
+		return commits, r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: snapshotItem(item), ResponseID: responseID})
 	case *openresponses.OutputItemDoneEvent:
 		item := e.Item
 		modelCallID := ""
@@ -1812,7 +1812,7 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 	}
 	if idx, ok := outputIndex(ev); ok {
 		item, _ := acc.ItemAt(idx)
-		return false, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: r.withCallID(item, idx), Stream: ev, ResponseID: responseID})
+		return false, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: snapshotItem(r.withCallID(item, idx)), Stream: ev, ResponseID: responseID})
 	}
 	return false, nil
 }
@@ -1891,6 +1891,64 @@ func (r *runner) withCallID(item openresponses.Item, index int) openresponses.It
 	renamed := *call
 	renamed.CallID = id
 	return &renamed
+}
+
+// snapshotItem returns item as it stands, sharing nothing the stream's
+// accumulator changes as later events arrive: an event's members are the
+// facts as of the event (#218). The accumulator appends to a part's text
+// and a call's arguments and replaces parts by index, so the item, its
+// content lists and their streamed parts are copied; strings are
+// immutable and are shared, and so is a part's logprobs, which only
+// grow, capped at their length. An item of another type is cloned
+// through its wire form.
+func snapshotItem(item openresponses.Item) openresponses.Item {
+	switch v := item.(type) {
+	case nil:
+		return nil
+	case *openresponses.Message:
+		c := *v
+		c.Content = snapshotContents(v.Content)
+		return &c
+	case *openresponses.FunctionCall:
+		c := *v
+		return &c
+	case *openresponses.ReasoningItem:
+		c := *v
+		c.Summary = snapshotContents(v.Summary)
+		c.Content = snapshotContents(v.Content)
+		return &c
+	}
+	return openresponses.Items{item}.Clone()[0]
+}
+
+// snapshotContents copies a content list and the parts a stream writes
+// into in place.
+func snapshotContents(in openresponses.Contents) openresponses.Contents {
+	if in == nil {
+		return nil
+	}
+	out := make(openresponses.Contents, len(in))
+	for i, part := range in {
+		switch p := part.(type) {
+		case *openresponses.OutputText:
+			c := *p
+			c.Annotations = slices.Clone(p.Annotations)
+			c.Logprobs = p.Logprobs[:len(p.Logprobs):len(p.Logprobs)]
+			out[i] = &c
+		case *openresponses.Refusal:
+			c := *p
+			out[i] = &c
+		case *openresponses.SummaryText:
+			c := *p
+			out[i] = &c
+		case *openresponses.ReasoningText:
+			c := *p
+			out[i] = &c
+		default:
+			out[i] = part
+		}
+	}
+	return out
 }
 
 // maxCallIDPrefix is the longest prefix callIDPrefix keeps, so the ID

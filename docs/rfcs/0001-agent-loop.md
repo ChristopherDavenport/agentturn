@@ -1000,6 +1000,13 @@ turn number. The catalogue, with the members beyond those two:
 | `run_end` | `items`, `reason`, `cause`, `error`, `failure`, `pending`, `withheld` | last event of a run; `withheld` when the output guard's stop ended it; `failure` when a consumer or a hook failed for a reason of its own while the run was being cancelled |
 | `queued` | `item`, `mode`, `hidden` | an item accepted into a queue; belongs to no run |
 
+An event's members are the facts as of the event. A loop MUST deliver
+each event so that a consumer that keeps it, as a view's render queue
+or a recorder that writes later does, finds the same values in it
+afterwards, whatever the loop does next: the item an `item_start` or
+`item_update` carries is the item as accumulated at that event, and
+later wire events do not change it (#218).
+
 `response_id` is the provider's response identifier for an item the
 model produced and empty for an item the loop appended. `stream` is
 the Open Responses wire event verbatim, so a front switches on the same

@@ -265,6 +265,10 @@ func (*ItemStart) EventType() string { return EventItemStart }
 // openresponses event verbatim, so a front switches on the same concrete
 // types it would use against a remote server. Item is the accumulated
 // item so far.
+//
+// The Item of an ItemStart and an ItemUpdate is a snapshot: the item as
+// accumulated at that event, which later events of the stream do not
+// change, so a subscriber that keeps the event draws what it said.
 type ItemUpdate struct {
 	RunID  string
 	Turn   int
