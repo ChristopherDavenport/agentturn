@@ -413,7 +413,14 @@ that a recorder holding the transcript and the settings rebuilds it:
    know. The loop learns the producer of each reasoning item a
    response adds, under the model name in force, and a host gives it
    the producers of a transcript it rebuilt; the working transcript
-   keeps every item.
+   keeps every item. The context a hook or a tool runs under MUST
+   carry the run's attribution, so a run a tool starts over the
+   parent's items, a child the loop-as-a-tool opens with the
+   conversation so far included, leaves out the reasoning another
+   model produced as a configuration switch does; its recorder
+   describes that omission with an `omit` naming the entries, since
+   items a run is prompted with name no response for the format's
+   reasoning rule to read (#242).
 4. Take the request base, set the loop-owned transport members — store
    false, stream true, no stream options, no previous response ID — and
    apply the model
@@ -1543,7 +1550,7 @@ maps onto it as follows:
 | transcript | `Transcript = openresponses.Items`; `Items` for a fragment |
 | hidden item | `Hidden(item)`, `Unhide(item)`; `Hidden` on the item events |
 | filter | `Config.Filter`; `DefaultFilter`, `VisibleFilter(types…)` |
-| reasoning another model produced | `ReasoningModels` (`Attribute`, `For`); `WithReasoningModels` for an agent, `ContextWithReasoningModels` for `Run` and `Continue` |
+| reasoning another model produced | `ReasoningModels` (`Attribute`, `For`); `WithReasoningModels` for an agent, `ContextWithReasoningModels` for `Run` and `Continue`, and on every hook's and tool's context |
 | transform | `Config.Transform`; `compact.New`, `compact.NewLocal` as the reference; `compact.MarkFold`/`compact.IsFold` for a fold's own model call |
 | configuration | `Config`; `Config.BaseRequest`, `Config.ResolveTools` |
 | tools of the moment | `Config.Tools`, `Config.ToolProvider` |

@@ -2,7 +2,9 @@ package session
 
 import (
 	"context"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/ChristopherDavenport/agentsession"
@@ -562,4 +564,121 @@ func TestObservedChildRecordsItsQueuedInputs(t *testing.T) {
 		t.Errorf("idle delivery's source = %+v, want timer:t1", d.Source)
 	}
 	verifyAll(t, cs)
+}
+
+// reasonsThenDelegates reasons, then calls task once with fork set,
+// then answers once the output is in.
+type reasonsThenDelegates struct{}
+
+func (reasonsThenDelegates) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	r, err := em.Reasoning()
+	if err != nil {
+		return err
+	}
+	r.EncryptedContent("signed by " + req.Model)
+	if err := r.Close(); err != nil {
+		return err
+	}
+	if _, ok := req.Input[len(req.Input)-1].(*openresponses.FunctionCallOutput); ok {
+		msg, err := em.Message(openresponses.PhaseFinalAnswer)
+		if err != nil {
+			return err
+		}
+		if err := msg.Text("done"); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	call, err := em.FunctionCall("", "task")
+	if err != nil {
+		return err
+	}
+	if err := call.Arguments(`{"input":"go on"}`); err != nil {
+		return err
+	}
+	if err := call.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// countsReasoning answers every request and records, for each, the
+// reasoning items it carried.
+type countsReasoning struct {
+	mu   sync.Mutex
+	sent []int
+}
+
+func (m *countsReasoning) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	n := 0
+	for _, item := range req.Input {
+		if _, ok := item.(*openresponses.ReasoningItem); ok {
+			n++
+		}
+	}
+	m.mu.Lock()
+	m.sent = append(m.sent, n)
+	m.mu.Unlock()
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	msg, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := msg.Text("child done"); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestAChildOnAnotherModelIsNotSentTheParentsReasoning pins #242: the
+// context a tool runs under carries the run's reasoning attribution, so
+// a child on another model that WithCallConfig opens with the parent's
+// conversation leaves out the reasoning the parent's model produced, as
+// a configuration switch does, and its recorder describes the omission,
+// so the child's request still verifies. The shape is the round 9
+// nous-trajectories check S3.
+func TestAChildOnAnotherModelIsNotSentTheParentsReasoning(t *testing.T) {
+	type taskArgs struct {
+		Input string `json:"input"`
+	}
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	childModel := &countsReasoning{}
+	task := agent.New(agentturn.Config{Name: "task", Description: "does tasks", Model: childModel, ModelName: "child-model"},
+		agent.WithCallConfig(func(_ context.Context, a taskArgs, parent agentturn.Transcript, cfg agentturn.Config) (agentturn.Config, openresponses.Items, error) {
+			return cfg, append(append(openresponses.Items(nil), parent...), openresponses.UserText(a.Input)), nil
+		}),
+		agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+	a := agentturn.New(agentturn.Config{Model: reasonsThenDelegates{}, ModelName: "parent-model", Tools: []agenttool.Tool{task}})
+	defer rec.Attach(a)()
+	if end, err := a.Prompt(ctx, openresponses.UserText("delegate")); err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	if !slices.Equal(childModel.sent, []int{0}) {
+		t.Errorf("reasoning items child-model was sent per request = %v, want [0]", childModel.sent)
+	}
+	l := links(s)
+	if len(l) != 1 {
+		t.Fatalf("links = %+v", l)
+	}
+	child, err := store.Open(ctx, l[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := verifyAll(t, child); n != 1 {
+		t.Errorf("child responses = %d, want 1", n)
+	}
+	cx, err := child.Context()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cx.Settings.Omit.Items) != 1 {
+		t.Errorf("the child's omit = %+v, want the parent's reasoning item listed", cx.Settings.Omit)
+	}
+	verifyAll(t, s)
 }

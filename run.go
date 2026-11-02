@@ -2278,10 +2278,14 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 }
 
 // toolContext is the context hooks and tools run under: ctx with a
-// snapshot of the working transcript attached, and the invoker that
-// runs another of the turn's tools through the loop.
+// snapshot of the working transcript attached, the run's reasoning
+// attribution, so a run a tool starts over the parent's items leaves
+// out the reasoning another model produced as this run does (#242),
+// and the invoker that runs another of the turn's tools through the
+// loop.
 func (r *runner) toolContext(ctx context.Context, tools agenttool.Set) context.Context {
 	ctx = ContextWithTranscript(ctx, append(Transcript(nil), r.transcript...))
+	ctx = ContextWithReasoningModels(ctx, r.reasoning)
 	// [Ask] says a person's accept note through the run whose hook or
 	// tool asked.
 	ctx = context.WithValue(ctx, noteSinkKey{}, r)

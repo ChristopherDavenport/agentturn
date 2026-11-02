@@ -189,3 +189,40 @@ func TestReasoningModelsFor(t *testing.T) {
 		t.Errorf("Attribute overwrote an attribution: %v", m)
 	}
 }
+
+// TestAToolsRunLeavesOutTheParentsReasoning pins #242's loop half: the
+// context a tool runs under carries the run's reasoning attribution, so
+// a run the tool starts over the parent's items under another model
+// leaves out the reasoning the parent's model produced, as a
+// configuration switch does, and one under the same model keeps it.
+func TestAToolsRunLeavesOutTheParentsReasoning(t *testing.T) {
+	for _, tc := range []struct {
+		child string
+		want  []string
+	}{
+		{"child", []string{}},
+		{"parent", []string{"sig:parent"}},
+	} {
+		t.Run(tc.child, func(t *testing.T) {
+			var sent openresponses.Items
+			child := Config{Model: thinker{}, ModelName: tc.child, BeforeModelCall: func(_ context.Context, req *openresponses.Request) error {
+				sent = req.Input
+				return nil
+			}}
+			delegate := agenttool.NewFunc("delegate", "runs a child over the conversation", json.RawMessage(`{"type":"object"}`),
+				func(ctx context.Context, _ agenttool.Call) (agenttool.Result, error) {
+					parent, _ := TranscriptFromContext(ctx)
+					for range Run(ctx, nil, append(parent, openresponses.UserText("go on")), child) {
+					}
+					return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: "done"}}, nil
+				})
+			a := New(Config{Model: thinker{call: true}, ModelName: "parent", Tools: []agenttool.Tool{delegate}})
+			if _, err := a.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
+				t.Fatal(err)
+			}
+			if got := signatures(sent); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("reasoning the child's request carried = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

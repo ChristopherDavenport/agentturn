@@ -63,6 +63,14 @@ versions may break the API.
   from a path whose `omit` sends outputs or images as placeholders
   hold those items as the path holds them, not as the placeholder.
 
+- Fixed: the context a hook or tool runs under carries the run's
+  reasoning attribution, so a run a tool starts over the parent's
+  items, such as a `tools/agent` child on another model that
+  `WithCallConfig` opens with the conversation so far, leaves out the
+  reasoning the parent's model produced instead of sending it to a
+  provider that refuses it. The child's recorder describes the
+  omission with `omit.items`, so its request still verifies. (#242)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the
