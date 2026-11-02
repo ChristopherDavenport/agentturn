@@ -97,7 +97,7 @@ func TestADeliveryIsRecordedAsOne(t *testing.T) {
 		cfg.BeforeToolCall = nil
 		b := agentturn.New(cfg, opts...)
 		defer rec.Attach(b)()
-		if n := rec.Requeue(ctx, b); n != 1 {
+		if n, deliver := rec.Requeue(ctx, b); n != 1 || !deliver {
 			t.Fatalf("requeued %d, want the delivery", n)
 		}
 		var arrived []agentturn.TurnInput
@@ -123,4 +123,62 @@ func TestADeliveryIsRecordedAsOne(t *testing.T) {
 		}
 		verifyAll(t, s)
 	})
+}
+
+// TestAnOwedDeliveryStartsTheRunThatTakesIt pins the host's half of
+// the queued row (#244): Requeue says that what it handed back holds a
+// delivery, and Continue then runs although the transcript ends with
+// the model's answer, its first turn taking the delivery as one.
+func TestAnOwedDeliveryStartsTheRunThatTakesIt(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1}
+	a := agentturn.New(cfg)
+	unsub := rec.Attach(a)
+	if _, err := a.Prompt(ctx, openresponses.UserText("hello")); err != nil {
+		t.Fatal(err)
+	}
+	unsub()
+	// A delivery the process accepted and wrote, then quit before any
+	// run took it.
+	if _, err := store.Append(ctx, s.ID(), agentsession.NewDelivery(openresponses.UserText("the build passed"))); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, s, err = Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts, err := AgentOptions(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := agentturn.New(cfg, opts...)
+	defer rec.Attach(b)()
+	n, deliver := rec.Requeue(ctx, b)
+	if n != 1 || !deliver {
+		t.Errorf("Requeue = %d, %v; want one input, a delivery", n, deliver)
+	}
+	var arrived []agentturn.TurnInput
+	b.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if e, ok := ev.(*agentturn.TurnStart); ok && e.Turn == 1 {
+			arrived = e.Arrived
+		}
+		return nil
+	})
+	end, err := b.Continue(ctx)
+	if err != nil {
+		t.Fatalf("continue: %v", err)
+	}
+	if end.Reason != agentturn.ReasonDone {
+		t.Errorf("run ended %s", end.Reason)
+	}
+	if len(arrived) != 1 || arrived[0].Mode != agentturn.InputDeliver {
+		t.Errorf("the first turn's inputs = %+v, want the delivery as deliver", arrived)
+	}
+	verifyAll(t, s)
 }

@@ -565,12 +565,16 @@ func (a *Agent) Prompt(ctx context.Context, items ...openresponses.Item) (*RunEn
 	return a.run(ctx, items, nil, nil, false, false)
 }
 
-// Continue runs from the transcript as it stands, which must satisfy
-// [CanContinue], and returns as [Agent.Prompt] does.
+// Continue runs from the transcript as it stands with the steered
+// items queued, which the run's first turn takes before its model
+// call, and returns as [Agent.Prompt] does. The two together must
+// satisfy [CanContinue], so a delivery a host handed back with
+// [Agent.Redeliver] starts the run that takes it although the
+// transcript ends with the model's answer.
 func (a *Agent) Continue(ctx context.Context) (*RunEnd, error) {
 	a.mu.Lock()
 	pending := len(a.pending) > 0
-	ok := CanContinue(a.transcript)
+	ok := CanContinue(append(append(Transcript(nil), a.transcript...), unhideAll(queuedItems(a.steer))...))
 	a.mu.Unlock()
 	if pending {
 		return nil, ErrInputRequired

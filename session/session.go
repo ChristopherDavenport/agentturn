@@ -3044,14 +3044,15 @@ func (r *Recorder) Deliver(ctx context.Context, a *agentturn.Agent, items ...ope
 // Requeue hands the agent the inputs the session owes, the ones queued
 // on the path at [Resume], or at a [Start] on a base, and not yet
 // appended, in the order they were accepted and each in its own mode
-// and with its trigger, and returns how many. Each is handed back the
-// way it arrived: a delivery, whose entry carries deliver, with
-// agentturn.Agent.Redeliver, so the turn that takes it reads it as one,
-// and a steer or a follow-up with Queue. An owed delivery must reach
-// the model: when nothing else starts a run, the host starts the one
-// that takes it with agentturn.Agent.Continue, and while calls are
-// pending the resume takes it after its batch; an owed steer waits for
-// the next input. The path already holds
+// and with its trigger, and returns how many, and whether a delivery is
+// among them. Each is handed back the way it arrived: a delivery, whose
+// entry carries deliver, with agentturn.Agent.Redeliver, so the turn
+// that takes it reads it as one, and a steer or a follow-up with Queue.
+// An owed delivery must reach the model: when deliver is true and
+// nothing else starts a run, the host starts the one that takes it with
+// agentturn.Agent.Continue, which runs on queued steered input; while
+// calls are pending the resume takes it after its batch. An owed steer
+// waits for the next input. The path already holds
 // each, so their queued events write nothing and the item that drains
 // each names its entry. Call it after Resume and before the agent's
 // first run: an input nobody has taken up when a run ends is closed by
@@ -3061,7 +3062,7 @@ func (r *Recorder) Deliver(ctx context.Context, a *agentturn.Agent, items ...ope
 // entry does not carry. The trigger's members of its own come back in
 // its Extra as json.RawMessage values, as they were written, not as
 // the values the host first gave.
-func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) int {
+func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) (n int, deliver bool) {
 	r.mu.Lock()
 	var owed []*inboxItem
 	for _, in := range r.root.inbox {
@@ -3084,11 +3085,12 @@ func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) int {
 		// does not refuse it.
 		if in.deliver {
 			_ = a.Redeliver(qctx, in.item)
+			deliver = true
 			continue
 		}
 		_ = a.Queue(qctx, mode, in.item)
 	}
-	return len(owed)
+	return len(owed), deliver
 }
 
 // Annotate appends a custom entry in namespace ns carrying data,

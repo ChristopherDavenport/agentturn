@@ -217,7 +217,7 @@ func TestResumeReturnsTheSessionAReopenLeft(t *testing.T) {
 	}
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"}, agentturn.WithTranscript(cx.Items))
 	defer rec.Attach(a)()
-	if n := rec.Requeue(context.Background(), a); n != 1 {
+	if n, _ := rec.Requeue(context.Background(), a); n != 1 {
 		t.Fatalf("requeued %d", n)
 	}
 	if _, err := a.Prompt(context.Background(), openresponses.UserText("go on")); err != nil {

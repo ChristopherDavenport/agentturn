@@ -290,6 +290,13 @@ versions may break the API.
   cannot link. (#237)
 - Changed: `front/control` carries `copied` on the item events.
 
+- Fixed: `Agent.Continue` runs when the steered items queued for its
+  first turn end in something the model can answer, so a delivery a
+  host handed back with `Redeliver` starts the run that takes it,
+  although the transcript ends with the model's answer; before, it was
+  refused with `ErrCannotContinue`. `Recorder.Requeue` returns, beside
+  the count, whether a delivery is among what it handed back. (#244)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

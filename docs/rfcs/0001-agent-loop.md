@@ -246,7 +246,10 @@ A run begins in one of two ways, and its **source** says which:
 - **input**: new items are appended and the model is called. The
   low-level loop takes the items as its prompts, or continues from a
   transcript that already ends with something the model can answer: a
-  message that is not the assistant's, or a function call output.
+  message that is not the assistant's, or a function call output. An
+  agent continues, too, from a transcript whose steered items queued
+  ahead of the first model call end with such an item, so an input
+  handed back as a delivery starts the run that takes it.
 - **resume**: the run begins by answering a call that was pending when
   it started, whether the caller approved the call so the loop runs it
   or supplied its output. A prompt that opens with the outputs of the
@@ -1291,8 +1294,9 @@ was idle, whose event waits for the next run, writes it itself. A
 the queue it joined, and the recorder writes that on the `queued`
 entry. A recorder hands back the inputs it owes after a restart or a
 rewind the way they arrived, so the turn that takes a delivery reads
-it as one, and a delivery owed with nothing else to start a run is
-the host's to start one for, as the delivery would have. A recorder
+it as one, and says whether a delivery is among them: a delivery owed
+with nothing else to start a run is the host's to start one for, as
+the delivery would have, with a continue. A recorder
 offers a delivery that writes the `queued` entry before the agent
 accepts the input, as it does for a queue, so a delivery that arrives
 while the agent waits on an approval survives a quit (#244).
