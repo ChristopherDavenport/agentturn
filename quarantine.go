@@ -153,10 +153,16 @@ func (q *quarantine) has(item openresponses.Item) bool {
 type quarantineKey struct{}
 
 // quarantineFromContext returns the quarantine of the run whose hook,
-// transform or tool the context belongs to, or nil.
+// transform or tool the context belongs to, else the [QuarantineSet]
+// a host attached, or nil.
 func quarantineFromContext(ctx context.Context) *quarantine {
-	q, _ := ctx.Value(quarantineKey{}).(*quarantine)
-	return q
+	if q, ok := ctx.Value(quarantineKey{}).(*quarantine); ok && q != nil {
+		return q
+	}
+	if s, ok := ctx.Value(quarantineSetKey{}).(*QuarantineSet); ok && s != nil {
+		return &s.q
+	}
+	return nil
 }
 
 // Quarantined is a read-only view of the quarantine a request is built
@@ -223,11 +229,19 @@ func (s *QuarantineSet) Add(items ...openresponses.Item) error { return s.q.add(
 // Items returns the quarantined items, in no order.
 func (s *QuarantineSet) Items() openresponses.Items { return s.q.list() }
 
+// Apply returns items as a request carries them under the set, as
+// [Quarantined.Apply] does: for a front that builds a request itself
+// rather than through the loop.
+func (s *QuarantineSet) Apply(items openresponses.Items) openresponses.Items {
+	return s.q.apply(items)
+}
+
 type quarantineSetKey struct{}
 
 // ContextWithQuarantineSet attaches s for [Run] and [Continue], which
 // build their requests under it and add to it what their hooks and
-// tools quarantine.
+// tools quarantine, and for a hook a front calls itself outside a run,
+// whose [Quarantine] adds to s.
 func ContextWithQuarantineSet(ctx context.Context, s *QuarantineSet) context.Context {
 	return context.WithValue(ctx, quarantineSetKey{}, s)
 }

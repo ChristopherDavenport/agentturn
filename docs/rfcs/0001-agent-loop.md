@@ -493,7 +493,9 @@ that a recorder holding the transcript and the settings rebuilds it:
    conversation's quarantine, a handoff's legs included, so what one
    leg's guard quarantined the next leg's requests leave out too; a
    host that drives the low-level loop carries the quarantine from run
-   to run. A recorder writes a quarantine as the `omit` setting that
+   to run, and a front that builds a turn's request itself builds it
+   under a quarantine as the loop does, applied after its
+   before-model-call hook. A recorder writes a quarantine as the `omit` setting that
    describes it, `omit.outputs` for a placeholder and `omit.items` for
    an item left out, as the consequences below say, so the requests
    after it rebuild and hash; a fold made again is recorded as any

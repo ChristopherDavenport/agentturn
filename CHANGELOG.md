@@ -426,7 +426,9 @@ versions may break the API.
   `TranscriptFromContext` is the quarantined view. A run a tool starts
   takes the quarantine as it stands then. `QuarantineSet` with
   `ContextWithQuarantineSet` carries one through `Run` and `Continue`,
-  and `front/responses` carries one across a handoff's legs. The record
+  and `front/responses` carries one across a handoff's legs and builds
+  its single caller-tools turn under one, so a guard's `Quarantine`
+  there leaves that request (`QuarantineSet.Apply`). The record
   and its exports keep the items as they arrived. RFC 0001 The request
   step 3. (#281)
 
