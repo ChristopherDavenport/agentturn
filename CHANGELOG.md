@@ -33,6 +33,13 @@ versions may break the API.
   a store lists children by name; a child session reopened for a later
   run keeps the name it has. Observed children and children written
   from their items alike. (#292)
+- Fixed: `Recorder.Observe` writes an observed child's `queued` reports.
+  One that names the child's run goes to that run's session; one that
+  names no run, an input steered or delivered while the child was idle,
+  is held until the run that takes it starts and written to its
+  session, so the drained item carries `queued_from` and its trigger as
+  `source`. Before, the observer dropped them and the item was written
+  bare. (#289)
 
 ## v0.0.34 - 2026-10-26
 

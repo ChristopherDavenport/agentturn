@@ -881,6 +881,11 @@ type Recorder struct {
 	// the child's session whether or not the host put the session's ID
 	// on that context.
 	ended map[string]string
+	// heldQueued holds, by the call the child runs under, the queued
+	// reports of an observed child that named no run: inputs accepted
+	// while it was idle, written to the session of the run that takes
+	// them, at its start.
+	heldQueued map[string][]*agentturn.Queued
 	// childIDs holds the ID of every child session the recorder has
 	// written, so a record naming one by [SessionIDFromContext] after
 	// its run ended is filed there rather than at the root.
@@ -3447,6 +3452,19 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 	// An observer cannot fail the child run, so a store failure ends
 	// the record of that child where it is: later events find no writer
 	// and the parent's tool_end falls back to the items.
+	if e, ok := ev.(*agentturn.Queued); ok && e.RunID == "" {
+		// An idle child reports an input before the run that takes it
+		// starts, so its session is not known yet.
+		callID := ""
+		if call, ok := agenttool.CallFrom(ctx); ok {
+			callID = call.ID
+		}
+		if r.heldQueued == nil {
+			r.heldQueued = map[string][]*agentturn.Queued{}
+		}
+		r.heldQueued[callID] = append(r.heldQueued[callID], e)
+		return
+	}
 	if e, ok := ev.(*agentturn.RunStart); ok {
 		parent := r.root
 		if p, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
@@ -3469,6 +3487,14 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 			// The link is written at dispatch, which is now: the call
 			// is running.
 			_ = parent.link(ctx, w.id, callID)
+		}
+		held := r.heldQueued[callID]
+		delete(r.heldQueued, callID)
+		for _, q := range held {
+			if err := w.handle(ctx, q); err != nil {
+				r.release(e.RunID, w)
+				return
+			}
 		}
 	}
 	w, ok := r.runs[runID(ev)]
@@ -3629,6 +3655,8 @@ func runID(ev agentturn.Event) string {
 	case *agentturn.TurnEnd:
 		return e.RunID
 	case *agentturn.RunEnd:
+		return e.RunID
+	case *agentturn.Queued:
 		return e.RunID
 	case *agentturn.NotesHeld:
 		return e.RunID

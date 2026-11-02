@@ -487,3 +487,79 @@ func TestChildSessionIsNamedAfterItsConfiguration(t *testing.T) {
 		})
 	}
 }
+
+// TestObservedChildRecordsItsQueuedInputs pins RFC 0001's The record:
+// an observed child's queued reports are among the events its session
+// is written from. One that names the child's run goes to that run's
+// session; one that names no run, steered before the run starts or
+// delivered while the child is idle, goes to the session of the run
+// that takes it, so the item that drains it names it in queued_from
+// with its trigger as source (#289).
+func TestObservedChildRecordsItsQueuedInputs(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var child *agentturn.Agent
+	ping := agenttool.New("ping", "ping", func(ctx context.Context, _ echoArgs) (string, error) {
+		// Mid-run: the report names the child's run.
+		child.Steer(openresponses.UserText("mid-run"))
+		return "pong", nil
+	})
+	childCfg := agentturn.Config{Name: "helper", Model: scriptedCalls{{"ping", `{"text":"t"}`}}, Tools: []agenttool.Tool{ping}}
+	helper := agent.New(childCfg,
+		agent.WithObserver(rec.Observe),
+		agent.WithRunContext(rec.ChildContext),
+		agent.WithSpawn(func(_ string, c *agentturn.Agent) {
+			child = c
+			// Before the run starts: the report names no run.
+			c.Steer(openresponses.UserText("before"))
+		}))
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{helper}})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
+		t.Fatal(err)
+	}
+	// Idle: the delivery names no run and starts the one that takes it.
+	ctx := agentturn.ContextWithTrigger(context.Background(), agentturn.Trigger{Kind: "timer", Ref: "t1"})
+	if _, _, err := child.Deliver(ctx, openresponses.UserText("idle")); err != nil {
+		t.Fatal(err)
+	}
+	l := links(s)
+	if len(l) != 1 {
+		t.Fatalf("links = %+v", l)
+	}
+	cs, err := store.Open(context.Background(), l[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued := map[string]*agentsession.QueuedEntry{}
+	drained := map[string]*agentsession.ItemEntry{}
+	for _, e := range cs.Entries() {
+		switch v := e.(type) {
+		case *agentsession.QueuedEntry:
+			if m, ok := v.Item.(*openresponses.Message); ok {
+				queued[m.Text()] = v
+			}
+		case *agentsession.ItemEntry:
+			if m, ok := v.Item.(*openresponses.Message); ok && v.QueuedFrom != "" {
+				drained[m.Text()] = v
+			}
+		}
+	}
+	for _, text := range []string{"before", "mid-run", "idle"} {
+		q, d := queued[text], drained[text]
+		if q == nil {
+			t.Errorf("%s: no queued entry in %q", text, entryTypes(cs))
+			continue
+		}
+		if d == nil || d.QueuedFrom != q.ID {
+			t.Errorf("%s: drained item = %+v, want queued_from %s", text, d, q.ID)
+		}
+	}
+	if d := drained["idle"]; d != nil && (d.Source == nil || d.Source.Kind != "timer" || d.Source.Ref != "t1") {
+		t.Errorf("idle delivery's source = %+v, want timer:t1", d.Source)
+	}
+	verifyAll(t, cs)
+}
