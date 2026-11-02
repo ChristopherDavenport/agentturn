@@ -1618,7 +1618,14 @@ An agent stands in four places inside another system:
   tool, a task mapped to one call and input-required to a returned
   error the model can answer, naming what the task waits on in the
   shape a child's input-required does: each call its status message
-  lists, else the question, with the task as the callee.
+  lists, else the question, with the task as the callee. A front
+  serving the loop as a peer MUST NOT leave a pending call answerable
+  only through a task it no longer knows: either it keeps its tasks as
+  long as the conversations that refer to them, or the next message on
+  the conversation lists again the calls a lost task left pending, so
+  the caller answers them on a new task. A2A asks for no durability,
+  since a task may be purged (§3.3.2), so the reference front does the
+  second whatever task store its host gives it (#257).
 - **As itself, under new settings.** The configuration replaced and the
   transcript kept, so the next run continues the same conversation
   under another agent's instructions, tools and model. This is what an

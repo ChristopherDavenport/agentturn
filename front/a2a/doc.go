@@ -231,4 +231,28 @@
 // input-required task among them, and a served agent whose tool sends
 // to its own conversation gets the error rather than waiting on
 // itself.
+//
+// # Durability
+//
+// Two stores keep what a conversation needs, and both are the host's.
+// The [ConversationStore] holds the transcript, with the calls the last
+// task left pending, and the executor loads it for every message; the
+// default, [MemoryStore], ends with the process. The SDK's task store
+// holds the tasks themselves, their status and history, and is given
+// with the request handler: RequestHandler(a2asrv.WithTaskStore(s)),
+// or a2asrv.NewHandler(exec, a2asrv.WithTaskStore(s)); without one
+// the SDK keeps them in memory. A durable task store lets a caller
+// answer or cancel an input-required task after a restart, as it
+// would before. A2A asks for no durability: Get Task may answer
+// TaskNotFound for a task that is invalid, expired, or completed and
+// purged (§3.3.2). A task the task store has lost cannot be read,
+// answered or canceled: a message naming it is refused. The
+// conversation does not stall on it, since the transcript says what it
+// waits on: the next message on the same context ID, with no task ID,
+// lists the calls the lost task left pending again, under a task of its
+// own, and the caller answers them there, as it would have on the lost
+// one. A pending call is never answerable only through a task the
+// executor no longer knows. A host keeps its tasks as long as the
+// conversations that refer to them, or tells its callers to answer a
+// lost task on the context.
 package a2a

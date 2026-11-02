@@ -462,6 +462,13 @@ versions may break the API.
   for a `WithHandoff` receiver, which inherited neither. RFC 0001
   Composition. (#234)
 
+- Docs: `front/a2a`'s package doc has a Durability section: the
+  conversation store and the SDK's task store are the host's, a durable
+  task store goes in through `RequestHandler(a2asrv.WithTaskStore(…))`,
+  and when a task is lost the next message on its context lists the
+  calls it left pending again under a new task. A test pins that path.
+  RFC 0001 Composition (as a peer) states the rule. (#257)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the
