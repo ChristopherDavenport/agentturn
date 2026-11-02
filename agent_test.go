@@ -824,3 +824,27 @@ func TestWhileIdleHoldsTheRunSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestDeliverDuringAHoldQueuesNothing pins that a delivery refused
+// because the agent is held idle leaves nothing queued: an input that
+// stayed queued would run on whatever the hold made of the agent, a
+// rewound branch among them.
+func TestDeliverDuringAHoldQueuesNothing(t *testing.T) {
+	ctx := context.Background()
+	a := New(Config{Model: &echo.Adapter{}})
+	if _, err := a.Prompt(ctx, openresponses.UserText("one")); err != nil {
+		t.Fatal(err)
+	}
+	err := a.WhileIdle(func() error {
+		if _, _, err := a.Deliver(ctx, openresponses.UserText("raced")); !errors.Is(err, ErrRunning) {
+			t.Errorf("deliver during a hold: %v, want ErrRunning", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := a.State(); st.Steering != 0 || st.FollowUps != 0 {
+		t.Errorf("after a refused delivery the agent holds %d steered and %d queued inputs", st.Steering, st.FollowUps)
+	}
+}

@@ -485,7 +485,8 @@ func WithNotes(notes []Note) Option {
 // prompt, a continue, a resume or a delivery that would start a run is
 // refused with [ErrRunning] until fn returns. The check that the agent
 // is idle and the hold are one step, as a run's start is, so fn sees no
-// run begin between the two. It returns [ErrRunning] without calling fn
+// run begin between the two. A delivery refused meanwhile queues
+// nothing. It returns [ErrRunning] without calling fn
 // while a run is active or another WhileIdle holds the agent, and
 // otherwise what fn returns. fn may call the agent's setters,
 // [Agent.SetTranscript], [Agent.SetPending], [Agent.SetNotes],
@@ -1427,6 +1428,13 @@ func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joine
 		return false, nil, err
 	}
 	a.mu.Lock()
+	if a.held {
+		// No run starts during WhileIdle, so the items would wait for
+		// whatever the hold made of the agent: refused before anything
+		// is queued.
+		a.mu.Unlock()
+		return false, nil, ErrRunning
+	}
 	drains, before := a.drains, len(a.steer)
 	a.queue(TriggerFromContext(ctx), QueueSteer, InputDeliver, items)
 	if len(a.steer) == before {
