@@ -159,9 +159,16 @@ versions may break the API.
   the entries it trimmed instead of leaving the recorder to find them,
   and `session.ErrNotOmittable` for an ID that names no item entry of
   the context. (#233)
-- Fixed: `session.Transcript`, `TranscriptModels` and a recorder seeded
-  from a path whose `omit` sends outputs or images as placeholders
-  hold those items as the path holds them, not as the placeholder.
+- Fixed: a recorder seeded from a path whose `omit` sends outputs or
+  images as placeholders holds those items as the path holds them, not
+  as the placeholder.
+- Changed: `session.Transcript`, `TranscriptModels`, `AgentOptions` and
+  `MoveTo` give the agent the context as the `omit` in force sends it:
+  the item entries it lists left out, and the outputs and image parts
+  it reaches as its placeholders, so a host's trim the record describes
+  holds after a restart instead of coming back whole. Reasoning the
+  `other_models` rule leaves out is still given, since the loop leaves
+  it out by its attribution and sends it again to its own model. (#233)
 
 - Fixed: the context a hook or tool runs under carries the run's
   reasoning attribution, so a run a tool starts over the parent's

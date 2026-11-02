@@ -2086,9 +2086,11 @@ func AgentOptions(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Opti
 // Agent.SetTranscript after [Recorder.Rebase] or to seed the agent of
 // a [Start] on a base with; Context.Items differs from it by those
 // items, which the filter keeps out of every request anyway, and by
-// the items the omit setting in force leaves out of a request to the
-// model at the leaf, which a request to another model may hold: the
-// transcript is the whole conversation, and [TranscriptModels] says
+// the reasoning the omit setting's other_models rule leaves out of a
+// request to the model at the leaf, which a request to another model
+// may hold. The items omit lists, and the outputs and images it sends
+// as placeholders, are as the context has them, so a trim the record
+// describes holds after a restart (#233). [TranscriptModels] says
 // which model produced each reasoning item so the loop leaves out of
 // a request what that model must not be sent. Each call decodes those
 // items afresh.
@@ -2097,7 +2099,7 @@ func Transcript(s *agentsession.Session) (openresponses.Items, error) {
 	if err != nil {
 		return nil, fmt.Errorf("session: context at leaf: %w", err)
 	}
-	items, _, _, _ := transcriptOf(cx)
+	items, _ := agentTranscriptOf(cx)
 	return items, nil
 }
 
@@ -2118,7 +2120,7 @@ func TranscriptModels(s *agentsession.Session) (openresponses.Items, agentturn.R
 	if err != nil {
 		return nil, nil, fmt.Errorf("session: context at leaf: %w", err)
 	}
-	items, entries, _, _ := transcriptOf(cx)
+	items, entries := agentTranscriptOf(cx)
 	produced := producedModels(s.Path(s.Leaf()))
 	models := agentturn.ReasoningModels{}
 	for i, item := range items {
@@ -2158,7 +2160,8 @@ func producedModels(path []agentsession.Entry) map[string]string {
 	return produced
 }
 
-// transcriptOf is the transcript of cx, as [Transcript] reads it, with
+// transcriptOf is the whole of what the path holds for cx's context, as
+// a writer seeded there compares requests with it, with
 // the ID of the entry contributing each item, and whether that entry
 // is a custom entry, outside the context, one [MarkedItem] decodes. The
 // items the omit setting leaves out of a request to the model at the
@@ -2194,6 +2197,40 @@ func transcriptOf(cx agentsession.Context) (items openresponses.Items, entries [
 		}
 	}
 	return items, entries, custom, folded
+}
+
+// agentTranscriptOf is the transcript an agent continuing cx holds, as
+// [Transcript] gives it, with the ID of the entry contributing each
+// item: the context's items as the omit in force sends them, so a trim
+// the record describes survives a restart rather than coming back
+// whole, the item entries omit lists left out and the outputs and
+// image parts it reaches as its placeholders, except the reasoning its
+// other_models rule leaves out, which the loop leaves out itself by its
+// attribution and sends again to the model that produced it; and the
+// items the filter kept from the model, from their custom entries.
+func agentTranscriptOf(cx agentsession.Context) (items openresponses.Items, entries []string) {
+	reasoning := make(map[agentsession.Entry]bool, len(cx.OmittedItems))
+	for _, o := range cx.OmittedItems {
+		if o.Reason == agentsession.OmitOtherModels {
+			reasoning[o.Entry] = true
+		}
+	}
+	j := 0
+	for _, e := range cx.Entries {
+		if ie, ok := e.(*agentsession.ItemEntry); ok && reasoning[e] {
+			items, entries = append(items, ie.Item), append(entries, ie.ID)
+			continue
+		}
+		for ; j < len(cx.ItemEntries) && cx.ItemEntries[j] == e; j++ {
+			items, entries = append(items, cx.Items[j]), append(entries, e.Base().ID)
+		}
+		if c, ok := e.(*agentsession.CustomEntry); ok {
+			if item, _, ok := MarkedItem(c); ok {
+				items, entries = append(items, item), append(entries, c.ID)
+			}
+		}
+	}
+	return items, entries
 }
 
 // CallIDs returns the call ID of every function call in the session,

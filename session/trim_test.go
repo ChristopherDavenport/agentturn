@@ -94,6 +94,9 @@ func TestATrimTheFormatDescribesKeepsEveryResponseVerifiable(t *testing.T) {
 		// unhashed is how many responses the record cannot rebuild.
 		unhashed int
 		restart  bool
+		// keep restarts without trimming again: the agent the record
+		// seeds holds the trim.
+		keep bool
 	}{
 		{name: "the tools' items left out", trim: trimTools,
 			check: func(o agentsession.Omit) bool { return len(o.Items) == 2 && o.Outputs == nil && o.Images == nil }},
@@ -108,6 +111,12 @@ func TestATrimTheFormatDescribesKeepsEveryResponseVerifiable(t *testing.T) {
 		// The second trim leaves out the tools' items of both runs.
 		{name: "a restart after the trim", trim: trimTools, restart: true,
 			check: func(o agentsession.Omit) bool { return len(o.Items) == 4 }},
+		{name: "a restart keeps the tools' items left out", trim: trimTools, restart: true, keep: true,
+			check: func(o agentsession.Omit) bool { return len(o.Items) == 2 && !o.IsZero() }},
+		{name: "a restart keeps outputs cleared", trim: clearOutputs, restart: true, keep: true,
+			check: func(o agentsession.Omit) bool { return o.Outputs != nil && len(o.Outputs.Items) == 1 }},
+		{name: "a restart keeps images pruned", trim: dropImages, restart: true, keep: true,
+			check: func(o agentsession.Omit) bool { return o.Images != nil && o.Images.Keep == 0 }},
 		{name: "an edit the format cannot describe", trim: rewrite, unhashed: 2,
 			check: func(o agentsession.Omit) bool { return o.IsZero() }},
 	}
@@ -148,9 +157,12 @@ func TestATrimTheFormatDescribesKeepsEveryResponseVerifiable(t *testing.T) {
 					t.Fatal(err)
 				}
 				b := agentturn.New(cfg, opts...)
-				// The path holds every item; the host trims again.
-				if err := b.SetTranscript(tc.trim(b.State().Transcript)); err != nil {
-					t.Fatal(err)
+				if !tc.keep {
+					// Trimming again changes nothing more than the
+					// trim the agent was seeded with.
+					if err := b.SetTranscript(tc.trim(b.State().Transcript)); err != nil {
+						t.Fatal(err)
+					}
 				}
 				unsub = rec2.Attach(b)
 				if _, err := b.Prompt(ctx, openresponses.UserText("after")); err != nil {
@@ -165,6 +177,13 @@ func TestATrimTheFormatDescribesKeepsEveryResponseVerifiable(t *testing.T) {
 			cx, err := s.Context()
 			if err != nil {
 				t.Fatal(err)
+			}
+			if tc.keep {
+				for _, c := range configs(s)[1:] {
+					if c.Replace {
+						t.Errorf("a replace after the restart undid the trim: %s", entryTypes(s))
+					}
+				}
 			}
 			if !tc.check(cx.Settings.Omit) {
 				t.Errorf("omit in force = %+v, outputs %+v, images %+v", cx.Settings.Omit, cx.Settings.Omit.Outputs, cx.Settings.Omit.Images)
