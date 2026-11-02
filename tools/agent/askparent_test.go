@@ -111,3 +111,48 @@ func TestAChildsDeferralAsksTheParentsElicitor(t *testing.T) {
 		})
 	}
 }
+
+// TestAnAskedChildCallIsByTheAnswersDecider pins that the answer the
+// parent's elicitor gives a child's deferred call decides it by the
+// decider the answer names, and that a rule's note reaches the child's
+// model in the developer's voice, after the call's output.
+func TestAnAskedChildCallIsByTheAnswersDecider(t *testing.T) {
+	lookup := agenttool.New("lookup", "", func(context.Context, struct {
+		Text string `json:"text"`
+	}) (string, error) {
+		return "FOUND", nil
+	})
+	var reqs []openresponses.Items
+	var starts []*agentturn.ToolStart
+	// Two turns: echo calls the tool again on a request that ends in
+	// the note, so the child is cut off after the one it reads it in.
+	childCfg := agentturn.Config{Name: "child", Model: &echo.Adapter{}, Tools: []agenttool.Tool{lookup}, MaxTurns: 2,
+		BeforeToolCall: func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+			return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "a person approves lookups"}, nil
+		},
+		BeforeModelCall: func(_ context.Context, req *openresponses.Request) error {
+			reqs = append(reqs, append(openresponses.Items(nil), req.Input...))
+			return nil
+		}}
+	child := New(childCfg, WithAskParent(), WithObserver(func(_ context.Context, ev agentturn.Event) {
+		if s, ok := ev.(*agentturn.ToolStart); ok {
+			starts = append(starts, s)
+		}
+	}))
+	parent := agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{child}, MaxTurns: 1,
+		ToolElicitor: func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+			return agenttool.Answer{Action: agenttool.ActionAccept, By: agenttool.ByPolicy, Note: "n"}, nil
+		}}
+	for range agentturn.Run(context.Background(), nil, openresponses.Items{openresponses.UserText("find")}, parent) {
+	}
+	if len(starts) == 0 || starts[0].Decision == nil || starts[0].Decision.Action != agentturn.Allow || starts[0].Decision.By != "policy" {
+		t.Fatalf("child's tool_start = %+v, want allowed by policy", starts)
+	}
+	if len(reqs) < 2 {
+		t.Fatalf("child's requests = %d, want 2", len(reqs))
+	}
+	last := reqs[1][len(reqs[1])-1]
+	if m, ok := last.(*openresponses.Message); !ok || m.Role != openresponses.RoleDeveloper || m.Text() != "n" {
+		t.Errorf("child's second request ends with %+v, want the developer message n", last)
+	}
+}
