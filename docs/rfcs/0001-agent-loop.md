@@ -1734,9 +1734,14 @@ An agent stands in four places inside another system:
   inherits the sender's (#274). A trim between runs that hands a
   conversation to a receiver MUST leave a transcript the loop can
   continue: when the trim would leave a model output last, a transfer's
-  preamble once its call is trimmed out, the host appends a developer
-  message that names the transfer, the sender and the receiver, so the
-  receiver's first request ends in input the model can answer (#276).
+  preamble once its call is trimmed out, the host delivers a developer
+  message that names the transfer, the sender and the receiver as the
+  input of the receiver's run, so the receiver's first request ends in
+  input the model can answer. It MUST be the run's input rather than
+  part of the trimmed transcript, so the loop appends it and a recorder
+  writes it, once, and every request after it keeps its hash; a front
+  that rebuilds the trimmed conversation for a later request or task
+  finds it in the history and MUST NOT add another (#276).
   A trim holds for the rest of the conversation: a front that keeps
   the history whole, or is sent it whole, so it can find the handoffs
   in it, MUST give the receiver's later requests or tasks the
@@ -1926,7 +1931,7 @@ maps onto it as follows:
 | nested call | `Invoke(ctx, name, args)`; `ErrNoInvoker`; `Parent` on the tool events, `ToolStart.Invoked`, `Replayed` on `ToolStart` and `ToolEnd`; `PendingCall.Nested` holding `NestedRecord{CallID, Parent, Name, Args, Dispatched, IdempotencyKey, DispatchArgs, Ended, Result, Err, Blocked, Reason}`, `RecordedDetails` for the details a replayed result gives back |
 | queue mode | `QueueMode`: `QueueSteer`, `QueueFollowUp`; `Queued.Input` (`InputSteer`, `InputFollowUp`, `InputDeliver`); `Agent.Redeliver` for a delivery a record owes |
 | the loop as a model | `front/responses.New(cfg)` → `openresponses.Adapter` |
-| handoffs a front takes | `WithHandoff`, `WithStart`, `WithTransfers(route)` in both fronts; `front/responses.Route`, `Handoffs`, `HandedTo`, `Attribute`, re-exported by `front/a2a` but for `Attribute` |
+| handoffs a front takes | `WithHandoff`, `WithStart`, `WithTransfers(route)` in both fronts; `front/responses.Route`, `Handoffs`, `HandedTo`, `Attribute`, re-exported by `front/a2a` but for `Attribute`; `front/responses.TrimHandedOff`, `HandoffNote`, `TransferName` |
 | the handoff | `handoff.New(agents…)` → `*Team` (`Agent{Config, Handoffs []To}`, `To{Agent, Filter, Enabled}`); `Team.Config`, `Team.Route` (a `front/responses.Route`, which both fronts' `WithTransfers` take), `Team.Run` (→ end, path), `Team.Resume`, `Team.Handoff` and `Team.Trim` (for the fronts' `WithHandoff` and `WithHandoffTrim`), `Team.MaxHandoffs`, `ErrTooManyHandoffs`, `ToolName`, `RemoveAllTools`, `Dest`; the fronts' `WithMaxHandoffs` and `WithHandoffTrim` |
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`, which implements `agentturn.InputRequired` (`PendingCalls() []WaitingCall`), as `tools/a2a`'s does; `WithAskParent`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)`; a detached call: `tools/a2a.WithDetach(fn)`, `WithPollInterval`, `Answer(final)`, and `CalleeTrigger(callID, task)` (`TriggerCallee`) to deliver its result under; a steer of a working task: `front/a2a.WithDeliverWhileBusy()`, served by `Executor.RequestHandler`, and `tools/a2a.Steer(ctx, client, info, parts…)` |

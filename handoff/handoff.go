@@ -303,12 +303,24 @@ func (t *Team) follow(ctx context.Context, a *agentturn.Agent, path []string, en
 			return end, path, err
 		}
 		path = append(path, to.Name)
+		var note openresponses.Item
+		if !agentturn.CanContinue(a.State().Transcript) {
+			// The trim left a model output last: the note is the
+			// receiver's input, so the loop appends it and a recorder
+			// writes it (#276).
+			note = responses.HandoffNote(ToolName(to.Name), from, to)
+		}
 		if n == limit {
 			// Taken, not run: the receiver has the conversation, as
 			// the transcript says, and answers the next input.
 			return end, path, fmt.Errorf("%w: %d followed, and %s would hand to %s again", ErrTooManyHandoffs, limit, from.Name, to.Name)
 		}
-		end, err = a.Continue(agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff", Ref: from.Name}))
+		handed := agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff", Ref: from.Name})
+		if note != nil {
+			end, err = a.Prompt(handed, note)
+		} else {
+			end, err = a.Continue(handed)
+		}
 	}
 	return end, path, err
 }
@@ -333,22 +345,20 @@ func (t *Team) Handoff(_ context.Context, end *agentturn.RunEnd, _ []*agentturn.
 // Trim applies the filter of the handoff from from to to, when it
 // offers one, to tr, and returns tr unchanged otherwise. A trimmed
 // transcript the loop cannot continue, a model output left last as a
-// transfer's preamble is once its call is filtered out, gets a
-// developer message naming the transfer, the sender and the receiver,
-// so the receiver's first request ends in input it can answer. It is
-// what the fronts' WithHandoffTrim take, so a team served through a
-// front trims as [Team.Run] does.
+// transfer's preamble is once its call is filtered out, is continued
+// with responses.HandoffNote as the receiver's input, which names the
+// transfer, the sender and the receiver: [Team.Run] and the fronts
+// deliver it as the receiver's run's input rather than Trim adding it,
+// so the loop appends it and a recorder writes it, once, and a later
+// trim of a history that holds it adds none (#276). It is what the
+// fronts' WithHandoffTrim take, so a team served through a front trims
+// as [Team.Run] does.
 func (t *Team) Trim(_ context.Context, from, to agentturn.Config, tr agentturn.Transcript) agentturn.Transcript {
 	f := t.filters[[2]string{from.Name, to.Name}]
 	if f == nil {
 		return tr
 	}
-	trimmed := f(append(agentturn.Transcript(nil), tr...))
-	if !agentturn.CanContinue(trimmed) {
-		trimmed = append(trimmed, openresponses.DeveloperText(fmt.Sprintf(
-			"The conversation was handed off by %s, from %s to %s, which answers from here.", ToolName(to.Name), from.Name, to.Name)))
-	}
-	return trimmed
+	return f(append(agentturn.Transcript(nil), tr...))
 }
 
 // inherit returns next with from's question and record channels where

@@ -250,9 +250,10 @@ func WithMaxHandoffs(n int) Option { return func(a *Adapter) { a.maxHandoffs = n
 // WithHandoffTrim trims what the receiver of a [WithHandoff] switch
 // sees, once, between the sender's run and the receiver's: fn is given
 // the sender's configuration, the receiver's and the conversation as
-// it stands, and returns the conversation the receiver continues,
-// which must be one the loop can continue (agentturn.CanContinue), or
-// the response fails. With [WithTransfers] the trim holds for the
+// it stands, and returns the conversation the receiver continues. One
+// the loop cannot continue, a transfer's preamble left last, is
+// continued with [HandoffNote] as the receiver's input, which the
+// response relays, so the caller's history holds it once. With [WithTransfers] the trim holds for the
 // conversation's later requests too: each starts from its input
 // trimmed at every handoff the route finds in it ([TrimHandedOff]),
 // while the caller keeps, and sends back, the history whole, which is
@@ -365,13 +366,14 @@ func (a *Adapter) fullRun(ctx context.Context, base agentturn.Config, req openre
 	var usage openresponses.Usage
 	var end *agentturn.RunEnd
 	var results []*agentturn.ToolEnd
+	var prompts openresponses.Items
 	limit := a.maxHandoffs
 	if limit <= 0 {
 		limit = DefaultMaxHandoffs
 	}
 	for handoffs := 0; ; handoffs++ {
 		var err error
-		if end, results, err = a.relayRun(agentturn.ContextWithReasoningModels(runCtx, models), transcript, cfg, rl, &usage); err != nil {
+		if end, results, err = a.relayRun(agentturn.ContextWithReasoningModels(runCtx, models), transcript, prompts, cfg, rl, &usage); err != nil {
 			return err
 		}
 		next, ok := a.handsOff(ctx, end, results)
@@ -388,8 +390,14 @@ func (a *Adapter) fullRun(ctx context.Context, base agentturn.Config, req openre
 		// it runs another model.
 		models.Attribute(cfg.ModelName, end.Items)
 		transcript = append(transcript, end.Items...)
+		prompts = nil
 		if a.trim != nil {
 			transcript = a.trim(ctx, cfg, next, append(agentturn.Transcript(nil), transcript...))
+			if !agentturn.CanContinue(transcript) {
+				// The note is the receiver's input, so it is relayed and
+				// the caller's history holds it from here (#276).
+				prompts = openresponses.Items{HandoffNote(TransferName(results), cfg, next)}
+			}
 		}
 		runCtx = agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff", Ref: cfg.Name})
 		cfg = a.perRequest(inherit(next, cfg), req)
@@ -444,10 +452,14 @@ func (a *Adapter) fullRun(ctx context.Context, base agentturn.Config, req openre
 
 // relayRun runs cfg over transcript, relaying its items and adding its
 // usage, and returns its end and the tool_end events of its last batch.
-func (a *Adapter) relayRun(ctx context.Context, transcript agentturn.Transcript, cfg agentturn.Config, rl *relay, usage *openresponses.Usage) (*agentturn.RunEnd, []*agentturn.ToolEnd, error) {
+func (a *Adapter) relayRun(ctx context.Context, transcript agentturn.Transcript, prompts openresponses.Items, cfg agentturn.Config, rl *relay, usage *openresponses.Usage) (*agentturn.RunEnd, []*agentturn.ToolEnd, error) {
 	var end *agentturn.RunEnd
 	var results []*agentturn.ToolEnd
-	for ev := range agentturn.Continue(ctx, transcript, cfg) {
+	events := agentturn.Continue(ctx, transcript, cfg)
+	if len(prompts) > 0 {
+		events = agentturn.Run(ctx, transcript, prompts, cfg)
+	}
+	for ev := range events {
 		switch e := ev.(type) {
 		case *agentturn.TurnStart:
 			results = nil

@@ -765,7 +765,16 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 		cfg := e.runConfig(inherit(next, prev), caller)
 		if err = agent.SetConfig(cfg); err == nil {
 			guarded = cfg.OutputGuard != nil
-			end, err = agent.Continue(agentturn.ContextWithTrigger(runCtx, agentturn.Trigger{Kind: "handoff", Ref: prev.Name}))
+			handed := agentturn.ContextWithTrigger(runCtx, agentturn.Trigger{Kind: "handoff", Ref: prev.Name})
+			if agentturn.CanContinue(agent.State().Transcript) {
+				end, err = agent.Continue(handed)
+			} else {
+				// The trim left a model output last: the note is the
+				// receiver's input, so the run appends it, the store
+				// and a recorder keep it, and a later task's trim of
+				// the history adds none (#276).
+				end, err = agent.Prompt(handed, responses.HandoffNote(responses.TransferName(out.results), prev, next))
+			}
 		} else {
 			end = nil
 		}

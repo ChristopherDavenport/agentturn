@@ -351,8 +351,10 @@ produces them. An agent stands in four places inside another system:
   `Agent.SetTranscript` between runs, not in `Config.Transform`, which
   runs on every call, and must leave a transcript the loop can
   continue: a trim that leaves a model output last, a transfer's
-  preamble once its call is gone, appends a developer message naming
-  the transfer, the sender and the receiver, as `Team.Run` does. The
+  preamble once its call is gone, continues with a developer message
+  naming the transfer, the sender and the receiver as the receiver's
+  prompt, `responses.HandoffNote`, as `Team.Run` does, so the recorder
+  writes it once. The
   recorder describes such a trim with the format's `omit`, so the
   responses after it keep their hash. The loop leaves another model's
   reasoning items out of each request on its own, so a change of model

@@ -7,6 +7,14 @@ versions may break the API.
 
 ## Unreleased
 
+- Fixed: a handoff whose trim leaves the sender's preamble last now
+  delivers its developer note, `front/responses.HandoffNote`, as the
+  receiver's run's input instead of adding it to the trimmed transcript,
+  in `handoff.Team.Run` and both fronts. The loop appends it and a
+  session recorder writes it once, so every later request in the
+  conversation keeps its hash; `Team.Trim` and `TrimHandedOff` add no
+  note, and a later task or request finds it in the history. Added
+  `responses.HandoffNote` and `responses.TransferName`. (#276)
 - Dependencies: every module requires openresponses v0.0.18, up from
   v0.0.15, and agenttool v0.0.28, up from v0.0.24; `session` requires
   agentsession v0.0.32, up from v0.0.28, so the sessions it writes are

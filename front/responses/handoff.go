@@ -2,6 +2,7 @@ package responses
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/openresponses"
@@ -92,6 +93,29 @@ func Attribute(t agentturn.Transcript, start agentturn.Config, handoffs []Handof
 	}
 	m.Attribute(name, t[from:])
 	return m
+}
+
+// HandoffNote is the developer message a handoff delivers as the
+// receiver's input when its trim leaves a model output last, a
+// transfer's preamble once its call is trimmed out, so the receiver's
+// first request ends in input the model can answer: it names the
+// transfer, the sender and the receiver. It is delivered as the input
+// of the receiver's run, not put in the trimmed transcript, so the loop
+// appends it and a session recorder writes it, once; the history that
+// holds it keeps it, and a later trim of that history adds none (#276).
+func HandoffNote(transfer string, from, to agentturn.Config) openresponses.Item {
+	return openresponses.DeveloperText(fmt.Sprintf("The conversation was handed off by %s, from %s to %s, which answers from here.", transfer, from.Name, to.Name))
+}
+
+// TransferName is the name of the call the terminating results of a
+// batch handed off with: the last that set Terminate and succeeded.
+func TransferName(results []*agentturn.ToolEnd) string {
+	for i := len(results) - 1; i >= 0; i-- {
+		if r := results[i]; r.Result.Terminate && r.Err == nil && !r.Blocked {
+			return r.Name
+		}
+	}
+	return "a transfer"
 }
 
 // TrimHandedOff returns t as the agent that has it saw it: at each of
