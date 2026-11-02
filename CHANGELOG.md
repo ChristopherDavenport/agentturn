@@ -437,6 +437,22 @@ versions may break the API.
   rule's or another model's approval note reaches the model as a
   developer message. RFC 0001 Pending calls and resume. (#291)
 
+- Added: `agentturn.InputRequired`, an interface a composition tool's
+  input-required error implements, with `PendingCalls()` naming what
+  its callee waits on in one shape, `WaitingCall{ID, Name, Args,
+  Callee}`: tools/agent's `InputRequiredError` names each deferred call
+  of the child, the child's run as the callee, and tools/a2a's each
+  call the task's status message lists, else the question, the task as
+  the callee. One `errors.As` replaces a type switch per tool; the `Is`
+  methods stay. (#84)
+- Added: `tools/agent.WithAskParent` puts a call the child's own hook
+  defers to the elicitor of the call that started the child, with
+  `agentturn.Ask`, so an accept runs it and a decline refuses it inside
+  the child; a call held only beside an asked one is released. Only
+  when nobody can be asked does the call fail with input-required. RFC
+  0001 Composition (as a tool, as a peer) states the rule, and its open
+  question "Input required as an interface" is closed. (#84)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

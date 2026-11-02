@@ -64,12 +64,15 @@ type TaskInfo struct {
 // before it can finish. The model sees the message. A host can resume a
 // peer's task with the IDs; a subsession's task left in input-required
 // or auth-required has been sent tasks/cancel. It matches
-// agentturn.ErrInputRequired under errors.Is.
+// agentturn.ErrInputRequired under errors.Is and implements
+// agentturn.InputRequired.
 type InputRequiredError struct {
 	TaskID    a2a.TaskID
 	ContextID string
 	// Message is the agent's question, or empty when it sent none.
 	Message string
+	// waiting is what the task's status message waits on.
+	waiting []agentturn.WaitingCall
 }
 
 // Error phrases the question for the model.
@@ -82,6 +85,51 @@ func (e *InputRequiredError) Error() string {
 
 // Is reports whether target is agentturn.ErrInputRequired.
 func (e *InputRequiredError) Is(target error) bool { return target == agentturn.ErrInputRequired }
+
+// PendingCalls names what the task waits on, the task as the callee:
+// each call its status message lists as a function_call data part, as
+// front/a2a lists a call it puts to its caller, with its call ID, name
+// and arguments, or else the question itself, by its message ID, or
+// the task's ID when it sent none. For [agentturn.InputRequired].
+func (e *InputRequiredError) PendingCalls() []agentturn.WaitingCall {
+	if e.waiting != nil {
+		return e.waiting
+	}
+	return []agentturn.WaitingCall{{ID: string(e.TaskID), Callee: string(e.TaskID)}}
+}
+
+// waitingOn names what an input-required task's status message waits
+// on, as [InputRequiredError.PendingCalls] describes.
+func waitingOn(task a2a.TaskID, status *a2a.Message) []agentturn.WaitingCall {
+	var out []agentturn.WaitingCall
+	if status == nil {
+		return []agentturn.WaitingCall{{ID: string(task), Callee: string(task)}}
+	}
+	for _, part := range status.Parts {
+		dp, ok := part.(a2a.DataPart)
+		if !ok || dp.Data["type"] != "function_call" {
+			continue
+		}
+		id, _ := dp.Data["call_id"].(string)
+		name, _ := dp.Data["name"].(string)
+		if id == "" {
+			continue
+		}
+		var args json.RawMessage
+		if a, ok := dp.Data["arguments"].(string); ok {
+			args = json.RawMessage(a)
+		}
+		out = append(out, agentturn.WaitingCall{ID: id, Name: name, Args: args, Callee: string(task)})
+	}
+	if len(out) == 0 {
+		id := status.ID
+		if id == "" {
+			id = string(task)
+		}
+		out = append(out, agentturn.WaitingCall{ID: id, Callee: string(task)})
+	}
+	return out
+}
 
 // Option configures the tool. The type it configures is unexported, so
 // options come only from this package.
@@ -574,7 +622,7 @@ func (o *outcome) result() (agenttool.Result, error) {
 		res.Output = output(o.text(), o.fileParts())
 		return res, nil
 	case a2a.TaskStateInputRequired, a2a.TaskStateAuthRequired:
-		return res, &InputRequiredError{TaskID: o.taskID, ContextID: o.contextID, Message: o.text()}
+		return res, &InputRequiredError{TaskID: o.taskID, ContextID: o.contextID, Message: o.text(), waiting: waitingOn(o.taskID, o.status)}
 	case a2a.TaskStateCanceled:
 		return res, errors.New("the agent's task was canceled")
 	case a2a.TaskStateRejected:

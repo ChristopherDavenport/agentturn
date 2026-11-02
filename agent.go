@@ -29,8 +29,41 @@ var (
 	// failure; answer them through [Agent.Resume], or open the next
 	// [Agent.Prompt] with their outputs. The typed errors of tools/agent
 	// and tools/a2a match it with errors.Is, so a host can ask "does any
-	// sub-agent need input" once.
+	// sub-agent need input" once, and implement [InputRequired], which
+	// names what each waits on.
 	ErrInputRequired = errors.New("agentturn: pending tool calls must be resumed before continuing")
+)
+
+// InputRequired is the error of a composition tool whose callee, a
+// child run or a remote agent's task, stopped waiting on an answer
+// nobody could give inside the call: tools/agent's and tools/a2a's
+// InputRequiredError implement it, and a third such tool should. One
+// errors.As finds what is waiting whichever tool failed, where a type
+// switch per implementation misses the next one. An implementation
+// also matches [ErrInputRequired] under errors.Is.
+type InputRequired interface {
+	error
+	// PendingCalls names what the callee waits on, in one shape.
+	PendingCalls() []WaitingCall
+}
+
+// WaitingCall is one item a callee waits on, as [InputRequired] names
+// it: a call the callee's model made that its policy deferred, or a
+// question a remote task asked that is not a call.
+type WaitingCall struct {
+	// ID is the item's ID: the call's call ID, or the question's
+	// message ID, else the task's ID when the task sent none.
+	ID string
+	// Name and Args are the call's, the arguments those it would run
+	// with; both are empty for a question that is not a call.
+	Name string
+	Args json.RawMessage
+	// Callee is what waits: the child's run ID, or the remote task's
+	// ID.
+	Callee string
+}
+
+var (
 	// ErrNotPending is returned when Resume was given an answer for a
 	// call that is not pending, left a pending call unanswered, or was
 	// called with nothing pending, and when a Prompt opens with an

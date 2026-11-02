@@ -67,10 +67,12 @@ type ChildInfo struct {
 }
 
 // InputRequiredError is returned when the child run stopped on calls
-// its BeforeToolCall deferred. The parent's model sees it as the error
-// output and can decide what to do; a host that wants to resume the
-// child finds the run and the pending calls in the result's ChildInfo.
-// It matches agentturn.ErrInputRequired under errors.Is.
+// its BeforeToolCall deferred, with nobody to ask ([WithAskParent]).
+// The parent's model sees it as the error output and can decide what
+// to do; a host that wants to resume the child finds the run and the
+// pending calls in the result's ChildInfo. It matches
+// agentturn.ErrInputRequired under errors.Is and implements
+// agentturn.InputRequired.
 type InputRequiredError struct {
 	Agent   string
 	RunID   string
@@ -95,6 +97,75 @@ func (e *InputRequiredError) Error() string {
 // Is reports whether target is agentturn.ErrInputRequired.
 func (e *InputRequiredError) Is(target error) bool { return target == agentturn.ErrInputRequired }
 
+// PendingCalls names the calls the child waits on, each with its call
+// ID, name and arguments, and the child's run as the callee, for
+// [agentturn.InputRequired].
+func (e *InputRequiredError) PendingCalls() []agentturn.WaitingCall {
+	out := make([]agentturn.WaitingCall, 0, len(e.Pending))
+	for _, p := range e.Pending {
+		if p.Call == nil {
+			continue
+		}
+		args := json.RawMessage(p.Call.Arguments)
+		if p.Decision != nil && p.Decision.Args != nil {
+			args = p.Decision.Args
+		}
+		out = append(out, agentturn.WaitingCall{ID: p.Call.CallID, Name: p.Call.Name, Args: args, Callee: e.RunID})
+	}
+	return out
+}
+
+// WithAskParent puts a call the child's own BeforeToolCall defers to
+// the elicitor of the call that started the child, as the loop puts a
+// nested call's deferral, rather than ending the child's run on it: the
+// question is agentturn.Ask's, filed under the parent's call, and the
+// answer's decision, by the decider it names, is the child's hook's
+// verdict, so an accept runs the call and a decline refuses it inside
+// the child, whose model reads what the answerer said. A call the hook
+// holds only beside an asked one (ToolDecision.Held) is released as
+// the policy allowed it, since the batch no longer waits on anyone.
+// Only when there is nobody to ask, no elicitor on the call's context,
+// a failure to ask or a cancel, does the deferral stand, the child end
+// input-required and the call fail with an [*InputRequiredError]. The
+// child's own Config.ToolElicitor answers its tools' questions, not
+// these.
+func WithAskParent() Option { return func(o *options) { o.askParent = true } }
+
+// askParent wraps hook so that a deferral of a call the child's model
+// made is put to elicit, the elicitor of the call that started the
+// child. A nested call's deferral is left to the loop, which asks the
+// invoking tool's elicitor itself.
+func askParent(hook func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error), elicit agenttool.Elicitor) func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+	return func(ctx context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+		d, err := hook(ctx, info)
+		if err != nil || d == nil || d.Action != agentturn.Defer || info.Parent != "" {
+			return d, err
+		}
+		if d.Held {
+			// Nobody waits at the batch's end: the calls asked about
+			// are asked here, one at a time.
+			released := *d
+			released.Action, released.Held = agentturn.Allow, false
+			return &released, nil
+		}
+		if elicit == nil {
+			return d, nil
+		}
+		args := info.Args
+		if args == nil {
+			args = json.RawMessage(info.Call.Arguments)
+		}
+		if d.Args != nil {
+			args = d.Args
+		}
+		asked := agentturn.AskedCall{CallID: info.Call.CallID, Name: info.Call.Name, Args: args, Decision: d}
+		if decided, ok := agentturn.Ask(agenttool.ContextWithElicitor(ctx, elicit), asked); ok {
+			return decided, nil
+		}
+		return d, nil
+	}
+}
+
 // Option configures the tool built by [New].
 type Option func(*options)
 
@@ -110,6 +181,8 @@ type options struct {
 	spawn    func(callID string, child *agentturn.Agent)
 	runCtx   func(ctx context.Context, callID string) context.Context
 	detach   func(callID string, end *agentturn.RunEnd)
+	// askParent is [WithAskParent].
+	askParent bool
 }
 
 // toolName is the form a provider accepts for a function tool's name.
@@ -414,9 +487,9 @@ func (a *agentTool) Strict() bool                { return a.opts.strict }
 // it runs. The output is the text of the child's last assistant
 // message; Details is a [ChildInfo]. A child that fails returns its
 // error, one that is aborted returns the context error, and one that
-// stopped on deferred calls returns an [*InputRequiredError], because a
-// pause inside the child cannot become a pause of the parent after the
-// fact. A child that ends without a final assistant message returns
+// stopped on deferred calls, nobody having been asked ([WithAskParent]),
+// returns an [*InputRequiredError], because a pause inside the child
+// cannot become a pause of the parent after the fact. A child that ends without a final assistant message returns
 // what [WithNoAnswer] says, by default an error naming the cause. On
 // every error path the Result still carries the ChildInfo: the loop
 // keeps Details when it turns an error into the output the model sees,
@@ -462,7 +535,14 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	if seed != nil {
 		opts = append(opts, agentturn.WithTranscript(seed))
 	}
-	child := agentturn.New(cfg, opts...)
+	runCfg := cfg
+	if a.opts.askParent && cfg.BeforeToolCall != nil {
+		// The elicitor of the call that started the child, which the
+		// parent's loop put on the call's context.
+		elicit, _ := agenttool.ElicitorFrom(ctx)
+		runCfg.BeforeToolCall = askParent(cfg.BeforeToolCall, elicit)
+	}
+	child := agentturn.New(runCfg, opts...)
 	var mu sync.Mutex
 	var soFar []string
 	done := false

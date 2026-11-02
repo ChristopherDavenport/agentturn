@@ -1581,10 +1581,23 @@ An agent stands in four places inside another system:
   the result's details, so a recorder on the parent links the child
   session. The
   child runs with its own configuration and its own hooks; the
-  parent's do not run inside it. A child that ends with calls its own
-  hook deferred returns an error that says so and names them, so the
-  parent's model sees it as an error output and a host can ask once
-  whether any sub-agent needs input (#84). A cancellation on the
+  parent's do not run inside it. A child run's deferral SHOULD be put
+  to the elicitor of the call that started the child, as a nested
+  call's deferral is: a question naming the call, filed under the
+  parent's call, whose answer is the decision on the child's call, by
+  the decider the answer names, so the child goes on and its model
+  reads what the answerer said; a call held only beside an asked one
+  is released, since the batch no longer waits on anyone. The call
+  fails with input-required only when there is nobody to ask, no
+  elicitor, a failure to ask or a cancel: an error that says so and
+  names the calls, so the parent's model sees it as an error output.
+  The child's call is not made a pending call of the parent's run,
+  which would give the loop a sub-agent concept. Every composition
+  tool that fails with input-required names its waiting items in one
+  shape: each item's ID, its name and arguments when it is a call, and
+  the callee, a child run ID or a remote task ID, so a host asks once
+  whether any callee needs input and finds what it waits on whichever
+  tool failed (#84). A cancellation on the
   parent reaches the child through the context. An **observer** the
   host installs receives every event of the child run, in order, with
   the parent's call context, which is how one recorder serves every
@@ -1603,7 +1616,9 @@ An agent stands in four places inside another system:
 - **As a peer.** The loop exposed to A2A callers, with its card derived
   from its name, description and tools; a remote A2A agent wrapped as a
   tool, a task mapped to one call and input-required to a returned
-  error the model can answer.
+  error the model can answer, naming what the task waits on in the
+  shape a child's input-required does: each call its status message
+  lists, else the question, with the task as the callee.
 - **As itself, under new settings.** The configuration replaced and the
   transcript kept, so the next run continues the same conversation
   under another agent's instructions, tools and model. This is what an
@@ -1783,7 +1798,7 @@ maps onto it as follows:
 | queue mode | `QueueMode`: `QueueSteer`, `QueueFollowUp`; `Queued.Input` (`InputSteer`, `InputFollowUp`, `InputDeliver`); `Agent.Redeliver` for a delivery a record owes |
 | the loop as a model | `front/responses.New(cfg)` → `openresponses.Adapter` |
 | handoffs a front takes | `WithHandoff`, `WithStart`, `WithTransfers(route)` in both fronts; `front/responses.Route`, `Handoffs`, `HandedTo`, `Attribute`, re-exported by `front/a2a` but for `Attribute` |
-| the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
+| the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`, which implements `agentturn.InputRequired` (`PendingCalls() []WaitingCall`), as `tools/a2a`'s does; `WithAskParent`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)` |
 | quarantine | `Agent.Quarantine`, `Agent.Quarantined`; `Quarantine(ctx, items…)` from a hook or a tool, `ErrNoQuarantine`, `ErrNotQuarantinable`; `QuarantinedOutput`, the placeholder |
 | the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Queue`, `Deliver`, `Control` (`RecordedControl`, for a front), `Requeue`, `Rebase`; `session.MoveTo` for a rewind; `WithInstructionsParts`, `WithMedia`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`; the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
@@ -2013,9 +2028,6 @@ the scenario, fixed without a change of rule.
   failure and is retried by a supervisor that honours policy stops.
   Returning a decision with a cause instead, with the sentinel kept as
   sugar, is proposed.
-- **Input required as an interface** (#84). The child tools' errors
-  match one sentinel, and the pending calls are reached by a type
-  switch per implementation. An interface both satisfy is proposed.
 - **The handoff** (#96). The fourth composition is the cheapest and
   the least documented. The loop leaves another model's reasoning
   items out of each turn's request (#91), and a recorder describes that
