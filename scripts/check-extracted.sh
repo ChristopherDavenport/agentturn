@@ -67,6 +67,50 @@ required_version() {
   ' "$1"
 }
 
+# The directory a go.mod replaces a given module path with.
+replace_target() {
+  awk -v d="$2" '
+    /^replace[[:space:]]*\(/ { blk = 1; next }
+    blk && /^\)/             { blk = 0; next }
+    blk && $1 == d && /=>/   { print $3; exit }
+    /^replace[[:space:]]/ && $2 == d && /=>/ { print $4; exit }
+  ' "$1"
+}
+
+# Whether the sibling at dir (relative to module m) is ahead of its
+# release v: v is that sibling's latest release, and the tree has moved
+# on since it was tagged. Both halves matter. A require naming an older
+# release is drift, the thing this script exists to catch, and is never
+# excused; only the newest release can be one the tree has simply
+# outgrown. The tag of a module at the repository root is v, and of one
+# in a subdirectory <dir>/v. What is compared is what compiles: the Go
+# files, go.mod and go.sum under the directory, less every module nested
+# inside it, which its own tag names. A script or a doc changing is not
+# the sibling moving. Nothing here uses go:embed; if something starts
+# to, its files belong in this list.
+ahead_of_release() {
+  local m="$1" dir="$2" v="$3" top prefix latest
+  top="$(git rev-parse --show-toplevel)"
+  # Called under ! and ||, where set -e does not apply, so every step
+  # that can fail says so.
+  prefix="$(git -C "$m/$dir" rev-parse --show-prefix)" \
+    || die "$m/$dir is not inside this repository"
+  git -C "$top" rev-parse -q --verify "refs/tags/$prefix$v" >/dev/null \
+    || die "tag $prefix$v is not in this clone; fetch tags (a CI checkout needs fetch-depth: 0)"
+  latest="$(git -C "$top" tag -l "${prefix}v*" | grep -E "^${prefix}v[0-9]+\.[0-9]+\.[0-9]+$" | sort -V | tail -n1)"
+  [ "$latest" = "$prefix$v" ] || return 1
+  local specs=(":(glob)${prefix}**/*.go" "${prefix}go.mod" "${prefix}go.sum")
+  local sub
+  while read -r sub; do
+    sub="${sub%/go.mod}"
+    case "$sub/" in "$prefix"?*) specs+=(":(exclude)$sub") ;; esac
+  done < <(git -C "$top" ls-files '*/go.mod')
+  # A file not yet added moves the tree as much as one that changed, and
+  # diff sees only tracked files.
+  ! git -C "$top" diff --quiet "$prefix$v" -- "${specs[@]}" \
+    || [ -n "$(git -C "$top" ls-files --others --exclude-standard -- "${specs[@]}")" ]
+}
+
 # One parent for every copy. mktemp -d lands outside any module, which is
 # the whole point: a relative replace left in place would otherwise be
 # satisfied by accident from somewhere up the tree.
@@ -101,6 +145,31 @@ for m in "$@"; do
     echo "  and the push; anywhere else it is a require that names a version" >&2
     echo "  nobody can fetch." >&2
     status=1
+    continue
+  fi
+
+  # Between releases the tree moves ahead of the version the require
+  # names, and a nested module that uses what the tree added cannot
+  # compile against the proxy's copy — ./mcp_test.go: undefined:
+  # agenttool.ReplayOf, on the first change to do it. That is not a
+  # defect a consumer can meet: nobody gets this module with that
+  # require until make release points it at a version holding the same
+  # tree. So a module is skipped when a sibling it drops is ahead of the
+  # latest release its require names, and built otherwise: on the tagged
+  # commit once it is published, and on main or a change that touches
+  # this module alone until the root moves. Between the first change to
+  # the root and the next release that leaves it skipped, and make check
+  # is what builds the module; the release puts it back in force.
+  moved=""
+  for p in $dropped; do
+    v="$(required_version "$m/go.mod" "$p")"
+    ! ahead_of_release "$m" "$(replace_target "$m/go.mod" "$p")" "$v" \
+      || moved="$moved $p@$v"
+  done
+  if [ -n "$moved" ]; then
+    msg="$m skipped: the tree has moved on since$moved, so the build would test the previous release against code written for this one. make release re-points the require; make check has built $m against the tree."
+    echo "  --  $msg"
+    [ "${GITHUB_ACTIONS:-}" != true ] || echo "::notice title=check-extracted::$msg"
     continue
   fi
 
