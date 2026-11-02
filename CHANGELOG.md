@@ -614,6 +614,12 @@ versions may break the API.
   refuses it, as before. `tools/a2a.Steer(ctx, client, info, parts...)`
   sends one, to the task a `WithDetach` call follows among others. RFC
   0001 Composition, as a peer, states it. (#287)
+- Fixed: `front/responses`' single turn, served when the caller
+  declares tools, builds its request once more when a
+  `BeforeModelCall` guard quarantines an item the transform folded into
+  that request, as the loop does, so the summary the model is sent
+  never carries the quarantined text. RFC 0001 The request, step 3,
+  says a front building its own request does so. (#281)
 
 ## v0.0.34 - 2026-10-26
 

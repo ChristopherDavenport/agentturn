@@ -93,6 +93,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
@@ -563,6 +564,24 @@ func terminatingText(items agentturn.Transcript, results []*agentturn.ToolEnd) (
 	return "", false
 }
 
+// foldedAway reports whether an item of transcript the quarantine holds
+// is not among what the transform returned, sent: the transform folded
+// it, or left it out, so what it returned may still carry its content.
+func foldedAway(q agentturn.Quarantined, transcript, sent agentturn.Transcript) bool {
+	kept := make(map[openresponses.Item]bool, len(sent))
+	for _, item := range sent {
+		if item != nil && reflect.TypeOf(item).Comparable() {
+			kept[item] = true
+		}
+	}
+	for _, item := range transcript {
+		if item != nil && reflect.TypeOf(item).Comparable() && !kept[item] && q.Has(item) {
+			return true
+		}
+	}
+	return false
+}
+
 // oneTurn calls the model of cfg once with the agent's and the
 // caller's tools and re-emits the response; calls are the caller's to
 // run. The request is the same one the loop would send,
@@ -591,34 +610,48 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 			return openresponses.InvalidRequest(openresponses.CodeInvalidValue, fmt.Sprintf("tool %q is owned by the agent", ct.Name), "tools")
 		}
 	}
-	input := transcript
-	if cfg.Transform != nil {
-		var err error
-		input, err = cfg.Transform(ctx, append(agentturn.Transcript(nil), transcript...))
-		if err != nil {
-			return fmt.Errorf("transform: %w", err)
-		}
-	}
 	filter := cfg.Filter
 	if filter == nil {
 		filter = agentturn.DefaultFilter
 	}
-	upstream := cfg.BaseRequest(ctx)
-	upstream.Input = quarantined.Apply(models.For(cfg.ModelName, filter(input)))
-	for _, ct := range callerTools {
-		upstream.Tools = append(upstream.Tools, ct)
-	}
-	if req.ToolChoice != (openresponses.ToolChoice{}) {
-		upstream.ToolChoice = req.ToolChoice
-	}
-	if cfg.BeforeModelCall != nil {
+	view := agentturn.QuarantinedFromContext(ctx)
+	var upstream openresponses.Request
+	for again := true; ; again = false {
+		input := transcript
+		if cfg.Transform != nil {
+			var err error
+			input, err = cfg.Transform(ctx, append(agentturn.Transcript(nil), transcript...))
+			if err != nil {
+				return fmt.Errorf("transform: %w", err)
+			}
+		}
+		upstream = cfg.BaseRequest(ctx)
+		upstream.Input = quarantined.Apply(models.For(cfg.ModelName, filter(input)))
+		for _, ct := range callerTools {
+			upstream.Tools = append(upstream.Tools, ct)
+		}
+		if req.ToolChoice != (openresponses.ToolChoice{}) {
+			upstream.ToolChoice = req.ToolChoice
+		}
+		if cfg.BeforeModelCall == nil {
+			break
+		}
+		gen := view.Generation()
 		if err := cfg.BeforeModelCall(ctx, &upstream); err != nil {
 			if errors.Is(err, agentturn.ErrGuard) {
 				return rl.refuse()
 			}
 			return fmt.Errorf("before-model-call hook: %w", err)
 		}
+		if again && cfg.Transform != nil && view.Generation() != gen && foldedAway(view, transcript, input) {
+			// The hook quarantined an item the transform had folded
+			// into this request, a summary of it say: the request is
+			// built once more, so the fold is made without it, as the
+			// loop builds its own (#281).
+			continue
+		}
 		upstream.Input = quarantined.Apply(upstream.Input)
+		break
 	}
 	var acc openresponses.Accumulator
 	var final *openresponses.Response
