@@ -251,44 +251,55 @@ func TestDetachedCallsLeaveTheBatch(t *testing.T) {
 
 // TestAnAbortCutsADetachedCall pins the cut: an abort of the parent's
 // run while it still runs cancels the detached call's task, records the
-// cancel after the peer's callee, and hands fn the abort; the run
-// ending by itself, as above, does not.
+// cancel after the peer's callee, and hands fn the abort, whether the
+// task is followed by its stream or by tasks/get; the run ending by
+// itself, as above, does not.
 func TestAnAbortCutsADetachedCall(t *testing.T) {
-	remote := newGated("lint")
-	client, card := serve(t, remote, nil)
-	ends := make(chan error, 1)
-	tool := New(client, card, WithName("lint"), WithDetach(func(_ string, _ TaskInfo, _ *a2a.Task, err error) { ends <- err }))
-	started := make(chan struct{})
-	hold := agenttool.New("hold", "", func(ctx context.Context, _ struct{}) (string, error) {
-		close(started)
-		<-ctx.Done()
-		return "", ctx.Err()
-	})
-	var recs records
-	parent := agentturn.New(agentturn.Config{Model: callsAll{}, ModelName: "local", Tools: []agenttool.Tool{tool, hold}, ToolExecution: agentturn.ExecSequential, ToolRecorder: recs.fn})
-	stop := errors.New("stop everything")
-	go func() {
-		<-started
-		parent.AbortCause(stop)
-	}()
-	if _, err := parent.Prompt(context.Background(), openresponses.UserText("lint")); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-ends:
-		if !errors.Is(err, context.Canceled) && !errors.Is(err, stop) {
-			t.Errorf("fn got %v, want the abort", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the abort did not reach the detached call")
-	}
-	select {
-	case <-remote.cancelled:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the remote agent saw no tasks/cancel")
-	}
-	if n := len(recs.of(CancelNS)); n != 1 {
-		t.Errorf("cancel records = %d, want 1", n)
+	for _, tc := range []struct {
+		name string
+		opts []Option
+	}{
+		{name: "streaming"},
+		{name: "blocking", opts: []Option{WithBlocking(), WithPollInterval(MinPollInterval)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remote := newGated("lint")
+			client, card := serve(t, remote, nil)
+			ends := make(chan error, 1)
+			tool := New(client, card, append(tc.opts, WithName("lint"), WithDetach(func(_ string, _ TaskInfo, _ *a2a.Task, err error) { ends <- err }))...)
+			started := make(chan struct{})
+			hold := agenttool.New("hold", "", func(ctx context.Context, _ struct{}) (string, error) {
+				close(started)
+				<-ctx.Done()
+				return "", ctx.Err()
+			})
+			var recs records
+			parent := agentturn.New(agentturn.Config{Model: callsAll{}, ModelName: "local", Tools: []agenttool.Tool{tool, hold}, ToolExecution: agentturn.ExecSequential, ToolRecorder: recs.fn})
+			stop := errors.New("stop everything")
+			go func() {
+				<-started
+				parent.AbortCause(stop)
+			}()
+			if _, err := parent.Prompt(context.Background(), openresponses.UserText("lint")); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-ends:
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, stop) {
+					t.Errorf("fn got %v, want the abort", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("the abort did not reach the detached call")
+			}
+			select {
+			case <-remote.cancelled:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the remote agent saw no tasks/cancel")
+			}
+			if n := len(recs.of(CancelNS)); n != 1 {
+				t.Errorf("cancel records = %d, want 1", n)
+			}
+		})
 	}
 }
 
