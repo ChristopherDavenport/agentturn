@@ -460,21 +460,49 @@ that a recorder holding the transcript and the settings rebuilds it:
    Then apply the **quarantine**. A host MAY quarantine an item for
    the rest of the conversation, and a hook, such as a before-model-call
    guard that finds an instruction injected into a tool's output or a
-   fetched page, MAY name items to quarantine through its context: from
-   then on, every request leaves the item out, or, for a function call
-   output, whose call needs an answer, carries it with one fixed
-   placeholder text in place of its output; a quarantined function call
-   is left out with its outputs. The loop applies the quarantine after
-   the transform and the filter, so it holds whatever a transform
-   returned, and keeps the item in the transcript, which stays
-   append-only and what arrived. A quarantine a before-model-call hook
-   makes applies to the request it was given, as the hook returns. A
-   run a tool starts over its parent's items carries the parent's
-   quarantine, as it carries the attribution. A recorder writes a
-   quarantine as the `omit` setting that describes it, `omit.outputs`
-   for a placeholder and `omit.items` for an item left out, as the
-   consequences below say, so the requests after it rebuild and hash
-   (#281).
+   fetched page, MAY name items to quarantine through its context. A
+   quarantine covers everything a request is built from: from then on,
+   no request carries the item, or, for a function call output, whose
+   call needs an answer, a request carries it with one fixed placeholder
+   text in place of its output, and a quarantined function call is left
+   out with its outputs. The loop applies it here, to what the transform
+   and the filter returned, and keeps the item in the transcript, which
+   stays append-only and what arrived. Because the transform runs
+   first, the loop MUST give it the quarantine, read-only, with a
+   version that changes whenever the quarantine grows. A transform that
+   sends any part of the conversation to a model of its own, as a
+   fold's summary request does, MUST leave out of it what a request
+   leaves out, by the same rule. A transform that remembers what it
+   built over a part of the conversation, as a fold remembers its
+   summary, MUST build it again when the quarantine has grown to reach
+   that part, since what it remembers may carry the item; it keeps its
+   own split of the conversation, so the quarantine is a predicate it
+   reads rather than a list it is given shortened. The loop applies
+   the quarantine again to whatever input the before-model-call hook
+   returns, so a hook that puts a quarantined item back, by replacing
+   the input with items from elsewhere, sends it as the quarantine
+   says. A quarantine that hook makes applies to the request it was
+   given, as the hook returns; when the transform had folded an item the hook
+   quarantined into that request, the loop builds the request once
+   more, transform and hook included, so the fold is made without it.
+   The transcript a tool reads from its context is the conversation as
+   a request carries it, under the quarantine. A run a tool starts over
+   its parent's items carries the parent's quarantine as it stood when
+   that run started, as it carries the attribution: a child that runs
+   on, detached or spawned, does not see what the parent quarantines
+   later. Each run of one conversation builds under that
+   conversation's quarantine, a handoff's legs included, so what one
+   leg's guard quarantined the next leg's requests leave out too; a
+   host that drives the low-level loop carries the quarantine from run
+   to run, and a front that builds a turn's request itself builds it
+   under a quarantine as the loop does, applied after its
+   before-model-call hook. A recorder writes a quarantine as the `omit` setting that
+   describes it, `omit.outputs` for a placeholder and `omit.items` for
+   an item left out, as the consequences below say, so the requests
+   after it rebuild and hash; a fold made again is recorded as any
+   fold. The record keeps the item as it arrived, and so does whatever
+   is exported from the record, a trajectory or a trace: they are the
+   record of the conversation, not the model's input (#281).
 4. Take the request base, set the loop-owned transport members — store
    false, stream true, no stream options, no previous response ID — and
    apply the model
@@ -588,10 +616,18 @@ the transcript.
   under the ID the transcript holds it by. A function call the
   completed response lists that the stream opened and never completed
   is completed from the response: it takes the ID decided when it
-  opened, paired as above by item ID or else by open order among the
-  calls the attempt opened, never by its position in the response,
-  which after a reused output index names another call, and it is
-  appended with its `item_end` before `response_end`. A listed call the
+  opened, paired by item ID or else by open order among the calls the
+  attempt opened, never by its position in the response, which after a
+  reused output index names another call, and it is appended with its
+  `item_end` before `response_end`. The completed calls are paired
+  first: a listed call whose item ID, or whose call ID and arguments,
+  match a completed call is that call. A listed call left over pairs by
+  its call ID with the calls of that ID in the order they opened,
+  completed or not, and then by order, the completed calls first, so
+  neither a completed call nor one never completed is taken for
+  another that only shares its call ID. The response the turn acts on lists the calls in the
+  transcript's order, the ones only the response completed after the
+  ones the stream completed. A listed call the
   stream never opened is decided and appended the same way at that
   point, so every call the response lists is paired or decided and
   none runs that the transcript does not hold. A call the stream opened
@@ -669,7 +705,12 @@ SHOULD rebuild the request through it with a fold asked for, as the
 request's step 2 says, and send it once, as a retry: `model_retry`
 reports the refusal and carries the rebuilt request, so a record shows
 the fold and then the attempt. It does so whatever the retry policy,
-whose attempts it does not count, and never twice in one turn. A
+whose attempts it does not count: the attempt number the policy's
+limit, backoff and revision are given counts the policy's own retries
+alone, while `model_retry` numbers every call. A request a revision
+made keeps the revision's model and settings when it is rebuilt, and
+the transform weighs those, so an overflow on a smaller fallback is
+folded for the fallback. It happens never twice in one turn. A
 rebuilt request whose input is the one refused, because the transform
 could not fold, is not sent, and the run ends with the refusal (#277).
 
@@ -1840,7 +1881,7 @@ maps onto it as follows:
 | the handoff | `handoff.New(agents…)` → `*Team` (`Agent{Config, Handoffs []To}`, `To{Agent, Filter, Enabled}`); `Team.Config`, `Team.Route` (a `front/responses.Route`, which both fronts' `WithTransfers` take), `Team.Run` (→ end, path), `Team.Resume`, `Team.Handoff` and `Team.Trim` (for the fronts' `WithHandoff` and `WithHandoffTrim`), `Team.MaxHandoffs`, `ErrTooManyHandoffs`, `ToolName`, `RemoveAllTools`, `Dest`; the fronts' `WithMaxHandoffs` and `WithHandoffTrim` |
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`, which implements `agentturn.InputRequired` (`PendingCalls() []WaitingCall`), as `tools/a2a`'s does; `WithAskParent`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)` |
-| quarantine | `Agent.Quarantine`, `Agent.Quarantined`; `Quarantine(ctx, items…)` from a hook or a tool, `ErrNoQuarantine`, `ErrNotQuarantinable`; `QuarantinedOutput`, the placeholder |
+| quarantine | `Agent.Quarantine`, `Agent.Quarantined`; `Quarantine(ctx, items…)` from a hook or a tool, `ErrNoQuarantine`, `ErrNotQuarantinable`; `QuarantinedOutput`, the placeholder; `QuarantinedFromContext` (`Has`, `Generation`, `Apply`) for a transform, which `compact` reads; `QuarantineSet`, `ContextWithQuarantineSet` for a host carrying one through `Run` and `Continue`, as `front/responses` does across a handoff's legs |
 | the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Queue`, `Deliver`, `Control` (`RecordedControl`, for a front), `Requeue`, `Rebase`; `session.MoveTo` for a rewind; `WithInstructionsParts`, `WithMedia`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`; the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
 
 Every error the package returns to its caller, sentinel or wrapped,

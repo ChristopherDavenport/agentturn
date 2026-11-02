@@ -346,7 +346,10 @@ versions may break the API.
   ran it under another call's ID, so the next request sent an output
   with no call and a recorder failed the run. The response's calls pair
   with the attempt's by item ID, the model's call ID or open order,
-  never by output index. RFC 0001 The model call and Invariants. (#236)
+  never by output index, the completed calls first, by item ID or by
+  call ID and arguments, so a call completed at an index another call
+  opened at first runs once, under its own ID. RFC 0001 The model call
+  and Invariants. (#236)
 
 - Fixed: a retry the policy's `Revise` moves to another model, and a
   `BeforeModelCall` hook that does, keeping the input the loop built,
@@ -371,8 +374,12 @@ versions may break the API.
   rebuilds the request once with a fold asked for, marking the
   transform's context with `ContextWithFoldRequest` (`FoldRequested`),
   and sends it as a retry reported by `model_retry`, whatever the retry
-  policy; a transform that cannot shorten it ends the run with the
-  refusal, as before. RFC 0001 The request step 2 and Retry. (#277)
+  policy and without counting against it: `MaxAttempts`, the backoff
+  and `Revise` see the policy's attempts alone, while `model_retry`
+  numbers every call. After a `Revise` the fold-retry keeps the revised
+  model and settings, which the transform weighs. A transform that
+  cannot shorten it ends the run with the refusal, as before. RFC 0001
+  The request step 2 and Retry. (#277)
 
 - Changed: the transform's context carries the settings the request
   will carry, built before the transform runs, as
@@ -409,8 +416,21 @@ versions may break the API.
   hook was given, and passes it to runs a tool starts over the
   conversation. The session recorder writes it as `omit.outputs` and
   `omit.items`, so every later response still verifies.
-  `Agent.Quarantined` lists the items. RFC 0001 The request step 3.
-  (#281)
+  `Agent.Quarantined` lists the items. A quarantine covers everything
+  a request is built from: the transform reads it,
+  `QuarantinedFromContext`, and `compact` leaves quarantined items out
+  of what a fold sends its summarizer and folds again when a quarantine
+  reaches a prefix it already summarised; when a `BeforeModelCall`
+  guard quarantines an item the transform folded into that request,
+  the loop builds the request once more. A tool's
+  `TranscriptFromContext` is the quarantined view. A run a tool starts
+  takes the quarantine as it stands then. `QuarantineSet` with
+  `ContextWithQuarantineSet` carries one through `Run` and `Continue`,
+  and `front/responses` carries one across a handoff's legs and builds
+  its single caller-tools turn under one, so a guard's `Quarantine`
+  there leaves that request (`QuarantineSet.Apply`). The record
+  and its exports keep the items as they arrived. RFC 0001 The request
+  step 3. (#281)
 
 - Changed: a decision an answer to an asked call makes is by the
   decider the answer names, agenttool's `Answer.By` (`human`, `policy`,

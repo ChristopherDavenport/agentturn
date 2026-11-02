@@ -330,7 +330,10 @@ func (a *Adapter) CreateStream(ctx context.Context, req openresponses.Request, s
 	if len(callerTools) > 0 {
 		return a.oneTurn(ctx, base, req, transcript, models, callerTools, rl)
 	}
-	return a.fullRun(ctx, base, req, transcript, models, rl)
+	// Every leg of a handoff continues one conversation, so what a leg's
+	// guard quarantined the next leg's requests leave out too (#281).
+	quarantined, _ := agentturn.NewQuarantineSet()
+	return a.fullRun(agentturn.ContextWithQuarantineSet(ctx, quarantined), base, req, transcript, models, rl)
 }
 
 // attribute says which model produced each reasoning item of the
@@ -570,6 +573,11 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 	cfg.Tools = cfg.ResolveTools(ctx)
 	cfg.ToolProvider = nil
 	tools := agenttool.Set(cfg.Tools)
+	// The turn is built as the loop builds one, under a quarantine, so
+	// what the transform or a guard quarantines leaves the request
+	// (#281).
+	quarantined, _ := agentturn.NewQuarantineSet()
+	ctx = agentturn.ContextWithQuarantineSet(ctx, quarantined)
 	for _, ct := range callerTools {
 		if _, ok := tools.Lookup(ct.Name); ok {
 			return openresponses.InvalidRequest(openresponses.CodeInvalidValue, fmt.Sprintf("tool %q is owned by the agent", ct.Name), "tools")
@@ -588,7 +596,7 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 		filter = agentturn.DefaultFilter
 	}
 	upstream := cfg.BaseRequest(ctx)
-	upstream.Input = models.For(cfg.ModelName, filter(input))
+	upstream.Input = quarantined.Apply(models.For(cfg.ModelName, filter(input)))
 	for _, ct := range callerTools {
 		upstream.Tools = append(upstream.Tools, ct)
 	}
@@ -602,6 +610,7 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 			}
 			return fmt.Errorf("before-model-call hook: %w", err)
 		}
+		upstream.Input = quarantined.Apply(upstream.Input)
 	}
 	var acc openresponses.Accumulator
 	var final *openresponses.Response

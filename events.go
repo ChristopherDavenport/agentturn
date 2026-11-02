@@ -194,8 +194,11 @@ func (*TurnStart) EventType() string { return EventTurnStart }
 type ModelRetry struct {
 	RunID string
 	Turn  int
-	// Attempt is the number of the attempt that failed, from 1; the
-	// next attempt is Attempt+1.
+	// Attempt is the number of the attempt that failed, from 1, counting
+	// every call the turn made; the next attempt is Attempt+1. A fold
+	// after a context-length refusal is one of them, though the retry
+	// policy does not count it: [Retry.Revise] and [Retry.Backoff] are
+	// given the policy's own count.
 	Attempt int
 	Err     error
 	Delay   time.Duration

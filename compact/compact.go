@@ -372,8 +372,12 @@ type Transform struct {
 	// empty prefixHash means no memory.
 	prefixLen  int
 	prefixHash string
-	output     openresponses.Items
-	last       openresponses.Item
+	// prefixGen is the quarantine's generation the memory was last
+	// checked against: a quarantine that reaches the folded prefix
+	// drops it, so the next fold is made without the item.
+	prefixGen int
+	output    openresponses.Items
+	last      openresponses.Item
 	// The last fold that failed with an unfolded send: failLen items of
 	// the transcript hashing to failHash, at failTokens. An empty
 	// failHash means none.
@@ -816,10 +820,11 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 		// The instructions and tools share the window with the items.
 		settings = t.settings(req)
 	}
+	quarantined := agentturn.QuarantinedFromContext(ctx)
 	t.mu.Lock()
 	forced, instructions := t.next || agentturn.FoldRequested(ctx), t.nextInstructions
 	t.next, t.nextInstructions = false, ""
-	view, base := t.view(items)
+	view, base := t.view(items, quarantined)
 	tokens := t.estimate(view) + settings
 	if tokens <= t.budget && !forced {
 		t.mu.Unlock()
@@ -834,7 +839,9 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	if base > 0 {
 		input = append(input, t.output...)
 	}
-	input = append(input, t.filter(items[base:split])...)
+	// What the quarantine leaves out of a request is left out of what
+	// the fold sends its model too (#281).
+	input = append(input, quarantined.Apply(t.filter(items[base:split]))...)
 	if len(input) == 0 || t.estimate(input) < t.minFold {
 		t.mu.Unlock()
 		return view, nil
@@ -871,7 +878,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	if t.prefixLen != prevLen || t.prefixHash != prevHash {
 		// Another caller folded meanwhile; its memory stands and this
 		// call is answered from it.
-		view, _ := t.view(items)
+		view, _ := t.view(items, quarantined)
 		t.mu.Unlock()
 		return view, nil
 	}
@@ -881,6 +888,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 		first = items[split]
 	}
 	t.prefixLen = split
+	t.prefixGen = quarantined.Generation()
 	t.prefixHash = PrefixHash(items[:split])
 	t.output = append(append(openresponses.Items(nil), f.output...), pinned...)
 	if f.summary != nil {
@@ -938,12 +946,31 @@ func (t *Transform) pinned(prefix agentturn.Transcript) openresponses.Items {
 
 // view returns the transcript with the remembered fold applied, and how
 // many items it covers; zero when the memory no longer matches.
-func (t *Transform) view(items agentturn.Transcript) (agentturn.Transcript, int) {
-	if t.prefixHash != "" && t.prefixLen > 0 && len(items) >= t.prefixLen && PrefixHash(items[:t.prefixLen]) == t.prefixHash {
+func (t *Transform) view(items agentturn.Transcript, quarantined agentturn.Quarantined) (agentturn.Transcript, int) {
+	if t.prefixHash != "" && t.prefixLen > 0 && len(items) >= t.prefixLen && PrefixHash(items[:t.prefixLen]) == t.prefixHash && !t.quarantinedSince(items[:t.prefixLen], quarantined) {
 		return t.join(items, t.prefixLen), t.prefixLen
 	}
 	t.prefixLen, t.prefixHash, t.output = 0, "", nil
 	return items, 0
+}
+
+// quarantinedSince reports whether the quarantine has grown since the
+// memory was last checked to reach an item of prefix, the part the
+// remembered fold stands for, whose summary may then carry what the
+// quarantine leaves out. A growth that reaches none is taken as checked.
+// Called with the lock held.
+func (t *Transform) quarantinedSince(prefix agentturn.Transcript, quarantined agentturn.Quarantined) bool {
+	gen := quarantined.Generation()
+	if gen == t.prefixGen {
+		return false
+	}
+	for _, item := range prefix {
+		if quarantined.Has(item) {
+			return true
+		}
+	}
+	t.prefixGen = gen
+	return false
 }
 
 // join returns the remembered output followed by items from n.

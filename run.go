@@ -173,7 +173,7 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 				transcript: append(Transcript(nil), t...),
 				runCtx:     runCtx,
 				reasoning:  reasoningFromContext(ctx).merged(nil),
-				quarantine: inheritQuarantine(ctx, &quarantine{}),
+				quarantine: runQuarantine(ctx),
 				// Every event is sent, cancelled or not: the consumer
 				// below drains the channel until the run returns, so a
 				// send never blocks for good, and the events an abort
@@ -447,19 +447,34 @@ func ContextWithRequest(ctx context.Context, req openresponses.Request) context.
 }
 
 // RequestFromContext returns the settings [ContextWithRequest] attached
-// to ctx, and whether there were any. The request is a copy, its tool
-// list and maps included, so a transform reads it and changes nothing
-// the loop sends.
+// to ctx, and whether there were any. The request is a copy, each tool
+// definition, the include list and the maps included, so a transform
+// reads it and changes nothing the loop sends.
 func RequestFromContext(ctx context.Context) (openresponses.Request, bool) {
 	req, ok := ctx.Value(requestKey{}).(openresponses.Request)
 	if !ok {
 		return openresponses.Request{}, false
 	}
-	req.Tools = slices.Clone(req.Tools)
+	req.Tools = cloneTools(req.Tools)
 	req.Include = slices.Clone(req.Include)
 	req.Metadata = maps.Clone(req.Metadata)
 	req.Extra = maps.Clone(req.Extra)
 	return req, true
+}
+
+// cloneTools returns a copy of tools that shares nothing with it, each
+// definition decoded again from its wire form.
+func cloneTools(tools openresponses.Tools) openresponses.Tools {
+	if tools == nil {
+		return nil
+	}
+	data, err := json.Marshal(tools)
+	var out openresponses.Tools
+	if err != nil || json.Unmarshal(data, &out) != nil {
+		// A definition that does not round-trip is shared, as given.
+		return slices.Clone(tools)
+	}
+	return out
 }
 
 type foldRequestKey struct{}
@@ -1637,15 +1652,36 @@ func (r *runner) appendOne(item openresponses.Item, mode InputMode, trigger, end
 // input the loop set, which the request still carries when the
 // before-model-call hook kept it.
 func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponses.Request, built, error) {
-	// The transform and BeforeModelCall run under the attribution too.
+	return r.requestWith(ctx, tools, nil)
+}
+
+// requestWith is request with the transform given settings, when not
+// nil, as the settings the request will carry in place of the
+// configuration's: a retry's revision that moved the turn to another
+// model is weighed as that model's request.
+func (r *runner) requestWith(ctx context.Context, tools agenttool.Set, settings *openresponses.Request) (openresponses.Request, built, error) {
+	return r.build(ctx, tools, settings, true)
+}
+
+// build is requestWith, building the request once more, when again is
+// set, if the before-model-call hook quarantined an item the transform
+// had folded into it, so the fold is made again without it.
+func (r *runner) build(ctx context.Context, tools agenttool.Set, settings *openresponses.Request, again bool) (openresponses.Request, built, error) {
+	outer := ctx
+	// The transform and BeforeModelCall run under the attribution and
+	// the quarantine too.
 	ctx = r.attributed(ctx)
 	// The settings come first, so the transform can weigh what the
 	// request will carry beside the input (#279).
 	req := r.cfg.baseRequest(tools)
+	weighed := req
+	if settings != nil {
+		weighed = *settings
+	}
 	input := Transcript(append(openresponses.Items(nil), r.transcript...))
 	if r.cfg.Transform != nil {
 		var err error
-		input, err = r.cfg.Transform(ContextWithRequest(ctx, req), input)
+		input, err = r.cfg.Transform(ContextWithRequest(ctx, weighed), input)
 		if err != nil {
 			return openresponses.Request{}, built{}, fmt.Errorf("agentturn: transform: %w", err)
 		}
@@ -1670,17 +1706,41 @@ func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponse
 		// A hook that moved the call to another model and kept the
 		// loop's input is sent that input as built for the model.
 		req = b.forModel(r, before, req)
-		if r.quarantine.generation() != gen {
-			// The hook quarantined items: the request it returns
-			// leaves them out already.
-			own := sameSlice(req.Input, b.input)
-			req.Input = r.quarantine.apply(req.Input)
-			if own {
-				b.input = req.Input
-			}
+		if r.quarantine.generation() != gen && again && r.cfg.Transform != nil && foldedAway(r.quarantine, r.transcript, input) {
+			// The hook quarantined an item the transform had folded
+			// into this request, a summary of it say: the request is
+			// built again, so the fold is made without it (#281).
+			return r.build(outer, tools, settings, false)
+		}
+		// The quarantine holds whatever input the hook returns: the
+		// items it quarantined now, and quarantined items it put back,
+		// as a hook that replaces the input with items from elsewhere
+		// may. Applying it to the loop's own input changes nothing.
+		own := sameSlice(req.Input, b.input)
+		req.Input = r.quarantine.apply(req.Input)
+		if own {
+			b.input = req.Input
 		}
 	}
 	return req, b, nil
+}
+
+// foldedAway reports whether an item of transcript the quarantine holds
+// is not among what the transform returned, sent: the transform folded
+// it, or left it out, so what it returned may still carry its content.
+func foldedAway(q *quarantine, transcript, sent Transcript) bool {
+	kept := make(map[openresponses.Item]bool, len(sent))
+	for _, item := range sent {
+		if item != nil && reflect.TypeOf(item).Comparable() {
+			kept[item] = true
+		}
+	}
+	for _, item := range transcript {
+		if item != nil && reflect.TypeOf(item).Comparable() && !kept[item] && q.has(item) {
+			return true
+		}
+	}
+	return false
 }
 
 // built is what request built a turn's input from: filtered, the
@@ -1713,18 +1773,19 @@ func (r *runner) inputFor(model string, filtered Transcript) openresponses.Items
 	return r.quarantine.apply(r.reasoning.For(model, filtered))
 }
 
-// sameItems reports whether a and b hold the very same items, in order:
-// one pointer, or an equal value; an item of a type that cannot be
-// compared, as an extension's may be, is compared by its contents.
+// sameItems reports whether a and b hold the same items, in order: the
+// very items, or items alike in every member, such as the placeholder
+// the quarantine makes afresh for one output on every request, so a
+// request rebuilt to the same content reads as unchanged.
 func sameItems(a, b openresponses.Items) bool {
 	return slices.EqualFunc(a, b, func(x, y openresponses.Item) bool {
 		if x == nil || y == nil || reflect.TypeOf(x) != reflect.TypeOf(y) {
 			return x == nil && y == nil
 		}
-		if !reflect.TypeOf(x).Comparable() {
-			return reflect.DeepEqual(x, y)
+		if reflect.TypeOf(x).Comparable() && x == y {
+			return true
 		}
-		return x == y
+		return reflect.DeepEqual(x, y)
 	})
 }
 
@@ -1747,8 +1808,12 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 		return nil, err
 	}
 	start := len(r.transcript)
-	folded := false
-	for attempt := 1; ; attempt++ {
+	// call numbers the calls made, as model_retry reports them; attempt
+	// numbers the ones the retry policy counts, which a fold after a
+	// context-length refusal is not (#277). revised says the policy's
+	// revision made the request in flight.
+	folded, revised := false, false
+	for call, attempt := 1, 1; ; call++ {
 		resp, committed, err := r.stream(ctx, req)
 		// What the attempt kept is the model its request named, however
 		// it ended: after a revision, not the configuration's (#286).
@@ -1811,12 +1876,27 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 			// fold is reported and recorded as any other, before the
 			// attempt it shortened (#277).
 			folded = true
-			next, nb, rerr := r.request(ContextWithFoldRequest(ctx), tools)
+			var settings *openresponses.Request
+			if revised {
+				// The revision's model and settings stay, and the
+				// transform weighs them, not the configuration's.
+				settings = &req
+			}
+			next, nb, rerr := r.requestWith(ContextWithFoldRequest(ctx), tools, settings)
 			if rerr != nil {
 				return nil, rerr
 			}
+			if revised {
+				input := next.Input
+				if sameSlice(next.Input, nb.input) {
+					input = r.inputFor(req.Model, nb.filtered)
+					nb.input = input
+				}
+				next = req
+				next.Input = input
+			}
 			if !sameItems(next.Input, req.Input) {
-				if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: attempt, Err: err, Request: next}); err != nil {
+				if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: call, Err: err, Request: next}); err != nil {
 					return nil, err
 				}
 				req, b = next, nb
@@ -1836,14 +1916,15 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 			}
 			// The model a request names is the model its input is built
 			// for: a move to another model rebuilds the loop's input.
-			req = b.forModel(r, req, next)
+			req, revised = b.forModel(r, req, next), true
 		}
-		if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: attempt, Err: err, Delay: delay, Request: req}); err != nil {
+		if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: call, Err: err, Delay: delay, Request: req}); err != nil {
 			return nil, err
 		}
 		if err := sleep(ctx, delay); err != nil {
 			return nil, stop(ReasonAborted, context.Cause(ctx))
 		}
+		attempt++
 	}
 }
 
@@ -2319,29 +2400,64 @@ func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Respon
 		paired[i] = -1
 	}
 	taken := make([]bool, len(calls))
-	pair := func(index int, match func(*openedItem) bool) {
+	// pair pairs the call at index of the response with the first call
+	// of the attempt not yet paired that match accepts, among the
+	// completed ones when completed is set and among those never
+	// completed otherwise.
+	pair := func(index int, completed bool, match func(*openedItem) bool) {
 		for j, at := range calls {
-			if !taken[j] && match(&r.opened[at]) {
+			if o := &r.opened[at]; !taken[j] && (o.done != nil) == completed && match(o) {
 				paired[index], taken[j] = j, true
 				return
 			}
 		}
 	}
-	for index, item := range resp.Output {
-		if call, ok := item.(*openresponses.FunctionCall); ok && call.ID != "" {
-			pair(index, func(c *openedItem) bool { return c.itemID == call.ID })
+	// each runs pass over the response's calls not yet paired.
+	each := func(pass func(index int, call *openresponses.FunctionCall)) {
+		for index, item := range resp.Output {
+			if call, ok := item.(*openresponses.FunctionCall); ok && paired[index] < 0 {
+				pass(index, call)
+			}
 		}
 	}
-	for index, item := range resp.Output {
-		if call, ok := item.(*openresponses.FunctionCall); ok && paired[index] < 0 && call.CallID != "" {
-			pair(index, func(c *openedItem) bool { return c.modelCallID == call.CallID })
+	// An item ID names one call, completed or not.
+	each(func(index int, call *openresponses.FunctionCall) {
+		if call.ID != "" {
+			pair(index, true, func(c *openedItem) bool { return c.itemID == call.ID })
 		}
-	}
-	for index, item := range resp.Output {
-		if _, ok := item.(*openresponses.FunctionCall); ok && paired[index] < 0 {
-			pair(index, func(*openedItem) bool { return true })
+		if call.ID != "" && paired[index] < 0 {
+			pair(index, false, func(c *openedItem) bool { return c.itemID == call.ID })
 		}
-	}
+	})
+	// A completed call is the one the response lists with its call ID
+	// and its arguments. A call ID the model gave more than one call
+	// names them in the order they opened, completed or not: a call
+	// never completed has no arguments to match, and a completed one
+	// whose arguments the response gives otherwise matches none, so
+	// neither takes the other's place by sharing the ID (#236).
+	each(func(index int, call *openresponses.FunctionCall) {
+		pair(index, true, func(c *openedItem) bool {
+			done := c.done.(*openresponses.FunctionCall)
+			return c.modelCallID == call.CallID && done.Arguments == call.Arguments
+		})
+	})
+	each(func(index int, call *openresponses.FunctionCall) {
+		if call.CallID == "" {
+			return
+		}
+		for j, at := range calls {
+			if o := &r.opened[at]; !taken[j] && o.modelCallID == call.CallID {
+				paired[index], taken[j] = j, true
+				return
+			}
+		}
+	})
+	each(func(index int, _ *openresponses.FunctionCall) {
+		pair(index, true, func(*openedItem) bool { return true })
+	})
+	each(func(index int, _ *openresponses.FunctionCall) {
+		pair(index, false, func(*openedItem) bool { return true })
+	})
 	if complete {
 		for index, item := range resp.Output {
 			call, ok := item.(*openresponses.FunctionCall)
@@ -2378,6 +2494,25 @@ func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Respon
 			unpaired = true
 		}
 	}
+	// The transcript holds the calls the stream completed in the order
+	// they opened and then the ones only the response completed, so a
+	// response that lists one of the latter before one of the former is
+	// out of the transcript's order. rank is a call's place there.
+	rank := func(j int) int {
+		if r.opened[calls[j]].fromResponse {
+			return len(calls) + j
+		}
+		return j
+	}
+	last := -1
+	for index := range resp.Output {
+		if j := paired[index]; j >= 0 {
+			if rank(j) < last {
+				unpaired = true
+			}
+			last = rank(j)
+		}
+	}
 	if unpaired {
 		// A completed call the response does not list, because the
 		// server built its terminal response one item per output index
@@ -2386,13 +2521,19 @@ func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Respon
 		// paired by now, so the listed calls, as a group, give way to
 		// the transcript's calls in the order they opened, which is the
 		// transcript's order, where the first of them stood; an item
-		// that is not a call keeps its place.
-		var held openresponses.Items
+		// that is not a call keeps its place. So do listed calls out of
+		// the transcript's order, a call only the response completed
+		// listed before one the stream completed.
+		var held, late openresponses.Items
 		for _, at := range calls {
-			if done := r.opened[at].done; done != nil {
-				held = append(held, done)
+			switch o := r.opened[at]; {
+			case o.fromResponse:
+				late = append(late, o.done)
+			case o.done != nil:
+				held = append(held, o.done)
 			}
 		}
+		held = append(held, late...)
 		copied := *resp
 		copied.Output = make(openresponses.Items, 0, len(resp.Output)+len(held))
 		placed := false
@@ -2629,7 +2770,9 @@ func (r *runner) attributed(ctx context.Context) context.Context {
 // and the invoker that runs another of the turn's tools through the
 // loop.
 func (r *runner) toolContext(ctx context.Context, tools agenttool.Set) context.Context {
-	ctx = ContextWithTranscript(ctx, append(Transcript(nil), r.transcript...))
+	// A tool reads the conversation as a request carries it: what the
+	// quarantine leaves out is not there (#281).
+	ctx = ContextWithTranscript(ctx, Transcript(r.quarantine.apply(append(openresponses.Items(nil), r.transcript...))))
 	ctx = r.attributed(ctx)
 	// [Ask] says a person's accept note through the run whose hook or
 	// tool asked.
