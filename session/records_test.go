@@ -1538,7 +1538,7 @@ func TestNestedCallsAreRecorded(t *testing.T) {
 		}
 		nested = append(nested, n)
 	}
-	if len(nested) != 4 {
+	if len(nested) != 5 {
 		t.Fatalf("nested call entries = %d", len(nested))
 	}
 	parent := callsOf(t, s)["eval"]
@@ -1553,8 +1553,14 @@ func TestNestedCallsAreRecorded(t *testing.T) {
 	if nested[0].Name != "read" || nested[0].Phase != agentsession.RunStart || string(nested[0].Args) != `{"text":"go.mod"}` {
 		t.Errorf("first entry = %+v", nested[0])
 	}
-	if nested[1].Phase != agentsession.RunEnd || nested[1].Output != "the contents" {
+	// The hand-off is durable before the tool runs, with its key, so a
+	// parent run again runs it under the same one (#261).
+	if nested[1].Phase != "dispatch" || nested[1].CallID != nested[0].CallID || nested[1].IdempotencyKey == "" {
 		t.Errorf("second entry = %+v", nested[1])
+	}
+	nested = slices.Delete(nested, 1, 2)
+	if nested[1].Phase != agentsession.RunEnd || nested[1].Output != "the contents" {
+		t.Errorf("third entry = %+v", nested[1])
 	}
 	if nested[2].Name != "bash" || nested[2].Verdict != agentsession.VerdictReject || nested[2].Reason != "denied by bash(rm:*)" || nested[2].By != agentsession.ByPolicy {
 		t.Errorf("third entry = %+v", nested[2])
@@ -1637,9 +1643,14 @@ func TestAskedNestedCallsAreRecorded(t *testing.T) {
 				}
 			}
 			// #213: the question is on the record before it is put, the
-			// answer after, both before the nested call's own entries.
-			if strings.Join(order, " ") != "ask answer start end" {
-				t.Errorf("entries = %v", order)
+			// answer after, both before the nested call's own entries;
+			// an accepted call is handed to its tool (#261).
+			want := "ask answer start end"
+			if tc.action == agenttool.ActionAccept {
+				want = "ask answer start dispatch end"
+			}
+			if strings.Join(order, " ") != want {
+				t.Errorf("entries = %v, want %s", order, want)
 			}
 			if start == nil || start.Verdict != tc.verdict || start.By != agentsession.ByHuman || !strings.Contains(start.Reason, "ask bash(git push:*)") {
 				t.Fatalf("start entry = %+v", start)

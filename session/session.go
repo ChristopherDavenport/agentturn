@@ -254,10 +254,12 @@
 //   - tool_end with a tools/agent ChildInfo whose run was not observed:
 //     a session holding only the child's items, with no records
 //     promise, and the link; wire Observe to get the full record.
-//   - tool_start and tool_end of a call a tool made through
-//     agentturn.Invoke: a custom entry in the [NestedCallNS] namespace
-//     for each, carrying the parent call, the name, the arguments and
-//     what a hook decided, then the outcome. A nested call has no
+//   - tool_start, tool_dispatch and tool_end of a call a tool made
+//     through agentturn.Invoke: a custom entry in the [NestedCallNS]
+//     namespace for each, carrying the parent call, the name, the
+//     arguments and what a hook decided, then the key it was handed
+//     over with, then the outcome, none for a call given its recorded
+//     result again. A nested call has no
 //     function_call item for a dispatch or a decision to name, so until
 //     the format has a word for one these carry what a reader needs to
 //     count the calls a turn ran.
@@ -530,9 +532,15 @@ type FoldCall struct {
 
 // NestedCallNS is the namespace of the custom entries written for a
 // call a tool made through [agentturn.Invoke]. Its data is a
-// [NestedCall]: one entry with phase start before the call runs,
-// carrying the name, the arguments and what a hook decided, and one
-// with phase end carrying the outcome.
+// [NestedCall]: one entry with phase start when it is decided,
+// carrying the name, the arguments and what a hook decided, one with
+// phase dispatch when it is handed to its tool, carrying the key it
+// runs under, durable before the tool runs, and one with phase end
+// carrying the outcome. A call run again, its parent run again after a
+// restart, gets a dispatch and an end entry each time; one whose
+// recorded result is given again ([agentturn.ToolEnd.Replayed]) gets
+// none, since it did not run. [Pending] reads them into
+// [agentturn.PendingCall.Nested], so the call keeps its ID and its key.
 //
 // A nested call has no function_call item in the transcript, because it
 // is the work of the call that made it, and the format's dispatch and
@@ -554,6 +562,13 @@ type NestedCall struct {
 	Name   string `json:"name"`
 	// Args are the arguments the tool ran with, on the start entry.
 	Args json.RawMessage `json:"args,omitempty"`
+	// Invoked are the arguments the invoking tool gave, on the start
+	// entry when a decision rewrote them into Args: what the call is
+	// matched on when its parent runs again.
+	Invoked json.RawMessage `json:"invoked,omitempty"`
+	// IdempotencyKey is the key the call was handed to its tool with,
+	// on the dispatch entry.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 	// Verdict, Reason and By are what a hook decided about the call,
 	// or the user it deferred the call to through the elicitor, in the
 	// format's terms, on the start entry: proceed for a call allowed
@@ -561,11 +576,23 @@ type NestedCall struct {
 	Verdict string `json:"verdict,omitempty"`
 	Reason  string `json:"reason,omitempty"`
 	By      string `json:"by,omitempty"`
-	// Output is the text the caller received and Error the failure, on
-	// the end entry.
-	Output string `json:"output,omitempty"`
-	Error  string `json:"error,omitempty"`
+	// Output is the text the caller received, Parts the output's parts
+	// when it has parts rather than text, and Error the failure, on the
+	// end entry.
+	Output string                 `json:"output,omitempty"`
+	Parts  openresponses.Contents `json:"parts,omitempty"`
+	Error  string                 `json:"error,omitempty"`
+	// Cut says, on the end entry, that the call was cut off before it
+	// had a result of its own, and Withdrawn that a consumer refused its
+	// hand-off, so its tool never ran: neither is an end of the call's
+	// own, and a call run again is not given it.
+	Cut       bool `json:"cut,omitempty"`
+	Withdrawn bool `json:"withdrawn,omitempty"`
 }
+
+// nestedDispatch is the phase of the [NestedCallNS] entry written when
+// a nested call is handed to its tool.
+const nestedDispatch = "dispatch"
 
 // ModelRetryNS is the namespace of the custom entry written for each
 // failed attempt of a model call that [agentturn.Retry] tries again.
@@ -1900,6 +1927,7 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 	path := s.Path(s.Leaf())
 	withdrawn := withdrawnDispatches(path)
 	open := openQuestions(path)
+	nested := nestedRecords(path)
 	for _, c := range calls {
 		p := agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingUnknown}
 		state := c.State(s.Header())
@@ -1982,12 +2010,87 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 			p.Args = json.RawMessage(args)
 		}
 		p.Question = open[c.Call.CallID]
+		p.Nested = nested[c.Call.CallID]
 		out = append(out, p)
 	}
 	if len(out) > 0 {
 		out[len(out)-1].Notes = lastHeldNotes(path)
 	}
 	return out, ranAt, nil
+}
+
+// nestedRecords reads the [NestedCallNS] entries on path into what
+// each call's tool did through agentturn.Invoke, by the call of the
+// path the nested calls were made under, whatever their depth, each
+// nested call once, in the order the path first names it: its last
+// hand-off no consumer withdrew, and how it ended, unless it was cut
+// off.
+func nestedRecords(path []agentsession.Entry) map[string][]agentturn.NestedRecord {
+	type state struct {
+		rec  agentturn.NestedRecord
+		ran  json.RawMessage
+		keys []string
+	}
+	byID := map[string]*state{}
+	var order []string
+	for _, e := range path {
+		c, ok := e.(*agentsession.CustomEntry)
+		if !ok || c.NS != NestedCallNS {
+			continue
+		}
+		var n NestedCall
+		if json.Unmarshal(c.Data, &n) != nil || n.CallID == "" {
+			continue
+		}
+		st := byID[n.CallID]
+		if st == nil {
+			st = &state{rec: agentturn.NestedRecord{CallID: n.CallID, Parent: n.Parent, Name: n.Name}}
+			byID[n.CallID] = st
+			order = append(order, n.CallID)
+		}
+		switch n.Phase {
+		case agentsession.RunStart:
+			if st.rec.Args == nil {
+				st.rec.Args = n.Invoked
+				if st.rec.Args == nil {
+					st.rec.Args = n.Args
+				}
+			}
+			st.ran = n.Args
+		case nestedDispatch:
+			st.keys = append(st.keys, n.IdempotencyKey)
+		case agentsession.RunEnd:
+			if n.Withdrawn && len(st.keys) > 0 {
+				// The hand-off was withdrawn before the tool ran.
+				st.keys = st.keys[:len(st.keys)-1]
+			}
+			if !n.Cut && !n.Withdrawn {
+				st.rec.Ended = true
+				st.rec.Result = agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: n.Output, Parts: n.Parts}}
+				st.rec.Err = n.Error
+			}
+		}
+	}
+	out := map[string][]agentturn.NestedRecord{}
+	for _, id := range order {
+		st := byID[id]
+		if len(st.keys) > 0 {
+			st.rec.Dispatched, st.rec.IdempotencyKey = true, st.keys[len(st.keys)-1]
+			if st.ran != nil && !sameJSON(st.ran, string(st.rec.Args)) {
+				st.rec.DispatchArgs = st.ran
+			}
+		}
+		root := st.rec.Parent
+		for range len(order) {
+			up, ok := byID[root]
+			if !ok {
+				break
+			}
+			root = up.rec.Parent
+		}
+		out[root] = append(out[root], st.rec)
+	}
+	return out
 }
 
 // outputAfter is the output of the call held by the entry callEntry
@@ -4059,14 +4162,17 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 			c.result = r
 		}
 	}
-	if e.Parent != "" {
+	if e.Parent != "" && !e.Replayed {
 		if err := w.nested(ctx, NestedCall{
-			Phase:  agentsession.RunEnd,
-			CallID: e.CallID,
-			Parent: e.Parent,
-			Name:   e.Name,
-			Output: e.Result.Output.Text,
-			Error:  errText(e.Err),
+			Phase:     agentsession.RunEnd,
+			CallID:    e.CallID,
+			Parent:    e.Parent,
+			Name:      e.Name,
+			Output:    e.Result.Output.Text,
+			Parts:     e.Result.Output.Parts,
+			Error:     errText(e.Err),
+			Cut:       e.Cut,
+			Withdrawn: e.Withdrawn,
 		}, e.Parent); err != nil {
 			return err
 		}
@@ -5045,12 +5151,21 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 	}
 	if e.Parent != "" {
 		w.parents[e.CallID] = e.Parent
+		if e.Replayed {
+			// Its record is on the path already, and it does not run.
+			return nil
+		}
+		var invoked json.RawMessage
+		if e.Invoked != nil && !sameJSON(e.Invoked, string(e.Args)) {
+			invoked = e.Invoked
+		}
 		return w.nested(ctx, NestedCall{
-			Phase:  agentsession.RunStart,
-			CallID: e.CallID,
-			Parent: e.Parent,
-			Name:   e.Name,
-			Args:   json.RawMessage(e.Args),
+			Phase:   agentsession.RunStart,
+			CallID:  e.CallID,
+			Parent:  e.Parent,
+			Name:    e.Name,
+			Args:    json.RawMessage(e.Args),
+			Invoked: invoked,
 			Verdict: func() string {
 				switch {
 				case e.Decision == nil:
@@ -5199,7 +5314,10 @@ const agentRunAgain = "run again"
 // entries tool_start and tool_end write.
 func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) error {
 	if e.Parent != "" {
-		return nil
+		// A nested call has no function call for a dispatch to name; its
+		// hand-off and its key are a record entry, durable before its
+		// tool runs, so a parent run again runs it under the same key.
+		return w.nested(ctx, NestedCall{Phase: nestedDispatch, CallID: e.CallID, Parent: e.Parent, Name: e.Name, IdempotencyKey: e.IdempotencyKey}, e.Parent)
 	}
 	c := w.calls[e.CallID]
 	if c == nil && !w.appOnly[e.CallID] {

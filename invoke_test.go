@@ -389,3 +389,77 @@ func TestToolCallInfoNamesTheParent(t *testing.T) {
 		}
 	}
 }
+
+// TestANestedCallKeepsItsIdentityWhenItsParentRunsAgain pins the
+// in-process half of RFC 0001's Nested calls rule (#261): a run that
+// leaves a call pending carries the nested calls its tool made on the
+// pending list, so a resume that runs the call again matches its
+// invocations against them as a restart reading them from a record
+// would: the nested call that ended is given its result again under
+// its ID, without running.
+func TestANestedCallKeepsItsIdentityWhenItsParentRunsAgain(t *testing.T) {
+	var mu sync.Mutex
+	reads := 0
+	read := agenttool.New("read", "reads", func(_ context.Context, a echoArgs) (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		reads++
+		return fmt.Sprintf("read %d", reads), nil
+	})
+	runs := 0
+	var ids []string
+	eval := agenttool.New("eval", "runs code", func(ctx context.Context, _ echoArgs) (string, error) {
+		mu.Lock()
+		runs++
+		first := runs == 1
+		mu.Unlock()
+		res, err := Invoke(ctx, "read", json.RawMessage(`{"text":"go.mod"}`))
+		if err != nil {
+			return "", err
+		}
+		if first {
+			<-ctx.Done() // cut off after its nested call ended
+			return "", ctx.Err()
+		}
+		return "saw " + res.Output.Text, nil
+	}, agenttool.WithReplay(func(context.Context, json.RawMessage) agenttool.Replay { return agenttool.ReplaySafe }))
+	a := New(Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{eval, read}, MaxTurns: 1})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if e, ok := ev.(*ToolEnd); ok && e.Parent != "" {
+			ids = append(ids, e.CallID)
+			cancel()
+		}
+		return nil
+	})
+	end, err := a.Prompt(ctx, openresponses.UserText("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if end.Reason != ReasonAborted || len(end.Pending) != 1 {
+		t.Fatalf("first run ended %s with %d pending", end.Reason, len(end.Pending))
+	}
+	if n := end.Pending[0].Nested; len(n) != 1 || !n[0].Ended || !n[0].Dispatched || n[0].Result.Output.Text != "read 1" {
+		t.Errorf("pending nested = %+v, want read ended with its result", n)
+	}
+	end, err = a.Resume(context.Background(), Approve(end.Pending[0].Call.CallID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reads != 1 {
+		t.Errorf("read ran %d times, want once", reads)
+	}
+	if len(ids) != 2 || ids[0] != ids[1] {
+		t.Errorf("nested call IDs = %v, want one ID twice", ids)
+	}
+	out := a.State().Transcript[len(a.State().Transcript)-1]
+	for _, item := range a.State().Transcript {
+		if o, ok := item.(*openresponses.FunctionCallOutput); ok {
+			out = o
+		}
+	}
+	if o := out.(*openresponses.FunctionCallOutput); o.Output.Text != "saw read 1" {
+		t.Errorf("eval's output = %q, want the recorded read", o.Output.Text)
+	}
+}

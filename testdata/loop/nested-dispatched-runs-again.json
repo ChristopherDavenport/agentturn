@@ -1,0 +1,57 @@
+{
+  "name": "nested-dispatched-runs-again",
+  "description": "A nested call the record shows handed to its tool and never ended runs again under its recorded ID and key when its tool's replay is keyed, and one whose replay says nothing is given the outcome unknown without running.",
+  "rules": ["#nested-calls", "#pending-calls-and-resume"],
+  "config": {"model": "m"},
+  "tools": [
+    {"name": "run_code", "replay": "safe"},
+    {"name": "charge", "replay": "keyed", "result": {"output": "charged 5"}},
+    {"name": "send"}
+  ],
+  "results": {
+    "call_1": {"invokes": [
+      {"name": "charge", "arguments": {"amount": 5}},
+      {"name": "send", "arguments": {"to": "bob"}}
+    ]}
+  },
+  "transcript": [
+    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "charge and tell bob"}]},
+    {"type": "function_call", "call_id": "call_1", "name": "run_code", "arguments": "{}"}
+  ],
+  "pending": [
+    {"call_id": "call_1", "reason": "aborted", "idempotency_key": "key_1", "nested": [
+      {"call_id": "call_n1", "parent": "call_1", "name": "charge", "args": {"amount": 5}, "dispatched": true, "idempotency_key": "key_n1"},
+      {"call_id": "call_n2", "parent": "call_1", "name": "send", "args": {"to": "bob"}, "dispatched": true, "idempotency_key": "key_n2"}
+    ]}
+  ],
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "check whether bob heard"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "resume": [{"call_id": "call_1", "approve": true}],
+      "expect": {
+        "events": [
+          {"type": "run_start", "source": "resume"},
+          {"type": "tool_start", "turn": 0, "call_id": "call_1", "name": "run_code"},
+          {"type": "tool_dispatch", "turn": 0, "call_id": "call_1"},
+          {"type": "tool_start", "turn": 0, "call_id": "call_n1", "name": "charge", "parent": "call_1", "replayed": false},
+          {"type": "tool_dispatch", "turn": 0, "call_id": "call_n1", "parent": "call_1", "idempotency_key": "key_n1"},
+          {"type": "tool_end", "turn": 0, "call_id": "call_n1", "parent": "call_1", "result": {"output": "charged 5"}, "error": false, "replayed": false},
+          {"type": "tool_start", "turn": 0, "call_id": "call_n2", "name": "send", "parent": "call_1", "replayed": false},
+          {"type": "tool_end", "turn": 0, "call_id": "call_n2", "parent": "call_1", "error": true, "replayed": false},
+          {"type": "tool_end", "turn": 0, "call_id": "call_1", "error": true},
+          {"type": "item_start", "turn": 0, "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "turn": 0, "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end", "turn": 1},
+          {"type": "turn_end", "turn": 1},
+          {"type": "run_end", "reason": "done", "error": false, "pending": []}
+        ]
+      }
+    }
+  ]
+}

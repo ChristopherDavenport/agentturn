@@ -230,6 +230,23 @@ versions may break the API.
   `agentturn:model_blocked` record with the request's hash, as for a
   `BeforeModelCall` guard, rather than an empty response.
 
+- Fixed: a nested call made again when its parent runs again keeps its
+  ID and its key. Under one parent, the k-th invocation of a tool with
+  JSON-equal arguments matches the k-th nested call of that tool with
+  those arguments on the pending call's new `PendingCall.Nested`
+  (`NestedRecord`), in any order: one that ended is given its recorded
+  result without running, its `ToolStart` and `ToolEnd` marked
+  `Replayed`; one handed to its tool that never ended runs again under
+  its recorded key as agenttool's replay rule allows, else is given the
+  outcome unknown; an invocation with nothing left to match is new.
+  `ToolStart.Invoked` carries the arguments a nested call was invoked
+  with. A run that leaves a call pending carries the nested calls it
+  made under it. `session`'s recorder writes a nested call's hand-off
+  as a `dispatch` phase entry carrying its key, durable before the tool
+  runs, and its end with the output's parts and whether it was cut or
+  withdrawn, and `session.Pending` reads them into `Nested`. RFC 0001's
+  open question on a key for a nested call is closed. (#261)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

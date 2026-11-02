@@ -45,10 +45,10 @@ func sampleEvents(t *testing.T) map[string]agentturn.Event {
 		"ItemUpdate":   &agentturn.ItemUpdate{RunID: "run_1", Turn: 1, Item: call, Stream: stream, ResponseID: "resp_1"},
 		"ItemEnd":      &agentturn.ItemEnd{RunID: "run_1", Turn: 1, Item: call, ResponseID: "resp_1", Hidden: true, Trigger: trigger, ModelCallID: "m_1"},
 		"ResponseEnd":  &agentturn.ResponseEnd{RunID: "run_1", Turn: 1, Response: resp, Withheld: true},
-		"ToolStart":    &agentturn.ToolStart{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Args: json.RawMessage(`{"text":"a"}`), Decision: decision, Parent: "call_0"},
+		"ToolStart":    &agentturn.ToolStart{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Args: json.RawMessage(`{"text":"a"}`), Decision: decision, Parent: "call_0", Invoked: json.RawMessage(`{"text":"A"}`), Replayed: true},
 		"ToolDispatch": &agentturn.ToolDispatch{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Parent: "call_0", IdempotencyKey: "k"},
 		"ToolUpdate":   &agentturn.ToolUpdate{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Partial: result},
-		"ToolEnd":      &agentturn.ToolEnd{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Result: result, Err: errors.New("boom"), Blocked: true, Deferred: true, Reason: "r", Parent: "call_0", Withdrawn: true, Cut: true},
+		"ToolEnd":      &agentturn.ToolEnd{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Result: result, Err: errors.New("boom"), Blocked: true, Deferred: true, Reason: "r", Parent: "call_0", Withdrawn: true, Cut: true, Replayed: true},
 		"TurnEnd":      &agentturn.TurnEnd{RunID: "run_1", Turn: 1, Response: resp, ToolResults: []agenttool.Result{result}},
 		"RunEnd": &agentturn.RunEnd{RunID: "run_1", Items: openresponses.Items{openresponses.UserText("hi"), call, out}, Reason: agentturn.ReasonInputRequired,
 			Cause: agentturn.StopGuard, Err: agentturn.ErrRunning, Failure: errors.New("disk full"), Withheld: true, Pending: []agentturn.PendingCall{{
@@ -279,5 +279,32 @@ func TestAnswersCarryEveryField(t *testing.T) {
 	got.Output, in.Output = nil, nil
 	if !reflect.DeepEqual(got, in) || !bytes.Equal(gotOut, wantOut) {
 		t.Errorf("answer after the wire = %+v %s, want %+v %s", got, gotOut, in, wantOut)
+	}
+}
+
+// TestANestedCallsMatchCrossesTheWire pins that a remote view tells a
+// nested call given its recorded result from one that ran, and sees the
+// arguments it was invoked with (#261).
+func TestANestedCallsMatchCrossesTheWire(t *testing.T) {
+	samples := sampleEvents(t)
+	for _, name := range []string{"ToolStart", "ToolEnd"} {
+		data, err := MarshalEvent(samples[name])
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := UnmarshalEvent(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch e := got.(type) {
+		case *agentturn.ToolStart:
+			if !e.Replayed || string(e.Invoked) != `{"text":"A"}` {
+				t.Errorf("tool_start = %+v, want replayed and invoked", e)
+			}
+		case *agentturn.ToolEnd:
+			if !e.Replayed {
+				t.Errorf("tool_end = %+v, want replayed", e)
+			}
+		}
 	}
 }

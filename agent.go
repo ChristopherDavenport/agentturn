@@ -704,12 +704,17 @@ func Refuse(out *openresponses.FunctionCallOutput) Answer {
 // [OutcomeUnknown] carries until [Answer.WithReason] gives another.
 const OutcomeUnknownReason = "not run again: outcome unknown"
 
+// errOutcomeUnknown is what a call that may have run and must not run
+// again is answered with: the output of [OutcomeUnknown], and the error
+// a nested call matched to one is given.
+var errOutcomeUnknown = errors.New("outcome unknown: the call was cut off after it was handed to its tool, and it may or may not have taken effect; check before calling it again")
+
 // OutcomeUnknown answers a pending call that may have run and must not
 // run again with the error agenttool's replay rule asks for, so the
 // model sees that the call may or may not have taken effect and can
 // check before it asks again. It carries [OutcomeUnknownReason].
 func OutcomeUnknown(callID string) Answer {
-	res := agenttool.ErrorResult(errors.New("outcome unknown: the call was cut off after it was handed to its tool, and it may or may not have taken effect; check before calling it again"))
+	res := agenttool.ErrorResult(errOutcomeUnknown)
 	a := Output(&openresponses.FunctionCallOutput{CallID: callID, Output: res.Output})
 	a.Reason = OutcomeUnknownReason
 	a.Failed = true
@@ -910,7 +915,7 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 		if p.Reason == PendingDeferred && p.Decision != nil {
 			held = p.Decision.Note
 		}
-		approved = append(approved, approval{call: p.Call, args: args, note: ans.Note, held: held, by: ans.By, reason: reason, key: key, decide: p.Reason == PendingUndispatched})
+		approved = append(approved, approval{call: p.Call, args: args, note: ans.Note, held: held, by: ans.By, reason: reason, key: key, decide: p.Reason == PendingUndispatched, nested: p.Nested})
 	}
 	if len(byID) > 0 {
 		return nil, fmt.Errorf("%w: %d pending call(s) unanswered", ErrNotPending, len(byID))
@@ -941,26 +946,33 @@ func mayRunAgain(ctx context.Context, cfg Config, p PendingCall, args json.RawMe
 	if !ok {
 		return "", nil
 	}
-	args = orEmpty(args, call.Arguments)
-	ctx = agenttool.WithCall(ctx, agenttool.Call{ID: call.CallID, Args: args, IdempotencyKey: key})
+	return runAgain(ctx, tool, call.CallID, orEmpty(args, call.Arguments), key, orEmpty(p.Args, call.Arguments), p.IdempotencyKey)
+}
+
+// runAgain is agenttool's rule for running a call that may have run
+// again: tool's replay for args, asked under the call callID and key,
+// the key it would run under, given prior and priorKey, the arguments
+// and the key of the hand-off it repeats.
+func runAgain(ctx context.Context, tool agenttool.Tool, callID string, args json.RawMessage, key string, prior json.RawMessage, priorKey string) (string, error) {
+	ctx = agenttool.WithCall(ctx, agenttool.Call{ID: callID, Args: args, IdempotencyKey: key})
 	switch agenttool.ReplayOf(ctx, tool, args) {
 	case agenttool.ReplaySafe:
 		return RunAgainSafeReason, nil
 	case agenttool.ReplayKeyed:
-		same := sameArgs(args, orEmpty(p.Args, call.Arguments))
+		same := sameArgs(args, prior)
 		switch {
 		case key == "":
-			return "", fmt.Errorf("%w: %q is keyed and the key of the dispatch it repeats is not known", ErrAmbiguousCall, call.CallID)
-		case same && p.IdempotencyKey == "":
-			return "", fmt.Errorf("%w: %q is keyed and the key of the dispatch it repeats is not known, so another key would run it as a new operation", ErrAmbiguousCall, call.CallID)
-		case same && key != p.IdempotencyKey:
-			return "", fmt.Errorf("%w: %q is keyed and would run again under another key than the dispatch it repeats, as a new operation", ErrAmbiguousCall, call.CallID)
-		case !same && key == p.IdempotencyKey:
-			return "", fmt.Errorf("%w: %q is keyed and would run again with other arguments under the key of the dispatch it repeats", ErrAmbiguousCall, call.CallID)
+			return "", fmt.Errorf("%w: %q is keyed and the key of the dispatch it repeats is not known", ErrAmbiguousCall, callID)
+		case same && priorKey == "":
+			return "", fmt.Errorf("%w: %q is keyed and the key of the dispatch it repeats is not known, so another key would run it as a new operation", ErrAmbiguousCall, callID)
+		case same && key != priorKey:
+			return "", fmt.Errorf("%w: %q is keyed and would run again under another key than the dispatch it repeats, as a new operation", ErrAmbiguousCall, callID)
+		case !same && key == priorKey:
+			return "", fmt.Errorf("%w: %q is keyed and would run again with other arguments under the key of the dispatch it repeats", ErrAmbiguousCall, callID)
 		}
 		return RunAgainKeyedReason, nil
 	}
-	return "", fmt.Errorf("%w: %q", ErrAmbiguousCall, call.CallID)
+	return "", fmt.Errorf("%w: %q", ErrAmbiguousCall, callID)
 }
 
 // orEmpty is args, else the call's own arguments, an empty object

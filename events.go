@@ -375,6 +375,14 @@ type ToolStart struct {
 	// no function_call item in the transcript: it is the work of the
 	// call that made it.
 	Parent string
+	// Invoked are the arguments a nested call was invoked with, before
+	// a decision rewrote them into Args, so a recorder can match the
+	// call when its parent runs again; nil for a call the model made.
+	Invoked json.RawMessage
+	// Replayed says a nested call matched one on the record that had
+	// ended: no decision is made, nothing is dispatched, and its
+	// tool_end carries the recorded result ([PendingCall.Nested]).
+	Replayed bool
 }
 
 // EventType returns "tool_start".
@@ -470,6 +478,9 @@ type ToolEnd struct {
 	// batch still run keeps its result, so a process that dies before
 	// the batch's outputs are appended does not run it again.
 	Cut bool
+	// Replayed says the result is the one a record held for a nested
+	// call that had ended, given again without running its tool.
+	Replayed bool
 }
 
 // EventType returns "tool_end".
@@ -756,6 +767,47 @@ type PendingCall struct {
 	// an agent seeded with the pending calls ([WithPending]) appends
 	// them as the one that held them would have.
 	Notes []Note
+	// Nested are the nested calls a record holds under the call, its
+	// tool's and theirs, in the order the record first names each: what
+	// the call's tool did through [Invoke] the last times it ran. When
+	// the call runs again its tool's invocations are matched against
+	// them, so a nested call already on the record keeps its ID and its
+	// key, and one that ended returns its recorded result without
+	// running; see [NestedRecord]. agentturn/session's Pending sets it
+	// from the record; the loop carries it onto the pending list of a
+	// run that leaves the call pending, with the nested calls that run
+	// made under it.
+	Nested []NestedRecord
+}
+
+// NestedRecord is what a record holds of one nested call, a call a
+// tool made through [Invoke], for matching the invocations of the
+// tool's next run against it. Under one parent, the k-th invocation of
+// a tool with JSON-equal arguments matches the k-th record of that
+// tool with those arguments, whatever order the invocations arrive in.
+type NestedRecord struct {
+	// CallID is the nested call's ID and Parent the call whose tool
+	// made it.
+	CallID string
+	Parent string
+	Name   string
+	// Args are the arguments the tool invoked it with, before a
+	// decision rewrote them: what an invocation is matched on.
+	Args json.RawMessage
+	// Dispatched says it was handed to its tool, a hand-off no consumer
+	// withdrew, so it may have run. IdempotencyKey is the key of its
+	// last hand-off and DispatchArgs the arguments it ran with, nil when
+	// they are Args.
+	Dispatched     bool
+	IdempotencyKey string
+	DispatchArgs   json.RawMessage
+	// Ended says it settled with a result of its own, or a refusal, and
+	// was not cut off: Result and Err are what the invoking tool was
+	// given, and a matched invocation is given them again. A call that
+	// was cut off has not ended.
+	Ended  bool
+	Result agenttool.Result
+	Err    string
 }
 
 // Note is a note waiting on the outputs of its batch: the item and how
