@@ -7,6 +7,11 @@ versions may break the API.
 
 ## Unreleased
 
+- Fixed: `front/responses`' single turn, a request carrying the caller's
+  tools, calls its transform under `agentturn.ContextWithRequest` with
+  the settings the request will carry, the caller's tools included, as
+  the loop does, so a fold against a share of the context window counts
+  them. (#279)
 - Fixed: a handoff whose trim leaves the sender's preamble last now
   delivers its developer note, `front/responses.HandoffNote`, as the
   receiver's run's input instead of adding it to the trimmed transcript,

@@ -6,9 +6,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/agentturn/compact"
 	"github.com/ChristopherDavenport/openresponses"
+	"github.com/ChristopherDavenport/openresponses/echo"
 	"github.com/ChristopherDavenport/openresponses/streamtest"
 )
 
@@ -77,5 +79,38 @@ func TestASingleTurnFoldsAgainWithoutAQuarantinedItem(t *testing.T) {
 	}
 	if guards != 2 {
 		t.Errorf("the guard ran %d times, want twice: the request was built once more", guards)
+	}
+}
+
+// TestTheSingleTurnGivesItsTransformTheSettings pins #279 for the
+// single turn a request with the caller's tools runs: its transform is
+// called under agentturn.ContextWithRequest, as the loop's is, with the
+// settings the request will carry, the instructions and every tool, the
+// caller's among them, so a fold against a share of the context window
+// counts what shares it.
+func TestTheSingleTurnGivesItsTransformTheSettings(t *testing.T) {
+	var got openresponses.Request
+	seen := false
+	transform := func(ctx context.Context, tr agentturn.Transcript) (agentturn.Transcript, error) {
+		got, seen = agentturn.RequestFromContext(ctx)
+		return tr, nil
+	}
+	a := New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Instructions: "Be brief.", Tools: []agenttool.Tool{upper}, Transform: transform})
+	req := request(openresponses.UserText("hello"))
+	req.Tools = openresponses.Tools{openresponses.NewFunctionTool("remote", "caller side", json.RawMessage(`{"type":"object"}`))}
+	if _, err := streamtest.Run(context.Background(), a, req); err != nil {
+		t.Fatal(err)
+	}
+	if !seen {
+		t.Fatal("the transform was given no settings")
+	}
+	var names []string
+	for _, tool := range got.Tools {
+		if ft, ok := tool.(*openresponses.FunctionTool); ok {
+			names = append(names, ft.Name)
+		}
+	}
+	if got.Instructions != "Be brief." || strings.Join(names, ",") != "upper,remote" || got.Input != nil {
+		t.Errorf("settings = instructions %q, tools %v, input %d items", got.Instructions, names, len(got.Input))
 	}
 }

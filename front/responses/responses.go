@@ -629,22 +629,25 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 	view := agentturn.QuarantinedFromContext(ctx)
 	var upstream openresponses.Request
 	for again := true; ; again = false {
-		input := transcript
-		if cfg.Transform != nil {
-			var err error
-			input, err = cfg.Transform(ctx, append(agentturn.Transcript(nil), transcript...))
-			if err != nil {
-				return fmt.Errorf("transform: %w", err)
-			}
-		}
+		// The settings come first, the caller's tools among them, so
+		// the transform weighs what the request will carry beside the
+		// input, as the loop's does (#279).
 		upstream = cfg.BaseRequest(ctx)
-		upstream.Input = quarantined.Apply(models.For(cfg.ModelName, filter(input)))
 		for _, ct := range callerTools {
 			upstream.Tools = append(upstream.Tools, ct)
 		}
 		if req.ToolChoice != (openresponses.ToolChoice{}) {
 			upstream.ToolChoice = req.ToolChoice
 		}
+		input := transcript
+		if cfg.Transform != nil {
+			var err error
+			input, err = cfg.Transform(agentturn.ContextWithRequest(ctx, upstream), append(agentturn.Transcript(nil), transcript...))
+			if err != nil {
+				return fmt.Errorf("transform: %w", err)
+			}
+		}
+		upstream.Input = quarantined.Apply(models.For(cfg.ModelName, filter(input)))
 		if cfg.BeforeModelCall == nil {
 			break
 		}
