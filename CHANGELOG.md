@@ -78,6 +78,15 @@ versions may break the API.
   appends it with no decision before it. An answer `ReplayAnswers` takes
   from a branch's output, or from a result, is marked failed when that
   output was. (#273)
+- Added: `PendingReturned`, the pending reason of a call a record holds
+  a `result` for and no output. `Pending` gives it, with the result as
+  `Ran`, in place of `PendingAborted`, so `MayHaveRun` is false and
+  `Agent.Resume` refuses an approval of it with `ErrCallAnswered`. The
+  recorder refuses a decision or a dispatch for a call whose result is
+  on the path, one it wrote itself included, with agentsession's
+  `ErrCallReturned`, so its tool does not run again. A host that
+  answers pending calls itself answers a returned call with `Ran`.
+  (#273)
 - Docs: `Config.ToolProvider` says the loop never closes what a
   provider returns, and that a provider building tools that own a
   resource caches them per session and closes them itself; RFC 0001's

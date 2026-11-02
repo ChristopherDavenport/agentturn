@@ -1861,9 +1861,9 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 			p.Reason = agentturn.PendingUndispatched
 		case agentsession.CallReturned:
 			// Its tool returned before its output joined the path: the
-			// result on the path is its outcome, and it is not run
-			// again.
-			p.Reason = agentturn.PendingAborted
+			// result on the path is its outcome, owed as its output, and
+			// it is not run again.
+			p.Reason = agentturn.PendingReturned
 			if out, ok := c.Result.Item.(*openresponses.FunctionCallOutput); ok {
 				p.Ran, p.RanWhere = out, returnedReason
 				ranAt[p.Call.CallID] = ranFrom{entry: c.Result.ID, failed: c.Result.Failed}
@@ -2228,6 +2228,12 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 			ans = agentturn.Approve(id)
 		case agentturn.PendingAnswered:
 			ans = agentturn.OutcomeUnknown(id)
+		case agentturn.PendingReturned:
+			// The result is the call's outcome; see the default case.
+			ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Status: p.Ran.Status, Output: p.Ran.Output}).WithReason(p.RanWhere).WithOrigin(ranAt[id].entry)
+			if ranAt[id].failed {
+				ans = ans.WithFailed()
+			}
 		case agentturn.PendingRejected:
 			ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Output: openresponses.FunctionCallOutputData{Text: p.Refused}})
 		default:
@@ -3922,6 +3928,7 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 			if _, err := w.append(ctx, r); err != nil {
 				return err
 			}
+			c.result = r
 		}
 	}
 	if e.Parent != "" {
@@ -4893,6 +4900,13 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 		// go on the path.
 		return fmt.Errorf("session: decision on call %s: %w", e.CallID, agentsession.ErrCallCompleted)
 	}
+	if c.result != nil {
+		// Its tool returned and the result is on the path: the format
+		// takes no proceed, hold or reject after it, and the call is
+		// owed that output, so a harness deciding on it again has lost
+		// track of it and the tool must not run.
+		return fmt.Errorf("session: decision on call %s: %w", e.CallID, agentsession.ErrCallReturned)
+	}
 	if c.rejected || c.ended {
 		// The call's fate is on the path: only its output may follow.
 		return nil
@@ -5021,6 +5035,12 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 		// The output ended the call, and the format reads a tool run
 		// after it as a new call: refusing the dispatch stops the tool.
 		return fmt.Errorf("session: dispatch of call %s: %w", e.CallID, agentsession.ErrCallCompleted)
+	}
+	if c.result != nil {
+		// A result is on the path, and the format reads a hand-off
+		// after it as running a call that returned: refusing the
+		// dispatch stops the tool.
+		return fmt.Errorf("session: dispatch of call %s: %w", e.CallID, agentsession.ErrCallReturned)
 	}
 	if c.again != nil {
 		// Running a call again is the harness's choice, and the format
