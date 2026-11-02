@@ -439,3 +439,57 @@ func TestThePollIntervalHasALowerBound(t *testing.T) {
 		t.Errorf("tasks/get sent %d times in 4 minimum intervals", n)
 	}
 }
+
+// authLater is a remote agent whose task works until its gate opens,
+// then waits on credentials.
+type authLater struct{ gate chan struct{} }
+
+func (s authLater) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue) error {
+	if err := q.Write(ctx, a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateWorking, nil)); err != nil {
+		return err
+	}
+	select {
+	case <-s.gate:
+	case <-ctx.Done():
+		return nil
+	case <-time.After(8 * time.Second):
+	}
+	ev := a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateAuthRequired, a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: "sign in"}))
+	ev.Final = true
+	return q.Write(ctx, ev)
+}
+
+func (authLater) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue) error {
+	ev := a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateCanceled, nil)
+	ev.Final = true
+	return q.Write(ctx, ev)
+}
+
+// TestADetachedCallEndsOnAuthRequired pins the review of #290: a task
+// a detached call follows by tasks/get ends the follow once it waits on
+// credentials, as a call that is not detached ends there, and fn gets
+// the input-required error.
+func TestADetachedCallEndsOnAuthRequired(t *testing.T) {
+	remote := authLater{gate: make(chan struct{})}
+	client, card := serve(t, remote, nil)
+	ends := make(chan error, 1)
+	tool := New(client, card, WithBlocking(), WithPollInterval(MinPollInterval), WithDetach(func(_ string, info TaskInfo, _ *a2a.Task, err error) {
+		if info.State != a2a.TaskStateAuthRequired {
+			t.Errorf("fn's task state = %s", info.State)
+		}
+		ends <- err
+	}))
+	if _, err := tool.Execute(context.Background(), agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"work"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	close(remote.gate)
+	select {
+	case err := <-ends:
+		var ir *InputRequiredError
+		if !errors.As(err, &ir) {
+			t.Errorf("fn got %v, want the input-required error", err)
+		}
+	case <-time.After(10 * MinPollInterval):
+		t.Fatal("the follow never ended on auth-required")
+	}
+}

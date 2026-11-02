@@ -666,7 +666,7 @@ func (c *callState) start(out *outcome) {
 
 // poll follows a task a non-blocking send left unfinished with
 // tasks/get, every [WithPollInterval], until it is final or waits on
-// input.
+// input or credentials.
 func (r *remote) poll(ctx context.Context, out *outcome, c *callState) error {
 	for {
 		select {
@@ -741,7 +741,9 @@ func (o *outcome) absorb(ev a2a.Event) bool {
 		o.state = e.Status.State
 		o.status = e.Status.Message
 		o.artifacts = e.Artifacts
-		return e.Status.State.Terminal() || e.Status.State == a2a.TaskStateInputRequired
+		// A task waiting on input or credentials is as far as the call
+		// follows it: a poll that met either would ask again forever.
+		return e.Status.State.Terminal() || e.Status.State == a2a.TaskStateInputRequired || e.Status.State == a2a.TaskStateAuthRequired
 	case *a2a.TaskStatusUpdateEvent:
 		o.state = e.Status.State
 		if e.Status.Message != nil {

@@ -616,7 +616,8 @@ versions may break the API.
   as a peer; the task is followed on the run context, by its stream or,
   under `WithBlocking`, by a send that returns at once and `tasks/get`
   every `WithPollInterval` (at least `MinPollInterval`, 50ms), and `fn`
-  gets its end. An abort of the
+  gets its end, the task completed, failed or waiting on input or
+  credentials. An abort of the
   parent's run cuts it (tasks/cancel, recorded); the batch or the run
   ending does not. `tools/a2a.Answer(final)` is the output a call would
   have returned. The host delivers the result with `Agent.Deliver`
