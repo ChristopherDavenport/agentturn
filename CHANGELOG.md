@@ -398,6 +398,20 @@ versions may break the API.
   an item and the provider refuses the request. Nothing in the loop or
   the record changes. (#285)
 
+- Added: a quarantine. `Agent.Quarantine(items…)`, or
+  `agentturn.Quarantine(ctx, items…)` from a hook such as a
+  `BeforeModelCall` guard that found an injected instruction, names
+  items, by identity, that every request from then on leaves out, or,
+  for a function call output, sends with `QuarantinedOutput` in place of
+  its output; a quarantined call is left out with its outputs. The
+  loop applies it after the transform and the filter, keeps every item
+  in the transcript, applies a hook's quarantine to the request that
+  hook was given, and passes it to runs a tool starts over the
+  conversation. The session recorder writes it as `omit.outputs` and
+  `omit.items`, so every later response still verifies.
+  `Agent.Quarantined` lists the items. RFC 0001 The request step 3.
+  (#281)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

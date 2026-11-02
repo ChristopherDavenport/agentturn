@@ -173,6 +173,7 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 				transcript: append(Transcript(nil), t...),
 				runCtx:     runCtx,
 				reasoning:  reasoningFromContext(ctx).merged(nil),
+				quarantine: inheritQuarantine(ctx, &quarantine{}),
 				// Every event is sent, cancelled or not: the consumer
 				// below drains the channel until the run returns, so a
 				// send never blocks for good, and the events an abort
@@ -734,6 +735,9 @@ type runner struct {
 	// reasoning says which model produced the reasoning items of the
 	// transcript it knows, so a request leaves another model's out.
 	reasoning ReasoningModels
+	// quarantine holds the items every request leaves out or sends as
+	// a placeholder: the agent's, shared, or the run's own for Run.
+	quarantine *quarantine
 
 	// held are the completed items of the attempt in flight that the
 	// transcript does not have yet, because nothing has committed the
@@ -1606,10 +1610,10 @@ func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponse
 		}
 	}
 	b := built{filtered: r.cfg.filter()(input)}
-	req.Input = r.reasoning.For(req.Model, b.filtered)
+	req.Input = r.inputFor(req.Model, b.filtered)
 	b.input = req.Input
 	if r.cfg.BeforeModelCall != nil {
-		before := req
+		before, gen := req, r.quarantine.generation()
 		if err := r.cfg.BeforeModelCall(ctx, &req); err != nil {
 			// The call was never made; the request as built is the
 			// record of what was refused, whether a policy stopped the
@@ -1625,6 +1629,15 @@ func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponse
 		// A hook that moved the call to another model and kept the
 		// loop's input is sent that input as built for the model.
 		req = b.forModel(r, before, req)
+		if r.quarantine.generation() != gen {
+			// The hook quarantined items: the request it returns
+			// leaves them out already.
+			own := sameSlice(req.Input, b.input)
+			req.Input = r.quarantine.apply(req.Input)
+			if own {
+				b.input = req.Input
+			}
+		}
 	}
 	return req, b, nil
 }
@@ -1647,9 +1660,16 @@ func (b *built) forModel(r *runner, prev, req openresponses.Request) openrespons
 	if req.Model == prev.Model || !sameSlice(req.Input, b.input) || !sameSlice(prev.Input, b.input) {
 		return req
 	}
-	req.Input = r.reasoning.For(req.Model, b.filtered)
+	req.Input = r.inputFor(req.Model, b.filtered)
 	b.input = req.Input
 	return req
+}
+
+// inputFor is the input a request naming model carries, from the
+// transformed, filtered list: without the reasoning another model
+// produced, and under the quarantine (RFC 0001 The request, step 3).
+func (r *runner) inputFor(model string, filtered Transcript) openresponses.Items {
+	return r.quarantine.apply(r.reasoning.For(model, filtered))
 }
 
 // sameItems reports whether a and b hold the very same items, in order:
@@ -2558,7 +2578,7 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 // of them starts over the run's items leaves out the reasoning another
 // model produced (#242).
 func (r *runner) attributed(ctx context.Context) context.Context {
-	return ContextWithReasoningModels(ctx, r.reasoning)
+	return context.WithValue(ContextWithReasoningModels(ctx, r.reasoning), quarantineKey{}, r.quarantine)
 }
 
 // toolContext is the context hooks and tools run under: ctx with a

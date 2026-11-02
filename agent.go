@@ -137,6 +137,9 @@ type Agent struct {
 	// transcript it knows, so a run leaves another model's out of its
 	// requests.
 	reasoning ReasoningModels
+	// quarantine holds the items quarantined for the rest of the
+	// conversation, shared with each run.
+	quarantine *quarantine
 	// asks holds the questions QuestionElicitor raised that Reply can
 	// still answer, by ID.
 	asks map[string]*asking
@@ -207,7 +210,7 @@ func WithReservedCallIDs(ids []string) Option {
 
 // New builds an agent.
 func New(cfg Config, opts ...Option) *Agent {
-	a := &Agent{cfg: cfg, idle: closedChan(), steered: make(chan struct{}), progress: make(chan struct{})}
+	a := &Agent{cfg: cfg, idle: closedChan(), steered: make(chan struct{}), progress: make(chan struct{}), quarantine: &quarantine{}}
 	for _, opt := range opts {
 		opt(a)
 	}
@@ -1131,6 +1134,7 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, notes []
 			prior:       prior,
 			reserved:    a.reserved,
 			reasoning:   a.reasoning.merged(reasoningFromContext(ctx)),
+			quarantine:  inheritQuarantine(ctx, a.quarantine),
 			runID:       runID,
 			resuming:    resuming,
 			notes:       held,

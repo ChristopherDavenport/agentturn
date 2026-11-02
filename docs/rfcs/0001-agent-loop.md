@@ -455,6 +455,25 @@ that a recorder holding the transcript and the settings rebuilds it:
    describes that omission with an `omit` naming the entries, since
    items a run is prompted with name no response for the format's
    reasoning rule to read (#242).
+
+   Then apply the **quarantine**. A host MAY quarantine an item for
+   the rest of the conversation, and a hook, such as a before-model-call
+   guard that finds an instruction injected into a tool's output or a
+   fetched page, MAY name items to quarantine through its context: from
+   then on, every request leaves the item out, or, for a function call
+   output, whose call needs an answer, carries it with one fixed
+   placeholder text in place of its output; a quarantined function call
+   is left out with its outputs. The loop applies the quarantine after
+   the transform and the filter, so it holds whatever a transform
+   returned, and keeps the item in the transcript, which stays
+   append-only and what arrived. A quarantine a before-model-call hook
+   makes applies to the request it was given, as the hook returns. A
+   run a tool starts over its parent's items carries the parent's
+   quarantine, as it carries the attribution. A recorder writes a
+   quarantine as the `omit` setting that describes it, `omit.outputs`
+   for a placeholder and `omit.items` for an item left out, as the
+   consequences below say, so the requests after it rebuild and hash
+   (#281).
 4. Take the request base, set the loop-owned transport members — store
    false, stream true, no stream options, no previous response ID — and
    apply the model
@@ -1744,6 +1763,7 @@ maps onto it as follows:
 | handoffs a front takes | `WithHandoff`, `WithStart`, `WithTransfers(route)` in both fronts; `front/responses.Route`, `Handoffs`, `HandedTo`, `Attribute`, re-exported by `front/a2a` but for `Attribute` |
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)` |
+| quarantine | `Agent.Quarantine`, `Agent.Quarantined`; `Quarantine(ctx, items…)` from a hook or a tool, `ErrNoQuarantine`, `ErrNotQuarantinable`; `QuarantinedOutput`, the placeholder |
 | the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Queue`, `Deliver`, `Control` (`RecordedControl`, for a front), `Requeue`, `Rebase`; `session.MoveTo` for a rewind; `WithInstructionsParts`, `WithMedia`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`; the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
 
 Every error the package returns to its caller, sentinel or wrapped,
