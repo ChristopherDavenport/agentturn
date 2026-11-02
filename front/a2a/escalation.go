@@ -105,7 +105,9 @@ func WithEscalation() Option { return func(e *Executor) { e.escalate = true } }
 // reason, its rewrite of the arguments and its note. A held call
 // (Decision.Held), which the policy allowed and held only beside an
 // asked sibling, is not put to the caller; it is released, by the
-// policy, with the answers to the calls that were.
+// policy, with the answers to the calls that were when every approval
+// accepts, and refused unrun, by the policy, when the caller refused
+// one.
 type Escalated struct {
 	Task     string                      `json:"task"`
 	Call     *openresponses.FunctionCall `json:"call"`
@@ -245,6 +247,14 @@ func (c Escalated) release() agentturn.Answer {
 		ans = agentturn.ApproveWith(c.Call.CallID, c.Decision.Args)
 	}
 	return ans.WithBy("policy").WithReason("released: " + c.Decision.Reason)
+}
+
+// refuse answers a held call whose batch the caller refused: not run,
+// by the policy that held it, since it was held only beside the call
+// the caller said no to.
+func (c Escalated) refuse(principal string) agentturn.Answer {
+	text := "not run: the caller " + principal + " refused the call this one was held beside"
+	return agentturn.Output(&openresponses.FunctionCallOutput{CallID: c.Call.CallID, Output: openresponses.FunctionCallOutputData{Text: text}}).WithBy("policy").WithReason(text)
 }
 
 // escalation is what an input-required status message says about the

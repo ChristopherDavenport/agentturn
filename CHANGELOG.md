@@ -566,6 +566,12 @@ versions may break the API.
   transcript names, as a front's `WithTransfers` starts it; it left the
   agent with the sender. (#274)
 
+- Fixed: under `front/a2a`'s `WithEscalation`, a call the policy held
+  only beside an asked one is released only when every approval in the
+  caller's message accepts; when the caller refuses one, the held call
+  is answered with a refusal, unrun, by `policy`. It was released, and
+  ran, whatever the caller answered.
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

@@ -155,7 +155,8 @@
 // as the policy decided it, its rewrite of the arguments, which the
 // question shows, and its note included. A call the policy held only
 // beside an asked one is not put to the caller; the policy releases it
-// with the caller's answers. The run the answer resumes is under the caller's principal,
+// with the caller's answers when every approval accepts, and it is
+// refused unrun when the caller refused one. The run the answer resumes is under the caller's principal,
 // and the caller's note reaches the model as the caller's words, in the
 // user's voice, never as the serving side's instructions. Who decided
 // is recorded as nobody, unless the host lets the principal name a

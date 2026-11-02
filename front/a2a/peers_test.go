@@ -575,7 +575,8 @@ func TestAHeldCallIsReleasedNotAsked(t *testing.T) {
 		}
 		var decisions []*agentturn.ToolDecision
 		cfg := agentturn.Config{Model: callsBoth{"deploy", "read"}, Tools: []agenttool.Tool{tool("deploy"), tool("read")}, BeforeToolCall: hook}
-		h := New(cfg, WithAuthenticator(tokenAuth(map[string]string{"a-token": "alice"})), WithEscalation(), WithRecorderFor(decisionsOf(&decisions))).RequestHandler()
+		store := &MemoryStore{}
+		h := New(cfg, WithAuthenticator(tokenAuth(map[string]string{"a-token": "alice"})), WithEscalation(), WithConversationStore(store), WithRecorderFor(decisionsOf(&decisions))).RequestHandler()
 		alice := as("a-token")
 		res, err := h.OnSendMessage(alice, &a2a.MessageSendParams{Message: userMessage("ship it")})
 		if err != nil {
@@ -591,23 +592,45 @@ func TestAHeldCallIsReleasedNotAsked(t *testing.T) {
 		if err != nil || res.(*a2a.Task).Status.State != a2a.TaskStateCompleted {
 			t.Fatalf("approve=%v: %v %v", approve, res, err)
 		}
+		// The held call follows the answer to the call asked about: it
+		// runs when the caller approves and is refused, unrun, when the
+		// caller refuses.
 		want := 0
 		if approve {
 			want = 1
 		}
 		mu.Lock()
-		if ran["read"] != 1 || ran["deploy"] != want {
+		if ran["read"] != want || ran["deploy"] != want {
 			t.Errorf("approve=%v: ran %v", approve, ran)
 		}
 		mu.Unlock()
-		var released *agentturn.ToolDecision
-		for _, d := range decisions {
-			if d != nil && d.By == "policy" {
-				released = d
+		if approve {
+			var released *agentturn.ToolDecision
+			for _, d := range decisions {
+				if d != nil && d.By == "policy" {
+					released = d
+				}
+			}
+			if released == nil || released.Reason != "released: allowed by read" {
+				t.Errorf("the held call's release = %+v", released)
+			}
+			continue
+		}
+		tr, _ := store.Load(context.Background(), task.ContextID)
+		var readOut string
+		calls := map[string]string{}
+		for _, item := range tr {
+			switch it := item.(type) {
+			case *openresponses.FunctionCall:
+				calls[it.CallID] = it.Name
+			case *openresponses.FunctionCallOutput:
+				if calls[it.CallID] == "read" {
+					readOut = it.Output.Text
+				}
 			}
 		}
-		if released == nil || released.Reason != "released: allowed by read" {
-			t.Errorf("approve=%v: the held call's release = %+v", approve, released)
+		if !strings.Contains(readOut, "not run") || !strings.Contains(readOut, "refused") {
+			t.Errorf("the held call's output = %q, want it refused unrun", readOut)
 		}
 	}
 }

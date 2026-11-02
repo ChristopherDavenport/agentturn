@@ -500,9 +500,21 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 		for _, a := range approvals {
 			answers = append(answers, a.answer(asked[a.CallID], principal))
 		}
+		// A held call follows the answer to the calls it was held
+		// beside: released when every approval accepts, refused unrun
+		// when the caller refused one.
+		accepted := true
+		for _, a := range approvals {
+			accepted = accepted && a.Approve
+		}
 		for _, c := range escalated {
-			if !c.asked() {
+			if c.asked() {
+				continue
+			}
+			if accepted {
 				answers = append(answers, c.release())
+			} else {
+				answers = append(answers, c.refuse(principal))
 			}
 		}
 		run = func(ctx context.Context) (*agentturn.RunEnd, error) { return agent.Resume(ctx, answers...) }
