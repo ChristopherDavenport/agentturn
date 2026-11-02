@@ -943,13 +943,14 @@ type wireAnswer struct {
 	Origin         string          `json:"origin,omitempty"`
 	IdempotencyKey string          `json:"idempotency_key,omitempty"`
 	RunAgain       bool            `json:"run_again,omitempty"`
+	Failed         bool            `json:"failed,omitempty"`
 }
 
 func answersOut(in []agentturn.Answer) ([]wireAnswer, error) {
 	out := make([]wireAnswer, 0, len(in))
 	for _, a := range in {
 		w := wireAnswer{CallID: a.CallID, Args: a.Args, Note: a.Note, Terminate: a.Terminate, By: a.By, Reason: a.Reason,
-			Origin: a.Origin, IdempotencyKey: a.IdempotencyKey, RunAgain: a.RunAgain}
+			Origin: a.Origin, IdempotencyKey: a.IdempotencyKey, RunAgain: a.RunAgain, Failed: a.Failed}
 		if a.Output != nil {
 			var err error
 			if w.Output, err = json.Marshal(a.Output); err != nil {
@@ -965,7 +966,7 @@ func answersIn(in []wireAnswer) ([]agentturn.Answer, error) {
 	out := make([]agentturn.Answer, 0, len(in))
 	for _, w := range in {
 		a := agentturn.Answer{CallID: w.CallID, Args: w.Args, Note: w.Note, Terminate: w.Terminate, By: w.By, Reason: w.Reason,
-			Origin: w.Origin, IdempotencyKey: w.IdempotencyKey, RunAgain: w.RunAgain}
+			Origin: w.Origin, IdempotencyKey: w.IdempotencyKey, RunAgain: w.RunAgain, Failed: w.Failed}
 		var err error
 		if a.Output, err = functionCallOutputIn(w.Output); err != nil {
 			return nil, err

@@ -1129,31 +1129,63 @@ type callRecord struct {
 	childOff   string
 	calleesOff []agentsession.CalleeLink
 	// dispatchEntry is the ID of the last dispatch entry written or
-	// seeded for the call, and lastWithdrawn says a [WithdrawnNS] entry
-	// withdrew it. handedOff counts the call's dispatches on the path no
-	// such entry withdrew, the hand-offs its tool may have run on; a
-	// dispatched call with none never ran. It keeps its dispatches for
-	// the format's sake, a decision that ends it is an answer, but it is
-	// not run again. A live recorder and one seeded from the path count
-	// alike, so both write the same decisions.
+	// seeded for the call, and lastWithdrawn says it was withdrawn.
+	// handedOff counts the call's hand-offs on the path, those its tool
+	// may have run on. A withdrawal, the format's reject carrying
+	// withdrawn, takes its dispatch off the path as a reader sees it, so
+	// the recorder puts the call back as it was before that dispatch,
+	// which before is. A path written by agentturn v0.0.34 or earlier
+	// marks a withdrawal with a [WithdrawnNS] entry instead, which the
+	// format does not know: such a call keeps its dispatches for the
+	// format's sake, a decision that ends it is an answer, and when
+	// every one was withdrawn it never ran and is not run again. A live
+	// recorder and one seeded from the path count alike, so both write
+	// the same decisions.
 	dispatchEntry string
 	lastWithdrawn bool
 	handedOff     int
+	// before is the dispatch state the last dispatch this writer wrote
+	// replaced, which a withdrawal of it restores.
+	before *dispatchState
+	// failed is set when the call's tool_end carried the tool's error
+	// for a hand-off of this writer's run, so the output it appends is
+	// marked failed. A refusal, the loop's or a hook's, is not a
+	// failure: its reject records it.
+	failed bool
 }
 
-// neverRan reports whether every dispatch the call has was withdrawn.
+// dispatchState is what a dispatch changes in a callRecord.
+type dispatchState struct {
+	dispatched, unknown bool
+	run, entry          string
+	handedOff           int
+}
+
+// withdraw puts the call back as it was before its last dispatch, which
+// a withdrawal takes off the path as a reader sees it.
+func (c *callRecord) withdraw() {
+	if b := c.before; b != nil {
+		c.dispatched, c.unknown, c.dispatchRun, c.dispatchEntry, c.handedOff = b.dispatched, b.unknown, b.run, b.entry, b.handedOff
+		c.before = nil
+	}
+	c.lastWithdrawn = true
+}
+
+// neverRan reports whether every dispatch the call has was withdrawn,
+// which only a [WithdrawnNS] entry leaves on the path.
 func (c *callRecord) neverRan() bool { return c.dispatched && c.handedOff == 0 }
 
-// WithdrawnNS is the namespace of the custom entry the recorder writes
-// after a dispatch the loop withdrew (agentturn.ToolEnd.Withdrawn): a
-// subscriber called after the recorder failed on the call's
-// tool_dispatch, so the tool never ran. Its call_id is the call's and
-// its data a [Withdrawn], which names the one dispatch it withdraws.
-// [Pending] reads a call whose every dispatch on the path is withdrawn
-// as agentturn.PendingUndispatched, which the loop knew it to
-// be, rather than as one that may have run; a reader that does not
-// know the namespace reads the call in flight, which errs on the side
-// of caution.
+// WithdrawnNS is the namespace of the custom entry agentturn v0.0.34
+// and earlier wrote after a dispatch the loop withdrew
+// (agentturn.ToolEnd.Withdrawn): a subscriber called after the
+// recorder failed on the call's tool_dispatch, so the tool never ran.
+// Its call_id is the call's and its data a [Withdrawn], which names the
+// one dispatch it withdraws. The recorder now writes the format's
+// withdrawal, a reject carrying withdrawn (format 0.14), and reads
+// these entries only on paths that hold them: [Pending] reads a call
+// whose every dispatch on the path is withdrawn as
+// agentturn.PendingUndispatched, which the loop knew it to be, rather
+// than as one that may have run.
 const WithdrawnNS = "agentturn:withdrawn"
 
 // HeldNotesNS is the namespace of the custom entry the recorder writes
@@ -1307,7 +1339,8 @@ func OwedNotes(s *agentsession.Session) ([]agentturn.Note, error) {
 	return out, nil
 }
 
-// Withdrawn is the data of a [WithdrawnNS] custom entry.
+// Withdrawn is the data of a [WithdrawnNS] custom entry, which the
+// recorder no longer writes.
 type Withdrawn struct {
 	// Dispatch is the ID of the dispatch entry withdrawn.
 	Dispatch string `json:"dispatch"`
@@ -1635,9 +1668,10 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // [NoteMember]); one in flight when the record stopped
 // may have run and is [agentturn.PendingAborted], as is one with no
 // dispatch on the path that has one on a branch a rebase to before it
-// left, a held one of which is Dispatched; one in flight whose every
-// dispatch a [WithdrawnNS] entry withdrew never reached its tool and is
-// [agentturn.PendingUndispatched]; one an answer
+// left, a held one of which is Dispatched; one whose every dispatch
+// was withdrawn, by the format's withdrawal or, on a path agentturn
+// v0.0.34 or earlier wrote, a [WithdrawnNS] entry, never reached its
+// tool and is [agentturn.PendingUndispatched]; one an answer
 // decision ended before its output was written is
 // [agentturn.PendingAnswered], owed that output and nothing else; one
 // a reject decision refused before its output was written is
@@ -1743,7 +1777,9 @@ type origins struct {
 // and the session holding it: s, or for a call in a fork's prefix with
 // none in s, the session the fork was made from, and so up the chain,
 // as [agentsession.OriginDispatches] walks it. It returns nil when none
-// of them holds one.
+// of them holds one. A dispatch on s's path is the path's to read, a
+// withdrawn one included: a withdrawal says that hand-off was never
+// made, and the call is what the path says it is.
 func (o *origins) dispatchOff(s *agentsession.Session, callEntry string) (*agentsession.Session, *agentsession.DispatchEntry, error) {
 	at, ds, err := agentsession.OriginDispatches(o.ctx, o.r, s, callEntry)
 	if err != nil {
@@ -1751,6 +1787,13 @@ func (o *origins) dispatchOff(s *agentsession.Session, callEntry string) (*agent
 			return nil, nil, nil
 		}
 		return nil, nil, fmt.Errorf("session: %w", err)
+	}
+	if at == s && len(ds) > 0 {
+		on := map[string]bool{}
+		for _, e := range s.Path(s.Leaf()) {
+			on[e.Base().ID] = true
+		}
+		ds = slices.DeleteFunc(ds, func(d *agentsession.DispatchEntry) bool { return on[d.ID] })
 	}
 	if len(ds) == 0 {
 		return nil, nil, nil
@@ -3801,18 +3844,23 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 		c.settledRun = w.run
 	}
 	if c := w.calls[e.CallID]; c != nil && e.Parent == "" && e.Withdrawn && c.dispatched && c.dispatchRun == w.run && !c.lastWithdrawn {
-		// The dispatch is on the path, and the tool never ran: say so,
-		// so the call reads as never started rather than as one that
-		// may have run.
-		data, err := json.Marshal(Withdrawn{Dispatch: c.dispatchEntry, Reason: errText(e.Err)})
-		if err != nil {
+		// The dispatch is on the path, and the tool never ran: withdraw
+		// it, so the call reads as it was before the dispatch, never
+		// started when it has no other, rather than as one that may
+		// have run.
+		reason := errText(e.Err)
+		if reason == "" {
+			reason = "dispatch withdrawn"
+		}
+		if _, err := w.append(ctx, agentsession.NewWithdrawal(e.CallID, c.entry, "", reason)); err != nil {
 			return err
 		}
-		if _, err := w.append(ctx, &agentsession.CustomEntry{NS: WithdrawnNS, Data: data, CallID: e.CallID}); err != nil {
-			return err
-		}
-		c.lastWithdrawn = true
-		c.handedOff--
+		c.withdraw()
+	}
+	if c := w.calls[e.CallID]; c != nil && e.Parent == "" {
+		// The tool reported failure, after a hand-off of this run that
+		// stood: a block and the loop's own refusals are rejects.
+		c.failed = e.Err != nil && !e.Blocked && !e.Withdrawn && c.dispatched && c.dispatchRun == w.run
 	}
 	if e.Parent != "" {
 		if err := w.nested(ctx, NestedCall{
@@ -4502,6 +4550,11 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 	if item == nil {
 		return nil
 	}
+	// failed marks an output that says the call failed: its tool
+	// reported failure, or the caller answered a call it gave up, such
+	// as one whose outcome is unknown. A refusal, written as a reject,
+	// is not a failure.
+	failed := false
 	if out, ok := item.(*openresponses.FunctionCallOutput); ok && !w.replay {
 		c := w.calls[out.CallID]
 		switch {
@@ -4510,12 +4563,16 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 			// one is a harness that lost track of the call, and would
 			// put two outputs for one call in the context.
 			return fmt.Errorf("session: output of call %s: %w", out.CallID, agentsession.ErrCallCompleted)
-		case c == nil || c.rejected || c.ended:
-			// Nothing to anchor a decision to, or the call's fate is
-			// on the path already: after a reject or an answer, only
-			// its output.
+		case c == nil || c.ended:
+			// Nothing to anchor a decision to, or an answer on the path
+			// already, which only its output may follow.
+			failed = agentturn.FailedFromContext(ctx, out.CallID)
+		case c.rejected:
+			// The call's reject is on the path: only its output, the
+			// refusal, may follow.
 		case c.dispatched && c.dispatchRun != "" && c.dispatchRun == w.run:
 			// The tool's own output: the dispatch is the record.
+			failed = c.failed
 		case c.dispatched || c.unknown:
 			// A call an earlier run dispatched, or one the path
 			// cannot say about, another branch's dispatch of a held
@@ -4565,6 +4622,7 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 			// reads the call as PendingAnswered.
 			w.takeUp(out.CallID)
 			c.held, c.ended = false, true
+			failed = agentturn.FailedFromContext(ctx, out.CallID)
 		default:
 			// The caller wrote the output themselves: the call never
 			// reached its tool, and the output is what the model sees.
@@ -4614,7 +4672,7 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		}
 		entry = &agentsession.CustomEntry{NS: item.ItemType(), Data: raw, EntryBase: agentsession.EntryBase{Unknown: map[string]json.RawMessage{ResponseIDMember: id}}}
 	} else {
-		e := &agentsession.ItemEntry{Item: item, ResponseID: responseID}
+		e := &agentsession.ItemEntry{Item: item, ResponseID: responseID, Failed: failed}
 		if hidden {
 			visible := false
 			e.Visible = &visible
@@ -4906,6 +4964,7 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 		return err
 	}
 	w.takeUp(e.CallID)
+	c.before = &dispatchState{dispatched: c.dispatched, unknown: c.unknown, run: c.dispatchRun, entry: c.dispatchEntry, handedOff: c.handedOff}
 	c.dispatched, c.dispatchRun, c.unknown = true, w.run, false
 	c.dispatchEntry, c.lastWithdrawn = id, false
 	c.handedOff++
@@ -5467,7 +5526,11 @@ func (w *writer) append(ctx context.Context, e agentsession.Entry) (string, erro
 	// are written rather than by reading the segment back.
 	switch v := e.(type) {
 	case *agentsession.DecisionEntry:
-		w.answeredCall = true
+		// A withdrawal is no decision: the format reads the call as it
+		// was before the dispatch it withdraws.
+		if !v.Withdrawn {
+			w.answeredCall = true
+		}
 	case *agentsession.ItemEntry:
 		if _, ok := v.Item.(*openresponses.FunctionCallOutput); ok {
 			w.answeredCall = true

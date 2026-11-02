@@ -595,6 +595,13 @@ type Answer struct {
 	// can tie the output it writes to the one it repeats and to the
 	// child session that produced it. Empty for any other answer.
 	Origin string
+	// Failed, for an output, says the output reports the call failed:
+	// the call was given up, as one cut off whose outcome is unknown,
+	// or the caller ran it and it failed. [OutcomeUnknown] sets it. The
+	// loop carries it unread, on the run's context with
+	// [ContextWithFailures], so a session recorder marks the output's
+	// entry failed. A refusal is not a failure and does not set it.
+	Failed bool
 	// IdempotencyKey, for an approval, is the key the tool receives in
 	// place of the one the loop would give it: the pending call's, for
 	// a call that may have run, and a new one otherwise. A key names one
@@ -656,6 +663,7 @@ func OutcomeUnknown(callID string) Answer {
 	res := agenttool.ErrorResult(errors.New("outcome unknown: the call was cut off after it was handed to its tool, and it may or may not have taken effect; check before calling it again"))
 	a := Output(&openresponses.FunctionCallOutput{CallID: callID, Output: res.Output})
 	a.Reason = OutcomeUnknownReason
+	a.Failed = true
 	return a
 }
 
@@ -696,6 +704,13 @@ func (a Answer) WithReason(reason string) Answer {
 // for an output a record held rather than one produced now.
 func (a Answer) WithOrigin(origin string) Answer {
 	a.Origin = origin
+	return a
+}
+
+// WithFailed returns the output answer marked as reporting that the
+// call failed: see [Answer.Failed].
+func (a Answer) WithFailed() Answer {
+	a.Failed = true
 	return a
 }
 
@@ -787,6 +802,7 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 	var notes []answerNote
 	var approved []approval
 	deciders, reasons, origins := map[string]string{}, map[string]string{}, map[string]string{}
+	failures := map[string]bool{}
 	terminate := false
 	for _, ans := range answers {
 		p, ok := byID[ans.CallID]
@@ -805,6 +821,9 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 			}
 			if ans.Origin != "" {
 				origins[ans.CallID] = ans.Origin
+			}
+			if ans.Failed {
+				failures[ans.CallID] = true
 			}
 			if ans.Note != "" {
 				notes = append(notes, answerNote{callID: ans.CallID, item: answerNoteItem(ans.Note, ans.By)})
@@ -848,10 +867,12 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 		return nil, fmt.Errorf("%w: %d pending call(s) unanswered", ErrNotPending, len(byID))
 	}
 	// An output the caller wrote raises no tool_start, so the decider
-	// of an answer of that kind, its reason and where its output was
-	// taken from ride on the run's context, where a recorder writing
-	// the decision and the output for it finds them.
+	// of an answer of that kind, its reason, where its output was
+	// taken from and whether it reports a failure ride on the run's
+	// context, where a recorder writing the decision and the output for
+	// it finds them.
 	ctx = ContextWithOrigins(ContextWithReasons(ContextWithDeciders(ctx, deciders), reasons), origins)
+	ctx = ContextWithFailures(ctx, failures)
 	return a.run(ctx, outputs, notes, approved, true, terminate)
 }
 

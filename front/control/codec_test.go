@@ -237,3 +237,47 @@ func TestNotesOfAnOlderServerDecode(t *testing.T) {
 		t.Errorf("notes = %+v", notes)
 	}
 }
+
+// TestAnswersCarryEveryField pins that an answer crosses the wire whole:
+// every field of agentturn.Answer is set in the sample, and reads back
+// as it was sent. A failed mark lost on the way would leave the record
+// of the output unmarked (#278).
+func TestAnswersCarryEveryField(t *testing.T) {
+	in := agentturn.Answer{
+		CallID: "call_1", Output: openresponses.NewFunctionCallOutput("call_1", "gone"),
+		Args: json.RawMessage(`{"text":"b"}`), Note: "n", Terminate: true, By: "human", Reason: "r",
+		Origin: "sha256:e", IdempotencyKey: "k", RunAgain: true, Failed: true,
+	}
+	v := reflect.ValueOf(in)
+	for i := range v.NumField() {
+		if v.Field(i).IsZero() {
+			t.Errorf("the sample leaves Answer.%s unset: set it so the test covers it", v.Type().Field(i).Name)
+		}
+	}
+	wire, err := answersOut([]agentturn.Answer{in})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back []wireAnswer
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatal(err)
+	}
+	out, err := answersIn(back)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("answers = %d", len(out))
+	}
+	got := out[0]
+	gotOut, _ := json.Marshal(got.Output)
+	wantOut, _ := json.Marshal(in.Output)
+	got.Output, in.Output = nil, nil
+	if !reflect.DeepEqual(got, in) || !bytes.Equal(gotOut, wantOut) {
+		t.Errorf("answer after the wire = %+v %s, want %+v %s", got, gotOut, in, wantOut)
+	}
+}

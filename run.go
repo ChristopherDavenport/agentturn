@@ -216,6 +216,7 @@ type triggerKey struct{}
 type decidersKey struct{}
 type reasonsKey struct{}
 type originsKey struct{}
+type failuresKey struct{}
 type reservedKey struct{}
 
 // ContextWithTrigger attaches a [Trigger] to ctx. A run started with
@@ -345,6 +346,34 @@ func ContextWithOrigins(ctx context.Context, origins map[string]string) context.
 func OriginFromContext(ctx context.Context, callID string) string {
 	origins, _ := ctx.Value(originsKey{}).(map[string]string)
 	return origins[callID]
+}
+
+// ContextWithFailures attaches which outputs answering the pending
+// calls report that the call failed, by call ID, as
+// [ContextWithReasons] attaches why each was answered, in place of any
+// an outer context attached; an empty map clears them. [Agent.Resume]
+// does it from the [Answer.Failed] of the answers it was given as
+// outputs, so a subscriber writing the record of such an output can
+// mark it failed. The loop reads nothing from it.
+func ContextWithFailures(ctx context.Context, failed map[string]bool) context.Context {
+	if len(failed) == 0 {
+		if ctx.Value(failuresKey{}) == nil {
+			return ctx
+		}
+		return context.WithValue(ctx, failuresKey{}, map[string]bool(nil))
+	}
+	out := make(map[string]bool, len(failed))
+	for k, v := range failed {
+		out[k] = v
+	}
+	return context.WithValue(ctx, failuresKey{}, out)
+}
+
+// FailedFromContext reports whether the caller said the output
+// answering callID reports that the call failed.
+func FailedFromContext(ctx context.Context, callID string) bool {
+	failed, _ := ctx.Value(failuresKey{}).(map[string]bool)
+	return failed[callID]
 }
 
 // ContextWithTranscript attaches a transcript to ctx. The loop does this

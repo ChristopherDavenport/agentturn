@@ -528,11 +528,12 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	// The parent's trigger names what started the parent's run; the
 	// child's run was started by the call, which the child's link
 	// names, so it carries none unless WithRunContext gives it one.
-	// Who answered the parent's pending calls, why, and where their
-	// outputs were taken from are the parent's too: a child's call
-	// under the same ID is another call.
+	// Who answered the parent's pending calls, why, where their
+	// outputs were taken from and whether they report a failure are the
+	// parent's too: a child's call under the same ID is another call.
 	ctx = agentturn.ContextWithTrigger(ctx, agentturn.Trigger{})
 	ctx = agentturn.ContextWithOrigins(agentturn.ContextWithReasons(agentturn.ContextWithDeciders(ctx, nil), nil), nil)
+	ctx = agentturn.ContextWithFailures(ctx, nil)
 	// The child is new and holds nothing of an earlier run under this
 	// call, so its run starts afresh in the call's session: a second
 	// Execute under one call ID, a cut-off call run again, opens a new

@@ -2312,9 +2312,10 @@ func TestAnAnswerNamesWhoGaveIt(t *testing.T) {
 // TestAWithdrawnDispatchReadsAsNeverStarted pins the recorder half of
 // agentturn#119: a subscriber registered after the recorder that fails
 // on a call's tool_dispatch stops the tool after the dispatch is on the
-// record. The recorder then writes that the hand-off was withdrawn, so
-// Pending reads the call as never started, as the loop knew it, a
-// replay runs it, and its new dispatch is not recorded as a run again.
+// record. The recorder then writes that the hand-off was withdrawn, the
+// format's withdrawal (a reject carrying withdrawn, #278), so Pending
+// reads the call as never started, as the loop knew it, a replay runs
+// it, and its new dispatch is not recorded as a run again.
 func TestAWithdrawnDispatchReadsAsNeverStarted(t *testing.T) {
 	ctx := context.Background()
 	store := agentsession.NewMemoryStore()
@@ -2344,14 +2345,18 @@ func TestAWithdrawnDispatchReadsAsNeverStarted(t *testing.T) {
 	if ran != 0 {
 		t.Fatal("the tool ran after its dispatch was refused")
 	}
-	marks := customs(s, WithdrawnNS)
-	c := callsOf(t, s)["notify"]
-	if len(marks) != 1 || c == nil || len(c.Dispatches) != 1 || marks[0].CallID != c.ID() {
-		t.Fatalf("withdrawn entries = %d, call %+v", len(marks), c)
+	if marks := customs(s, WithdrawnNS); len(marks) != 0 {
+		t.Errorf("wrote %d %s entries, want the format's withdrawal", len(marks), WithdrawnNS)
 	}
-	var w Withdrawn
-	if err := json.Unmarshal(marks[0].Data, &w); err != nil || w.Dispatch != c.Dispatches[0].ID || !strings.Contains(w.Reason, "audit log") {
-		t.Errorf("withdrawn = %+v (%v), want the dispatch %s and the failure", w, err, c.Dispatches[0].ID)
+	c := callsOf(t, s)["notify"]
+	if c == nil || len(c.Dispatches) != 0 || len(c.Withdrawn) != 1 {
+		t.Fatalf("call = %+v, want one withdrawn hand-off and none made", c)
+	}
+	if w := c.Withdrawn[0]; w.Reject.CallID != c.ID() || !w.Reject.Withdrawn || !strings.Contains(w.Reject.Reason, "audit log") {
+		t.Errorf("withdrawal = %+v, want the failure as its reason", w.Reject)
+	}
+	if err := s.VerifyRecords(s.Leaf()); err != nil {
+		t.Errorf("verify: %v", err)
 	}
 
 	rec, s, err = Resume(ctx, store, s.ID())
@@ -2382,7 +2387,7 @@ func TestAWithdrawnDispatchReadsAsNeverStarted(t *testing.T) {
 		t.Errorf("the tool ran %d times on the replay, want once", ran)
 	}
 	c = callsOf(t, s)["notify"]
-	if c == nil || c.Output == nil || len(c.Dispatches) != 2 {
+	if c == nil || c.Output == nil || len(c.Dispatches) != 1 || len(c.Withdrawn) != 1 {
 		t.Fatalf("call after the replay = %+v", c)
 	}
 	for _, d := range c.Decisions {
@@ -2508,7 +2513,7 @@ func TestALiveRecorderCountsWithdrawalsAsARestartedOneDoes(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := callsOf(t, s)["notify"]
-	if c == nil || c.Output == nil || len(c.Dispatches) != 3 {
+	if c == nil || c.Output == nil || len(c.Dispatches) != 2 || len(c.Withdrawn) != 1 {
 		t.Fatalf("call = %+v", c)
 	}
 	if len(c.Decisions) != 2 || c.Decisions[0].By != c.Decisions[1].By {
