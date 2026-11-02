@@ -84,7 +84,8 @@
 // side: the call is put to Config.ToolElicitor with agentturn.Ask,
 // the call on the elicitor's context for agentturn.AskedCallFrom, and
 // the person's accept runs the tool while their decline refuses the
-// call, both recorded as decided by "human". Without an elicitor, or
+// call, both recorded as decided by the decider the answer names, or
+// "human" when it names none. Without an elicitor, or
 // with no answer, the call is refused with a reason saying it cannot
 // be handed to the caller, and the model sees that reason as the
 // call's output. The task therefore never goes input-required on a

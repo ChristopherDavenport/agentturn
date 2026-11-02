@@ -920,7 +920,13 @@ call **failed**: an output for a call the caller gave up, such as one
 saying a cut call's outcome is unknown, does, and a refusal does not.
 There is no default decider: a policy engine
 answers as often as a person does, so an answer that names nobody is
-recorded as an anonymous decision rather than guessed at. An answer MAY
+recorded as an anonymous decision rather than guessed at. A front that
+takes answers from a remote party, to pending calls or to the questions
+an elicitor asks, MUST record the decider that party names only when
+the host has authorised that principal to name one; otherwise it MUST
+record the front's stated default, `human` for a control front, where
+a person at a client is who answers. An unchecked claim is never
+recorded (#267). An answer MAY
 ask the run to **terminate** once every answer is in, for a refusal
 that should end the turn so the user can say what to do instead; the
 outputs are still appended, so the transcript stays valid.
@@ -947,7 +953,9 @@ then runs as follows, and its source is `resume`:
 
 1. `run_start`.
 2. The outputs of the answers that carry one are appended with their
-   item events, then the notes of those answers as user messages.
+   item events, then the notes of those answers, each in its
+   answerer's voice: a user message for an answer by `human` or by
+   nobody, a developer message for one by `policy` or `agent`.
 3. The approved calls run as **one batch before the first turn**, with
    the decision hook skipped because the decision has been made, except
    for a call pending as `undispatched`: nothing decided it, so the hook
@@ -960,7 +968,8 @@ then runs as follows, and its source is `resume`:
    gave one; the tool events carry turn 0; the
    execution mode and bound apply; the after-call hook runs; the
    outputs are appended in the order the answers name the calls, not
-   in transcript order, and their notes after them as user messages.
+   in transcript order, and their notes after them, in their
+   answerers' voices as in step 2.
 4. If no answer asked the run to terminate and every result of the
    approved batch set terminate, the run ends with reason `stopped` and
    cause `terminate`, or `partial_terminate` when some did.
@@ -1463,8 +1472,17 @@ as if the model had asked for it under the call in flight:
   question. An accept
   allows the call and a decline blocks it, with `declined when asked`
   and the reason as the refusal's; either is the decision `tool_start`
-  carries, by `human`, an accept with the reason, or `allowed when
-  asked` when there was none. Without an elicitor, or on a cancel or a
+  carries, an accept with the reason, or `allowed when
+  asked` when there was none. The decision an answer makes is by the
+  decider the answer names, under agenttool RFC 0001's Questions
+  (`human`, `policy`, `agent`), or `human` when it names none, since
+  an answer that names nobody is the user's; an answer naming a
+  decider the session format does not know is refused, as a failure
+  to ask is (#267). The answer's note reaches the model as a user
+  message only for `human`; a rule's or another model's is a
+  developer message, since its words are not the user's, and on a
+  decline the note ends the refusal's reason, named for whoever gave
+  it. Without an elicitor, or on a cancel or a
   failure to ask, the hook's deferral refuses the call, and the error
   reads `a nested call cannot be deferred to the caller: ` and the
   reason. The decision's note and terminate hint are ignored;

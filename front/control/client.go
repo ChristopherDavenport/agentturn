@@ -301,7 +301,9 @@ func (c *Client) FetchState(ctx context.Context) (agentturn.State, error) {
 
 // Reply implements agentturn.Control. Who answered is the principal
 // the handler authenticates, not anything on ctx, which bounds the
-// request. A question that is not waiting is an error that matches
+// request. answer.By, who decided, is recorded only when the handler
+// lets the principal say ([WithChosenBy]); otherwise the answer is a
+// person's. A question that is not waiting is an error that matches
 // agentturn.ErrNoQuestion.
 func (c *Client) Reply(ctx context.Context, id string, answer agenttool.Answer) error {
 	ctx, cancel := context.WithTimeout(ctx, c.wait)

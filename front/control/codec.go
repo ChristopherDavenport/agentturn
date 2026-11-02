@@ -923,20 +923,21 @@ type wireElicitAnswer struct {
 	Action  string          `json:"action"`
 	Content json.RawMessage `json:"content,omitempty"`
 	Note    string          `json:"note,omitempty"`
+	By      string          `json:"by,omitempty"`
 }
 
 func elicitAnswerOut(a *agenttool.Answer) *wireElicitAnswer {
 	if a == nil {
 		return nil
 	}
-	return &wireElicitAnswer{Action: string(a.Action), Content: a.Content, Note: a.Note}
+	return &wireElicitAnswer{Action: string(a.Action), Content: a.Content, Note: a.Note, By: a.By}
 }
 
 func elicitAnswerIn(w *wireElicitAnswer) *agenttool.Answer {
 	if w == nil {
 		return nil
 	}
-	return &agenttool.Answer{Action: agenttool.Action(w.Action), Content: w.Content, Note: w.Note}
+	return &agenttool.Answer{Action: agenttool.Action(w.Action), Content: w.Content, Note: w.Note, By: w.By}
 }
 
 // wireAnswer is an agentturn.Answer, which Resume takes.

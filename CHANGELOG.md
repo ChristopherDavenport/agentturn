@@ -412,6 +412,21 @@ versions may break the API.
   `Agent.Quarantined` lists the items. RFC 0001 The request step 3.
   (#281)
 
+- Changed: a decision an answer to an asked call makes is by the
+  decider the answer names, agenttool's `Answer.By` (`human`, `policy`,
+  `agent`), or `human` when it names none, where `Ask` wrote `human`
+  whatever answered; an answer naming a decider the session format does
+  not know is refused, and the deferral stands. The answer's note
+  reaches the model as a user message only for `human`, and as a
+  developer message for a rule or another model, on a question `Ask`
+  puts and on a tool's own question alike; outside a run, and in a
+  decline's reason, it is named for whoever gave it ("The policy
+  said: …"). `front/control` carries `by` on a `Reply`'s answer, kept
+  only for a principal holding the `WithChosenBy` scope, as for
+  `Resume`, and `human` otherwise; a chosen decider the format does not
+  know is refused on both routes. RFC 0001 Nested calls, Pending calls
+  and resume. (#267)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

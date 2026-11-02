@@ -402,6 +402,7 @@ type recorder struct {
 	ctx     context.Context
 	emit    []agentturn.Event
 	answers []agentturn.Answer
+	replies []agenttool.Answer
 }
 
 // noteCtx records a call and the context it came with; note one that
@@ -457,8 +458,11 @@ func (r *recorder) Subscribe(fn func(context.Context, agentturn.Event) error) fu
 	return func() {}
 }
 
-func (r *recorder) Reply(ctx context.Context, _ string, _ agenttool.Answer) error {
+func (r *recorder) Reply(ctx context.Context, _ string, a agenttool.Answer) error {
 	r.noteCtx(ctx, "Reply")
+	r.mu.Lock()
+	r.replies = append(r.replies, a)
+	r.mu.Unlock()
 	return nil
 }
 
@@ -595,6 +599,50 @@ func TestScopes(t *testing.T) {
 			r.mu.Unlock()
 			if got != tc.want {
 				t.Errorf("%s sending by %q: recorded %q, want %q", tc.token, tc.sent, got, tc.want)
+			}
+		}
+	})
+	// #267: who answered a question is on the answer, and a client
+	// names it only under the same host check as a resume's.
+	t.Run("who decided a reply", func(t *testing.T) {
+		chooser := map[string]Principal{
+			"answers": {Name: "alice", Scopes: []Scope{ScopeAnswer}},
+			"engine":  {Name: "engine", Scopes: []Scope{ScopeAnswer, "decide"}},
+		}
+		for _, tc := range []struct {
+			token, sent, want string
+			refused           bool
+		}{
+			{token: "answers", sent: "policy", want: "human"},
+			{token: "answers", sent: "", want: "human"},
+			{token: "answers", sent: "system", want: "human"},
+			{token: "engine", sent: "policy", want: "policy"},
+			{token: "engine", sent: "agent", want: "agent"},
+			{token: "engine", sent: "", want: ""},
+			{token: "engine", sent: "system", refused: true},
+		} {
+			r := &recorder{}
+			srv := httptest.NewServer(Handler(r, WithAuthenticator(tokenAuth(chooser)), WithChosenBy("decide")))
+			c, err := Dial(t.Context(), srv.URL, withToken(tc.token))
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = c.Reply(t.Context(), "q", agenttool.Answer{Action: agenttool.ActionAccept, By: tc.sent, Note: "n"})
+			srv.Close()
+			r.mu.Lock()
+			replies := slices.Clone(r.replies)
+			r.mu.Unlock()
+			if tc.refused {
+				if err == nil || len(replies) != 0 {
+					t.Errorf("%s sending by %q: err %v, replies %+v; want it refused", tc.token, tc.sent, err, replies)
+				}
+				continue
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(replies) != 1 || replies[0].By != tc.want || replies[0].Note != "n" {
+				t.Errorf("%s sending by %q: replied %+v, want by %q", tc.token, tc.sent, replies, tc.want)
 			}
 		}
 	})

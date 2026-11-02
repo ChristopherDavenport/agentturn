@@ -1075,9 +1075,9 @@ type noteSinkKey struct{}
 type notedKey struct{}
 
 // noteElicitor wraps the elicitor a run's tools ask through so that what
-// the user says answering a tool's own question reaches the model, as a
-// user message after the outputs of the call's batch: the tool may not
-// pass it on. A question [Ask] puts about a call
+// the answerer says answering a tool's own question reaches the model,
+// after the outputs of the call's batch, in its voice ([answerNoteItem]):
+// the tool may not pass it on. A question [Ask] puts about a call
 // carries its note on the decision instead. A run inside a tool, a
 // child agent's, wraps the elicitor it finds on its context, its
 // parent's, so the note goes to the run whose tool asked: the
@@ -1096,16 +1096,36 @@ func (r *runner) noteElicitor(elicit agenttool.Elicitor) agenttool.Elicitor {
 			return ans, err
 		}
 		if call, ok := agenttool.CallFrom(ctx); ok {
-			// A person's words, in the person's voice.
-			r.sayUnder(openresponses.UserText(ans.Note), call.ID)
+			// The answerer's words, in their voice: a person's as a
+			// user message, a rule's or another model's as the
+			// harness's.
+			r.sayUnder(answerNoteItem(ans.Note, ans.By), call.ID)
 		}
 		return ans, err
 	}
 }
 
-// userSaid is how a note the user gave with an answer reads to the
-// model.
-func userSaid(note string) string { return "The user said: " + note }
+// saidBy is how a note given with an answer reads to the model, named
+// for the decider that gave it, where it travels inside another
+// message rather than as one of its own.
+func saidBy(by, note string) string {
+	switch by {
+	case agenttool.ByPolicy:
+		return "The policy said: " + note
+	case agenttool.ByAgent:
+		return "Another agent said: " + note
+	}
+	return "The user said: " + note
+}
+
+// lowerFirst lowers the first letter of s, an ASCII one, for a phrase
+// that goes mid-sentence.
+func lowerFirst(s string) string {
+	if s == "" || s[0] < 'A' || s[0] > 'Z' {
+		return s
+	}
+	return string(s[0]+'a'-'A') + s[1:]
+}
 
 // run drives the loop and returns the RunEnd. terminate says the caller
 // asked the run to end once the answers are in, without a model call.
@@ -3250,7 +3270,8 @@ var ErrNoInvoker = errors.New("agentturn: no loop on the context to invoke a too
 // the question names the call, and the elicitor's context carries it
 // as an [AskedCall], its ID, name, whole arguments and the deferral,
 // for [AskedCallFrom]. An accept runs it and a decline refuses it, and
-// tool_start carries that answer as the decision, by "human". Without
+// tool_start carries that answer as the decision, by the decider the
+// answer names, or "human" when it names none. Without
 // an elicitor, or on a cancel or a failure to ask, the deferral
 // refuses the call. Nothing is appended
 // to the transcript, so a nested call costs no items and a Terminate

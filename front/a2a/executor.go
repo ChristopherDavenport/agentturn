@@ -889,7 +889,8 @@ func (e *Executor) startFor(ctx context.Context, t agentturn.Transcript) agenttu
 // cfg's own tools that cfg's hook defers is a question for the serving
 // side, and is put to cfg.ToolElicitor with agentturn.Ask, as the loop
 // puts a nested call the hook deferred: the person's accept runs the
-// call and their decline refuses it, both by "human", and without an
+// call and their decline refuses it, both by the decider the answer
+// names or "human", and without an
 // elicitor, or with no answer, the call is refused with a reason that
 // says it cannot be handed to the caller. The hook therefore never
 // returns Defer for a tool of cfg's own, so no such call is pending
