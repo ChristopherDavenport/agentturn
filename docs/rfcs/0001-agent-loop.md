@@ -1464,7 +1464,10 @@ cancellation is delivered with a usable context.
 The sessions a recorder creates, the root and each child session it
 opens for a tool's run, are described alike. A recorder that names its
 harness MUST write that harness in the header of every session it
-creates, unless the host names a different one for that session.
+creates, unless the host names a different one for that session. A
+child session MUST take the media form, `inline` or `sidecar`, of the
+session whose call spawned it, unless the host names another, so the
+blobs of a tree of sessions are kept one way.
 
 A recorder that continues a path on which a run is open that it is
 not running owns that run and closes it before it writes anything

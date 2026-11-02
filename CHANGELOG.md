@@ -25,6 +25,9 @@ versions may break the API.
 - Fixed: `session.Start` writes the harness `WithHarness` names in the
   root session's header when the header names none, as every child
   session's already did; a header that names one keeps it. (#219)
+- Fixed: a child session the recorder creates takes the media form of
+  the session whose call spawned it, so a sidecar parent's child is a
+  sidecar session too. (#283)
 
 ## v0.0.34 - 2026-10-26
 

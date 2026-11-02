@@ -652,6 +652,43 @@ func TestStartNamesTheHarnessInTheRootHeader(t *testing.T) {
 	}
 }
 
+// TestChildSessionTakesItsParentsMedia pins RFC 0001's The record: a
+// child session a recorder creates takes the media form of the session
+// whose call spawned it (#283).
+func TestChildSessionTakesItsParentsMedia(t *testing.T) {
+	for _, media := range []string{"", agentsession.MediaSidecar} {
+		t.Run("media "+media, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{Media: media})
+			if err != nil {
+				t.Fatal(err)
+			}
+			child := agent.New(agentturn.Config{Name: "specialist", Description: "a child", Model: &echo.Adapter{}})
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{child}})
+			defer rec.Attach(a)()
+			if _, err := a.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
+				t.Fatal(err)
+			}
+			var link *agentsession.LinkEntry
+			for _, e := range s.Entries() {
+				if l, ok := e.(*agentsession.LinkEntry); ok {
+					link = l
+				}
+			}
+			if link == nil {
+				t.Fatalf("no link entry in %q", entryTypes(s))
+			}
+			cs, err := store.Open(context.Background(), link.Session)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cs.Header().Media; got != media {
+				t.Errorf("child media = %q, want %q", got, media)
+			}
+		})
+	}
+}
+
 func TestChildRunProducesLink(t *testing.T) {
 	store := agentsession.NewMemoryStore()
 	rec, s, err := Start(context.Background(), store, agentsession.Header{}, WithHarness("test", "1"))

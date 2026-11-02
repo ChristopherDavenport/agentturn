@@ -912,6 +912,9 @@ type writer struct {
 	// child session inherits: a child runs in its parent's process and
 	// its parent's directory, and a store buckets sessions by it.
 	cwd string
+	// media is the media form the session's header names, which a child
+	// session takes too: its parent's blobs and its own live together.
+	media string
 
 	settings agentsession.Settings
 	// wroteConfig is set once a config entry is on the path, written by
@@ -1543,6 +1546,7 @@ func Start(ctx context.Context, store agentsession.Store, h agentsession.Header,
 		r.harness = s.Header().Harness
 	}
 	r.root.cwd = s.Header().CWD
+	r.root.media = s.Header().Media
 	if s.Header().Base != "" {
 		if err := r.root.closeOpenRun(ctx, s, agentsession.ReasonInterrupted, "fork at "+s.Header().Base, false); err != nil {
 			return nil, nil, err
@@ -2347,6 +2351,7 @@ func resume(ctx context.Context, s *agentsession.Session, store agentsession.Sto
 		r.harness = s.Header().Harness
 	}
 	r.root.cwd = s.Header().CWD
+	r.root.media = s.Header().Media
 	if err := r.root.closeOpenRun(ctx, s, agentsession.ReasonError, "cut off: closed on resume", true); err != nil {
 		return nil, nil, err
 	}
@@ -3537,7 +3542,7 @@ func (r *Recorder) Fold(ctx context.Context, f compact.Fold) error {
 // promises the record entries; a child replayed from its items
 // promises nothing.
 func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, live bool) (*writer, error) {
-	h := agentsession.Header{ParentSession: parent.id, Harness: r.harness, SpawnedBy: callID, CWD: parent.cwd}
+	h := agentsession.Header{ParentSession: parent.id, Harness: r.harness, SpawnedBy: callID, CWD: parent.cwd, Media: parent.media}
 	if live {
 		h.Records = append([]string(nil), agentsession.AllRecords...)
 	}
@@ -3549,7 +3554,9 @@ func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, 
 		if s, err = r.store.Open(ctx, h.ID); err == nil {
 			r.addChild(s.ID())
 			w := newWriter(r, s.ID())
-			w.cwd = parent.cwd
+			// A reopened child keeps the media form it was created
+			// with, which its own children take.
+			w.cwd, w.media = parent.cwd, s.Header().Media
 			w.parent, w.parentID = parent, parent.id
 			if agent.RetryFromContext(ctx) {
 				s.ResetLeaf()
@@ -3570,7 +3577,7 @@ func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, 
 	}
 	r.addChild(s.ID())
 	w := newWriter(r, s.ID())
-	w.cwd = parent.cwd
+	w.cwd, w.media = parent.cwd, parent.media
 	w.parent, w.parentID = parent, parent.id
 	return w, nil
 }
