@@ -929,6 +929,10 @@ type writer struct {
 	// follow: turn_start computes it and the next event of the turn
 	// writes it, so an annotation made during turn_start lands first.
 	settleReq *openresponses.Request
+	// settleOmit is the omit setting settleReq is hashed under, which
+	// its settle writes: the one in force, or one that describes how
+	// the request's input differs from what the path holds.
+	settleOmit agentsession.Omit
 	// inFlight is set from turn_start to the response; pending is the
 	// hash of the request in flight, empty when the recorder cannot
 	// stand behind it; started is when it was sent; inFlightID is the
@@ -964,6 +968,9 @@ type writer struct {
 	items  []string
 	values openresponses.Items
 	custom []bool
+	// meta holds, beside each item, what the writer knows of its entry
+	// beyond the item: whether a fold contributed it.
+	meta []itemMeta
 	// models holds, beside each item, the model in force when a
 	// reasoning item a response produced was written, "" for every other
 	// item: what the omit rule [agentsession.OmitOtherModels] compares
@@ -1057,6 +1064,14 @@ type writer struct {
 	lastCalls    bool
 	answeredCall bool
 	withheld     bool
+}
+
+// itemMeta is what a writer knows of an item's entry beyond the item.
+type itemMeta struct {
+	// folded marks an item a compaction contributes, its summary or a
+	// pin, on a path the writer was seeded from: no item entry, so no
+	// omit reaches it.
+	folded bool
 }
 
 // unnamedItem is an item_end of the call in flight that named no
@@ -2045,7 +2060,7 @@ func Transcript(s *agentsession.Session) (openresponses.Items, error) {
 	if err != nil {
 		return nil, fmt.Errorf("session: context at leaf: %w", err)
 	}
-	items, _, _ := transcriptOf(cx)
+	items, _, _, _ := transcriptOf(cx)
 	return items, nil
 }
 
@@ -2066,7 +2081,7 @@ func TranscriptModels(s *agentsession.Session) (openresponses.Items, agentturn.R
 	if err != nil {
 		return nil, nil, fmt.Errorf("session: context at leaf: %w", err)
 	}
-	items, entries, _ := transcriptOf(cx)
+	items, entries, _, _ := transcriptOf(cx)
 	produced := producedModels(s.Path(s.Leaf()))
 	models := agentturn.ReasoningModels{}
 	for i, item := range items {
@@ -2110,31 +2125,38 @@ func producedModels(path []agentsession.Entry) map[string]string {
 // the ID of the entry contributing each item, and whether that entry
 // is a custom entry, outside the context, one [MarkedItem] decodes. The
 // items the omit setting leaves out of a request to the model at the
-// leaf are in it, where the path holds them.
-func transcriptOf(cx agentsession.Context) (items openresponses.Items, entries []string, custom []bool) {
+// leaf are in it, where the path holds them, and an item it sends with
+// a placeholder in place of an output or an image is in it as the
+// path holds it. folded marks the items a compaction contributes.
+func transcriptOf(cx agentsession.Context) (items openresponses.Items, entries []string, custom, folded []bool) {
 	omitted := make(map[agentsession.Entry]bool, len(cx.OmittedItems))
 	for _, o := range cx.OmittedItems {
 		omitted[o.Entry] = true
 	}
 	j := 0
 	for _, e := range cx.Entries {
-		if ie, ok := e.(*agentsession.ItemEntry); ok && omitted[e] {
-			items, entries, custom = append(items, ie.Item), append(entries, ie.ID), append(custom, false)
+		if ie, ok := e.(*agentsession.ItemEntry); ok {
+			if omitted[e] || j < len(cx.ItemEntries) && cx.ItemEntries[j] == e {
+				items, entries, custom, folded = append(items, ie.Item), append(entries, ie.ID), append(custom, false), append(folded, false)
+			}
+			if !omitted[e] && j < len(cx.ItemEntries) && cx.ItemEntries[j] == e {
+				j++
+			}
 			continue
 		}
 		// A compaction contributes its summary and its pins in a row.
 		for ; j < len(cx.ItemEntries) && cx.ItemEntries[j] == e; j++ {
-			items, entries, custom = append(items, cx.Items[j]), append(entries, e.Base().ID), append(custom, false)
+			items, entries, custom, folded = append(items, cx.Items[j]), append(entries, e.Base().ID), append(custom, false), append(folded, true)
 		}
 		c, ok := e.(*agentsession.CustomEntry)
 		if !ok {
 			continue
 		}
 		if item, _, ok := MarkedItem(c); ok {
-			items, entries, custom = append(items, item), append(entries, c.ID), append(custom, true)
+			items, entries, custom, folded = append(items, item), append(entries, c.ID), append(custom, true), append(folded, false)
 		}
 	}
-	return items, entries, custom
+	return items, entries, custom, folded
 }
 
 // CallIDs returns the call ID of every function call in the session,
@@ -3204,7 +3226,7 @@ func (w *writer) reset() {
 	w.inFlight, w.pending, w.started, w.inFlightID = false, "", time.Time{}, ""
 	w.unhashed, w.noted = nil, nil
 	w.unnamed = nil
-	w.items, w.values, w.custom, w.models = nil, nil, nil, nil
+	w.items, w.values, w.custom, w.models, w.meta = nil, nil, nil, nil, nil
 	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = false, 0, nil, nil
 	w.calls = map[string]*callRecord{}
 	// The links written are on the branch left: a call whose child is
@@ -3230,11 +3252,14 @@ func (w *writer) seed(ctx context.Context, s *agentsession.Session, owed bool) e
 	}
 	w.settings = cx.Settings
 	w.wroteConfig = hasConfig(cx.Entries)
-	w.values, w.items, w.custom = transcriptOf(cx)
+	var folded []bool
+	w.values, w.items, w.custom, folded = transcriptOf(cx)
 	produced := producedModels(s.Path(s.Leaf()))
 	w.models = make([]string, len(w.items))
+	w.meta = make([]itemMeta, len(w.items))
 	for i, id := range w.items {
 		w.models[i] = produced[id]
+		w.meta[i].folded = folded[i]
 	}
 	w.base = lastConfigBase(s.Path(s.Leaf()))
 	w.seededNotes, w.heldNotes = lastHeldNotes(s.Path(s.Leaf())), nil
@@ -4081,7 +4106,8 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 	default:
 		return nil
 	}
-	return w.settle(ctx, Canonical(w.cfg.BaseRequest(ctx)))
+	req := Canonical(w.cfg.BaseRequest(ctx))
+	return w.settle(ctx, req, w.omitFor(req.Model))
 }
 
 // lastConfigBase returns the [ConfigBaseMember] of the last run start
@@ -4230,11 +4256,11 @@ func (w *writer) turnStart(ctx context.Context, e *agentturn.TurnStart) error {
 		return err
 	}
 	req := Canonical(e.Request)
-	hash, unhashed, err := w.hash(req)
+	hash, omit, unhashed, err := w.hash(req)
 	if err != nil {
 		return err
 	}
-	w.settleReq = &req
+	w.settleReq, w.settleOmit = &req, omit
 	if w.attempt, err = json.Marshal(req); err != nil {
 		return fmt.Errorf("session: encode request: %w", err)
 	}
@@ -4265,7 +4291,7 @@ func (w *writer) attempts() int {
 // that answered.
 func (w *writer) retry(ctx context.Context, e *agentturn.ModelRetry) error {
 	req := Canonical(e.Request)
-	hash, unhashed, err := w.hash(req)
+	hash, omit, unhashed, err := w.hash(req)
 	if err != nil {
 		return err
 	}
@@ -4294,7 +4320,7 @@ func (w *writer) retry(ctx context.Context, e *agentturn.ModelRetry) error {
 		return err
 	}
 	w.attempt, w.attemptModel, w.retries = next, req.Model, e.Attempt
-	w.settleReq = &req
+	w.settleReq, w.settleOmit = &req, omit
 	w.inFlight = true
 	w.pending, w.unhashed = hash, unhashed
 	w.started = w.rec.now()
@@ -4307,9 +4333,9 @@ func (w *writer) flush(ctx context.Context) error {
 	if w.settleReq == nil {
 		return nil
 	}
-	req := *w.settleReq
-	w.settleReq = nil
-	return w.settle(ctx, req)
+	req, omit := *w.settleReq, w.settleOmit
+	w.settleReq, w.settleOmit = nil, agentsession.Omit{}
+	return w.settle(ctx, req, omit)
 }
 
 // name writes the items held for the call in flight, in order, with
@@ -4328,17 +4354,30 @@ func (w *writer) name(ctx context.Context, responseID string) (bool, error) {
 }
 
 // hash returns the request's hash when its input is what the stored
-// path rebuilds, and otherwise "" and why not.
-func (w *writer) hash(req openresponses.Request) (string, *Unhashed, error) {
-	expected, ok := w.expectedInput(req.Model, w.omitFor(req.Model))
+// path rebuilds under the omit setting it returns, which the settle of
+// the request writes, and otherwise "" and why not. The setting is the
+// one in force, with the reasoning rule a model switch adds, or one
+// that describes how the input differs from what the path holds, when
+// the format can describe it (#233).
+func (w *writer) hash(req openresponses.Request) (string, agentsession.Omit, *Unhashed, error) {
+	omit := w.omitFor(req.Model)
+	expected, ok := w.rebuild(req.Model, omit)
 	if !ok {
-		return "", &Unhashed{Reason: "the last fold recorded keeps more items than the recorder holds"}, nil
+		return "", omit, &Unhashed{Reason: "the last fold recorded keeps more items than the recorder holds"}, nil
 	}
-	if !equalJSON(expected, req.Input) {
-		return "", divergence(req.Input, expected), nil
+	if !w.matches(req.Input, expected) {
+		described, ok := w.describe(req.Input, req.Model)
+		if !ok {
+			items := make(openresponses.Items, len(expected))
+			for k, r := range expected {
+				items[k] = r.item
+			}
+			return "", omit, divergence(req.Input, items), nil
+		}
+		omit = described
 	}
 	hash, err := RequestHash(req)
-	return hash, nil, err
+	return hash, omit, nil, err
 }
 
 // divergence names the first item at which sent, a request's input,
@@ -4396,35 +4435,6 @@ func (w *writer) noteUnhashed(ctx context.Context, why *Unhashed) error {
 	return nil
 }
 
-// expectedInput is the input the stored path rebuilds, as the context
-// algorithm reads it: the summary of the last fold recorded, then the
-// items that fold pinned, then the items written as item entries from
-// the fold's first kept one on, less the ones omit leaves out of a
-// request to model.
-func (w *writer) expectedInput(model string, omit agentsession.Omit) (openresponses.Items, bool) {
-	from := 0
-	var out openresponses.Items
-	if w.foldSet {
-		if w.foldSplit > len(w.values) {
-			return nil, false
-		}
-		from = w.foldSplit
-		out = append(out, w.foldSummary)
-		out = append(out, w.foldPinned...)
-	}
-	listed := make(map[string]bool, len(omit.Items))
-	for _, id := range omit.Items {
-		listed[id] = true
-	}
-	for i := from; i < len(w.values); i++ {
-		if w.custom[i] || listed[w.items[i]] || w.leftOut(i, model, omit) {
-			continue
-		}
-		out = append(out, w.values[i])
-	}
-	return out, true
-}
-
 // leftOut reports whether omit's rule leaves the reasoning item at
 // index i out of a request to model: it is one a response produced
 // while another model was in force. A request under no model leaves
@@ -4467,11 +4477,11 @@ func (w *writer) omitFor(model string) agentsession.Omit {
 // made.
 func (w *writer) blocked(ctx context.Context, e *agentturn.ModelBlocked) error {
 	req := Canonical(e.Request)
-	hash, unhashed, err := w.hash(req)
+	hash, omit, unhashed, err := w.hash(req)
 	if err != nil {
 		return err
 	}
-	if err := w.settle(ctx, req); err != nil {
+	if err := w.settle(ctx, req, omit); err != nil {
 		return err
 	}
 	if err := w.noteUnhashed(ctx, unhashed); err != nil {
@@ -4502,7 +4512,7 @@ func (w *writer) blocked(ctx context.Context, e *agentturn.ModelBlocked) error {
 // config first and deltas after. With [WithInstructionsParts] the
 // entries carry the parts of the instructions when they join to the
 // request's, and what was left out.
-func (w *writer) settle(ctx context.Context, req openresponses.Request) error {
+func (w *writer) settle(ctx context.Context, req openresponses.Request, want agentsession.Omit) error {
 	parts, omitted := w.instructionParts(ctx, req)
 	full, err := agentsession.ConfigFromRequestParts(req, parts...)
 	if err != nil {
@@ -4513,16 +4523,14 @@ func (w *writer) settle(ctx context.Context, req openresponses.Request) error {
 	// [] when it emptied.
 	omittedDelta := w.settings.OmittedDelta(omitted)
 	// What a request leaves out of the context is the path's to say,
-	// and it is written with the model change it answers: a delta
-	// carrying the rule, or nothing when it is in force.
-	want := w.omitFor(req.Model)
+	// and it is written with the change it answers: a delta carrying
+	// the rule or the items, outputs and images left out, or nothing
+	// when it is in force. One no delta can reach, an item left out
+	// before and sent again, is a replace, which carries it whole.
 	omit, ok := w.settings.OmitDelta(want)
-	if !ok {
-		return fmt.Errorf("session: omit setting %+v is not one config entry", want)
-	}
 	var entry *agentsession.ConfigEntry
 	switch {
-	case !w.wroteConfig:
+	case !w.wroteConfig || !ok:
 		entry = full
 	default:
 		entry = configDelta(w.settings, agentsession.Settings{}.Apply(full), full, parts, omitted)
@@ -4545,7 +4553,10 @@ func (w *writer) settle(ctx context.Context, req openresponses.Request) error {
 		// is wanted whole; a delta carries what moved.
 		if entry.Replace {
 			if !want.IsZero() {
-				kept := agentsession.Omit{Reasoning: want.Reasoning, Items: slices.Clone(want.Items)}
+				kept := agentsession.Omit{Reasoning: want.Reasoning, Items: slices.Clone(want.Items), Images: want.Images}
+				if want.Outputs != nil {
+					kept.Outputs = &agentsession.OmitOutputs{Text: want.Outputs.Text, Items: slices.Clone(want.Outputs.Items)}
+				}
 				entry.Omit = &kept
 			}
 		} else {
@@ -4775,6 +4786,7 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 	w.items = append(w.items, id)
 	w.values = append(w.values, item)
 	w.custom = append(w.custom, appOnly)
+	w.meta = append(w.meta, itemMeta{})
 	model := ""
 	if _, ok := item.(*openresponses.ReasoningItem); ok && responseID != "" {
 		model = w.settings.Model

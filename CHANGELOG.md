@@ -41,6 +41,28 @@ versions may break the API.
   `source`. Before, the observer dropped them and the item was written
   bare. (#289)
 
+- Fixed: the session recorder describes a request whose input differs
+  from what the path holds by edits the format can describe, rather
+  than leaving it unhashed. Item entries left out with their order
+  kept, function call outputs sent as one placeholder text and the
+  image parts of all but the last few sent as one placeholder are
+  written as a `config` entry whose `omit` names them, `items`,
+  `outputs` and `images`, before the response, and the response
+  carries its hash. A handoff that trims the transcript between runs,
+  a transform that keeps a window, or a host that clears old tool
+  results now verifies; an item left out and sent again is a replace.
+  Only an input the format cannot describe, an item added or
+  rewritten, is still unhashed. RFC 0001's The request states the rule
+  and drops the paragraph that said a transform's change to the input
+  could not be described. (#233)
+- Added: `session.Recorder.Omit(ctx, ids...)`, for a host that names
+  the entries it trimmed instead of leaving the recorder to find them,
+  and `session.ErrNotOmittable` for an ID that names no item entry of
+  the context. (#233)
+- Fixed: `session.Transcript`, `TranscriptModels` and a recorder seeded
+  from a path whose `omit` sends outputs or images as placeholders
+  hold those items as the path holds them, not as the placeholder.
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

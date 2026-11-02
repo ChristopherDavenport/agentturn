@@ -433,15 +433,24 @@ does, and a cached prefix survives a run boundary. That is the writing
 discipline of agentsession RFC 0001 applied where the request is made.
 
 Two consequences follow for the record and are stated here because
-they are decided here. A change to the input by the transform or the
-hook is one the record cannot describe: the path holds the transcript's
-items and the request carried others, so a recorder that hashes what it
-sent MUST decline to hash rather than write a hash the path cannot
-verify (#92). A change to a setting by the hook is a config delta on
-the path. A transform that folds the transcript and reports the fold to
-the recorder, with what it kept, is the one edit the record can
-describe, and it is described as a compaction rather than as a
-divergence.
+they are decided here. A change to a setting by the hook is a config
+delta on the path. A change to the input, by the transform, the hook
+or a host that replaced the transcript, is described when the session
+format can describe it, and costs the hash only when it cannot. When
+the input sent differs from the input the path rebuilds only by edits
+agentsession RFC 0001's `omit` describes — item entries left out with
+their order kept, function call outputs sent as one placeholder text,
+the image parts of all but the last few sent as one placeholder — the
+recorder MUST write a `config` delta whose `omit` describes them before
+the response, a replace carrying the setting whole when an item left
+out is sent again, and hash the request against the path as edited; a
+host MAY name the entries it trimmed instead of leaving the recorder to
+find them. The recorder MUST decline the hash only for an input the
+format cannot describe, an item added or rewritten, since the path
+holds the transcript's items and the request carried others, rather
+than write a hash the path cannot verify (#92, #233). A transform that
+folds the transcript and reports the fold to the recorder, with what
+it kept, is described as a compaction rather than as an `omit`.
 
 ### The model call
 
@@ -1444,13 +1453,12 @@ An agent stands in four places inside another system:
   (`omit.outputs`, `omit.images`) since 0.14. A recorder that writes
   that `omit` before the response hashes the request against the path
   as edited, and only an input the format cannot describe leaves the
-  responses after it unhashed. The reference recorder writes the
-  reasoning rule alone so far, and a trim it does not describe costs
-  the hash (#233). A handoff that trims what the receiver
-  sees does it once, between runs, by replacing the transcript; a
-  recorder moved to the last entry kept keeps every later response
-  verifiable when the trim takes a prefix, and one that describes a
-  trim from the middle as an `omit` keeps them verifiable too. Where each agent keeps a session of its own,
+  responses after it unhashed, as the request procedure has it (#233).
+  A handoff that trims what the receiver sees does it once, between
+  runs, by replacing the transcript, and the receiver's first request
+  carries the `omit` that describes the trim; a recorder moved to the
+  last entry kept keeps every later response verifiable as well when
+  the trim takes a prefix. Where each agent keeps a session of its own,
   the receiver's is a fork of the sender's at the handoff's last entry,
   a session whose header names that entry as its base, and every hash
   on the fork's path verifies when the receiver starts from the fork's
@@ -1474,7 +1482,7 @@ of the events.
 | `model_retry` | a record entry with the attempt, the error, the delay, the failed attempt's model and whether the retry policy revised the request, before the response of the attempt that answers; the revised request's settings are settled with that attempt, so only the attempt that answered is configured on the path. The record entry stays beside the count below, since it says what the count cannot |
 | `model_blocked` | for an error marked as a guard's, a custom entry in `agentturn:model_blocked` carrying the guard's error, the request hash and the model, since the run stopped rather than failed and a failed `response` would make its end read as a failure; for any other error, a failed `response` carrying the hook's error and the request hash. Either way the call that was refused is told from one that was made and failed |
 | `item_end` | an `item`, with the display flag off for a hidden item, and the run's trigger as `source` for an item the run was prompted with, an answer's output on a resume excepted. Before a caller-supplied output for a call that was neither dispatched nor rejected, a `reject` decision with the output's text as its reason and the decider the caller named, and `policy` as the decider when the loop refused the call itself in this run, for a name no tool has or arguments that are not an object, or closed it because the output guard withheld the response that made it; before one for a call that may have run, dispatched in an earlier run or on a path that does not promise dispatch records, an `answer` decision with the answer's decider and reason, since a `proceed` would say the call went on toward its tool and a `reject` that it never reached it, and no second `dispatch` says the tool did not run again; before one for a call the path already shows answered, nothing; one for a call that has its output is refused with agentsession's `ErrCallCompleted`, since the context would hold two. The answer's output for a call that completed off the path the run continues, which the caller marked with where it was taken from, is written with a `link` to the child session that produced the output it repeats, when the record holds one: the `subsession` link a branch of this session holding the original output has for the call, written again on this branch before the `answer`, since a link on a branch left says nothing of this one; a fork writes none, since a `subsession` link names a child of the session that writes it and the child is the origin's, which the fork reaches through the origin's link in its prefix. A call the loop renamed keeps the model's ID in an `agentturn:model_call_id` member beside the `item`. An output's `item` MUST be marked `failed` when the call's `tool_end` carried the tool's error for a hand-off of this run, or when the answer it is reports that the call failed, as an output saying a cut call's outcome is unknown does; a call refused, by a block, by the loop for a name no tool has or arguments that are not an object, or by an answer's output for a call that never started, is recorded by its `reject` and MUST NOT be marked |
-| `response_end` | the `response`, with `request_hash` when the input the loop sent is the input the recorded path rebuilds, and none otherwise, and `attempts`, the calls it took, when the retry policy tried it again; a `response_end` marked withheld is written `incomplete` with `content_filter` and no error, as the loop gives it, so the guard's text is not on it, before the outputs that close its calls; so is the failed `response` `run_end` writes for a call left in flight, where an abort during the retry's backoff counts the attempt that was due, since nothing tells it from an abort before that attempt streamed |
+| `response_end` | the `response`, with `request_hash` when the input the loop sent is the input the recorded path rebuilds, under the `omit` written before it when the input differs by edits the format describes, as the request procedure has it, and none otherwise, and `attempts`, the calls it took, when the retry policy tried it again; a `response_end` marked withheld is written `incomplete` with `content_filter` and no error, as the loop gives it, so the guard's text is not on it, before the outputs that close its calls; so is the failed `response` `run_end` writes for a call left in flight, where an abort during the retry's backoff counts the attempt that was due, since nothing tells it from an abort before that attempt streamed |
 | `tool_start` | a `decision`: `reject` with the reason for a block, `call blocked` when it gave none, and `answer` in its place for a call that may have run, since the format keeps `reject` for a call no `dispatch` reached; nothing for a call a `reject` or an `answer` already ended, which takes only its output, and a refusal, with `ErrCallCompleted`, for one that has its output, which the format reads as ended, so a loop that lost track of a call fails its run rather than the record hiding it; `hold` for a defer, with the reason when given; `proceed` for a call that was held, whose arguments were rewritten, with the arguments, or whose decision gave a reason, with the reason, and for a call an earlier run dispatched that goes to its tool again, since running it again is a decision: when its decision gives no reason, the proceed is written before its second `dispatch` with `run again` as the reason, and not at all when the loop refuses the call before it. The decider is the decision's, and `policy` for a call nothing was holding and no earlier run dispatched whose decision names nobody. A nested call is a record entry instead |
 | `tool_dispatch` | a `dispatch`, durable before the event returns, so the tool runs after it or not at all, carrying the call's idempotency key as `idempotency_key`; a second one for a call an earlier run dispatched and a resume runs again, carrying the key it runs under, that of the dispatch it repeats unless a decision made it a new operation, so the path holds one per hand-off; nothing for a nested call; and a refusal, with agentsession's `ErrCallCompleted`, for a call whose output is on the path, so its tool does not run again as the same call; and a refusal for a call no `function_call` entry on the path names, other than one the filter keeps from the model, so no tool runs unrecorded. Every `decision` and `dispatch` names its call by `target`, the entry of its `function_call`, whichever writer wrote it: a live run's, one seeded by a resume or a rebase, a reopened child's. A function call the filter keeps from the model is a custom entry, which no `target` can name, and takes none. Subscribers are called in order, so one that vetoes a dispatch is registered before the recorder; one registered after it refuses a call whose dispatch is already durable, and the call's `tool_end` says the hand-off was withdrawn, for which the recorder MUST write agentsession RFC 0001's withdrawal, a `reject` carrying `withdrawn: true` with the refusal as its reason, directly after that `dispatch`, so the call reads as it was before it, never started when it has no other, and is not held to the replay rule (#119) |
 | `tool_end` | for a call the model made whose tool returned a result of its own, neither `cut` nor `withdrawn`, while another call of its batch has not settled, a `result` entry naming the call, carrying the output as the batch will append it and `failed` as its `item` will, durable before the event returns, since the batch appends the outputs only once every call has settled and a process that dies in between would otherwise leave a call that ran with nothing to show for it: a recorder MUST write it then, and MUST NOT write one for a call whose output joins as soon as it settles, the last of its batch; the output that later joins the path is that result's item, with no decision before it. Then a recordable details value as a record entry in its namespace, its `call_id` naming the call, or for a nested call the call whose tool made it; a nested call's record; for a child run that was not observed, its session written from the items it added and its `link`; an observed child's `link` and session are written by the observer from the child's own events, starting at its `run_start`, and the child's `queued` reports are among them: one that names a run MUST go to that run's session, and one that names no run, an input the child accepted while idle and reports before the start of the run that takes it, MUST go to the session of that run, written before anything appends the item, so the item that drains it names it in `queued_from` with its trigger as `source` |
@@ -1565,7 +1573,7 @@ maps onto it as follows:
 | handoffs a front takes | `WithHandoff`, `WithStart`, `WithTransfers(route)` in both fronts; `front/responses.Route`, `Handoffs`, `HandedTo`, `Attribute`, re-exported by `front/a2a` but for `Attribute` |
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)` |
-| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `RecordFunc`, `Elicitor`, `Requeue`, `Rebase`; `WithInstructionsParts`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`; the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
+| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Requeue`, `Rebase`; `WithInstructionsParts`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`; the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
 
 Every error the package returns to its caller, sentinel or wrapped,
 begins with `agentturn:`; the error texts a call's output carries,
@@ -1797,10 +1805,10 @@ the scenario, fixed without a change of rule.
   match one sentinel, and the pending calls are reached by a type
   switch per implementation. An interface both satisfy is proposed.
 - **The handoff** (#96). The fourth composition is the cheapest and
-  the least documented. The loop now leaves another model's reasoning
-  items out of each turn's request (#91); that omission, like every route
-  that trims the history mid-path, costs the responses after it their
-  request hash, which is the format's question (agentsession#56).
+  the least documented. The loop leaves another model's reasoning
+  items out of each turn's request (#91), and a recorder describes that
+  omission, and a trim from the middle of the history, with the
+  format's `omit` (agentsession#56, #233), so neither costs a hash.
 - **A second execution under one call** (#87, resolved). A child tool
   builds a fresh agent per call while the recorder continued the child
   session at its leaf, so the second run's path rebuilt a context the

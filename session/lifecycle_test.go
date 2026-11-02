@@ -536,9 +536,10 @@ func unhashedOf(t *testing.T, s *agentsession.Session) []Unhashed {
 // leaves without a hash for one cause is preceded by one UnhashedNS
 // entry naming it, at the first; another is written when the cause
 // changes, or when hashing resumed and the input diverges again. A
-// window of the transcript is one cause though it sends another item
-// first at every turn, and a recorder resumed in a new process takes
-// up the cause the path last named.
+// recorder resumed in a new process takes up the cause the path last
+// named. A window of the transcript is no cause at all: it leaves item
+// entries out, their order kept, which the omit setting describes, so
+// its responses carry a hash (#233).
 func TestUnhashedSaysWhyOnce(t *testing.T) {
 	const (
 		none   = ""
@@ -562,7 +563,7 @@ func TestUnhashedSaysWhyOnce(t *testing.T) {
 		{name: "hashing resumes, then diverges again", modes: []string{front, front, none, front}, want: []int{0, 0}},
 		{name: "the cause changes", modes: []string{front, behind, behind}, want: []int{0, 3}},
 		{name: "never diverges", modes: []string{none, none}},
-		{name: "a window", modes: []string{none, window, window, window}, want: []int{0}},
+		{name: "a window is described", modes: []string{none, window, window, window}},
 		{name: "a restart keeps the cause", modes: []string{front, front, front}, want: []int{0}, restart: 2},
 		{name: "a restart after a hashed response", modes: []string{front, none, front}, want: []int{0, 0}, restart: 2},
 	}
@@ -610,7 +611,7 @@ func TestUnhashedSaysWhyOnce(t *testing.T) {
 				if _, err := a.Prompt(ctx, openresponses.UserText(fmt.Sprint("prompt ", i))); err != nil {
 					t.Fatal(err)
 				}
-				if m != none {
+				if m == front || m == behind {
 					unhashed++
 				}
 			}
