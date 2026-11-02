@@ -399,7 +399,11 @@ that a recorder holding the transcript and the settings rebuilds it:
 2. Apply the **transform**, which MAY return a shorter or otherwise
    edited list for this call only: prune, compact, inject. It receives
    a copy of the list and MUST NOT mutate the items. The working
-   transcript is not replaced.
+   transcript is not replaced. A model call the transform makes for its
+   own purposes, such as a fold's summary, MUST be distinguishable from
+   a turn's call by the model it calls, without reading the request:
+   the binding carries the mark beside the request, not on it, so
+   neither the provider nor the request hash sees it (#88).
 3. Apply the **filter** to the result, which removes what the model
    must not see. Then leave out every reasoning item the loop knows a
    model under another model name produced: a reasoning item carries a
@@ -1532,7 +1536,7 @@ maps onto it as follows:
 | hidden item | `Hidden(item)`, `Unhide(item)`; `Hidden` on the item events |
 | filter | `Config.Filter`; `DefaultFilter`, `VisibleFilter(types…)` |
 | reasoning another model produced | `ReasoningModels` (`Attribute`, `For`); `WithReasoningModels` for an agent, `ContextWithReasoningModels` for `Run` and `Continue` |
-| transform | `Config.Transform`; `compact.New`, `compact.NewLocal` as the reference |
+| transform | `Config.Transform`; `compact.New`, `compact.NewLocal` as the reference; `compact.MarkFold`/`compact.IsFold` for a fold's own model call |
 | configuration | `Config`; `Config.BaseRequest`, `Config.ResolveTools` |
 | tools of the moment | `Config.Tools`, `Config.ToolProvider` |
 | execution mode, bound | `Config.ToolExecution` (`ExecParallel`, `ExecSequential`), `Config.MaxParallelTools` |
@@ -1809,10 +1813,6 @@ the scenario, fixed without a change of rule.
   leaf. A run a host starts on an agent it kept through `WithSpawn` is
   unmarked and continues at the leaf, since that agent holds its
   context.
-- **A fold identifying itself** (#88). The local fold's summary request
-  is a request with no tools and no instructions, and a replay tells a
-  fold from a turn by that shape. A marker on the context the fold
-  already passes is proposed.
 - **Why a request was not hashed** (#92). A recorder declines a hash it
   cannot stand behind, and a response with no hash has three
   indistinguishable causes. A member on the response entry saying why,

@@ -1153,3 +1153,40 @@ func TestLocalSummaryLeavesOutReasoning(t *testing.T) {
 		})
 	}
 }
+
+// foldSpotter answers every call with text and records, for each, what
+// IsFold says of its context.
+type foldSpotter struct{ marks []bool }
+
+func (f *foldSpotter) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	f.marks = append(f.marks, IsFold(ctx))
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("ok"); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestAFoldsOwnCallIsMarked pins RFC 0001's The request, step 2 (#88):
+// the model call a fold makes for itself is told from a turn's by its
+// context, not by the request's shape, here one model serving both and
+// a configuration with no tools or instructions, whose turn requests
+// look like a summary request.
+func TestAFoldsOwnCallIsMarked(t *testing.T) {
+	m := &foldSpotter{}
+	tr := NewLocal(m, WithBudget(5), WithKeepLast(1), WithEstimator(count), WithModel("small"))
+	cfg := agentturn.Config{Model: m, ModelName: "m", Transform: tr.Transform}
+	if _, end, err := firstRequests(t, agentturn.Run(context.Background(), items(6), openresponses.Items{openresponses.UserText("latest")}, cfg)); err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("err = %v end = %+v", err, end)
+	}
+	if !slices.Equal(m.marks, []bool{true, false}) {
+		t.Errorf("IsFold per call = %v, want the summary marked and the turn not", m.marks)
+	}
+	if IsFold(context.Background()) {
+		t.Error("an unmarked context reads as a fold's")
+	}
+}

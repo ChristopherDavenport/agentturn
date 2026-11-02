@@ -45,6 +45,25 @@ import (
 	"github.com/ChristopherDavenport/openresponses"
 )
 
+type foldKey struct{}
+
+// MarkFold returns ctx marked as the context of a model call a fold
+// makes for itself, such as [NewLocal]'s summary. The mark rides beside
+// the request, not on it, so neither the provider nor a request hash
+// sees it.
+func MarkFold(ctx context.Context) context.Context {
+	return context.WithValue(ctx, foldKey{}, true)
+}
+
+// IsFold reports whether ctx is the context of a model call a fold
+// makes for itself, as [MarkFold] marks it: a model, a streamer
+// wrapping one or a replay tells a fold's call from a turn's by this,
+// when the call arrives, rather than by the request's shape.
+func IsFold(ctx context.Context) bool {
+	v, _ := ctx.Value(foldKey{}).(bool)
+	return v
+}
+
 // Compactor is the compaction side of an openresponses.Adapter.
 type Compactor interface {
 	Compact(ctx context.Context, req openresponses.CompactRequest) (*openresponses.CompactResponse, error)
@@ -168,9 +187,10 @@ func WithSummaryPrompt(prompt string) Option { return func(t *Transform) { t.pro
 // default reasoning may think through the whole fold and end with a
 // function call copied from the transcript, so a caller whose own
 // requests set Reasoning sets the same here, and may set
-// MaxOutputTokens, Temperature or any other field. A replay tells the
-// fold's call from a turn by its lack of tools and instructions, so
-// leave those empty. The transform sets MaxOutputTokens to half the
+// MaxOutputTokens, Temperature or any other field. The call's context
+// is marked with [MarkFold], so a model or a replay tells it from a
+// turn's by [IsFold] whatever the request holds. The transform sets
+// MaxOutputTokens to half the
 // budget, at most [DefaultSummaryMaxOutputTokens], before fn runs, so
 // a summary that runs away is cut by the server; fn may change or
 // clear it. fn runs once per attempt on a
@@ -331,7 +351,7 @@ func New(c Compactor, opts ...Option) *Transform {
 		t.minFold = 0
 	}
 	t.fold = func(ctx context.Context, input openresponses.Items) (folded, error) {
-		resp, err := c.Compact(ctx, openresponses.CompactRequest{Model: t.model, Input: input})
+		resp, err := c.Compact(MarkFold(ctx), openresponses.CompactRequest{Model: t.model, Input: input})
 		if err != nil {
 			return folded{attempts: 1}, fmt.Errorf("compact: %w", err)
 		}
@@ -488,6 +508,8 @@ func unfolded(err error) bool {
 
 // summarize asks model once for a summary of input.
 func (t *Transform) summarize(ctx context.Context, model openresponses.Streamer, input openresponses.Items) (folded, error) {
+	// The summary is the fold's own call, and says so to the model.
+	ctx = MarkFold(ctx)
 	store := false
 	req := openresponses.Request{
 		Model: t.model,
