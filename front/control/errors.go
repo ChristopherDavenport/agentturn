@@ -53,6 +53,7 @@ var sentinels = []struct {
 	{"deadline_exceeded", context.DeadlineExceeded},
 	{"remote_tool", ErrRemoteTool},
 	{"unknown_command", ErrUnknownCommand},
+	{"no_delivery", ErrNoDelivery},
 	{"unauthenticated", ErrUnauthenticated},
 	{"forbidden", ErrForbidden},
 }

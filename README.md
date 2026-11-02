@@ -130,7 +130,9 @@ to say who answered, and a
 subscriber that attaches while one waits is sent it first. Those
 methods, with `Prompt`, `Resume`, `Queue`, `Abort`, `State` and
 `Subscribe`, are `agentturn.Control`, the contract a client drives an
-agent through, which `*Agent` implements in process.
+agent through, which `*Agent` implements in process. `Deliver` is the
+optional `agentturn.Deliverer` beside it, which front/control serves,
+since a remote party cannot tell whether a run will still take a steer.
 
 ## Tools
 

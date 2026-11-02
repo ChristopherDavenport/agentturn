@@ -53,6 +53,22 @@ type Control interface {
 
 var _ Control = (*Agent)(nil)
 
+// Deliverer is the delivery a [Control] may offer beside Queue, which
+// [Agent.Deliver] is: the items are queued as a steer that must reach
+// the model, and Deliver says whether they joined the run in flight,
+// or, when no run would take them, starts one that does once the run
+// in flight has ended, unless calls are pending, and returns its end.
+// A party that cannot observe the agent atomically, one across a wire
+// above all, cannot tell from Queue and State whether a run will still
+// take a steer: a run past its last drain still reads as running. A
+// front that lets a remote party queue input SHOULD offer it; *Agent
+// implements it, and so does front/control's Client.
+type Deliverer interface {
+	Deliver(ctx context.Context, items ...openresponses.Item) (joined bool, end *RunEnd, err error)
+}
+
+var _ Deliverer = (*Agent)(nil)
+
 // Question event type names.
 const (
 	EventQuestion       = "question"

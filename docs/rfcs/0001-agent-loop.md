@@ -1270,6 +1270,16 @@ made, does not wait, since the run waits on it: the item joins the run
 as any steer does, or waits for the next run when the run is past its
 last drain.
 
+A front that lets a remote party queue input into an agent SHOULD also
+offer the delivery, with these semantics: the item joins the run in
+flight when that run will still take it, and otherwise starts a run
+once the run in flight has ended, unless calls are pending. The front
+reports whether the item joined and the end of any run it started. A
+remote party cannot observe atomically whether a run will take a
+steer, since a run past its last drain still reads as running, so a
+queue and a read of the state are a race that only the delivery closes
+(#288).
+
 The queues live in memory. An item accepted is in no record until a
 run appends it or a subscriber writes it, and it survives a
 cancellation, a configuration change and a transcript change but not
@@ -1628,6 +1638,7 @@ maps onto it as follows:
 | turn limit | `Config.MaxTurns` |
 | retry policy | `Config.Retry{MaxAttempts, Backoff, Retryable, Revise}`; `DefaultBackoff`, `DefaultRetryable` |
 | low-level loop | `Run(ctx, t, prompts, cfg)`, `Continue(ctx, t, cfg)` → `iter.Seq[Event]`; `EventBuffer`; `CanContinue` |
+| delivery a control offers | `Deliverer`, which `*Agent` and `front/control`'s `Client` implement; `front/control` serves it as `POST /deliver`, `ErrNoDelivery` when the control offers none |
 | agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`, `WithPending`, `SetPending`, `WithReservedCallIDs`, `ReserveCallIDs`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Deliver`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `WhileIdle`, `State`, `SetConfig`, `SetTranscript`, `SetReasoningModels`, `Config` |
 | refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning`, `ErrAmbiguousCall`, `ErrCallAnswered`, `ErrTriggerExtra` (`Trigger.Validate`) |
 | run ID, turn, trigger, transcript on the context | `ContextWithRunID`/`RunIDFromContext`, `ContextWithTurn`/`TurnFromContext`, `ContextWithTrigger`/`TriggerFromContext`, `ContextWithTranscript`/`TranscriptFromContext`, `ContextWithReservedCallIDs` |
@@ -1685,7 +1696,7 @@ active; accepts a queued item without blocking and reports it at the
 next event; delivers post-cancellation events with the cancellation
 lifted; and ends a run with reason `error` when a subscriber fails.
 
-**A conforming front** feeds prompts, resumes and queued items in and
+**A conforming front** feeds prompts, resumes, queued items and deliveries in and
 consumes events out, and nothing else; correlates `tool_end` with
 `tool_start` by call ID; renders withheld text on `item_end` and not
 from deltas; and answers pending calls through the resume.

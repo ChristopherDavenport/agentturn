@@ -238,6 +238,39 @@ func (c *Client) Queue(ctx context.Context, mode agentturn.QueueMode, items ...o
 	return errorIn(out.Err)
 }
 
+// Deliver implements agentturn.Deliverer: the server's agent queues
+// the items as a steer that must reach the model, and joined says
+// whether the run in flight took them; otherwise end is the run the
+// delivery started, or the one that took them and ended before a model
+// call saw them. A server whose Control offers no delivery answers
+// [ErrNoDelivery]. Cancelling ctx stops waiting and aborts nothing: a
+// run the delivery started goes on, and Abort stops it.
+func (c *Client) Deliver(ctx context.Context, items ...openresponses.Item) (bool, *agentturn.RunEnd, error) {
+	raw, err := itemsOut(items)
+	if err != nil {
+		return false, nil, err
+	}
+	var out deliverReply
+	if err := c.call(ctx, http.MethodPost, "deliver", struct {
+		Items json.RawMessage `json:"items"`
+	}{raw}, &out); err != nil {
+		var lost *lostError
+		if errors.As(err, &lost) && ctx.Err() == nil {
+			return false, nil, fmt.Errorf("%w: %w", ErrConnectionLost, lost.err)
+		}
+		return false, nil, err
+	}
+	var end *agentturn.RunEnd
+	if out.End != nil {
+		if end, err = runEndIn(*out.End); err != nil {
+			return false, nil, err
+		}
+	}
+	return out.Joined, end, errorIn(out.Err)
+}
+
+var _ agentturn.Deliverer = (*Client)(nil)
+
 // Abort implements agentturn.Control. A failure goes to the
 // [WithStreamErrors] function.
 func (c *Client) Abort() {

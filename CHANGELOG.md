@@ -247,6 +247,14 @@ versions may break the API.
   withdrawn, and `session.Pending` reads them into `Nested`. RFC 0001's
   open question on a key for a nested call is closed. (#261)
 
+- Added: `Deliverer`, the delivery a `Control` may offer beside `Queue`,
+  which `*Agent` implements. `front/control` serves it as `POST
+  /deliver` under `ScopeControl`, answering whether the items joined the
+  run in flight and the end of any run the delivery started, and
+  `Client.Deliver` implements it; a served `Control` that offers none
+  answers `ErrNoDelivery`. A remote party cannot tell from `/queue` and
+  `/state` whether a run will still take a steer. (#288)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

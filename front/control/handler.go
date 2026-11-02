@@ -29,7 +29,7 @@ type Scope string
 const (
 	// ScopeRead follows the agent: Subscribe and State.
 	ScopeRead Scope = "read"
-	// ScopeControl drives it: Prompt, Queue and Abort.
+	// ScopeControl drives it: Prompt, Queue, Deliver and Abort.
 	ScopeControl Scope = "control"
 	// ScopeAnswer answers it: Resume and Reply, which let a call run
 	// that the policy asked a person about. No other scope implies it.
@@ -97,6 +97,10 @@ type Command struct {
 
 // ErrUnknownCommand is a command no [WithCommands] names.
 var ErrUnknownCommand = errors.New("control: no such command")
+
+// ErrNoDelivery is the answer to a delivery when the Control the
+// handler serves is no agentturn.Deliverer.
+var ErrNoDelivery = errors.New("control: the agent offers no delivery")
 
 // Option configures a Handler.
 type Option func(*handler)
@@ -186,6 +190,7 @@ type handler struct {
 //	GET  /events           Subscribe, as server-sent events  read
 //	POST /prompt           Prompt; returns the run's end     control
 //	POST /queue            Queue: steer or follow_up         control
+//	POST /deliver          Deliver, when c offers it         control
 //	POST /abort            Abort                             control
 //	POST /resume           Resume; returns the run's end     answer
 //	POST /reply            Reply                             answer
@@ -223,6 +228,7 @@ func Handler(c agentturn.Control, opts ...Option) http.Handler {
 	mux.HandleFunc("GET /events", h.guard(ScopeRead, h.events))
 	mux.HandleFunc("POST /prompt", h.guard(ScopeControl, h.prompt))
 	mux.HandleFunc("POST /queue", h.guard(ScopeControl, h.queue))
+	mux.HandleFunc("POST /deliver", h.guard(ScopeControl, h.deliver))
 	mux.HandleFunc("POST /abort", h.guard(ScopeControl, h.abort))
 	mux.HandleFunc("POST /resume", h.guard(ScopeAnswer, h.resume))
 	mux.HandleFunc("POST /reply", h.guard(ScopeAnswer, h.reply))
@@ -362,6 +368,50 @@ func (h *handler) queue(w http.ResponseWriter, r *http.Request, _ Principal) {
 		return
 	}
 	writeJSON(w, http.StatusOK, errReply{errorOut(h.c.Queue(r.Context(), agentturn.QueueMode(req.Mode), items...))})
+}
+
+// deliverReply is Deliver's answer: whether the items joined the run
+// in flight, the end of a run the delivery started or of the run that
+// took them and ended before a model call saw them, and the error.
+type deliverReply struct {
+	Joined bool        `json:"joined"`
+	End    *wireRunEnd `json:"end,omitempty"`
+	Err    *wireError  `json:"error,omitempty"`
+}
+
+// deliver serves agentturn.Deliverer, which c offers or not: a remote
+// party cannot tell from /queue and /state whether a run will still
+// take a steer, and a delivery says. It runs on the request's context
+// with its cancellation lifted, as a prompt does, since a run it
+// starts goes on when the client goes away.
+func (h *handler) deliver(w http.ResponseWriter, r *http.Request, _ Principal) {
+	d, ok := h.c.(agentturn.Deliverer)
+	if !ok {
+		h.writeFailure(w, http.StatusNotImplemented, ErrNoDelivery)
+		return
+	}
+	var req struct {
+		Items json.RawMessage `json:"items"`
+	}
+	if !h.decode(w, r, &req) {
+		return
+	}
+	items, err := itemsIn(req.Items)
+	if err != nil {
+		h.writeFailure(w, http.StatusBadRequest, err)
+		return
+	}
+	joined, end, err := d.Deliver(context.WithoutCancel(r.Context()), items...)
+	out := deliverReply{Joined: joined, Err: errorOut(err)}
+	if end != nil {
+		we, merr := runEndOut(end)
+		if merr != nil {
+			h.writeFailure(w, http.StatusInternalServerError, merr)
+			return
+		}
+		out.End = &we
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (h *handler) abort(w http.ResponseWriter, _ *http.Request, _ Principal) {
