@@ -18,11 +18,25 @@
 // sender; the handoffs one input causes are bounded
 // ([Team.MaxHandoffs]); a filter trims once, between runs, and leaves a
 // transcript the loop can continue; and a receiver with no question or
-// record channel of its own inherits the sender's. [Team.Route] gives
-// the same team to front/responses' and front/a2a's WithTransfers, so a
-// served conversation starts its next request or task where the last
-// transfer left it, by the rules front/responses.Handoffs states for
-// which call handed off.
+// record channel of its own inherits the sender's. [Team.Resume] does
+// the same after a run that paused on a deferred call is answered.
+//
+// Served through a front, the team is given in three parts:
+//
+//	responses.New(team.Config("Triage agent"),
+//		responses.WithTransfers(team.Route()), // the next request starts where the last transfer left it
+//		responses.WithHandoff(team.Handoff),   // a transfer within a request is relayed to the receiver
+//		responses.WithHandoffTrim(team.Trim))  // with the handoff's filter applied
+//
+// and front/a2a takes the same options. Route alone starts the next
+// request or task under the receiver, by the rules
+// front/responses.Handoffs states for which call handed off, but
+// neither relays a transfer within one nor trims. A front's trim
+// applies to the receiver's runs in the request or task that took the
+// handoff: the conversation a front keeps, or a caller sends back,
+// holds the history whole, since the next request finds its agent by
+// the transfer in it. The fronts bound the handoffs one request or
+// task follows themselves (WithMaxHandoffs).
 package handoff
 
 import (
@@ -237,55 +251,96 @@ func (t *Team) Route() responses.Route {
 // Run prompts a with items and follows every handoff: when a run stops
 // on a terminating result (agentturn.StopTerminate or
 // StopPartialTerminate) whose batch handed off, the last transfer of
-// it by [Team.Route], it applies the handoff's filter to the transcript
-// once, with Agent.SetTranscript, switches a to the receiver with
+// it by [Team.Route], it trims the transcript once with [Team.Trim]
+// and Agent.SetTranscript, switches a to the receiver with
 // Agent.SetConfig, and continues under
 // agentturn.Trigger{Kind: "handoff", Ref: sender}. It returns the last
 // run's end and the names of the agents that had the conversation, in
 // order.
 //
-// A filtered transcript the loop cannot continue, a model output left
-// last as a transfer's preamble is once its call is filtered out, gets
-// a developer message naming the transfer, the sender and the
-// receiver, so the receiver's first request ends in input it can
-// answer. A receiver with no ToolElicitor or ToolRecorder of its own
-// is given the sender's. After [Team.MaxHandoffs] handoffs a run that
-// ends on another returns [ErrTooManyHandoffs], a left with the
-// sender.
+// A receiver with no ToolElicitor or ToolRecorder of its own is given
+// the sender's. After [Team.MaxHandoffs] handoffs a run that ends on
+// another returns [ErrTooManyHandoffs], a left with the sender.
 func (t *Team) Run(ctx context.Context, a *agentturn.Agent, items ...openresponses.Item) (*agentturn.RunEnd, []string, error) {
 	path := []string{a.Config().Name}
 	end, err := a.Prompt(ctx, items...)
+	return t.follow(ctx, a, path, end, err)
+}
+
+// Resume answers a's pending calls with Agent.Resume and follows the
+// handoffs the resumed run ends on, as [Team.Run] does, so a transfer
+// the model makes after a run paused on a deferred call is taken too.
+func (t *Team) Resume(ctx context.Context, a *agentturn.Agent, answers ...agentturn.Answer) (*agentturn.RunEnd, []string, error) {
+	path := []string{a.Config().Name}
+	end, err := a.Resume(ctx, answers...)
+	return t.follow(ctx, a, path, end, err)
+}
+
+// follow takes the handoffs end and the runs after it end on.
+func (t *Team) follow(ctx context.Context, a *agentturn.Agent, path []string, end *agentturn.RunEnd, err error) (*agentturn.RunEnd, []string, error) {
 	limit := t.MaxHandoffs
 	if limit <= 0 {
 		limit = DefaultMaxHandoffs
 	}
 	for n := 0; err == nil && terminated(end); n++ {
-		hs := responses.Handoffs(end.Items, t.Route())
-		if len(hs) == 0 {
+		to, ok := t.Handoff(ctx, end, nil)
+		if !ok {
 			break
 		}
-		h := hs[len(hs)-1]
 		if n == limit {
 			return end, path, fmt.Errorf("%w: %d followed", ErrTooManyHandoffs, limit)
 		}
 		from := a.Config()
-		if f := t.filters[[2]string{from.Name, h.To.Name}]; f != nil {
-			trimmed := f(a.State().Transcript)
-			if !agentturn.CanContinue(trimmed) {
-				trimmed = append(trimmed, openresponses.DeveloperText(fmt.Sprintf(
-					"The conversation was handed off by %s, from %s to %s, which answers from here.", h.Call.Name, from.Name, h.To.Name)))
-			}
-			if err := a.SetTranscript(trimmed); err != nil {
+		if _, filtered := t.filters[[2]string{from.Name, to.Name}]; filtered {
+			if err := a.SetTranscript(t.Trim(ctx, from, to, a.State().Transcript)); err != nil {
 				return end, path, err
 			}
 		}
-		if err := a.SetConfig(inherit(h.To, from)); err != nil {
+		if err := a.SetConfig(inherit(to, from)); err != nil {
 			return end, path, err
 		}
-		path = append(path, h.To.Name)
+		path = append(path, to.Name)
 		end, err = a.Continue(agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff", Ref: from.Name}))
 	}
 	return end, path, err
+}
+
+// Handoff returns the receiver of the last transfer of the team that
+// handed the conversation off in end's items, by [Team.Route], and
+// false when none did. It is what front/responses' and front/a2a's
+// WithHandoff take, so a team served through a front relays the
+// receiver's run within the request or task, as [Team.Run] continues
+// it in process.
+func (t *Team) Handoff(_ context.Context, end *agentturn.RunEnd, _ []*agentturn.ToolEnd) (agentturn.Config, bool) {
+	if end == nil {
+		return agentturn.Config{}, false
+	}
+	hs := responses.Handoffs(end.Items, t.Route())
+	if len(hs) == 0 {
+		return agentturn.Config{}, false
+	}
+	return hs[len(hs)-1].To, true
+}
+
+// Trim applies the filter of the handoff from from to to, when it
+// offers one, to tr, and returns tr unchanged otherwise. A trimmed
+// transcript the loop cannot continue, a model output left last as a
+// transfer's preamble is once its call is filtered out, gets a
+// developer message naming the transfer, the sender and the receiver,
+// so the receiver's first request ends in input it can answer. It is
+// what the fronts' WithHandoffTrim take, so a team served through a
+// front trims as [Team.Run] does.
+func (t *Team) Trim(_ context.Context, from, to agentturn.Config, tr agentturn.Transcript) agentturn.Transcript {
+	f := t.filters[[2]string{from.Name, to.Name}]
+	if f == nil {
+		return tr
+	}
+	trimmed := f(append(agentturn.Transcript(nil), tr...))
+	if !agentturn.CanContinue(trimmed) {
+		trimmed = append(trimmed, openresponses.DeveloperText(fmt.Sprintf(
+			"The conversation was handed off by %s, from %s to %s, which answers from here.", ToolName(to.Name), from.Name, to.Name)))
+	}
+	return trimmed
 }
 
 // inherit returns next with from's question and record channels where

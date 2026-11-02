@@ -29,6 +29,7 @@ type Executor struct {
 	chosenBy    func(ctx context.Context, principal string) bool
 	handoff     func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool)
 	maxHandoffs int
+	trim        func(ctx context.Context, from, to agentturn.Config, t agentturn.Transcript) agentturn.Transcript
 	start       func(context.Context, agentturn.Transcript) (agentturn.Config, bool)
 	route       Route
 	auth        *Authenticator
@@ -189,6 +190,20 @@ const DefaultMaxHandoffs = 10
 // WithHandoff declined would. n of 0 or less means
 // [DefaultMaxHandoffs].
 func WithMaxHandoffs(n int) Option { return func(e *Executor) { e.maxHandoffs = n } }
+
+// WithHandoffTrim trims what the receiver of a [WithHandoff] switch
+// sees, once, between the sender's run and the receiver's: fn is given
+// the sender's configuration, the receiver's and the agent's
+// transcript, and returns the one the receiver continues, set with
+// Agent.SetTranscript, so what [WithRecorderFor] attached records the
+// trim. It must be one the loop can continue (agentturn.CanContinue),
+// or the task fails. The trim applies to the receiver's runs within the
+// task: the [ConversationStore] keeps the history whole, since the next
+// task finds its agent by the transfer in it. agentturn/handoff's
+// Team.Trim is one.
+func WithHandoffTrim(fn func(ctx context.Context, from, to agentturn.Config, t agentturn.Transcript) agentturn.Transcript) Option {
+	return func(e *Executor) { e.trim = fn }
+}
 
 // WithStart picks the configuration a task starts under from the
 // conversation: the transcript the [ConversationStore] holds for the
@@ -674,6 +689,12 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 			return out
 		}
 		prev := agent.Config()
+		if e.trim != nil {
+			if err = agent.SetTranscript(e.trim(runCtx, prev, next, agent.State().Transcript)); err != nil {
+				end = nil
+				continue
+			}
+		}
 		// The receiver inherits what the sender's configuration holds
 		// before the run's hook is built, so the hook's fallback
 		// elicitor is the inherited one.

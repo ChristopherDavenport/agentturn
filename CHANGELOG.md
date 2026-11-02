@@ -526,6 +526,16 @@ versions may break the API.
   person said, and a held call beside no asked one was released too.
   `ChildInfo.Items` holds the items of every run of the call. (#84)
 
+- Added: `handoff.Team.Resume` answers pending calls and follows the
+  transfers the resumed run ends on, as `Run` does; `Team.Handoff` and
+  `Team.Trim` are what the fronts' `WithHandoff` and the new
+  `WithHandoffTrim` take, so a team served through `front/responses` or
+  `front/a2a` relays a transfer within a request or task with the
+  handoff's filter applied, where serving it through `Route` alone
+  dropped its filters. A front's trim applies to the receiver's runs in
+  that request or task; the stored conversation keeps the history whole.
+  (#274)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

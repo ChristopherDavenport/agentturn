@@ -312,3 +312,101 @@ func itemTypes(items openresponses.Items) string {
 	}
 	return strings.Join(parts, " ")
 }
+
+// script calls names in turn, one per output the input holds, then
+// answers with its name.
+type script struct {
+	name  string
+	names []string
+}
+
+func (m script) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	n := 0
+	for _, item := range req.Input {
+		if _, ok := item.(*openresponses.FunctionCallOutput); ok {
+			n++
+		}
+	}
+	if n >= len(m.names) {
+		if err := em.Item(openresponses.AssistantText(m.name + " here")); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	w, err := em.FunctionCall("", m.names[n])
+	if err != nil {
+		return err
+	}
+	if err := w.Arguments(`{}`); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestATeamFollowsATransferAfterAResume pins Team.Resume: a run that
+// paused on a deferred call is resumed through the team, and a
+// transfer the resumed run ends on is followed as Run follows one.
+func TestATeamFollowsATransferAfterAResume(t *testing.T) {
+	lookup := agenttool.NewFunc("lookup", "", nil, func(context.Context, agenttool.Call) (agenttool.Result, error) {
+		return agenttool.Text("found"), nil
+	})
+	team, err := New(
+		Agent{Config: agentturn.Config{Name: "Triage agent", Model: script{name: "triage", names: []string{"lookup", ToolName("Refund agent")}}, Tools: []agenttool.Tool{lookup},
+			BeforeToolCall: func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+				if info.Call.Name == "lookup" {
+					return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask"}, nil
+				}
+				return nil, nil
+			}}, Handoffs: []To{{Agent: "Refund agent"}}},
+		Agent{Config: agentturn.Config{Name: "Refund agent", Model: transfers{name: "refunds"}}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(team.Config("Triage agent"))
+	end, _, err := team.Run(context.Background(), a, openresponses.UserText("I was double charged"))
+	if err != nil || end.Reason != agentturn.ReasonInputRequired {
+		t.Fatalf("first run = %+v, %v; want it paused on lookup", end, err)
+	}
+	end, path, err := team.Resume(context.Background(), a, agentturn.Approve(end.Pending[0].Call.CallID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(path, ",") != "Triage agent,Refund agent" {
+		t.Errorf("path = %v", path)
+	}
+	if text, _ := end.Answer(); text != "refunds here" || a.Config().Name != "Refund agent" {
+		t.Errorf("answer = %q under %s, want the receiver's", text, a.Config().Name)
+	}
+}
+
+// TestATeamTrimsOverAFront pins Team.Handoff and Team.Trim: a team
+// served through front/responses with WithHandoff and WithHandoffTrim
+// applies the handoff's filter, so the receiver's first request holds
+// no tool call and ends in the note naming the handoff.
+func TestATeamTrimsOverAFront(t *testing.T) {
+	var refundReqs requests
+	team, err := New(
+		Agent{Config: agentturn.Config{Name: "Triage agent", Model: transfers{name: "triage", to: "Refund agent", preamble: true}},
+			Handoffs: []To{{Agent: "Refund agent", Filter: RemoveAllTools}}},
+		Agent{Config: agentturn.Config{Name: "Refund agent", Model: transfers{name: "refunds"}, BeforeModelCall: refundReqs.hook}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	front := responses.New(team.Config("Triage agent"), responses.WithTransfers(team.Route()), responses.WithHandoff(team.Handoff), responses.WithHandoffTrim(team.Trim))
+	sink, err := streamtest.Run(context.Background(), front, openresponses.Request{Model: "m", Input: openresponses.Items{openresponses.UserText("I was double charged")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sink.Response().OutputText(); !strings.HasSuffix(got, "refunds here") {
+		t.Errorf("answer = %q", got)
+	}
+	if len(refundReqs.seen) != 1 || itemTypes(refundReqs.seen[0].Input) != "user assistant developer" {
+		t.Fatalf("receiver's requests = %d, first input %v", len(refundReqs.seen), refundReqs.seen)
+	}
+}

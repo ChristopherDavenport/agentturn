@@ -108,6 +108,7 @@ type Adapter struct {
 	start               func(context.Context, agentturn.Transcript) (agentturn.Config, bool)
 	route               Route
 	maxHandoffs         int
+	trim                func(ctx context.Context, from, to agentturn.Config, t agentturn.Transcript) agentturn.Transcript
 }
 
 var _ openresponses.Adapter = (*Adapter)(nil)
@@ -234,6 +235,18 @@ const DefaultMaxHandoffs = 10
 // [DefaultMaxHandoffs].
 func WithMaxHandoffs(n int) Option { return func(a *Adapter) { a.maxHandoffs = n } }
 
+// WithHandoffTrim trims what the receiver of a [WithHandoff] switch
+// sees, once, between the sender's run and the receiver's: fn is given
+// the sender's configuration, the receiver's and the conversation as
+// it stands, and returns the conversation the receiver continues,
+// which must be one the loop can continue (agentturn.CanContinue), or
+// the response fails. The trim applies to the receiver's runs within
+// the request; the caller's next request carries what it sends back.
+// agentturn/handoff's Team.Trim is one.
+func WithHandoffTrim(fn func(ctx context.Context, from, to agentturn.Config, t agentturn.Transcript) agentturn.Transcript) Option {
+	return func(a *Adapter) { a.trim = fn }
+}
+
 // New builds an adapter over cfg.
 func New(cfg agentturn.Config, opts ...Option) *Adapter {
 	a := &Adapter{cfg: cfg}
@@ -349,6 +362,9 @@ func (a *Adapter) fullRun(ctx context.Context, base agentturn.Config, req openre
 		// it runs another model.
 		models.Attribute(cfg.ModelName, end.Items)
 		transcript = append(transcript, end.Items...)
+		if a.trim != nil {
+			transcript = a.trim(ctx, cfg, next, append(agentturn.Transcript(nil), transcript...))
+		}
 		runCtx = agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff", Ref: cfg.Name})
 		cfg = a.perRequest(inherit(next, cfg), req)
 	}

@@ -2,12 +2,14 @@ package a2a
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/agentturn/handoff"
 	"github.com/ChristopherDavenport/openresponses"
+	"github.com/ChristopherDavenport/openresponses/echo"
 	"github.com/a2aproject/a2a-go/a2a"
 	"github.com/a2aproject/a2a-go/a2asrv"
 )
@@ -86,3 +88,35 @@ var issueRefundTool = agenttool.NewFunc("issue_refund", "refunds a charge", nil,
 	func(context.Context, agenttool.Call) (agenttool.Result, error) {
 		return agenttool.Text("refunded"), nil
 	})
+
+// TestATeamTrimsWithinATask pins WithHandoffTrim with a team's Handoff
+// and Trim: a transfer within a task is relayed to the receiver with
+// the handoff's filter applied, so its first request holds no tool call
+// and ends in the note naming the handoff, while the stored
+// conversation keeps the history whole.
+func TestATeamTrimsWithinATask(t *testing.T) {
+	var inputs []string
+	team, err := handoff.New(
+		handoff.Agent{Config: agentturn.Config{Name: "Triage agent", Model: preamble{}}, Handoffs: []handoff.To{{Agent: "Refund agent", Filter: handoff.RemoveAllTools}}},
+		handoff.Agent{Config: agentturn.Config{Name: "Refund agent", Model: &echo.Adapter{}, BeforeModelCall: func(_ context.Context, req *openresponses.Request) error {
+			inputs = append(inputs, itemTypes(req.Input))
+			return nil
+		}}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &MemoryStore{}
+	h := a2asrv.NewHandler(New(team.Config("Triage agent"), WithConversationStore(store), WithTransfers(team.Route()), WithHandoff(team.Handoff), WithHandoffTrim(team.Trim)))
+	task := sendTask(t, h, userMessage("I was double charged"))
+	if task.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("task = %s %q", task.Status.State, taskText(task))
+	}
+	if len(inputs) != 1 || inputs[0] != "user assistant developer" {
+		t.Errorf("receiver's inputs = %v, want the trimmed history ending in the note", inputs)
+	}
+	stored, _ := store.Load(context.Background(), task.ContextID)
+	if got := itemTypes(stored); !strings.Contains(got, "function_call function_call_output") {
+		t.Errorf("stored conversation = %s, want the transfer kept", got)
+	}
+}
