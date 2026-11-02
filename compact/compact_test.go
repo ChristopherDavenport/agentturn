@@ -1,9 +1,13 @@
 package compact
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"hash/crc32"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -1304,5 +1308,99 @@ func TestAnOverflowFoldsOnceAndRetries(t *testing.T) {
 				t.Errorf("run error = %v", end.Err)
 			}
 		})
+	}
+}
+
+// TestTheBudgetCountsTheSettings pins #279's first half (the context
+// study's check 2a): the instructions and tool definitions the request
+// carries share the budget with the items, so long instructions push a
+// transcript the items alone keep within budget over it, and it folds.
+func TestTheBudgetCountsTheSettings(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		instructions string
+		folds        int
+	}{
+		{name: "short instructions", instructions: "be brief", folds: 0},
+		{name: "long instructions", instructions: strings.Repeat("Follow every rule. ", 120), folds: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &summarizer{reply: "They talked about things."}
+			tr := NewLocal(s, WithBudget(300), WithKeepLast(1), WithMinFold(0))
+			if got := Estimate(openresponses.Items(items(7))); got >= 300 {
+				t.Fatalf("the items alone weigh %d, want them within the budget", got)
+			}
+			cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Instructions: tc.instructions, Transform: tr.Transform}
+			if _, end, err := firstRequests(t, agentturn.Run(context.Background(), items(6), openresponses.Items{openresponses.UserText("latest")}, cfg)); err != nil || end.Reason != agentturn.ReasonDone {
+				t.Fatalf("err = %v end = %+v", err, end)
+			}
+			if len(s.reqs) != tc.folds {
+				t.Errorf("summaries asked = %d, want %d", len(s.reqs), tc.folds)
+			}
+		})
+	}
+	// The settings the transform reads are a copy: changing them
+	// changes nothing the loop sends.
+	ctx := agentturn.ContextWithRequest(context.Background(), openresponses.Request{Instructions: "x", Tools: openresponses.Tools{&openresponses.FunctionTool{Name: "a"}}})
+	req, ok := agentturn.RequestFromContext(ctx)
+	if !ok || req.Instructions != "x" || len(req.Tools) != 1 {
+		t.Fatalf("settings = %+v, %v", req, ok)
+	}
+	req.Tools[0] = &openresponses.FunctionTool{Name: "b"}
+	if again, _ := agentturn.RequestFromContext(ctx); again.Tools[0].(*openresponses.FunctionTool).Name != "a" {
+		t.Error("a transform changed the settings on the context")
+	}
+}
+
+// pngOf returns a base64 data URL of a PNG whose header says width by
+// height, followed by size bytes that stand in for its pixels, as large
+// as a screenshot's.
+func pngOf(width, height, size int) string {
+	ihdr := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdr[0:], uint32(width))
+	binary.BigEndian.PutUint32(ihdr[4:], uint32(height))
+	ihdr[8], ihdr[9] = 8, 2 // 8-bit RGB
+	var b bytes.Buffer
+	b.WriteString("\x89PNG\r\n\x1a\n")
+	_ = binary.Write(&b, binary.BigEndian, uint32(len(ihdr)))
+	chunk := append([]byte("IHDR"), ihdr...)
+	b.Write(chunk)
+	_ = binary.Write(&b, binary.BigEndian, crc32.ChecksumIEEE(chunk))
+	b.Write(bytes.Repeat([]byte{0x5a}, size))
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(b.Bytes())
+}
+
+// TestAScreenshotWeighsItsVisualCost pins #279's second half (the media
+// study's scenario 4): an image counts by its dimensions, wherever it
+// is, not by its base64, so a transcript holding a screenshot is not
+// folded at every step.
+func TestAScreenshotWeighsItsVisualCost(t *testing.T) {
+	shot := pngOf(1280, 800, 400_000)
+	transcript := openresponses.Items{
+		&openresponses.Message{Role: openresponses.RoleUser, Content: openresponses.Contents{
+			&openresponses.InputText{Text: "what is on the screen?"},
+			&openresponses.InputImage{ImageURL: shot},
+		}},
+		&openresponses.FunctionCall{CallID: "call_1", Name: "screenshot", Arguments: "{}"},
+		&openresponses.FunctionCallOutput{CallID: "call_1", Output: openresponses.FunctionCallOutputData{Parts: openresponses.Contents{
+			&openresponses.InputImage{ImageURL: shot},
+		}}},
+		&openresponses.Message{Role: openresponses.RoleUser, Content: openresponses.Contents{
+			&openresponses.InputFile{Filename: "shot.png", FileData: shot},
+			&openresponses.InputImage{ImageURL: "https://example.com/unknown.png"},
+		}},
+	}
+	got := Estimate(transcript)
+	want := 3*ImageTokens(1280, 800) + DefaultImageTokens
+	if got < want || got > want+200 {
+		t.Errorf("Estimate = %d, want about %d (three 1280x800 images and one unread)", got, want)
+	}
+	if ImageTokens(1280, 800) != 1366 || ImageTokens(4000, 3000) != 1534 {
+		t.Errorf("ImageTokens = %d, %d", ImageTokens(1280, 800), ImageTokens(4000, 3000))
+	}
+	s := &summarizer{reply: "They looked at the screen."}
+	tr := NewLocal(s, WithKeepLast(1))
+	if _, err := tr.Transform(context.Background(), agentturn.Transcript(transcript)); err != nil || len(s.reqs) != 0 {
+		t.Errorf("err = %v, summaries asked = %d, want none within the default budget", err, len(s.reqs))
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -427,6 +428,37 @@ func ContextWithTurn(ctx context.Context, turn int) context.Context {
 func TurnFromContext(ctx context.Context) int {
 	turn, _ := ctx.Value(turnKey{}).(int)
 	return turn
+}
+
+type requestKey struct{}
+
+// ContextWithRequest attaches req, without its input, as the settings
+// of the request a transform is called for. The loop attaches the
+// request base it built for the turn, with the model name, the
+// instructions and the definitions of the tools of the moment, before
+// it calls the transform, so a transform that folds against a budget
+// meant as a share of the model's context window counts what shares it
+// (RFC 0001 The request, step 2; #279). The before-model-call hook runs
+// after the transform and may still change them.
+func ContextWithRequest(ctx context.Context, req openresponses.Request) context.Context {
+	req.Input = nil
+	return context.WithValue(ctx, requestKey{}, req)
+}
+
+// RequestFromContext returns the settings [ContextWithRequest] attached
+// to ctx, and whether there were any. The request is a copy, its tool
+// list and maps included, so a transform reads it and changes nothing
+// the loop sends.
+func RequestFromContext(ctx context.Context) (openresponses.Request, bool) {
+	req, ok := ctx.Value(requestKey{}).(openresponses.Request)
+	if !ok {
+		return openresponses.Request{}, false
+	}
+	req.Tools = slices.Clone(req.Tools)
+	req.Include = slices.Clone(req.Include)
+	req.Metadata = maps.Clone(req.Metadata)
+	req.Extra = maps.Clone(req.Extra)
+	return req, true
 }
 
 type foldRequestKey struct{}
@@ -1562,15 +1594,17 @@ func (r *runner) appendOne(item openresponses.Item, mode InputMode, trigger, end
 func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponses.Request, built, error) {
 	// The transform and BeforeModelCall run under the attribution too.
 	ctx = r.attributed(ctx)
+	// The settings come first, so the transform can weigh what the
+	// request will carry beside the input (#279).
+	req := r.cfg.baseRequest(tools)
 	input := Transcript(append(openresponses.Items(nil), r.transcript...))
 	if r.cfg.Transform != nil {
 		var err error
-		input, err = r.cfg.Transform(ctx, input)
+		input, err = r.cfg.Transform(ContextWithRequest(ctx, req), input)
 		if err != nil {
 			return openresponses.Request{}, built{}, fmt.Errorf("agentturn: transform: %w", err)
 		}
 	}
-	req := r.cfg.baseRequest(tools)
 	b := built{filtered: r.cfg.filter()(input)}
 	req.Input = r.reasoning.For(req.Model, b.filtered)
 	b.input = req.Input

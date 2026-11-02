@@ -374,6 +374,20 @@ versions may break the API.
   policy; a transform that cannot shorten it ends the run with the
   refusal, as before. RFC 0001 The request step 2 and Retry. (#277)
 
+- Changed: the transform's context carries the settings the request
+  will carry, built before the transform runs, as
+  `RequestFromContext` (`ContextWithRequest`), a copy. `compact`
+  counts the instructions and the tool definitions in its budget with
+  `EstimateSettings` (`WithSettingsEstimator` replaces it; a transform
+  given `WithEstimator` alone weighs items alone, since its units are
+  its own), so long instructions or many tools now fold a transcript
+  sooner. `compact.Estimate` weighs each image, an `input_image` part
+  or an image `input_file`, in a message or a function call output, by
+  its visual cost, `ImageTokens` from a PNG, JPEG or GIF header and
+  `DefaultImageTokens` (1600) otherwise, not by its base64, so a
+  screenshot no longer folds the transcript at every step. RFC 0001
+  The request step 2. (#279)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

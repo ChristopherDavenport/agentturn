@@ -415,7 +415,14 @@ that a recorder holding the transcript and the settings rebuilds it:
    and recorded as any other. The loop asks the same, with no
    instructions, when it rebuilds a request the server refused as too
    long, as [Retry](#retry) says, by a mark on the transform's
-   context (#277).
+   context (#277). The transform MAY read the settings the request
+   will carry, the instructions and the tool definitions of the
+   moment, as step 4 builds them before the hook; the loop MUST make
+   them available to it, read-only. A transform that folds against a
+   budget meant as a share of the model's context window SHOULD count
+   those settings in the budget, and SHOULD weigh an image by the
+   provider's visual cost, a fixed cost or one derived from the
+   image's dimensions, rather than by its encoded size (#279).
 3. Apply the **filter** to the result, which removes what the model
    must not see. Then leave out every reasoning item the loop knows a
    model under another model name produced: a reasoning item carries a
@@ -1696,7 +1703,7 @@ maps onto it as follows:
 | copied item | `Copied(item)`, which `tools/agent`'s `WithCallConfig` sets on the items it takes from the parent; `Copied` on the item events |
 | filter | `Config.Filter`; `DefaultFilter`, `VisibleFilter(types…)` |
 | reasoning another model produced | `ReasoningModels` (`Attribute`, `For`); `WithReasoningModels` for an agent, `ContextWithReasoningModels` for `Run` and `Continue`, and on every hook's and tool's context |
-| transform | `Config.Transform`; `compact.New`, `compact.NewLocal` as the reference; `compact.MarkFold`/`compact.IsFold` for a fold's own model call; `(*compact.Transform).FoldNext(instructions)` for a fold on request, `ContextWithFoldRequest`/`FoldRequested` for the loop's after an overflow, `compact.Fold.Forced`/`Instructions` |
+| transform | `Config.Transform`; `compact.New`, `compact.NewLocal` as the reference; `compact.MarkFold`/`compact.IsFold` for a fold's own model call; `(*compact.Transform).FoldNext(instructions)` for a fold on request, `ContextWithFoldRequest`/`FoldRequested` for the loop's after an overflow, `compact.Fold.Forced`/`Instructions`; the settings a transform reads, `ContextWithRequest`/`RequestFromContext`, weighed by `compact.EstimateSettings`, and images by `compact.ImageTokens` in `compact.Estimate` |
 | configuration | `Config`; `Config.BaseRequest`, `Config.ResolveTools` |
 | tools of the moment | `Config.Tools`, `Config.ToolProvider` |
 | execution mode, bound | `Config.ToolExecution` (`ExecParallel`, `ExecSequential`), `Config.MaxParallelTools` |

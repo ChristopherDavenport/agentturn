@@ -32,12 +32,19 @@
 package compact
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/gif"  // GIF headers, for an image's visual cost
+	_ "image/jpeg" // JPEG headers
+	_ "image/png"  // PNG headers
+	"math"
 	"strings"
 	"sync"
 
@@ -84,13 +91,37 @@ const DefaultSummaryPrompt = `Summarize the conversation above so that it can co
 type Option func(*Transform)
 
 // WithBudget sets the estimated token count above which the transcript
-// is compacted.
+// is compacted. The budget covers the whole request: the items the
+// transform would send and the settings the request carries beside
+// them, its instructions and its tool definitions, which the loop puts
+// on the transform's context (agentturn.RequestFromContext) and
+// [EstimateSettings] weighs. So a budget set as a share of the model's
+// context window is a share of what the window holds. A transform
+// called with no settings on its context, or given [WithEstimator]
+// without [WithSettingsEstimator], weighs the items alone.
 func WithBudget(tokens int) Option { return func(t *Transform) { t.budget = tokens } }
 
-// WithEstimator replaces the token estimator. The default divides the
-// JSON size of the items by four.
+// WithEstimator replaces the token estimator for items. The default is
+// [Estimate]. An estimator of its own counts in its own units, so the
+// settings are weighed only when [WithSettingsEstimator] gives an
+// estimator for them in the same units.
 func WithEstimator(fn func(openresponses.Items) int) Option {
-	return func(t *Transform) { t.estimate = fn }
+	return func(t *Transform) {
+		t.estimate = fn
+		if !t.settingsSet {
+			t.settings = nil
+		}
+	}
+}
+
+// WithSettingsEstimator replaces the estimator of the settings a
+// request carries beside its input, the instructions and the tool
+// definitions, which the transform adds to the estimate of the items
+// before it compares the sum with the budget. The default is
+// [EstimateSettings] while the item estimator is [Estimate]. nil weighs
+// the items alone.
+func WithSettingsEstimator(fn func(openresponses.Request) int) Option {
+	return func(t *Transform) { t.settings, t.settingsSet = fn, true }
 }
 
 // WithModel sets the model named on compaction or summary requests.
@@ -324,6 +355,8 @@ type Transform struct {
 	minFold     int
 	model       string
 	estimate    func(openresponses.Items) int
+	settings    func(openresponses.Request) int
+	settingsSet bool
 	filter      func(agentturn.Transcript) agentturn.Transcript
 	prompt      string
 	summaryItem func(string) openresponses.Item
@@ -593,6 +626,7 @@ func newTransform(opts []Option) *Transform {
 		keepLast:    DefaultKeepLast,
 		minFold:     -1,
 		estimate:    Estimate,
+		settings:    EstimateSettings,
 		filter:      agentturn.DefaultFilter,
 		prompt:      DefaultSummaryPrompt,
 		summaryItem: SummaryMessage,
@@ -611,13 +645,119 @@ func SummaryMessage(summary string) openresponses.Item {
 }
 
 // Estimate is the default token estimator: the JSON size of the items
-// divided by four.
+// divided by four, but for images, which a provider charges by their
+// visual cost rather than by their encoded size. Each input_image part,
+// and each input_file part whose data is an image, wherever it is, in
+// a message or a function call output, counts [ImageTokens] for its
+// dimensions when its data URL holds a PNG, JPEG or GIF whose header
+// gives them, and [DefaultImageTokens] otherwise; its encoded data
+// counts nothing more. So a screenshot weighs what the model is charged
+// for it, not a hundred thousand tokens of base64.
 func Estimate(items openresponses.Items) int {
 	data, err := json.Marshal(items)
 	if err != nil {
 		return 0
 	}
+	if !bytes.Contains(data, []byte(`"input_image"`)) && !bytes.Contains(data, []byte(`"input_file"`)) {
+		return len(data) / 4
+	}
+	var tree any
+	if err := json.Unmarshal(data, &tree); err != nil {
+		return len(data) / 4
+	}
+	images := weighImages(tree)
+	rest, err := json.Marshal(tree)
+	if err != nil {
+		return len(data) / 4
+	}
+	return len(rest)/4 + images
+}
+
+// EstimateSettings is the default estimator of the settings a request
+// carries beside its input: the JSON size of its instructions and its
+// tool definitions divided by four, as [Estimate] weighs items.
+func EstimateSettings(req openresponses.Request) int {
+	data, err := json.Marshal(struct {
+		Instructions string              `json:"instructions,omitempty"`
+		Tools        openresponses.Tools `json:"tools,omitempty"`
+	}{req.Instructions, req.Tools})
+	if err != nil {
+		return 0
+	}
 	return len(data) / 4
+}
+
+// DefaultImageTokens is what [Estimate] counts for an image whose
+// dimensions it cannot read: one referred to by URL or file ID, or of a
+// format whose header it does not parse. It is about what the largest
+// image a provider takes without scaling costs.
+const DefaultImageTokens = 1600
+
+// ImageTokens is the visual cost [Estimate] gives an image of width by
+// height pixels: its area over 750, after scaling it down to fit
+// within 1568 pixels on its long edge and about 1.15 megapixels, as
+// the providers that charge by area scale it, and never more than
+// [DefaultImageTokens].
+func ImageTokens(width, height int) int {
+	if width <= 0 || height <= 0 {
+		return DefaultImageTokens
+	}
+	w, h := float64(width), float64(height)
+	if long := max(w, h); long > 1568 {
+		w, h = w*1568/long, h*1568/long
+	}
+	if area := w * h; area > 1_150_000 {
+		scale := math.Sqrt(1_150_000 / area)
+		w, h = w*scale, h*scale
+	}
+	return min(int(math.Ceil(w*h/750)), DefaultImageTokens)
+}
+
+// weighImages walks a decoded JSON tree, removes the encoded data of
+// every image part it finds and returns their visual cost.
+func weighImages(v any) int {
+	total := 0
+	switch n := v.(type) {
+	case []any:
+		for _, e := range n {
+			total += weighImages(e)
+		}
+	case map[string]any:
+		switch n["type"] {
+		case "input_image":
+			url, _ := n["image_url"].(string)
+			delete(n, "image_url")
+			return imageTokens(url)
+		case "input_file":
+			if data, _ := n["file_data"].(string); strings.HasPrefix(data, "data:image/") {
+				delete(n, "file_data")
+				return imageTokens(data)
+			}
+		}
+		for _, e := range n {
+			total += weighImages(e)
+		}
+	}
+	return total
+}
+
+// imageTokens is the visual cost of the image a URL names: by the
+// dimensions in its header when it is a base64 data URL of a format
+// image.DecodeConfig reads, [DefaultImageTokens] otherwise.
+func imageTokens(url string) int {
+	rest, ok := strings.CutPrefix(url, "data:")
+	if !ok {
+		return DefaultImageTokens
+	}
+	meta, payload, ok := strings.Cut(rest, ",")
+	if !ok || !strings.HasSuffix(meta, ";base64") {
+		return DefaultImageTokens
+	}
+	cfg, _, err := image.DecodeConfig(base64.NewDecoder(base64.StdEncoding, strings.NewReader(payload)))
+	if err != nil {
+		return DefaultImageTokens
+	}
+	return ImageTokens(cfg.Width, cfg.Height)
 }
 
 // Last returns the item that most recently replaced a folded prefix,
@@ -671,11 +811,16 @@ func (t *Transform) FoldNext(instructions string) {
 // conversation's or one rewound before it, folds as usual.
 // [WithBackOff] turns the back-off off.
 func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (agentturn.Transcript, error) {
+	settings := 0
+	if req, ok := agentturn.RequestFromContext(ctx); ok && t.settings != nil {
+		// The instructions and tools share the window with the items.
+		settings = t.settings(req)
+	}
 	t.mu.Lock()
 	forced, instructions := t.next || agentturn.FoldRequested(ctx), t.nextInstructions
 	t.next, t.nextInstructions = false, ""
 	view, base := t.view(items)
-	tokens := t.estimate(view)
+	tokens := t.estimate(view) + settings
 	if tokens <= t.budget && !forced {
 		t.mu.Unlock()
 		return view, nil
