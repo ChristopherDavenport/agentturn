@@ -955,3 +955,75 @@ func TestAReopenedSidecarQuarantineMatchesItsMedia(t *testing.T) {
 		t.Errorf("%d unhashed entries: %s", n, entryTypes(s2))
 	}
 }
+
+// TestAnOutputMovedFromTheTrimToTheQuarantineIsAReplace pins format
+// 0.16's groups across a move: a host clears two outputs as
+// "[cleared]" and then quarantines one of them, which a request sends
+// as the quarantine's text. A delta cannot take an entry from one group
+// to another, so the recorder writes a replace carrying both groups,
+// and every response verifies.
+func TestAnOutputMovedFromTheTrimToTheQuarantineIsAReplace(t *testing.T) {
+	ctx := context.Background()
+	rec, s, err := Start(ctx, agentsession.NewMemoryStore(), agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetch := agenttool.New("fetch", "fetches a page", func(context.Context, struct{}) (string, error) { return "a page", nil })
+	a := agentturn.New(agentturn.Config{Model: fetchThenAnswer{}, ModelName: "m", Tools: []agenttool.Tool{fetch}})
+	defer rec.Attach(a)()
+	for _, text := range []string{"fetch the first page", "fetch the second page"} {
+		if _, err := a.Prompt(ctx, openresponses.UserText(text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.SetTranscript(clearOutputs(a.State().Transcript)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Prompt(ctx, openresponses.UserText("and then")); err != nil {
+		t.Fatal(err)
+	}
+	var second openresponses.Item
+	for _, item := range a.State().Transcript {
+		if _, ok := item.(*openresponses.FunctionCallOutput); ok {
+			second = item
+		}
+	}
+	if err := a.Quarantine(second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Prompt(ctx, openresponses.UserText("once more")); err != nil {
+		t.Fatal(err)
+	}
+	if n := verifyAll(t, s); n != 6 {
+		t.Errorf("responses = %d, want 6", n)
+	}
+	if n := unhashedEntries(s); n != 0 {
+		t.Errorf("%d unhashed entries: %s", n, entryTypes(s))
+	}
+	cs := configs(s)
+	if last := cs[len(cs)-1]; !last.Replace {
+		t.Errorf("the move was written as %+v, want a replace", last)
+	}
+	cx, err := s.Context()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var outs []string
+	for _, e := range s.Path(s.Leaf()) {
+		if ie, ok := e.(*agentsession.ItemEntry); ok {
+			if _, ok := ie.Item.(*openresponses.FunctionCallOutput); ok {
+				outs = append(outs, ie.ID)
+			}
+		}
+	}
+	o := cx.Settings.Omit.Outputs
+	if len(outs) != 2 || o == nil {
+		t.Fatalf("outputs %v, omit.outputs %+v", outs, o)
+	}
+	if text, _ := o.TextFor(outs[0]); text != "[cleared]" {
+		t.Errorf("the first output is sent as %q, want [cleared]; omit.outputs = %+v", text, o)
+	}
+	if text, _ := o.TextFor(outs[1]); text != agentturn.QuarantinedOutput {
+		t.Errorf("the second output is sent as %q, want the quarantine's text; omit.outputs = %+v", text, o)
+	}
+}
