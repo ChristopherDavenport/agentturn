@@ -1189,6 +1189,9 @@ type inboxItem struct {
 	// awaiting is set while an input Requeue handed back waits for its
 	// queued event, which then writes nothing: the path holds it.
 	awaiting bool
+	// holder is the agent Requeue or Redeliver handed the input to,
+	// nil when nothing did.
+	holder *agentturn.Agent
 	// declined is set for an input whose entry was written and which
 	// the agent then refused: nobody holds it, Requeue does not hand it
 	// back, and the next run end drops it.
@@ -3111,8 +3114,9 @@ func (r *Recorder) Deliver(ctx context.Context, a *agentturn.Agent, items ...ope
 // as a delivery under the same trigger, equal to it, and that nobody
 // has taken up, one a task that stopped for input left for the
 // message answering its calls, is handed over under that entry rather
-// than written again, and one [Recorder.Requeue] already handed back,
-// which the agent holds, is not handed over a second time. A front
+// than written again, and one [Recorder.Requeue] already handed back
+// to a, which a holds, is not handed over a second time; one Requeue
+// handed to another agent is a's to take as a new input. A front
 // that may hand over two inputs alike names each in its trigger, as
 // front/a2a names the message. An item whose entry cannot be written
 // is not queued, and the error says so; the items before it are.
@@ -3129,15 +3133,17 @@ func (r *Recorder) Redeliver(ctx context.Context, a *agentturn.Agent, items ...o
 		r.mu.Lock()
 		in := r.root.owedDelivery(base, trigger)
 		switch {
-		case in != nil && in.held:
-			// Requeue already handed it back and the agent holds it:
+		case in != nil && in.held && in.holder == a:
+			// Requeue already handed it back and this agent holds it:
 			// handing it over again would queue it twice.
 			r.mu.Unlock()
 			continue
-		case in != nil:
-			in.item, in.held, in.awaiting = base, true, true
+		case in != nil && !in.held:
+			in.item, in.held, in.awaiting, in.holder = base, true, true, a
 		default:
-			in = &inboxItem{item: base, mode: agentsession.ModeSteer, deliver: true, held: true, awaiting: true, trigger: trigger.Clone()}
+			// A new input, or one another agent holds, as when a host
+			// reuses one recorder across tasks: this agent gets its own.
+			in = &inboxItem{item: base, mode: agentsession.ModeSteer, deliver: true, held: true, awaiting: true, trigger: trigger.Clone(), holder: a}
 			r.root.inbox = append(r.root.inbox, in)
 			if err := r.root.requeue(context.WithoutCancel(ctx)); err != nil {
 				r.root.inbox = r.root.inbox[:len(r.root.inbox)-1]
@@ -3244,7 +3250,7 @@ func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) (n int, deli
 	var owed []*inboxItem
 	for _, in := range r.root.inbox {
 		if !in.held && !in.declined && in.entry != "" {
-			in.held, in.awaiting = true, true
+			in.held, in.awaiting, in.holder = true, true, a
 			owed = append(owed, in)
 		}
 	}
