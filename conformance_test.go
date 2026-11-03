@@ -114,6 +114,9 @@ type scriptedAttempt struct {
 	// NoDone lists the output indexes whose output_item.done the stream
 	// leaves out, so only response.completed completes the item.
 	NoDone []int `json:"no_done"`
+	// AtIndexZero streams every item at output index 0, one after the
+	// other, while response.completed lists each at its own position.
+	AtIndexZero bool `json:"at_index_zero"`
 }
 
 type scriptedError struct {
@@ -761,6 +764,30 @@ func (m *scriptedModel) CreateStream(_ context.Context, req openresponses.Reques
 	resp := openresponses.NewResponse(req)
 	if at.ID != "" {
 		resp.ID = at.ID
+	}
+	if at.AtIndexZero {
+		next := sink
+		sink = openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+			switch e := ev.(type) {
+			case *openresponses.OutputItemAddedEvent:
+				e.OutputIndex = 0
+			case *openresponses.OutputItemDoneEvent:
+				e.OutputIndex = 0
+			case *openresponses.FunctionCallArgumentsDeltaEvent:
+				e.OutputIndex = 0
+			case *openresponses.FunctionCallArgumentsDoneEvent:
+				e.OutputIndex = 0
+			case *openresponses.ContentPartAddedEvent:
+				e.OutputIndex = 0
+			case *openresponses.ContentPartDoneEvent:
+				e.OutputIndex = 0
+			case *openresponses.OutputTextDeltaEvent:
+				e.OutputIndex = 0
+			case *openresponses.OutputTextDoneEvent:
+				e.OutputIndex = 0
+			}
+			return next.Send(ev)
+		})
 	}
 	if len(at.NoDone) > 0 {
 		next := sink

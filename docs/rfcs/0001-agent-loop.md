@@ -2098,7 +2098,9 @@ streamed before the failure, and `error`, a `message`, whether it is
 Responses error `code` it carries, `context_length_exceeded` say, with
 which the attempt fails. An answer's `no_done` lists the output indexes
 whose `output_item.done` the stream leaves out, so only
-`response.completed` completes those items. A stream opens each item
+`response.completed` completes those items, and `at_index_zero` streams
+every item at output index 0, one after the other, as some servers
+do, while `response.completed` lists each at its own position. A stream opens each item
 with `output_item.added`, sends its text, arguments or summary as one
 delta and closes it with `output_item.done`, between
 `response.created` and `response.completed`. The runner's retry
@@ -2190,6 +2192,7 @@ sequentially, gives it one call, orders it with a barrier, or holds a call with 
 | `model-blocked` | a model's guard refusal before the answer opened raises `model_blocked` in place of `response_end`, is not retried, and ends the run `stopped` with cause `guard` |
 | `call-completed-by-response` | a function call only `response.completed` completes joins the transcript under the ID it opened with before its batch runs, and its output is paired with it (#236) |
 | `fold-retry` | a request refused as longer than the window is folded through the transform and sent again as a retry, never unchanged |
+| `calls-pair-by-item-id` | calls a stream opens at one output index pair with the response's by item ID, never by output index, one only the response completes among them (#236) |
 
 Four rules are not in the corpus, because a scenario cannot express
 them: a delivery from outside the run, which waits, or starts a run
@@ -2292,9 +2295,10 @@ it.
   (#267); the MUSTs among them are breaking for a recorder.
 - **Conformance.** The recorder rule names the `omit` and `result`
   MUSTs. The corpus adds `deliver`, `pending-returned`,
-  `model-blocked`, `call-completed-by-response` and `fold-retry`, and
-  its runner the `fold` transform, `no_done`, a `guard` or `code`
-  error and `deliver_at`.
+  `model-blocked`, `call-completed-by-response`,
+  `calls-pair-by-item-id` and `fold-retry`, and its runner the `fold`
+  transform, `no_done`, `at_index_zero`, a `guard` or `code` error and
+  `deliver_at`.
 - **Open questions.** Closed: a dispatch a later subscriber refuses
   (#119), who closes a provided tool (#95), the failure beside a
   cancellation (#83), a fold identifying itself (#88), a key for a

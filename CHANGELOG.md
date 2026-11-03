@@ -91,9 +91,9 @@ versions may break the API.
   question's answer; the conformance recorder rule names the `omit` and
   `result` MUSTs; resolved open questions are gone. The scenario corpus
   adds `deliver`, `pending-returned`, `model-blocked`,
-  `call-completed-by-response` and `fold-retry`, and its runner a
-  `fold` transform, `no_done`, `guard` and `code` errors and
-  `deliver_at`; the RFC says which rules a scenario cannot express.
+  `call-completed-by-response`, `calls-pair-by-item-id` and
+  `fold-retry`, and its runner a `fold` transform, `no_done`,
+  `at_index_zero`, `guard` and `code` errors and `deliver_at`; the RFC says which rules a scenario cannot express.
   `TranscriptFromContext`'s doc says it is the quarantined view.
 - Fixed: `session.Start` writes the harness `WithHarness` names in the
   root session's header when the header names none, as every child
@@ -156,15 +156,15 @@ versions may break the API.
   appends it with no decision before it. An answer `ReplayAnswers` takes
   from a branch's output, or from a result, is marked failed when that
   output was. (#273)
-- Added: `PendingReturned`, the pending reason of a call a record holds
-  a `result` for and no output. `Pending` gives it, with the result as
-  `Ran`, in place of `PendingAborted`, so `MayHaveRun` is false and
-  `Agent.Resume` refuses an approval of it with `ErrCallAnswered`. The
-  recorder refuses a decision or a dispatch for a call whose result is
-  on the path, one it wrote itself included, with agentsession's
-  `ErrCallReturned`, so its tool does not run again. A host that
-  answers pending calls itself answers a returned call with `Ran`.
-  (#273)
+- Changed, breaking: a call a record holds a `result` for and no
+  output is pending as the new `PendingReturned`. `Pending` gives it,
+  with the result as `Ran`, in place of `PendingAborted`, so
+  `MayHaveRun` is false and `Agent.Resume` refuses an approval of it
+  with `ErrCallAnswered`. The recorder refuses a decision or a
+  dispatch for a call whose result is on the path, one it wrote itself
+  included, with agentsession's `ErrCallReturned`, so its tool does
+  not run again. A host that answers pending calls itself answers a
+  returned call with `Ran`. (#273)
 - Changed: the header `session.Start` writes when the caller's names no
   records, and a child session written from its events, promise `result`
   as well, since the recorder writes one for every call that settles
@@ -282,14 +282,15 @@ versions may break the API.
   and refuses every run start until fn returns, the check one step with
   a run's start, and `Agent.SetReasoningModels`, the setter beside
   `WithReasoningModels`. (#220)
-- Added: `session.MoveTo(ctx, agent, recorder, entryID)`, a rewind as
-  one operation: it rebases the record and replaces the agent's
-  transcript, pending calls, owed notes, reasoning attribution and
-  reserved call IDs with what the record holds at the entry, under
-  `WhileIdle`, so a prompt raced into it is refused rather than
-  failing the move. A failure after the record moved puts the record
-  back, and the error names an undo only when the undo failed. It
-  replaces the five calls a host made by hand. (#220)
+- Changed, breaking: a rewind is one operation, as RFC 0001 now
+  requires; added `session.MoveTo(ctx, agent, recorder, entryID)`: it
+  rebases the record and replaces the agent's transcript, pending
+  calls, owed notes, reasoning attribution and reserved call IDs with
+  what the record holds at the entry, under `WhileIdle`, so a prompt
+  raced into it is refused rather than failing the move. A failure
+  after the record moved puts the record back, and the error names an
+  undo only when the undo failed. It replaces the five calls a host
+  made by hand. (#220)
 
 - Fixed: `Recorder.Rebase` takes an input the agent holds as already
   queued on the new branch only when the branch owes an entry holding
@@ -310,22 +311,23 @@ versions may break the API.
   that may have been billed is counted. `front/control` carries `usage`
   on the wire. (#275)
 
-- Fixed: a nested call made again when its parent runs again keeps its
-  ID and its key. Under one parent, the k-th invocation of a tool with
-  JSON-equal arguments matches the k-th nested call of that tool with
-  those arguments on the pending call's new `PendingCall.Nested`
-  (`NestedRecord`), in any order: one that ended is given its recorded
-  result without running, its `ToolStart` and `ToolEnd` marked
-  `Replayed`; one handed to its tool that never ended runs again under
-  its recorded key as agenttool's replay rule allows, else is given the
-  outcome unknown; an invocation with nothing left to match is new.
-  `ToolStart.Invoked` carries the arguments a nested call was invoked
-  with. A run that leaves a call pending carries the nested calls it
-  made under it. `session`'s recorder writes a nested call's hand-off
-  as a `dispatch` phase entry carrying its key, durable before the tool
-  runs, and its end with the output's parts and whether it was cut or
-  withdrawn, and `session.Pending` reads them into `Nested`. RFC 0001's
-  open question on a key for a nested call is closed. (#261)
+- Changed, breaking: a nested call made again when its parent runs
+  again keeps its ID and its key. Under one parent, the k-th
+  invocation of a tool with JSON-equal arguments matches the k-th
+  nested call of that tool with those arguments on the pending call's
+  new `PendingCall.Nested` (`NestedRecord`), in any order: one that
+  ended is given its recorded result without running, its `ToolStart`
+  and `ToolEnd` marked `Replayed`; one handed to its tool that never
+  ended runs again under its recorded key as agenttool's replay rule
+  allows, else is given the outcome unknown; an invocation with
+  nothing left to match is new. `ToolStart.Invoked` carries the
+  arguments a nested call was invoked with. A run that leaves a call
+  pending carries the nested calls it made under it. `session`'s
+  recorder writes a nested call's hand-off as a `dispatch` phase entry
+  carrying its key, durable before the tool runs, and its end with the
+  output's parts and whether it was cut or withdrawn, and
+  `session.Pending` reads them into `Nested`. RFC 0001's open question
+  on a key for a nested call is closed. (#261)
 
 - Added: `Deliverer`, the delivery a `Control` may offer beside `Queue`,
   which `*Agent` implements. `front/control` serves it as `POST
@@ -434,16 +436,16 @@ versions may break the API.
   opened at first runs once, under its own ID. RFC 0001 The model call
   and Invariants. (#236)
 
-- Fixed: a retry the policy's `Revise` moves to another model, and a
-  `BeforeModelCall` hook that does, keeping the input the loop built,
-  sends that input rebuilt for the model the request names, without the
-  reasoning another model produced; and the reasoning an attempt
-  produced is credited to the model its request named, not to
-  `Config.ModelName`. Before, the fallback was sent the primary's
-  reasoning, the next turn on the primary was sent the fallback's, and
-  a recorder left both responses unhashed. Provider refusals of another
-  issuer's reasoning were already answered by openresponses v0.0.18.
-  RFC 0001 The request step 3 and Retry. (#286)
+- Changed, breaking: a retry the policy's `Revise` moves to another
+  model, and a `BeforeModelCall` hook that does, keeping the input the
+  loop built, sends that input rebuilt for the model the request
+  names, without the reasoning another model produced; and the
+  reasoning an attempt produced is credited to the model its request
+  named, not to `Config.ModelName`. Before, the fallback was sent the
+  primary's reasoning, the next turn on the primary was sent the
+  fallback's, and a recorder left both responses unhashed. Provider
+  refusals of another issuer's reasoning were already answered by
+  openresponses v0.0.18. RFC 0001 The request step 3 and Retry. (#286)
 
 - Added: `(*compact.Transform).FoldNext(instructions)` makes the next
   `Transform` call fold whatever its budget, with instructions for that
@@ -516,20 +518,20 @@ versions may break the API.
   and its exports keep the items as they arrived. RFC 0001 The request
   step 3. (#281)
 
-- Changed: a decision an answer to an asked call makes is by the
-  decider the answer names, agenttool's `Answer.By` (`human`, `policy`,
-  `agent`), or `human` when it names none, where `Ask` wrote `human`
-  whatever answered; an answer naming a decider the session format does
-  not know is refused, and the deferral stands. The answer's note
-  reaches the model as a user message only for `human`, and as a
-  developer message for a rule or another model, on a question `Ask`
-  puts and on a tool's own question alike; outside a run, and in a
-  decline's reason, it is named for whoever gave it ("The policy
-  said: …"). `front/control` carries `by` on a `Reply`'s answer, kept
-  only for a principal holding the `WithChosenBy` scope, as for
-  `Resume`, and `human` otherwise; a chosen decider the format does not
-  know is refused on both routes. RFC 0001 Nested calls, Pending calls
-  and resume. (#267)
+- Changed, breaking: a decision an answer to an asked call makes is by
+  the decider the answer names, agenttool's `Answer.By` (`human`,
+  `policy`, `agent`), or `human` when it names none, where `Ask` wrote
+  `human` whatever answered; an answer naming a decider the session
+  format does not know is refused, and the deferral stands. The
+  answer's note reaches the model as a user message only for `human`,
+  and as a developer message for a rule or another model, on a
+  question `Ask` puts and on a tool's own question alike; outside a
+  run, and in a decline's reason, it is named for whoever gave it
+  ("The policy said: …"). `front/control` carries `by` on a `Reply`'s
+  answer, kept only for a principal holding the `WithChosenBy` scope,
+  as for `Resume`, and `human` otherwise; a chosen decider the format
+  does not know is refused on both routes. RFC 0001 Nested calls,
+  Pending calls and resume. (#267)
 
 - Added: `front/a2a`'s `WithChosenBy(func(ctx, principal) bool)` lets
   a host name the principals that may say who decided an approval, as
