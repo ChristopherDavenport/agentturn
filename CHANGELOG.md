@@ -70,7 +70,14 @@ versions may break the API.
 - Changed, breaking: `session` writes format 0.16 sessions, which a
   reader of format 0.15 or earlier refuses once the file is raised: the
   recorder writes `result`, `deliver`, `copied_from` and the 0.15
-  header promises.
+  header promises, and 0.16's `omit.outputs` groups.
+- Fixed: a request that sends function call outputs under two
+  placeholder texts, a host's trim clearing one as `[cleared]` and a
+  quarantine sending another as `QuarantinedOutput`, is described with
+  format 0.16's `omit.outputs` groups, a group to each text, rather
+  than leaving every later response without a hash. A single text is
+  still written as the default group, as format 0.14 reads it. (#233,
+  #281)
 - Dependencies: every module requires openresponses v0.0.18, up from
   v0.0.15, and agenttool v0.0.28, up from v0.0.24; `session` requires
   agentsession v0.0.33, up from v0.0.28. openresponses' `Reasoning` now carries members of its own, so the
@@ -219,7 +226,7 @@ versions may break the API.
 - Fixed: the session recorder describes a request whose input differs
   from what the path holds by edits the format can describe, rather
   than leaving it unhashed. Item entries left out with their order
-  kept, function call outputs sent as one placeholder text and the
+  kept, function call outputs sent as placeholder texts and the
   image parts of all but the last few sent as one placeholder are
   written as a `config` entry whose `omit` names them, `items`,
   `outputs` and `images`, before the response, and the response
@@ -521,7 +528,9 @@ versions may break the API.
   in the transcript, applies a hook's quarantine to the request that
   hook was given, and passes it to runs a tool starts over the
   conversation. The session recorder writes it as `omit.outputs` and
-  `omit.items`, so every later response still verifies.
+  `omit.items`, so every later response still verifies, a host's trim
+  that clears other outputs under another text included: each text is
+  a group of format 0.16's `omit.outputs`.
   `Agent.Quarantined` lists the items. A quarantine covers everything
   a request is built from: the transform reads it,
   `QuarantineFromContext`, a `QuarantineView`, and `compact` leaves

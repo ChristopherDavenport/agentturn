@@ -5223,10 +5223,7 @@ func (w *writer) settle(ctx context.Context, req openresponses.Request, want age
 		// is wanted whole; a delta carries what moved.
 		if entry.Replace {
 			if !want.IsZero() {
-				kept := agentsession.Omit{Reasoning: want.Reasoning, Items: slices.Clone(want.Items), Images: want.Images}
-				if want.Outputs != nil {
-					kept.Outputs = &agentsession.OmitOutputs{Text: want.Outputs.Text, Items: slices.Clone(want.Outputs.Items)}
-				}
+				kept := agentsession.Omit{Reasoning: want.Reasoning, Items: slices.Clone(want.Items), Images: want.Images, Outputs: cloneOutputs(want.Outputs)}
 				entry.Omit = &kept
 			}
 		} else {

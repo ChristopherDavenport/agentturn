@@ -53,14 +53,17 @@ func (w *writer) rebuild(model string, omit agentsession.Omit) ([]rebuiltItem, b
 		}
 		out = append(out, w.rebuiltAt(i))
 	}
-	if omit.Outputs != nil && len(omit.Outputs.Items) > 0 {
-		outs := idSet(omit.Outputs.Items)
+	if omit.Outputs != nil {
 		for k, r := range out {
-			if r.at < 0 || w.meta[r.at].folded || !outs[w.items[r.at]] {
+			if r.at < 0 || w.meta[r.at].folded {
+				continue
+			}
+			text, listed := omit.Outputs.TextFor(w.items[r.at])
+			if !listed {
 				continue
 			}
 			if o, ok := w.recordedItem(r.at).(*openresponses.FunctionCallOutput); ok {
-				out[k].item, out[k].orig = outputPlaceholder(o, omit.Outputs.Text), nil
+				out[k].item, out[k].orig = outputPlaceholder(o, text), nil
 			}
 		}
 	}
@@ -258,9 +261,10 @@ func (w *writer) same(sent *sentInput, k int, r rebuiltItem) bool {
 // describe returns the omit setting under which the stored path
 // rebuilds sent, a request's input to model, and reports whether there
 // is one: the input differs from what the path holds only by item
-// entries left out, their order kept, function call outputs sent as one
-// placeholder text, and the image parts of all but the last few sent as
-// one placeholder, which is what the format's omit can say (#233). It
+// entries left out, their order kept, function call outputs sent as
+// placeholder texts, one text to a group of format 0.16's
+// omit.outputs, and the image parts of all but the last few sent as one
+// placeholder, which is what the format's omit can say (#233). It
 // looks first for a setting that adds to the one in force, which a
 // config delta carries, and then for one that starts afresh, which only
 // a replace does. A setting it finds is checked by rebuilding the input
@@ -296,13 +300,19 @@ func (w *writer) describeOver(in *sentInput, model string, base agentsession.Omi
 		j = len(head)
 	}
 	listed := idSet(base.Items)
-	outText, outs := "", map[string]bool{}
-	if base.Outputs != nil {
-		outText, outs = base.Outputs.Text, idSet(base.Outputs.Items)
+	// outText is the text the outputs in force send an entry's output
+	// with, and whether they list it.
+	outText := func(id string) (string, bool) {
+		if base.Outputs == nil {
+			return "", false
+		}
+		return base.Outputs.TextFor(id)
 	}
 	want := agentsession.Omit{Reasoning: base.Reasoning, Items: slices.Clone(base.Items)}
-	var newOuts []string
-	textSet := len(outs) > 0
+	// newOuts are the outputs sent as a placeholder that the outputs in
+	// force do not list, by text, the texts in the order first sent.
+	newOuts := map[string][]string{}
+	var newTexts []string
 	// images lists, in request order, whether each image part of the
 	// item entries kept was sent as a placeholder, and placeholder is
 	// the text that stood in for those that were.
@@ -328,22 +338,26 @@ func (w *writer) describeOver(in *sentInput, model string, base agentsession.Omi
 		at.item = w.recordedItem(i)
 		rec := at.item
 		out, isOutput := rec.(*openresponses.FunctionCallOutput)
-		if isOutput && outs[w.items[i]] {
-			rec = outputPlaceholder(out, outText)
+		text, cleared := outText(w.items[i])
+		cleared = cleared && isOutput
+		if cleared {
+			rec = outputPlaceholder(out, text)
 			at = rebuiltItem{item: rec, at: i}
 		}
 		if j < len(sent) {
 			if w.same(in, j, at) {
-				if !isOutput || !outs[w.items[i]] {
+				if !cleared {
 					images = append(images, make([]bool, len(imageParts(rec)))...)
 				}
 				j++
 				continue
 			}
 			conv := w.recordForm(sent[j])
-			if text, ok := sentAsPlaceholder(conv, rec); ok && !outs[w.items[i]] && (!textSet || text == outText) {
-				outText, textSet = text, true
-				newOuts = append(newOuts, w.items[i])
+			if text, ok := sentAsPlaceholder(conv, rec); ok && !cleared {
+				if _, seen := newOuts[text]; !seen {
+					newTexts = append(newTexts, text)
+				}
+				newOuts[text] = append(newOuts[text], w.items[i])
 				j++
 				continue
 			}
@@ -359,12 +373,8 @@ func (w *writer) describeOver(in *sentInput, model string, base agentsession.Omi
 	if j != len(sent) {
 		return agentsession.Omit{}, nil, false
 	}
-	if base.Outputs != nil || len(newOuts) > 0 {
-		var kept []string
-		if base.Outputs != nil {
-			kept = base.Outputs.Items
-		}
-		want.Outputs = &agentsession.OmitOutputs{Text: outText, Items: slices.Concat(kept, newOuts)}
+	if base.Outputs != nil || len(newTexts) > 0 {
+		want.Outputs = withOutputs(base.Outputs, newTexts, newOuts)
 	}
 	// The image parts sent as a placeholder are the first of them, all
 	// but the last few: the keep form. The one in force stays when it
@@ -390,6 +400,49 @@ func (w *writer) describeOver(in *sentInput, model string, base agentsession.Omi
 		return agentsession.Omit{}, nil, false
 	}
 	return want, got, true
+}
+
+// withOutputs is the outputs member in force, have, with the outputs
+// add lists sent with each text of texts: those of the default group's
+// text in the default group, those of a named group's text in that
+// group, and those of another text in a group of their own, the first
+// text in the default group when have holds none, so a request whose
+// outputs are sent with one text is described as format 0.14 describes
+// it (#233).
+func withOutputs(have *agentsession.OmitOutputs, texts []string, add map[string][]string) *agentsession.OmitOutputs {
+	o := cloneOutputs(have)
+	if o == nil {
+		o = &agentsession.OmitOutputs{}
+	}
+	hasDefault := have != nil && (have.Text != "" || len(have.Items) > 0 || len(have.Groups) == 0)
+	for _, text := range texts {
+		group := slices.IndexFunc(o.Groups, func(g agentsession.OmitOutputGroup) bool { return g.Text == text })
+		switch {
+		case hasDefault && text == o.Text:
+			o.Items = append(o.Items, add[text]...)
+		case group >= 0:
+			o.Groups[group].Items = append(o.Groups[group].Items, add[text]...)
+		case !hasDefault:
+			o.Text, o.Items, hasDefault = text, append(o.Items, add[text]...), true
+		default:
+			o.Groups = append(o.Groups, agentsession.OmitOutputGroup{Text: text, Items: slices.Clone(add[text])})
+		}
+	}
+	return o
+}
+
+// cloneOutputs is a copy of o that shares no list with it, nil for nil.
+func cloneOutputs(o *agentsession.OmitOutputs) *agentsession.OmitOutputs {
+	if o == nil {
+		return nil
+	}
+	cp := *o
+	cp.Items = slices.Clone(o.Items)
+	cp.Groups = nil
+	for _, g := range o.Groups {
+		cp.Groups = append(cp.Groups, agentsession.OmitOutputGroup{Text: g.Text, Items: slices.Clone(g.Items)})
+	}
+	return &cp
 }
 
 // outputPlaceholder is out sent with text in place of its output.
@@ -571,8 +624,14 @@ func (w *writer) quarantinedIn(t agentturn.Transcript) openresponses.Items {
 	o := w.settings.Omit
 	listed := idSet(o.Items)
 	outs := map[string]bool{}
-	if o.Outputs != nil && o.Outputs.Text == agentturn.QuarantinedOutput {
-		outs = idSet(o.Outputs.Items)
+	if o.Outputs != nil {
+		// The outputs the quarantine's text is sent for, in whichever
+		// group lists them.
+		for i := range w.values {
+			if text, ok := o.Outputs.TextFor(w.items[i]); ok && text == agentturn.QuarantinedOutput {
+				outs[w.items[i]] = true
+			}
+		}
 	}
 	if len(listed) == 0 && len(outs) == 0 || len(t) == 0 {
 		return nil

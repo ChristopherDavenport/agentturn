@@ -522,7 +522,9 @@ that a recorder holding the transcript and the settings rebuilds it:
    quarantined an item the transform had folded into it. A recorder
    writes a quarantine as the `omit` setting that describes it, `omit.outputs` for a placeholder and `omit.items` for
    an item left out, as the consequences below say, so the requests
-   after it rebuild and hash; a fold made again is recorded as any
+   after it rebuild and hash, beside a host's trim that clears other
+   outputs under another text too, each text a group of format 0.16's
+   `omit.outputs`; a fold made again is recorded as any
    fold. The record keeps the item as it arrived, and so does whatever
    is exported from the record, a trajectory or a trace: they are the
    record of the conversation, not the model's input (#281).
@@ -551,8 +553,9 @@ or a host that replaced the transcript, is described when the session
 format can describe it, and costs the hash only when it cannot. When
 the input sent differs from the input the path rebuilds only by edits
 agentsession RFC 0001's `omit` describes — item entries left out with
-their order kept, function call outputs sent as one placeholder text,
-the image parts of all but the last few sent as one placeholder — the
+their order kept, function call outputs sent as placeholder texts, one
+text to a group of `omit.outputs` since format 0.16, so a host's trim
+and a quarantine are described together, the image parts of all but the last few sent as one placeholder — the
 recorder MUST write a `config` delta whose `omit` describes them before
 the response, a replace carrying the setting whole when an item left
 out is sent again, and hash the request against the path as edited; a
@@ -1836,7 +1839,8 @@ An agent stands in four places inside another system:
   items out of the middle of its history: agentsession RFC 0001's
   `omit` names the item entries left out, their order kept, since
   format 0.11, and tool outputs and image parts sent as placeholders
-  (`omit.outputs`, `omit.images`) since 0.14. A recorder that writes
+  (`omit.outputs`, `omit.images`) since 0.14, under several texts
+  since 0.16. A recorder that writes
   that `omit` before the response hashes the request against the path
   as edited, and only an input the format cannot describe leaves the
   responses after it unhashed, as the request procedure has it (#233).
