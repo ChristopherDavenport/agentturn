@@ -82,29 +82,32 @@
 // the model's behalf; a sibling's output, or a blocked or failed
 // call's, is not taken for it.
 //
-// The adapter keeps nothing between requests but the quarantine, so
-// the conversation's next request starts under the adapter's
-// configuration again, the sender's, unless [WithStart] or
-// [WithTransfers] picks another from the input. The input's reasoning
-// items are the caller's, of unknown origin, and sent as they are
-// unless [WithTransfers] attributes them.
+// The adapter keeps nothing between requests but, under
+// [WithQuarantineScope], the quarantine, so the conversation's next
+// request starts under the adapter's configuration again, the
+// sender's, unless [WithStart] or [WithTransfers] picks another from
+// the input. The input's reasoning items are the caller's, of unknown
+// origin, and sent as they are unless [WithTransfers] attributes them.
 //
 // An item a hook or a tool quarantined (agentturn.Quarantine) in one
-// request stays quarantined in every later one: a request whose input
-// holds a copy of it, equal in its JSON encoding but for its id and
-// status, as the caller sends the conversation back
-// (agentturn.QuarantineSet.Bind), sends it as the quarantine says, a function
-// call output with agentturn.QuarantinedOutput in place of its own.
-// A request names no conversation, so the adapter keeps one set for
-// every conversation it serves, one copy of each item quarantined, for
-// its life (RFC 0001 The request, step 3; #281).
+// request stays quarantined in the later requests of its conversation,
+// as [WithQuarantineScope] keys it: a request whose input holds a copy
+// of it, equal in its JSON encoding but for its id and status, as the
+// caller sends the conversation back (agentturn.QuarantineSet.Bind),
+// sends it as the quarantine says, a function call output with
+// agentturn.QuarantinedOutput in place of its own. A request names no
+// conversation, so without the option a quarantine lasts one request,
+// the legs of its handoffs included (RFC 0001 The request, step 3;
+// #281).
 package responses
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
@@ -121,10 +124,11 @@ type Adapter struct {
 	route               Route
 	maxHandoffs         int
 	trim                func(ctx context.Context, from, to agentturn.Config, t agentturn.Transcript) agentturn.Transcript
-	// quarantined holds what the requests served so far quarantined,
-	// one copy of each item, matched to each request's input by value
+	// scope keys a request's conversation for the quarantine, and
+	// quarantines holds, by that key, what its requests quarantined
 	// (#281).
-	quarantined *agentturn.QuarantineSet
+	scope       func(ctx context.Context, req openresponses.Request) (string, bool)
+	quarantines scopes
 }
 
 var _ openresponses.Adapter = (*Adapter)(nil)
@@ -265,6 +269,69 @@ const DefaultMaxHandoffs = 10
 // [DefaultMaxHandoffs].
 func WithMaxHandoffs(n int) Option { return func(a *Adapter) { a.maxHandoffs = n } }
 
+// MaxQuarantineScopes is how many conversations' quarantines an
+// adapter keeps under [WithQuarantineScope]: past it, the set of the
+// key used least recently is let go, and that conversation's next
+// request sends what it quarantined as it is, unless its guard
+// quarantines it again.
+const MaxQuarantineScopes = 1024
+
+// WithQuarantineScope keeps what a request quarantined
+// (agentturn.Quarantine) for the later requests of its conversation:
+// fn keys the conversation a request belongs to, and the adapter keeps
+// one quarantine per key, which every request fn gives that key builds
+// under, an item the caller sends back matched by its content, equal
+// in its JSON encoding but for its id and status
+// (agentturn.QuarantineSet.Bind). A request names no conversation, and
+// Open Responses carries none the adapter is given, so the host says
+// which requests share one: the authenticated principal with the
+// request's prompt_cache_key or a metadata member, say, never a key a
+// caller chooses alone, since a key two callers share leaks to each
+// whether the other quarantined some text and drops it from the other's
+// requests. A request fn gives no key for, and every request without
+// the option, builds under a quarantine of its own, which the legs of
+// its handoffs share and nothing after it does. The adapter keeps at
+// most [MaxQuarantineScopes] keys, the least recently used let go
+// first (RFC 0001 The request, step 3; #281).
+func WithQuarantineScope(fn func(ctx context.Context, req openresponses.Request) (key string, ok bool)) Option {
+	return func(a *Adapter) { a.scope = fn }
+}
+
+// scopes holds the quarantine of each key [WithQuarantineScope] gave,
+// at most [MaxQuarantineScopes] of them, the least recently used let
+// go first. The zero value is ready to use.
+type scopes struct {
+	mu   sync.Mutex
+	sets map[string]*list.Element
+	lru  list.List
+}
+
+type scoped struct {
+	key string
+	set *agentturn.QuarantineSet
+}
+
+// get returns key's set, made when it has none, and marks key used.
+func (s *scopes) get(key string) *agentturn.QuarantineSet {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.sets[key]; ok {
+		s.lru.MoveToFront(e)
+		return e.Value.(*scoped).set
+	}
+	if s.sets == nil {
+		s.sets = map[string]*list.Element{}
+	}
+	set, _ := agentturn.NewQuarantineSet()
+	s.sets[key] = s.lru.PushFront(&scoped{key: key, set: set})
+	for s.lru.Len() > MaxQuarantineScopes {
+		last := s.lru.Back()
+		s.lru.Remove(last)
+		delete(s.sets, last.Value.(*scoped).key)
+	}
+	return set
+}
+
 // WithHandoffTrim trims what the receiver of a [WithHandoff] switch
 // sees, once, between the sender's run and the receiver's: fn is given
 // the sender's configuration, the receiver's and the conversation as
@@ -284,7 +351,6 @@ func WithHandoffTrim(fn func(ctx context.Context, from, to agentturn.Config, t a
 // New builds an adapter over cfg.
 func New(cfg agentturn.Config, opts ...Option) *Adapter {
 	a := &Adapter{cfg: cfg}
-	a.quarantined, _ = agentturn.NewQuarantineSet()
 	for _, opt := range opts {
 		opt(a)
 	}
@@ -356,14 +422,20 @@ func (a *Adapter) CreateStream(ctx context.Context, req openresponses.Request, s
 		resp.Instructions = &instructions
 	}
 	rl := newRelay(sink, resp)
-	// What an earlier request quarantined stays out of this one's
-	// requests, an item the caller sends back being a copy of the one
-	// quarantined; every leg of a handoff continues one conversation,
-	// so what a leg's guard quarantined the next leg's requests leave
-	// out too, and what this request quarantines is kept for the next
-	// (#281).
-	quarantined := a.quarantined.Bind(transcript)
-	defer a.quarantined.Merge(quarantined)
+	// Every leg of a handoff continues one conversation, so what a
+	// leg's guard quarantined the next leg's requests leave out too.
+	// Under WithQuarantineScope what an earlier request of the
+	// conversation quarantined stays out of this one's, an item the
+	// caller sends back being a copy of the one quarantined, and what
+	// this request quarantines is kept for the next (#281).
+	quarantined, _ := agentturn.NewQuarantineSet()
+	if a.scope != nil {
+		if key, ok := a.scope(ctx, req); ok {
+			held := a.quarantines.get(key)
+			quarantined = held.Bind(transcript)
+			defer held.Merge(quarantined)
+		}
+	}
 	ctx = agentturn.ContextWithQuarantineSet(ctx, quarantined)
 	if len(callerTools) > 0 {
 		return a.oneTurn(ctx, base, req, transcript, models, callerTools, rl)
