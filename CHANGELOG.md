@@ -48,35 +48,18 @@ versions may break the API.
   quarantine left out, so an agent seeded from a store that keeps the
   conversation whole, as `front/a2a`'s is, does not send it again
   after a reopen. (#281)
-- Fixed: `Recorder.Rebase` takes an entry the new branch owes as an
-  input's own only when it holds the same input in the same mode under
-  the same trigger; an entry for the same item that something else
-  brought is left to that input, and this one is queued on its own
-  entry with its trigger. (#220)
-- Changed: a model call refused with a guard's error before the attempt
-  committed now raises `ModelBlocked` in place of its `response_end`,
-  carrying the request sent and the new `ModelBlocked.Usage`, what the
-  provider reported, and the recorder's `agentturn:model_blocked` record
-  carries that usage, so a call that may have been billed is counted.
-  `front/control` carries `usage` on the wire.
 - Fixed: `front/responses`' single turn, a request carrying the caller's
   tools, calls its transform under `agentturn.ContextWithRequest` with
   the settings the request will carry, the caller's tools included, as
   the loop does, so a fold against a share of the context window counts
   them. (#279)
-- Fixed: a handoff whose trim leaves the sender's preamble last now
-  delivers its developer note, `front/responses.HandoffNote`, as the
-  receiver's run's input instead of adding it to the trimmed transcript,
-  in `handoff.Team.Run` and both fronts. The loop appends it and a
-  session recorder writes it once, so every later request in the
-  conversation keeps its hash; `Team.Trim` and `TrimHandedOff` add no
-  note, and a later task or request finds it in the history. Added
-  `responses.HandoffNote` and `responses.TransferName`. (#276)
+- Changed, breaking: `session` writes format 0.15 sessions, which a
+  reader of format 0.14 refuses once the file is raised: the recorder
+  writes `result`, `deliver`, `copied_from` and the 0.15 header
+  promises.
 - Dependencies: every module requires openresponses v0.0.18, up from
   v0.0.15, and agenttool v0.0.28, up from v0.0.24; `session` requires
-  agentsession v0.0.32, up from v0.0.28, so the sessions it writes are
-  format 0.15, which a reader of 0.14 refuses once the file is raised.
-  openresponses' `Reasoning` now carries members of its own, so the
+  agentsession v0.0.32, up from v0.0.28. openresponses' `Reasoning` now carries members of its own, so the
   recorder compares two reasoning settings by their JSON when it writes a
   config delta.
 - Fixed: RFC 0001's Composition no longer says a recorder cannot write
@@ -199,10 +182,10 @@ versions may break the API.
   everything a turn calls, its hooks, the transform, the model and the
   tools, carries the turn's number beside the run ID; it is 0 outside a
   turn and in a resume's approved batch. (#275)
-- Changed: a model call that fails with an error wrapping `ErrGuard`,
-  as a moderation wrapper around the model marks its refusal, stops the
-  run with `ReasonStopped` and `StopGuard` and the error on `RunEnd.Err`,
-  without a retry, and closes the calls the stream completed before it
+- Changed, breaking: a model call that fails with an error wrapping
+  `ErrGuard`, as a moderation wrapper around the model marks its
+  refusal, stops the run with `ReasonStopped` and `StopGuard` and the
+  error on `RunEnd.Err`, without a retry, and closes the calls the stream completed before it
   with `WithheldCallOutput`. It ended `ReasonError` before. (#275)
 - Fixed: a model guard error after the response began is the output
   guard's stop in the record too: the loop delivers that response's
@@ -297,16 +280,23 @@ versions may break the API.
   replaces the five calls a host made by hand. (#220)
 
 - Fixed: `Recorder.Rebase` takes an input the agent holds as already
-  queued on the new branch when the branch owes an entry holding the
-  same input in the same mode, so a `MoveTo` that fails after the record
-  moved and moves it back writes no duplicate `queued` entry and leaves
-  the leaf where it was. (#220)
+  queued on the new branch only when the branch owes an entry holding
+  the same input in the same mode under the same trigger, so a `MoveTo`
+  that fails after the record moved and moves it back writes no
+  duplicate `queued` entry and leaves the leaf where it was; an entry
+  for the same item that something else brought is left to that input,
+  and this one is queued on its own entry with its trigger. (#220)
 
-- Fixed: a model call refused with a guard's error before the attempt
-  committed to an answer no longer delivers an empty withheld
-  `response_end`; the session recorder writes the refused call as an
-  `agentturn:model_blocked` record with the request's hash, as for a
-  `BeforeModelCall` guard, rather than an empty response.
+- Changed, breaking: a model call refused with a guard's error before
+  the attempt committed to an answer raises `ModelBlocked` in place of
+  its `response_end`, where it delivered an empty withheld
+  `response_end`; the event carries the request sent and the new
+  `ModelBlocked.Usage`, what the provider reported. The session
+  recorder writes the refused call as an `agentturn:model_blocked`
+  record with the request's hash and that usage, as for a
+  `BeforeModelCall` guard, rather than an empty response, so a call
+  that may have been billed is counted. `front/control` carries `usage`
+  on the wire. (#275)
 
 - Fixed: a nested call made again when its parent runs again keeps its
   ID and its key. Under one parent, the k-th invocation of a tool with
@@ -372,8 +362,11 @@ versions may break the API.
   first turn end in something the model can answer, so a delivery a
   host handed back with `Redeliver` starts the run that takes it,
   although the transcript ends with the model's answer; before, it was
-  refused with `ErrCannotContinue`. `Recorder.Requeue` returns, beside
-  the count, whether a delivery is among what it handed back. (#244)
+  refused with `ErrCannotContinue`. (#244)
+- Changed, breaking: `session.Recorder.Requeue` returns `(int, bool)`,
+  the count of the inputs it handed back and whether a delivery is
+  among them, so the host knows to start the run that takes it with
+  `Continue`. (#244)
 
 - Fixed: a delivery the agent refuses leaves nothing owed. `Agent.Deliver`
   refuses during a `WhileIdle` hold with the new `ErrHeld` (still
@@ -496,8 +489,9 @@ versions may break the API.
   `omit.items`, so every later response still verifies.
   `Agent.Quarantined` lists the items. A quarantine covers everything
   a request is built from: the transform reads it,
-  `QuarantineFromContext`, a `QuarantineView`, and `compact` leaves quarantined items out
-  of what a fold sends its summarizer and folds again when a quarantine
+  `QuarantineFromContext`, a `QuarantineView`, and `compact` leaves
+  quarantined items out of what a fold sends its summarizer and folds
+  again when a quarantine
   reaches a prefix it already summarised; when a `BeforeModelCall`
   guard quarantines an item the transform folded into that request,
   the loop builds the request once more. A tool's
@@ -546,10 +540,16 @@ versions may break the API.
 - Added: `tools/agent.WithAskParent` puts a call the child's own hook
   defers to the elicitor of the call that started the child, with
   `agentturn.Ask`, so an accept runs it and a decline refuses it inside
-  the child; a call held only beside an asked one is released. Only
-  when nobody can be asked does the call fail with input-required. RFC
-  0001 Composition (as a tool, as a peer) states the rule, and its open
-  question "Input required as an interface" is closed. (#84)
+  the child. A call the child's policy held only beside an asked one
+  follows its batch's answers: once every call asked about in its batch
+  was accepted, a resume of the child approves it as the policy decided
+  it; once one was declined, it is refused, unrun, by `policy`, and the
+  child goes on; only when nobody answered does it stay held. Only when
+  nobody can be asked does the call fail with input-required, naming
+  what waits. `ChildInfo.Items` holds the items of every run of the
+  call. RFC 0001 Composition (as a tool, as a peer) states the rule,
+  and its open question "Input required as an interface" is closed.
+  (#84)
 
 - Fixed: a task `front/a2a` starts under `WithStart`'s or
   `WithTransfers`' receiver, the conversation's next message after a
@@ -577,23 +577,36 @@ versions may break the API.
   `remove_all_tools`), switches with `SetConfig`, the receiver
   inheriting the sender's `ToolElicitor` and `ToolRecorder` where it
   has none, and continues under a `handoff` trigger naming the sender,
-  returning the path of agents; after `MaxHandoffs` (default 10) it
-  returns `ErrTooManyHandoffs`. `Team.Route` is the
+  returning the path of agents. At `MaxHandoffs`, by default
+  `front/responses.DefaultMaxHandoffs` (10), it takes the last transfer
+  without running the receiver, so the next input goes to the agent the
+  transcript names, and returns `ErrTooManyHandoffs`. `Team.Route` is the
   `front/responses.Route` both fronts' `WithTransfers` take, so the same
   team is served over either. This reverses #96's "a handoff needs no
   package". RFC 0001 Composition states the rules a host taking a
   handoff meets, and its open question on the handoff is closed. (#274)
-- Changed: `front/a2a` and `front/responses` bound the `WithHandoff`
-  switches one task or request follows, `WithMaxHandoffs(n)`,
-  `DefaultMaxHandoffs` (10) by default, where a pair of agents handing
-  back and forth ran until the host declined or the task was canceled;
-  past the bound the task or response ends as when `WithHandoff`
-  declines. (#274)
+- Changed, breaking: `front/a2a` and `front/responses` bound the
+  `WithHandoff` switches one task or request follows,
+  `WithMaxHandoffs(n)`, `front/responses.DefaultMaxHandoffs` (10) by
+  default, where a pair of agents handing back and forth ran until the
+  host declined or the task was canceled. At the bound the caller is
+  told: `front/a2a` fails the task with a status message, and
+  `front/responses` fails the response with a `model_error` of code
+  `too_many_handoffs`, both matching `ErrTooManyHandoffs`
+  (front/responses', which front/a2a and `handoff` share); the
+  conversation keeps the last transfer, so under `WithTransfers` its
+  next input starts with the receiver. (#274)
 - Fixed: RFC 0001, the README and `Agent.SetTranscript` say a handoff's
-  trim between runs must leave a transcript the loop can continue, and
-  that a trim leaving a model output last appends a developer message
-  naming the transfer, the sender and the receiver; `handoff.Team.Run`
-  does so. (#276)
+  trim between runs must leave a transcript the loop can continue. When
+  a trim leaves the sender's preamble, a model output, last, the
+  receiver's run takes a developer message naming the transfer, the
+  sender and the receiver, `front/responses.HandoffNote`, as its input,
+  in `handoff.Team.Run` and both fronts, rather than the trim adding it
+  to the transcript: the loop appends it and a session recorder writes
+  it once, so every later request in the conversation keeps its hash.
+  `Team.Trim` and `TrimHandedOff` add no note, and a later task or
+  request finds it in the history. Added `responses.HandoffNote` and
+  `responses.TransferName`. (#276)
 
 - Fixed: `session.Recorder.Elicitor` writes the decider the answer
   names (`agenttool.Answer.By`) on the answer entry, and the label it
@@ -607,22 +620,14 @@ versions may break the API.
   note is not said, where it was passed to the tool and its note said
   as a developer message. (#267)
 
-- Security: a nested call a tool makes with `Invoke` that the policy
-  defers is put to the run's elicitor, and its decision hook sees the
+- Security, breaking: a nested call a tool makes with `Invoke` that the
+  policy defers is put to the run's elicitor, and its decision hook sees the
   run's elicitor, never one the invoking tool put on its own context.
   A tool could install an elicitor of its own and approve the call its
   policy deferred, under any decider it named. A host that relied on a
   tool's own elicitor answering its nested calls sets
   `Config.ToolElicitor`, or puts it on the context the run is prompted
   with, instead. RFC 0001 Nested calls.
-
-- Fixed: under `tools/agent.WithAskParent` a call the child's policy
-  held only beside an asked one is released only once every call asked
-  about in its batch was accepted, by a resume of the child approving
-  it as the policy decided; a decline leaves it held and the call fails
-  input-required naming it. It was released, and ran, whatever the
-  person said, and a held call beside no asked one was released too.
-  `ChildInfo.Items` holds the items of every run of the call. (#84)
 
 - Added: `handoff.Team.Resume` answers pending calls and follows the
   transfers the resumed run ends on, as `Run` does; `Team.Handoff` and
@@ -634,27 +639,11 @@ versions may break the API.
   that request or task; the stored conversation keeps the history whole.
   (#274)
 
-- Changed: at the handoff bound the caller is told. `front/a2a` fails
-  the task with a status message, and `front/responses` fails the
-  response with a `model_error` of code `too_many_handoffs`, both
-  matching `ErrTooManyHandoffs` (front/responses', which front/a2a and
-  `handoff` share), where they ended as if the handoff had been
-  declined. `handoff.Team.Run` at its bound now takes the last transfer
-  without running the receiver, so the next input goes to the agent the
-  transcript names, as a front's `WithTransfers` starts it; it left the
-  agent with the sender. (#274)
-
 - Fixed: under `front/a2a`'s `WithEscalation`, a call the policy held
   only beside an asked one is released only when every approval in the
   caller's message accepts; when the caller refuses one, the held call
   is answered with a refusal, unrun, by `policy`. It was released, and
   ran, whatever the caller answered.
-
-- Fixed: under `tools/agent.WithAskParent` a held call whose batch's
-  asked call was declined is refused, unrun, by `policy`, and the child
-  goes on, where it stayed held and the call failed input-required
-  though someone had answered. Only when nobody answered does it stay
-  held. (#84)
 
 - Fixed: a handoff's trim through a front holds for the receiver's
   later tasks and requests. Under `WithTransfers` and `WithHandoffTrim`
@@ -694,8 +683,7 @@ versions may break the API.
   taken and refuses the next. A message naming
   only the context is still refused as busy; a data part or declared
   caller tools are refused while the task runs. The steer is served by
-  `Executor.RequestHandler`, which now wraps the A2A server's handler
-  inside the interceptors; a handler built with `a2asrv.NewHandler`
+  `Executor.RequestHandler`; a handler built with `a2asrv.NewHandler`
   refuses it, as before. `tools/a2a.Steer(ctx, client, info, parts...)`
   sends one, to the task a `WithDetach` call follows among others. RFC
   0001 Composition, as a peer, states it. (#287)
@@ -705,6 +693,12 @@ versions may break the API.
   that request, as the loop does, so the summary the model is sent
   never carries the quarantined text. RFC 0001 The request, step 3,
   says a front building its own request does so. (#281)
+- Changed, breaking: `front/a2a`'s `Executor.RequestHandler` returns the
+  A2A server's handler wrapped in one of its own, inside the
+  interceptors, so a steer's caller is authenticated and its ownership
+  of the task checked before the message reaches a running agent; a
+  host that type-asserts the handler, or relies on it being the SDK's
+  own, gets the wrapper. (#287)
 
 ## v0.0.34 - 2026-10-26
 
