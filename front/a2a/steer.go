@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"maps"
 
 	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/openresponses"
@@ -15,7 +16,8 @@ import (
 // working, the steer A2A allows (§3.3.3, "Agents MAY accept additional
 // messages for tasks in non-terminal states"): its text and files are
 // handed to the task's running agent as a delivery, under the trigger
-// of the caller that sent it, and the send is answered with that task,
+// of the caller that sent it with the A2A message ID as its "message"
+// member, and the send is answered with that task,
 // as it stands for a non-blocking send, followed to its end for a
 // blocking one, its events for a stream. The delivery joins the run in
 // flight when that run will still take it, and otherwise the task
@@ -236,7 +238,10 @@ func (e *Executor) deliver(ctx context.Context, msg *a2a.Message) (bool, error) 
 	if len(items) == 0 {
 		return false, fmt.Errorf("%w: message has no usable parts", a2a.ErrInvalidParams)
 	}
-	trigger := agentturn.TriggerFromContext(ctx)
+	// The trigger names the message, so two steers alike are two to
+	// a recorder that takes a steer it already owes only once.
+	trigger := steerTrigger(agentturn.TriggerFromContext(ctx), msg.ID)
+	ctx = agentturn.ContextWithTrigger(ctx, trigger)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if !rt.open {
@@ -252,6 +257,23 @@ func (e *Executor) deliver(ctx context.Context, msg *a2a.Message) (bool, error) 
 		rt.steered = append(rt.steered, steer{item: item, trigger: trigger})
 	}
 	return true, nil
+}
+
+// steerTrigger is the caller's trigger, of kind "a2a" when it has
+// none, naming the A2A message a steer arrived in as its "message"
+// member.
+func steerTrigger(t agentturn.Trigger, messageID string) agentturn.Trigger {
+	if t.Kind == "" {
+		t.Kind = "a2a"
+	}
+	if messageID == "" {
+		return t
+	}
+	extra := make(map[string]any, len(t.Extra)+1)
+	maps.Copy(extra, t.Extra)
+	extra["message"] = messageID
+	t.Extra = extra
+	return t
 }
 
 // steering serves [WithDeliverWhileBusy]'s steer inside the interceptors,

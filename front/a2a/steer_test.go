@@ -548,3 +548,64 @@ func TestATakenSteerNoLongerCounts(t *testing.T) {
 		t.Fatalf("task = %s", done.Status.State)
 	}
 }
+
+// triggering is a Redeliverer that notes the trigger each steer was
+// handed under, then hands it to the agent.
+type triggering struct {
+	mu       sync.Mutex
+	triggers []agentturn.Trigger
+}
+
+func (r *triggering) Redeliver(ctx context.Context, a *agentturn.Agent, items ...openresponses.Item) error {
+	r.mu.Lock()
+	r.triggers = append(r.triggers, agentturn.TriggerFromContext(ctx))
+	r.mu.Unlock()
+	return a.Redeliver(ctx, items...)
+}
+
+// TestTwoSteersWithOneTextAreTwo pins the round-two review of #244 ×
+// #287: a steer's trigger names the A2A message that carried it, so a
+// recorder that takes a steer it already owes under its entry rather
+// than twice still takes two real steers with the same text as two.
+func TestTwoSteersWithOneTextAreTwo(t *testing.T) {
+	model := &worksOnce{}
+	entered, release := make(chan struct{}), make(chan struct{})
+	work := agenttool.New("work", "works until released", func(ctx context.Context, _ struct{}) (string, error) {
+		close(entered)
+		<-release
+		return "worked", nil
+	})
+	via := &triggering{}
+	recorded := func(ctx context.Context, _ string, _ *agentturn.Agent) (context.Context, func(), error) {
+		return ContextWithRedeliverer(ctx, via), nil, nil
+	}
+	h := New(agentturn.Config{Model: model, Tools: []agenttool.Tool{work}}, WithDeliverWhileBusy(), WithRecorderFor(recorded)).RequestHandler()
+	first := userMessage("lint the repo")
+	first.ContextID = "c1"
+	res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: first, Config: nonBlocking})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := res.(*a2a.Task)
+	<-entered
+	var ids []string
+	for range 2 {
+		steer := a2a.NewMessageForTask(a2a.MessageRoleUser, task, a2a.TextPart{Text: "again"})
+		ids = append(ids, steer.ID)
+		if _, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: steer, Config: nonBlocking}); err != nil {
+			t.Fatalf("steer: %v", err)
+		}
+	}
+	close(release)
+	finalTask(t, h, task.ID)
+	via.mu.Lock()
+	defer via.mu.Unlock()
+	if len(via.triggers) != 2 {
+		t.Fatalf("the recorder was handed %d steers, want 2", len(via.triggers))
+	}
+	for i, tr := range via.triggers {
+		if tr.Extra["message"] != ids[i] {
+			t.Errorf("steer %d's trigger = %+v, want it to name message %s", i, tr, ids[i])
+		}
+	}
+}

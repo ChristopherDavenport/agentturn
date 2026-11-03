@@ -356,3 +356,57 @@ func TestARedeliveredSteerIsWrittenFirst(t *testing.T) {
 	}
 	verifyAll(t, s)
 }
+
+// TestARequeuedSteerIsNotRedeliveredTwice pins the round-two review of
+// Recorder.Redeliver: an owed steer the host has already handed back
+// with Requeue, which the agent holds, is not written or queued again
+// when the front hands the same steer over; the agent holds it once.
+func TestARequeuedSteerIsNotRedeliveredTwice(t *testing.T) {
+	ctx := agentturn.ContextWithTrigger(context.Background(), agentturn.Trigger{Kind: "a2a", Ref: "alice", Extra: map[string]any{"message": "m1"}})
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1}
+	a := agentturn.New(cfg)
+	unsub := rec.Attach(a)
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Redeliver(ctx, a, openresponses.UserText("also check the cache")); err != nil {
+		t.Fatal(err)
+	}
+	unsub()
+
+	rec, s, err = Resume(context.Background(), store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts, err := AgentOptions(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := agentturn.New(cfg, opts...)
+	defer rec.Attach(b)()
+	if n, _ := rec.Requeue(context.Background(), b); n != 1 {
+		t.Fatalf("requeued %d, want the steer", n)
+	}
+	if err := rec.Redeliver(ctx, b, openresponses.UserText("also check the cache")); err != nil {
+		t.Fatal(err)
+	}
+	if st := b.State(); st.Steering != 1 {
+		t.Errorf("the agent holds %d steers, want the one Requeue handed back", st.Steering)
+	}
+	if _, err := b.Continue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s, err = store.Open(context.Background(), s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := queuedCount(s, "also check the cache"); n != 1 {
+		t.Errorf("the steer has %d queued entries, want one", n)
+	}
+	verifyAll(t, s)
+}

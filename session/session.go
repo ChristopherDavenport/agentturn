@@ -3111,8 +3111,11 @@ func (r *Recorder) Deliver(ctx context.Context, a *agentturn.Agent, items ...ope
 // as a delivery under the same trigger, equal to it, and that nobody
 // has taken up, one a task that stopped for input left for the
 // message answering its calls, is handed over under that entry rather
-// than written again. An item whose entry cannot be written is not
-// queued, and the error says so; the items before it are.
+// than written again, and one [Recorder.Requeue] already handed back,
+// which the agent holds, is not handed over a second time. A front
+// that may hand over two inputs alike names each in its trigger, as
+// front/a2a names the message. An item whose entry cannot be written
+// is not queued, and the error says so; the items before it are.
 func (r *Recorder) Redeliver(ctx context.Context, a *agentturn.Agent, items ...openresponses.Item) error {
 	trigger, err := sessionTrigger(agentturn.TriggerFromContext(ctx))
 	if err != nil {
@@ -3125,9 +3128,15 @@ func (r *Recorder) Redeliver(ctx context.Context, a *agentturn.Agent, items ...o
 		base, _ := agentturn.Unhide(item)
 		r.mu.Lock()
 		in := r.root.owedDelivery(base, trigger)
-		if in != nil {
+		switch {
+		case in != nil && in.held:
+			// Requeue already handed it back and the agent holds it:
+			// handing it over again would queue it twice.
+			r.mu.Unlock()
+			continue
+		case in != nil:
 			in.item, in.held, in.awaiting = base, true, true
-		} else {
+		default:
 			in = &inboxItem{item: base, mode: agentsession.ModeSteer, deliver: true, held: true, awaiting: true, trigger: trigger.Clone()}
 			r.root.inbox = append(r.root.inbox, in)
 			if err := r.root.requeue(context.WithoutCancel(ctx)); err != nil {
@@ -3148,10 +3157,15 @@ func (r *Recorder) Redeliver(ctx context.Context, a *agentturn.Agent, items ...o
 }
 
 // owedDelivery is the input of the inbox the path owes as a delivery
-// of item under trigger, which nobody has taken up, or nil.
+// of item under trigger: one nobody has taken up, or one Requeue
+// handed back that the agent holds and has not reported yet; nil when
+// there is none.
 func (w *writer) owedDelivery(item openresponses.Item, trigger *agentsession.Trigger) *inboxItem {
 	for _, in := range w.inbox {
-		if !in.held && !in.declined && in.entry != "" && in.deliver && in.mode == agentsession.ModeSteer && equalJSON(in.item, item) && equalJSON(in.trigger, trigger) {
+		if in.declined || in.entry == "" || !in.deliver || in.mode != agentsession.ModeSteer || in.held && !in.awaiting {
+			continue
+		}
+		if equalJSON(in.item, item) && equalJSON(in.trigger, trigger) {
 			return in
 		}
 	}

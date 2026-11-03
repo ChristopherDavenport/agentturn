@@ -14,8 +14,10 @@ versions may break the API.
   the steers a task left for the message answering its calls go
   through it too. Added `session.Recorder.Redeliver`, which writes the
   queued entry, with `deliver`, first, and hands over an input the path
-  already owes under its entry rather than writing it twice. (#244,
-  #287)
+  already owes under its entry rather than writing it twice, and does
+  nothing for one `Requeue` already handed back. A steer's trigger
+  names its A2A message in a `message` member, so two steers with the
+  same text are two. (#244, #287)
 - Fixed: `front/a2a.MaxSteers` counts only the steers a task holds
   untaken: one the agent has taken no longer counts, where all the
   steers since the last run's end did. (#287)
