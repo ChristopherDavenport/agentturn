@@ -127,7 +127,7 @@ type Adapter struct {
 	// scope keys a request's conversation for the quarantine, and
 	// quarantines holds, by that key, what its requests quarantined
 	// (#281).
-	scope       func(ctx context.Context, req openresponses.Request) (string, bool)
+	scope       func(ctx context.Context, req openresponses.Request) (QuarantineScope, bool)
 	quarantines scopes
 }
 
@@ -270,38 +270,59 @@ const DefaultMaxHandoffs = 10
 func WithMaxHandoffs(n int) Option { return func(a *Adapter) { a.maxHandoffs = n } }
 
 // MaxQuarantineScopes is how many conversations' quarantines an
-// adapter keeps under [WithQuarantineScope]: past it, the set of the
-// key used least recently is let go, and that conversation's next
-// request sends what it quarantined as it is, unless its guard
-// quarantines it again.
-const MaxQuarantineScopes = 1024
+// adapter keeps for one principal under [WithQuarantineScope]: past
+// it, the set of that principal's key used least recently is let go,
+// and that conversation's next request sends what it quarantined as
+// it is, unless its guard quarantines it again. A principal's keys
+// never evict another principal's, so what the adapter keeps is this
+// many sets per principal the host authenticates.
+const MaxQuarantineScopes = 256
 
 // WithQuarantineScope keeps what a request quarantined
 // (agentturn.Quarantine) for the later requests of its conversation:
-// fn keys the conversation a request belongs to, and the adapter keeps
-// one quarantine per key, which every request fn gives that key builds
-// under, an item the caller sends back matched by its content, equal
-// in its JSON encoding but for its id and status
+// fn says who asks and which of their conversations the request
+// belongs to, a [QuarantineScope], and the adapter keeps one
+// quarantine per principal and key, which every request fn gives that
+// scope builds under, an item the caller sends back matched by its
+// content, equal in its JSON encoding but for its id and status
 // (agentturn.QuarantineSet.Bind). A request names no conversation, and
 // Open Responses carries none the adapter is given, so the host says
-// which requests share one: the authenticated principal with the
-// request's prompt_cache_key or a metadata member, say, never a key a
-// caller chooses alone, since a key two callers share leaks to each
-// whether the other quarantined some text and drops it from the other's
-// requests. A request fn gives no key for, and every request without
-// the option, builds under a quarantine of its own, which the legs of
-// its handoffs share and nothing after it does. The adapter keeps at
-// most [MaxQuarantineScopes] keys, the least recently used let go
-// first (RFC 0001 The request, step 3; #281).
-func WithQuarantineScope(fn func(ctx context.Context, req openresponses.Request) (key string, ok bool)) Option {
+// which requests share one. The principal is the one the host
+// authenticated, never a name the caller chooses, since a scope two
+// callers share leaks to each whether the other quarantined some text
+// and drops it from the other's requests, and the bound is per
+// principal: a caller that rotates its keys, its prompt_cache_key
+// say, lets go of its own oldest sets, never another caller's. The key
+// may be the caller's own, the request's prompt_cache_key or a
+// metadata member. Callers the host does not tell apart share the
+// empty principal and its bound. A request fn gives no scope for, and
+// every request without the option, builds under a quarantine of its
+// own, which the legs of its handoffs share and nothing after it does.
+// Each principal keeps at most [MaxQuarantineScopes] keys, the least
+// recently used let go first (RFC 0001 The request, step 3; #281).
+func WithQuarantineScope(fn func(ctx context.Context, req openresponses.Request) (QuarantineScope, bool)) Option {
 	return func(a *Adapter) { a.scope = fn }
 }
 
-// scopes holds the quarantine of each key [WithQuarantineScope] gave,
-// at most [MaxQuarantineScopes] of them, the least recently used let
-// go first. The zero value is ready to use.
+// QuarantineScope is what [WithQuarantineScope]'s function keys a
+// request's conversation with: the principal asking, as the host
+// authenticated it, and the conversation's key among that principal's.
+type QuarantineScope struct {
+	Principal string
+	Key       string
+}
+
+// scopes holds the quarantine of each scope [WithQuarantineScope]
+// gave, at most [MaxQuarantineScopes] keys per principal, the least
+// recently used of a principal's let go first. The zero value is ready
+// to use.
 type scopes struct {
-	mu   sync.Mutex
+	mu         sync.Mutex
+	principals map[string]*keys
+}
+
+// keys is one principal's sets, by key, in the order they were used.
+type keys struct {
 	sets map[string]*list.Element
 	lru  list.List
 }
@@ -311,23 +332,29 @@ type scoped struct {
 	set *agentturn.QuarantineSet
 }
 
-// get returns key's set, made when it has none, and marks key used.
-func (s *scopes) get(key string) *agentturn.QuarantineSet {
+// get returns the scope's set, made when it has none, and marks it
+// used.
+func (s *scopes) get(scope QuarantineScope) *agentturn.QuarantineSet {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if e, ok := s.sets[key]; ok {
-		s.lru.MoveToFront(e)
+	if s.principals == nil {
+		s.principals = map[string]*keys{}
+	}
+	p := s.principals[scope.Principal]
+	if p == nil {
+		p = &keys{sets: map[string]*list.Element{}}
+		s.principals[scope.Principal] = p
+	}
+	if e, ok := p.sets[scope.Key]; ok {
+		p.lru.MoveToFront(e)
 		return e.Value.(*scoped).set
 	}
-	if s.sets == nil {
-		s.sets = map[string]*list.Element{}
-	}
 	set, _ := agentturn.NewQuarantineSet()
-	s.sets[key] = s.lru.PushFront(&scoped{key: key, set: set})
-	for s.lru.Len() > MaxQuarantineScopes {
-		last := s.lru.Back()
-		s.lru.Remove(last)
-		delete(s.sets, last.Value.(*scoped).key)
+	p.sets[scope.Key] = p.lru.PushFront(&scoped{key: scope.Key, set: set})
+	for p.lru.Len() > MaxQuarantineScopes {
+		last := p.lru.Back()
+		p.lru.Remove(last)
+		delete(p.sets, last.Value.(*scoped).key)
 	}
 	return set
 }
@@ -430,8 +457,8 @@ func (a *Adapter) CreateStream(ctx context.Context, req openresponses.Request, s
 	// this request quarantines is kept for the next (#281).
 	quarantined, _ := agentturn.NewQuarantineSet()
 	if a.scope != nil {
-		if key, ok := a.scope(ctx, req); ok {
-			held := a.quarantines.get(key)
+		if scope, ok := a.scope(ctx, req); ok {
+			held := a.quarantines.get(scope)
 			quarantined = held.Bind(transcript)
 			defer held.Merge(quarantined)
 		}

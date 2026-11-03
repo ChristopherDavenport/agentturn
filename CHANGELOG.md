@@ -44,9 +44,11 @@ versions may break the API.
 - Fixed: a quarantine holds for the rest of a conversation served over
   a wire. `front/a2a` keeps each conversation's quarantine across its
   tasks, and `front/responses` across the requests the new
-  `WithQuarantineScope(fn)` gives one key, the host deriving it from
-  the caller (at most `MaxQuarantineScopes`, 1024, keys, the least
-  recently used let go; without a key a quarantine lasts one request).
+  `WithQuarantineScope(fn)` gives one `QuarantineScope`, the principal
+  the host authenticated and a key among that principal's (at most
+  `MaxQuarantineScopes`, 256, keys per principal, the least recently
+  used let go, so one caller's keys never evict another's; without a
+  scope a quarantine lasts one request).
   Each matches the copies of an item a store or a caller hands back, so
   a tool output a guard quarantined in one task or request is sent as
   `QuarantinedOutput` in the next rather than whole. Added
