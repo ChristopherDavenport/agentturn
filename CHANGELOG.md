@@ -55,7 +55,11 @@ versions may break the API.
   `Attach` has the agent quarantine what the record's `omit` says a
   quarantine left out, so an agent seeded from a store that keeps the
   conversation whole, as `front/a2a`'s is, does not send it again
-  after a reopen. (#281)
+  after a reopen; it matches as `Bind` does, every copy. A quarantine
+  matches reloaded items by content, so a quarantined "yes" leaves out
+  every "yes" of the conversation loaded, as RFC 0001 now says. A
+  quarantined call leaves out its own output, the one after it, and no
+  other call's output under the same call ID. (#281)
 - Fixed: `front/responses`' single turn, a request carrying the caller's
   tools, calls its transform under `agentturn.ContextWithRequest` with
   the settings the request will carry, the caller's tools included, as

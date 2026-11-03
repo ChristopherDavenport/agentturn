@@ -640,6 +640,61 @@ func TestAReopenedRecordKeepsItsQuarantine(t *testing.T) {
 	}
 }
 
+// TestAReopenedQuarantineMatchesEveryCopy pins the round-two review of
+// #281: a quarantine reseeded on a reopen matches by content as a
+// front's QuarantineSet.Bind does, every copy of a quarantined item,
+// so a quarantined "yes" leaves out each "yes" the conversation holds,
+// and the requests after it still hash.
+func TestAReopenedQuarantineMatchesEveryCopy(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: fetchThenAnswer{}, ModelName: "m"})
+	detach := rec.Attach(a)
+	if _, err := a.Prompt(ctx, openresponses.UserText("yes")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Quarantine(a.State().Transcript[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Prompt(ctx, openresponses.UserText("yes")); err != nil {
+		t.Fatal(err)
+	}
+	detach()
+	data, err := json.Marshal(openresponses.Items(a.State().Transcript))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var whole openresponses.Items
+	if err := json.Unmarshal(data, &whole); err != nil {
+		t.Fatal(err)
+	}
+	rec2, _, err := Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &sentInputs{}
+	b := agentturn.New(agentturn.Config{Model: model, ModelName: "m"}, agentturn.WithTranscript(agentturn.Transcript(whole)))
+	defer rec2.Attach(b)()
+	if _, err := b.Prompt(ctx, openresponses.UserText("once more")); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(model.sent[0], `"yes"`) {
+		t.Errorf("the request after the reopen carried a copy of the quarantined message: %s", model.sent[0])
+	}
+	s2, err := store.Open(ctx, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyAll(t, s2)
+	if n := unhashedEntries(s2); n != 0 {
+		t.Errorf("%d unhashed entries: %s", n, entryTypes(s2))
+	}
+}
+
 // retelling summarises by retelling every text it was given, so a
 // summary carries whatever the fold sent it.
 type retelling struct{}

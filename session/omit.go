@@ -560,12 +560,13 @@ func (r *Recorder) Omit(ctx context.Context, ids ...string) error {
 // with t: each item entry it sends as [agentturn.QuarantinedOutput],
 // and each it lists in items but a reasoning item, which the
 // other-models rule and a prompt's attribution leave out for one model
-// and not another. An entry's item in t is the writer's own or a copy
-// equal to it, the k-th copy for the entry k-th among equal ones, so
-// an agent seeded from a store that keeps the conversation whole, as
-// front/a2a's is, quarantines what the record does. An agent seeded
-// from the record has the context's items, which omit already shaped,
-// and finds none.
+// and not another. An entry's item in t is matched as
+// agentturn.QuarantineSet.Bind matches one, the writer's own or every
+// copy equal to it in content, so an agent seeded from a store that
+// keeps the conversation whole, as front/a2a's is, quarantines what the
+// record does, and what a front binds agrees. An agent seeded from the
+// record has the context's items, which omit already shaped, and finds
+// none.
 func (w *writer) quarantinedIn(t agentturn.Transcript) openresponses.Items {
 	o := w.settings.Omit
 	listed := idSet(o.Items)
@@ -576,7 +577,7 @@ func (w *writer) quarantinedIn(t agentturn.Transcript) openresponses.Items {
 	if len(listed) == 0 && len(outs) == 0 || len(t) == 0 {
 		return nil
 	}
-	var out openresponses.Items
+	var recorded openresponses.Items
 	for i := range w.values {
 		if w.custom[i] || w.meta[i].folded {
 			continue
@@ -585,23 +586,11 @@ func (w *writer) quarantinedIn(t agentturn.Transcript) openresponses.Items {
 		if !outs[w.items[i]] && (!listed[w.items[i]] || reasoning) {
 			continue
 		}
-		rec := w.recordedItem(i)
-		k := 0
-		for j := 0; j < i; j++ {
-			if !w.custom[j] && !w.meta[j].folded && equalJSON(w.recordedItem(j), rec) {
-				k++
-			}
-		}
-		for _, item := range t {
-			if item != w.values[i] && !equalJSON(item, rec) {
-				continue
-			}
-			if k == 0 {
-				out = append(out, item)
-				break
-			}
-			k--
-		}
+		recorded = append(recorded, w.values[i], w.recordedItem(i))
 	}
-	return out
+	set, err := agentturn.NewQuarantineSet(recorded...)
+	if err != nil {
+		return nil
+	}
+	return set.Bind(t).Items()
 }

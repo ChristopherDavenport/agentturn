@@ -266,3 +266,41 @@ func TestAQuarantineSetOutlivesTheAgent(t *testing.T) {
 		t.Errorf("after a second merge the set holds %d items, want one copy", len(held.Items()))
 	}
 }
+
+// TestAQuarantinedCallTakesOnlyItsOwnOutput pins the round-two review
+// of #281: with a provider that reuses call IDs, a quarantined call
+// leaves out the output that answers it, the one after it, and not
+// another call's output under the same ID, which would be left
+// without its answer.
+func TestAQuarantinedCallTakesOnlyItsOwnOutput(t *testing.T) {
+	first := &openresponses.FunctionCall{CallID: "call_0", Name: "read", Arguments: `{"page":1}`}
+	second := &openresponses.FunctionCall{CallID: "call_0", Name: "read", Arguments: `{"page":2}`}
+	transcript := Transcript{
+		openresponses.UserText("read"),
+		first, openresponses.NewFunctionCallOutput("call_0", "page one"),
+		openresponses.AssistantText("and the next"),
+		second, openresponses.NewFunctionCallOutput("call_0", "page two"),
+		openresponses.AssistantText("done"),
+	}
+	model := &caller{}
+	a := New(Config{Model: model, ModelName: "m"}, WithTranscript(transcript))
+	if err := a.Quarantine(second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("go on")); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"user: read", "output: page one", "user: go on"}
+	if got := sentTexts(model.sent[0]); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("sent %q, want %q", got, want)
+	}
+	calls := 0
+	for _, item := range model.sent[0] {
+		if _, ok := item.(*openresponses.FunctionCall); ok {
+			calls++
+		}
+	}
+	if calls != 1 {
+		t.Errorf("sent %d calls, want the first alone", calls)
+	}
+}

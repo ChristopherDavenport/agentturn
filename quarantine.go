@@ -98,13 +98,29 @@ func (q *quarantine) apply(items openresponses.Items) openresponses.Items {
 			calls[c.CallID] = true
 		}
 	}
+	// An output answers the last call before it with its call ID, so
+	// with a provider that reuses call IDs a quarantined call takes its
+	// own output and not another call's; an output whose call is not
+	// among items goes with any quarantined call of its ID.
+	last := map[string]openresponses.Item{}
 	var out openresponses.Items
 	changed := false
 	for i, item := range items {
 		sent := item
 		out2, isOutput := item.(*openresponses.FunctionCallOutput)
+		if c, ok := item.(*openresponses.FunctionCall); ok {
+			last[c.CallID] = c
+		}
+		callHeld := false
+		if isOutput {
+			if c, ok := last[out2.CallID]; ok {
+				callHeld = held(c)
+			} else {
+				callHeld = calls[out2.CallID]
+			}
+		}
 		switch {
-		case isOutput && calls[out2.CallID]:
+		case callHeld:
 			sent = nil
 		case held(item) && isOutput:
 			placeholder := *out2

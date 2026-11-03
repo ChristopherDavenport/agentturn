@@ -467,7 +467,9 @@ that a recorder holding the transcript and the settings rebuilds it:
    no request carries the item, or, for a function call output, whose
    call needs an answer, a request carries it with one fixed placeholder
    text in place of its output, and a quarantined function call is left
-   out with its outputs. The loop applies it here, to what the transform
+   out with its outputs, each the output that answers it, after it
+   with its call ID and before another call's, so a provider that
+   reuses call IDs loses no other call's answer. The loop applies it here, to what the transform
    and the filter returned, and keeps the item in the transcript, which
    stays append-only and what arrived. Because the transform runs
    first, the loop MUST give it the quarantine, read-only, with a
@@ -500,7 +502,11 @@ that a recorder holding the transcript and the settings rebuilds it:
    request: it keeps the conversation's quarantine from one to the
    next and applies it to the copy of each item it loads, which a
    store or a caller hands back decoded afresh, so it names an item by
-   its content rather than its identity. A front whose requests name
+   its content rather than its identity: every copy equal to a
+   quarantined item, but for the id and status a relay or a store sets,
+   is quarantined, so a quarantined user message "yes" leaves out every
+   "yes" the loaded conversation holds, and a recorder reseeding a
+   quarantine on a reopen matches the same way. A front whose requests name
    no conversation, as an Open Responses one's do not, keeps a
    quarantine past a request only under a key the host derives from
    who is asking, MUST NOT share one between callers, since a shared
