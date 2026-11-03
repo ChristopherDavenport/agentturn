@@ -1409,7 +1409,14 @@ that drains it and then sends a request has taken it. A run that stops
 after its turn or ends without draining it leaves it queued, and the
 delivery starts a run that takes it once that run has ended, as a
 continue after a steer would, unless calls are pending, when it is
-left for the resume and the delivery says input is required. A run
+left for the resume and the delivery says input is required. A
+delivery MUST NOT start a run once the last run ended on a terminating
+result and no run has started since: what the result says is the
+host's to read, a handoff's transfer above all, and a run the delivery
+started would answer under the sender's configuration and race the
+host's switch to the receiver. It leaves the item queued for the
+host's next run, the receiver's, which takes it before its first model
+call, and says so (#274, #290). A run
 that drained it and ended before the next request, on a guard, a
 cancellation or a failure, leaves it in the transcript unanswered,
 and the delivery reports that run's end rather than start another. The
@@ -1423,7 +1430,8 @@ last drain.
 A front that lets a remote party queue input into an agent SHOULD also
 offer the delivery, with these semantics: the item joins the run in
 flight when that run will still take it, and otherwise starts a run
-once the run in flight has ended, unless calls are pending. The front
+once the run in flight has ended, unless calls are pending or that run
+ended on a terminating result. The front
 reports whether the item joined and the end of any run it started. A
 remote party cannot observe atomically whether a run will take a
 steer, since a run past its last drain still reads as running, so a
@@ -1929,7 +1937,7 @@ maps onto it as follows:
 | low-level loop | `Run(ctx, t, prompts, cfg)`, `Continue(ctx, t, cfg)` → `iter.Seq[Event]`; `EventBuffer`; `CanContinue` |
 | delivery a control offers | `Deliverer`, which `*Agent` and `front/control`'s `Client` implement; `front/control` serves it as `POST /deliver`, `ErrNoDelivery` when the control offers none |
 | agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`, `WithPending`, `SetPending`, `WithReservedCallIDs`, `ReserveCallIDs`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Deliver`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `WhileIdle`, `State`, `SetConfig`, `SetTranscript`, `SetReasoningModels`, `Config` |
-| refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning` (`ErrHeld` for a delivery during a hold, `State.Held`), `ErrAmbiguousCall`, `ErrCallAnswered`, `ErrTriggerExtra` (`Trigger.Validate`) |
+| refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning` (`ErrHeld` for a delivery during a hold, `State.Held`), `ErrTerminated` (a delivery after a terminating stop), `ErrAmbiguousCall`, `ErrCallAnswered`, `ErrTriggerExtra` (`Trigger.Validate`) |
 | run ID, turn, trigger, transcript on the context | `ContextWithRunID`/`RunIDFromContext`, `ContextWithTurn`/`TurnFromContext`, `ContextWithTrigger`/`TriggerFromContext`, `ContextWithTranscript`/`TranscriptFromContext`, `ContextWithReservedCallIDs` |
 | run context, steer signal | `RunContext(ctx)`, `Steered(ctx)` |
 | source | `Source`: `SourceInput`, `SourceResume` |

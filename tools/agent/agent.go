@@ -464,6 +464,18 @@ func WithRunContext(fn func(ctx context.Context, callID string) context.Context)
 // wait on the parent's run to end; a host that must not block the
 // child calls Deliver from a goroutine of its own.
 //
+// A parent whose run ended on a terminating result, a handoff's
+// transfer to another agent, has handed the conversation on: Deliver
+// then starts no run under the sender's configuration, which would
+// answer the result as the sender and refuse the host's switch to the
+// receiver with agentturn.ErrRunning. It returns
+// agentturn.ErrTerminated and leaves the answer queued, and the
+// receiver's run the host starts, handoff.Team's, front/a2a's relay
+// under WithHandoff, or the host's own Continue after its SetConfig,
+// takes it before its first model call; one that arrives while the
+// receiver's run is in flight joins it. fn treats ErrTerminated as
+// delivered, not as a failure.
+//
 // The child runs on agentturn.RunContext of the call, so an abort of
 // the parent's run still cuts it, and the parent's batch ending or its
 // run ending by itself does not. The observer stays subscribed, as

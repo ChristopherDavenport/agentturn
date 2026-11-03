@@ -32,6 +32,16 @@ var (
 	// sub-agent need input" once, and implement [InputRequired], which
 	// names what each waits on.
 	ErrInputRequired = errors.New("agentturn: pending tool calls must be resumed before continuing")
+	// ErrTerminated is returned by [Agent.Deliver] when the last run
+	// ended on a terminating result, [StopTerminate] or
+	// [StopPartialTerminate], and no run has started since: what the
+	// result says is the host's to read before the next run, a
+	// handoff's transfer above all, whose receiver's run the host
+	// starts under the receiver's configuration. The items stay queued
+	// for that run, which takes them before its first model call; a
+	// host whose terminating result was the run's answer starts it with
+	// [Agent.Continue].
+	ErrTerminated = errors.New("agentturn: the last run ended on a terminating result; the delivery waits for the host's next run")
 )
 
 // InputRequired is the error of a composition tool whose callee, a
@@ -1490,6 +1500,15 @@ func (a *Agent) Redeliver(ctx context.Context, items ...openresponses.Item) erro
 // host that wants it to stick reads the reason on the end returned and
 // on the run it asked for, or aborts the run Deliver started.
 //
+// A run that ended on a terminating result is the exception: what the
+// result says is the host's to read, a handoff's transfer whose
+// receiver the host continues under its own configuration among it, so
+// while no run has started since, Deliver starts none, leaves the items
+// queued for the host's next run, which takes them before its first
+// model call, and returns [ErrTerminated] with that run's end. A
+// delivery that arrives once the receiver's run is in flight joins it
+// as any delivery does.
+//
 // A run that drained the items and then ended before a model call, on
 // a guard before the call, an abort or a failure, has them in its
 // transcript unanswered: Deliver returns joined false with the end of
@@ -1575,6 +1594,14 @@ func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joine
 	if len(a.pending) > 0 {
 		a.mu.Unlock()
 		return false, nil, ErrInputRequired
+	}
+	if end := a.lastEnd; end != nil && end.Reason == ReasonStopped && (end.Cause == StopTerminate || end.Cause == StopPartialTerminate) {
+		// A terminating result is the host's to read: a run started
+		// here would answer under the configuration that handed the
+		// conversation off, and race the host's switch to the
+		// receiver, whose run takes the items instead (#274, #290).
+		a.mu.Unlock()
+		return false, end, ErrTerminated
 	}
 	if !CanContinue(append(append(Transcript(nil), a.transcript...), unhideAll(queuedItems(a.steer))...)) {
 		a.mu.Unlock()

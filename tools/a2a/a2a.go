@@ -232,11 +232,23 @@ func WithInputRounds(n int) Option { return func(r *remote) { r.inputRounds = n 
 // returns among it, is not on the hook's, so a hook that asks someone
 // carries its own way to. Until the call returns on a running task it
 // is the call's, and its own context ending, a per-call timeout say,
-// ends it as it ends a call that is not detached. A call whose answer is final before the task
-// runs, a message answer or a task that ended at once, or that fails
-// first, returns as any call does, and fn is not called: its callee is
-// the call's own subsession, and a task it fails on is cancelled. Progress
-// updates stop when the call returns.
+// ends it as it ends a call that is not detached. A call whose answer
+// is final before the task runs, a message answer or a task that ended
+// at once, or that fails first, returns as any call does, and fn is
+// not called: its callee is the call's own subsession, and a task it
+// fails on is cancelled. Progress updates stop when the call returns.
+//
+// A parent whose run ended on a terminating result, a handoff's
+// transfer to another agent, has handed the conversation on: Deliver
+// then starts no run under the sender's configuration, which would
+// answer the result as the sender and refuse the host's switch to the
+// receiver with agentturn.ErrRunning. It returns
+// agentturn.ErrTerminated and leaves the answer queued, and the
+// receiver's run the host starts, handoff.Team's, front/a2a's relay
+// under WithHandoff, or the host's own Continue after its SetConfig,
+// takes it before its first model call; one that arrives while the
+// receiver's run is in flight joins it. fn treats ErrTerminated as
+// delivered, not as a failure.
 func WithDetach(fn func(callID string, info TaskInfo, final *a2a.Task, err error)) Option {
 	return func(r *remote) { r.detach = fn }
 }

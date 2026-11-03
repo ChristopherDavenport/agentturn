@@ -473,3 +473,123 @@ func TestDeliverFromInsideTheRun(t *testing.T) {
 		})
 	}
 }
+
+// transferring calls transfer_to_b when its last input is the user
+// saying "go", and otherwise answers; it keeps the user texts each
+// request carried.
+type transferring struct {
+	mu   sync.Mutex
+	seen []string
+}
+
+func (m *transferring) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	var texts []string
+	for _, item := range req.Input {
+		if msg, ok := item.(*openresponses.Message); ok && msg.Role == openresponses.RoleUser {
+			texts = append(texts, msg.Text())
+		}
+	}
+	m.mu.Lock()
+	m.seen = append(m.seen, strings.Join(texts, "|"))
+	m.mu.Unlock()
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if msg, ok := req.Input[len(req.Input)-1].(*openresponses.Message); ok && msg.Text() == "go" {
+		w, err := em.FunctionCall("", "transfer_to_b")
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(`{}`); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	if err := em.Item(openresponses.AssistantText("ok")); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+func (m *transferring) saw(text string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range m.seen {
+		if strings.Contains(s, text) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestADeliveryAfterATransferWaitsForTheReceiver pins the review of
+// #244 × #274: a delivery that finds the last run ended on a
+// terminating result, a handoff's transfer, starts no run under the
+// sender's configuration, which would race the host's switch to the
+// receiver; it stays queued, Deliver says so with ErrTerminated and
+// that run's end, and the receiver's run the host starts takes it.
+// That holds for a delivery made while the run ends and for one made
+// once the agent is idle.
+func TestADeliveryAfterATransferWaitsForTheReceiver(t *testing.T) {
+	for _, at := range []string{EventRunEnd, "idle"} {
+		t.Run(at, func(t *testing.T) {
+			delivered := "the background task is done"
+			transfer := agenttool.NewFunc("transfer_to_b", "hands off to b", []byte(`{"type":"object"}`), func(context.Context, agenttool.Call) (agenttool.Result, error) {
+				return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: `{"assistant":"b"}`}, Terminate: true}, nil
+			})
+			sender, receiver := &transferring{}, &transferring{}
+			a := New(Config{Name: "a", Model: sender, ModelName: "m", Tools: []agenttool.Tool{transfer}})
+			type outcome struct {
+				end *RunEnd
+				err error
+			}
+			result := make(chan outcome, 1)
+			deliver := func() {
+				_, end, err := a.Deliver(context.Background(), openresponses.UserText(delivered))
+				result <- outcome{end, err}
+			}
+			var once sync.Once
+			a.Subscribe(func(_ context.Context, ev Event) error {
+				if ev.EventType() == at {
+					once.Do(func() {
+						go deliver()
+						for a.State().Steering == 0 {
+							runtime.Gosched()
+						}
+					})
+				}
+				return nil
+			})
+			end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+			if err != nil || end.Cause != StopTerminate {
+				t.Fatalf("sender's run = %+v, %v", end, err)
+			}
+			if at == "idle" {
+				deliver()
+			}
+			var got outcome
+			select {
+			case got = <-result:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Deliver never returned")
+			}
+			if !errors.Is(got.err, ErrTerminated) || got.end == nil || got.end.RunID != end.RunID {
+				t.Errorf("Deliver = %+v, want ErrTerminated with the sender's run's end", got)
+			}
+			// The host follows the transfer: the receiver's run takes it.
+			if err := a.SetConfig(Config{Name: "b", Model: receiver, ModelName: "m"}); err != nil {
+				t.Fatalf("the switch to the receiver: %v", err)
+			}
+			if _, err := a.Continue(ContextWithTrigger(context.Background(), Trigger{Kind: "handoff", Ref: "a"})); err != nil {
+				t.Fatal(err)
+			}
+			if sender.saw(delivered) {
+				t.Error("the sender's configuration answered the delivery")
+			}
+			if !receiver.saw(delivered) {
+				t.Errorf("the receiver never saw the delivery: %q", receiver.seen)
+			}
+		})
+	}
+}

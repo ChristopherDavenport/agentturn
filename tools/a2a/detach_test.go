@@ -13,6 +13,7 @@ import (
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
 	fronta2a "github.com/ChristopherDavenport/agentturn/front/a2a"
+	"github.com/ChristopherDavenport/agentturn/handoff"
 	"github.com/ChristopherDavenport/openresponses"
 	"github.com/a2aproject/a2a-go/a2a"
 	"github.com/a2aproject/a2a-go/a2aclient"
@@ -594,5 +595,142 @@ func TestADetachedCallHonoursItsContext(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("the call outlived its context")
+	}
+}
+
+// lintsThenHandsOff calls lint and transfer_to_b in one batch when the
+// user asks it to, and otherwise answers; it keeps the user texts each
+// request carried.
+type lintsThenHandsOff struct {
+	mu   sync.Mutex
+	seen []string
+}
+
+func (m *lintsThenHandsOff) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	var texts []string
+	for _, item := range req.Input {
+		if msg, ok := item.(*openresponses.Message); ok && msg.Role == openresponses.RoleUser {
+			texts = append(texts, msg.Text())
+		}
+	}
+	m.mu.Lock()
+	m.seen = append(m.seen, strings.Join(texts, "|"))
+	m.mu.Unlock()
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if msg, ok := req.Input[len(req.Input)-1].(*openresponses.Message); ok && msg.Text() == "lint, then hand off" {
+		for _, name := range []string{"lint", "transfer_to_b"} {
+			w, err := em.FunctionCall("", name)
+			if err != nil {
+				return err
+			}
+			args, _ := json.Marshal(Args{Input: "lint"})
+			if err := w.Arguments(string(args)); err != nil {
+				return err
+			}
+			if err := w.Close(); err != nil {
+				return err
+			}
+		}
+		return em.Complete()
+	}
+	if err := em.Item(openresponses.AssistantText("ok")); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+func (m *lintsThenHandsOff) saw(text string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return strings.Contains(strings.Join(m.seen, "\n"), text)
+}
+
+// TestADetachedResultDuringATransferGoesToTheReceiver pins the
+// integration review of #290 × #274: a detached call's task finishing
+// while the sender's run stops on transfer_to_b delivers its result to
+// the receiver. The delivery, queued while the sender's run ends,
+// starts no run under the sender's configuration, which would answer
+// it as the sender and leave handoff.Team's switch refused; it waits,
+// and the receiver's run the team starts takes it.
+func TestADetachedResultDuringATransferGoesToTheReceiver(t *testing.T) {
+	remote := newGated("lint")
+	client, card := serve(t, remote, nil)
+	sender, receiver := &lintsThenHandsOff{}, &lintsThenHandsOff{}
+	var parent *agentturn.Agent
+	delivered := make(chan error, 1)
+	returned := make(chan struct{})
+	detach := func(callID string, info TaskInfo, final *a2a.Task, err error) {
+		ctx := agentturn.ContextWithTrigger(context.Background(), agentturn.CalleeTrigger(callID, string(info.TaskID)))
+		_, _, derr := parent.Deliver(ctx, openresponses.UserText("lint says: "+Answer(final).Text))
+		delivered <- errors.Join(err, derr)
+		close(returned)
+	}
+	// The team's switch waits, in the handoff's filter, until the
+	// delivery has returned or started a run of its own, so the
+	// window between the sender's run and the receiver's is the
+	// delivery's to take.
+	settled := func(t agentturn.Transcript) agentturn.Transcript {
+		deadline := time.Now().Add(5 * time.Second)
+		for !parent.State().Running && time.Now().Before(deadline) {
+			select {
+			case <-returned:
+				return t
+			case <-time.After(time.Millisecond):
+			}
+		}
+		return t
+	}
+	team, err := handoff.New(
+		handoff.Agent{Config: agentturn.Config{Name: "a", Model: sender, ModelName: "m", Tools: []agenttool.Tool{New(client, card, WithName("lint"), WithDetach(detach))}}, Handoffs: []handoff.To{{Agent: "b", Filter: settled}}},
+		handoff.Agent{Config: agentturn.Config{Name: "b", Model: receiver, ModelName: "m"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent = agentturn.New(team.Config("a"))
+	parent.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		switch e := ev.(type) {
+		case *agentturn.ToolEnd:
+			if e.Name == "transfer_to_b" {
+				// The task finishes as the sender's run stops on the
+				// transfer.
+				remote.open("lint")
+			}
+		case *agentturn.RunEnd:
+			if parent.Config().Name != "a" {
+				return nil
+			}
+			// The result is delivered before the sender's run has
+			// ended, so it waits on that run.
+			deadline := time.Now().Add(5 * time.Second)
+			for parent.State().Steering == 0 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+		}
+		return nil
+	})
+	end, path, err := team.Run(context.Background(), parent, openresponses.UserText("lint, then hand off"))
+	if err != nil {
+		t.Fatalf("Team.Run: %v (path %v)", err, path)
+	}
+	if strings.Join(path, ",") != "a,b" || end.Reason != agentturn.ReasonDone {
+		t.Errorf("Team.Run = %+v, path %v", end, path)
+	}
+	select {
+	case err := <-delivered:
+		if err != nil && !errors.Is(err, agentturn.ErrTerminated) {
+			t.Errorf("delivery: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the result was never delivered")
+	}
+	if err := parent.WaitForIdle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if sender.saw("lint says") {
+		t.Error("the sender's configuration answered the detached result")
+	}
+	if !receiver.saw("lint says: lint finished") {
+		t.Errorf("the receiver never read the detached result: %q", receiver.seen)
 	}
 }

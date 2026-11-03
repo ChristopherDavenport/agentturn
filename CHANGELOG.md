@@ -7,6 +7,19 @@ versions may break the API.
 
 ## Unreleased
 
+- Changed, breaking: `Agent.Deliver` starts no run once the last run
+  ended on a terminating result, `StopTerminate` or
+  `StopPartialTerminate`, and none has started since. It returns the new
+  `ErrTerminated` with that run's end and leaves the items queued for
+  the host's next run, which takes them before its first model call. A
+  detached call's result arriving while the sender's run stops on a
+  handoff's transfer therefore reaches the receiver, where it used to
+  start a run under the sender's configuration and leave
+  `handoff.Team`'s, `front/a2a`'s or the host's switch refused with
+  `ErrRunning`. A host whose terminating result was the run's answer
+  starts the run with `Continue`. `front/control` carries the
+  `terminated` code; the `WithDetach` docs of `tools/agent` and
+  `tools/a2a` say so. (#244, #274, #290)
 - Fixed: a quarantine holds for the rest of a conversation served over
   a wire. `front/a2a` keeps each conversation's quarantine across its
   tasks and `front/responses` across its requests, each matching the
