@@ -7,6 +7,22 @@ versions may break the API.
 
 ## Unreleased
 
+- Fixed: `front/a2a`'s steer into a working task goes through what
+  records the conversation when the task's `RecorderFor` returns a
+  context carrying a `Redeliverer` (`ContextWithRedeliverer`), so the
+  steer is written before the agent holds it and survives a quit, and
+  the steers a task left for the message answering its calls go
+  through it too. Added `session.Recorder.Redeliver`, which writes the
+  queued entry, with `deliver`, first, and hands over an input the path
+  already owes under its entry rather than writing it twice. (#244,
+  #287)
+- Fixed: `front/a2a.MaxSteers` counts only the steers a task holds
+  untaken: one the agent has taken no longer counts, where all the
+  steers since the last run's end did. (#287)
+- Fixed: RFC 0001 and `session.MoveTo` say what a rewind does to the
+  quarantine: the transcript at the entry is shaped by the `omit` in
+  force there, so what was quarantined before it stays out and what the
+  branch left quarantined after it does not. (#281)
 - Changed, breaking: `Agent.Deliver` starts no run once the last run
   ended on a terminating result, `StopTerminate` or
   `StopPartialTerminate`, and none has started since. It returns the new

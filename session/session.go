@@ -3101,6 +3101,63 @@ func (r *Recorder) Deliver(ctx context.Context, a *agentturn.Agent, items ...ope
 	return joined, end, err
 }
 
+// Redeliver queues items into a as agentturn.Agent.Redeliver does, a
+// steer reaching the turn that takes it as a delivery, with ctx's
+// trigger, after writing each as a queued entry carrying deliver at
+// the session's leaf, durably: how a front takes a remote party's
+// steer into a running agent so it survives a quit, front/a2a's
+// WithDeliverWhileBusy through its Redeliverer. Neither waits nor
+// starts a run, as Redeliver does not. An item the path already owes
+// as a delivery under the same trigger, equal to it, and that nobody
+// has taken up, one a task that stopped for input left for the
+// message answering its calls, is handed over under that entry rather
+// than written again. An item whose entry cannot be written is not
+// queued, and the error says so; the items before it are.
+func (r *Recorder) Redeliver(ctx context.Context, a *agentturn.Agent, items ...openresponses.Item) error {
+	trigger, err := sessionTrigger(agentturn.TriggerFromContext(ctx))
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		base, _ := agentturn.Unhide(item)
+		r.mu.Lock()
+		in := r.root.owedDelivery(base, trigger)
+		if in != nil {
+			in.item, in.held, in.awaiting = base, true, true
+		} else {
+			in = &inboxItem{item: base, mode: agentsession.ModeSteer, deliver: true, held: true, awaiting: true, trigger: trigger.Clone()}
+			r.root.inbox = append(r.root.inbox, in)
+			if err := r.root.requeue(context.WithoutCancel(ctx)); err != nil {
+				r.root.inbox = r.root.inbox[:len(r.root.inbox)-1]
+				r.mu.Unlock()
+				return err
+			}
+		}
+		r.mu.Unlock()
+		if err := a.Redeliver(ctx, item); err != nil {
+			r.mu.Lock()
+			decline([]*inboxItem{in})
+			r.mu.Unlock()
+			return err
+		}
+	}
+	return nil
+}
+
+// owedDelivery is the input of the inbox the path owes as a delivery
+// of item under trigger, which nobody has taken up, or nil.
+func (w *writer) owedDelivery(item openresponses.Item, trigger *agentsession.Trigger) *inboxItem {
+	for _, in := range w.inbox {
+		if !in.held && !in.declined && in.entry != "" && in.deliver && in.mode == agentsession.ModeSteer && equalJSON(in.item, item) && equalJSON(in.trigger, trigger) {
+			return in
+		}
+	}
+	return nil
+}
+
 // RecordedControl is the agentturn.Control a recorder offers for an
 // agent it records, with the delivery beside it: what a front serving
 // the agent to remote parties, front/control's Handler among them, is

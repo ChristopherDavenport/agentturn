@@ -25,7 +25,10 @@ import (
 // leaves it for the message that answers them, which takes it after
 // the answered batch, unless the task is cancelled first; one that
 // fails or is cancelled drops it, with the task. A task holds at most
-// [MaxSteers] steers it has not taken.
+// [MaxSteers] steers it has not taken. A [Redeliverer] the task's
+// [RecorderFor] put on its context takes each steer, and each one
+// owed to the answering message, so the record holds it before the
+// agent does.
 //
 // The conversation still runs one task at a time. A message naming
 // only the context, which the A2A server makes a new task, is still
@@ -46,8 +49,36 @@ func WithDeliverWhileBusy() Option { return func(e *Executor) { e.deliverBusy = 
 // MaxSteers is how many steers a working task holds that its agent has
 // not taken yet, the ones it keeps for the message answering its calls
 // included; [WithDeliverWhileBusy] refuses the next with
-// a2a.ErrInvalidRequest until the agent takes one.
+// a2a.ErrInvalidRequest until the agent takes one. A steer the agent
+// has taken no longer counts.
 const MaxSteers = 16
+
+// Redeliverer takes a steer into a task's running agent through what
+// records the conversation, which writes it before the agent holds it,
+// as agentturn/session's Recorder.Redeliver does, so a caller's input
+// survives a quit as a local one does (RFC 0001 Steering, #244). A
+// [RecorderFor] puts one on the context it returns, with
+// [ContextWithRedeliverer]; [WithDeliverWhileBusy] then hands it every
+// steer, and the steers a task left for the message answering its
+// calls, rather than the agent's own Redeliver. A steer it refuses is
+// refused to the caller.
+type Redeliverer interface {
+	Redeliver(ctx context.Context, a *agentturn.Agent, items ...openresponses.Item) error
+}
+
+type redelivererKey struct{}
+
+// ContextWithRedeliverer returns ctx carrying r, for a [RecorderFor] to
+// return.
+func ContextWithRedeliverer(ctx context.Context, r Redeliverer) context.Context {
+	return context.WithValue(ctx, redelivererKey{}, r)
+}
+
+// redelivererFrom returns the [Redeliverer] on ctx, or nil.
+func redelivererFrom(ctx context.Context) Redeliverer {
+	r, _ := ctx.Value(redelivererKey{}).(Redeliverer)
+	return r
+}
 
 // running is a task whose run is in flight: its agent, and the steers
 // callers delivered into it.
@@ -55,6 +86,8 @@ type running struct {
 	task      a2a.TaskID
 	contextID string
 	agent     *agentturn.Agent
+	// via is the [Redeliverer] the task's RecorderFor returned, or nil.
+	via Redeliverer
 	// open is whether the task still takes a steer; it is closed in the
 	// same step as the check that finds none outstanding.
 	open    bool
@@ -77,22 +110,49 @@ type steer struct {
 
 // track registers agent as task's running agent and hands it the
 // steers the conversation's last task left owed, waiting on calls the
-// task now answers. It returns the task's record.
-func (e *Executor) track(ctx context.Context, task a2a.TaskID, contextID string, agent *agentturn.Agent) *running {
+// task now answers, through via when the task's RecorderFor gave one.
+// It returns the task's record.
+func (e *Executor) track(ctx context.Context, task a2a.TaskID, contextID string, agent *agentturn.Agent, via Redeliverer) *running {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.running == nil {
 		e.running = map[a2a.TaskID]*running{}
 	}
-	rt := &running{task: task, contextID: contextID, agent: agent, open: true}
+	rt := &running{task: task, contextID: contextID, agent: agent, via: via, open: true}
 	for _, s := range e.owed[contextID].steers {
-		if agent.Redeliver(agentturn.ContextWithTrigger(ctx, s.trigger), s.item) == nil {
+		if rt.redeliver(agentturn.ContextWithTrigger(ctx, s.trigger), s.item) == nil {
 			rt.steered = append(rt.steered, s)
 		}
 	}
 	delete(e.owed, contextID)
 	e.running[task] = rt
 	return rt
+}
+
+// redeliver hands items to rt's agent as a steer, through its
+// [Redeliverer] when it has one.
+func (rt *running) redeliver(ctx context.Context, items ...openresponses.Item) error {
+	if rt.via != nil {
+		return rt.via.Redeliver(ctx, rt.agent, items...)
+	}
+	return rt.agent.Redeliver(ctx, items...)
+}
+
+// untaken drops from rt's steers the ones its agent has taken, and
+// returns the rest. The caller holds e.mu.
+func (rt *running) untaken() []steer {
+	queued := map[openresponses.Item]bool{}
+	for _, item := range rt.agent.State().Steered {
+		queued[item] = true
+	}
+	var left []steer
+	for _, s := range rt.steered {
+		if queued[s.item] {
+			left = append(left, s)
+		}
+	}
+	rt.steered = left
+	return left
 }
 
 // untrack forgets task's running agent.
@@ -118,17 +178,7 @@ func (e *Executor) outstanding(rt *running, end *agentturn.RunEnd) (agentturn.Tr
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	queued := map[openresponses.Item]bool{}
-	for _, item := range rt.agent.State().Steered {
-		queued[item] = true
-	}
-	var left []steer
-	for _, s := range rt.steered {
-		if queued[s.item] {
-			left = append(left, s)
-		}
-	}
-	rt.steered = left
+	left := rt.untaken()
 	if len(left) > 0 && end != nil && (end.Reason == agentturn.ReasonDone || end.Reason == agentturn.ReasonStopped) {
 		return left[0].trigger, true
 	}
@@ -192,10 +242,10 @@ func (e *Executor) deliver(ctx context.Context, msg *a2a.Message) (bool, error) 
 	if !rt.open {
 		return false, nil
 	}
-	if len(rt.steered)+len(items) > MaxSteers {
-		return false, a2a.NewError(fmt.Errorf("%w: the task holds %d steers it has not taken", a2a.ErrInvalidRequest, len(rt.steered)), "the task holds as many steers as it takes; send again once it has taken one")
+	if left := rt.untaken(); len(left)+len(items) > MaxSteers {
+		return false, a2a.NewError(fmt.Errorf("%w: the task holds %d steers it has not taken", a2a.ErrInvalidRequest, len(left)), "the task holds as many steers as it takes; send again once it has taken one")
 	}
-	if err := rt.agent.Redeliver(ctx, items...); err != nil {
+	if err := rt.redeliver(ctx, items...); err != nil {
 		return false, err
 	}
 	for _, item := range items {

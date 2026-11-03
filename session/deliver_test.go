@@ -273,3 +273,86 @@ func TestARemoteDeliveryAtAnApprovalPromptIsWrittenFirst(t *testing.T) {
 		t.Errorf("the delivery's entry = %+v, want it written with deliver before any run", d)
 	}
 }
+
+// queuedCount counts the queued entries of s holding a message with
+// text.
+func queuedCount(s *agentsession.Session, text string) int {
+	n := 0
+	for _, e := range s.Entries() {
+		if q, ok := e.(*agentsession.QueuedEntry); ok {
+			if m, ok := q.Item.(*openresponses.Message); ok && m.Text() == text {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// TestARedeliveredSteerIsWrittenFirst pins the integration review of
+// #287 × #244: Recorder.Redeliver, which front/a2a's steer goes
+// through, writes the steer's queued entry, with deliver, before the
+// agent holds it, so it is on the record across a quit; and one the
+// path already owes, handed over again by a later task's recorder, is
+// taken under its entry rather than written twice.
+func TestARedeliveredSteerIsWrittenFirst(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1}
+	a := agentturn.New(cfg)
+	unsub := rec.Attach(a)
+	if _, err := a.Prompt(ctx, openresponses.UserText("hello")); err != nil {
+		t.Fatal(err)
+	}
+	steer := openresponses.UserText("also check the cache")
+	if err := rec.Redeliver(ctx, a, steer); err != nil {
+		t.Fatal(err)
+	}
+	if d := deliveries(s)["also check the cache"]; d == nil || !d.Deliver {
+		t.Fatalf("the steer's entry = %+v, want it written with deliver before the agent took it", d)
+	}
+	if st := a.State(); st.Steering != 1 {
+		t.Fatalf("the agent holds %d steers", st.Steering)
+	}
+	// The process quits before a run takes it.
+	unsub()
+
+	rec, s, err = Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts, err := AgentOptions(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := agentturn.New(cfg, opts...)
+	defer rec.Attach(b)()
+	// The front hands its owed steer over again, a copy of it.
+	if err := rec.Redeliver(ctx, b, openresponses.UserText("also check the cache")); err != nil {
+		t.Fatal(err)
+	}
+	var arrived []agentturn.TurnInput
+	b.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if e, ok := ev.(*agentturn.TurnStart); ok && e.Turn == 1 {
+			arrived = e.Arrived
+		}
+		return nil
+	})
+	if _, err := b.Continue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(arrived) != 1 || arrived[0].Mode != agentturn.InputDeliver {
+		t.Errorf("the first turn's inputs = %+v, want the steer as a delivery", arrived)
+	}
+	s, err = store.Open(ctx, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := queuedCount(s, "also check the cache"); n != 1 {
+		t.Errorf("the steer has %d queued entries, want the one written first", n)
+	}
+	verifyAll(t, s)
+}

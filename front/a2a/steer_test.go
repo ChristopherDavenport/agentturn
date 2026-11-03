@@ -417,3 +417,134 @@ func TestSteersAreBounded(t *testing.T) {
 		}
 	}
 }
+
+// redelivering is a Redeliverer standing in for a session recorder's:
+// it notes each steer it is handed, then hands it to the agent.
+type redelivering struct {
+	mu    sync.Mutex
+	texts []string
+}
+
+func (r *redelivering) Redeliver(ctx context.Context, a *agentturn.Agent, items ...openresponses.Item) error {
+	r.mu.Lock()
+	for _, item := range items {
+		if m, ok := item.(*openresponses.Message); ok {
+			r.texts = append(r.texts, m.Text())
+		}
+	}
+	r.mu.Unlock()
+	return a.Redeliver(ctx, items...)
+}
+
+// TestASteerGoesThroughTheRecorder pins the integration review of
+// #287 × #244 (RFC 0001 Steering's SHOULD): a steer into a working
+// task, and the same steer the task left for the message answering
+// its calls, are handed to the Redeliverer the task's RecorderFor put
+// on its context, which writes them before the agent holds them, and
+// the agent still takes the steer after the answered batch.
+func TestASteerGoesThroughTheRecorder(t *testing.T) {
+	model := &asksTheCaller{entered: make(chan struct{}), release: make(chan struct{})}
+	via := &redelivering{}
+	recorded := func(ctx context.Context, _ string, _ *agentturn.Agent) (context.Context, func(), error) {
+		return ContextWithRedeliverer(ctx, via), nil, nil
+	}
+	h := New(agentturn.Config{Model: model}, WithDeliverWhileBusy(), WithRecorderFor(recorded),
+		WithCallerTools(openresponses.NewFunctionTool("remote", "caller side", json.RawMessage(`{"type":"object"}`)))).RequestHandler()
+	first := userMessage("lint the repo")
+	first.ContextID = "c1"
+	res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: first, Config: nonBlocking})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := res.(*a2a.Task)
+	<-model.entered
+	steer := a2a.NewMessageForTask(a2a.MessageRoleUser, task, a2a.TextPart{Text: "also check the cache"})
+	if _, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: steer, Config: nonBlocking}); err != nil {
+		t.Fatalf("steer: %v", err)
+	}
+	close(model.release)
+	asking := finalOrAsking(t, h, task.ID)
+	if asking.Status.State != a2a.TaskStateInputRequired {
+		t.Fatalf("task = %s, want input-required", asking.Status.State)
+	}
+	ids := pendingIDs(t, asking)
+	answer := a2a.NewMessageForTask(a2a.MessageRoleUser, task, a2a.DataPart{Data: map[string]any{"type": "function_call_output", "call_id": ids[0], "output": "found"}})
+	if done := sendTask(t, h, answer); done.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("answered task = %s", done.Status.State)
+	}
+	via.mu.Lock()
+	texts := strings.Join(via.texts, "|")
+	via.mu.Unlock()
+	if texts != "also check the cache|also check the cache" {
+		t.Errorf("the recorder was handed %q, want the steer and the owed steer", texts)
+	}
+	requests := model.seen()
+	if last := requests[len(requests)-1]; len(last) != 2 || last[1] != "also check the cache" {
+		t.Errorf("requests = %q, want the steer after the answered call", requests)
+	}
+}
+
+// worksTwice calls work until two outputs are in, then answers.
+type worksTwice struct{ worksOnce }
+
+func (m *worksTwice) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	outputs := 0
+	for _, item := range req.Input {
+		if _, ok := item.(*openresponses.FunctionCallOutput); ok {
+			outputs++
+		}
+	}
+	if outputs != 1 {
+		return m.worksOnce.CreateStream(ctx, req, sink)
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.FunctionCall("", "work")
+	if err != nil {
+		return err
+	}
+	if err := w.Arguments(`{}`); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestATakenSteerNoLongerCounts pins the integration review of the
+// steer bound: MaxSteers counts the steers a task holds untaken, so
+// once the agent has taken a full bound of them, as it does after a
+// batch, the task takes as many again during its next call.
+func TestATakenSteerNoLongerCounts(t *testing.T) {
+	model := &worksTwice{}
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{}, 2)
+	work := agenttool.New("work", "works until released", func(ctx context.Context, _ struct{}) (string, error) {
+		entered <- struct{}{}
+		<-release
+		return "worked", nil
+	})
+	h := New(agentturn.Config{Model: model, Tools: []agenttool.Tool{work}}, WithDeliverWhileBusy()).RequestHandler()
+	first := userMessage("lint the repo")
+	first.ContextID = "c1"
+	res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: first, Config: nonBlocking})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := res.(*a2a.Task)
+	for round := range 2 {
+		<-entered
+		for i := range MaxSteers {
+			steer := a2a.NewMessageForTask(a2a.MessageRoleUser, task, a2a.TextPart{Text: "more"})
+			if _, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: steer, Config: nonBlocking}); err != nil {
+				release <- struct{}{}
+				release <- struct{}{}
+				t.Fatalf("round %d, steer %d: %v", round, i, err)
+			}
+		}
+		release <- struct{}{}
+	}
+	if done := finalTask(t, h, task.ID); done.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("task = %s", done.Status.State)
+	}
+}

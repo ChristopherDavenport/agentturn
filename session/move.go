@@ -16,7 +16,11 @@ import (
 // with what the record holds there, as [AgentOptions] reads them for a
 // new agent, reserving every call ID the session holds. r must be the
 // recorder that writes a's runs. The empty entry ID is the reset Rebase
-// describes, which leaves a with an empty transcript.
+// describes, which leaves a with an empty transcript. The quarantine
+// goes with the transcript: the context at entryID is shaped by the
+// omit in force there, so what was quarantined before it stays out,
+// and what the branch left quarantined after it is not (RFC 0001 The
+// record, the rewind).
 //
 // It is refused with agentturn.ErrRunning, with nothing changed, while
 // a run of a is active, and no run of a starts until it returns: the

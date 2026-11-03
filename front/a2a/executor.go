@@ -135,9 +135,14 @@ func WithCallerTools(tools ...*openresponses.FunctionTool) Option {
 //		if err := a.SetConfig(cfg); err != nil {
 //			return nil, nil, err
 //		}
-//		return session.ContextWithSessionID(ctx, rec.SessionID()), rec.Attach(a), nil
+//		ctx = a2a.ContextWithRedeliverer(session.ContextWithSessionID(ctx, rec.SessionID()), rec)
+//		return ctx, rec.Attach(a), nil
 //	})
 //
+// [ContextWithRedeliverer] has the steers [WithDeliverWhileBusy] takes
+// into the task go through the recorder, which writes each before the
+// agent holds it; without it a steer reaches the record only when its
+// queued event does, and a quit before then loses it.
 // The returned context is the only one the configuration's hooks see.
 // A host whose hooks record verdicts of their own, a kit built on this
 // agent, puts its recorder on that context as well, with the kit's
@@ -493,11 +498,6 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 		opts = append(opts, agentturn.WithPending(seeded))
 	}
 	agent := agentturn.New(e.runConfig(start, caller), opts...)
-	var rt *running
-	if e.deliverBusy {
-		rt = e.track(runCtx, reqCtx.TaskID, reqCtx.ContextID, agent)
-		defer e.untrack(reqCtx.TaskID)
-	}
 	var detach func()
 	if e.recorderFor != nil {
 		rctx, d, err := e.recorderFor(runCtx, reqCtx.ContextID, agent)
@@ -512,6 +512,13 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 			return fmt.Errorf("record conversation %q: %w", reqCtx.ContextID, err)
 		}
 		runCtx = rctx
+	}
+	var rt *running
+	if e.deliverBusy {
+		// Tracked once the record is attached, so a steer, and one the
+		// last task left owed, goes through what records it.
+		rt = e.track(runCtx, reqCtx.TaskID, reqCtx.ContextID, agent, redelivererFrom(runCtx))
+		defer e.untrack(reqCtx.TaskID)
 	}
 	if err := q.Write(ctx, a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateWorking, nil)); err != nil {
 		return err
