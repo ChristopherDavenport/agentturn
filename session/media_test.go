@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ChristopherDavenport/agentsession"
 	"github.com/ChristopherDavenport/agentsession/remote"
@@ -513,5 +514,78 @@ func TestAMediaWriterElsewhereResumesWithItsTypes(t *testing.T) {
 	}
 	if got, _ := json.Marshal(items[0]); !strings.Contains(string(got), pngURL(shot)) {
 		t.Errorf("the prompt came back as %s, want its image as %s", got, pngURL(shot))
+	}
+}
+
+// TestAChildNamingItsParentsBlobAfterTheGraceHasItsType pins the final
+// review of #284 over RFC 0003: a server gives a session the type of a
+// blob its writer uploaded only while the upload's grace lasts, so a
+// child session naming a blob its parent put earlier, once the grace
+// has passed, is given the type by the recorder putting the blob again
+// for it, rather than holding none and resolving it as an octet
+// stream.
+func TestAChildNamingItsParentsBlobAfterTheGraceHasItsType(t *testing.T) {
+	ctx := context.Background()
+	const grace = 100 * time.Millisecond
+	h := remote.NewHandler(agentsession.NewMemoryStore(), remote.WithInsecureNoAuth(), remote.WithUploadGrace(grace))
+	srv := httptest.NewServer(h)
+	defer func() {
+		srv.CloseClientConnections()
+		srv.Close()
+		h.Close()
+	}()
+	c, err := remote.Dial(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, s, err := Start(ctx, c, agentsession.Header{Media: agentsession.MediaSidecar})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	shot := agenttool.NewFunc("shot", "takes a screenshot", []byte(`{"type":"object"}`),
+		func(context.Context, agenttool.Call) (agenttool.Result, error) {
+			if n == 0 {
+				// The parent's uploads are past their grace.
+				time.Sleep(3 * grace)
+			}
+			n++
+			return agenttool.Result{Output: openresponses.FunctionCallOutputData{Parts: openresponses.Contents{
+				&openresponses.InputImage{ImageURL: pngURL(screenshots[n%2])},
+			}}}, nil
+		})
+	browse := agent.New(agentturn.Config{Name: "task", Description: "browses", Model: &shooter{}, ModelName: "m", Tools: []agenttool.Tool{shot}},
+		agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+	a := agentturn.New(agentturn.Config{Model: &twoCalls{calls: []string{`{"input":"browse"}`}}, Tools: []agenttool.Tool{browse}})
+	defer rec.Attach(a)()
+	// The parent's prompt holds both screenshots, so it puts them first.
+	prompt := openresponses.UserMessage(&openresponses.InputText{Text: "go"},
+		&openresponses.InputImage{ImageURL: pngURL(screenshots[0])}, &openresponses.InputImage{ImageURL: pngURL(screenshots[1])})
+	if end, err := a.Prompt(ctx, prompt); err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	s, err = c.Open(ctx, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := links(s)
+	if len(l) != 1 {
+		t.Fatalf("links = %+v", l)
+	}
+	child, err := c.Open(ctx, l[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, err := agentsession.SessionBlobs(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(held) != 2 {
+		t.Fatalf("the child names %d blobs, want 2", len(held))
+	}
+	for _, hash := range held {
+		if _, mt, err := c.SessionBlob(ctx, child.ID(), hash); err != nil || mt != "image/png" {
+			t.Errorf("the child's blob %s: type %q, err %v; want image/png", hash, mt, err)
+		}
 	}
 }

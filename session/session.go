@@ -981,8 +981,9 @@ type writer struct {
 	// media is the media form the session's header names, which a child
 	// session takes too: its parent's blobs and its own live together.
 	media string
-	// typed holds the hash of each blob the session was given a media
-	// type for, so it is given once.
+	// typed holds the hash of each blob the session has named, given
+	// its media type, so the type is given, and the blob put for the
+	// session, once.
 	typed map[string]bool
 
 	settings agentsession.Settings

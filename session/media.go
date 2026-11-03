@@ -108,7 +108,8 @@ type blob struct {
 // is stored with the media type of the data URL it replaced, through
 // agentsession.TypedBlobWriter when the writer is one, and the session
 // is given that type for it when the store holds types per session
-// (agentsession.SessionBlobTyper), so a resume reads each reference
+// (agentsession.SessionBlobTyper), or else the blob is put again the
+// first time the session names it, so a resume reads each reference
 // back as the data URL it was.
 func (w *writer) sidecar(ctx context.Context, item openresponses.Item) (openresponses.Item, error) {
 	if w.media != agentsession.MediaSidecar || item == nil {
@@ -122,10 +123,17 @@ func (w *writer) sidecar(ctx context.Context, item openresponses.Item) (openresp
 	if bw == nil {
 		return nil, fmt.Errorf("session: media of a sidecar session: %w", agentsession.ErrNoBlobWriter)
 	}
+	// A store that holds no types per session, an RFC 0003 client, gives
+	// a session the type of a blob its writer uploaded, and lets the
+	// session reach the blob, only while the upload's grace lasts: a
+	// session that has not named the blob yet, a child naming its
+	// parent's, has it put again for it.
+	typer, perSession := w.rec.store.(agentsession.SessionBlobTyper)
 	var types map[string]string
 	for _, b := range blobs {
 		hash := agentsession.HashBytes(b.data)
-		if !w.rec.stored[hash] {
+		_, named := types[hash]
+		if !w.rec.stored[hash] || !perSession && !w.typed[hash] && !named {
 			var got string
 			var err error
 			if tw, ok := bw.(agentsession.TypedBlobWriter); ok {
@@ -141,20 +149,18 @@ func (w *writer) sidecar(ctx context.Context, item openresponses.Item) (openresp
 			}
 			w.rec.stored[hash] = true
 		}
-		if b.mediaType != "" && !w.typed[hash] {
+		if !w.typed[hash] && !named {
 			if types == nil {
 				types = map[string]string{}
 			}
-			if _, ok := types[hash]; !ok {
-				types[hash] = b.mediaType
-			}
+			types[hash] = b.mediaType
 		}
 	}
 	// The session's own type for each blob, held by the store that
 	// holds the session, the blobs its own or a [WithMedia] writer's: a
 	// type a store holds per blob is the first it was given, which
 	// another session may have given these bytes.
-	if typer, ok := w.rec.store.(agentsession.SessionBlobTyper); ok && len(types) > 0 {
+	if perSession && len(types) > 0 {
 		if err := typer.SetSessionBlobTypes(ctx, w.id, types); err != nil {
 			return nil, fmt.Errorf("session: blob types: %w", err)
 		}

@@ -274,7 +274,10 @@ versions may break the API.
   after-call hook and resolves it again in a model wrapper. Each blob
   is put once per recorder, with the media type of the data URL it
   replaced (agentsession's `TypedBlobWriter`), and the session is given
-  that type for it when the store holds types per session; a data URL
+  that type for it when the store holds types per session, or, over an
+  RFC 0003 client, the blob is put again the first time a session names
+  it, so a child naming its parent's blob after the upload's grace still
+  reaches it with its type; a data URL
   whose type a store cannot keep stays inline. (#284)
 - Fixed, breaking: a resumed, reopened or rewound sidecar session no
   longer hands the agent `sidecar:` URLs, which every provider, and
