@@ -26,7 +26,10 @@ type Executor struct {
 	chunkSize   int
 	callerTools []*openresponses.FunctionTool
 	recorderFor RecorderFor
+	chosenBy    func(ctx context.Context, principal string) bool
 	handoff     func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool)
+	maxHandoffs int
+	trim        func(ctx context.Context, from, to agentturn.Config, t agentturn.Transcript) agentturn.Transcript
 	start       func(context.Context, agentturn.Transcript) (agentturn.Config, bool)
 	route       Route
 	auth        *Authenticator
@@ -44,6 +47,16 @@ type Executor struct {
 	// the cancel does not run on the conversation the cancel settled.
 	canceled map[string]canceledMark
 	waiting  memoryWaiting
+	// deliverBusy is [WithDeliverWhileBusy]; running holds the tasks
+	// whose run is in flight, and owed, by context ID, the steers a task
+	// left queued when it stopped for input, for the task that answers.
+	deliverBusy bool
+	running     map[a2a.TaskID]*running
+	owed        map[string]owedSteers
+	// quarantines holds, by context ID, what the conversation's tasks
+	// quarantined, one copy of each item, which the next task's agent
+	// builds under (#281).
+	quarantines map[string]*agentturn.QuarantineSet
 }
 
 // ErrConversationBusy is the cause of the error a message gets when its
@@ -122,9 +135,14 @@ func WithCallerTools(tools ...*openresponses.FunctionTool) Option {
 //		if err := a.SetConfig(cfg); err != nil {
 //			return nil, nil, err
 //		}
-//		return session.ContextWithSessionID(ctx, rec.SessionID()), rec.Attach(a), nil
+//		ctx = a2a.ContextWithRedeliverer(session.ContextWithSessionID(ctx, rec.SessionID()), rec)
+//		return ctx, rec.Attach(a), nil
 //	})
 //
+// [ContextWithRedeliverer] has the steers [WithDeliverWhileBusy] takes
+// into the task go through the recorder, which writes each before the
+// agent holds it; without it a steer reaches the record only when its
+// queued event does, and a quit before then loses it.
 // The returned context is the only one the configuration's hooks see.
 // A host whose hooks record verdicts of their own, a kit built on this
 // agent, puts its recorder on that context as well, with the kit's
@@ -154,9 +172,10 @@ func WithRecorderFor(fn RecorderFor) Option {
 // in a result's Details, which the model never sees, or in end.Items,
 // the terminating call and its output. It is asked again each time a
 // run it started stops the same way, so a pair of agents that hand
-// back and forth runs until fn declines or the task is canceled; a
-// host that wants a bound counts on a value it puts on the context
-// RecorderFor returns, which fn is given.
+// back and forth runs until fn declines, the task is canceled or the
+// task has followed [WithMaxHandoffs] of them,
+// [responses.DefaultMaxHandoffs] by default, after which the task
+// fails with [ErrTooManyHandoffs].
 //
 // The receiver's run is continued under
 // agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff",
@@ -177,12 +196,46 @@ func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*
 	return func(e *Executor) { e.handoff = fn }
 }
 
+// WithMaxHandoffs bounds the [WithHandoff] switches one task follows,
+// as RFC 0001 requires of a host that takes handoffs: when a run after
+// n of them ends on one more that WithHandoff takes, the task fails
+// with a status message saying so ([ErrTooManyHandoffs]), rather than
+// completing with a transfer's text. The conversation keeps the
+// transfer, so under [WithTransfers] its next task starts with the
+// receiver of the last one. n of 0 or less means
+// [responses.DefaultMaxHandoffs], the one bound both fronts and
+// agentturn/handoff default to.
+func WithMaxHandoffs(n int) Option { return func(e *Executor) { e.maxHandoffs = n } }
+
+// ErrTooManyHandoffs is front/responses' [responses.ErrTooManyHandoffs],
+// which a task stopped at [WithMaxHandoffs]' bound fails with.
+var ErrTooManyHandoffs = responses.ErrTooManyHandoffs
+
+// WithHandoffTrim trims what the receiver of a [WithHandoff] switch
+// sees, once, between the sender's run and the receiver's: fn is given
+// the sender's configuration, the receiver's and the agent's
+// transcript, and returns the one the receiver continues, set with
+// Agent.SetTranscript, so what [WithRecorderFor] attached records the
+// trim. It must be one the loop can continue (agentturn.CanContinue),
+// or the task fails. The trim applies to the receiver's runs within the
+// task and, under [WithTransfers], the receiver's later tasks: each
+// starts from the conversation trimmed at every handoff the route finds
+// in it (responses.TrimHandedOff), while the [ConversationStore] keeps
+// the history whole, since the next task finds its agent by the
+// transfer in it. agentturn/handoff's Team.Trim is one.
+func WithHandoffTrim(fn func(ctx context.Context, from, to agentturn.Config, t agentturn.Transcript) agentturn.Transcript) Option {
+	return func(e *Executor) { e.trim = fn }
+}
+
 // WithStart picks the configuration a task starts under from the
 // conversation: the transcript the [ConversationStore] holds for the
 // task's context ID with the message's items after it. A configuration
 // it returns is used in place of the executor's, with the caller-owned
 // tools offered under it as under the executor's own; false keeps the
-// executor's. It is how the receiver of a handoff answers the
+// executor's. A configuration it returns is given the executor's
+// ToolRecorder and ToolElicitor where it leaves them nil, as a
+// [WithHandoff] receiver is given the sender's, so a call its hook
+// holds is put to the same people. It is how the receiver of a handoff answers the
 // conversation's later messages. The executor keeps no configuration
 // between tasks, so the conversation, which holds the transfer call
 // and its output, says who has it. A host whose handoff tools are
@@ -221,7 +274,8 @@ func WithStart(fn func(ctx context.Context, t agentturn.Transcript) (agentturn.C
 // WithTransfers says the conversation's handoffs are the transfer
 // calls route names, as [Handoffs] finds them. Without [WithStart] a
 // task starts where the last of them left the conversation, as
-// WithStart does with [HandedTo]; with it, WithStart picks the start,
+// WithStart does with [HandedTo], the receiver given the executor's
+// ToolRecorder and ToolElicitor where it has none of its own; with it, WithStart picks the start,
 // in whichever order the two are given, and the rest of this option
 // applies all the same. A message that declares a caller-owned tool
 // route takes is refused as invalid params, as is one declaring a
@@ -310,6 +364,9 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	if len(approvals) > 0 && !e.escalate {
 		return fmt.Errorf("%w: the message carries approvals, and this agent puts no call to its caller", a2a.ErrInvalidParams)
 	}
+	if err := e.checkChosen(ctx, principal, approvals); err != nil {
+		return fmt.Errorf("%w: %w", a2a.ErrInvalidParams, err)
+	}
 	prompts, err := ItemsFromMessage(rest)
 	if err != nil {
 		return fmt.Errorf("%w: %w", a2a.ErrInvalidParams, err)
@@ -355,7 +412,11 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	if err != nil {
 		return fmt.Errorf("load conversation %q: %w", reqCtx.ContextID, err)
 	}
-	start := e.startFor(runCtx, slices.Concat(transcript, prompts))
+	// A task started under another configuration, the receiver the
+	// conversation was handed to, puts its questions and records its
+	// tools' writes where the executor's own does, as a WithHandoff
+	// switch within a task does (#234).
+	start := inherit(e.startFor(runCtx, slices.Concat(transcript, prompts)), e.cfg)
 	caller := slices.Concat(e.callerTools, declared)
 	callers := callerNames(caller)
 	// The calls this task put to its caller, which an approval may run
@@ -414,7 +475,17 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	if e.route != nil {
 		models = responses.Attribute(transcript, e.cfg, Handoffs(transcript, e.route))
 	}
-	opts := []agentturn.Option{agentturn.WithTranscript(transcript), agentturn.WithReasoningModels(models)}
+	// The agent sees the conversation trimmed as each handoff's trim
+	// left it, the receiver's later tasks included (#276); the store
+	// keeps it whole, for the route to find the handoffs in.
+	seen := transcript
+	if e.route != nil && e.trim != nil {
+		seen = responses.TrimHandedOff(runCtx, transcript, e.cfg, e.route, e.trim)
+	}
+	// What an earlier task quarantined stays out of this one's requests:
+	// the set is the conversation's, bound to the transcript as loaded.
+	quarantined := e.quarantineFor(reqCtx.ContextID, seen)
+	opts := []agentturn.Option{agentturn.WithTranscript(seen), agentturn.WithReasoningModels(models), agentturn.WithQuarantineSet(quarantined)}
 	if len(approvals) > 0 {
 		// The calls the last run deferred, the caller's and the escalated
 		// ones alike, were never handed to a tool; an escalated one
@@ -442,6 +513,13 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 		}
 		runCtx = rctx
 	}
+	var rt *running
+	if e.deliverBusy {
+		// Tracked once the record is attached, so a steer, and one the
+		// last task left owed, goes through what records it.
+		rt = e.track(runCtx, reqCtx.TaskID, reqCtx.ContextID, agent, redelivererFrom(runCtx))
+		defer e.untrack(reqCtx.TaskID)
+	}
 	if err := q.Write(ctx, a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateWorking, nil)); err != nil {
 		return err
 	}
@@ -454,14 +532,27 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 		for _, a := range approvals {
 			answers = append(answers, a.answer(asked[a.CallID], principal))
 		}
+		// A held call follows the answer to the calls it was held
+		// beside: released when every approval accepts, refused unrun
+		// when the caller refused one.
+		accepted := true
+		for _, a := range approvals {
+			accepted = accepted && a.Approve
+		}
 		for _, c := range escalated {
-			if !c.asked() {
+			if c.asked() {
+				continue
+			}
+			if accepted {
 				answers = append(answers, c.release())
+			} else {
+				answers = append(answers, c.refuse(principal))
 			}
 		}
 		run = func(ctx context.Context) (*agentturn.RunEnd, error) { return agent.Resume(ctx, answers...) }
 	}
-	out := e.relay(ctx, runCtx, cancel, reqCtx, q, agent, run, caller)
+	out := e.relay(ctx, runCtx, cancel, reqCtx, q, agent, run, caller, rt)
+	e.keepQuarantine(reqCtx.ContextID, quarantined)
 	if err := e.persist(ctx, reqCtx.ContextID, transcript, out); err != nil {
 		return err
 	}
@@ -505,6 +596,40 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	}
 	release()
 	return e.conclude(ctx, reqCtx, q, out, escalated)
+}
+
+// quarantineFor returns the set a task's agent builds under: what the
+// conversation's earlier tasks quarantined, bound to t, the transcript
+// the task loaded.
+func (e *Executor) quarantineFor(contextID string, t agentturn.Transcript) *agentturn.QuarantineSet {
+	e.mu.Lock()
+	held := e.quarantines[contextID]
+	e.mu.Unlock()
+	if held == nil {
+		held, _ = agentturn.NewQuarantineSet()
+	}
+	return held.Bind(t)
+}
+
+// keepQuarantine adds to the conversation's set what the task's set,
+// from quarantineFor, holds beyond it, one copy of each item: what the
+// task's hooks and tools quarantined, and what a recorder attached to
+// its agent found quarantined in the record.
+func (e *Executor) keepQuarantine(contextID string, task *agentturn.QuarantineSet) {
+	if len(task.Items()) == 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	held := e.quarantines[contextID]
+	if held == nil {
+		held, _ = agentturn.NewQuarantineSet()
+		if e.quarantines == nil {
+			e.quarantines = map[string]*agentturn.QuarantineSet{}
+		}
+		e.quarantines[contextID] = held
+	}
+	held.Merge(task)
 }
 
 // errCanceled is what claim returns for a task a cancel ended with no
@@ -562,17 +687,23 @@ type outcome struct {
 	// writeErr is the first failure to write an event to the queue; it
 	// aborted the run.
 	writeErr error
+	// bounded says the task stopped at WithMaxHandoffs' bound, with a
+	// handoff left untaken.
+	bounded error
 }
 
 // relay prompts the agent and streams assistant text into artifacts
 // from a subscriber, after whatever RecorderFor subscribed, and
-// continues it under each configuration WithHandoff returns. Under a
+// continues it under each configuration WithHandoff returns, and,
+// under [WithDeliverWhileBusy], while a steer a caller delivered into
+// the task is still queued after a run, as a delivery's own continue
+// would. Under a
 // configuration with an OutputGuard a message's artifact is written
 // whole from its item_end, the guard's replacement, so text the guard
 // withheld never enters the task's artifacts. A failed write aborts
 // the run through cancel and is reported on the outcome; the run's
 // own end and error are reported alongside.
-func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc, reqCtx *a2asrv.RequestContext, q eventqueue.Queue, agent *agentturn.Agent, run func(context.Context) (*agentturn.RunEnd, error), caller []*openresponses.FunctionTool) outcome {
+func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc, reqCtx *a2asrv.RequestContext, q eventqueue.Queue, agent *agentturn.Agent, run func(context.Context) (*agentturn.RunEnd, error), caller []*openresponses.FunctionTool, rt *running) outcome {
 	var out outcome
 	var writer *artifactWriter
 	// guarded says the configuration running has an OutputGuard, whose
@@ -630,7 +761,11 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 	})
 	defer unsubscribe()
 	end, err := run(runCtx)
-	for {
+	limit := e.maxHandoffs
+	if limit <= 0 {
+		limit = responses.DefaultMaxHandoffs
+	}
+	for handoffs := 0; ; {
 		if end == nil {
 			// The run never started: a misuse the loop refused before
 			// any event, which fails the task as a run would.
@@ -638,27 +773,72 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 		}
 		out.end = end
 		out.items = append(out.items, end.Items...)
-		if out.writeErr != nil || e.handoff == nil || !terminated(end) {
+		if out.writeErr != nil {
+			e.outstanding(rt, nil)
 			return out
 		}
-		next, ok := e.handoff(runCtx, end, out.results)
+		var next agentturn.Config
+		ok := false
+		if e.handoff != nil && terminated(end) {
+			next, ok = e.handoff(runCtx, end, out.results)
+		}
 		if !ok {
+			// A steer delivered into the task and not yet taken keeps
+			// the task going: the run it starts is the task's.
+			if trigger, more := e.outstanding(rt, end); more {
+				end, err = agent.Continue(agentturn.ContextWithTrigger(runCtx, trigger))
+				continue
+			}
+			if terminated(end) && agent.State().Steering > 0 {
+				// A delivery the terminating stop left queued, for which
+				// the agent started no run (agentturn.ErrTerminated), is
+				// taken by a run of this task: the task's agent goes with
+				// the task (#290).
+				end, err = agent.Continue(runCtx)
+				continue
+			}
 			return out
 		}
+		if handoffs == limit {
+			// The caller is told, not answered with the transfer's
+			// text: the agents handed the task back and forth.
+			out.bounded = fmt.Errorf("%w: the agents handed the task on %d times and %s would hand it to %s again; stopped", ErrTooManyHandoffs, limit, agent.Config().Name, next.Name)
+			if agent.State().Steering > 0 {
+				// A delivery waiting on the agent is taken in one run
+				// under the configuration it holds, whose own transfer
+				// is not followed, before the task fails (#290).
+				if end, _ = agent.Continue(runCtx); end != nil {
+					out.end = end
+					out.items = append(out.items, end.Items...)
+				}
+			}
+			e.outstanding(rt, nil)
+			return out
+		}
+		handoffs++
 		prev := agent.Config()
+		if e.trim != nil {
+			if err = agent.SetTranscript(e.trim(runCtx, prev, next, agent.State().Transcript)); err != nil {
+				end = nil
+				continue
+			}
+		}
 		// The receiver inherits what the sender's configuration holds
 		// before the run's hook is built, so the hook's fallback
 		// elicitor is the inherited one.
-		if next.ToolRecorder == nil {
-			next.ToolRecorder = prev.ToolRecorder
-		}
-		if next.ToolElicitor == nil {
-			next.ToolElicitor = prev.ToolElicitor
-		}
-		cfg := e.runConfig(next, caller)
+		cfg := e.runConfig(inherit(next, prev), caller)
 		if err = agent.SetConfig(cfg); err == nil {
 			guarded = cfg.OutputGuard != nil
-			end, err = agent.Continue(agentturn.ContextWithTrigger(runCtx, agentturn.Trigger{Kind: "handoff", Ref: prev.Name}))
+			handed := agentturn.ContextWithTrigger(runCtx, agentturn.Trigger{Kind: "handoff", Ref: prev.Name})
+			if agentturn.CanContinue(agent.State().Transcript) {
+				end, err = agent.Continue(handed)
+			} else {
+				// The trim left a model output last: the note is the
+				// receiver's input, so the run appends it, the store
+				// and a recorder keep it, and a later task's trim of
+				// the history adds none (#276).
+				end, err = agent.Prompt(handed, responses.HandoffNote(responses.TransferName(out.results), prev, next))
+			}
 		} else {
 			end = nil
 		}
@@ -730,6 +910,9 @@ func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, 
 	case agentturn.ReasonInputRequired:
 		return e.inputRequired(ctx, reqCtx, q, agentturn.PendingCalls(out.end.Pending), "", escalated)
 	case agentturn.ReasonDone, agentturn.ReasonStopped:
+		if out.bounded != nil {
+			return e.finish(ctx, reqCtx, q, a2a.TaskStateFailed, errorMessage(reqCtx, out.bounded))
+		}
 		if _, ok := out.end.Answer(); out.end.Cause == agentturn.StopGuard && !ok {
 			// A guard stopped the run before the agent answered, at
 			// whichever hook: the agent refused the task, which neither
@@ -856,6 +1039,22 @@ func (e *Executor) closeOwnPending(ctx context.Context, t agentturn.Transcript, 
 	return out, closed
 }
 
+// inherit returns next with the question and tool record channels of
+// from wherever next has none of its own: a configuration a run starts
+// or continues under that is not the one the serving side set up, a
+// handoff's receiver or the agent a later task starts under, puts a
+// held call to the same people and records its tools' writes in the
+// same place.
+func inherit(next, from agentturn.Config) agentturn.Config {
+	if next.ToolRecorder == nil {
+		next.ToolRecorder = from.ToolRecorder
+	}
+	if next.ToolElicitor == nil {
+		next.ToolElicitor = from.ToolElicitor
+	}
+	return next
+}
+
 // startFor returns the configuration a task over t starts under:
 // [WithStart]'s choice, else where the last transfer [WithTransfers]'
 // route takes left the conversation, else the executor's own.
@@ -889,7 +1088,8 @@ func (e *Executor) startFor(ctx context.Context, t agentturn.Transcript) agenttu
 // cfg's own tools that cfg's hook defers is a question for the serving
 // side, and is put to cfg.ToolElicitor with agentturn.Ask, as the loop
 // puts a nested call the hook deferred: the person's accept runs the
-// call and their decline refuses it, both by "human", and without an
+// call and their decline refuses it, both by the decider the answer
+// names or "human", and without an
 // elicitor, or with no answer, the call is refused with a reason that
 // says it cannot be handed to the caller. The hook therefore never
 // returns Defer for a tool of cfg's own, so no such call is pending

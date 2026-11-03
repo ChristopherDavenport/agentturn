@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"sync"
@@ -507,5 +508,139 @@ func TestDispatchOfUnknownCallIsRefused(t *testing.T) {
 	}
 	if got := entryTypes(s); strings.Contains(got, "dispatch") || strings.Contains(got, "function_call_output") {
 		t.Errorf("entries = %q", got)
+	}
+}
+
+// responseOnlyCalls makes, on its first turn, one call to upper per
+// entry of calls, each with its own text, streams them at their own
+// output indexes or all at index 0, and never sends the last call's
+// output_item.done, so only the terminal response completes it; it
+// answers with text on the next turn.
+type responseOnlyCalls struct {
+	calls  []string
+	atZero bool
+	turns  int
+}
+
+func (m *responseOnlyCalls) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.turns++
+	done := 0
+	rewrite := openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+		switch e := ev.(type) {
+		case *openresponses.OutputItemAddedEvent:
+			if m.atZero {
+				e.OutputIndex = 0
+			}
+		case *openresponses.OutputItemDoneEvent:
+			if _, ok := e.Item.(*openresponses.FunctionCall); ok {
+				if done++; done == len(m.calls) {
+					return nil
+				}
+			}
+			if m.atZero {
+				e.OutputIndex = 0
+			}
+		case *openresponses.FunctionCallArgumentsDeltaEvent:
+			if m.atZero {
+				e.OutputIndex = 0
+			}
+		case *openresponses.FunctionCallArgumentsDoneEvent:
+			if m.atZero {
+				e.OutputIndex = 0
+			}
+		}
+		if resp, ok := openresponses.TerminalResponse(ev); ok {
+			for _, item := range resp.Output {
+				if call, ok := item.(*openresponses.FunctionCall); ok {
+					call.ID = ""
+				}
+			}
+		}
+		return sink.Send(ev)
+	})
+	em := openresponses.NewEmitter(rewrite, openresponses.NewResponse(req))
+	if m.turns > 1 {
+		w, err := em.Message(openresponses.PhaseFinalAnswer)
+		if err != nil {
+			return err
+		}
+		if err := w.Text("done"); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	for i, id := range m.calls {
+		w, err := em.FunctionCall(id, "upper")
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(fmt.Sprintf(`{"text":"t%d"}`, i)); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+	}
+	return em.Complete()
+}
+
+// TestACallOnlyTheResponseCompletesIsRecorded pins agentturn #236 on the
+// record: a function call the stream opened and never completed, which
+// the terminal response alone lists whole, is written as the transcript
+// holds it, under the ID it opened with, and run once, so the dispatch
+// names a call on the path and the session verifies; after a reused
+// output index it keeps its own ID rather than the earlier call's.
+func TestACallOnlyTheResponseCompletesIsRecorded(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		calls  []string
+		atZero bool
+	}{
+		{name: "one call", calls: []string{"call_x"}},
+		{name: "one call ID at their own indexes", calls: []string{"call_0", "call_0"}},
+		{name: "one call ID at index 0", calls: []string{"call_0", "call_0"}, atZero: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec, s, err := Start(context.Background(), agentsession.NewMemoryStore(), agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ran []string
+			tool := agenttool.New("upper", "", func(ctx context.Context, a echoArgs) (string, error) {
+				ran = append(ran, a.Text)
+				return strings.ToUpper(a.Text), nil
+			})
+			a := agentturn.New(agentturn.Config{Model: &responseOnlyCalls{calls: tc.calls, atZero: tc.atZero}, Tools: []agenttool.Tool{tool}, ToolExecution: agentturn.ExecSequential})
+			defer rec.Attach(a)()
+			end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+			if err != nil || end.Reason != agentturn.ReasonDone {
+				t.Fatalf("end = %+v, err = %v", end, err)
+			}
+			if len(ran) != len(tc.calls) {
+				t.Errorf("tool ran %v, want %d calls", ran, len(tc.calls))
+			}
+			verifyAll(t, s)
+			calls := agentsession.Calls(s.Path(s.Leaf()))
+			if len(calls) != len(tc.calls) {
+				t.Fatalf("calls on the path = %d, want %d", len(calls), len(tc.calls))
+			}
+			for _, c := range calls {
+				call := c.Entry.Item.(*openresponses.FunctionCall)
+				var in echoArgs
+				if err := json.Unmarshal([]byte(call.Arguments), &in); err != nil {
+					t.Fatal(err)
+				}
+				if c.Dispatch == nil || c.Output == nil {
+					t.Errorf("call %s: dispatch %v output %v", call.CallID, c.Dispatch, c.Output)
+					continue
+				}
+				if got, want := c.Output.Item.(*openresponses.FunctionCallOutput).Output.String(), strings.ToUpper(in.Text); got != want {
+					t.Errorf("output of %s (%s) = %q, want %q", call.CallID, call.Arguments, got, want)
+				}
+			}
+		})
 	}
 }

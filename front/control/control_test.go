@@ -221,6 +221,74 @@ func TestQueueSteersAndFollowsUpARun(t *testing.T) {
 	}
 }
 
+// TestDeliverOverTheWire pins RFC 0001's rule for a front that lets a
+// remote party queue input (#288): it offers the delivery, which says
+// whether the items joined the run in flight, and otherwise starts a
+// run that takes them and returns its end. A remote party cannot tell
+// from Queue and State whether a run will still take a steer.
+func TestDeliverOverTheWire(t *testing.T) {
+	t.Run("to an idle agent, a run starts", func(t *testing.T) {
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, MaxTurns: 1})
+		c := serve(t, a)
+		joined, end, err := c.Deliver(t.Context(), openresponses.UserText("the build passed"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if joined || end == nil || end.Reason != agentturn.ReasonDone {
+			t.Fatalf("joined %v, end %+v; want a run started and done", joined, end)
+		}
+		if m, ok := end.Items[0].(*openresponses.Message); !ok || m.Text() != "the build passed" {
+			t.Errorf("the run's first item = %+v, want the delivery", end.Items[0])
+		}
+	})
+	t.Run("during a run, it joins", func(t *testing.T) {
+		running, release := make(chan struct{}, 1), make(chan struct{})
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, MaxTurns: 3, Tools: []agenttool.Tool{blocker(running, release)}})
+		c := serve(t, a)
+		done := make(chan *agentturn.RunEnd, 1)
+		go func() {
+			end, _ := c.Prompt(context.Background(), openresponses.UserText("go"))
+			done <- end
+		}()
+		<-running
+		type delivered struct {
+			joined bool
+			end    *agentturn.RunEnd
+			err    error
+		}
+		got := make(chan delivered, 1)
+		go func() {
+			joined, end, err := c.Deliver(context.Background(), openresponses.UserText("the build passed"))
+			got <- delivered{joined, end, err}
+		}()
+		// The queued report waits for the run's next event, so the
+		// state says when the server's agent holds the delivery.
+		var d *delivered
+		for deadline := time.Now().Add(10 * time.Second); d == nil && a.State().Steering == 0 && time.Now().Before(deadline); {
+			select {
+			case r := <-got:
+				d = &r // it came back before anything was queued
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+		close(release)
+		if d == nil {
+			r := <-got
+			d = &r
+		}
+		if d.err != nil || !d.joined || d.end != nil {
+			t.Errorf("joined %v, end %+v, err %v; want joined", d.joined, d.end, d.err)
+		}
+		<-done
+	})
+	t.Run("a Control without one", func(t *testing.T) {
+		c := serve(t, struct{ agentturn.Control }{agentturn.New(agentturn.Config{Model: &echo.Adapter{}})})
+		if _, _, err := c.Deliver(t.Context(), openresponses.UserText("x")); !errors.Is(err, ErrNoDelivery) {
+			t.Errorf("err = %v, want ErrNoDelivery", err)
+		}
+	})
+}
+
 func TestAbortMidBatch(t *testing.T) {
 	running := make(chan struct{}, 1)
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{blocker(running, nil)}})
@@ -334,6 +402,7 @@ type recorder struct {
 	ctx     context.Context
 	emit    []agentturn.Event
 	answers []agentturn.Answer
+	replies []agenttool.Answer
 }
 
 // noteCtx records a call and the context it came with; note one that
@@ -369,6 +438,11 @@ func (r *recorder) Queue(ctx context.Context, _ agentturn.QueueMode, _ ...openre
 	return nil
 }
 
+func (r *recorder) Deliver(ctx context.Context, _ ...openresponses.Item) (bool, *agentturn.RunEnd, error) {
+	r.noteCtx(ctx, "Deliver")
+	return true, nil, nil
+}
+
 func (r *recorder) Abort() { r.note("Abort") }
 
 func (r *recorder) State() agentturn.State {
@@ -384,8 +458,11 @@ func (r *recorder) Subscribe(fn func(context.Context, agentturn.Event) error) fu
 	return func() {}
 }
 
-func (r *recorder) Reply(ctx context.Context, _ string, _ agenttool.Answer) error {
+func (r *recorder) Reply(ctx context.Context, _ string, a agenttool.Answer) error {
 	r.noteCtx(ctx, "Reply")
+	r.mu.Lock()
+	r.replies = append(r.replies, a)
+	r.mu.Unlock()
 	return nil
 }
 
@@ -417,6 +494,10 @@ func TestScopes(t *testing.T) {
 		}},
 		{"Queue", ScopeControl, func(c *Client) error {
 			return c.Queue(context.Background(), agentturn.QueueSteer, openresponses.UserText("x"))
+		}},
+		{"Deliver", ScopeControl, func(c *Client) error {
+			_, _, err := c.Deliver(context.Background(), openresponses.UserText("x"))
+			return err
 		}},
 		{"Resume", ScopeAnswer, func(c *Client) error { _, err := c.Resume(context.Background(), agentturn.Approve("c")); return err }},
 		{"Reply", ScopeAnswer, func(c *Client) error {
@@ -518,6 +599,50 @@ func TestScopes(t *testing.T) {
 			r.mu.Unlock()
 			if got != tc.want {
 				t.Errorf("%s sending by %q: recorded %q, want %q", tc.token, tc.sent, got, tc.want)
+			}
+		}
+	})
+	// #267: who answered a question is on the answer, and a client
+	// names it only under the same host check as a resume's.
+	t.Run("who decided a reply", func(t *testing.T) {
+		chooser := map[string]Principal{
+			"answers": {Name: "alice", Scopes: []Scope{ScopeAnswer}},
+			"engine":  {Name: "engine", Scopes: []Scope{ScopeAnswer, "decide"}},
+		}
+		for _, tc := range []struct {
+			token, sent, want string
+			refused           bool
+		}{
+			{token: "answers", sent: "policy", want: "human"},
+			{token: "answers", sent: "", want: "human"},
+			{token: "answers", sent: "system", want: "human"},
+			{token: "engine", sent: "policy", want: "policy"},
+			{token: "engine", sent: "agent", want: "agent"},
+			{token: "engine", sent: "", want: ""},
+			{token: "engine", sent: "system", refused: true},
+		} {
+			r := &recorder{}
+			srv := httptest.NewServer(Handler(r, WithAuthenticator(tokenAuth(chooser)), WithChosenBy("decide")))
+			c, err := Dial(t.Context(), srv.URL, withToken(tc.token))
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = c.Reply(t.Context(), "q", agenttool.Answer{Action: agenttool.ActionAccept, By: tc.sent, Note: "n"})
+			srv.Close()
+			r.mu.Lock()
+			replies := slices.Clone(r.replies)
+			r.mu.Unlock()
+			if tc.refused {
+				if err == nil || len(replies) != 0 {
+					t.Errorf("%s sending by %q: err %v, replies %+v; want it refused", tc.token, tc.sent, err, replies)
+				}
+				continue
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(replies) != 1 || replies[0].By != tc.want || replies[0].Note != "n" {
+				t.Errorf("%s sending by %q: replied %+v, want by %q", tc.token, tc.sent, replies, tc.want)
 			}
 		}
 	})

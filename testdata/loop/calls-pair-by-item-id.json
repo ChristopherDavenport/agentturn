@@ -1,0 +1,56 @@
+{
+  "name": "calls-pair-by-item-id",
+  "description": "Two calls a stream opens one after the other at output index 0, as some servers do, each with its own item ID, the second never completed by its own output_item.done, while response.completed lists them at their own positions, are paired with the response's by item ID and never by output index: the second joins the transcript from the response under its own call ID and arguments, each runs once, and its output answers it.",
+  "rules": ["#the-model-call", "#the-batch", "#invariants"],
+  "config": {"model": "m", "tool_execution": "sequential"},
+  "tools": [{"name": "read"}],
+  "results": {"call_a": {"output": "page one"}, "call_b": {"output": "page two"}},
+  "model": [
+    {"id": "resp_1", "at_index_zero": true, "no_done": [1], "output": [
+      {"type": "function_call", "id": "fc_a", "call_id": "call_a", "name": "read", "arguments": "{\"page\":1}"},
+      {"type": "function_call", "id": "fc_b", "call_id": "call_b", "name": "read", "arguments": "{\"page\":2}"}
+    ]},
+    {"id": "resp_2", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "read both"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read both pages"}]}],
+      "expect": {
+        "events": [
+          {"type": "run_start"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start", "item": {"type": "function_call", "call_id": "call_a"}},
+          {"type": "item_end", "item": {"type": "function_call", "call_id": "call_a", "arguments": "{\"page\":1}"}},
+          {"type": "item_start", "item": {"type": "function_call", "call_id": "call_b"}},
+          {"type": "item_end", "item": {"type": "function_call", "call_id": "call_b", "arguments": "{\"page\":2}"}},
+          {"type": "response_end", "turn": 1},
+          {"type": "tool_start", "call_id": "call_a", "args": {"page": 1}},
+          {"type": "tool_start", "call_id": "call_b", "args": {"page": 2}},
+          {"type": "tool_dispatch", "call_id": "call_a"},
+          {"type": "tool_end", "call_id": "call_a", "result": {"output": "page one"}},
+          {"type": "tool_dispatch", "call_id": "call_b"},
+          {"type": "tool_end", "call_id": "call_b", "result": {"output": "page two"}},
+          {"type": "item_start"}, {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_a", "output": "page one"}},
+          {"type": "item_start"}, {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_b", "output": "page two"}},
+          {"type": "turn_end", "turn": 1},
+          {"type": "turn_start", "turn": 2},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end", "turn": 2},
+          {"type": "turn_end", "turn": 2},
+          {"type": "run_end", "reason": "done", "error": false}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "function_call", "call_id": "call_a", "arguments": "{\"page\":1}"},
+          {"type": "function_call", "call_id": "call_b", "arguments": "{\"page\":2}"},
+          {"type": "function_call_output", "call_id": "call_a", "output": "page one"},
+          {"type": "function_call_output", "call_id": "call_b", "output": "page two"},
+          {"type": "message", "role": "assistant"}
+        ]
+      }
+    }
+  ]
+}

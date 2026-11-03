@@ -1484,12 +1484,16 @@ func TestReservedCallIDs(t *testing.T) {
 // it completes with holds them at their own positions. noID says where
 // the calls carry no item ID: on output_item.added, on
 // output_item.done, in the response, or a combination. A say ends the
-// first turn with a message holding it, after the calls.
+// first turn with a message holding it, after the calls. last says how
+// the stream treats the last call: it never sends its output_item.done
+// (lastNoDone), or never sends any event of it (lastUnopened), so only
+// the terminal response lists it whole.
 type reusedIndexModel struct {
 	calls  []string
 	say    string
 	atZero bool
 	noID   idPlaces
+	last   lastCall
 	turns  int
 	// accShaped builds the terminal response as openresponses.Accumulator
 	// builds one from a stream that reuses an index: one item per output
@@ -1500,6 +1504,22 @@ type reusedIndexModel struct {
 
 // idPlaces names the events of a stream a call's item ID is left off.
 type idPlaces struct{ added, done, response bool }
+
+// lastCall says what a reusedIndexModel's stream leaves out of its last
+// call's events.
+type lastCall int
+
+const (
+	lastWhole lastCall = iota
+	lastNoDone
+	lastUnopened
+	// firstNoDone leaves out the first call's output_item.done instead.
+	firstNoDone
+	// lastNoDoneFirstArgs is lastNoDone with the terminal response
+	// giving the first call's arguments otherwise than its
+	// output_item.done did.
+	lastNoDoneFirstArgs
+)
 
 func (m *reusedIndexModel) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
 	m.turns++
@@ -1514,7 +1534,28 @@ func (m *reusedIndexModel) CreateStream(_ context.Context, req openresponses.Req
 		bare.ID = ""
 		return &bare
 	}
+	// opened counts the calls the emitter has opened; skipping is set
+	// while the last call's events are left out.
+	opened, skipping := 0, false
 	rewrite := openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+		switch e := ev.(type) {
+		case *openresponses.OutputItemAddedEvent:
+			if _, ok := e.Item.(*openresponses.FunctionCall); ok {
+				opened++
+				skipping = m.last == lastUnopened && opened == len(m.calls)
+			}
+		case *openresponses.OutputItemDoneEvent:
+			if _, ok := e.Item.(*openresponses.FunctionCall); ok && (m.last == lastNoDone || m.last == lastUnopened || m.last == lastNoDoneFirstArgs) && opened == len(m.calls) {
+				skipping = false
+				return nil
+			}
+			if _, ok := e.Item.(*openresponses.FunctionCall); ok && m.last == firstNoDone && opened == 1 {
+				return nil
+			}
+		}
+		if skipping {
+			return nil
+		}
 		switch e := ev.(type) {
 		case *openresponses.OutputItemAddedEvent:
 			copied := *e
@@ -1558,6 +1599,16 @@ func (m *reusedIndexModel) CreateStream(_ context.Context, req openresponses.Req
 		if resp, ok := openresponses.TerminalResponse(ev); ok {
 			for i, item := range resp.Output {
 				resp.Output[i] = strip(item, m.noID.response)
+			}
+			if m.last == lastNoDoneFirstArgs {
+				for i, item := range resp.Output {
+					if call, ok := item.(*openresponses.FunctionCall); ok {
+						differs := *call
+						differs.Arguments += " "
+						resp.Output[i] = &differs
+						break
+					}
+				}
 			}
 			if m.accShaped && m.atZero && len(resp.Output) > 1 {
 				resp.Output = resp.Output[len(resp.Output)-1:]
@@ -1746,6 +1797,10 @@ func TestBatchRunsTheCallsTheTranscriptHolds(t *testing.T) {
 		atZero    bool
 		noID      idPlaces
 		accShaped bool
+		last      lastCall
+		// ran is how many calls the transcript holds and the batch runs,
+		// when not every call the stream opened: 0 means all of them.
+		ran int
 	}{
 		{name: "a: one index, no item IDs", calls: []string{"call_a", "call_b"}, atZero: true, noID: all},
 		{name: "one index, no item IDs, terminal response lists the last call alone", calls: []string{"call_a", "call_b"}, atZero: true, noID: all, accShaped: true},
@@ -1762,10 +1817,30 @@ func TestBatchRunsTheCallsTheTranscriptHolds(t *testing.T) {
 		{name: "own indexes, no item IDs", calls: []string{"call_a", "call_b"}, noID: all},
 		{name: "own indexes, one call ID, no item IDs", calls: []string{"call_0", "call_0"}, noID: all},
 		{name: "own indexes, item IDs", calls: []string{"call_a", "call_b"}},
+		// #236: a call the stream opened and never completed, which the
+		// terminal response alone completes, and one the stream never
+		// opened at all, are in the transcript under their own IDs.
+		{name: "one call, no output_item.done, no item IDs", calls: []string{"call_x"}, noID: all, last: lastNoDone},
+		{name: "one call, no output_item.done, item IDs", calls: []string{"call_x"}, last: lastNoDone},
+		{name: "own indexes, one call ID, last with no output_item.done", calls: []string{"call_0", "call_0"}, noID: all, last: lastNoDone},
+		{name: "one index, one call ID, last with no output_item.done", calls: []string{"call_0", "call_0"}, atZero: true, noID: all, last: lastNoDone},
+		{name: "one index, item IDs, last with no output_item.done", calls: []string{"call_a", "call_b"}, atZero: true, last: lastNoDone},
+		{name: "own indexes, last never opened", calls: []string{"call_a", "call_b"}, noID: all, last: lastUnopened},
+		{name: "own indexes, one call ID, last never opened", calls: []string{"call_0", "call_0"}, noID: all, last: lastUnopened},
+		{name: "one index, one call ID, last never opened", calls: []string{"call_0", "call_0"}, atZero: true, noID: all, last: lastUnopened},
+		// A call never completed whose index a completed call took, and
+		// which the response does not list, is not run, and the
+		// completed call runs once, under its own ID.
+		{name: "one index, one call ID, first with no output_item.done, response lists the last", calls: []string{"call_0", "call_0"}, atZero: true, noID: all, accShaped: true, last: firstNoDone, ran: 1},
+		{name: "own indexes, one call ID, first with no output_item.done", calls: []string{"call_0", "call_0"}, noID: all, last: firstNoDone},
+		// The response gives a completed call's arguments otherwise: it
+		// is still the first call_0, and the call never completed the
+		// second.
+		{name: "own indexes, one call ID, last with no output_item.done, the response's arguments differ", calls: []string{"call_0", "call_0"}, noID: all, last: lastNoDoneFirstArgs},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := &reusedIndexModel{calls: tc.calls, atZero: tc.atZero, noID: tc.noID, accShaped: tc.accShaped}
+			m := &reusedIndexModel{calls: tc.calls, atZero: tc.atZero, noID: tc.noID, accShaped: tc.accShaped, last: tc.last}
 			events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")},
 				Config{Model: m, Tools: []agenttool.Tool{agenttool.New("upper", "", upper)}}))
 			if err != nil || end.Reason != ReasonDone || len(end.Pending) != 0 {
@@ -1788,8 +1863,30 @@ func TestBatchRunsTheCallsTheTranscriptHolds(t *testing.T) {
 					outputs[it.CallID] = append(outputs[it.CallID], it.Output.String())
 				}
 			}
-			if len(order) != len(tc.calls) {
-				t.Fatalf("calls %v, want %d", order, len(tc.calls))
+			wantCalls := len(tc.calls)
+			if tc.ran != 0 {
+				wantCalls = tc.ran
+			}
+			if len(order) != wantCalls {
+				t.Fatalf("calls %v, want %d", order, wantCalls)
+			}
+			// Every call the model made runs with its own arguments: none
+			// runs twice and none is lost.
+			if tc.ran == 0 {
+				var texts, made []string
+				for _, a := range args {
+					var in echoArgs
+					if err := json.Unmarshal([]byte(a), &in); err != nil {
+						t.Fatal(err)
+					}
+					texts = append(texts, in.Text)
+				}
+				for i := range tc.calls {
+					made = append(made, fmt.Sprintf("t%d", i))
+				}
+				if slices.Sort(texts); !slices.Equal(texts, made) {
+					t.Errorf("calls ran with %v, the model made %v", texts, made)
+				}
 			}
 			for id, a := range args {
 				var in echoArgs
@@ -1808,10 +1905,16 @@ func TestBatchRunsTheCallsTheTranscriptHolds(t *testing.T) {
 			// The events: the batch runs under the IDs item_end carried,
 			// each once, and the response the turn acts on names them.
 			var ended, started, finished, turned []string
+			responded := false
 			for _, ev := range events {
 				switch e := ev.(type) {
+				case *ResponseEnd:
+					responded = true
 				case *ItemEnd:
 					if call, ok := e.Item.(*openresponses.FunctionCall); ok {
+						if responded {
+							t.Errorf("item_end of %s after response_end", call.CallID)
+						}
 						ended = append(ended, call.CallID)
 					}
 				case *ToolStart:
@@ -1842,5 +1945,51 @@ func TestBatchRunsTheCallsTheTranscriptHolds(t *testing.T) {
 				t.Errorf("turn_end response calls %q, transcript %q", turned, want)
 			}
 		})
+	}
+}
+
+// TestToolEndSaysWhichCallsWereCut pins the tool_end member cut (#273):
+// a call the cancellation cut off before it had a result of its own is
+// marked, so a recorder never keeps the cancellation as its result,
+// and a call that returned before the cut is not.
+func TestToolEndSaysWhichCallsWereCut(t *testing.T) {
+	fast := agenttool.New("a", "", func(context.Context, echoArgs) (string, error) { return "a", nil })
+	slow := agenttool.New("b", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	ag := New(Config{Model: &twoCalls{}, Tools: []agenttool.Tool{fast, slow}, MaxTurns: 1})
+	ends := map[string]*ToolEnd{}
+	fastDone, slowDispatched := make(chan struct{}), make(chan struct{})
+	ag.Subscribe(func(_ context.Context, ev Event) error {
+		switch e := ev.(type) {
+		case *ToolEnd:
+			ends[e.Name] = e
+			if e.Name == "a" {
+				close(fastDone)
+			}
+		case *ToolDispatch:
+			if e.Name == "b" {
+				close(slowDispatched)
+			}
+		}
+		return nil
+	})
+	done := make(chan *RunEnd, 1)
+	go func() {
+		end, _ := ag.Prompt(context.Background(), openresponses.UserText("go"))
+		done <- end
+	}()
+	<-fastDone
+	<-slowDispatched
+	ag.Abort()
+	if end := <-done; end == nil || end.Reason != ReasonAborted {
+		t.Fatalf("end = %+v", end)
+	}
+	if e := ends["a"]; e == nil || e.Cut {
+		t.Errorf("a = %+v, want it settled, not cut", e)
+	}
+	if e := ends["b"]; e == nil || !e.Cut {
+		t.Errorf("b = %+v, want it cut", e)
 	}
 }

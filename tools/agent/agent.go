@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -66,10 +67,12 @@ type ChildInfo struct {
 }
 
 // InputRequiredError is returned when the child run stopped on calls
-// its BeforeToolCall deferred. The parent's model sees it as the error
-// output and can decide what to do; a host that wants to resume the
-// child finds the run and the pending calls in the result's ChildInfo.
-// It matches agentturn.ErrInputRequired under errors.Is.
+// its BeforeToolCall deferred, with nobody to ask ([WithAskParent]).
+// The parent's model sees it as the error output and can decide what
+// to do; a host that wants to resume the child finds the run and the
+// pending calls in the result's ChildInfo. It matches
+// agentturn.ErrInputRequired under errors.Is and implements
+// agentturn.InputRequired.
 type InputRequiredError struct {
 	Agent   string
 	RunID   string
@@ -94,6 +97,161 @@ func (e *InputRequiredError) Error() string {
 // Is reports whether target is agentturn.ErrInputRequired.
 func (e *InputRequiredError) Is(target error) bool { return target == agentturn.ErrInputRequired }
 
+// PendingCalls names the calls the child waits on, each with its call
+// ID, name and arguments, and the child's run as the callee, for
+// [agentturn.InputRequired].
+func (e *InputRequiredError) PendingCalls() []agentturn.WaitingCall {
+	out := make([]agentturn.WaitingCall, 0, len(e.Pending))
+	for _, p := range e.Pending {
+		if p.Call == nil {
+			continue
+		}
+		args := json.RawMessage(p.Call.Arguments)
+		if p.Decision != nil && p.Decision.Args != nil {
+			args = p.Decision.Args
+		}
+		out = append(out, agentturn.WaitingCall{ID: p.Call.CallID, Name: p.Call.Name, Args: args, Callee: e.RunID})
+	}
+	return out
+}
+
+// WithAskParent puts a call the child's own BeforeToolCall defers to
+// the elicitor of the call that started the child, as the loop puts a
+// nested call's deferral, rather than ending the child's run on it: the
+// question is agentturn.Ask's, filed under the parent's call, and the
+// answer's decision, by the decider it names, is the child's hook's
+// verdict, so an accept runs the call and a decline refuses it inside
+// the child, whose model reads what the answerer said. A call the hook
+// holds only beside an asked one (ToolDecision.Held) is not asked
+// about: its batch's answers decide it, and it is released, approved
+// as the policy decided it with a resume of the child, once every call
+// asked about in its batch was accepted, or refused unrun, by the
+// policy, once one was declined. Only when nobody answered does it stay
+// held.
+// Only when there is nobody to ask, no elicitor on the call's context,
+// a failure to ask or a cancel, does the deferral stand, the child end
+// input-required and the call fail with an [*InputRequiredError]. The
+// child's own Config.ToolElicitor answers its tools' questions, not
+// these.
+func WithAskParent() Option { return func(o *options) { o.askParent = true } }
+
+// askLog wraps a child's BeforeToolCall for [WithAskParent] and keeps
+// what the asking decided, batch by batch, so a call the policy held
+// only beside asked ones is released when, and only when, every call
+// asked about in its batch was accepted, and refused when one was
+// declined.
+type askLog struct {
+	mu sync.Mutex
+	// batches counts, by batch, the calls asked about and those
+	// accepted.
+	batches map[string]*askedBatch
+	// held maps a held call's ID to its batch.
+	held map[string]string
+}
+
+type askedBatch struct{ asked, accepted, declined int }
+
+// batchKey names the batch a call is decided in: its first call.
+func batchKey(info agentturn.ToolCallInfo) string {
+	if len(info.Batch) > 0 && info.Batch[0] != nil {
+		return info.Batch[0].CallID
+	}
+	return info.Call.CallID
+}
+
+// wrap returns hook with a deferral of a call the child's model made
+// put to elicit, the elicitor of the call that started the child. A
+// nested call's deferral is left to the loop, which asks the run's
+// elicitor itself. A held deferral is returned as it is, and noted.
+func (l *askLog) wrap(hook func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error), elicit agenttool.Elicitor) func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+	return func(ctx context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+		d, err := hook(ctx, info)
+		if err != nil || d == nil || d.Action != agentturn.Defer || info.Parent != "" {
+			return d, err
+		}
+		key := batchKey(info)
+		l.mu.Lock()
+		if l.batches == nil {
+			l.batches, l.held = map[string]*askedBatch{}, map[string]string{}
+		}
+		b := l.batches[key]
+		if b == nil {
+			b = &askedBatch{}
+			l.batches[key] = b
+		}
+		if d.Held {
+			// Its fate is the batch's answer, not its own question.
+			l.held[info.Call.CallID] = key
+			l.mu.Unlock()
+			return d, nil
+		}
+		b.asked++
+		l.mu.Unlock()
+		if elicit == nil {
+			return d, nil
+		}
+		args := info.Args
+		if args == nil {
+			args = json.RawMessage(info.Call.Arguments)
+		}
+		if d.Args != nil {
+			args = d.Args
+		}
+		asked := agentturn.AskedCall{CallID: info.Call.CallID, Name: info.Call.Name, Args: args, Decision: d}
+		decided, ok := agentturn.Ask(agenttool.ContextWithElicitor(ctx, elicit), asked)
+		if !ok {
+			return d, nil
+		}
+		l.mu.Lock()
+		if decided.Action == agentturn.Allow {
+			b.accepted++
+		} else {
+			b.declined++
+		}
+		l.mu.Unlock()
+		return decided, nil
+	}
+}
+
+// releases returns the answers that settle pending, when every call
+// pending is one the policy held and every call asked about in its
+// batch was answered: an approval as the policy decided when all were
+// accepted, and a refusal, unrun, by the policy, when one was declined.
+// false otherwise, nobody having answered, the run's end standing.
+func (l *askLog) releases(pending []agentturn.PendingCall) ([]agentturn.Answer, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(pending) == 0 {
+		return nil, false
+	}
+	answers := make([]agentturn.Answer, 0, len(pending))
+	for _, p := range pending {
+		if p.Call == nil || p.Decision == nil || !p.Decision.Held {
+			return nil, false
+		}
+		key, ok := l.held[p.Call.CallID]
+		b := l.batches[key]
+		if !ok || b == nil || b.asked == 0 || b.accepted+b.declined != b.asked {
+			return nil, false
+		}
+		if b.declined > 0 {
+			text := "not run: the call this one was held beside was declined when asked"
+			answers = append(answers, agentturn.Output(&openresponses.FunctionCallOutput{CallID: p.Call.CallID, Output: openresponses.FunctionCallOutputData{Text: text}}).WithBy(agenttool.ByPolicy).WithReason(text))
+			continue
+		}
+		ans := agentturn.Approve(p.Call.CallID)
+		if p.Decision.Args != nil {
+			ans = agentturn.ApproveWith(p.Call.CallID, p.Decision.Args)
+		}
+		by := p.Decision.By
+		if by == "" {
+			by = agenttool.ByPolicy
+		}
+		answers = append(answers, ans.WithBy(by).WithReason("released: "+p.Decision.Reason))
+	}
+	return answers, true
+}
+
 // Option configures the tool built by [New].
 type Option func(*options)
 
@@ -109,6 +267,8 @@ type options struct {
 	spawn    func(callID string, child *agentturn.Agent)
 	runCtx   func(ctx context.Context, callID string) context.Context
 	detach   func(callID string, end *agentturn.RunEnd)
+	// askParent is [WithAskParent].
+	askParent bool
 }
 
 // toolName is the form a provider accepts for a function tool's name.
@@ -198,10 +358,11 @@ func withArgs[T any](strict bool, render func(T) openresponses.Items) Option {
 // was given, which the tool is offered and the child is recorded under;
 // a configuration that renames it fails the call. fn's error fails the
 // call before any run starts. Items fn takes from the parent's
-// transcript go in as the run's prompt, not as a seed, so a recorder
-// writes them as the child's own and can stand behind the request that
-// carries them; [WithTranscript]'s seed, which a recorder did not
-// write, it cannot. A seed set as well still goes before the items.
+// transcript, the very items it was given, go in as the run's prompt,
+// not as a seed, marked agentturn.Copied, so a recorder writes them as
+// copied from the parent's session, not as the child's own work, and
+// can stand behind the request that carries them; [WithTranscript]'s
+// seed, which a recorder did not write, it cannot. A seed set as well still goes before the items.
 func WithCallConfig[T any](fn func(ctx context.Context, args T, parent agentturn.Transcript, cfg agentturn.Config) (agentturn.Config, openresponses.Items, error)) Option {
 	schema, err := agenttool.SchemaFor[T]()
 	if err != nil {
@@ -302,6 +463,20 @@ func WithRunContext(fn func(ctx context.Context, callID string) context.Context)
 // child's goroutine, which is not inside a parent's event, so it may
 // wait on the parent's run to end; a host that must not block the
 // child calls Deliver from a goroutine of its own.
+//
+// A parent whose run ended on a terminating result, a handoff's
+// transfer to another agent, has handed the conversation on: Deliver
+// then starts no run under the sender's configuration, which would
+// answer the result as the sender and refuse the host's switch to the
+// receiver with agentturn.ErrRunning. It returns
+// agentturn.ErrTerminated and leaves the answer queued, and the
+// receiver's run the host starts, handoff.Team's, front/a2a's relay
+// under WithHandoff, or the host's own Continue after its SetConfig,
+// takes it before its first model call; one that arrives while the
+// receiver's run is in flight joins it. A host that follows no handoff
+// on that stop, or stops at its bound, starts a run that takes it:
+// handoff.Team and front/a2a's relay do. fn treats ErrTerminated as
+// delivered, not as a failure.
 //
 // The child runs on agentturn.RunContext of the call, so an abort of
 // the parent's run still cuts it, and the parent's batch ending or its
@@ -412,9 +587,9 @@ func (a *agentTool) Strict() bool                { return a.opts.strict }
 // it runs. The output is the text of the child's last assistant
 // message; Details is a [ChildInfo]. A child that fails returns its
 // error, one that is aborted returns the context error, and one that
-// stopped on deferred calls returns an [*InputRequiredError], because a
-// pause inside the child cannot become a pause of the parent after the
-// fact. A child that ends without a final assistant message returns
+// stopped on deferred calls, nobody having been asked ([WithAskParent]),
+// returns an [*InputRequiredError], because a pause inside the child
+// cannot become a pause of the parent after the fact. A child that ends without a final assistant message returns
 // what [WithNoAnswer] says, by default an error naming the cause. On
 // every error path the Result still carries the ChildInfo: the loop
 // keeps Details when it turns an error into the output the model sees,
@@ -443,6 +618,9 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	if len(prompts) == 0 {
 		return agenttool.Result{}, fmt.Errorf("agent %q: arguments rendered no items", a.cfg.Name)
 	}
+	if a.opts.call != nil {
+		prompts = markCopied(prompts, parent)
+	}
 	var seed agentturn.Transcript
 	if a.opts.seed != nil {
 		seed = a.opts.seed(parent)
@@ -457,7 +635,16 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	if seed != nil {
 		opts = append(opts, agentturn.WithTranscript(seed))
 	}
-	child := agentturn.New(cfg, opts...)
+	runCfg := cfg
+	var asks *askLog
+	if a.opts.askParent && cfg.BeforeToolCall != nil {
+		// The elicitor of the call that started the child, which the
+		// parent's loop put on the call's context.
+		elicit, _ := agenttool.ElicitorFrom(ctx)
+		asks = &askLog{}
+		runCfg.BeforeToolCall = asks.wrap(cfg.BeforeToolCall, elicit)
+	}
+	child := agentturn.New(runCfg, opts...)
 	var mu sync.Mutex
 	var soFar []string
 	done := false
@@ -528,11 +715,12 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	// The parent's trigger names what started the parent's run; the
 	// child's run was started by the call, which the child's link
 	// names, so it carries none unless WithRunContext gives it one.
-	// Who answered the parent's pending calls, why, and where their
-	// outputs were taken from are the parent's too: a child's call
-	// under the same ID is another call.
+	// Who answered the parent's pending calls, why, where their
+	// outputs were taken from and whether they report a failure are the
+	// parent's too: a child's call under the same ID is another call.
 	ctx = agentturn.ContextWithTrigger(ctx, agentturn.Trigger{})
 	ctx = agentturn.ContextWithOrigins(agentturn.ContextWithReasons(agentturn.ContextWithDeciders(ctx, nil), nil), nil)
+	ctx = agentturn.ContextWithFailures(ctx, nil)
 	// The child is new and holds nothing of an earlier run under this
 	// call, so its run starts afresh in the call's session: a second
 	// Execute under one call ID, a cut-off call run again, opens a new
@@ -550,6 +738,28 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		})
 	}
 	end, err := child.Prompt(ctx, prompts...)
+	var items agentturn.Transcript
+	if end != nil {
+		items = end.Items
+	}
+	// Calls the child's policy held only beside asked ones are released
+	// once every call asked about in their batch was accepted, and
+	// refused once one was declined, as a front settles them with the
+	// answers; the resume continues the same call's work at the leaf,
+	// so it is not marked a retry.
+	for err == nil && asks != nil && end != nil && end.Reason == agentturn.ReasonInputRequired {
+		answers, ok := asks.releases(end.Pending)
+		if !ok {
+			break
+		}
+		next, rerr := child.Resume(context.WithValue(ctx, retryKey{}, false), answers...)
+		if next == nil {
+			err = rerr
+			break
+		}
+		end, err = next, rerr
+		items = append(items, end.Items...)
+	}
 	mu.Lock()
 	done = true
 	mu.Unlock()
@@ -559,7 +769,7 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		}
 		return agenttool.Result{}, fmt.Errorf("agent %s: %w", strconv.Quote(a.cfg.Name), err)
 	}
-	info := ChildInfo{Agent: a.cfg.Name, RunID: end.RunID, Items: end.Items, Reason: end.Reason, Cause: end.Cause, Pending: end.Pending}
+	info := ChildInfo{Agent: a.cfg.Name, RunID: end.RunID, Items: items, Reason: end.Reason, Cause: end.Cause, Pending: end.Pending}
 	switch end.Reason {
 	case agentturn.ReasonInputRequired:
 		return agenttool.Result{Details: info}, &InputRequiredError{Agent: a.cfg.Name, RunID: end.RunID, Pending: end.Pending}
@@ -632,6 +842,37 @@ func (a *agentTool) detached(ctx context.Context, call agenttool.Call, child *ag
 		}
 		return agenttool.Result{}, fmt.Errorf("agent %s: %w", strconv.Quote(a.cfg.Name), err)
 	}
+}
+
+// markCopied returns prompts with each item taken from parent marked
+// agentturn.Copied: the parent's own items and the placeholder outputs
+// answered gave its calls in flight, which are the parent's
+// conversation and not the child's work. An item is taken when it is
+// the same item, not an equal one, so an item fn built is the child's.
+func markCopied(prompts openresponses.Items, parent agentturn.Transcript) openresponses.Items {
+	if len(parent) == 0 {
+		return prompts
+	}
+	from := make(map[openresponses.Item]bool, len(parent))
+	for _, item := range parent {
+		if keyable(item) {
+			from[item] = true
+		}
+	}
+	out := make(openresponses.Items, len(prompts))
+	for i, item := range prompts {
+		out[i] = item
+		if base, _ := agentturn.Unhide(item); keyable(base) && from[base] {
+			out[i] = agentturn.Copied(item)
+		}
+	}
+	return out
+}
+
+// keyable reports whether item can be a map key: a pointer, as
+// every openresponses item type is.
+func keyable(item openresponses.Item) bool {
+	return item != nil && reflect.TypeOf(item).Comparable()
 }
 
 // answered returns a copy of parent in which every function call

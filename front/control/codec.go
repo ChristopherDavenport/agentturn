@@ -87,13 +87,13 @@ func wireOf(ev agentturn.Event) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return wireModelBlocked{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Request: req, Err: errorOut(e.Err)}, nil
+		return wireModelBlocked{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Request: req, Err: errorOut(e.Err), Usage: e.Usage}, nil
 	case *agentturn.ItemStart:
 		item, err := itemOut(e.Item)
 		if err != nil {
 			return nil, err
 		}
-		return wireItemStart{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Item: item, ResponseID: e.ResponseID, Hidden: e.Hidden}, nil
+		return wireItemStart{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Item: item, ResponseID: e.ResponseID, Hidden: e.Hidden, Copied: e.Copied}, nil
 	case *agentturn.ItemUpdate:
 		item, err := itemOut(e.Item)
 		if err != nil {
@@ -111,7 +111,7 @@ func wireOf(ev agentturn.Event) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return wireItemEnd{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Item: item, ResponseID: e.ResponseID, Hidden: e.Hidden, Trigger: triggerOut(e.Trigger), ModelCallID: e.ModelCallID}, nil
+		return wireItemEnd{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Item: item, ResponseID: e.ResponseID, Hidden: e.Hidden, Copied: e.Copied, Trigger: triggerOut(e.Trigger), ModelCallID: e.ModelCallID}, nil
 	case *agentturn.ResponseEnd:
 		resp, err := responseOut(e.Response)
 		if err != nil {
@@ -119,7 +119,7 @@ func wireOf(ev agentturn.Event) (any, error) {
 		}
 		return wireResponseEnd{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Response: resp, Withheld: e.Withheld}, nil
 	case *agentturn.ToolStart:
-		return wireToolStart{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, CallID: e.CallID, Name: e.Name, Args: e.Args, Decision: decisionOut(e.Decision), Parent: e.Parent}, nil
+		return wireToolStart{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, CallID: e.CallID, Name: e.Name, Args: e.Args, Decision: decisionOut(e.Decision), Parent: e.Parent, Invoked: e.Invoked, Replayed: e.Replayed}, nil
 	case *agentturn.ToolDispatch:
 		return wireToolDispatch{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, CallID: e.CallID, Name: e.Name, Parent: e.Parent, IdempotencyKey: e.IdempotencyKey}, nil
 	case *agentturn.ToolUpdate:
@@ -134,7 +134,7 @@ func wireOf(ev agentturn.Event) (any, error) {
 			return nil, err
 		}
 		return wireToolEnd{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, CallID: e.CallID, Name: e.Name, Result: result, Err: errorOut(e.Err),
-			Blocked: e.Blocked, Deferred: e.Deferred, Reason: e.Reason, Parent: e.Parent, Withdrawn: e.Withdrawn}, nil
+			Blocked: e.Blocked, Deferred: e.Deferred, Reason: e.Reason, Parent: e.Parent, Withdrawn: e.Withdrawn, Cut: e.Cut, Replayed: e.Replayed}, nil
 	case *agentturn.TurnEnd:
 		resp, err := responseOut(e.Response)
 		if err != nil {
@@ -160,7 +160,7 @@ func wireOf(ev agentturn.Event) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return wireQueued{Type: e.EventType(), RunID: e.RunID, Item: item, Mode: string(e.Mode), Hidden: e.Hidden, Trigger: triggerOut(e.Trigger)}, nil
+		return wireQueued{Type: e.EventType(), RunID: e.RunID, Item: item, Mode: string(e.Mode), Input: string(e.Input), Hidden: e.Hidden, Trigger: triggerOut(e.Trigger)}, nil
 	case *agentturn.Question:
 		return wireQuestion{Type: e.EventType(), ID: e.ID, RunID: e.RunID, CallID: e.CallID, Call: askedCallOut(e.Call), Elicitation: elicitationOut(e.Elicitation)}, nil
 	case *agentturn.QuestionClosed:
@@ -226,7 +226,7 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 		if err != nil {
 			return nil, err
 		}
-		return &agentturn.ModelBlocked{RunID: w.RunID, Turn: w.Turn, Request: req, Err: errorIn(w.Err)}, nil
+		return &agentturn.ModelBlocked{RunID: w.RunID, Turn: w.Turn, Request: req, Err: errorIn(w.Err), Usage: w.Usage}, nil
 	},
 	agentturn.EventItemStart: func(data []byte) (agentturn.Event, error) {
 		var w wireItemStart
@@ -237,7 +237,7 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 		if err != nil {
 			return nil, err
 		}
-		return &agentturn.ItemStart{RunID: w.RunID, Turn: w.Turn, Item: item, ResponseID: w.ResponseID, Hidden: w.Hidden}, nil
+		return &agentturn.ItemStart{RunID: w.RunID, Turn: w.Turn, Item: item, ResponseID: w.ResponseID, Hidden: w.Hidden, Copied: w.Copied}, nil
 	},
 	agentturn.EventItemUpdate: func(data []byte) (agentturn.Event, error) {
 		var w wireItemUpdate
@@ -265,7 +265,7 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 		if err != nil {
 			return nil, err
 		}
-		return &agentturn.ItemEnd{RunID: w.RunID, Turn: w.Turn, Item: item, ResponseID: w.ResponseID, Hidden: w.Hidden, Trigger: triggerIn(w.Trigger), ModelCallID: w.ModelCallID}, nil
+		return &agentturn.ItemEnd{RunID: w.RunID, Turn: w.Turn, Item: item, ResponseID: w.ResponseID, Hidden: w.Hidden, Copied: w.Copied, Trigger: triggerIn(w.Trigger), ModelCallID: w.ModelCallID}, nil
 	},
 	agentturn.EventResponseEnd: func(data []byte) (agentturn.Event, error) {
 		var w wireResponseEnd
@@ -287,7 +287,7 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 		if err != nil {
 			return nil, err
 		}
-		return &agentturn.ToolStart{RunID: w.RunID, Turn: w.Turn, CallID: w.CallID, Name: w.Name, Args: w.Args, Decision: d, Parent: w.Parent}, nil
+		return &agentturn.ToolStart{RunID: w.RunID, Turn: w.Turn, CallID: w.CallID, Name: w.Name, Args: w.Args, Decision: d, Parent: w.Parent, Invoked: w.Invoked, Replayed: w.Replayed}, nil
 	},
 	agentturn.EventToolDispatch: func(data []byte) (agentturn.Event, error) {
 		var w wireToolDispatch
@@ -309,7 +309,7 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 			return nil, err
 		}
 		return &agentturn.ToolEnd{RunID: w.RunID, Turn: w.Turn, CallID: w.CallID, Name: w.Name, Result: resultIn(w.Result), Err: errorIn(w.Err),
-			Blocked: w.Blocked, Deferred: w.Deferred, Reason: w.Reason, Parent: w.Parent, Withdrawn: w.Withdrawn}, nil
+			Blocked: w.Blocked, Deferred: w.Deferred, Reason: w.Reason, Parent: w.Parent, Withdrawn: w.Withdrawn, Cut: w.Cut, Replayed: w.Replayed}, nil
 	},
 	agentturn.EventTurnEnd: func(data []byte) (agentturn.Event, error) {
 		var w wireTurnEnd
@@ -342,7 +342,7 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 		if err != nil {
 			return nil, err
 		}
-		return &agentturn.Queued{RunID: w.RunID, Item: item, Mode: agentturn.QueueMode(w.Mode), Hidden: w.Hidden, Trigger: triggerIn(w.Trigger)}, nil
+		return &agentturn.Queued{RunID: w.RunID, Item: item, Mode: agentturn.QueueMode(w.Mode), Input: agentturn.InputMode(w.Input), Hidden: w.Hidden, Trigger: triggerIn(w.Trigger)}, nil
 	},
 	agentturn.EventNotesHeld: func(data []byte) (agentturn.Event, error) {
 		var w wireNotesHeld
@@ -404,11 +404,12 @@ type wireModelRetry struct {
 }
 
 type wireModelBlocked struct {
-	Type    string          `json:"type"`
-	RunID   string          `json:"run_id"`
-	Turn    int             `json:"turn"`
-	Request json.RawMessage `json:"request"`
-	Err     *wireError      `json:"error,omitempty"`
+	Type    string               `json:"type"`
+	RunID   string               `json:"run_id"`
+	Turn    int                  `json:"turn"`
+	Request json.RawMessage      `json:"request"`
+	Err     *wireError           `json:"error,omitempty"`
+	Usage   *openresponses.Usage `json:"usage,omitempty"`
 }
 
 type wireItemStart struct {
@@ -418,6 +419,7 @@ type wireItemStart struct {
 	Item       json.RawMessage `json:"item"`
 	ResponseID string          `json:"response_id,omitempty"`
 	Hidden     bool            `json:"hidden,omitempty"`
+	Copied     bool            `json:"copied,omitempty"`
 }
 
 type wireItemUpdate struct {
@@ -436,6 +438,7 @@ type wireItemEnd struct {
 	Item        json.RawMessage `json:"item"`
 	ResponseID  string          `json:"response_id,omitempty"`
 	Hidden      bool            `json:"hidden,omitempty"`
+	Copied      bool            `json:"copied,omitempty"`
 	Trigger     *wireTrigger    `json:"trigger,omitempty"`
 	ModelCallID string          `json:"model_call_id,omitempty"`
 }
@@ -457,6 +460,8 @@ type wireToolStart struct {
 	Args     json.RawMessage `json:"args,omitempty"`
 	Decision *wireDecision   `json:"decision,omitempty"`
 	Parent   string          `json:"parent,omitempty"`
+	Invoked  json.RawMessage `json:"invoked,omitempty"`
+	Replayed bool            `json:"replayed,omitempty"`
 }
 
 type wireToolDispatch struct {
@@ -491,6 +496,8 @@ type wireToolEnd struct {
 	Reason    string     `json:"reason,omitempty"`
 	Parent    string     `json:"parent,omitempty"`
 	Withdrawn bool       `json:"withdrawn,omitempty"`
+	Cut       bool       `json:"cut,omitempty"`
+	Replayed  bool       `json:"replayed,omitempty"`
 }
 
 type wireTurnEnd struct {
@@ -508,6 +515,7 @@ type wireRunEnd struct {
 	Reason   string          `json:"reason"`
 	Cause    string          `json:"cause,omitempty"`
 	Err      *wireError      `json:"error,omitempty"`
+	Failure  *wireError      `json:"failure,omitempty"`
 	Pending  []wirePending   `json:"pending,omitempty"`
 	Notes    []wireNote      `json:"notes,omitempty"`
 	Withheld bool            `json:"withheld,omitempty"`
@@ -518,6 +526,7 @@ type wireQueued struct {
 	RunID   string          `json:"run_id,omitempty"`
 	Item    json.RawMessage `json:"item"`
 	Mode    string          `json:"mode"`
+	Input   string          `json:"input,omitempty"`
 	Hidden  bool            `json:"hidden,omitempty"`
 	Trigger *wireTrigger    `json:"trigger,omitempty"`
 }
@@ -915,20 +924,21 @@ type wireElicitAnswer struct {
 	Action  string          `json:"action"`
 	Content json.RawMessage `json:"content,omitempty"`
 	Note    string          `json:"note,omitempty"`
+	By      string          `json:"by,omitempty"`
 }
 
 func elicitAnswerOut(a *agenttool.Answer) *wireElicitAnswer {
 	if a == nil {
 		return nil
 	}
-	return &wireElicitAnswer{Action: string(a.Action), Content: a.Content, Note: a.Note}
+	return &wireElicitAnswer{Action: string(a.Action), Content: a.Content, Note: a.Note, By: a.By}
 }
 
 func elicitAnswerIn(w *wireElicitAnswer) *agenttool.Answer {
 	if w == nil {
 		return nil
 	}
-	return &agenttool.Answer{Action: agenttool.Action(w.Action), Content: w.Content, Note: w.Note}
+	return &agenttool.Answer{Action: agenttool.Action(w.Action), Content: w.Content, Note: w.Note, By: w.By}
 }
 
 // wireAnswer is an agentturn.Answer, which Resume takes.
@@ -943,13 +953,14 @@ type wireAnswer struct {
 	Origin         string          `json:"origin,omitempty"`
 	IdempotencyKey string          `json:"idempotency_key,omitempty"`
 	RunAgain       bool            `json:"run_again,omitempty"`
+	Failed         bool            `json:"failed,omitempty"`
 }
 
 func answersOut(in []agentturn.Answer) ([]wireAnswer, error) {
 	out := make([]wireAnswer, 0, len(in))
 	for _, a := range in {
 		w := wireAnswer{CallID: a.CallID, Args: a.Args, Note: a.Note, Terminate: a.Terminate, By: a.By, Reason: a.Reason,
-			Origin: a.Origin, IdempotencyKey: a.IdempotencyKey, RunAgain: a.RunAgain}
+			Origin: a.Origin, IdempotencyKey: a.IdempotencyKey, RunAgain: a.RunAgain, Failed: a.Failed}
 		if a.Output != nil {
 			var err error
 			if w.Output, err = json.Marshal(a.Output); err != nil {
@@ -965,7 +976,7 @@ func answersIn(in []wireAnswer) ([]agentturn.Answer, error) {
 	out := make([]agentturn.Answer, 0, len(in))
 	for _, w := range in {
 		a := agentturn.Answer{CallID: w.CallID, Args: w.Args, Note: w.Note, Terminate: w.Terminate, By: w.By, Reason: w.Reason,
-			Origin: w.Origin, IdempotencyKey: w.IdempotencyKey, RunAgain: w.RunAgain}
+			Origin: w.Origin, IdempotencyKey: w.IdempotencyKey, RunAgain: w.RunAgain, Failed: w.Failed}
 		var err error
 		if a.Output, err = functionCallOutputIn(w.Output); err != nil {
 			return nil, err
@@ -989,11 +1000,11 @@ func runEndOut(e *agentturn.RunEnd) (wireRunEnd, error) {
 		return wireRunEnd{}, err
 	}
 	return wireRunEnd{Type: e.EventType(), RunID: e.RunID, Items: items, Reason: string(e.Reason), Cause: string(e.Cause),
-		Err: errorOut(e.Err), Pending: pending, Notes: notes, Withheld: e.Withheld}, nil
+		Err: errorOut(e.Err), Failure: errorOut(e.Failure), Pending: pending, Notes: notes, Withheld: e.Withheld}, nil
 }
 
 func runEndIn(w wireRunEnd) (*agentturn.RunEnd, error) {
-	e := &agentturn.RunEnd{RunID: w.RunID, Reason: agentturn.Reason(w.Reason), Cause: agentturn.StopCause(w.Cause), Err: errorIn(w.Err), Withheld: w.Withheld}
+	e := &agentturn.RunEnd{RunID: w.RunID, Reason: agentturn.Reason(w.Reason), Cause: agentturn.StopCause(w.Cause), Err: errorIn(w.Err), Failure: errorIn(w.Failure), Withheld: w.Withheld}
 	var err error
 	if e.Items, err = itemsIn(w.Items); err != nil {
 		return nil, err
@@ -1017,11 +1028,12 @@ type wireState struct {
 	Steered    json.RawMessage `json:"steered,omitempty"`
 	Queued     json.RawMessage `json:"queued,omitempty"`
 	Pending    []wirePending   `json:"pending,omitempty"`
+	Held       bool            `json:"held,omitempty"`
 	Notes      []wireNote      `json:"notes,omitempty"`
 }
 
 func stateOut(s agentturn.State) (wireState, error) {
-	w := wireState{Running: s.Running, RunID: s.RunID, Turn: s.Turn, Steering: s.Steering, FollowUps: s.FollowUps}
+	w := wireState{Running: s.Running, RunID: s.RunID, Turn: s.Turn, Steering: s.Steering, FollowUps: s.FollowUps, Held: s.Held}
 	var err error
 	if w.Transcript, err = itemsOut(s.Transcript); err != nil {
 		return w, err
@@ -1040,7 +1052,7 @@ func stateOut(s agentturn.State) (wireState, error) {
 }
 
 func stateIn(w wireState) (agentturn.State, error) {
-	s := agentturn.State{Running: w.Running, RunID: w.RunID, Turn: w.Turn, Steering: w.Steering, FollowUps: w.FollowUps}
+	s := agentturn.State{Running: w.Running, RunID: w.RunID, Turn: w.Turn, Steering: w.Steering, FollowUps: w.FollowUps, Held: w.Held}
 	var err error
 	if s.Transcript, err = itemsIn(w.Transcript); err != nil {
 		return s, err

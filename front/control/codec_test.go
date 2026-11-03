@@ -41,23 +41,23 @@ func sampleEvents(t *testing.T) map[string]agentturn.Event {
 		"TurnStart":    &agentturn.TurnStart{RunID: "run_1", Turn: 1, Request: req, Inputs: openresponses.Items{openresponses.UserText("hi")}, Arrived: []agentturn.TurnInput{{Item: openresponses.UserText("hi"), Mode: agentturn.InputPrompt, Trigger: trigger}}},
 		"ModelRetry":   &agentturn.ModelRetry{RunID: "run_1", Turn: 1, Attempt: 2, Err: agentturn.ErrNoModel, Delay: 1500 * time.Millisecond, Request: req},
 		"ModelBlocked": &agentturn.ModelBlocked{RunID: "run_1", Turn: 1, Request: req, Err: agentturn.ErrGuard},
-		"ItemStart":    &agentturn.ItemStart{RunID: "run_1", Turn: 1, Item: call, ResponseID: "resp_1", Hidden: true},
+		"ItemStart":    &agentturn.ItemStart{RunID: "run_1", Turn: 1, Item: call, ResponseID: "resp_1", Hidden: true, Copied: true},
 		"ItemUpdate":   &agentturn.ItemUpdate{RunID: "run_1", Turn: 1, Item: call, Stream: stream, ResponseID: "resp_1"},
-		"ItemEnd":      &agentturn.ItemEnd{RunID: "run_1", Turn: 1, Item: call, ResponseID: "resp_1", Hidden: true, Trigger: trigger, ModelCallID: "m_1"},
+		"ItemEnd":      &agentturn.ItemEnd{RunID: "run_1", Turn: 1, Item: call, ResponseID: "resp_1", Hidden: true, Copied: true, Trigger: trigger, ModelCallID: "m_1"},
 		"ResponseEnd":  &agentturn.ResponseEnd{RunID: "run_1", Turn: 1, Response: resp, Withheld: true},
-		"ToolStart":    &agentturn.ToolStart{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Args: json.RawMessage(`{"text":"a"}`), Decision: decision, Parent: "call_0"},
+		"ToolStart":    &agentturn.ToolStart{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Args: json.RawMessage(`{"text":"a"}`), Decision: decision, Parent: "call_0", Invoked: json.RawMessage(`{"text":"A"}`), Replayed: true},
 		"ToolDispatch": &agentturn.ToolDispatch{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Parent: "call_0", IdempotencyKey: "k"},
 		"ToolUpdate":   &agentturn.ToolUpdate{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Partial: result},
-		"ToolEnd":      &agentturn.ToolEnd{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Result: result, Err: errors.New("boom"), Blocked: true, Deferred: true, Reason: "r", Parent: "call_0", Withdrawn: true},
+		"ToolEnd":      &agentturn.ToolEnd{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Result: result, Err: errors.New("boom"), Blocked: true, Deferred: true, Reason: "r", Parent: "call_0", Withdrawn: true, Cut: true, Replayed: true},
 		"TurnEnd":      &agentturn.TurnEnd{RunID: "run_1", Turn: 1, Response: resp, ToolResults: []agenttool.Result{result}},
 		"RunEnd": &agentturn.RunEnd{RunID: "run_1", Items: openresponses.Items{openresponses.UserText("hi"), call, out}, Reason: agentturn.ReasonInputRequired,
-			Cause: agentturn.StopGuard, Err: agentturn.ErrRunning, Withheld: true, Pending: []agentturn.PendingCall{{
+			Cause: agentturn.StopGuard, Err: agentturn.ErrRunning, Failure: errors.New("disk full"), Withheld: true, Pending: []agentturn.PendingCall{{
 				Call: call, Reason: agentturn.PendingDeferred, Tool: remoteUpper(), Dispatched: true, IdempotencyKey: "k", Args: json.RawMessage(`{"text":"b"}`),
 				Ran: out, RanWhere: "branch", Refused: "no", Decision: decision,
 				Notes:    []agentturn.Note{{Item: openresponses.UserText("only the unit tests"), Mode: agentturn.InputResume, Trigger: trigger, CallID: "call_1"}},
 				Question: &agentturn.OpenQuestion{ID: "entry_1", Message: "Allow notify?", Call: &agentturn.AskedCall{Parent: "call_1", CallID: "call_2", Name: "notify"}},
 			}}, Notes: []agentturn.Note{{Item: openresponses.DeveloperText("owed"), Mode: agentturn.InputTool}}},
-		"Queued":         &agentturn.Queued{RunID: "run_1", Item: openresponses.UserText("more"), Mode: agentturn.QueueSteer, Hidden: true, Trigger: trigger},
+		"Queued":         &agentturn.Queued{RunID: "run_1", Item: openresponses.UserText("more"), Mode: agentturn.QueueSteer, Input: agentturn.InputDeliver, Hidden: true, Trigger: trigger},
 		"Question":       &agentturn.Question{ID: "question_1", RunID: "run_1", CallID: "call_0", Call: &agentturn.AskedCall{Parent: "call_0", CallID: "call_1", Name: "upper", Args: json.RawMessage(`{}`), Decision: decision}, Elicitation: agenttool.Elicitation{Message: "ok?", Schema: json.RawMessage(`{"type":"object"}`), URL: "https://example.test"}},
 		"NotesHeld":      &agentturn.NotesHeld{RunID: "run_1", Notes: []agentturn.Note{{Item: openresponses.DeveloperText("a ran in the sandbox"), Mode: agentturn.InputTool}}},
 		"QuestionClosed": &agentturn.QuestionClosed{ID: "question_1", RunID: "run_1", Answer: &agenttool.Answer{Action: agenttool.ActionDecline, Content: json.RawMessage(`{"a":1}`), Note: "not now"}, By: trigger},
@@ -235,5 +235,117 @@ func TestNotesOfAnOlderServerDecode(t *testing.T) {
 	notes := ev.(*agentturn.RunEnd).Pending[0].Notes
 	if len(notes) != 1 || notes[0].Item.(*openresponses.Message).Text() != "a ran in the sandbox" || notes[0].Mode != "" {
 		t.Errorf("notes = %+v", notes)
+	}
+}
+
+// TestAnswersCarryEveryField pins that an answer crosses the wire whole:
+// every field of agentturn.Answer is set in the sample, and reads back
+// as it was sent. A failed mark lost on the way would leave the record
+// of the output unmarked (#278).
+func TestAnswersCarryEveryField(t *testing.T) {
+	in := agentturn.Answer{
+		CallID: "call_1", Output: openresponses.NewFunctionCallOutput("call_1", "gone"),
+		Args: json.RawMessage(`{"text":"b"}`), Note: "n", Terminate: true, By: "human", Reason: "r",
+		Origin: "sha256:e", IdempotencyKey: "k", RunAgain: true, Failed: true,
+	}
+	v := reflect.ValueOf(in)
+	for i := range v.NumField() {
+		if v.Field(i).IsZero() {
+			t.Errorf("the sample leaves Answer.%s unset: set it so the test covers it", v.Type().Field(i).Name)
+		}
+	}
+	wire, err := answersOut([]agentturn.Answer{in})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back []wireAnswer
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatal(err)
+	}
+	out, err := answersIn(back)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("answers = %d", len(out))
+	}
+	got := out[0]
+	gotOut, _ := json.Marshal(got.Output)
+	wantOut, _ := json.Marshal(in.Output)
+	got.Output, in.Output = nil, nil
+	if !reflect.DeepEqual(got, in) || !bytes.Equal(gotOut, wantOut) {
+		t.Errorf("answer after the wire = %+v %s, want %+v %s", got, gotOut, in, wantOut)
+	}
+}
+
+// TestANestedCallsMatchCrossesTheWire pins that a remote view tells a
+// nested call given its recorded result from one that ran, and sees the
+// arguments it was invoked with (#261).
+func TestANestedCallsMatchCrossesTheWire(t *testing.T) {
+	samples := sampleEvents(t)
+	for _, name := range []string{"ToolStart", "ToolEnd"} {
+		data, err := MarshalEvent(samples[name])
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := UnmarshalEvent(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch e := got.(type) {
+		case *agentturn.ToolStart:
+			if !e.Replayed || string(e.Invoked) != `{"text":"A"}` {
+				t.Errorf("tool_start = %+v, want replayed and invoked", e)
+			}
+		case *agentturn.ToolEnd:
+			if !e.Replayed {
+				t.Errorf("tool_end = %+v, want replayed", e)
+			}
+		}
+	}
+}
+
+// TestAQueuedReportSaysHowTheInputArrived pins that a remote view
+// tells a delivery from a steer on the queued report (#244).
+func TestAQueuedReportSaysHowTheInputArrived(t *testing.T) {
+	data, err := MarshalEvent(sampleEvents(t)["Queued"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q := got.(*agentturn.Queued); q.Input != agentturn.InputDeliver {
+		t.Errorf("queued = %+v, want input deliver", q)
+	}
+}
+
+// TestACopiedItemCrossesTheWire pins that a remote view tells an item
+// taken from another conversation from one this one produced (#243).
+func TestACopiedItemCrossesTheWire(t *testing.T) {
+	for _, name := range []string{"ItemStart", "ItemEnd"} {
+		data, err := MarshalEvent(sampleEvents(t)[name])
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := UnmarshalEvent(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch e := got.(type) {
+		case *agentturn.ItemStart:
+			if !e.Copied {
+				t.Errorf("item_start = %+v, want copied", e)
+			}
+		case *agentturn.ItemEnd:
+			if !e.Copied {
+				t.Errorf("item_end = %+v, want copied", e)
+			}
+		}
 	}
 }

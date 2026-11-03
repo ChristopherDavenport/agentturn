@@ -131,11 +131,11 @@ func WithReasoningModels(m ReasoningModels) Option {
 	return func(a *Agent) { a.reasoning = a.reasoning.merged(m) }
 }
 
-// attribute records the run's model as the producer of the reasoning
-// items among items.
-func (r *runner) attribute(items openresponses.Items) {
+// attribute records modelName, the model the attempt's request named,
+// as the producer of the reasoning items among items.
+func (r *runner) attribute(modelName string, items openresponses.Items) {
 	if r.reasoning == nil {
 		r.reasoning = ReasoningModels{}
 	}
-	r.reasoning.Attribute(r.cfg.ModelName, items)
+	r.reasoning.Attribute(modelName, items)
 }

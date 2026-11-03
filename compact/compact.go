@@ -32,18 +32,44 @@
 package compact
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/gif"  // GIF headers, for an image's visual cost
+	_ "image/jpeg" // JPEG headers
+	_ "image/png"  // PNG headers
+	"math"
 	"strings"
 	"sync"
 
 	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/openresponses"
 )
+
+type foldKey struct{}
+
+// MarkFold returns ctx marked as the context of a model call a fold
+// makes for itself, such as [NewLocal]'s summary. The mark rides beside
+// the request, not on it, so neither the provider nor a request hash
+// sees it.
+func MarkFold(ctx context.Context) context.Context {
+	return context.WithValue(ctx, foldKey{}, true)
+}
+
+// IsFold reports whether ctx is the context of a model call a fold
+// makes for itself, as [MarkFold] marks it: a model, a streamer
+// wrapping one or a replay tells a fold's call from a turn's by this,
+// when the call arrives, rather than by the request's shape.
+func IsFold(ctx context.Context) bool {
+	v, _ := ctx.Value(foldKey{}).(bool)
+	return v
+}
 
 // Compactor is the compaction side of an openresponses.Adapter.
 type Compactor interface {
@@ -65,13 +91,37 @@ const DefaultSummaryPrompt = `Summarize the conversation above so that it can co
 type Option func(*Transform)
 
 // WithBudget sets the estimated token count above which the transcript
-// is compacted.
+// is compacted. The budget covers the whole request: the items the
+// transform would send and the settings the request carries beside
+// them, its instructions and its tool definitions, which the loop puts
+// on the transform's context (agentturn.RequestFromContext) and
+// [EstimateSettings] weighs. So a budget set as a share of the model's
+// context window is a share of what the window holds. A transform
+// called with no settings on its context, or given [WithEstimator]
+// without [WithSettingsEstimator], weighs the items alone.
 func WithBudget(tokens int) Option { return func(t *Transform) { t.budget = tokens } }
 
-// WithEstimator replaces the token estimator. The default divides the
-// JSON size of the items by four.
+// WithEstimator replaces the token estimator for items. The default is
+// [Estimate]. An estimator of its own counts in its own units, so the
+// settings are weighed only when [WithSettingsEstimator] gives an
+// estimator for them in the same units.
 func WithEstimator(fn func(openresponses.Items) int) Option {
-	return func(t *Transform) { t.estimate = fn }
+	return func(t *Transform) {
+		t.estimate = fn
+		if !t.settingsSet {
+			t.settings = nil
+		}
+	}
+}
+
+// WithSettingsEstimator replaces the estimator of the settings a
+// request carries beside its input, the instructions and the tool
+// definitions, which the transform adds to the estimate of the items
+// before it compares the sum with the budget. The default is
+// [EstimateSettings] while the item estimator is [Estimate]. nil weighs
+// the items alone.
+func WithSettingsEstimator(fn func(openresponses.Request) int) Option {
+	return func(t *Transform) { t.settings, t.settingsSet = fn, true }
 }
 
 // WithModel sets the model named on compaction or summary requests.
@@ -168,9 +218,10 @@ func WithSummaryPrompt(prompt string) Option { return func(t *Transform) { t.pro
 // default reasoning may think through the whole fold and end with a
 // function call copied from the transcript, so a caller whose own
 // requests set Reasoning sets the same here, and may set
-// MaxOutputTokens, Temperature or any other field. A replay tells the
-// fold's call from a turn by its lack of tools and instructions, so
-// leave those empty. The transform sets MaxOutputTokens to half the
+// MaxOutputTokens, Temperature or any other field. The call's context
+// is marked with [MarkFold], so a model or a replay tells it from a
+// turn's by [IsFold] whatever the request holds. The transform sets
+// MaxOutputTokens to half the
 // budget, at most [DefaultSummaryMaxOutputTokens], before fn runs, so
 // a summary that runs away is cut by the server; fn may change or
 // clear it. fn runs once per attempt on a
@@ -237,6 +288,12 @@ type Fold struct {
 	// path; a recorder that keeps it must mark it as the fold's own
 	// call. nil for [New], whose compaction request is not a Request.
 	Request *openresponses.Request
+	// Forced says the fold was asked for, by [Transform.FoldNext] or by
+	// the loop after the server refused a request as too long, rather
+	// than made because the estimate passed the budget. Instructions are
+	// the ones FoldNext gave for it, "" for none.
+	Forced       bool
+	Instructions string
 	// PrefixHash is the [PrefixHash] of the transcript's first Split
 	// items when the fold failed and the transform backs off from that
 	// prefix, as [Transform.Transform] describes, and empty otherwise:
@@ -291,13 +348,15 @@ func WithSummaryItem(fn func(summary string) openresponses.Item) Option {
 // fold or skips a fold because the other's failed; it only folds more
 // often than one per conversation would, as each forgets the other's.
 type Transform struct {
-	fold        func(ctx context.Context, input openresponses.Items) (folded, error)
+	fold        func(ctx context.Context, input openresponses.Items, instructions string) (folded, error)
 	onFold      []func(context.Context, Fold) error
 	budget      int
 	keepLast    int
 	minFold     int
 	model       string
 	estimate    func(openresponses.Items) int
+	settings    func(openresponses.Request) int
+	settingsSet bool
 	filter      func(agentturn.Transcript) agentturn.Transcript
 	prompt      string
 	summaryItem func(string) openresponses.Item
@@ -305,12 +364,20 @@ type Transform struct {
 	request     func(*openresponses.Request)
 
 	mu sync.Mutex
+	// next says FoldNext asked the next call to fold whatever its
+	// budget, with nextInstructions for that fold alone.
+	next             bool
+	nextInstructions string
 	// prefixLen items of the transcript are represented by output. An
 	// empty prefixHash means no memory.
 	prefixLen  int
 	prefixHash string
-	output     openresponses.Items
-	last       openresponses.Item
+	// prefixGen is the quarantine's generation the memory was last
+	// checked against: a quarantine that reaches the folded prefix
+	// drops it, so the next fold is made without the item.
+	prefixGen int
+	output    openresponses.Items
+	last      openresponses.Item
 	// The last fold that failed with an unfolded send: failLen items of
 	// the transcript hashing to failHash, at failTokens. An empty
 	// failHash means none.
@@ -330,8 +397,8 @@ func New(c Compactor, opts ...Option) *Transform {
 	if t.minFold < 0 {
 		t.minFold = 0
 	}
-	t.fold = func(ctx context.Context, input openresponses.Items) (folded, error) {
-		resp, err := c.Compact(ctx, openresponses.CompactRequest{Model: t.model, Input: input})
+	t.fold = func(ctx context.Context, input openresponses.Items, _ string) (folded, error) {
+		resp, err := c.Compact(MarkFold(ctx), openresponses.CompactRequest{Model: t.model, Input: input})
 		if err != nil {
 			return folded{attempts: 1}, fmt.Errorf("compact: %w", err)
 		}
@@ -415,12 +482,12 @@ func NewLocal(model openresponses.Streamer, opts ...Option) *Transform {
 	if t.minFold < 0 {
 		t.minFold = max(2*t.estimate(openresponses.Items{t.summaryItem("")}), t.budget/8)
 	}
-	t.fold = func(ctx context.Context, input openresponses.Items) (folded, error) {
-		f, err := t.summarize(ctx, model, input)
+	t.fold = func(ctx context.Context, input openresponses.Items, instructions string) (folded, error) {
+		f, err := t.summarize(ctx, model, input, instructions)
 		f.attempts = 1
 		if unfolded(err) {
 			first := f.usage
-			f, err = t.summarize(ctx, model, input)
+			f, err = t.summarize(ctx, model, input, instructions)
 			f.attempts = 2
 			f.usage = addUsage(first, f.usage)
 		}
@@ -486,12 +553,19 @@ func unfolded(err error) bool {
 	return errors.Is(err, ErrSummaryNoText) || errors.Is(err, ErrSummaryIncomplete) || errors.Is(err, ErrSummaryTooLarge)
 }
 
-// summarize asks model once for a summary of input.
-func (t *Transform) summarize(ctx context.Context, model openresponses.Streamer, input openresponses.Items) (folded, error) {
+// summarize asks model once for a summary of input, with instructions,
+// when there are any, after the summary prompt.
+func (t *Transform) summarize(ctx context.Context, model openresponses.Streamer, input openresponses.Items, instructions string) (folded, error) {
+	// The summary is the fold's own call, and says so to the model.
+	ctx = MarkFold(ctx)
 	store := false
+	prompt := t.prompt
+	if instructions != "" {
+		prompt += "\n\n" + instructions
+	}
 	req := openresponses.Request{
 		Model: t.model,
-		Input: append(withoutReasoning(input), openresponses.UserText(t.prompt)),
+		Input: append(withoutReasoning(input), openresponses.UserText(prompt)),
 		Store: &store,
 	}
 	if limit := min(t.budget/2, DefaultSummaryMaxOutputTokens); limit > 0 {
@@ -556,6 +630,7 @@ func newTransform(opts []Option) *Transform {
 		keepLast:    DefaultKeepLast,
 		minFold:     -1,
 		estimate:    Estimate,
+		settings:    EstimateSettings,
 		filter:      agentturn.DefaultFilter,
 		prompt:      DefaultSummaryPrompt,
 		summaryItem: SummaryMessage,
@@ -574,13 +649,119 @@ func SummaryMessage(summary string) openresponses.Item {
 }
 
 // Estimate is the default token estimator: the JSON size of the items
-// divided by four.
+// divided by four, but for images, which a provider charges by their
+// visual cost rather than by their encoded size. Each input_image part,
+// and each input_file part whose data is an image, wherever it is, in
+// a message or a function call output, counts [ImageTokens] for its
+// dimensions when its data URL holds a PNG, JPEG or GIF whose header
+// gives them, and [DefaultImageTokens] otherwise; its encoded data
+// counts nothing more. So a screenshot weighs what the model is charged
+// for it, not a hundred thousand tokens of base64.
 func Estimate(items openresponses.Items) int {
 	data, err := json.Marshal(items)
 	if err != nil {
 		return 0
 	}
+	if !bytes.Contains(data, []byte(`"input_image"`)) && !bytes.Contains(data, []byte(`"input_file"`)) {
+		return len(data) / 4
+	}
+	var tree any
+	if err := json.Unmarshal(data, &tree); err != nil {
+		return len(data) / 4
+	}
+	images := weighImages(tree)
+	rest, err := json.Marshal(tree)
+	if err != nil {
+		return len(data) / 4
+	}
+	return len(rest)/4 + images
+}
+
+// EstimateSettings is the default estimator of the settings a request
+// carries beside its input: the JSON size of its instructions and its
+// tool definitions divided by four, as [Estimate] weighs items.
+func EstimateSettings(req openresponses.Request) int {
+	data, err := json.Marshal(struct {
+		Instructions string              `json:"instructions,omitempty"`
+		Tools        openresponses.Tools `json:"tools,omitempty"`
+	}{req.Instructions, req.Tools})
+	if err != nil {
+		return 0
+	}
 	return len(data) / 4
+}
+
+// DefaultImageTokens is what [Estimate] counts for an image whose
+// dimensions it cannot read: one referred to by URL or file ID, or of a
+// format whose header it does not parse. It is about what the largest
+// image a provider takes without scaling costs.
+const DefaultImageTokens = 1600
+
+// ImageTokens is the visual cost [Estimate] gives an image of width by
+// height pixels: its area over 750, after scaling it down to fit
+// within 1568 pixels on its long edge and about 1.15 megapixels, as
+// the providers that charge by area scale it, and never more than
+// [DefaultImageTokens].
+func ImageTokens(width, height int) int {
+	if width <= 0 || height <= 0 {
+		return DefaultImageTokens
+	}
+	w, h := float64(width), float64(height)
+	if long := max(w, h); long > 1568 {
+		w, h = w*1568/long, h*1568/long
+	}
+	if area := w * h; area > 1_150_000 {
+		scale := math.Sqrt(1_150_000 / area)
+		w, h = w*scale, h*scale
+	}
+	return min(int(math.Ceil(w*h/750)), DefaultImageTokens)
+}
+
+// weighImages walks a decoded JSON tree, removes the encoded data of
+// every image part it finds and returns their visual cost.
+func weighImages(v any) int {
+	total := 0
+	switch n := v.(type) {
+	case []any:
+		for _, e := range n {
+			total += weighImages(e)
+		}
+	case map[string]any:
+		switch n["type"] {
+		case "input_image":
+			url, _ := n["image_url"].(string)
+			delete(n, "image_url")
+			return imageTokens(url)
+		case "input_file":
+			if data, _ := n["file_data"].(string); strings.HasPrefix(data, "data:image/") {
+				delete(n, "file_data")
+				return imageTokens(data)
+			}
+		}
+		for _, e := range n {
+			total += weighImages(e)
+		}
+	}
+	return total
+}
+
+// imageTokens is the visual cost of the image a URL names: by the
+// dimensions in its header when it is a base64 data URL of a format
+// image.DecodeConfig reads, [DefaultImageTokens] otherwise.
+func imageTokens(url string) int {
+	rest, ok := strings.CutPrefix(url, "data:")
+	if !ok {
+		return DefaultImageTokens
+	}
+	meta, payload, ok := strings.Cut(rest, ",")
+	if !ok || !strings.HasSuffix(meta, ";base64") {
+		return DefaultImageTokens
+	}
+	cfg, _, err := image.DecodeConfig(base64.NewDecoder(base64.StdEncoding, strings.NewReader(payload)))
+	if err != nil {
+		return DefaultImageTokens
+	}
+	return ImageTokens(cfg.Width, cfg.Height)
 }
 
 // Last returns the item that most recently replaced a folded prefix,
@@ -593,10 +774,32 @@ func (t *Transform) Last() openresponses.Item {
 	return t.last
 }
 
+// FoldNext asks the next call to [Transform.Transform] to fold whatever
+// its budget, with instructions, when not empty, for that fold alone:
+// [NewLocal] sends them after the summary prompt, and [New], whose
+// compaction endpoint takes no prompt, ignores them. The fold is the
+// one a call over budget makes, kept tail and [WithPin] included, and
+// is reported to [WithOnFold] as any other, so a recorder writes it.
+// [WithMinFold] still guards it: a prefix too small to fold is left as
+// it is, and so is a transcript whose older part the remembered fold
+// already covers. The back-off after a failed fold does not hold a
+// fold asked for. The request is taken by the next call whether or not
+// it folds; a later FoldNext before that call replaces its
+// instructions. It is how a host compacts on request, such as a
+// /compact command, between runs or during one.
+func (t *Transform) FoldNext(instructions string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.next, t.nextInstructions = true, instructions
+}
+
 // Transform returns the transcript to send for this call: unchanged
 // when it fits the budget or when its older part is smaller than
 // [WithMinFold], otherwise the fold of its older part followed by the
-// recent items.
+// recent items. A call after [Transform.FoldNext], or one whose context
+// the loop marked with agentturn.ContextWithFoldRequest, as it does to
+// rebuild a request the server refused as too long, folds whatever the
+// budget.
 //
 // A fold that failed with [ErrSummaryTooLarge], [ErrSummaryIncomplete]
 // or [ErrSummaryNoText] sends the transcript unfolded, and the
@@ -612,15 +815,23 @@ func (t *Transform) Last() openresponses.Item {
 // conversation's or one rewound before it, folds as usual.
 // [WithBackOff] turns the back-off off.
 func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (agentturn.Transcript, error) {
+	settings := 0
+	if req, ok := agentturn.RequestFromContext(ctx); ok && t.settings != nil {
+		// The instructions and tools share the window with the items.
+		settings = t.settings(req)
+	}
+	quarantined := agentturn.QuarantineFromContext(ctx)
 	t.mu.Lock()
-	view, base := t.view(items)
-	tokens := t.estimate(view)
-	if tokens <= t.budget {
+	forced, instructions := t.next || agentturn.FoldRequested(ctx), t.nextInstructions
+	t.next, t.nextInstructions = false, ""
+	view, base := t.view(items, quarantined)
+	tokens := t.estimate(view) + settings
+	if tokens <= t.budget && !forced {
 		t.mu.Unlock()
 		return view, nil
 	}
 	split := t.split(items)
-	if split <= base || t.backOff(items, split, tokens) {
+	if split <= base || (!forced && t.backOff(items, split, tokens)) {
 		t.mu.Unlock()
 		return view, nil
 	}
@@ -628,7 +839,9 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	if base > 0 {
 		input = append(input, t.output...)
 	}
-	input = append(input, t.filter(items[base:split])...)
+	// What the quarantine leaves out of a request is left out of what
+	// the fold sends its model too (#281).
+	input = append(input, quarantined.Apply(t.filter(items[base:split]))...)
 	if len(input) == 0 || t.estimate(input) < t.minFold {
 		t.mu.Unlock()
 		return view, nil
@@ -638,9 +851,9 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 
 	// The model call runs unlocked so concurrent callers do not
 	// serialise on the network.
-	f, err := t.fold(ctx, input)
+	f, err := t.fold(ctx, input, instructions)
 	if err != nil {
-		failed := Fold{Split: split, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Err: err}
+		failed := Fold{Split: split, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Forced: forced, Instructions: instructions, Err: err}
 		if unfolded(err) {
 			failed.PrefixHash = PrefixHash(items[:split])
 		}
@@ -665,7 +878,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	if t.prefixLen != prevLen || t.prefixHash != prevHash {
 		// Another caller folded meanwhile; its memory stands and this
 		// call is answered from it.
-		view, _ := t.view(items)
+		view, _ := t.view(items, quarantined)
 		t.mu.Unlock()
 		return view, nil
 	}
@@ -675,6 +888,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 		first = items[split]
 	}
 	t.prefixLen = split
+	t.prefixGen = quarantined.Generation()
 	t.prefixHash = PrefixHash(items[:split])
 	t.output = append(append(openresponses.Items(nil), f.output...), pinned...)
 	if f.summary != nil {
@@ -684,7 +898,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	t.mu.Unlock()
 	// The fold's own output and the pinned items, as locals: the memory
 	// they were written to belongs to the lock that was just released.
-	if err := t.report(ctx, Fold{Split: split, First: first, Output: f.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request}); err != nil {
+	if err := t.report(ctx, Fold{Split: split, First: first, Output: f.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Forced: forced, Instructions: instructions}); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -732,12 +946,31 @@ func (t *Transform) pinned(prefix agentturn.Transcript) openresponses.Items {
 
 // view returns the transcript with the remembered fold applied, and how
 // many items it covers; zero when the memory no longer matches.
-func (t *Transform) view(items agentturn.Transcript) (agentturn.Transcript, int) {
-	if t.prefixHash != "" && t.prefixLen > 0 && len(items) >= t.prefixLen && PrefixHash(items[:t.prefixLen]) == t.prefixHash {
+func (t *Transform) view(items agentturn.Transcript, quarantined agentturn.QuarantineView) (agentturn.Transcript, int) {
+	if t.prefixHash != "" && t.prefixLen > 0 && len(items) >= t.prefixLen && PrefixHash(items[:t.prefixLen]) == t.prefixHash && !t.quarantinedSince(items[:t.prefixLen], quarantined) {
 		return t.join(items, t.prefixLen), t.prefixLen
 	}
 	t.prefixLen, t.prefixHash, t.output = 0, "", nil
 	return items, 0
+}
+
+// quarantinedSince reports whether the quarantine has grown since the
+// memory was last checked to reach an item of prefix, the part the
+// remembered fold stands for, whose summary may then carry what the
+// quarantine leaves out. A growth that reaches none is taken as checked.
+// Called with the lock held.
+func (t *Transform) quarantinedSince(prefix agentturn.Transcript, quarantined agentturn.QuarantineView) bool {
+	gen := quarantined.Generation()
+	if gen == t.prefixGen {
+		return false
+	}
+	for _, item := range prefix {
+		if quarantined.Has(item) {
+			return true
+		}
+	}
+	t.prefixGen = gen
+	return false
 }
 
 // join returns the remembered output followed by items from n.

@@ -74,8 +74,10 @@ func TestAskedCallOnTheElicitorsContext(t *testing.T) {
 }
 
 // TestAsk pins the one rule a question about a call follows: the text,
-// the decision each answer makes, by "human", and the cases that leave
-// the caller with the deferral it started with.
+// the decision each answer makes, by the decider the answer names or
+// "human" when it names none (#267), and the cases that leave the
+// caller with the deferral it started with, an answer naming a decider
+// nobody knows among them.
 func TestAsk(t *testing.T) {
 	cases := []struct {
 		name string
@@ -86,6 +88,8 @@ func TestAsk(t *testing.T) {
 		wantAction ToolAction
 		wantReason string
 		wantNote   string
+		// wantBy is the decision's decider; empty means "human".
+		wantBy string
 	}{
 		{name: "no elicitor", reason: "rule r"},
 		{name: "accept", elicit: answers(agenttool.Answer{Action: agenttool.ActionAccept}), reason: "rule r", wantOK: true, wantAction: Allow, wantReason: "rule r"},
@@ -94,6 +98,10 @@ func TestAsk(t *testing.T) {
 		{name: "decline, no reason", elicit: answers(agenttool.Answer{Action: agenttool.ActionDecline}), wantOK: true, wantAction: Block, wantReason: "declined when asked"},
 		{name: "decline, with a note", elicit: answers(agenttool.Answer{Action: agenttool.ActionDecline, Note: "use the fixture"}), reason: "rule r", wantOK: true, wantAction: Block, wantReason: "declined when asked: rule r; the user said: use the fixture"},
 		{name: "accept, with a note", elicit: answers(agenttool.Answer{Action: agenttool.ActionAccept, Note: "only this once"}), reason: "rule r", wantOK: true, wantAction: Allow, wantReason: "rule r", wantNote: "The user said: only this once"},
+		{name: "accept by a rule, with a note", elicit: answers(agenttool.Answer{Action: agenttool.ActionAccept, Note: "only this once", By: agenttool.ByPolicy}), reason: "rule r", wantOK: true, wantAction: Allow, wantReason: "rule r", wantNote: "The policy said: only this once", wantBy: "policy"},
+		{name: "decline by another model, with a note", elicit: answers(agenttool.Answer{Action: agenttool.ActionDecline, Note: "use the fixture", By: agenttool.ByAgent}), reason: "rule r", wantOK: true, wantAction: Block, wantReason: "declined when asked: rule r; another agent said: use the fixture", wantBy: "agent"},
+		{name: "accept by a person named", elicit: answers(agenttool.Answer{Action: agenttool.ActionAccept, By: agenttool.ByHuman}), reason: "rule r", wantOK: true, wantAction: Allow, wantReason: "rule r"},
+		{name: "an unknown decider", elicit: answers(agenttool.Answer{Action: agenttool.ActionAccept, By: "system"}), reason: "rule r"},
 		{name: "cancel", elicit: answers(agenttool.Answer{Action: agenttool.ActionCancel}), reason: "rule r"},
 		{name: "elicitor error", elicit: func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
 			return agenttool.Answer{}, errors.New("no terminal")
@@ -141,8 +149,12 @@ func TestAsk(t *testing.T) {
 				}
 				return
 			}
-			if d == nil || d.Action != tc.wantAction || d.Reason != tc.wantReason || d.Note != tc.wantNote || d.By != "human" {
-				t.Errorf("decision = %+v, want %v %q note %q by human", d, tc.wantAction, tc.wantReason, tc.wantNote)
+			wantBy := tc.wantBy
+			if wantBy == "" {
+				wantBy = "human"
+			}
+			if d == nil || d.Action != tc.wantAction || d.Reason != tc.wantReason || d.Note != tc.wantNote || d.By != wantBy {
+				t.Errorf("decision = %+v, want %v %q note %q by %s", d, tc.wantAction, tc.wantReason, tc.wantNote, wantBy)
 			}
 		})
 	}

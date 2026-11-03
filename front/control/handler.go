@@ -18,7 +18,7 @@ import (
 )
 
 // byHuman is the session format's name for a person who decided.
-const byHuman = "human"
+const byHuman = agenttool.ByHuman
 
 // Protocol names the wire this package speaks, as GET / reports it.
 const Protocol = "agentturn-control/1"
@@ -29,7 +29,7 @@ type Scope string
 const (
 	// ScopeRead follows the agent: Subscribe and State.
 	ScopeRead Scope = "read"
-	// ScopeControl drives it: Prompt, Queue and Abort.
+	// ScopeControl drives it: Prompt, Queue, Deliver and Abort.
 	ScopeControl Scope = "control"
 	// ScopeAnswer answers it: Resume and Reply, which let a call run
 	// that the policy asked a person about. No other scope implies it.
@@ -98,6 +98,10 @@ type Command struct {
 // ErrUnknownCommand is a command no [WithCommands] names.
 var ErrUnknownCommand = errors.New("control: no such command")
 
+// ErrNoDelivery is the answer to a delivery when the Control the
+// handler serves is no agentturn.Deliverer.
+var ErrNoDelivery = errors.New("control: the agent offers no delivery")
+
 // Option configures a Handler.
 type Option func(*handler)
 
@@ -138,13 +142,17 @@ func WithCommands(cmds map[string]Command) Option {
 }
 
 // WithChosenBy lets a principal that holds scope say who decided its
-// answers to Resume, with agentturn.Answer.By: a policy engine or
-// another agent that answers over the wire, whose host names a scope
-// for it. Without it, or for a principal without scope, every answer
-// to Resume is recorded as decided by "human", whatever By the client
-// sent: a person at a client is who answers through one, and a client
-// holding only [ScopeAnswer] cannot make a person's decision read as a
-// rule's. Who it was is the run's trigger, which names the principal.
+// answers, to Resume with agentturn.Answer.By and to Reply with
+// agenttool.Answer.By: a policy engine or another agent that answers
+// over the wire, whose host names a scope for it. Without it, or for a
+// principal without scope, every answer is recorded as decided by
+// "human", whatever By the client sent: a person at a client is who
+// answers through one, and a client holding only [ScopeAnswer] cannot
+// make a person's decision read as a rule's. Who it was is the run's
+// trigger, or the question's answerer, which names the principal. A
+// principal that may choose and names a decider the session format
+// does not know ("human", "policy", "agent") is refused, rather than
+// recorded under a name nobody reads.
 func WithChosenBy(scope Scope) Option {
 	return func(h *handler) { h.chosenBy = scope }
 }
@@ -178,7 +186,9 @@ type handler struct {
 }
 
 // Handler serves c over HTTP: JSON requests for its methods and a
-// server-sent event stream for Subscribe. Mount it under a path with
+// server-sent event stream for Subscribe. A host that records the agent
+// serves agentturn/session's Recorder.Control(agent), so a queued or
+// delivered input is written before the agent takes it. Mount it under a path with
 // http.StripPrefix. The routes, relative to that path:
 //
 //	GET  /                 the protocol, for Dial            any scope
@@ -186,6 +196,7 @@ type handler struct {
 //	GET  /events           Subscribe, as server-sent events  read
 //	POST /prompt           Prompt; returns the run's end     control
 //	POST /queue            Queue: steer or follow_up         control
+//	POST /deliver          Deliver, when c offers it         control
 //	POST /abort            Abort                             control
 //	POST /resume           Resume; returns the run's end     answer
 //	POST /reply            Reply                             answer
@@ -197,8 +208,8 @@ type handler struct {
 // answers carries an agentturn.Trigger of kind "control" naming it. So
 // does an answer to a question: Reply gets the request's context, so
 // agentturn.QuestionClosed.By and a recorder name who answered. An
-// answer to Resume is recorded as decided by "human" unless the
-// principal holds the scope [WithChosenBy] names.
+// answer to Resume or Reply is recorded as decided by "human" unless
+// the principal holds the scope [WithChosenBy] names.
 // Prompt and Resume run on the request's context with its
 // cancellation lifted (context.WithoutCancel, the principal and the
 // trigger kept), so a run goes on when its client goes away: over a
@@ -223,6 +234,7 @@ func Handler(c agentturn.Control, opts ...Option) http.Handler {
 	mux.HandleFunc("GET /events", h.guard(ScopeRead, h.events))
 	mux.HandleFunc("POST /prompt", h.guard(ScopeControl, h.prompt))
 	mux.HandleFunc("POST /queue", h.guard(ScopeControl, h.queue))
+	mux.HandleFunc("POST /deliver", h.guard(ScopeControl, h.deliver))
 	mux.HandleFunc("POST /abort", h.guard(ScopeControl, h.abort))
 	mux.HandleFunc("POST /resume", h.guard(ScopeAnswer, h.resume))
 	mux.HandleFunc("POST /reply", h.guard(ScopeAnswer, h.reply))
@@ -313,12 +325,34 @@ func (h *handler) resume(w http.ResponseWriter, r *http.Request, p Principal) {
 		h.writeFailure(w, http.StatusBadRequest, err)
 		return
 	}
-	if h.chosenBy == "" || !p.Has(h.chosenBy) {
+	if !h.mayChoose(p) {
 		for i := range answers {
 			answers[i].By = byHuman
 		}
 	}
+	for _, a := range answers {
+		if err := knownDecider(a.By); err != nil {
+			h.writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: resume: %w", err))
+			return
+		}
+	}
 	h.writeRun(w, func() (*agentturn.RunEnd, error) { return h.c.Resume(context.WithoutCancel(r.Context()), answers...) })
+}
+
+// mayChoose reports whether p may say who decided its answers
+// ([WithChosenBy]).
+func (h *handler) mayChoose(p Principal) bool {
+	return h.chosenBy != "" && p.Has(h.chosenBy)
+}
+
+// knownDecider refuses a decider the session format does not know; an
+// empty one names nobody.
+func knownDecider(by string) error {
+	switch by {
+	case "", agenttool.ByHuman, agenttool.ByPolicy, agenttool.ByAgent:
+		return nil
+	}
+	return fmt.Errorf("unknown decider %q: an answer is by human, policy or agent, or names nobody", by)
 }
 
 func (h *handler) writeRun(w http.ResponseWriter, run func() (*agentturn.RunEnd, error)) {
@@ -364,6 +398,50 @@ func (h *handler) queue(w http.ResponseWriter, r *http.Request, _ Principal) {
 	writeJSON(w, http.StatusOK, errReply{errorOut(h.c.Queue(r.Context(), agentturn.QueueMode(req.Mode), items...))})
 }
 
+// deliverReply is Deliver's answer: whether the items joined the run
+// in flight, the end of a run the delivery started or of the run that
+// took them and ended before a model call saw them, and the error.
+type deliverReply struct {
+	Joined bool        `json:"joined"`
+	End    *wireRunEnd `json:"end,omitempty"`
+	Err    *wireError  `json:"error,omitempty"`
+}
+
+// deliver serves agentturn.Deliverer, which c offers or not: a remote
+// party cannot tell from /queue and /state whether a run will still
+// take a steer, and a delivery says. It runs on the request's context
+// with its cancellation lifted, as a prompt does, since a run it
+// starts goes on when the client goes away.
+func (h *handler) deliver(w http.ResponseWriter, r *http.Request, _ Principal) {
+	d, ok := h.c.(agentturn.Deliverer)
+	if !ok {
+		h.writeFailure(w, http.StatusNotImplemented, ErrNoDelivery)
+		return
+	}
+	var req struct {
+		Items json.RawMessage `json:"items"`
+	}
+	if !h.decode(w, r, &req) {
+		return
+	}
+	items, err := itemsIn(req.Items)
+	if err != nil {
+		h.writeFailure(w, http.StatusBadRequest, err)
+		return
+	}
+	joined, end, err := d.Deliver(context.WithoutCancel(r.Context()), items...)
+	out := deliverReply{Joined: joined, Err: errorOut(err)}
+	if end != nil {
+		we, merr := runEndOut(end)
+		if merr != nil {
+			h.writeFailure(w, http.StatusInternalServerError, merr)
+			return
+		}
+		out.End = &we
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 func (h *handler) abort(w http.ResponseWriter, _ *http.Request, _ Principal) {
 	h.c.Abort()
 	writeJSON(w, http.StatusOK, errReply{})
@@ -382,6 +460,15 @@ func (h *handler) reply(w http.ResponseWriter, r *http.Request, p Principal) {
 	case agenttool.ActionAccept, agenttool.ActionDecline, agenttool.ActionCancel:
 	default:
 		h.writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: reply: unknown action %q", a.Action))
+		return
+	}
+	// Who decided is a person's unless the host lets this principal
+	// say, as for Resume.
+	if !h.mayChoose(p) {
+		a.By = byHuman
+	}
+	if err := knownDecider(a.By); err != nil {
+		h.writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: reply: %w", err))
 		return
 	}
 	// The principal is who answered, as a run it starts names it.

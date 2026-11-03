@@ -41,6 +41,8 @@ func (e *Executor) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, q 
 	if cancel != nil {
 		cancel()
 	}
+	// The steers the task kept for its answers go with it.
+	e.dropOwed(reqCtx.ContextID, reqCtx.TaskID)
 	if release != nil {
 		defer release()
 		if err := e.settle(ctx, reqCtx, principal); err != nil {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -749,5 +750,56 @@ func TestCancelBeforeTheStatusReachesTheSDK(t *testing.T) {
 	}
 	if waiting, _ := store.LoadWaiting(context.Background(), "c1"); waiting != "" {
 		t.Errorf("the conversation still waits on %q", waiting)
+	}
+}
+
+// forget drops a task, as a task store that keeps tasks in memory does
+// at a restart, or one that purges a task it holds for done.
+func (s *taskStore) forget(id a2a.TaskID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.tasks, id)
+}
+
+// TestALostTaskIsAnsweredOnTheNextMessage pins #257's second path: the
+// SDK's task store is the host's (RequestHandler with
+// a2asrv.WithTaskStore), and when it loses a task left input-required
+// the caller cannot answer on it, but the conversation does not stall:
+// the next message on the context lists the calls the lost task left
+// pending again, under a task of its own, and the caller answers them
+// there.
+func TestALostTaskIsAnsweredOnTheNextMessage(t *testing.T) {
+	store, tasks := &MemoryStore{}, &taskStore{}
+	tokens := map[string]string{"a-token": "alice"}
+	cfg := agentturn.Config{Model: callsThenDone{"remote"}}
+	alice := peer(t, New(cfg, WithAuthenticator(tokenAuth(tokens)), WithConversationStore(store), WithCallerTools(remoteTool)), tasks)("a-token")
+	task := send(t, alice, userMessage("go"))
+	ids := pendingIDs(t, task)
+	tasks.forget(task.ID)
+
+	// The lost task cannot be read or answered.
+	if _, err := alice.GetTask(context.Background(), &a2a.TaskQueryParams{ID: task.ID}); !errors.Is(err, a2a.ErrTaskNotFound) {
+		t.Errorf("get the lost task: %v, want task not found", err)
+	}
+	answer := a2a.NewMessageForTask(a2a.MessageRoleUser, task, a2a.DataPart{Data: map[string]any{"type": "function_call_output", "call_id": ids[0], "output": "ran"}})
+	if _, err := alice.SendMessage(context.Background(), &a2a.MessageSendParams{Message: answer}); err == nil {
+		t.Error("an answer on the lost task was taken")
+	}
+
+	// The next message on the conversation lists the same calls.
+	next := userMessage("are you there?")
+	next.ContextID = task.ContextID
+	again := send(t, alice, next)
+	if again.ID == task.ID {
+		t.Fatal("the next message answered on the lost task")
+	}
+	slices.Sort(ids)
+	if got := slices.Sorted(slices.Values(pendingIDs(t, again))); !slices.Equal(got, ids) {
+		t.Fatalf("the next task lists %v, want the lost task's %v", got, ids)
+	}
+	answer = a2a.NewMessageForTask(a2a.MessageRoleUser, again, a2a.DataPart{Data: map[string]any{"type": "function_call_output", "call_id": ids[0], "output": "ran"}})
+	done := send(t, alice, answer)
+	if done.Status.State != a2a.TaskStateCompleted {
+		t.Errorf("after the answer: %s %q, want completed", done.Status.State, taskText(done))
 	}
 }

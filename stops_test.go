@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/ChristopherDavenport/agenttool"
@@ -472,4 +473,185 @@ func TestOutputGuardWithheldResponse(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAFailureDuringAnAbortIsReportedOnItsOwn pins the run_end member
+// failure (#83): a subscriber that fails on a cut call's tool_end while
+// the run is being aborted ends it aborted, with the cancellation still
+// its error and the subscriber's failure on the end as Failure.
+func TestAFailureDuringAnAbortIsReportedOnItsOwn(t *testing.T) {
+	started := make(chan struct{})
+	slow := agenttool.New("a", "", func(ctx context.Context, _ echoArgs) (string, error) {
+		close(started)
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	ag := New(Config{Model: &twoCalls{}, Tools: []agenttool.Tool{slow}, MaxTurns: 1})
+	disk := errors.New("the record could not be written")
+	ag.Subscribe(func(_ context.Context, ev Event) error {
+		if _, ok := ev.(*ToolEnd); ok {
+			return disk
+		}
+		return nil
+	})
+	go func() {
+		<-started
+		ag.Abort()
+	}()
+	end, _ := ag.Prompt(context.Background(), openresponses.UserText("go"))
+	if end == nil || end.Reason != ReasonAborted {
+		t.Fatalf("end = %+v", end)
+	}
+	if !errors.Is(end.Err, context.Canceled) {
+		t.Errorf("err = %v, want the cancellation", end.Err)
+	}
+	if !errors.Is(end.Failure, disk) {
+		t.Errorf("failure = %v, want the subscriber's", end.Failure)
+	}
+
+	// An abort nothing failed on has none.
+	started = make(chan struct{})
+	quiet := New(Config{Model: &twoCalls{}, Tools: []agenttool.Tool{slow}, MaxTurns: 1})
+	go func() {
+		<-started
+		quiet.Abort()
+	}()
+	if end, _ := quiet.Prompt(context.Background(), openresponses.UserText("go")); end == nil || end.Failure != nil {
+		t.Errorf("end = %+v, want no failure", end)
+	}
+}
+
+// guardingModel fails the call with an error marked as a guard's after
+// its answer has opened, as a provider-side moderation wrapper does,
+// and counts its calls.
+type guardingModel struct{ calls *int }
+
+func (m guardingModel) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	*m.calls++
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("the sec"); err != nil {
+		return err
+	}
+	return fmt.Errorf("moderation: %w", ErrGuard)
+}
+
+// TestAModelErrorMarkedAsAGuardsStops pins RFC 0001's The model call
+// (#275): a model call that fails with an error marked as a guard's is
+// a guard stop, not retried, with the error on the end.
+func TestAModelErrorMarkedAsAGuardsStops(t *testing.T) {
+	calls := 0
+	ag := New(Config{Model: guardingModel{&calls}, Retry: Retry{MaxAttempts: 3, Retryable: func(error) bool { return true }}})
+	end, err := ag.Prompt(context.Background(), openresponses.UserText("go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if end.Reason != ReasonStopped || end.Cause != StopGuard || !errors.Is(end.Err, ErrGuard) {
+		t.Errorf("end = %s/%s %v, want stopped by the guard with its error", end.Reason, end.Cause, end.Err)
+	}
+	if calls != 1 {
+		t.Errorf("the model was called %d times, want once", calls)
+	}
+	if _, ok := end.Answer(); ok {
+		t.Error("a guard's stop answered")
+	}
+}
+
+// TestTheTurnIsOnTheContext pins RFC 0001's Starting a run (#275): the
+// context of everything a turn calls carries the turn number beside
+// the run ID.
+func TestTheTurnIsOnTheContext(t *testing.T) {
+	seen := map[string][]int{}
+	note := func(where string) func(ctx context.Context) {
+		return func(ctx context.Context) { seen[where] = append(seen[where], TurnFromContext(ctx)) }
+	}
+	tool := agenttool.New("upper", "", func(ctx context.Context, a echoArgs) (string, error) {
+		note("tool")(ctx)
+		return upper(ctx, a)
+	})
+	model := noting{note: note("model")}
+	ag := New(Config{
+		Model: model, Tools: []agenttool.Tool{tool}, MaxTurns: 2,
+		Transform: func(ctx context.Context, items Transcript) (Transcript, error) {
+			note("transform")(ctx)
+			return items, nil
+		},
+		OutputGuard: func(ctx context.Context, _ OutputInfo) (*openresponses.Message, error) {
+			note("output guard")(ctx)
+			return nil, nil
+		},
+		AfterToolCall: func(ctx context.Context, _ ToolResultInfo) (*ToolOverride, error) {
+			note("after tool call")(ctx)
+			return nil, nil
+		},
+		BeforeTurn: func(ctx context.Context, _ TurnStartInfo) (openresponses.Items, error) {
+			note("before turn")(ctx)
+			return nil, nil
+		},
+		BeforeModelCall: func(ctx context.Context, _ *openresponses.Request) error {
+			note("before model call")(ctx)
+			return nil
+		},
+		BeforeToolCall: func(ctx context.Context, _ ToolCallInfo) (*ToolDecision, error) {
+			note("before tool call")(ctx)
+			return nil, nil
+		},
+		ShouldStopAfterTurn: func(ctx context.Context, _ TurnInfo) (bool, error) {
+			note("should stop")(ctx)
+			return false, nil
+		},
+	})
+	if _, err := ag.Prompt(context.Background(), openresponses.UserText("go")); err != nil {
+		t.Fatal(err)
+	}
+	// The first turn calls the tool and the second answers.
+	want := map[string][]int{
+		"before turn": {1, 2}, "transform": {1, 2}, "before model call": {1, 2}, "model": {1, 2}, "should stop": {1, 2},
+		"before tool call": {1}, "tool": {1}, "after tool call": {1},
+		"output guard": {2},
+	}
+	for where, turns := range want {
+		if got := seen[where]; !slices.Equal(got, turns) {
+			t.Errorf("%s saw turns %v, want %v", where, got, turns)
+		}
+	}
+	if n := TurnFromContext(context.Background()); n != 0 {
+		t.Errorf("outside a run: turn %d", n)
+	}
+}
+
+// noting calls upper until a tool has answered, then answers, and
+// notes the context of each call.
+type noting struct{ note func(context.Context) }
+
+func (m noting) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.note(ctx)
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if _, ok := req.Input[len(req.Input)-1].(*openresponses.FunctionCallOutput); !ok {
+		w, err := em.FunctionCall("", "upper")
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(`{"text":"t"}`); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("done"); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
 }

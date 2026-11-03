@@ -19,13 +19,61 @@ var (
 	// ErrRunning is returned when Prompt, Continue, Resume, SetConfig or
 	// SetTranscript is called while a run is active.
 	ErrRunning = errors.New("agentturn: agent is already running")
+	// ErrHeld is [ErrRunning] for an agent held idle by
+	// [Agent.WhileIdle]: [Agent.Deliver] refuses so before it queues
+	// anything, so a host that wrote the input first knows to take it
+	// back.
+	ErrHeld = fmt.Errorf("%w: it is held idle", ErrRunning)
 	// ErrInputRequired is returned when the last run left calls
 	// unanswered, deferred to the caller or cut off by an abort or a
 	// failure; answer them through [Agent.Resume], or open the next
 	// [Agent.Prompt] with their outputs. The typed errors of tools/agent
 	// and tools/a2a match it with errors.Is, so a host can ask "does any
-	// sub-agent need input" once.
+	// sub-agent need input" once, and implement [InputRequired], which
+	// names what each waits on.
 	ErrInputRequired = errors.New("agentturn: pending tool calls must be resumed before continuing")
+	// ErrTerminated is returned by [Agent.Deliver] when the last run
+	// ended on a terminating result, [StopTerminate] or
+	// [StopPartialTerminate], and no run has started since: what the
+	// result says is the host's to read before the next run, a
+	// handoff's transfer above all, whose receiver's run the host
+	// starts under the receiver's configuration. The items stay queued
+	// for that run, which takes them before its first model call; a
+	// host whose terminating result was the run's answer starts it with
+	// [Agent.Continue].
+	ErrTerminated = errors.New("agentturn: the last run ended on a terminating result; the delivery waits for the host's next run")
+)
+
+// InputRequired is the error of a composition tool whose callee, a
+// child run or a remote agent's task, stopped waiting on an answer
+// nobody could give inside the call: tools/agent's and tools/a2a's
+// InputRequiredError implement it, and a third such tool should. One
+// errors.As finds what is waiting whichever tool failed, where a type
+// switch per implementation misses the next one. An implementation
+// also matches [ErrInputRequired] under errors.Is.
+type InputRequired interface {
+	error
+	// PendingCalls names what the callee waits on, in one shape.
+	PendingCalls() []WaitingCall
+}
+
+// WaitingCall is one item a callee waits on, as [InputRequired] names
+// it: a call the callee's model made that its policy deferred, or a
+// question a remote task asked that is not a call.
+type WaitingCall struct {
+	// ID is the item's ID: the call's call ID, or the question's
+	// message ID, else the task's ID when the task sent none.
+	ID string
+	// Name and Args are the call's, the arguments those it would run
+	// with; both are empty for a question that is not a call.
+	Name string
+	Args json.RawMessage
+	// Callee is what waits: the child's run ID, or the remote task's
+	// ID.
+	Callee string
+}
+
+var (
 	// ErrNotPending is returned when Resume was given an answer for a
 	// call that is not pending, left a pending call unanswered, or was
 	// called with nothing pending, and when a Prompt opens with an
@@ -43,9 +91,10 @@ var (
 	// [Answer.WithRunAgain].
 	ErrAmbiguousCall = errors.New("agentturn: a call that may have run cannot run again")
 	// ErrCallAnswered is returned when Resume was asked to approve a
-	// call pending as [PendingAnswered] or [PendingRejected]: a record
-	// answered it without running it again, or refused it, and only its
-	// output may follow.
+	// call pending as [PendingAnswered], [PendingRejected] or
+	// [PendingReturned]: a record answered it without running it again,
+	// refused it, or holds what its tool returned, and only its output
+	// may follow.
 	ErrCallAnswered = errors.New("agentturn: an answered call is owed its output and nothing else")
 )
 
@@ -84,6 +133,9 @@ type Agent struct {
 	steer      []queuedItem
 	followUp   []queuedItem
 	running    bool
+	// held is set while [Agent.WhileIdle] runs its function: no run
+	// starts, and nothing else is refused.
+	held bool
 	// closing is set once the run in flight is past its last drain of
 	// the queues, before its run_end: an item steered after it waits
 	// for the next run, so Deliver starts one rather than joining.
@@ -128,6 +180,9 @@ type Agent struct {
 	// transcript it knows, so a run leaves another model's out of its
 	// requests.
 	reasoning ReasoningModels
+	// quarantine holds the items quarantined for the rest of the
+	// conversation, shared with each run.
+	quarantine *quarantine
 	// asks holds the questions QuestionElicitor raised that Reply can
 	// still answer, by ID.
 	asks map[string]*asking
@@ -198,7 +253,7 @@ func WithReservedCallIDs(ids []string) Option {
 
 // New builds an agent.
 func New(cfg Config, opts ...Option) *Agent {
-	a := &Agent{cfg: cfg, idle: closedChan(), steered: make(chan struct{}), progress: make(chan struct{})}
+	a := &Agent{cfg: cfg, idle: closedChan(), steered: make(chan struct{}), progress: make(chan struct{}), quarantine: &quarantine{}}
 	for _, opt := range opts {
 		opt(a)
 	}
@@ -308,8 +363,8 @@ func (a *Agent) Config() Config { return a.cfg }
 // switches back to that model is sent them again. A configuration with
 // an empty ModelName names no model, so nothing is attributed to it
 // and nothing is left out of its requests. A session recorder
-// cannot write a request that leaves items out of the middle of its
-// history, so the responses after such a change carry no request hash.
+// describes what a request leaves out with the format's omit setting,
+// so the responses after such a change keep their request hash.
 func (a *Agent) SetConfig(cfg Config) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -322,12 +377,17 @@ func (a *Agent) SetConfig(cfg Config) error {
 
 // SetTranscript replaces the transcript, as when switching to another
 // branch of a session, or when a handoff trims what the receiving
-// configuration sees, between runs and once. It returns [ErrRunning]
-// while a run is active. A session recorder writing the agent is moved
-// to match with its Rebase: to the entry of the last item kept, for a
-// trim that keeps a prefix, whose responses then carry hashes; a trim
-// from the middle runs as well and leaves the next responses without
-// one. A handoff to another model need not trim the previous model's
+// configuration sees, between runs and once. A handoff's trim must
+// leave a transcript the receiver can continue ([CanContinue]): one
+// that would leave a model output last, a transfer's preamble once its
+// call is trimmed, is continued with a developer message naming the
+// transfer, the sender and the receiver as the next run's prompt, as the
+// handoff package does, so a recorder writes it. It returns
+// [ErrRunning] while a run is active. A session recorder writing the agent describes
+// a trim the format can describe, items left out with their order kept,
+// outputs or images sent as a placeholder, with an omit before the next
+// response, which keeps its hash; one that moves to another branch of
+// the record is the session package's MoveTo. A handoff to another model need not trim the previous model's
 // reasoning items: the loop leaves them out of each request, as
 // [Agent.SetConfig] says, for every item it attributed, which the new
 // transcript keeps when it holds the same item. A transcript rebuilt
@@ -441,6 +501,9 @@ type State struct {
 	// transcript. Continue refuses until Resume has answered them, and
 	// Prompt unless it opens with their outputs.
 	Pending []PendingCall
+	// Held is true while [Agent.WhileIdle] holds the agent: no run
+	// starts and [Agent.Deliver] refuses with [ErrHeld].
+	Held bool
 	// Notes are the notes the last run owed after outputs already in the
 	// transcript and could not append ([RunEnd.Notes]), which the next
 	// run appends first.
@@ -461,6 +524,7 @@ func (a *Agent) State() State {
 		Steered:    queuedItems(a.steer),
 		Queued:     queuedItems(a.followUp),
 		Pending:    append([]PendingCall(nil), a.pending...),
+		Held:       a.held,
 		Notes:      slices.Clone(a.notes),
 	}
 }
@@ -475,6 +539,51 @@ func (a *Agent) State() State {
 // item is left out.
 func WithNotes(notes []Note) Option {
 	return func(a *Agent) { a.notes = liveNotes(notes) }
+}
+
+// WhileIdle runs fn while no run is active and none can start: a
+// prompt, a continue, a resume or a delivery that would start a run is
+// refused with [ErrRunning] until fn returns. The check that the agent
+// is idle and the hold are one step, as a run's start is, so fn sees no
+// run begin between the two. A delivery refused meanwhile queues
+// nothing. It returns [ErrRunning] without calling fn
+// while a run is active or another WhileIdle holds the agent, and
+// otherwise what fn returns. fn may call the agent's setters,
+// [Agent.SetTranscript], [Agent.SetPending], [Agent.SetNotes],
+// [Agent.SetReasoningModels] and the others, which a run would refuse;
+// it must not start a run, which is refused. This is how a host makes a
+// change of several steps one operation, such as a rewind that moves a
+// record and the agent with it (#220).
+func (a *Agent) WhileIdle(fn func() error) error {
+	a.mu.Lock()
+	if a.running || a.held {
+		a.mu.Unlock()
+		return ErrRunning
+	}
+	a.held = true
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.held = false
+		a.mu.Unlock()
+	}()
+	return fn()
+}
+
+// SetReasoningModels says which model produced the reasoning items of
+// the transcript, as [WithReasoningModels] does for a new agent: after
+// [Agent.SetTranscript] to a branch of a session, with what the session
+// package's TranscriptModels reads there. What it says is added to what
+// the agent knows, item by item. It returns [ErrRunning] while a run is
+// active.
+func (a *Agent) SetReasoningModels(m ReasoningModels) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		return ErrRunning
+	}
+	a.reasoning = a.reasoning.merged(m)
+	return nil
 }
 
 // SetNotes replaces the notes the next run appends first, as
@@ -516,12 +625,16 @@ func (a *Agent) Prompt(ctx context.Context, items ...openresponses.Item) (*RunEn
 	return a.run(ctx, items, nil, nil, false, false)
 }
 
-// Continue runs from the transcript as it stands, which must satisfy
-// [CanContinue], and returns as [Agent.Prompt] does.
+// Continue runs from the transcript as it stands with the steered
+// items queued, which the run's first turn takes before its model
+// call, and returns as [Agent.Prompt] does. The two together must
+// satisfy [CanContinue], so a delivery a host handed back with
+// [Agent.Redeliver] starts the run that takes it although the
+// transcript ends with the model's answer.
 func (a *Agent) Continue(ctx context.Context) (*RunEnd, error) {
 	a.mu.Lock()
 	pending := len(a.pending) > 0
-	ok := CanContinue(a.transcript)
+	ok := CanContinue(append(append(Transcript(nil), a.transcript...), unhideAll(queuedItems(a.steer))...))
 	a.mu.Unlock()
 	if pending {
 		return nil, ErrInputRequired
@@ -595,6 +708,13 @@ type Answer struct {
 	// can tie the output it writes to the one it repeats and to the
 	// child session that produced it. Empty for any other answer.
 	Origin string
+	// Failed, for an output, says the output reports the call failed:
+	// the call was given up, as one cut off whose outcome is unknown,
+	// or the caller ran it and it failed. [OutcomeUnknown] sets it. The
+	// loop carries it unread, on the run's context with
+	// [ContextWithFailures], so a session recorder marks the output's
+	// entry failed. A refusal is not a failure and does not set it.
+	Failed bool
 	// IdempotencyKey, for an approval, is the key the tool receives in
 	// place of the one the loop would give it: the pending call's, for
 	// a call that may have run, and a new one otherwise. A key names one
@@ -648,14 +768,20 @@ func Refuse(out *openresponses.FunctionCallOutput) Answer {
 // [OutcomeUnknown] carries until [Answer.WithReason] gives another.
 const OutcomeUnknownReason = "not run again: outcome unknown"
 
+// errOutcomeUnknown is what a call that may have run and must not run
+// again is answered with: the output of [OutcomeUnknown], and the error
+// a nested call matched to one is given.
+var errOutcomeUnknown = errors.New("outcome unknown: the call was cut off after it was handed to its tool, and it may or may not have taken effect; check before calling it again")
+
 // OutcomeUnknown answers a pending call that may have run and must not
 // run again with the error agenttool's replay rule asks for, so the
 // model sees that the call may or may not have taken effect and can
 // check before it asks again. It carries [OutcomeUnknownReason].
 func OutcomeUnknown(callID string) Answer {
-	res := agenttool.ErrorResult(errors.New("outcome unknown: the call was cut off after it was handed to its tool, and it may or may not have taken effect; check before calling it again"))
+	res := agenttool.ErrorResult(errOutcomeUnknown)
 	a := Output(&openresponses.FunctionCallOutput{CallID: callID, Output: res.Output})
 	a.Reason = OutcomeUnknownReason
+	a.Failed = true
 	return a
 }
 
@@ -696,6 +822,13 @@ func (a Answer) WithReason(reason string) Answer {
 // for an output a record held rather than one produced now.
 func (a Answer) WithOrigin(origin string) Answer {
 	a.Origin = origin
+	return a
+}
+
+// WithFailed returns the output answer marked as reporting that the
+// call failed: see [Answer.Failed].
+func (a Answer) WithFailed() Answer {
+	a.Failed = true
 	return a
 }
 
@@ -787,6 +920,7 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 	var notes []answerNote
 	var approved []approval
 	deciders, reasons, origins := map[string]string{}, map[string]string{}, map[string]string{}
+	failures := map[string]bool{}
 	terminate := false
 	for _, ans := range answers {
 		p, ok := byID[ans.CallID]
@@ -806,12 +940,15 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 			if ans.Origin != "" {
 				origins[ans.CallID] = ans.Origin
 			}
+			if ans.Failed {
+				failures[ans.CallID] = true
+			}
 			if ans.Note != "" {
 				notes = append(notes, answerNote{callID: ans.CallID, item: answerNoteItem(ans.Note, ans.By)})
 			}
 			continue
 		}
-		if p.Reason == PendingAnswered || p.Reason == PendingRejected {
+		if p.Reason == PendingAnswered || p.Reason == PendingRejected || p.Reason == PendingReturned {
 			return nil, fmt.Errorf("%w: %q", ErrCallAnswered, ans.CallID)
 		}
 		key := ans.IdempotencyKey
@@ -842,16 +979,18 @@ func (a *Agent) Resume(ctx context.Context, answers ...Answer) (*RunEnd, error) 
 		if p.Reason == PendingDeferred && p.Decision != nil {
 			held = p.Decision.Note
 		}
-		approved = append(approved, approval{call: p.Call, args: args, note: ans.Note, held: held, by: ans.By, reason: reason, key: key, decide: p.Reason == PendingUndispatched})
+		approved = append(approved, approval{call: p.Call, args: args, note: ans.Note, held: held, by: ans.By, reason: reason, key: key, decide: p.Reason == PendingUndispatched, nested: p.Nested})
 	}
 	if len(byID) > 0 {
 		return nil, fmt.Errorf("%w: %d pending call(s) unanswered", ErrNotPending, len(byID))
 	}
 	// An output the caller wrote raises no tool_start, so the decider
-	// of an answer of that kind, its reason and where its output was
-	// taken from ride on the run's context, where a recorder writing
-	// the decision and the output for it finds them.
+	// of an answer of that kind, its reason, where its output was
+	// taken from and whether it reports a failure ride on the run's
+	// context, where a recorder writing the decision and the output for
+	// it finds them.
 	ctx = ContextWithOrigins(ContextWithReasons(ContextWithDeciders(ctx, deciders), reasons), origins)
+	ctx = ContextWithFailures(ctx, failures)
 	return a.run(ctx, outputs, notes, approved, true, terminate)
 }
 
@@ -871,26 +1010,33 @@ func mayRunAgain(ctx context.Context, cfg Config, p PendingCall, args json.RawMe
 	if !ok {
 		return "", nil
 	}
-	args = orEmpty(args, call.Arguments)
-	ctx = agenttool.WithCall(ctx, agenttool.Call{ID: call.CallID, Args: args, IdempotencyKey: key})
+	return runAgain(ctx, tool, call.CallID, orEmpty(args, call.Arguments), key, orEmpty(p.Args, call.Arguments), p.IdempotencyKey)
+}
+
+// runAgain is agenttool's rule for running a call that may have run
+// again: tool's replay for args, asked under the call callID and key,
+// the key it would run under, given prior and priorKey, the arguments
+// and the key of the hand-off it repeats.
+func runAgain(ctx context.Context, tool agenttool.Tool, callID string, args json.RawMessage, key string, prior json.RawMessage, priorKey string) (string, error) {
+	ctx = agenttool.WithCall(ctx, agenttool.Call{ID: callID, Args: args, IdempotencyKey: key})
 	switch agenttool.ReplayOf(ctx, tool, args) {
 	case agenttool.ReplaySafe:
 		return RunAgainSafeReason, nil
 	case agenttool.ReplayKeyed:
-		same := sameArgs(args, orEmpty(p.Args, call.Arguments))
+		same := sameArgs(args, prior)
 		switch {
 		case key == "":
-			return "", fmt.Errorf("%w: %q is keyed and the key of the dispatch it repeats is not known", ErrAmbiguousCall, call.CallID)
-		case same && p.IdempotencyKey == "":
-			return "", fmt.Errorf("%w: %q is keyed and the key of the dispatch it repeats is not known, so another key would run it as a new operation", ErrAmbiguousCall, call.CallID)
-		case same && key != p.IdempotencyKey:
-			return "", fmt.Errorf("%w: %q is keyed and would run again under another key than the dispatch it repeats, as a new operation", ErrAmbiguousCall, call.CallID)
-		case !same && key == p.IdempotencyKey:
-			return "", fmt.Errorf("%w: %q is keyed and would run again with other arguments under the key of the dispatch it repeats", ErrAmbiguousCall, call.CallID)
+			return "", fmt.Errorf("%w: %q is keyed and the key of the dispatch it repeats is not known", ErrAmbiguousCall, callID)
+		case same && priorKey == "":
+			return "", fmt.Errorf("%w: %q is keyed and the key of the dispatch it repeats is not known, so another key would run it as a new operation", ErrAmbiguousCall, callID)
+		case same && key != priorKey:
+			return "", fmt.Errorf("%w: %q is keyed and would run again under another key than the dispatch it repeats, as a new operation", ErrAmbiguousCall, callID)
+		case !same && key == priorKey:
+			return "", fmt.Errorf("%w: %q is keyed and would run again with other arguments under the key of the dispatch it repeats", ErrAmbiguousCall, callID)
 		}
 		return RunAgainKeyedReason, nil
 	}
-	return "", fmt.Errorf("%w: %q", ErrAmbiguousCall, call.CallID)
+	return "", fmt.Errorf("%w: %q", ErrAmbiguousCall, callID)
 }
 
 // orEmpty is args, else the call's own arguments, an empty object
@@ -976,7 +1122,7 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, notes []
 	if err := a.cfg.validate(); err != nil {
 		return nil, err
 	}
-	if a.running {
+	if a.running || a.held {
 		return nil, ErrRunning
 	}
 	if err := TriggerFromContext(ctx).Validate(); err != nil {
@@ -1036,6 +1182,7 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, notes []
 			prior:       prior,
 			reserved:    a.reserved,
 			reasoning:   a.reasoning.merged(reasoningFromContext(ctx)),
+			quarantine:  inheritQuarantine(ctx, a.quarantine),
 			runID:       runID,
 			resuming:    resuming,
 			notes:       held,
@@ -1308,6 +1455,26 @@ func (a *Agent) Queue(ctx context.Context, mode QueueMode, items ...openresponse
 	return nil
 }
 
+// Redeliver queues items as [Agent.Deliver] queues them, a steer that
+// reaches the turn that takes it as [InputDeliver] and is reported with
+// that Input, with the [Trigger] on ctx, but neither waits nor starts a
+// run: it is how a host hands back a delivery a record owes, before
+// the agent's first run, as agentturn/session's Requeue does. The host
+// then starts the run that takes it when nothing else will, with
+// [Agent.Continue], or leaves it for the resume while calls are
+// pending. A trigger whose Extra cannot be written is refused with
+// [ErrTriggerExtra], and nothing is queued.
+func (a *Agent) Redeliver(ctx context.Context, items ...openresponses.Item) error {
+	trigger := TriggerFromContext(ctx)
+	if err := trigger.Validate(); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.queue(trigger, QueueSteer, InputDeliver, items)
+	return nil
+}
+
 // Deliver hands items to the model, for an input that arrives on its
 // own time: a background task's result, a detached child's answer. The
 // items are queued as [Agent.Queue] queues a steer, with the [Trigger]
@@ -1332,6 +1499,15 @@ func (a *Agent) Queue(ctx context.Context, mode QueueMode, items ...openresponse
 // joined false. The stop is not repeated for the delivered items: a
 // host that wants it to stick reads the reason on the end returned and
 // on the run it asked for, or aborts the run Deliver started.
+//
+// A run that ended on a terminating result is the exception: what the
+// result says is the host's to read, a handoff's transfer whose
+// receiver the host continues under its own configuration among it, so
+// while no run has started since, Deliver starts none, leaves the items
+// queued for the host's next run, which takes them before its first
+// model call, and returns [ErrTerminated] with that run's end. A
+// delivery that arrives once the receiver's run is in flight joins it
+// as any delivery does.
 //
 // A run that drained the items and then ended before a model call, on
 // a guard before the call, an abort or a failure, has them in its
@@ -1358,6 +1534,13 @@ func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joine
 		return false, nil, err
 	}
 	a.mu.Lock()
+	if a.held {
+		// No run starts during WhileIdle, so the items would wait for
+		// whatever the hold made of the agent: refused before anything
+		// is queued.
+		a.mu.Unlock()
+		return false, nil, ErrHeld
+	}
 	drains, before := a.drains, len(a.steer)
 	a.queue(TriggerFromContext(ctx), QueueSteer, InputDeliver, items)
 	if len(a.steer) == before {
@@ -1411,6 +1594,14 @@ func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joine
 	if len(a.pending) > 0 {
 		a.mu.Unlock()
 		return false, nil, ErrInputRequired
+	}
+	if end := a.lastEnd; end != nil && end.Reason == ReasonStopped && (end.Cause == StopTerminate || end.Cause == StopPartialTerminate) {
+		// A terminating result is the host's to read: a run started
+		// here would answer under the configuration that handed the
+		// conversation off, and race the host's switch to the
+		// receiver, whose run takes the items instead (#274, #290).
+		a.mu.Unlock()
+		return false, end, ErrTerminated
 	}
 	if !CanContinue(append(append(Transcript(nil), a.transcript...), unhideAll(queuedItems(a.steer))...)) {
 		a.mu.Unlock()
@@ -1487,7 +1678,7 @@ func (a *Agent) queue(trigger Trigger, mode QueueMode, how InputMode, items open
 		} else {
 			a.followUp = append(a.followUp, entry)
 		}
-		a.queued = append(a.queued, &Queued{RunID: runID, Item: base, Mode: mode, Hidden: hidden, Trigger: trigger})
+		a.queued = append(a.queued, &Queued{RunID: runID, Item: base, Mode: mode, Input: how, Hidden: hidden, Trigger: trigger})
 	}
 }
 

@@ -72,6 +72,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The tags, so it can tell whether the tree is still the release
+          # a require names; see check-extracted.sh.
+          fetch-depth: 0
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod

@@ -139,6 +139,28 @@ func (t Trigger) IsZero() bool {
 	return t.Kind == "" && t.Ref == "" && t.Source == "" && len(t.Extra) == 0
 }
 
+// TriggerCallee is the kind of a [Trigger] naming the call whose
+// callee's late result an input carries: a detached call's, whose
+// output said the callee was working, its answer delivered turns
+// later. Ref is the call's ID, and the Extra member "task", when
+// present, the callee's task. A session recorder writes an item
+// delivered or queued under it with from_link naming that call's peer
+// link (RFC 0001 Composition, as a peer). [CalleeTrigger] builds one.
+const TriggerCallee = "callee"
+
+// CalleeTrigger returns the [TriggerCallee] trigger for the late result
+// of the call callID, from its callee's task when task is not empty. A
+// host delivers a detached call's result under it:
+//
+//	a.Deliver(agentturn.ContextWithTrigger(ctx, agentturn.CalleeTrigger(callID, task)), item)
+func CalleeTrigger(callID, task string) Trigger {
+	t := Trigger{Kind: TriggerCallee, Ref: callID}
+	if task != "" {
+		t.Extra = map[string]any{"task": task}
+	}
+	return t
+}
+
 // String returns "kind:ref", or whichever of the two is set.
 func (t Trigger) String() string {
 	switch {
@@ -194,8 +216,11 @@ func (*TurnStart) EventType() string { return EventTurnStart }
 type ModelRetry struct {
 	RunID string
 	Turn  int
-	// Attempt is the number of the attempt that failed, from 1; the
-	// next attempt is Attempt+1.
+	// Attempt is the number of the attempt that failed, from 1, counting
+	// every call the turn made; the next attempt is Attempt+1. A fold
+	// after a context-length refusal is one of them, though the retry
+	// policy does not count it: [Retry.Revise] and [Retry.Backoff] are
+	// given the policy's own count.
 	Attempt int
 	Err     error
 	Delay   time.Duration
@@ -216,11 +241,22 @@ func (*ModelRetry) EventType() string { return EventModelRetry }
 // a recorder can write the call that was refused as distinct from one
 // that was made and failed. The run ends with ReasonError, or with
 // ReasonStopped and StopGuard when Err wraps [ErrGuard].
+//
+// It also reports a call the model, or a wrapper around it, refused
+// with an error marked as a guard's before the attempt committed to an
+// answer: then it follows the turn's turn_start, in place of the
+// response_end, Request is the request sent, and Usage is what the
+// provider reported for the call, nil when it reported none, so a call
+// that may have been billed is counted. The run ends with
+// ReasonStopped and StopGuard.
 type ModelBlocked struct {
 	RunID   string
 	Turn    int
 	Request openresponses.Request
 	Err     error
+	// Usage is what the provider reported for a call the model's guard
+	// refused, nil otherwise.
+	Usage *openresponses.Usage
 }
 
 // EventType returns "model_blocked".
@@ -256,6 +292,9 @@ type ItemStart struct {
 	// in the model's context and a renderer should not show it. The
 	// Item is the item itself, unwrapped.
 	Hidden bool
+	// Copied is set for an item the caller marked with [Copied]: taken
+	// from another conversation, not produced in this one.
+	Copied bool
 }
 
 // EventType returns "item_start".
@@ -265,6 +304,10 @@ func (*ItemStart) EventType() string { return EventItemStart }
 // openresponses event verbatim, so a front switches on the same concrete
 // types it would use against a remote server. Item is the accumulated
 // item so far.
+//
+// The Item of an ItemStart and an ItemUpdate is a snapshot: the item as
+// accumulated at that event, which later events of the stream do not
+// change, so a subscriber that keeps the event draws what it said.
 type ItemUpdate struct {
 	RunID  string
 	Turn   int
@@ -301,6 +344,11 @@ type ItemEnd struct {
 	// in the model's context and a renderer should not show it. A
 	// session recorder writes its entry with visible false.
 	Hidden bool
+	// Copied is set for an item the caller marked with [Copied]: taken
+	// from another conversation, as a child prompted with its parent's
+	// is. A session recorder writes its entry with copied_from, and no
+	// decision for a call so marked or for its output.
+	Copied bool
 	// Trigger, for an item the run was prompted with, is the run's
 	// [Trigger], so a recorder can write how the input arrived; it is
 	// zero for every other item, a queued input included, whose own
@@ -371,6 +419,14 @@ type ToolStart struct {
 	// no function_call item in the transcript: it is the work of the
 	// call that made it.
 	Parent string
+	// Invoked are the arguments a nested call was invoked with, before
+	// a decision rewrote them into Args, so a recorder can match the
+	// call when its parent runs again; nil for a call the model made.
+	Invoked json.RawMessage
+	// Replayed says a nested call matched one on the record that had
+	// ended: no decision is made, nothing is dispatched, and its
+	// tool_end carries the recorded result ([PendingCall.Nested]).
+	Replayed bool
 }
 
 // EventType returns "tool_start".
@@ -457,6 +513,18 @@ type ToolEnd struct {
 	// subscriber failed writes so, and the call reads as never started
 	// rather than as one that may have run.
 	Withdrawn bool
+	// Cut says the call was cut off, by a cancellation or by a failure
+	// of the run, before it had a result of its own: Err is the
+	// cancellation or the failure, its output is not appended, and the
+	// call is left pending. A call that settled with a result of its own
+	// is not cut, and the batch appends its output with the others: a
+	// recorder that sees such a call settle while other calls of the
+	// batch still run keeps its result, so a process that dies before
+	// the batch's outputs are appended does not run it again.
+	Cut bool
+	// Replayed says the result is the one a record held for a nested
+	// call that had ended, given again without running its tool.
+	Replayed bool
 }
 
 // EventType returns "tool_end".
@@ -534,8 +602,15 @@ type RunEnd struct {
 	// context.Canceled when there was none, wrapping the failure of a
 	// subscriber or a hook when one failed for a reason of its own
 	// while the run was being aborted; and to the guard's error when
-	// Reason is ReasonStopped with Cause StopGuard.
+	// Reason is ReasonStopped with Cause StopGuard. The failure also
+	// rides on its own, as Failure.
 	Err error
+	// Failure is the failure of a subscriber or a hook that failed for
+	// a reason of its own while the run was being aborted, the one Err
+	// wraps beside the cause, and nil otherwise. A front renders the
+	// reason; a host that keeps a record checks Failure, since a
+	// non-nil one means the record of the run may be short.
+	Failure error
 	// Pending lists the function calls in the transcript with no
 	// function_call_output, in transcript order, each with why: the
 	// calls a deferred decision handed to the caller when Reason is
@@ -555,8 +630,9 @@ type RunEnd struct {
 	// calls pending the notes are on [PendingCall.Notes] instead.
 	Notes []Note
 	// Withheld says the run ended because [Config.OutputGuard]
-	// withheld a message, with Reason ReasonStopped and Cause
-	// StopGuard: the model's last word was kept from the transcript,
+	// withheld a message, or the model call failed with an error
+	// wrapping [ErrGuard] after its response began, with Reason
+	// ReasonStopped and Cause StopGuard: the model's last word was kept from the transcript,
 	// so whatever message Items end with was said before it and is no
 	// answer, and Answer reports none.
 	Withheld bool
@@ -637,6 +713,15 @@ const (
 	// [ErrCallAnswered]. Only [WithPending] and [Agent.SetPending] give
 	// it; a live run never leaves one.
 	PendingRejected PendingReason = "rejected"
+	// PendingReturned: a record says the call's tool returned, a
+	// result, before its output joined the transcript: a crash while
+	// the rest of its batch ran. Its outcome is known and is in Ran, so
+	// it is owed that output, or another the caller writes in its
+	// place, and nothing else: [Agent.Resume] refuses an approval of it
+	// with [ErrCallAnswered], and it is never run again. Only
+	// [WithPending] and [Agent.SetPending] give it; a live run never
+	// leaves one.
+	PendingReturned PendingReason = "returned"
 )
 
 // PendingCall is a function call with no output and the reason it has
@@ -672,12 +757,14 @@ type PendingCall struct {
 	// unless the answer carries its own.
 	Args json.RawMessage
 	// Ran is the output the call has where it ran, when a record shows
-	// it dispatched and completed off the path the agent continues: on
-	// a branch a rebase left, or in the session this one forks. The
-	// loop never sets it; agentturn/session's Pending does, from the
-	// record, and its ReplayAnswers answers the call with it rather
-	// than running the call again, as a host answering the call itself
-	// should. nil for every other call.
+	// it dispatched and completed off the path the agent continues, on
+	// a branch a rebase left or in the session this one forks, or shows
+	// its tool returned before its output joined the path, a call
+	// pending as [PendingReturned]. The loop never sets it;
+	// agentturn/session's Pending does, from the record, and its
+	// ReplayAnswers answers the call with it rather than running the
+	// call again, as a host answering the call itself should. nil for
+	// every other call.
 	Ran *openresponses.FunctionCallOutput
 	// RanWhere says where the call ran, for a call with Ran: the reason
 	// an answer giving that output carries.
@@ -724,6 +811,72 @@ type PendingCall struct {
 	// an agent seeded with the pending calls ([WithPending]) appends
 	// them as the one that held them would have.
 	Notes []Note
+	// Nested are the nested calls a record holds under the call, its
+	// tool's and theirs, in the order the record first names each: what
+	// the call's tool did through [Invoke] the last times it ran. When
+	// the call runs again its tool's invocations are matched against
+	// them, so a nested call already on the record keeps its ID and its
+	// key, and one that ended returns its recorded result without
+	// running; see [NestedRecord]. agentturn/session's Pending sets it
+	// from the record; the loop carries it onto the pending list of a
+	// run that leaves the call pending, with the nested calls that run
+	// made under it.
+	Nested []NestedRecord
+}
+
+// NestedRecord is what a record holds of one nested call, a call a
+// tool made through [Invoke], for matching the invocations of the
+// tool's next run against it. Under one parent, the k-th invocation of
+// a tool with JSON-equal arguments matches the k-th record of that
+// tool with those arguments, whatever order the invocations arrive in.
+type NestedRecord struct {
+	// CallID is the nested call's ID and Parent the call whose tool
+	// made it.
+	CallID string
+	Parent string
+	Name   string
+	// Args are the arguments the tool invoked it with, before a
+	// decision rewrote them: what an invocation is matched on.
+	Args json.RawMessage
+	// Dispatched says it was handed to its tool, a hand-off no consumer
+	// withdrew, so it may have run. IdempotencyKey is the key of its
+	// last hand-off and DispatchArgs the arguments it ran with, nil when
+	// they are Args.
+	Dispatched     bool
+	IdempotencyKey string
+	DispatchArgs   json.RawMessage
+	// Ended says it settled with a result of its own, or a refusal, and
+	// was not cut off: Result and Err are what the invoking tool was
+	// given, and a matched invocation is given them again. A call that
+	// was cut off has not ended.
+	Ended  bool
+	Result agenttool.Result
+	Err    string
+	// Blocked says a decision refused the call, and Reason is that
+	// refusal's reason, which a replayed tool_end carries again.
+	Blocked bool
+	Reason  string
+}
+
+// RecordedDetails is a Details value as a record kept it: the namespace
+// and the JSON of an agenttool.Recordable, given back on the result of
+// a nested call replayed from a record, so a recorder reading it, or
+// agenttool.RecordOf, gets the record it was. The Go value it was made
+// from does not survive the record.
+type RecordedDetails struct {
+	NS   string
+	Data json.RawMessage
+}
+
+// RecordNS returns the namespace the record was kept under.
+func (d RecordedDetails) RecordNS() string { return d.NS }
+
+// MarshalJSON returns the record's JSON as kept.
+func (d RecordedDetails) MarshalJSON() ([]byte, error) {
+	if len(d.Data) == 0 {
+		return []byte("null"), nil
+	}
+	return d.Data, nil
 }
 
 // Note is a note waiting on the outputs of its batch: the item and how
@@ -800,9 +953,9 @@ func (q *OpenQuestion) Reason() string {
 // MayHaveRun reports whether the call may have run and an approval of
 // it is held to agenttool's replay rule: it is pending as
 // [PendingAborted] or [PendingUnknown], or deferred after it was
-// dispatched. A call pending as [PendingAnswered] may have run too,
-// but it is owed an output and no approval, as one pending as
-// [PendingRejected] is.
+// dispatched. A call pending as [PendingAnswered] or [PendingReturned]
+// may have run too, or did, but it is owed an output and no approval,
+// as one pending as [PendingRejected] is.
 func (p PendingCall) MayHaveRun() bool {
 	return p.Reason == PendingAborted || p.Reason == PendingUnknown || p.Reason == PendingDeferred && p.Dispatched
 }
@@ -855,6 +1008,12 @@ type Queued struct {
 	// since how an item arrived is a fact about the turn, and the queue
 	// it waited in a fact about the agent.
 	Mode QueueMode
+	// Input says how the item arrived: [InputSteer] or [InputFollowUp]
+	// for an item queued, and [InputDeliver] for one delivered, which
+	// must reach the model and for which [Agent.Deliver] starts a run
+	// when none takes it. A recorder writes it on the queued entry, so
+	// an input owed after a restart is handed back the way it arrived.
+	Input InputMode
 	// Hidden is set for an item the caller marked with [Hidden].
 	Hidden bool
 	// Trigger is what brought the item in, from the context given to

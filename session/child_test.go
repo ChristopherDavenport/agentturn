@@ -2,7 +2,9 @@ package session
 
 import (
 	"context"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/ChristopherDavenport/agentsession"
@@ -428,4 +430,308 @@ func (m *twoCalls) CreateStream(_ context.Context, req openresponses.Request, si
 		}
 	}
 	return em.Complete()
+}
+
+// TestChildSessionIsNamedAfterItsConfiguration pins RFC 0001's The
+// record: a session a recorder creates for a run under a named
+// configuration carries that name as its display name, an info entry
+// before the run's first entry, whether the child run was observed or
+// written from its items (#292).
+func TestChildSessionIsNamedAfterItsConfiguration(t *testing.T) {
+	for _, observed := range []bool{true, false} {
+		name := "unobserved"
+		if observed {
+			name = "observed"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			childCfg := agentturn.Config{Name: "alice", Description: "a teammate", Model: &echo.Adapter{}}
+			var opts []agent.Option
+			if observed {
+				opts = append(opts, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+			}
+			alice := agent.New(childCfg, opts...)
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{alice}})
+			defer rec.Attach(a)()
+			if _, err := a.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
+				t.Fatal(err)
+			}
+			l := links(s)
+			if len(l) != 1 {
+				t.Fatalf("links = %+v", l)
+			}
+			child, err := store.Open(context.Background(), l[0].Session)
+			if err != nil {
+				t.Fatal(err)
+			}
+			es := child.Entries()
+			if len(es) == 0 {
+				t.Fatal("child session is empty")
+			}
+			info, ok := es[0].(*agentsession.InfoEntry)
+			if !ok || info.Name != "alice" {
+				t.Errorf("child's first entry = %#v, want info named alice; entries %q", es[0], entryTypes(child))
+			}
+			n := 0
+			for _, e := range es {
+				if _, ok := e.(*agentsession.InfoEntry); ok {
+					n++
+				}
+			}
+			if n != 1 {
+				t.Errorf("child holds %d info entries, want 1", n)
+			}
+			verifyAll(t, child)
+		})
+	}
+}
+
+// TestObservedChildRecordsItsQueuedInputs pins RFC 0001's The record:
+// an observed child's queued reports are among the events its session
+// is written from. One that names the child's run goes to that run's
+// session; one that names no run, steered before the run starts or
+// delivered while the child is idle, goes to the session of the run
+// that takes it, so the item that drains it names it in queued_from
+// with its trigger as source (#289).
+func TestObservedChildRecordsItsQueuedInputs(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var child *agentturn.Agent
+	ping := agenttool.New("ping", "ping", func(ctx context.Context, _ echoArgs) (string, error) {
+		// Mid-run: the report names the child's run.
+		child.Steer(openresponses.UserText("mid-run"))
+		return "pong", nil
+	})
+	childCfg := agentturn.Config{Name: "helper", Model: scriptedCalls{{"ping", `{"text":"t"}`}}, Tools: []agenttool.Tool{ping}}
+	helper := agent.New(childCfg,
+		agent.WithObserver(rec.Observe),
+		agent.WithRunContext(rec.ChildContext),
+		agent.WithSpawn(func(_ string, c *agentturn.Agent) {
+			child = c
+			// Before the run starts: the report names no run.
+			c.Steer(openresponses.UserText("before"))
+		}))
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{helper}})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
+		t.Fatal(err)
+	}
+	// Idle: the delivery names no run and starts the one that takes it.
+	ctx := agentturn.ContextWithTrigger(context.Background(), agentturn.Trigger{Kind: "timer", Ref: "t1"})
+	if _, _, err := child.Deliver(ctx, openresponses.UserText("idle")); err != nil {
+		t.Fatal(err)
+	}
+	l := links(s)
+	if len(l) != 1 {
+		t.Fatalf("links = %+v", l)
+	}
+	cs, err := store.Open(context.Background(), l[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued := map[string]*agentsession.QueuedEntry{}
+	drained := map[string]*agentsession.ItemEntry{}
+	for _, e := range cs.Entries() {
+		switch v := e.(type) {
+		case *agentsession.QueuedEntry:
+			if m, ok := v.Item.(*openresponses.Message); ok {
+				queued[m.Text()] = v
+			}
+		case *agentsession.ItemEntry:
+			if m, ok := v.Item.(*openresponses.Message); ok && v.QueuedFrom != "" {
+				drained[m.Text()] = v
+			}
+		}
+	}
+	for _, text := range []string{"before", "mid-run", "idle"} {
+		q, d := queued[text], drained[text]
+		if q == nil {
+			t.Errorf("%s: no queued entry in %q", text, entryTypes(cs))
+			continue
+		}
+		if d == nil || d.QueuedFrom != q.ID {
+			t.Errorf("%s: drained item = %+v, want queued_from %s", text, d, q.ID)
+		}
+	}
+	if d := drained["idle"]; d != nil && (d.Source == nil || d.Source.Kind != "timer" || d.Source.Ref != "t1") {
+		t.Errorf("idle delivery's source = %+v, want timer:t1", d.Source)
+	}
+	// The delivery is recorded as one (#244), and the child's header
+	// promises the queued entries it is written with.
+	if q := queued["idle"]; q != nil && !q.Deliver {
+		t.Errorf("idle delivery's entry = %+v, want deliver", q)
+	}
+	if q := queued["before"]; q != nil && q.Deliver {
+		t.Errorf("steer's entry = %+v, want no deliver", q)
+	}
+	if !slices.Contains(cs.Header().Records, agentsession.TypeQueued) {
+		t.Errorf("child header promises %v, want queued among them", cs.Header().Records)
+	}
+	verifyAll(t, cs)
+}
+
+// TestAnObservedChildsLateInputIsWrittenThoughItNeverRunsAgain pins
+// RFC 0001's tool_end row for an observed child: an input the child
+// accepts while its run's end is being delivered is reported after
+// that end, naming no run, and is written to the child's session when
+// it is reported, so it is on the record although the child never runs
+// again to take it.
+func TestAnObservedChildsLateInputIsWrittenThoughItNeverRunsAgain(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := agent.New(agentturn.Config{Name: "helper", Model: &echo.Adapter{}},
+		agent.WithObserver(rec.Observe),
+		agent.WithRunContext(rec.ChildContext),
+		agent.WithSpawn(func(_ string, c *agentturn.Agent) {
+			c.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+				if _, ok := ev.(*agentturn.RunEnd); ok {
+					c.Steer(openresponses.UserText("late"))
+				}
+				return nil
+			})
+		}))
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{helper}, MaxTurns: 1})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
+		t.Fatal(err)
+	}
+	l := links(s)
+	if len(l) != 1 {
+		t.Fatalf("links = %+v", l)
+	}
+	cs, err := store.Open(context.Background(), l[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deliveries(cs)["late"] == nil {
+		t.Errorf("no queued entry for the late input in %q", entryTypes(cs))
+	}
+	verifyAll(t, cs)
+}
+
+// reasonsThenDelegates reasons, then calls task once with fork set,
+// then answers once the output is in.
+type reasonsThenDelegates struct{}
+
+func (reasonsThenDelegates) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	r, err := em.Reasoning()
+	if err != nil {
+		return err
+	}
+	r.EncryptedContent("signed by " + req.Model)
+	if err := r.Close(); err != nil {
+		return err
+	}
+	if _, ok := req.Input[len(req.Input)-1].(*openresponses.FunctionCallOutput); ok {
+		msg, err := em.Message(openresponses.PhaseFinalAnswer)
+		if err != nil {
+			return err
+		}
+		if err := msg.Text("done"); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	call, err := em.FunctionCall("", "task")
+	if err != nil {
+		return err
+	}
+	if err := call.Arguments(`{"input":"go on"}`); err != nil {
+		return err
+	}
+	if err := call.Close(); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// countsReasoning answers every request and records, for each, the
+// reasoning items it carried.
+type countsReasoning struct {
+	mu   sync.Mutex
+	sent []int
+}
+
+func (m *countsReasoning) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	n := 0
+	for _, item := range req.Input {
+		if _, ok := item.(*openresponses.ReasoningItem); ok {
+			n++
+		}
+	}
+	m.mu.Lock()
+	m.sent = append(m.sent, n)
+	m.mu.Unlock()
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	msg, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := msg.Text("child done"); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestAChildOnAnotherModelIsNotSentTheParentsReasoning pins #242: the
+// context a tool runs under carries the run's reasoning attribution, so
+// a child on another model that WithCallConfig opens with the parent's
+// conversation leaves out the reasoning the parent's model produced, as
+// a configuration switch does, and its recorder describes the omission,
+// so the child's request still verifies. The shape is the round 9
+// nous-trajectories check S3.
+func TestAChildOnAnotherModelIsNotSentTheParentsReasoning(t *testing.T) {
+	type taskArgs struct {
+		Input string `json:"input"`
+	}
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	childModel := &countsReasoning{}
+	task := agent.New(agentturn.Config{Name: "task", Description: "does tasks", Model: childModel, ModelName: "child-model"},
+		agent.WithCallConfig(func(_ context.Context, a taskArgs, parent agentturn.Transcript, cfg agentturn.Config) (agentturn.Config, openresponses.Items, error) {
+			return cfg, append(append(openresponses.Items(nil), parent...), openresponses.UserText(a.Input)), nil
+		}),
+		agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+	a := agentturn.New(agentturn.Config{Model: reasonsThenDelegates{}, ModelName: "parent-model", Tools: []agenttool.Tool{task}})
+	defer rec.Attach(a)()
+	if end, err := a.Prompt(ctx, openresponses.UserText("delegate")); err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	if !slices.Equal(childModel.sent, []int{0}) {
+		t.Errorf("reasoning items child-model was sent per request = %v, want [0]", childModel.sent)
+	}
+	l := links(s)
+	if len(l) != 1 {
+		t.Fatalf("links = %+v", l)
+	}
+	child, err := store.Open(ctx, l[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := verifyAll(t, child); n != 1 {
+		t.Errorf("child responses = %d, want 1", n)
+	}
+	cx, err := child.Context()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cx.Settings.Omit.Items) != 1 {
+		t.Errorf("the child's omit = %+v, want the parent's reasoning item listed", cx.Settings.Omit)
+	}
+	verifyAll(t, s)
 }

@@ -254,10 +254,12 @@
 //   - tool_end with a tools/agent ChildInfo whose run was not observed:
 //     a session holding only the child's items, with no records
 //     promise, and the link; wire Observe to get the full record.
-//   - tool_start and tool_end of a call a tool made through
-//     agentturn.Invoke: a custom entry in the [NestedCallNS] namespace
-//     for each, carrying the parent call, the name, the arguments and
-//     what a hook decided, then the outcome. A nested call has no
+//   - tool_start, tool_dispatch and tool_end of a call a tool made
+//     through agentturn.Invoke: a custom entry in the [NestedCallNS]
+//     namespace for each, carrying the parent call, the name, the
+//     arguments and what a hook decided, then the key it was handed
+//     over with, then the outcome, none for a call given its recorded
+//     result again. A nested call has no
 //     function_call item for a dispatch or a decision to name, so until
 //     the format has a word for one these carry what a reader needs to
 //     count the calls a turn ran.
@@ -305,6 +307,13 @@
 //     the output is the harness's answer, and the answer's reason ties
 //     it to the branch left. A fork copies none, as it copies no
 //     child's link: the fork started none of that work.
+//   - a peer's late result: an input that arrived under
+//     agentturn.CalleeTrigger, a detached tools/a2a call's answer the
+//     host delivered, is written with format 0.14's from_link naming
+//     the latest peer link of that call on the path, to the task the
+//     trigger names when it names one, and none when there is no such
+//     link. The trigger rides on the queued entry, so an input owed
+//     across a restart names the link too.
 //
 // # Header
 //
@@ -441,6 +450,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"sync"
 	"time"
@@ -530,9 +540,15 @@ type FoldCall struct {
 
 // NestedCallNS is the namespace of the custom entries written for a
 // call a tool made through [agentturn.Invoke]. Its data is a
-// [NestedCall]: one entry with phase start before the call runs,
-// carrying the name, the arguments and what a hook decided, and one
-// with phase end carrying the outcome.
+// [NestedCall]: one entry with phase start when it is decided,
+// carrying the name, the arguments and what a hook decided, one with
+// phase dispatch when it is handed to its tool, carrying the key it
+// runs under, durable before the tool runs, and one with phase end
+// carrying the outcome. A call run again, its parent run again after a
+// restart, gets a dispatch and an end entry each time; one whose
+// recorded result is given again ([agentturn.ToolEnd.Replayed]) gets
+// none, since it did not run. [Pending] reads them into
+// [agentturn.PendingCall.Nested], so the call keeps its ID and its key.
 //
 // A nested call has no function_call item in the transcript, because it
 // is the work of the call that made it, and the format's dispatch and
@@ -554,18 +570,52 @@ type NestedCall struct {
 	Name   string `json:"name"`
 	// Args are the arguments the tool ran with, on the start entry.
 	Args json.RawMessage `json:"args,omitempty"`
+	// Invoked are the arguments the invoking tool gave, on the start
+	// entry when a decision rewrote them into Args: what the call is
+	// matched on when its parent runs again.
+	Invoked json.RawMessage `json:"invoked,omitempty"`
+	// IdempotencyKey is the key the call was handed to its tool with,
+	// on the dispatch entry.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 	// Verdict, Reason and By are what a hook decided about the call,
 	// or the user it deferred the call to through the elicitor, in the
-	// format's terms, on the start entry: proceed for a call allowed
+	// format's terms, on the start entry, and Reason the refusal's again
+	// on the end entry of a call refused: proceed for a call allowed
 	// with rewritten arguments or a reason, reject for one refused.
 	Verdict string `json:"verdict,omitempty"`
 	Reason  string `json:"reason,omitempty"`
 	By      string `json:"by,omitempty"`
-	// Output is the text the caller received and Error the failure, on
-	// the end entry.
-	Output string `json:"output,omitempty"`
-	Error  string `json:"error,omitempty"`
+	// Output is the text the caller received, Parts the output's parts
+	// when it has parts rather than text, and Error the failure, on the
+	// end entry.
+	Output string                 `json:"output,omitempty"`
+	Parts  openresponses.Contents `json:"parts,omitempty"`
+	Error  string                 `json:"error,omitempty"`
+	// Terminate is the result's terminate hint, Blocked says a decision
+	// refused the call, with Reason its reason, and Details is the
+	// result's agenttool.Recordable details, on the end entry: what a
+	// replayed result gives back beside the output and the error.
+	Terminate bool           `json:"terminate,omitempty"`
+	Blocked   bool           `json:"blocked,omitempty"`
+	Details   *NestedDetails `json:"details,omitempty"`
+	// Cut says, on the end entry, that the call was cut off before it
+	// had a result of its own, and Withdrawn that a consumer refused its
+	// hand-off, so its tool never ran: neither is an end of the call's
+	// own, and a call run again is not given it.
+	Cut       bool `json:"cut,omitempty"`
+	Withdrawn bool `json:"withdrawn,omitempty"`
 }
+
+// NestedDetails is a nested call's recordable details on its end
+// entry: the namespace and the JSON agenttool.RecordOf gives.
+type NestedDetails struct {
+	NS   string          `json:"ns"`
+	Data json.RawMessage `json:"data"`
+}
+
+// nestedDispatch is the phase of the [NestedCallNS] entry written when
+// a nested call is handed to its tool.
+const nestedDispatch = "dispatch"
 
 // ModelRetryNS is the namespace of the custom entry written for each
 // failed attempt of a model call that [agentturn.Retry] tries again.
@@ -614,6 +664,9 @@ type ModelBlocked struct {
 	// path rebuilds its input, and Model the model it named.
 	RequestHash string `json:"request_hash,omitempty"`
 	Model       string `json:"model,omitempty"`
+	// Usage is what the provider reported for a call the model's guard
+	// refused after it was sent, absent for one never sent.
+	Usage *openresponses.Usage `json:"usage,omitempty"`
 }
 
 // ElicitationNS is the namespace of the custom entry written for a
@@ -858,6 +911,11 @@ type Recorder struct {
 	parts    func(context.Context, openresponses.Request) ([]agentsession.InstructionPart, []agentsession.OmittedPart)
 	reopened func(*agentsession.Session)
 	now      func() time.Time
+	// blobs is the writer [WithMedia] names, nil for the store's; stored
+	// holds the hash of each blob put, so a blob is stored once however
+	// many items name it.
+	blobs  agentsession.BlobWriter
+	stored map[string]bool
 	// agent is the agent Attach subscribed to, whose configuration is
 	// taken again at every run_start.
 	agent *agentturn.Agent
@@ -881,6 +939,14 @@ type Recorder struct {
 	// the child's session whether or not the host put the session's ID
 	// on that context.
 	ended map[string]string
+	// heldQueued holds, by the call the child runs under, the queued
+	// reports of an observed child that named no run: inputs accepted
+	// while it was idle, for the run that takes them. One for a call
+	// whose child has a session already is written there when it is
+	// reported, so it is on the record whether or not the child runs
+	// again; one for a call with none yet is written at the start of
+	// the run that takes it.
+	heldQueued map[string][]*heldReport
 	// childIDs holds the ID of every child session the recorder has
 	// written, so a record naming one by [SessionIDFromContext] after
 	// its run ended is filed there rather than at the root.
@@ -912,6 +978,13 @@ type writer struct {
 	// child session inherits: a child runs in its parent's process and
 	// its parent's directory, and a store buckets sessions by it.
 	cwd string
+	// media is the media form the session's header names, which a child
+	// session takes too: its parent's blobs and its own live together.
+	media string
+	// typed holds the hash of each blob the session has named, given
+	// its media type, so the type is given, and the blob put for the
+	// session, once.
+	typed map[string]bool
 
 	settings agentsession.Settings
 	// wroteConfig is set once a config entry is on the path, written by
@@ -921,6 +994,10 @@ type writer struct {
 	// follow: turn_start computes it and the next event of the turn
 	// writes it, so an annotation made during turn_start lands first.
 	settleReq *openresponses.Request
+	// settleOmit is the omit setting settleReq is hashed under, which
+	// its settle writes: the one in force, or one that describes how
+	// the request's input differs from what the path holds.
+	settleOmit agentsession.Omit
 	// inFlight is set from turn_start to the response; pending is the
 	// hash of the request in flight, empty when the recorder cannot
 	// stand behind it; started is when it was sent; inFlightID is the
@@ -956,6 +1033,9 @@ type writer struct {
 	items  []string
 	values openresponses.Items
 	custom []bool
+	// meta holds, beside each item, what the writer knows of its entry
+	// beyond the item: whether a fold contributed it.
+	meta []itemMeta
 	// models holds, beside each item, the model in force when a
 	// reasoning item a response produced was written, "" for every other
 	// item: what the omit rule [agentsession.OmitOtherModels] compares
@@ -969,6 +1049,13 @@ type writer struct {
 	foldSplit   int
 	foldSummary openresponses.Item
 	foldPinned  openresponses.Items
+	// foldRecorded is the summary and the pins as the compaction entry
+	// holds them, which differ from foldSummary and foldPinned in a
+	// sidecar session.
+	foldRecorded openresponses.Items
+	// foldCanon holds the canonical JSON of each of foldRecorded, as
+	// itemMeta.canon does an item's.
+	foldCanon [][]byte
 	// calls maps a call ID to what the path holds for it, for the calls
 	// this writer wrote or Resume found pending.
 	calls map[string]*callRecord
@@ -980,6 +1067,13 @@ type writer struct {
 	// a cancel notice on the path names.
 	callees   []*agentsession.LinkEntry
 	cancelled map[string]bool
+	// copied holds the IDs of the copied calls on the path: calls
+	// another session made, which this one holds as context alone and
+	// writes no decision, dispatch or result for (format 0.15).
+	copied map[string]bool
+	// parentSession is the session of the call that spawned this one,
+	// opened for the trust of the entries a copied item names.
+	parentSession *agentsession.Session
 	// parents maps a nested call, one a tool made through
 	// agentturn.Invoke, to the call whose tool made it, so a record the
 	// nested call writes names a call the path holds.
@@ -989,6 +1083,11 @@ type writer struct {
 	// entry to name and is not written, and a dispatch for any other
 	// call the writer does not know is refused.
 	appOnly map[string]bool
+	// unsettled holds the model calls of the run's batch that have had
+	// their tool_start and not their tool_end. A call that settles while
+	// one is left has an output that cannot join the path until the
+	// batch is in, so its result is recorded at its tool_end.
+	unsettled map[string]bool
 	// detached is set for a child whose call returned while its run went
 	// on, so the writer is released at that run's end rather than at the
 	// call's.
@@ -1013,10 +1112,14 @@ type writer struct {
 	// so a run whose configuration changed settles it before any of its
 	// items.
 	base string
-	// attempt is the canonical request of the model call in flight,
-	// encoded when it was reported and before a retry policy could edit
-	// its maps in place, so a retry can say whether Revise changed it.
-	attempt []byte
+	// attempt is the request of the model call in flight less its
+	// input, encoded when it was reported and before a retry policy
+	// could edit its maps in place, and attemptInput its input, so a
+	// retry can say whether Revise changed it without encoding the
+	// whole transcript at every turn (#282): a policy that changes the
+	// input builds a new one.
+	attempt      []byte
+	attemptInput openresponses.Items
 	// attemptModel is the model that request named.
 	attemptModel string
 	// retries is the number of attempts of the call in flight that
@@ -1046,6 +1149,22 @@ type writer struct {
 	withheld     bool
 }
 
+// itemMeta is what a writer knows of an item's entry beyond the item.
+type itemMeta struct {
+	// folded marks an item a compaction contributes, its summary or a
+	// pin, on a path the writer was seeded from: no item entry, so no
+	// omit reaches it.
+	folded bool
+	// recorded is the item as its entry holds it when that is not the
+	// item the loop holds: in a sidecar session, with its media as
+	// sidecar references. nil when they are the same.
+	recorded openresponses.Item
+	// canon is the canonical JSON of the item as the path holds it,
+	// encoded the first time a request is compared with or hashed over
+	// it.
+	canon []byte
+}
+
 // unnamedItem is an item_end of the call in flight that named no
 // response, held until the response is known.
 type unnamedItem struct {
@@ -1058,6 +1177,10 @@ type inboxItem struct {
 	item    openresponses.Item
 	mode    string
 	trigger *agentsession.Trigger
+	// deliver says the input arrived as a delivery, which its queued
+	// entry carries as deliver, so one owed after a restart is handed
+	// back as one.
+	deliver bool
 	// entry is the ID of the queued entry holding the input on the
 	// current path, "" when a run end or a rewind has closed the one
 	// that did.
@@ -1070,6 +1193,33 @@ type inboxItem struct {
 	// awaiting is set while an input Requeue handed back waits for its
 	// queued event, which then writes nothing: the path holds it.
 	awaiting bool
+	// holder is the agent Requeue or Redeliver handed the input to,
+	// nil when nothing did.
+	holder *agentturn.Agent
+	// declined is set for an input whose entry was written and which
+	// the agent then refused: nobody holds it, Requeue does not hand it
+	// back, and the next run end drops it.
+	declined bool
+}
+
+// heldReport is a queued report of an observed child that named no
+// run, and, when it was written to the child's session as it was
+// reported, that session and the entry.
+type heldReport struct {
+	q       *agentturn.Queued
+	session string
+	entry   string
+}
+
+// inbox is the input the report's entry holds, for the run that takes
+// it up.
+func (h *heldReport) inbox() *inboxItem {
+	mode := agentsession.ModeFollowUp
+	if h.q.Mode == agentturn.QueueSteer {
+		mode = agentsession.ModeSteer
+	}
+	trigger, _ := sessionTrigger(h.q.Trigger)
+	return &inboxItem{item: h.q.Item, mode: mode, trigger: trigger, deliver: h.q.Input == agentturn.InputDeliver, entry: h.entry, held: true}
 }
 
 // callRecord is what the path holds for one function call.
@@ -1120,32 +1270,77 @@ type callRecord struct {
 	ranEntry   string
 	childOff   string
 	calleesOff []agentsession.CalleeLink
+	// ranSession is the session holding ranEntry when it is not this
+	// one, a fork's origin, and ranTrust that entry's trust: an output
+	// answered with ranEntry as its origin is written copied from it.
+	ranSession   string
+	ranTrust     *agentsession.Trust
+	ranPathTrust *agentsession.Trust
+	ranItem      openresponses.Item
 	// dispatchEntry is the ID of the last dispatch entry written or
-	// seeded for the call, and lastWithdrawn says a [WithdrawnNS] entry
-	// withdrew it. handedOff counts the call's dispatches on the path no
-	// such entry withdrew, the hand-offs its tool may have run on; a
-	// dispatched call with none never ran. It keeps its dispatches for
-	// the format's sake, a decision that ends it is an answer, but it is
-	// not run again. A live recorder and one seeded from the path count
-	// alike, so both write the same decisions.
+	// seeded for the call, and lastWithdrawn says it was withdrawn.
+	// handedOff counts the call's hand-offs on the path, those its tool
+	// may have run on. A withdrawal, the format's reject carrying
+	// withdrawn, takes its dispatch off the path as a reader sees it, so
+	// the recorder puts the call back as it was before that dispatch,
+	// which before is. A path written by agentturn v0.0.34 or earlier
+	// marks a withdrawal with a [WithdrawnNS] entry instead, which the
+	// format does not know: such a call keeps its dispatches for the
+	// format's sake, a decision that ends it is an answer, and when
+	// every one was withdrawn it never ran and is not run again. A live
+	// recorder and one seeded from the path count alike, so both write
+	// the same decisions.
 	dispatchEntry string
 	lastWithdrawn bool
 	handedOff     int
+	// before is the dispatch state the last dispatch this writer wrote
+	// replaced, which a withdrawal of it restores.
+	before *dispatchState
+	// failed is set when the call's tool_end carried the tool's error
+	// for a hand-off of this writer's run, so the output it appends is
+	// marked failed. A refusal, the loop's or a hook's, is not a
+	// failure: its reject records it.
+	failed bool
+	// result is the result entry a call seeded from the path returned
+	// with, its tool done and its output not yet on the path: the
+	// output that appends it is the call's own, with no decision, as
+	// the format has it, and only an output that differs from it is an
+	// answer.
+	result *agentsession.ResultEntry
 }
 
-// neverRan reports whether every dispatch the call has was withdrawn.
+// dispatchState is what a dispatch changes in a callRecord.
+type dispatchState struct {
+	dispatched, unknown bool
+	run, entry          string
+	handedOff           int
+}
+
+// withdraw puts the call back as it was before its last dispatch, which
+// a withdrawal takes off the path as a reader sees it.
+func (c *callRecord) withdraw() {
+	if b := c.before; b != nil {
+		c.dispatched, c.unknown, c.dispatchRun, c.dispatchEntry, c.handedOff = b.dispatched, b.unknown, b.run, b.entry, b.handedOff
+		c.before = nil
+	}
+	c.lastWithdrawn = true
+}
+
+// neverRan reports whether every dispatch the call has was withdrawn,
+// which only a [WithdrawnNS] entry leaves on the path.
 func (c *callRecord) neverRan() bool { return c.dispatched && c.handedOff == 0 }
 
-// WithdrawnNS is the namespace of the custom entry the recorder writes
-// after a dispatch the loop withdrew (agentturn.ToolEnd.Withdrawn): a
-// subscriber called after the recorder failed on the call's
-// tool_dispatch, so the tool never ran. Its call_id is the call's and
-// its data a [Withdrawn], which names the one dispatch it withdraws.
-// [Pending] reads a call whose every dispatch on the path is withdrawn
-// as agentturn.PendingUndispatched, which the loop knew it to
-// be, rather than as one that may have run; a reader that does not
-// know the namespace reads the call in flight, which errs on the side
-// of caution.
+// WithdrawnNS is the namespace of the custom entry agentturn v0.0.34
+// and earlier wrote after a dispatch the loop withdrew
+// (agentturn.ToolEnd.Withdrawn): a subscriber called after the
+// recorder failed on the call's tool_dispatch, so the tool never ran.
+// Its call_id is the call's and its data a [Withdrawn], which names the
+// one dispatch it withdraws. The recorder now writes the format's
+// withdrawal, a reject carrying withdrawn (format 0.14), and reads
+// these entries only on paths that hold them: [Pending] reads a call
+// whose every dispatch on the path is withdrawn as
+// agentturn.PendingUndispatched, which the loop knew it to be, rather
+// than as one that may have run.
 const WithdrawnNS = "agentturn:withdrawn"
 
 // HeldNotesNS is the namespace of the custom entry the recorder writes
@@ -1252,16 +1447,20 @@ func appendedSince(after []agentsession.Entry, notes []agentturn.Note) int {
 }
 
 // sameNoteItem reports whether an item on the path says what a note
-// says: a message by its role and text, as the loop compares notes.
+// says: a message by its role and text, as the loop compares notes, and
+// any other item by its JSON, as it is or, since a held note keeps its
+// media inline, with its media as a sidecar session's path names it.
 func sameNoteItem(a, b openresponses.Item) bool {
 	am, aok := a.(*openresponses.Message)
 	bm, bok := b.(*openresponses.Message)
 	if aok && bok {
 		return am.Role == bm.Role && am.Text() == bm.Text()
 	}
-	ja, errA := json.Marshal(a)
-	jb, errB := json.Marshal(b)
-	return errA == nil && errB == nil && string(ja) == string(jb)
+	if equalJSON(a, b) {
+		return true
+	}
+	conv, blobs := sidecarForm(b)
+	return len(blobs) > 0 && equalJSON(a, conv)
 }
 
 // OwedNotes returns the notes the session owes after outputs already on
@@ -1270,7 +1469,7 @@ func sameNoteItem(a, b openresponses.Item) bool {
 // no call, which a failed
 // run could not append. [AgentOptions] seeds an agent with them; with
 // calls pending, [Pending] puts the notes on the last of them instead.
-func OwedNotes(s *agentsession.Session) ([]agentturn.Note, error) {
+func OwedNotes(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Note, error) {
 	if s.Leaf() == "" {
 		return nil, nil
 	}
@@ -1291,15 +1490,20 @@ func OwedNotes(s *agentsession.Session) ([]agentturn.Note, error) {
 		}
 	}
 	var out []agentturn.Note
+	m := resolverFor(s, opts)
 	for _, n := range lastHeldNotes(path) {
 		if n.CallID == "" || answered[n.CallID] {
+			if n.Item, err = m.item(s.ID(), n.Item); err != nil {
+				return nil, err
+			}
 			out = append(out, n)
 		}
 	}
 	return out, nil
 }
 
-// Withdrawn is the data of a [WithdrawnNS] custom entry.
+// Withdrawn is the data of a [WithdrawnNS] custom entry, which the
+// recorder no longer writes.
 type Withdrawn struct {
 	// Dispatch is the ID of the dispatch entry withdrawn.
 	Dispatch string `json:"dispatch"`
@@ -1364,7 +1568,9 @@ func WithFilter(f func(agentturn.Transcript) agentturn.Transcript) Option {
 	return func(r *Recorder) { r.filter = f }
 }
 
-// WithHarness names the writer in the header of child sessions.
+// WithHarness names the writer in the header of every session the
+// recorder creates: the root a [Start] creates when its header names
+// no harness, and each child session.
 func WithHarness(name, version string) Option {
 	return func(r *Recorder) { r.harness = &agentsession.Harness{Name: name, Version: version} }
 }
@@ -1490,6 +1696,7 @@ func New(store agentsession.Store, sessionID string, opts ...Option) *Recorder {
 		now:      time.Now,
 		runs:     map[string]*writer{},
 		ended:    map[string]string{},
+		stored:   map[string]bool{},
 	}
 	r.root = newWriter(r, sessionID)
 	for _, opt := range opts {
@@ -1499,15 +1706,17 @@ func New(store agentsession.Store, sessionID string, opts ...Option) *Recorder {
 }
 
 func newWriter(r *Recorder, id string) *writer {
-	return &writer{rec: r, id: id, calls: map[string]*callRecord{}, linked: map[string]bool{}, cancelled: map[string]bool{}, parents: map[string]string{}, appOnly: map[string]bool{}}
+	return &writer{rec: r, id: id, calls: map[string]*callRecord{}, linked: map[string]bool{}, cancelled: map[string]bool{}, parents: map[string]string{}, appOnly: map[string]bool{}, copied: map[string]bool{}}
 }
 
 // Start creates a session from h and returns a recorder for it. When
-// h.Records is nil the header promises the run, dispatch, decision and
-// queued records, which this recorder writes whenever their event
-// occurs. Child sessions name h.Harness as their writer unless
-// [WithHarness] says otherwise. The caller keeps store for Sync,
-// Release and Close.
+// h.Records is nil the header promises the run, dispatch, decision,
+// queued and result records, which this recorder writes whenever their
+// event occurs: a result for every call whose output settles while the
+// rest of its batch runs. A header with no harness takes the one [WithHarness] names,
+// so the root names its writer as every child does; child sessions
+// name h.Harness as their writer unless [WithHarness] says otherwise.
+// The caller keeps store for Sync, Release and Close.
 //
 // A header with a Base forks the session that holds it: the store
 // writes the prefix, and the recorder is seeded from the context at
@@ -1524,17 +1733,23 @@ func newWriter(r *Recorder, id string) *writer {
 // [AgentOptions] and [ReplayAnswers] so they read it too.
 func Start(ctx context.Context, store agentsession.Store, h agentsession.Header, opts ...Option) (*Recorder, *agentsession.Session, error) {
 	if h.Records == nil {
-		h.Records = append(append([]string(nil), agentsession.AllRecords...), agentsession.TypeQueued)
+		h.Records = append(append([]string(nil), agentsession.AllRecords...), agentsession.TypeQueued, agentsession.TypeResult)
+	}
+	r := New(store, "", opts...)
+	if h.Harness == nil {
+		// The root names the recorder's harness, as each child does.
+		h.Harness = r.harness
 	}
 	s, err := store.Create(ctx, h)
 	if err != nil {
 		return nil, nil, fmt.Errorf("session: create: %w", err)
 	}
-	r := New(store, s.ID(), opts...)
+	r.root.id = s.ID()
 	if r.harness == nil {
 		r.harness = s.Header().Harness
 	}
 	r.root.cwd = s.Header().CWD
+	r.root.media = s.Header().Media
 	if s.Header().Base != "" {
 		if err := r.root.closeOpenRun(ctx, s, agentsession.ReasonInterrupted, "fork at "+s.Header().Base, false); err != nil {
 			return nil, nil, err
@@ -1618,9 +1833,10 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // [NoteMember]); one in flight when the record stopped
 // may have run and is [agentturn.PendingAborted], as is one with no
 // dispatch on the path that has one on a branch a rebase to before it
-// left, a held one of which is Dispatched; one in flight whose every
-// dispatch a [WithdrawnNS] entry withdrew never reached its tool and is
-// [agentturn.PendingUndispatched]; one an answer
+// left, a held one of which is Dispatched; one whose every dispatch
+// was withdrawn, by the format's withdrawal or, on a path agentturn
+// v0.0.34 or earlier wrote, a [WithdrawnNS] entry, never reached its
+// tool and is [agentturn.PendingUndispatched]; one an answer
 // decision ended before its output was written is
 // [agentturn.PendingAnswered], owed that output and nothing else; one
 // a reject decision refused before its output was written is
@@ -1668,15 +1884,15 @@ func Pending(s *agentsession.Session, opts ...ReadOption) ([]agentturn.PendingCa
 	return pending, err
 }
 
-// ReadOption configures how [Pending], [AgentOptions] and
-// [ReplayAnswers] read a session. [WithOrigins] and [WithContext] make
-// one.
+// ReadOption configures how [Pending], [AgentOptions],
+// [ReplayAnswers], [Transcript], [TranscriptModels] and [OwedNotes] read
+// a session. [WithOrigins], [WithBlobs] and [WithContext] make one.
 type ReadOption struct {
 	apply func(*origins)
 }
 
-// WithContext has [Pending] and [AgentOptions] read a fork's origins
-// under ctx, so a deadline or a cancellation on it ends the reads;
+// WithContext has [Pending] and [AgentOptions] read a fork's origins,
+// and a sidecar session's blobs, under ctx, so a deadline or a cancellation on it ends the reads;
 // without it they read under context.Background(). [ReplayAnswers]
 // takes a context of its own and reads under that one whatever this
 // option says.
@@ -1701,14 +1917,20 @@ func WithOrigins(r agentsession.Reader) ReadOption {
 // ReadOptions returns the options that have [Pending], [AgentOptions]
 // and [ReplayAnswers] read a session as the recorder reads it when it
 // is seeded: [WithOrigins] with the recorder's store, when the store
-// is an agentsession.Reader, and none otherwise. A caller with a
-// deadline on the reads, a request handler for one, adds
-// [WithContext] beside them.
+// is an agentsession.Reader, and [WithBlobs] with the reader the
+// recorder's blobs are read through, the [WithMedia] writer's when it
+// reads and the store's otherwise, so a sidecar session's media comes
+// back as data URLs. A caller with a deadline on the reads, a request
+// handler for one, adds [WithContext] beside them.
 func (r *Recorder) ReadOptions() []ReadOption {
+	var opts []ReadOption
 	if rd, ok := r.store.(agentsession.Reader); ok {
-		return []ReadOption{WithOrigins(rd)}
+		opts = append(opts, WithOrigins(rd))
 	}
-	return nil
+	if br := r.blobReader(); br != nil {
+		opts = append(opts, WithBlobs(br))
+	}
+	return opts
 }
 
 // origins reads the sessions a fork was made from. lenient takes an
@@ -1719,6 +1941,8 @@ type origins struct {
 	ctx     context.Context
 	r       agentsession.Reader
 	lenient bool
+	// blobs reads a sidecar session's blobs, for [WithBlobs].
+	blobs agentsession.BlobReader
 }
 
 // dispatchOff returns the last dispatch of the call held by the entry
@@ -1726,7 +1950,9 @@ type origins struct {
 // and the session holding it: s, or for a call in a fork's prefix with
 // none in s, the session the fork was made from, and so up the chain,
 // as [agentsession.OriginDispatches] walks it. It returns nil when none
-// of them holds one.
+// of them holds one. A dispatch on s's path is the path's to read, a
+// withdrawn one included: a withdrawal says that hand-off was never
+// made, and the call is what the path says it is.
 func (o *origins) dispatchOff(s *agentsession.Session, callEntry string) (*agentsession.Session, *agentsession.DispatchEntry, error) {
 	at, ds, err := agentsession.OriginDispatches(o.ctx, o.r, s, callEntry)
 	if err != nil {
@@ -1734,6 +1960,36 @@ func (o *origins) dispatchOff(s *agentsession.Session, callEntry string) (*agent
 			return nil, nil, nil
 		}
 		return nil, nil, fmt.Errorf("session: %w", err)
+	}
+	if at == s && len(ds) > 0 {
+		on := map[string]bool{}
+		for _, e := range s.Path(s.Leaf()) {
+			on[e.Base().ID] = true
+		}
+		ds = slices.DeleteFunc(ds, func(d *agentsession.DispatchEntry) bool { return on[d.ID] })
+		if len(ds) == 0 && s.Prefix(callEntry) && o.r != nil && s.Header().ParentSession != "" {
+			// Every dispatch s holds is on its path, withdrawn: a call
+			// in a fork's prefix is then what the session the fork was
+			// made from says it is, as for one s never dispatched.
+			origin, err := o.r.Read(o.ctx, s.Header().ParentSession)
+			if errors.Is(err, agentsession.ErrNoSession) {
+				return nil, nil, nil
+			}
+			if err != nil {
+				if o.lenient {
+					return nil, nil, nil
+				}
+				return nil, nil, fmt.Errorf("session: read origin %s: %w", s.Header().ParentSession, err)
+			}
+			// The origin's own dispatches are off the fork's path, so
+			// they are read as they stand.
+			if at, ds, err = agentsession.OriginDispatches(o.ctx, o.r, origin, callEntry); err != nil {
+				if o.lenient {
+					return nil, nil, nil
+				}
+				return nil, nil, fmt.Errorf("session: %w", err)
+			}
+		}
 	}
 	if len(ds) == 0 {
 		return nil, nil, nil
@@ -1746,7 +2002,7 @@ func (o *origins) dispatchOff(s *agentsession.Session, callEntry string) (*agent
 // it. The origins are read under the context the last [WithContext] in
 // opts gives, which [ReplayAnswers] appends its own as, and under
 // context.Background() without one.
-func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.PendingCall, map[string]string, error) {
+func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.PendingCall, map[string]ranFrom, error) {
 	if s.Leaf() == "" {
 		return nil, nil, nil
 	}
@@ -1761,12 +2017,17 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 		return nil, nil, fmt.Errorf("session: pending calls at leaf: %w", err)
 	}
 	var out []agentturn.PendingCall
-	ranAt := map[string]string{}
+	ranAt := map[string]ranFrom{}
+	m := resolverFor(s, opts)
 	path := s.Path(s.Leaf())
 	withdrawn := withdrawnDispatches(path)
 	open := openQuestions(path)
+	nested := nestedRecords(path)
 	for _, c := range calls {
 		p := agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingUnknown}
+		// ranIn is the session whose path holds the output p.Ran is,
+		// whose blobs it names.
+		ranIn := s.ID()
 		state := c.State(s.Header())
 		never := allWithdrawn(c, withdrawn)
 		switch state {
@@ -1788,6 +2049,15 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 			}
 		case agentsession.CallNeverStarted:
 			p.Reason = agentturn.PendingUndispatched
+		case agentsession.CallReturned:
+			// Its tool returned before its output joined the path: the
+			// result on the path is its outcome, owed as its output, and
+			// it is not run again.
+			p.Reason = agentturn.PendingReturned
+			if out, ok := c.Result.Item.(*openresponses.FunctionCallOutput); ok {
+				p.Ran, p.RanWhere = out, returnedReason
+				ranAt[p.Call.CallID] = ranFrom{entry: c.Result.ID, failed: c.Result.Failed}
+			}
 		}
 		// A call with no dispatch on the path may have one on a branch
 		// a rebase left, or in the session a fork was made from: it was
@@ -1806,8 +2076,10 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 				// The call ran where its dispatch is when its output
 				// follows it there: that is its outcome.
 				var entry string
-				if p.Ran, entry = outputAfter(at, d, c.Entry.ID); p.Ran != nil {
-					ranAt[p.Call.CallID], p.RanWhere = entry, ranOffReason
+				var failed bool
+				if p.Ran, entry, failed = outputAfterFailed(at, d, c.Entry.ID); p.Ran != nil {
+					ranAt[p.Call.CallID], p.RanWhere = ranFrom{entry: entry, failed: failed}, ranOffReason
+					ranIn = at.ID()
 					if at != s {
 						p.RanWhere = ranInOriginReason
 					}
@@ -1837,12 +2109,103 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 			p.Args = json.RawMessage(args)
 		}
 		p.Question = open[c.Call.CallID]
+		p.Nested = nested[c.Call.CallID]
+		if p.Ran != nil {
+			ran, err := m.item(ranIn, p.Ran)
+			if err != nil {
+				return nil, nil, err
+			}
+			p.Ran = ran.(*openresponses.FunctionCallOutput)
+		}
 		out = append(out, p)
 	}
 	if len(out) > 0 {
-		out[len(out)-1].Notes = lastHeldNotes(path)
+		notes := lastHeldNotes(path)
+		for i := range notes {
+			if notes[i].Item, err = m.item(s.ID(), notes[i].Item); err != nil {
+				return nil, nil, err
+			}
+		}
+		out[len(out)-1].Notes = notes
 	}
 	return out, ranAt, nil
+}
+
+// nestedRecords reads the [NestedCallNS] entries on path into what
+// each call's tool did through agentturn.Invoke, by the call of the
+// path the nested calls were made under, whatever their depth, each
+// nested call once, in the order the path first names it: its last
+// hand-off no consumer withdrew, and how it ended, unless it was cut
+// off.
+func nestedRecords(path []agentsession.Entry) map[string][]agentturn.NestedRecord {
+	type state struct {
+		rec  agentturn.NestedRecord
+		ran  json.RawMessage
+		keys []string
+	}
+	byID := map[string]*state{}
+	var order []string
+	for _, e := range path {
+		c, ok := e.(*agentsession.CustomEntry)
+		if !ok || c.NS != NestedCallNS {
+			continue
+		}
+		var n NestedCall
+		if json.Unmarshal(c.Data, &n) != nil || n.CallID == "" {
+			continue
+		}
+		st := byID[n.CallID]
+		if st == nil {
+			st = &state{rec: agentturn.NestedRecord{CallID: n.CallID, Parent: n.Parent, Name: n.Name}}
+			byID[n.CallID] = st
+			order = append(order, n.CallID)
+		}
+		switch n.Phase {
+		case agentsession.RunStart:
+			if st.rec.Args == nil {
+				st.rec.Args = n.Invoked
+				if st.rec.Args == nil {
+					st.rec.Args = n.Args
+				}
+			}
+			st.ran = n.Args
+		case nestedDispatch:
+			st.keys = append(st.keys, n.IdempotencyKey)
+		case agentsession.RunEnd:
+			if n.Withdrawn && len(st.keys) > 0 {
+				// The hand-off was withdrawn before the tool ran.
+				st.keys = st.keys[:len(st.keys)-1]
+			}
+			if !n.Cut && !n.Withdrawn {
+				st.rec.Ended = true
+				st.rec.Result = agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: n.Output, Parts: n.Parts}, Terminate: n.Terminate}
+				if n.Details != nil {
+					st.rec.Result.Details = agentturn.RecordedDetails{NS: n.Details.NS, Data: n.Details.Data}
+				}
+				st.rec.Err, st.rec.Blocked, st.rec.Reason = n.Error, n.Blocked, n.Reason
+			}
+		}
+	}
+	out := map[string][]agentturn.NestedRecord{}
+	for _, id := range order {
+		st := byID[id]
+		if len(st.keys) > 0 {
+			st.rec.Dispatched, st.rec.IdempotencyKey = true, st.keys[len(st.keys)-1]
+			if st.ran != nil && !sameJSON(st.ran, string(st.rec.Args)) {
+				st.rec.DispatchArgs = st.ran
+			}
+		}
+		root := st.rec.Parent
+		for range len(order) {
+			up, ok := byID[root]
+			if !ok {
+				break
+			}
+			root = up.rec.Parent
+		}
+		out[root] = append(out[root], st.rec)
+	}
+	return out
 }
 
 // outputAfter is the output of the call held by the entry callEntry
@@ -1852,8 +2215,15 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 // call returned but what someone said of it, an outcome unknown among
 // them, and is passed over.
 func outputAfter(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry string) (*openresponses.FunctionCallOutput, string) {
+	out, entry, _ := outputAfterFailed(s, d, callEntry)
+	return out, entry
+}
+
+// outputAfterFailed is [outputAfter], and whether that output's entry
+// is marked failed.
+func outputAfterFailed(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry string) (*openresponses.FunctionCallOutput, string, bool) {
 	var out *openresponses.FunctionCallOutput
-	entry := ""
+	entry, failed := "", false
 	for _, e := range s.Entries() {
 		ie, ok := e.(*agentsession.ItemEntry)
 		if !ok {
@@ -1864,11 +2234,11 @@ func outputAfter(s *agentsession.Session, d *agentsession.DispatchEntry, callEnt
 		}
 		for _, c := range agentsession.Calls(s.Path(ie.ID)) {
 			if c.Entry.ID == callEntry && c.Output == ie && slices.Contains(c.Dispatches, d) && !c.Answered() {
-				out, entry = ie.Item.(*openresponses.FunctionCallOutput), ie.ID
+				out, entry, failed = ie.Item.(*openresponses.FunctionCallOutput), ie.ID, ie.Failed
 			}
 		}
 	}
-	return out, entry
+	return out, entry, failed
 }
 
 // subsessionOn is the child session the path to entry links to the
@@ -1914,21 +2284,13 @@ func callAt(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry st
 // as [Pending] does. The transcript is [Transcript]'s, its reasoning
 // items attributed as [TranscriptModels] attributes them, so the loop
 // leaves another model's out of each request after a resume, as it
-// does for the items its own runs produced.
+// does for the items its own runs produced. In a sidecar session every
+// item it hands the agent carries its media as data URLs, each
+// sidecar: reference resolved through [WithBlobs], which
+// [Recorder.ReadOptions] carries, and it fails with [ErrNoBlobReader]
+// for one it has no reader to resolve.
 func AgentOptions(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Option, error) {
-	items, models, err := TranscriptModels(s)
-	if err != nil {
-		return nil, err
-	}
-	pending, err := Pending(s, opts...)
-	if err != nil {
-		return nil, err
-	}
-	ids, err := CallIDs(s)
-	if err != nil {
-		return nil, err
-	}
-	owed, err := OwedNotes(s)
+	items, models, pending, owed, ids, err := agentState(s, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -1944,20 +2306,27 @@ func AgentOptions(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Opti
 // saw before. It is the transcript
 // [AgentOptions] seeds an agent with, and the one to give
 // Agent.SetTranscript after [Recorder.Rebase] or to seed the agent of
-// a [Start] on a base with; Context.Items differs from it by those
+// a [Start] on a base with, its media resolved to data URLs in a
+// sidecar session as [AgentOptions] resolves it, through [WithBlobs];
+// Context.Items differs from it by those
 // items, which the filter keeps out of every request anyway, and by
-// the items the omit setting in force leaves out of a request to the
-// model at the leaf, which a request to another model may hold: the
-// transcript is the whole conversation, and [TranscriptModels] says
+// the reasoning the omit setting's other_models rule leaves out of a
+// request to the model at the leaf, which a request to another model
+// may hold. The items omit lists, and the outputs and images it sends
+// as placeholders, are as the context has them, so a trim the record
+// describes holds after a restart (#233). [TranscriptModels] says
 // which model produced each reasoning item so the loop leaves out of
 // a request what that model must not be sent. Each call decodes those
 // items afresh.
-func Transcript(s *agentsession.Session) (openresponses.Items, error) {
+func Transcript(s *agentsession.Session, opts ...ReadOption) (openresponses.Items, error) {
 	cx, err := s.Context()
 	if err != nil {
 		return nil, fmt.Errorf("session: context at leaf: %w", err)
 	}
-	items, _, _ := transcriptOf(cx)
+	items, _ := agentTranscriptOf(cx)
+	if err := resolverFor(s, opts).items(s.ID(), items); err != nil {
+		return nil, err
+	}
 	return items, nil
 }
 
@@ -1973,12 +2342,15 @@ func Transcript(s *agentsession.Session) (openresponses.Items, error) {
 // agentturn.WithReasoningModels or agentturn.ContextWithReasoningModels;
 // attribution holds an item by identity, so models attributes no other
 // copy of the transcript.
-func TranscriptModels(s *agentsession.Session) (openresponses.Items, agentturn.ReasoningModels, error) {
+func TranscriptModels(s *agentsession.Session, opts ...ReadOption) (openresponses.Items, agentturn.ReasoningModels, error) {
 	cx, err := s.Context()
 	if err != nil {
 		return nil, nil, fmt.Errorf("session: context at leaf: %w", err)
 	}
-	items, entries, _ := transcriptOf(cx)
+	items, entries := agentTranscriptOf(cx)
+	if err := resolverFor(s, opts).items(s.ID(), items); err != nil {
+		return nil, nil, err
+	}
 	produced := producedModels(s.Path(s.Leaf()))
 	models := agentturn.ReasoningModels{}
 	for i, item := range items {
@@ -2018,35 +2390,77 @@ func producedModels(path []agentsession.Entry) map[string]string {
 	return produced
 }
 
-// transcriptOf is the transcript of cx, as [Transcript] reads it, with
+// transcriptOf is the whole of what the path holds for cx's context, as
+// a writer seeded there compares requests with it, with
 // the ID of the entry contributing each item, and whether that entry
 // is a custom entry, outside the context, one [MarkedItem] decodes. The
 // items the omit setting leaves out of a request to the model at the
-// leaf are in it, where the path holds them.
-func transcriptOf(cx agentsession.Context) (items openresponses.Items, entries []string, custom []bool) {
+// leaf are in it, where the path holds them, and an item it sends with
+// a placeholder in place of an output or an image is in it as the
+// path holds it. folded marks the items a compaction contributes.
+func transcriptOf(cx agentsession.Context) (items openresponses.Items, entries []string, custom, folded []bool) {
 	omitted := make(map[agentsession.Entry]bool, len(cx.OmittedItems))
 	for _, o := range cx.OmittedItems {
 		omitted[o.Entry] = true
 	}
 	j := 0
 	for _, e := range cx.Entries {
-		if ie, ok := e.(*agentsession.ItemEntry); ok && omitted[e] {
-			items, entries, custom = append(items, ie.Item), append(entries, ie.ID), append(custom, false)
+		if ie, ok := e.(*agentsession.ItemEntry); ok {
+			if omitted[e] || j < len(cx.ItemEntries) && cx.ItemEntries[j] == e {
+				items, entries, custom, folded = append(items, ie.Item), append(entries, ie.ID), append(custom, false), append(folded, false)
+			}
+			if !omitted[e] && j < len(cx.ItemEntries) && cx.ItemEntries[j] == e {
+				j++
+			}
 			continue
 		}
 		// A compaction contributes its summary and its pins in a row.
 		for ; j < len(cx.ItemEntries) && cx.ItemEntries[j] == e; j++ {
-			items, entries, custom = append(items, cx.Items[j]), append(entries, e.Base().ID), append(custom, false)
+			items, entries, custom, folded = append(items, cx.Items[j]), append(entries, e.Base().ID), append(custom, false), append(folded, true)
 		}
 		c, ok := e.(*agentsession.CustomEntry)
 		if !ok {
 			continue
 		}
 		if item, _, ok := MarkedItem(c); ok {
-			items, entries, custom = append(items, item), append(entries, c.ID), append(custom, true)
+			items, entries, custom, folded = append(items, item), append(entries, c.ID), append(custom, true), append(folded, false)
 		}
 	}
-	return items, entries, custom
+	return items, entries, custom, folded
+}
+
+// agentTranscriptOf is the transcript an agent continuing cx holds, as
+// [Transcript] gives it, with the ID of the entry contributing each
+// item: the context's items as the omit in force sends them, so a trim
+// the record describes survives a restart rather than coming back
+// whole, the item entries omit lists left out and the outputs and
+// image parts it reaches as its placeholders, except the reasoning its
+// other_models rule leaves out, which the loop leaves out itself by its
+// attribution and sends again to the model that produced it; and the
+// items the filter kept from the model, from their custom entries.
+func agentTranscriptOf(cx agentsession.Context) (items openresponses.Items, entries []string) {
+	reasoning := make(map[agentsession.Entry]bool, len(cx.OmittedItems))
+	for _, o := range cx.OmittedItems {
+		if o.Reason == agentsession.OmitOtherModels {
+			reasoning[o.Entry] = true
+		}
+	}
+	j := 0
+	for _, e := range cx.Entries {
+		if ie, ok := e.(*agentsession.ItemEntry); ok && reasoning[e] {
+			items, entries = append(items, ie.Item), append(entries, ie.ID)
+			continue
+		}
+		for ; j < len(cx.ItemEntries) && cx.ItemEntries[j] == e; j++ {
+			items, entries = append(items, cx.Items[j]), append(entries, e.Base().ID)
+		}
+		if c, ok := e.(*agentsession.CustomEntry); ok {
+			if item, _, ok := MarkedItem(c); ok {
+				items, entries = append(items, item), append(entries, c.ID)
+			}
+		}
+	}
+	return items, entries
 }
 
 // CallIDs returns the call ID of every function call in the session,
@@ -2109,9 +2523,12 @@ func CallIDs(s *agentsession.Session) ([]string, error) {
 // one, naming the copy. In a fork no link is written, since a
 // subsession link names a child of the session that writes it and the
 // child is the origin's, and the callees in another system are the
-// origin's work, whose cancels the origin sent: the fork's record
-// reaches them through the origin, and the answer's Origin names the
-// output it repeats. A call an answer ended before its output was written gets
+// origin's work, whose cancels the origin sent: the recorder writes the
+// output with copied_from naming the origin and the origin's output
+// entry, with that entry's trust, and a reader reaches the child
+// through the origin's link for the call on the origin's path to that
+// entry, which the fork's own prefix lacks when the fork was based at
+// the call. A call an answer ended before its output was written gets
 // [agentturn.OutcomeUnknown] as that output, since the record holds
 // the answer and not the output it gave. A held call is waiting for
 // someone and is the caller's to answer, a call held after its
@@ -2140,13 +2557,30 @@ func ReplayAnswers(ctx context.Context, s *agentsession.Session, tools []agentto
 			ans = agentturn.Approve(id)
 		case agentturn.PendingAnswered:
 			ans = agentturn.OutcomeUnknown(id)
+		case agentturn.PendingReturned:
+			// The result is the call's outcome; see the default case.
+			ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Status: p.Ran.Status, Output: p.Ran.Output}).WithReason(p.RanWhere).WithOrigin(ranAt[id].entry)
+			if ranAt[id].failed {
+				ans = ans.WithFailed()
+			}
 		case agentturn.PendingRejected:
 			ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Output: openresponses.FunctionCallOutputData{Text: p.Refused}})
 		default:
 			if p.Ran != nil {
 				// The call ran on the branch its dispatch is on, and the
-				// session holds what it returned: that is its outcome.
-				ans = agentturn.Output(&openresponses.FunctionCallOutput{CallID: id, Status: p.Ran.Status, Output: p.Ran.Output}).WithReason(p.RanWhere).WithOrigin(ranAt[id])
+				// session holds what it returned: that is its outcome. One
+				// the session a fork was made from holds is given whole,
+				// its item ID and members of its own included, since the
+				// fork's recorder writes it as a copy of that entry.
+				out := &openresponses.FunctionCallOutput{CallID: id, Status: p.Ran.Status, Output: p.Ran.Output}
+				if p.RanWhere == ranInOriginReason {
+					whole := *p.Ran
+					out = &whole
+				}
+				ans = agentturn.Output(out).WithReason(p.RanWhere).WithOrigin(ranAt[id].entry)
+				if ranAt[id].failed {
+					ans = ans.WithFailed()
+				}
 				break
 			}
 			ans = replayAnswer(ctx, set, p)
@@ -2217,6 +2651,18 @@ const ranOffReason = "ran on a branch the rebase left"
 // call in a fork's prefix that completed in the session the fork was
 // made from.
 const ranInOriginReason = "ran in the session this one forks"
+
+// returnedReason is the reason of the answer [ReplayAnswers] gives a
+// call whose tool returned, a result on the path, before its output
+// joined it.
+const returnedReason = "returned before the record stopped"
+
+// ranFrom is the entry a call's Ran was read from, and whether it was
+// marked failed.
+type ranFrom struct {
+	entry  string
+	failed bool
+}
 
 // refusal is the reason of the last reject decision the session's
 // path holds for the call.
@@ -2339,6 +2785,7 @@ func resume(ctx context.Context, s *agentsession.Session, store agentsession.Sto
 		r.harness = s.Header().Harness
 	}
 	r.root.cwd = s.Header().CWD
+	r.root.media = s.Header().Media
 	if err := r.root.closeOpenRun(ctx, s, agentsession.ReasonError, "cut off: closed on resume", true); err != nil {
 		return nil, nil, err
 	}
@@ -2413,7 +2860,8 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 // is approved as a held call and one that may have run is held to the
 // replay rule, with the notes waiting on those calls, and
 // Agent.SetNotes from [OwedNotes], the notes the branch owes after
-// outputs already on it; [Recorder.CompactOptions] gives what seeds a transform
+// outputs already on it; [MoveTo] does all of it as one operation that
+// no run can interleave with. [Recorder.CompactOptions] gives what seeds a transform
 // built for the branch. Rebase reserves every call ID in the session, [CallIDs],
 // on the agent [Recorder.Attach] attached, so a call the model makes
 // does not take the ID of one the context leaves out or the branch
@@ -2427,7 +2875,9 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 // that run had queued and not appended is left behind with the rest
 // of the branch. And an input the agent holds, queued and not
 // appended, is written as a queued entry on the new branch unless the
-// entry that holds it is still pending there.
+// entry that holds it, or one the branch owes that holds the same input
+// in the same mode under the same trigger, is pending there, so a move back to where the input
+// was queued writes it no second time.
 //
 // The empty entry ID is the reset a product's /clear makes: the
 // session's leaf is reset so the next append starts a new root
@@ -2505,9 +2955,27 @@ func (r *Recorder) Rebase(s *agentsession.Session, entryID string) error {
 	for _, q := range owed {
 		pending[q.ID] = true
 	}
+	claimed := map[string]bool{}
 	for _, in := range w.inbox {
-		if !pending[in.entry] {
-			in.entry = ""
+		if pending[in.entry] {
+			claimed[in.entry] = true
+		}
+	}
+	for _, in := range w.inbox {
+		if pending[in.entry] {
+			continue
+		}
+		// An entry the new branch owes that holds this very input, in
+		// its mode and brought by the same trigger, is its entry there: a move back to a branch the
+		// input was queued on before, as an undone rewind makes, writes
+		// it no second time.
+		in.entry = ""
+		rec := w.recordForm(in.item)
+		for _, q := range owed {
+			if !claimed[q.ID] && q.Mode == in.mode && q.Deliver == in.deliver && equalJSON(q.Trigger, in.trigger) && equalJSON(q.Item, rec) {
+				in.entry, claimed[q.ID] = q.ID, true
+				break
+			}
 		}
 	}
 	if err := w.requeue(ctx); err != nil {
@@ -2578,7 +3046,12 @@ func (w *writer) requeue(ctx context.Context) error {
 		if in.entry != "" {
 			continue
 		}
-		q := agentsession.NewQueued(in.item, in.mode)
+		item, err := w.sidecar(ctx, in.item)
+		if err != nil {
+			return err
+		}
+		q := agentsession.NewQueued(item, in.mode)
+		q.Deliver = in.deliver && in.mode == agentsession.ModeSteer
 		q.Trigger = in.trigger.Clone()
 		id, err := w.append(ctx, q)
 		if err != nil {
@@ -2622,16 +3095,200 @@ func (r *Recorder) Queue(ctx context.Context, a *agentturn.Agent, mode agentturn
 			return err
 		}
 		// The trigger was checked above, so the agent does not refuse
-		// it.
-		_ = a.Queue(ctx, mode, item)
+		// it; should it, the input is the caller's again.
+		if err := a.Queue(ctx, mode, item); err != nil {
+			r.mu.Lock()
+			decline([]*inboxItem{in})
+			r.mu.Unlock()
+			return err
+		}
 	}
 	return nil
+}
+
+// Deliver delivers items to a, as agentturn.Agent.Deliver does with
+// ctx's trigger, after writing each as a queued entry carrying deliver
+// at the session's leaf, durably, before the agent accepts it: the way
+// to take a background task's result that must not be lost, one that
+// arrives while the agent waits on an approval among them, whose
+// queued event would otherwise wait for the next run. The event then
+// writes nothing. An item whose entry cannot be written is not
+// delivered, and the error says so; nothing is delivered then. It
+// returns what Deliver returns.
+func (r *Recorder) Deliver(ctx context.Context, a *agentturn.Agent, items ...openresponses.Item) (bool, *agentturn.RunEnd, error) {
+	trigger, err := sessionTrigger(agentturn.TriggerFromContext(ctx))
+	if err != nil {
+		return false, nil, err
+	}
+	if a.State().Held {
+		// The agent would refuse it before queueing anything: nothing
+		// is written, so nothing is owed for an input nobody took.
+		return false, nil, agentturn.ErrHeld
+	}
+	r.mu.Lock()
+	n := len(r.root.inbox)
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		base, _ := agentturn.Unhide(item)
+		r.root.inbox = append(r.root.inbox, &inboxItem{item: base, mode: agentsession.ModeSteer, deliver: true, held: true, awaiting: true, trigger: trigger.Clone()})
+	}
+	added := slices.Clone(r.root.inbox[n:])
+	if err := r.root.requeue(context.WithoutCancel(ctx)); err != nil {
+		// The entries written stay on the path until the next run end
+		// closes them; the agent holds none of the items, and a caller
+		// that retries delivers them anew.
+		decline(added)
+		r.mu.Unlock()
+		return false, nil, err
+	}
+	r.mu.Unlock()
+	joined, end, err := a.Deliver(ctx, items...)
+	if errors.Is(err, agentturn.ErrHeld) {
+		// A hold began after the check: the agent took nothing.
+		r.mu.Lock()
+		decline(added)
+		r.mu.Unlock()
+	}
+	return joined, end, err
+}
+
+// Redeliver queues items into a as agentturn.Agent.Redeliver does, a
+// steer reaching the turn that takes it as a delivery, with ctx's
+// trigger, after writing each as a queued entry carrying deliver at
+// the session's leaf, durably: how a front takes a remote party's
+// steer into a running agent so it survives a quit, front/a2a's
+// WithDeliverWhileBusy through its Redeliverer. Neither waits nor
+// starts a run, as Redeliver does not. An item the path already owes
+// as a delivery under the same trigger, equal to it, and that nobody
+// has taken up, one a task that stopped for input left for the
+// message answering its calls, is handed over under that entry rather
+// than written again, and one [Recorder.Requeue] already handed back
+// to a, which a holds, is not handed over a second time; one Requeue
+// handed to another agent is a's to take as a new input. A front
+// that may hand over two inputs alike names each in its trigger, as
+// front/a2a names the message. An item whose entry cannot be written
+// is not queued, and the error says so; the items before it are.
+func (r *Recorder) Redeliver(ctx context.Context, a *agentturn.Agent, items ...openresponses.Item) error {
+	trigger, err := sessionTrigger(agentturn.TriggerFromContext(ctx))
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		base, _ := agentturn.Unhide(item)
+		r.mu.Lock()
+		in := r.root.owedDelivery(base, trigger)
+		switch {
+		case in != nil && in.held && in.holder == a:
+			// Requeue already handed it back and this agent holds it:
+			// handing it over again would queue it twice.
+			r.mu.Unlock()
+			continue
+		case in != nil && !in.held:
+			in.item, in.held, in.awaiting, in.holder = base, true, true, a
+		default:
+			// A new input, or one another agent holds, as when a host
+			// reuses one recorder across tasks: this agent gets its own.
+			in = &inboxItem{item: base, mode: agentsession.ModeSteer, deliver: true, held: true, awaiting: true, trigger: trigger.Clone(), holder: a}
+			r.root.inbox = append(r.root.inbox, in)
+			if err := r.root.requeue(context.WithoutCancel(ctx)); err != nil {
+				r.root.inbox = r.root.inbox[:len(r.root.inbox)-1]
+				r.mu.Unlock()
+				return err
+			}
+		}
+		r.mu.Unlock()
+		if err := a.Redeliver(ctx, item); err != nil {
+			r.mu.Lock()
+			decline([]*inboxItem{in})
+			r.mu.Unlock()
+			return err
+		}
+	}
+	return nil
+}
+
+// owedDelivery is the input of the inbox the path owes as a delivery
+// of item under trigger: one nobody has taken up, or one Requeue
+// handed back that the agent holds and has not reported yet; nil when
+// there is none.
+func (w *writer) owedDelivery(item openresponses.Item, trigger *agentsession.Trigger) *inboxItem {
+	for _, in := range w.inbox {
+		if in.declined || in.entry == "" || !in.deliver || in.mode != agentsession.ModeSteer || in.held && !in.awaiting {
+			continue
+		}
+		// An input read back from a sidecar session's path holds its
+		// media as resolved, which the host's may have encoded
+		// otherwise: the two are compared as the path records them.
+		if equalJSON(w.recordForm(in.item), w.recordForm(item)) && equalJSON(in.trigger, trigger) {
+			return in
+		}
+	}
+	return nil
+}
+
+// RecordedControl is the agentturn.Control a recorder offers for an
+// agent it records, with the delivery beside it: what a front serving
+// the agent to remote parties, front/control's Handler among them, is
+// given, so input queued or delivered over the wire is written before
+// the agent takes it.
+type RecordedControl interface {
+	agentturn.Control
+	agentturn.Deliverer
+}
+
+// Control returns a's Control with its Queue going through
+// [Recorder.Queue] and its Deliver through [Recorder.Deliver], so an
+// input a remote party hands in while the agent is idle or waits on an
+// approval is on the record before the agent takes it and survives a
+// quit. Every other method is a's own.
+func (r *Recorder) Control(a *agentturn.Agent) RecordedControl {
+	return recordedControl{Agent: a, r: r}
+}
+
+// recordedControl is [Recorder.Control]'s value.
+type recordedControl struct {
+	*agentturn.Agent
+	r *Recorder
+}
+
+// Queue writes each item's queued entry, then queues it.
+func (c recordedControl) Queue(ctx context.Context, mode agentturn.QueueMode, items ...openresponses.Item) error {
+	return c.r.Queue(ctx, c.Agent, mode, items...)
+}
+
+// Deliver writes each item's queued entry, carrying deliver, then
+// delivers it.
+func (c recordedControl) Deliver(ctx context.Context, items ...openresponses.Item) (bool, *agentturn.RunEnd, error) {
+	return c.r.Deliver(ctx, c.Agent, items...)
+}
+
+// decline marks inputs whose entries were written and which the agent
+// did not take: nobody holds them, Requeue does not hand them back, and
+// the next run end drops them. A process that dies before that end
+// leaves them owed on the path, which a restart reads as owed.
+func decline(ins []*inboxItem) {
+	for _, in := range ins {
+		in.held, in.awaiting, in.declined = false, false, true
+	}
 }
 
 // Requeue hands the agent the inputs the session owes, the ones queued
 // on the path at [Resume], or at a [Start] on a base, and not yet
 // appended, in the order they were accepted and each in its own mode
-// and with its trigger, and returns how many. The path already holds
+// and with its trigger, and returns how many, and whether a delivery is
+// among them. Each is handed back the way it arrived: a delivery, whose
+// entry carries deliver, with agentturn.Agent.Redeliver, so the turn
+// that takes it reads it as one, and a steer or a follow-up with Queue.
+// An owed delivery must reach the model: when deliver is true and
+// nothing else starts a run, the host starts the one that takes it with
+// agentturn.Agent.Continue, which runs on queued steered input; while
+// calls are pending the resume takes it after its batch. An owed steer
+// waits for the next input. The path already holds
 // each, so their queued events write nothing and the item that drains
 // each names its entry. Call it after Resume and before the agent's
 // first run: an input nobody has taken up when a run ends is closed by
@@ -2641,12 +3298,12 @@ func (r *Recorder) Queue(ctx context.Context, a *agentturn.Agent, mode agentturn
 // entry does not carry. The trigger's members of its own come back in
 // its Extra as json.RawMessage values, as they were written, not as
 // the values the host first gave.
-func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) int {
+func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) (n int, deliver bool) {
 	r.mu.Lock()
 	var owed []*inboxItem
 	for _, in := range r.root.inbox {
-		if !in.held && in.entry != "" {
-			in.held, in.awaiting = true, true
+		if !in.held && !in.declined && in.entry != "" {
+			in.held, in.awaiting, in.holder = true, true, a
 			owed = append(owed, in)
 		}
 	}
@@ -2662,9 +3319,14 @@ func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) int {
 		}
 		// A trigger read back from the path was written, so the agent
 		// does not refuse it.
+		if in.deliver {
+			_ = a.Redeliver(qctx, in.item)
+			deliver = true
+			continue
+		}
 		_ = a.Queue(qctx, mode, in.item)
 	}
-	return len(owed)
+	return len(owed), deliver
 }
 
 // Annotate appends a custom entry in namespace ns carrying data,
@@ -3014,8 +3676,9 @@ func (r *Recorder) RecordFunc() agenttool.RecordFunc {
 // writes it as two [ElicitationNS] custom entries under the call that
 // asked: the question, with phase ask, before it is put to fn, and its
 // answer, with phase answer and asked naming the first entry, before
-// the answer returns to the tool; by names who answers, in the session
-// format's terms. When fn is an agent's QuestionElicitor answered
+// the answer returns to the tool; the answer entry names the decider
+// the answer names (agenttool.Answer.By), and by, in the session
+// format's terms, when it names none. When fn is an agent's QuestionElicitor answered
 // through Reply with a trigger on its context, such as front/control's
 // principal, the answer entry names it as its Source
 // (agentturn.WatchAnswerer, named by the replier with
@@ -3069,7 +3732,12 @@ func (r *Recorder) Elicitor(by string, fn agenttool.Elicitor) agenttool.Elicitor
 		if fn != nil {
 			actx, answerer := agentturn.WatchAnswerer(ctx)
 			ans, err = fn(actx, q)
+			// The answer names its decider; by is who answers when
+			// it names none.
 			who, source = by, answerer()
+			if ans.By != "" {
+				who = ans.By
+			}
 		}
 		data.Phase, data.Asked = ElicitationAnswer, asked
 		if err != nil {
@@ -3100,8 +3768,8 @@ func (w *writer) reset() {
 	w.inFlight, w.pending, w.started, w.inFlightID = false, "", time.Time{}, ""
 	w.unhashed, w.noted = nil, nil
 	w.unnamed = nil
-	w.items, w.values, w.custom, w.models = nil, nil, nil, nil
-	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = false, 0, nil, nil
+	w.items, w.values, w.custom, w.models, w.meta = nil, nil, nil, nil, nil
+	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned, w.foldRecorded, w.foldCanon = false, 0, nil, nil, nil, nil
 	w.calls = map[string]*callRecord{}
 	// The links written are on the branch left: a call whose child is
 	// linked there and answered here gets the link again.
@@ -3109,7 +3777,7 @@ func (w *writer) reset() {
 	w.callees, w.cancelled = nil, map[string]bool{}
 	w.env = nil
 	w.base = ""
-	w.attempt, w.attemptModel, w.retries = nil, "", 0
+	w.attempt, w.attemptInput, w.attemptModel, w.retries = nil, nil, "", 0
 	w.parents = map[string]string{}
 	w.appOnly = map[string]bool{}
 	w.heldNotes, w.seededNotes = nil, nil
@@ -3126,11 +3794,14 @@ func (w *writer) seed(ctx context.Context, s *agentsession.Session, owed bool) e
 	}
 	w.settings = cx.Settings
 	w.wroteConfig = hasConfig(cx.Entries)
-	w.values, w.items, w.custom = transcriptOf(cx)
+	var folded []bool
+	w.values, w.items, w.custom, folded = transcriptOf(cx)
 	produced := producedModels(s.Path(s.Leaf()))
 	w.models = make([]string, len(w.items))
+	w.meta = make([]itemMeta, len(w.items))
 	for i, id := range w.items {
 		w.models[i] = produced[id]
+		w.meta[i].folded = folded[i]
 	}
 	w.base = lastConfigBase(s.Path(s.Leaf()))
 	w.seededNotes, w.heldNotes = lastHeldNotes(s.Path(s.Leaf())), nil
@@ -3164,8 +3835,15 @@ func (w *writer) seed(ctx context.Context, s *agentsession.Session, owed bool) e
 		if err != nil {
 			return fmt.Errorf("session: queued inputs at leaf: %w", err)
 		}
+		// Requeue hands each to the agent, so its media is resolved
+		// as AgentOptions resolves the transcript's.
+		m := resolverFor(s, append(w.rec.ReadOptions(), WithContext(ctx)))
 		for _, q := range queued {
-			w.inbox = append(w.inbox, &inboxItem{item: q.Item, mode: q.Mode, trigger: q.Trigger, entry: q.ID})
+			item, err := m.item(s.ID(), q.Item)
+			if err != nil {
+				return fmt.Errorf("session: queued input %s: %w", q.ID, err)
+			}
+			w.inbox = append(w.inbox, &inboxItem{item: item, mode: q.Mode, trigger: q.Trigger, entry: q.ID, deliver: q.Deliver})
 		}
 	}
 	// Every call on the path, a call with its output included, so a
@@ -3193,7 +3871,15 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 	o.r, _ = w.rec.store.(agentsession.Reader)
 	withdrawn := withdrawnDispatches(s.Path(s.Leaf()))
 	for _, c := range calls {
+		if c.Copied() {
+			// Another session's call, held as context alone.
+			w.copied[c.ID()] = true
+			continue
+		}
 		off := false
+		ranSession := ""
+		var ranTrust, ranPathTrust *agentsession.Trust
+		var ranItem openresponses.Item
 		ranEntry, childOff := "", ""
 		var calleesOff []agentsession.CalleeLink
 		if c.Output == nil && len(c.Dispatches) == 0 {
@@ -3205,8 +3891,20 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 				if _, ranEntry = outputAfter(at, d, c.Entry.ID); ranEntry != "" && at == s {
 					// A link names a child of this session, so only a
 					// branch of this session can lend one; a fork's
-					// origin holds its own link, in the fork's prefix.
+					// answer names the origin's output by copied_from
+					// instead, and a reader follows the origin's link.
 					childOff = subsessionOn(at, ranEntry, c.ID())
+				}
+				if ranEntry != "" && at != s {
+					// The output is the origin's: one that repeats it
+					// names it, with its trust.
+					ranSession = at.ID()
+					ranPathTrust = agentsession.PathTrust(at.Path(ranEntry))
+					if e, ok := at.Entry(ranEntry); ok {
+						if ie, ok := e.(*agentsession.ItemEntry); ok {
+							ranTrust, ranItem = ie.Trust, ie.Item
+						}
+					}
 				}
 				if ranEntry != "" && at == s {
 					// Nor does a fork take its origin's callee links:
@@ -3219,6 +3917,7 @@ func (w *writer) seedCalls(ctx context.Context, s *agentsession.Session, calls [
 		}
 		rec := callRecordOf(c, s.Header(), off)
 		rec.ranEntry, rec.childOff, rec.calleesOff = ranEntry, childOff, calleesOff
+		rec.ranSession, rec.ranTrust, rec.ranPathTrust, rec.ranItem = ranSession, ranTrust, ranPathTrust, ranItem
 		rec.dispatchEntry = lastDispatch(c)
 		rec.lastWithdrawn = withdrawn[rec.dispatchEntry]
 		for _, d := range c.Dispatches {
@@ -3263,11 +3962,15 @@ func callRecordOf(c *agentsession.Call, h agentsession.Header, off bool) *callRe
 	if sameJSON(json.RawMessage(decided), c.Call.Arguments) {
 		decided = ""
 	}
-	return &callRecord{
+	rec := &callRecord{
 		entry: c.Entry.Base().ID, args: c.Call.Arguments, decided: decided,
 		held: c.Held(), dispatched: len(c.Dispatches) > 0, rejected: c.Rejected(), ended: c.Answered(),
 		unknown: c.State(h) == agentsession.CallUnknown || off,
 	}
+	if c.Returned() {
+		rec.result = c.Result
+	}
+	return rec
 }
 
 // hasConfig reports whether a config entry is on the path.
@@ -3358,6 +4061,16 @@ func (r *Recorder) Store() agentsession.Store { return r.store }
 // run_start from then on, so a change through Agent.SetConfig reaches
 // the record as a config delta and as the filter in force.
 //
+// A recorder reopened on a session whose omit setting records a
+// quarantine, an output sent as agentturn.QuarantinedOutput or an item
+// left out, quarantines in a what a's transcript holds of it as a
+// attaches (Agent.Quarantine), so an agent seeded with the
+// conversation whole, from a store kept beside the record as
+// front/a2a's is, leaves out what the record says it left out rather
+// than sending it again. An agent seeded from the record, with
+// [AgentOptions] or [Transcript], holds the context as omit shaped it
+// and has nothing to quarantine (#281).
+//
 // Subscribers are called in registration order and the recorder writes
 // a call's dispatch when tool_dispatch reaches it, durably, before the
 // tool runs. A subscriber that may refuse a dispatch, a policy that
@@ -3366,11 +4079,17 @@ func (r *Recorder) Store() agentsession.Store { return r.store }
 // already on the record, and the record reads that call as possibly
 // run although the loop never handed it over.
 func (r *Recorder) Attach(a *agentturn.Agent) (unsubscribe func()) {
+	t := a.State().Transcript
 	r.mu.Lock()
 	r.agent = a
 	cfg := a.Config()
 	r.root.cfg = &cfg
+	quarantined := r.root.quarantinedIn(t)
 	r.mu.Unlock()
+	// What the record says is quarantined stays so: an agent seeded
+	// with the whole conversation, from a store beside the record,
+	// would otherwise send it again (#281).
+	_ = a.Quarantine(quarantined...)
 	unsub := a.Subscribe(r.Handle)
 	return func() {
 		unsub()
@@ -3434,6 +4153,31 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 	// An observer cannot fail the child run, so a store failure ends
 	// the record of that child where it is: later events find no writer
 	// and the parent's tool_end falls back to the items.
+	if e, ok := ev.(*agentturn.Queued); ok && e.RunID == "" {
+		// An idle child reports an input before the run that takes it
+		// starts, so its session is not known yet.
+		callID := ""
+		if call, ok := agenttool.CallFrom(ctx); ok {
+			callID = call.ID
+		}
+		if r.heldQueued == nil {
+			r.heldQueued = map[string][]*heldReport{}
+		}
+		h := &heldReport{q: e}
+		parent := r.root
+		if p, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
+			parent = p
+		}
+		if id := agentsession.SubsessionID(parent.id, callID); callID != "" && r.childIDs[id] {
+			// The child's session continues at its leaf: the input is
+			// owed there from now, after the run that ended.
+			if w, err := r.reopenID(ctx, id); err == nil && w != nil && w.queued(ctx, e) == nil && len(w.inbox) > 0 {
+				h.session, h.entry = id, w.inbox[len(w.inbox)-1].entry
+			}
+		}
+		r.heldQueued[callID] = append(r.heldQueued[callID], h)
+		return
+	}
 	if e, ok := ev.(*agentturn.RunStart); ok {
 		parent := r.root
 		if p, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
@@ -3443,11 +4187,12 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 		if call, ok := agenttool.CallFrom(ctx); ok {
 			callID = call.ID
 		}
-		w, err := r.newChild(ctx, parent, callID, true)
+		cfg, hasCfg := agent.ConfigFromContext(ctx)
+		w, err := r.newChild(ctx, parent, callID, true, cfg.Name)
 		if err != nil {
 			return
 		}
-		if cfg, ok := agent.ConfigFromContext(ctx); ok {
+		if hasCfg {
 			w.cfg = &cfg
 		}
 		r.runs[e.RunID] = w
@@ -3455,6 +4200,21 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 			// The link is written at dispatch, which is now: the call
 			// is running.
 			_ = parent.link(ctx, w.id, callID)
+		}
+		held := r.heldQueued[callID]
+		delete(r.heldQueued, callID)
+		retry := agent.RetryFromContext(ctx)
+		for _, h := range held {
+			if h.entry != "" && h.session == w.id && !retry {
+				// Written when it was reported, at the leaf this run
+				// continues from: the run takes it up.
+				w.inbox = append(w.inbox, h.inbox())
+				continue
+			}
+			if err := w.handle(ctx, h.q); err != nil {
+				r.release(e.RunID, w)
+				return
+			}
 		}
 	}
 	w, ok := r.runs[runID(ev)]
@@ -3527,11 +4287,16 @@ func (r *Recorder) Fold(ctx context.Context, f compact.Fold) error {
 //
 // live says the child is written from its events, so the header
 // promises the record entries; a child replayed from its items
-// promises nothing.
-func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, live bool) (*writer, error) {
-	h := agentsession.Header{ParentSession: parent.id, Harness: r.harness, SpawnedBy: callID, CWD: parent.cwd}
+// promises nothing. name is the configuration the child ran under: a
+// session created for it is named so, by an info entry before anything
+// else, and one reopened keeps whatever name it has, so a name a
+// person set later stands.
+func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, live bool, name string) (*writer, error) {
+	h := agentsession.Header{ParentSession: parent.id, Harness: r.harness, SpawnedBy: callID, CWD: parent.cwd, Media: parent.media}
 	if live {
-		h.Records = append([]string(nil), agentsession.AllRecords...)
+		// Written from its events, the child's queued reports among
+		// them, as the root is.
+		h.Records = append(append([]string(nil), agentsession.AllRecords...), agentsession.TypeQueued, agentsession.TypeResult)
 	}
 	if callID != "" {
 		h.ID = agentsession.SubsessionID(parent.id, callID)
@@ -3541,7 +4306,9 @@ func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, 
 		if s, err = r.store.Open(ctx, h.ID); err == nil {
 			r.addChild(s.ID())
 			w := newWriter(r, s.ID())
-			w.cwd = parent.cwd
+			// A reopened child keeps the media form it was created
+			// with, which its own children take.
+			w.cwd, w.media = parent.cwd, s.Header().Media
 			w.parent, w.parentID = parent, parent.id
 			if agent.RetryFromContext(ctx) {
 				s.ResetLeaf()
@@ -3562,8 +4329,13 @@ func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, 
 	}
 	r.addChild(s.ID())
 	w := newWriter(r, s.ID())
-	w.cwd = parent.cwd
+	w.cwd, w.media = parent.cwd, parent.media
 	w.parent, w.parentID = parent, parent.id
+	if name != "" {
+		if _, err := w.append(ctx, &agentsession.InfoEntry{Name: name}); err != nil {
+			return nil, err
+		}
+	}
 	return w, nil
 }
 
@@ -3605,6 +4377,8 @@ func runID(ev agentturn.Event) string {
 	case *agentturn.TurnEnd:
 		return e.RunID
 	case *agentturn.RunEnd:
+		return e.RunID
+	case *agentturn.Queued:
 		return e.RunID
 	case *agentturn.NotesHeld:
 		return e.RunID
@@ -3673,7 +4447,7 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 		if err != nil {
 			return err
 		}
-		if w.inFlight && e.ResponseID == "" && !e.Hidden && source == nil {
+		if w.inFlight && e.ResponseID == "" && !e.Hidden && !e.Copied && source == nil {
 			// The loop appends nothing of its own while a model call
 			// is in flight, so this is the model's, from a stream that
 			// has not named its response yet: it is written once it
@@ -3681,7 +4455,13 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 			w.unnamed = append(w.unnamed, unnamedItem{item: e.Item, modelCallID: e.ModelCallID})
 			return nil
 		}
-		return w.item(ctx, e.Item, e.ResponseID, e.Hidden, source, e.ModelCallID)
+		var from *copySource
+		if e.Copied {
+			if from, err = w.copiedFrom(ctx, e.Item); err != nil {
+				return err
+			}
+		}
+		return w.itemFrom(ctx, e.Item, e.ResponseID, e.Hidden, source, e.ModelCallID, from)
 	case *agentturn.ResponseEnd:
 		return w.response(ctx, e)
 	case *agentturn.ToolStart:
@@ -3721,7 +4501,7 @@ func (w *writer) queued(ctx context.Context, e *agentturn.Queued) error {
 	if err != nil {
 		return err
 	}
-	in := &inboxItem{item: e.Item, mode: mode, held: true, trigger: trigger}
+	in := &inboxItem{item: e.Item, mode: mode, held: true, trigger: trigger, deliver: e.Input == agentturn.InputDeliver}
 	w.inbox = append(w.inbox, in)
 	return w.requeue(ctx)
 }
@@ -3749,27 +4529,71 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 		c.settledRun = w.run
 	}
 	if c := w.calls[e.CallID]; c != nil && e.Parent == "" && e.Withdrawn && c.dispatched && c.dispatchRun == w.run && !c.lastWithdrawn {
-		// The dispatch is on the path, and the tool never ran: say so,
-		// so the call reads as never started rather than as one that
-		// may have run.
-		data, err := json.Marshal(Withdrawn{Dispatch: c.dispatchEntry, Reason: errText(e.Err)})
-		if err != nil {
+		// The dispatch is on the path, and the tool never ran: withdraw
+		// it, so the call reads as it was before the dispatch, never
+		// started when it has no other, rather than as one that may
+		// have run.
+		reason := errText(e.Err)
+		if reason == "" {
+			reason = "dispatch withdrawn"
+		}
+		if _, err := w.append(ctx, agentsession.NewWithdrawal(e.CallID, c.entry, "", reason)); err != nil {
 			return err
 		}
-		if _, err := w.append(ctx, &agentsession.CustomEntry{NS: WithdrawnNS, Data: data, CallID: e.CallID}); err != nil {
-			return err
+		c.withdraw()
+	}
+	if e.Parent == "" {
+		delete(w.unsettled, e.CallID)
+	}
+	if c := w.calls[e.CallID]; c != nil && e.Parent == "" {
+		// The tool reported failure, after a hand-off of this run that
+		// stood: a block and the loop's own refusals are rejects.
+		ran := !e.Blocked && !e.Deferred && !e.Withdrawn && !e.Cut && c.dispatched && c.dispatchRun == w.run
+		c.failed = ran && e.Err != nil
+		if ran && len(w.unsettled) > 0 {
+			// The batch appends the outputs once every call has
+			// settled, and others still run: what the tool returned is
+			// durable before this event returns, so a process that
+			// dies before the batch is in does not run it again.
+			out, err := w.sidecar(ctx, &openresponses.FunctionCallOutput{CallID: e.CallID, Output: e.Result.Output})
+			if err != nil {
+				return err
+			}
+			r := agentsession.NewResult(e.CallID, c.entry, out.(*openresponses.FunctionCallOutput))
+			r.Failed = c.failed
+			if _, err := w.append(ctx, r); err != nil {
+				return err
+			}
+			c.result = r
 		}
-		c.lastWithdrawn = true
-		c.handedOff--
+	}
+	if e.Parent != "" && e.Replayed {
+		// Its record is on the path already, its details among it.
+		return nil
 	}
 	if e.Parent != "" {
+		var details *NestedDetails
+		if r, err := agenttool.RecordOf(e.Result.Details); err == nil && r != nil {
+			details = &NestedDetails{NS: r.NS, Data: r.Data}
+		}
+		reason := ""
+		if e.Blocked {
+			reason = e.Reason
+		}
 		if err := w.nested(ctx, NestedCall{
-			Phase:  agentsession.RunEnd,
-			CallID: e.CallID,
-			Parent: e.Parent,
-			Name:   e.Name,
-			Output: e.Result.Output.Text,
-			Error:  errText(e.Err),
+			Phase:     agentsession.RunEnd,
+			CallID:    e.CallID,
+			Parent:    e.Parent,
+			Name:      e.Name,
+			Output:    e.Result.Output.Text,
+			Parts:     e.Result.Output.Parts,
+			Error:     errText(e.Err),
+			Cut:       e.Cut,
+			Withdrawn: e.Withdrawn,
+			Terminate: e.Result.Terminate,
+			Blocked:   e.Blocked,
+			Reason:    reason,
+			Details:   details,
 		}, e.Parent); err != nil {
 			return err
 		}
@@ -3851,6 +4675,7 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 		return err
 	}
 	w.run = e.RunID
+	w.unsettled = nil
 	w.open = nil
 	w.responses = 0
 	w.lastCalls = false
@@ -3918,7 +4743,8 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 	default:
 		return nil
 	}
-	return w.settle(ctx, Canonical(w.cfg.BaseRequest(ctx)))
+	req := Canonical(w.cfg.BaseRequest(ctx))
+	return w.settle(ctx, req, w.omitFor(req.Model))
 }
 
 // lastConfigBase returns the [ConfigBaseMember] of the last run start
@@ -4067,20 +4893,45 @@ func (w *writer) turnStart(ctx context.Context, e *agentturn.TurnStart) error {
 		return err
 	}
 	req := Canonical(e.Request)
-	hash, unhashed, err := w.hash(req)
+	hash, omit, unhashed, err := w.hash(req)
 	if err != nil {
 		return err
 	}
-	w.settleReq = &req
-	if w.attempt, err = json.Marshal(req); err != nil {
-		return fmt.Errorf("session: encode request: %w", err)
+	w.settleReq, w.settleOmit = &req, omit
+	if w.attempt, err = settingsJSON(req); err != nil {
+		return err
 	}
+	w.attemptInput = req.Input
 	w.attemptModel, w.retries = req.Model, 0
 	w.inFlight = true
 	w.pending, w.unhashed = hash, unhashed
 	w.started = w.rec.now()
 	w.inFlightID = ""
 	return nil
+}
+
+// settingsJSON is req encoded without its input.
+func settingsJSON(req openresponses.Request) ([]byte, error) {
+	req.Input = nil
+	data, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("session: encode request: %w", err)
+	}
+	return data, nil
+}
+
+// sameItems reports whether a and b hold the same items: the very items,
+// or ones that encode alike.
+func sameItems(a, b openresponses.Items) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] && !equalJSON(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // attempts is the attempts member of the response entry of the call in
@@ -4102,17 +4953,17 @@ func (w *writer) attempts() int {
 // that answered.
 func (w *writer) retry(ctx context.Context, e *agentturn.ModelRetry) error {
 	req := Canonical(e.Request)
-	hash, unhashed, err := w.hash(req)
+	hash, omit, unhashed, err := w.hash(req)
 	if err != nil {
 		return err
 	}
-	next, err := json.Marshal(req)
+	next, err := settingsJSON(req)
 	if err != nil {
-		return fmt.Errorf("session: encode request: %w", err)
+		return err
 	}
 	rec := ModelRetry{Attempt: e.Attempt, Error: errText(e.Err), DelayMS: e.Delay.Milliseconds(), Model: w.attemptModel}
 	if w.attempt != nil {
-		rec.Revised = !bytes.Equal(w.attempt, next)
+		rec.Revised = !bytes.Equal(w.attempt, next) || !sameItems(w.attemptInput, req.Input)
 	}
 	raw, err := json.Marshal(rec)
 	if err != nil {
@@ -4130,8 +4981,8 @@ func (w *writer) retry(ctx context.Context, e *agentturn.ModelRetry) error {
 	if _, err := w.append(ctx, &agentsession.CustomEntry{NS: ModelRetryNS, Data: raw}); err != nil {
 		return err
 	}
-	w.attempt, w.attemptModel, w.retries = next, req.Model, e.Attempt
-	w.settleReq = &req
+	w.attempt, w.attemptInput, w.attemptModel, w.retries = next, req.Input, req.Model, e.Attempt
+	w.settleReq, w.settleOmit = &req, omit
 	w.inFlight = true
 	w.pending, w.unhashed = hash, unhashed
 	w.started = w.rec.now()
@@ -4144,9 +4995,9 @@ func (w *writer) flush(ctx context.Context) error {
 	if w.settleReq == nil {
 		return nil
 	}
-	req := *w.settleReq
-	w.settleReq = nil
-	return w.settle(ctx, req)
+	req, omit := *w.settleReq, w.settleOmit
+	w.settleReq, w.settleOmit = nil, agentsession.Omit{}
+	return w.settle(ctx, req, omit)
 }
 
 // name writes the items held for the call in flight, in order, with
@@ -4165,17 +5016,35 @@ func (w *writer) name(ctx context.Context, responseID string) (bool, error) {
 }
 
 // hash returns the request's hash when its input is what the stored
-// path rebuilds, and otherwise "" and why not.
-func (w *writer) hash(req openresponses.Request) (string, *Unhashed, error) {
-	expected, ok := w.expectedInput(req.Model, w.omitFor(req.Model))
+// path rebuilds under the omit setting it returns, which the settle of
+// the request writes, and otherwise "" and why not. The setting is the
+// one in force, with the reasoning rule a model switch adds, or one
+// that describes how the input differs from what the path holds, when
+// the format can describe it (#233).
+func (w *writer) hash(req openresponses.Request) (string, agentsession.Omit, *Unhashed, error) {
+	omit := w.omitFor(req.Model)
+	expected, ok := w.rebuild(req.Model, omit)
 	if !ok {
-		return "", &Unhashed{Reason: "the last fold recorded keeps more items than the recorder holds"}, nil
+		return "", omit, &Unhashed{Reason: "the last fold recorded keeps more items than the recorder holds"}, nil
 	}
-	if !equalJSON(expected, req.Input) {
-		return "", divergence(req.Input, expected), nil
+	sent := newSentInput(req.Input)
+	if !w.matches(sent, expected) {
+		described, _, ok := w.describe(sent, req.Model)
+		if !ok {
+			items := make(openresponses.Items, len(expected))
+			for k, r := range expected {
+				items[k] = r.item
+			}
+			return "", omit, divergence(req.Input, items), nil
+		}
+		omit = described
 	}
-	hash, err := RequestHash(req)
-	return hash, nil, err
+	// The input matches the one the path rebuilds, so the request is
+	// hashed with that input, item for item as the path holds it: in a
+	// sidecar session with each sidecar: URL as the item records it,
+	// which is the form a reader rebuilds (#284).
+	hash, err := w.hashOf(req, sent)
+	return hash, omit, nil, err
 }
 
 // divergence names the first item at which sent, a request's input,
@@ -4233,35 +5102,6 @@ func (w *writer) noteUnhashed(ctx context.Context, why *Unhashed) error {
 	return nil
 }
 
-// expectedInput is the input the stored path rebuilds, as the context
-// algorithm reads it: the summary of the last fold recorded, then the
-// items that fold pinned, then the items written as item entries from
-// the fold's first kept one on, less the ones omit leaves out of a
-// request to model.
-func (w *writer) expectedInput(model string, omit agentsession.Omit) (openresponses.Items, bool) {
-	from := 0
-	var out openresponses.Items
-	if w.foldSet {
-		if w.foldSplit > len(w.values) {
-			return nil, false
-		}
-		from = w.foldSplit
-		out = append(out, w.foldSummary)
-		out = append(out, w.foldPinned...)
-	}
-	listed := make(map[string]bool, len(omit.Items))
-	for _, id := range omit.Items {
-		listed[id] = true
-	}
-	for i := from; i < len(w.values); i++ {
-		if w.custom[i] || listed[w.items[i]] || w.leftOut(i, model, omit) {
-			continue
-		}
-		out = append(out, w.values[i])
-	}
-	return out, true
-}
-
 // leftOut reports whether omit's rule leaves the reasoning item at
 // index i out of a request to model: it is one a response produced
 // while another model was in force. A request under no model leaves
@@ -4304,21 +5144,25 @@ func (w *writer) omitFor(model string) agentsession.Omit {
 // made.
 func (w *writer) blocked(ctx context.Context, e *agentturn.ModelBlocked) error {
 	req := Canonical(e.Request)
-	hash, unhashed, err := w.hash(req)
+	hash, omit, unhashed, err := w.hash(req)
 	if err != nil {
 		return err
 	}
-	if err := w.settle(ctx, req); err != nil {
+	if err := w.settle(ctx, req, omit); err != nil {
 		return err
 	}
 	if err := w.noteUnhashed(ctx, unhashed); err != nil {
 		return err
 	}
+	// A call the model's guard refused after turn_start was in flight:
+	// it ends here, with this record, not as a failed response at the
+	// run's end.
+	w.inFlight, w.pending, w.started, w.inFlightID, w.retries, w.unhashed = false, "", time.Time{}, "", 0, nil
 	if errors.Is(e.Err, agentturn.ErrGuard) {
 		// A policy stopped the run: the refused request is a record of
 		// its own, since a failed response would read as the run
-		// failing.
-		raw, err := json.Marshal(ModelBlocked{Error: errText(e.Err), RequestHash: hash, Model: req.Model})
+		// failing. What the provider billed for it is counted.
+		raw, err := json.Marshal(ModelBlocked{Error: errText(e.Err), RequestHash: hash, Model: req.Model, Usage: e.Usage})
 		if err != nil {
 			return fmt.Errorf("session: encode model blocked: %w", err)
 		}
@@ -4339,8 +5183,12 @@ func (w *writer) blocked(ctx context.Context, e *agentturn.ModelBlocked) error {
 // config first and deltas after. With [WithInstructionsParts] the
 // entries carry the parts of the instructions when they join to the
 // request's, and what was left out.
-func (w *writer) settle(ctx context.Context, req openresponses.Request) error {
+func (w *writer) settle(ctx context.Context, req openresponses.Request, want agentsession.Omit) error {
 	parts, omitted := w.instructionParts(ctx, req)
+	// The settings are the request's less its input, which a config
+	// entry does not hold: it is left out before encoding rather than
+	// encoded and dropped (#282).
+	req.Input = nil
 	full, err := agentsession.ConfigFromRequestParts(req, parts...)
 	if err != nil {
 		return fmt.Errorf("session: %w", err)
@@ -4350,16 +5198,14 @@ func (w *writer) settle(ctx context.Context, req openresponses.Request) error {
 	// [] when it emptied.
 	omittedDelta := w.settings.OmittedDelta(omitted)
 	// What a request leaves out of the context is the path's to say,
-	// and it is written with the model change it answers: a delta
-	// carrying the rule, or nothing when it is in force.
-	want := w.omitFor(req.Model)
+	// and it is written with the change it answers: a delta carrying
+	// the rule or the items, outputs and images left out, or nothing
+	// when it is in force. One no delta can reach, an item left out
+	// before and sent again, is a replace, which carries it whole.
 	omit, ok := w.settings.OmitDelta(want)
-	if !ok {
-		return fmt.Errorf("session: omit setting %+v is not one config entry", want)
-	}
 	var entry *agentsession.ConfigEntry
 	switch {
-	case !w.wroteConfig:
+	case !w.wroteConfig || !ok:
 		entry = full
 	default:
 		entry = configDelta(w.settings, agentsession.Settings{}.Apply(full), full, parts, omitted)
@@ -4382,7 +5228,7 @@ func (w *writer) settle(ctx context.Context, req openresponses.Request) error {
 		// is wanted whole; a delta carries what moved.
 		if entry.Replace {
 			if !want.IsZero() {
-				kept := agentsession.Omit{Reasoning: want.Reasoning, Items: slices.Clone(want.Items)}
+				kept := agentsession.Omit{Reasoning: want.Reasoning, Items: slices.Clone(want.Items), Images: want.Images, Outputs: cloneOutputs(want.Outputs)}
 				entry.Omit = &kept
 			}
 		} else {
@@ -4396,9 +5242,27 @@ func (w *writer) settle(ctx context.Context, req openresponses.Request) error {
 		// and parts it put in force by.
 		entry.ID = id
 		w.settings = w.settings.Apply(entry)
+		if entry.Omit != nil {
+			w.forgetLeftOut()
+		}
 	}
 	w.wroteConfig = true
 	return nil
+}
+
+// forgetLeftOut lets go of the kept bytes of the items the omit in force
+// leaves out, which no request carries while it stays in force; one sent
+// again is encoded afresh.
+func (w *writer) forgetLeftOut() {
+	listed := idSet(w.settings.Omit.Items)
+	if len(listed) == 0 {
+		return
+	}
+	for i, id := range w.items {
+		if listed[id] && !w.meta[i].folded {
+			w.meta[i].canon = nil
+		}
+	}
 }
 
 // instructionParts asks the host for the parts of req's instructions
@@ -4447,10 +5311,104 @@ func (w *writer) instructionParts(ctx context.Context, req openresponses.Request
 // trigger for an item the run was prompted with, and modelCallID the
 // ID the model gave a call the loop renamed.
 func (w *writer) item(ctx context.Context, item openresponses.Item, responseID string, hidden bool, source *agentsession.Trigger, modelCallID string) error {
+	return w.itemFrom(ctx, item, responseID, hidden, source, modelCallID, nil)
+}
+
+// copySource is where a copied item was taken from: the entry's
+// copied_from and the trust it carries.
+type copySource struct {
+	from  agentsession.CopiedFrom
+	trust *agentsession.Trust
+	// pathTrust is the trust of the path the item was copied from,
+	// which a copy naming no entry carries (format 0.15), and item the
+	// named entry's item: a copy names the entry only when it writes
+	// that item unchanged.
+	pathTrust *agentsession.Trust
+	item      openresponses.Item
+}
+
+// copiedFrom resolves an item the loop marks copied, one a child was
+// prompted with from the conversation of the session whose call
+// spawned it: that session, and the entry of it holding the very item,
+// with that entry's trust, when there is one; a copy naming no entry,
+// a placeholder made for the copy among them, carries the trust of the
+// parent's path. It returns nil for a session with no parent, which has
+// no session to name, and an error when the parent session cannot be
+// read, since a copy must not name an entry without its trust.
+func (w *writer) copiedFrom(ctx context.Context, item openresponses.Item) (*copySource, error) {
+	if w.parentID == "" {
+		return nil, nil
+	}
+	ps, err := w.parentPath(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	src := &copySource{from: agentsession.CopiedFrom{Session: w.parentID}, pathTrust: agentsession.PathTrust(ps.Path(ps.Leaf()))}
+	src.trust = src.pathTrust
+	p := w.parent
+	if p == nil || item == nil || !reflect.TypeOf(item).Comparable() {
+		// An item type that cannot be compared is matched by no entry.
+		return src, nil
+	}
+	for i := len(p.values) - 1; i >= 0; i-- {
+		if p.values[i] != item || p.custom[i] {
+			continue
+		}
+		e, ok := ps.Entry(p.items[i])
+		if !ok {
+			// Written since the parent was read: read it again.
+			if ps, err = w.parentPath(ctx, true); err != nil {
+				return nil, err
+			}
+			src.pathTrust = agentsession.PathTrust(ps.Path(ps.Leaf()))
+			src.trust = src.pathTrust
+			if e, ok = ps.Entry(p.items[i]); !ok {
+				break
+			}
+		}
+		if ie, ok := e.(*agentsession.ItemEntry); ok {
+			src.from.Entry, src.trust, src.item = p.items[i], ie.Trust, ie.Item
+		}
+		break
+	}
+	return src, nil
+}
+
+// parentPath is the session whose call spawned this one, read once, or
+// again when fresh is set.
+func (w *writer) parentPath(ctx context.Context, fresh bool) (*agentsession.Session, error) {
+	if w.parentSession != nil && !fresh {
+		return w.parentSession, nil
+	}
+	s, err := w.rec.store.Open(context.WithoutCancel(ctx), w.parentID)
+	if err != nil {
+		return nil, fmt.Errorf("session: read parent session %s for a copied item: %w", w.parentID, err)
+	}
+	w.parentSession = s
+	return s, nil
+}
+
+// itemFrom is [writer.item] for an item taken from another session's
+// conversation when from is set: its entry carries copied_from and the
+// source's trust, and a copied call and its output take no decision.
+func (w *writer) itemFrom(ctx context.Context, item openresponses.Item, responseID string, hidden bool, source *agentsession.Trigger, modelCallID string, from *copySource) error {
 	if item == nil {
 		return nil
 	}
-	if out, ok := item.(*openresponses.FunctionCallOutput); ok && !w.replay {
+	if out, ok := item.(*openresponses.FunctionCallOutput); ok && from == nil && w.copied[out.CallID] && w.parentID != "" {
+		// An output for a copied call is copied too: made for the copy,
+		// it names no entry.
+		var err error
+		if from, err = w.copiedFrom(ctx, nil); err != nil {
+			return err
+		}
+	}
+	// failed marks an output that says the call failed: its tool
+	// reported failure, or the caller answered a call it gave up, such
+	// as one whose outcome is unknown. A refusal, written as a reject,
+	// is not a failure.
+	failed := false
+	if out, ok := item.(*openresponses.FunctionCallOutput); ok && !w.replay && !w.copied[out.CallID] {
 		c := w.calls[out.CallID]
 		switch {
 		case c != nil && c.answered:
@@ -4458,12 +5416,21 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 			// one is a harness that lost track of the call, and would
 			// put two outputs for one call in the context.
 			return fmt.Errorf("session: output of call %s: %w", out.CallID, agentsession.ErrCallCompleted)
-		case c == nil || c.rejected || c.ended:
-			// Nothing to anchor a decision to, or the call's fate is
-			// on the path already: after a reject or an answer, only
-			// its output.
+		case c == nil || c.ended:
+			// Nothing to anchor a decision to, or an answer on the path
+			// already, which only its output may follow.
+			failed = agentturn.FailedFromContext(ctx, out.CallID)
+		case c.rejected:
+			// The call's reject is on the path: only its output, the
+			// refusal, may follow.
+		case c.result != nil && equalJSON(c.result.Item, w.recordForm(out)):
+			// The tool returned before the record stopped, and this is
+			// what it returned: the result is the record, and the
+			// output appends it.
+			failed = c.result.Failed
 		case c.dispatched && c.dispatchRun != "" && c.dispatchRun == w.run:
 			// The tool's own output: the dispatch is the record.
+			failed = c.failed
 		case c.dispatched || c.unknown:
 			// A call an earlier run dispatched, or one the path
 			// cannot say about, another branch's dispatch of a held
@@ -4498,6 +5465,14 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 					return err
 				}
 			}
+			if origin := agentturn.OriginFromContext(ctx, out.CallID); origin != "" && origin == c.ranEntry && c.ranSession != "" && from == nil {
+				// The output repeats the one the fork's origin
+				// recorded: it names that entry, through which a
+				// reader reaches the origin's link to the child
+				// session that produced it, which this session's
+				// record cannot hold.
+				from = &copySource{from: agentsession.CopiedFrom{Session: c.ranSession, Entry: origin}, trust: c.ranTrust, pathTrust: c.ranPathTrust, item: c.ranItem}
+			}
 			dec := agentsession.NewDecision(out.CallID, c.entry, agentsession.VerdictAnswer, by)
 			if reason != "" {
 				dec.WithReason(reason)
@@ -4513,6 +5488,7 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 			// reads the call as PendingAnswered.
 			w.takeUp(out.CallID)
 			c.held, c.ended = false, true
+			failed = agentturn.FailedFromContext(ctx, out.CallID)
 		default:
 			// The caller wrote the output themselves: the call never
 			// reached its tool, and the output is what the model sees.
@@ -4545,6 +5521,12 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		}
 	}
 	var entry agentsession.Entry
+	// In a sidecar session the entry names the item's media by
+	// reference, stored as blobs first; the loop keeps the inline item.
+	recorded, err := w.sidecar(ctx, item)
+	if err != nil {
+		return err
+	}
 	// An item the filter in force drops never reached the model, so it
 	// is outside the context and outside the item entries; the hidden
 	// mark is about a renderer and adds nothing to it. A model's output
@@ -4552,7 +5534,7 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 	// others, is the same, and names its response beside it.
 	appOnly := len(w.filter()(agentturn.Transcript{item})) == 0
 	if appOnly {
-		raw, err := json.Marshal(item)
+		raw, err := json.Marshal(recorded)
 		if err != nil {
 			return fmt.Errorf("session: encode %s item: %w", item.ItemType(), err)
 		}
@@ -4562,7 +5544,16 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		}
 		entry = &agentsession.CustomEntry{NS: item.ItemType(), Data: raw, EntryBase: agentsession.EntryBase{Unknown: map[string]json.RawMessage{ResponseIDMember: id}}}
 	} else {
-		e := &agentsession.ItemEntry{Item: item, ResponseID: responseID}
+		e := &agentsession.ItemEntry{Item: recorded, ResponseID: responseID, Failed: failed}
+		if from != nil {
+			cf, trust := from.from, from.trust
+			if cf.Entry != "" && (from.item == nil || !equalJSON(from.item, recorded)) {
+				// Not the entry's item member for member: the copy
+				// names the session alone, with its path's trust.
+				cf.Entry, trust = "", from.pathTrust
+			}
+			e.CopiedFrom, e.Trust = &cf, trust
+		}
 		if hidden {
 			visible := false
 			e.Visible = &visible
@@ -4589,6 +5580,9 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 		} else if e, ok := entry.(*agentsession.ItemEntry); ok && in == nil && source != nil {
 			e.Source = source
 		}
+		if e, ok := entry.(*agentsession.ItemEntry); ok {
+			e.FromLink = w.fromLink(e.Source)
+		}
 	}
 	id, err := w.append(ctx, entry)
 	if err != nil {
@@ -4597,6 +5591,14 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 	w.items = append(w.items, id)
 	w.values = append(w.values, item)
 	w.custom = append(w.custom, appOnly)
+	meta := itemMeta{}
+	if recorded != item {
+		meta.recorded = recorded
+	}
+	// The bytes the entry holds, kept now: the loop shares the item, and
+	// an edit in place later is not what the record says was sent.
+	meta.canon, _ = canonicalValue(recorded)
+	w.meta = append(w.meta, meta)
 	model := ""
 	if _, ok := item.(*openresponses.ReasoningItem); ok && responseID != "" {
 		model = w.settings.Model
@@ -4604,6 +5606,13 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 	w.models = append(w.models, model)
 	switch v := item.(type) {
 	case *openresponses.FunctionCall:
+		if from != nil && !appOnly {
+			// Another session's call: context alone, never one of
+			// this session's, so no decision, dispatch or run end
+			// names it.
+			w.copied[v.CallID] = true
+			break
+		}
 		if appOnly {
 			// A custom entry is no function call a decision or a
 			// dispatch can name by target, nor one a run end lists.
@@ -4672,14 +5681,29 @@ func outputText(out *openresponses.FunctionCallOutput) string {
 // was. The dispatch is written when the call is handed to its tool,
 // which tool_dispatch reports.
 func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
+	if e.Parent == "" {
+		if w.unsettled == nil {
+			w.unsettled = map[string]bool{}
+		}
+		w.unsettled[e.CallID] = true
+	}
 	if e.Parent != "" {
 		w.parents[e.CallID] = e.Parent
+		if e.Replayed {
+			// Its record is on the path already, and it does not run.
+			return nil
+		}
+		var invoked json.RawMessage
+		if e.Invoked != nil && !sameJSON(e.Invoked, string(e.Args)) {
+			invoked = e.Invoked
+		}
 		return w.nested(ctx, NestedCall{
-			Phase:  agentsession.RunStart,
-			CallID: e.CallID,
-			Parent: e.Parent,
-			Name:   e.Name,
-			Args:   json.RawMessage(e.Args),
+			Phase:   agentsession.RunStart,
+			CallID:  e.CallID,
+			Parent:  e.Parent,
+			Name:    e.Name,
+			Args:    json.RawMessage(e.Args),
+			Invoked: invoked,
 			Verdict: func() string {
 				switch {
 				case e.Decision == nil:
@@ -4708,6 +5732,13 @@ func (w *writer) toolStart(ctx context.Context, e *agentturn.ToolStart) error {
 		// has lost track of it, and whatever it decides has nowhere to
 		// go on the path.
 		return fmt.Errorf("session: decision on call %s: %w", e.CallID, agentsession.ErrCallCompleted)
+	}
+	if c.result != nil {
+		// Its tool returned and the result is on the path: the format
+		// takes no proceed, hold or reject after it, and the call is
+		// owed that output, so a harness deciding on it again has lost
+		// track of it and the tool must not run.
+		return fmt.Errorf("session: decision on call %s: %w", e.CallID, agentsession.ErrCallReturned)
 	}
 	if c.rejected || c.ended {
 		// The call's fate is on the path: only its output may follow.
@@ -4821,7 +5852,10 @@ const agentRunAgain = "run again"
 // entries tool_start and tool_end write.
 func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) error {
 	if e.Parent != "" {
-		return nil
+		// A nested call has no function call for a dispatch to name; its
+		// hand-off and its key are a record entry, durable before its
+		// tool runs, so a parent run again runs it under the same key.
+		return w.nested(ctx, NestedCall{Phase: nestedDispatch, CallID: e.CallID, Parent: e.Parent, Name: e.Name, IdempotencyKey: e.IdempotencyKey}, e.Parent)
 	}
 	c := w.calls[e.CallID]
 	if c == nil && !w.appOnly[e.CallID] {
@@ -4837,6 +5871,12 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 		// The output ended the call, and the format reads a tool run
 		// after it as a new call: refusing the dispatch stops the tool.
 		return fmt.Errorf("session: dispatch of call %s: %w", e.CallID, agentsession.ErrCallCompleted)
+	}
+	if c.result != nil {
+		// A result is on the path, and the format reads a hand-off
+		// after it as running a call that returned: refusing the
+		// dispatch stops the tool.
+		return fmt.Errorf("session: dispatch of call %s: %w", e.CallID, agentsession.ErrCallReturned)
 	}
 	if c.again != nil {
 		// Running a call again is the harness's choice, and the format
@@ -4854,6 +5894,7 @@ func (w *writer) toolDispatch(ctx context.Context, e *agentturn.ToolDispatch) er
 		return err
 	}
 	w.takeUp(e.CallID)
+	c.before = &dispatchState{dispatched: c.dispatched, unknown: c.unknown, run: c.dispatchRun, entry: c.dispatchEntry, handedOff: c.handedOff}
 	c.dispatched, c.dispatchRun, c.unknown = true, w.run, false
 	c.dispatchEntry, c.lastWithdrawn = id, false
 	c.handedOff++
@@ -5202,11 +6243,27 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 		_, err = w.append(ctx, &agentsession.CustomEntry{NS: UnplacedFoldNS, Data: raw})
 		return err
 	}
-	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned = true, split, f.Summary, f.Pinned
+	recorded := make(openresponses.Items, 0, 1+len(f.Pinned))
+	for _, item := range append(openresponses.Items{f.Summary}, f.Pinned...) {
+		r, err := w.sidecar(ctx, item)
+		if err != nil {
+			return err
+		}
+		recorded = append(recorded, r)
+	}
+	w.foldSet, w.foldSplit, w.foldSummary, w.foldPinned, w.foldRecorded, w.foldCanon = true, split, f.Summary, f.Pinned, recorded, nil
+	w.foldCanon = make([][]byte, len(recorded))
+	for k, item := range recorded {
+		w.foldCanon[k], _ = canonicalValue(item)
+	}
+	// The items folded away are compared with nothing again.
+	for i := 0; i < split && i < len(w.meta); i++ {
+		w.meta[i].canon = nil
+	}
 	entry := &agentsession.CompactionEntry{
 		FirstKept:    w.items[split],
-		Summary:      f.Summary,
-		Pinned:       f.Pinned,
+		Summary:      recorded[0],
+		Pinned:       recordedPins(f.Pinned, recorded[1:]),
 		Config:       w.settings,
 		TokensBefore: f.TokensBefore,
 		Usage:        f.Usage,
@@ -5320,7 +6377,7 @@ func (w *writer) child(ctx context.Context, callID string, info agent.ChildInfo)
 	if running {
 		return nil
 	}
-	cw, err := r.newChild(ctx, w, callID, false)
+	cw, err := r.newChild(ctx, w, callID, false, info.Agent)
 	if err != nil {
 		return err
 	}
@@ -5415,7 +6472,11 @@ func (w *writer) append(ctx context.Context, e agentsession.Entry) (string, erro
 	// are written rather than by reading the segment back.
 	switch v := e.(type) {
 	case *agentsession.DecisionEntry:
-		w.answeredCall = true
+		// A withdrawal is no decision: the format reads the call as it
+		// was before the dispatch it withdraws.
+		if !v.Withdrawn {
+			w.answeredCall = true
+		}
 	case *agentsession.ItemEntry:
 		if _, ok := v.Item.(*openresponses.FunctionCallOutput); ok {
 			w.answeredCall = true
@@ -5453,7 +6514,9 @@ func (w *writer) reopen(ctx context.Context) error {
 // web_search) after the first tool out of place, is written as a
 // replace; any other tool list change is a delta (see toolDelta).
 // parts, when set, are the parts next's instructions are composed of,
-// and the instructions change is written as the parts that moved;
+// and the instructions change is written as the parts that moved, and
+// the change is a delta whatever its length, since a replace would
+// start the parts afresh and cost a later hand-back their hashes;
 // otherwise it is the joined string, and parts on the path whose join
 // is unchanged are left in place. omitted is what the host left out:
 // settle writes it, whole on a replace and as what moved on a delta,
@@ -5497,7 +6560,7 @@ func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntr
 		s := next.Instructions
 		d.Instructions = &s
 	}
-	if next.Reasoning != prev.Reasoning {
+	if !equalJSON(prev.Reasoning, next.Reasoning) {
 		rc := next.Reasoning
 		d.Reasoning = &rc
 	}
@@ -5521,6 +6584,12 @@ func configDelta(prev, next agentsession.Settings, full *agentsession.ConfigEntr
 	}
 	if equalJSON(d, &agentsession.ConfigEntry{}) {
 		return nil
+	}
+	if len(parts) > 0 {
+		// A replace starts the path's parts afresh, so a later
+		// hand-back could no longer name them by hash: with parts in
+		// play, length alone is no reason to replace (#235).
+		return d
 	}
 	dl, fl := *d, *full
 	dl.InstructionsOmitted = omittedDelta

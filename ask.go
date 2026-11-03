@@ -7,7 +7,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/ChristopherDavenport/agenttool"
-	"github.com/ChristopherDavenport/openresponses"
 )
 
 // AskedCall is a call the loop, or a front, is putting to the user
@@ -54,20 +53,26 @@ func ContextWithAskedCall(ctx context.Context, call AskedCall) context.Context {
 // the hook deferred: with the question "Allow <name> with arguments
 // <args>? <reason>", the arguments clipped at 500 bytes, and the call
 // on the elicitor's context for [AskedCallFrom]. It returns the
-// decision the answer makes, by "human": Allow with the deferral's
+// decision the answer makes, by the decider the answer names
+// ([agenttool.Answer.By]), or "human" when it names none, since an
+// answer that names nobody is the user's: Allow with the deferral's
 // reason, or "allowed when asked" when it has none, on an accept, and
 // Block with "declined when asked" and the reason on a decline. What
-// the user said with the answer ([agenttool.Answer.Note]) reaches the
-// model: on a decline it ends the reason the model is told, and on an
-// accept, under a run's hook or tool, it is a user message of its own,
-// in the person's voice, held with the call and appended after the
-// outputs of the batch it belongs to, for a nested call the batch of
-// the call that made it; the decision's Note stays the policy's,
-// a developer message. Outside a run there is nothing to hold it with,
-// and the decision's Note carries it as "The user said: <note>". It
-// returns nil and false when ctx carries no elicitor, the ask failed
-// or the answer was a cancel; the caller then still holds the
-// deferral it started with. call.Decision must be non-nil.
+// the answerer said with the answer ([agenttool.Answer.Note]) reaches
+// the model: on a decline it ends the reason the model is told, and on
+// an accept, under a run's hook or tool, it is a message of its own,
+// held with the call and appended after the outputs of the batch it
+// belongs to, for a nested call the batch of the call that made it: a
+// user message for "human", in the person's voice, and a developer
+// message for a rule or another model, whose words are not the user's.
+// The decision's Note stays the policy's, a developer message. Outside
+// a run there is nothing to hold it with, and the decision's Note
+// carries it as "The user said: <note>" ("The policy said", "Another
+// agent said"). It returns nil and false when ctx carries no elicitor,
+// the ask failed, the answer was a cancel or it named a decider the
+// session format does not know, which is refused rather than read as
+// the user's; the caller then still holds the deferral it started
+// with. call.Decision must be non-nil.
 func Ask(ctx context.Context, call AskedCall) (*ToolDecision, bool) {
 	elicit, ok := agenttool.ElicitorFrom(ctx)
 	if !ok {
@@ -81,9 +86,18 @@ func Ask(ctx context.Context, call AskedCall) (*ToolDecision, bool) {
 	if err != nil {
 		return nil, false
 	}
-	// An elicitation is a question for the user, so the user decided.
+	// The answer names its decider; one that names nobody is the
+	// user's. A name the format does not know is refused, never read
+	// as the user's.
+	if knownDecider(ans.By) != nil {
+		return nil, false
+	}
+	by := ans.By
+	if by == "" {
+		by = agenttool.ByHuman
+	}
 	decided := *call.Decision
-	decided.By = "human"
+	decided.By = by
 	switch ans.Action {
 	case agenttool.ActionAccept:
 		// The reason is the rule that raised the question, as a held
@@ -94,8 +108,9 @@ func Ask(ctx context.Context, call AskedCall) (*ToolDecision, bool) {
 		}
 		if ans.Note != "" {
 			if r, ok := ctx.Value(noteSinkKey{}).(*runner); ok {
-				// The person's words are theirs, a user message held
-				// with the call, apart from the decision's own Note. A
+				// The answerer's words are theirs, a message in their
+				// voice held with the call, apart from the decision's
+				// own Note. A
 				// nested call is tied to the call that made it, as
 				// Invoke ties it, so the note waits with that call's
 				// batch even when the loop never runs the nested call.
@@ -106,13 +121,13 @@ func Ask(ctx context.Context, call AskedCall) (*ToolDecision, bool) {
 				if c, ok := agenttool.CallFrom(ctx); ok {
 					asking = c.ID
 				}
-				r.sayUnder(openresponses.UserText(ans.Note), call.CallID, call.Parent, asking)
+				r.sayUnder(answerNoteItem(ans.Note, by), call.CallID, call.Parent, asking)
 			} else {
 				// No run to hold it with: the decision carries it.
 				if decided.Note != "" {
 					decided.Note += "\n"
 				}
-				decided.Note += userSaid(ans.Note)
+				decided.Note += saidBy(by, ans.Note)
 			}
 		}
 	case agenttool.ActionDecline:
@@ -122,7 +137,7 @@ func Ask(ctx context.Context, call AskedCall) (*ToolDecision, bool) {
 			decided.Reason += ": " + call.Decision.Reason
 		}
 		if ans.Note != "" {
-			decided.Reason += "; the user said: " + ans.Note
+			decided.Reason += "; " + lowerFirst(saidBy(by, ans.Note))
 		}
 	default:
 		return nil, false

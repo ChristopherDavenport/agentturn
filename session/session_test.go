@@ -599,6 +599,96 @@ func TestSlowAppendDelaysToolPreflight(t *testing.T) {
 	}
 }
 
+// TestStartNamesTheHarnessInTheRootHeader pins RFC 0001's The record:
+// a recorder that names its harness writes it in the header of every
+// session it creates, the root as well as each child, unless the host
+// names a different one for that session (#219).
+func TestStartNamesTheHarnessInTheRootHeader(t *testing.T) {
+	cases := []struct {
+		name   string
+		header agentsession.Header
+		root   string
+	}{
+		{"empty header takes the recorder's", agentsession.Header{}, "test"},
+		{"a header's own stands", agentsession.Header{Harness: &agentsession.Harness{Name: "host", Version: "2"}}, "host"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, tc.header, WithHarness("test", "1"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			child := agent.New(agentturn.Config{Name: "specialist", Description: "a child", Model: &echo.Adapter{}})
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{child}})
+			defer rec.Attach(a)()
+			if _, err := a.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
+				t.Fatal(err)
+			}
+			root, err := store.Open(context.Background(), s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if h := root.Header().Harness; h == nil || h.Name != tc.root {
+				t.Errorf("root harness = %+v, want %q", h, tc.root)
+			}
+			var link *agentsession.LinkEntry
+			for _, e := range root.Entries() {
+				if l, ok := e.(*agentsession.LinkEntry); ok {
+					link = l
+				}
+			}
+			if link == nil {
+				t.Fatalf("no link entry in %q", entryTypes(root))
+			}
+			cs, err := store.Open(context.Background(), link.Session)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if h := cs.Header().Harness; h == nil || h.Name != "test" || h.Version != "1" {
+				t.Errorf("child harness = %+v, want test 1", h)
+			}
+		})
+	}
+}
+
+// TestChildSessionTakesItsParentsMedia pins RFC 0001's The record: a
+// child session a recorder creates takes the media form of the session
+// whose call spawned it (#283).
+func TestChildSessionTakesItsParentsMedia(t *testing.T) {
+	for _, media := range []string{"", agentsession.MediaSidecar} {
+		t.Run("media "+media, func(t *testing.T) {
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(context.Background(), store, agentsession.Header{Media: media})
+			if err != nil {
+				t.Fatal(err)
+			}
+			child := agent.New(agentturn.Config{Name: "specialist", Description: "a child", Model: &echo.Adapter{}})
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{child}})
+			defer rec.Attach(a)()
+			if _, err := a.Prompt(context.Background(), openresponses.UserText("delegate")); err != nil {
+				t.Fatal(err)
+			}
+			var link *agentsession.LinkEntry
+			for _, e := range s.Entries() {
+				if l, ok := e.(*agentsession.LinkEntry); ok {
+					link = l
+				}
+			}
+			if link == nil {
+				t.Fatalf("no link entry in %q", entryTypes(s))
+			}
+			cs, err := store.Open(context.Background(), link.Session)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cs.Header().Media; got != media {
+				t.Errorf("child media = %q, want %q", got, media)
+			}
+		})
+	}
+}
+
 func TestChildRunProducesLink(t *testing.T) {
 	store := agentsession.NewMemoryStore()
 	rec, s, err := Start(context.Background(), store, agentsession.Header{}, WithHarness("test", "1"))
@@ -632,7 +722,7 @@ func TestChildRunProducesLink(t *testing.T) {
 	if h.ParentSession != s.ID() || h.Harness == nil || h.Harness.Name != "test" {
 		t.Errorf("child header = %+v", h)
 	}
-	if got := entryTypes(childSession); got != "item:user item:assistant*" {
+	if got := entryTypes(childSession); got != "info item:user item:assistant*" {
 		t.Errorf("child entries = %q", got)
 	}
 	verifyAll(t, s)
@@ -1166,7 +1256,7 @@ func TestObservedChildIsWrittenLive(t *testing.T) {
 	if h := cs.Header(); h.ParentSession != s.ID() || h.Harness == nil || h.Harness.Name != "test" {
 		t.Errorf("child header = %+v", h)
 	}
-	if got := entryTypes(cs); got != "run config item:user item:function_call* response dispatch link item:function_call_output item:assistant* response run" {
+	if got := entryTypes(cs); got != "info run config item:user item:function_call* response dispatch link item:function_call_output item:assistant* response run" {
 		t.Fatalf("child entries = %q", got)
 	}
 	if n := verifyAll(t, cs); n != 2 {
@@ -1190,7 +1280,7 @@ func TestObservedChildIsWrittenLive(t *testing.T) {
 	if h := gs.Header(); h.ParentSession != cs.ID() {
 		t.Errorf("grandchild header = %+v", h)
 	}
-	if got := entryTypes(gs); got != "run config item:user item:function_call* response dispatch item:function_call_output item:assistant* response run" {
+	if got := entryTypes(gs); got != "info run config item:user item:function_call* response dispatch item:function_call_output item:assistant* response run" {
 		t.Fatalf("grandchild entries = %q", got)
 	}
 	if n := verifyAll(t, gs); n != 2 {
@@ -1278,7 +1368,7 @@ func TestAbortDuringChildRunStillLinks(t *testing.T) {
 	}
 	// The child's cut-off call has its tool_end; its run_end wrote
 	// nothing more since no model call was in flight.
-	if got := entryTypes(cs); got != "run config item:user item:function_call* response dispatch run" {
+	if got := entryTypes(cs); got != "info run config item:user item:function_call* response dispatch run" {
 		t.Errorf("child entries = %q", got)
 	}
 	if verifyAll(t, cs) != 1 {
@@ -1827,5 +1917,58 @@ func TestPinnedFoldRebuildsWhatWasSent(t *testing.T) {
 	}
 	if n := verifyAll(t, s2); n != hashed(s2) {
 		t.Errorf("responses after the resume = %d, hashed = %d", n, hashed(s2))
+	}
+}
+
+// overflowing refuses every request whose input holds more than limit
+// items as longer than the model's context window, as an adapter
+// reports a provider's refusal, and answers the rest with a message.
+type overflowing struct {
+	limit int
+	sent  []int
+}
+
+func (m *overflowing) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.sent = append(m.sent, len(req.Input))
+	if len(req.Input) > m.limit {
+		return openresponses.ContextLengthExceeded("prompt is too long")
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("ok"); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestAnOverflowIsRecordedAsAFoldThenTheAttempt pins agentturn #277 on
+// the record: a request the server refused as too long is folded and
+// sent again, and the record holds the refused attempt's retry, the
+// fold, and the response to the folded request, which verifies.
+func TestAnOverflowIsRecordedAsAFoldThenTheAttempt(t *testing.T) {
+	rec, s, err := Start(context.Background(), agentsession.NewMemoryStore(), agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &overflowing{limit: 2}
+	tr := compact.NewLocal(&echo.Adapter{}, compact.WithBudget(100), compact.WithKeepLast(1), compact.WithMinFold(0), compact.WithEstimator(countItems), compact.WithOnFold(rec.Fold))
+	a := agentturn.New(agentturn.Config{Model: m, ModelName: "m", Transform: tr.Transform})
+	defer rec.Attach(a)()
+	for _, text := range []string{"one", "two"} {
+		if end, err := a.Prompt(context.Background(), openresponses.UserText(text)); err != nil || end.Reason != agentturn.ReasonDone {
+			t.Fatalf("%s: end = %+v, err = %v", text, end, err)
+		}
+	}
+	if want := []int{1, 3, 2}; !slices.Equal(m.sent, want) {
+		t.Errorf("inputs sent = %v, want %v", m.sent, want)
+	}
+	if got, want := entryTypes(s), "run config item:user item:assistant* response run run item:user compaction custom item:assistant* response run"; got != want {
+		t.Errorf("entries = %q\nwant      %q", got, want)
+	}
+	if n := verifyAll(t, s); n != 2 {
+		t.Errorf("responses = %d, want 2", n)
 	}
 }

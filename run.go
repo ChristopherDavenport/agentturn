@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -29,7 +31,9 @@ var (
 	// ErrGuard is what a guard wraps to end the run as a policy stop
 	// rather than a failure: ReasonStopped with StopGuard, the error on
 	// RunEnd.Err. BeforeTurn, BeforeModelCall, OutputGuard and
-	// ShouldStopAfterTurn each read it so.
+	// ShouldStopAfterTurn each read it so, and so does the loop of an
+	// error the model call fails with, which a moderation wrapper around
+	// the model marks: it is not retried.
 	ErrGuard = errors.New("agentturn: guard stopped the run")
 )
 
@@ -169,6 +173,7 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 				transcript: append(Transcript(nil), t...),
 				runCtx:     runCtx,
 				reasoning:  reasoningFromContext(ctx).merged(nil),
+				quarantine: runQuarantine(ctx),
 				// Every event is sent, cancelled or not: the consumer
 				// below drains the channel until the run returns, so a
 				// send never blocks for good, and the events an abort
@@ -210,12 +215,14 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 
 type transcriptKey struct{}
 type runIDKey struct{}
+type turnKey struct{}
 type runContextKey struct{}
 type steeredKey struct{}
 type triggerKey struct{}
 type decidersKey struct{}
 type reasonsKey struct{}
 type originsKey struct{}
+type failuresKey struct{}
 type reservedKey struct{}
 
 // ContextWithTrigger attaches a [Trigger] to ctx. A run started with
@@ -347,6 +354,34 @@ func OriginFromContext(ctx context.Context, callID string) string {
 	return origins[callID]
 }
 
+// ContextWithFailures attaches which outputs answering the pending
+// calls report that the call failed, by call ID, as
+// [ContextWithReasons] attaches why each was answered, in place of any
+// an outer context attached; an empty map clears them. [Agent.Resume]
+// does it from the [Answer.Failed] of the answers it was given as
+// outputs, so a subscriber writing the record of such an output can
+// mark it failed. The loop reads nothing from it.
+func ContextWithFailures(ctx context.Context, failed map[string]bool) context.Context {
+	if len(failed) == 0 {
+		if ctx.Value(failuresKey{}) == nil {
+			return ctx
+		}
+		return context.WithValue(ctx, failuresKey{}, map[string]bool(nil))
+	}
+	out := make(map[string]bool, len(failed))
+	for k, v := range failed {
+		out[k] = v
+	}
+	return context.WithValue(ctx, failuresKey{}, out)
+}
+
+// FailedFromContext reports whether the caller said the output
+// answering callID reports that the call failed.
+func FailedFromContext(ctx context.Context, callID string) bool {
+	failed, _ := ctx.Value(failuresKey{}).(map[string]bool)
+	return failed[callID]
+}
+
 // ContextWithTranscript attaches a transcript to ctx. The loop does this
 // with its working transcript before running a turn's hooks and tools,
 // so a tool that composes another agent can seed it from the
@@ -357,8 +392,13 @@ func ContextWithTranscript(ctx context.Context, t Transcript) context.Context {
 
 // TranscriptFromContext returns the transcript the loop attached to the
 // context of a hook or a tool call: the working transcript as it stood
-// when the batch started, the calls of the batch included. It is a
-// snapshot; do not mutate it.
+// when the batch started, the calls of the batch included, under the
+// quarantine, as a request carries it: a quarantined item left out, a
+// quarantined output with [QuarantinedOutput] in place of its own
+// ([Quarantine]), so a tool that seeds another agent from it does not
+// hand on what a guard kept from the model. The agent's transcript
+// ([Agent.State]) keeps every item as it arrived. It is a snapshot; do
+// not mutate it.
 func TranscriptFromContext(ctx context.Context) (Transcript, bool) {
 	t, ok := ctx.Value(transcriptKey{}).(Transcript)
 	return t, ok
@@ -377,6 +417,91 @@ func ContextWithRunID(ctx context.Context, runID string) context.Context {
 func RunIDFromContext(ctx context.Context) string {
 	id, _ := ctx.Value(runIDKey{}).(string)
 	return id
+}
+
+// ContextWithTurn attaches a turn number to ctx. The loop does this
+// with the turn in progress for everything the turn calls, its hooks,
+// the transform, the model and the tools, beside the run ID.
+func ContextWithTurn(ctx context.Context, turn int) context.Context {
+	return context.WithValue(ctx, turnKey{}, turn)
+}
+
+// TurnFromContext returns the number of the turn whose hook, model
+// call or tool call the context belongs to, as the turn's events carry
+// it, or 0 outside a turn: before a run's first turn, in the batch of
+// calls a resume approved, whose events carry turn 0, and outside a
+// loop.
+func TurnFromContext(ctx context.Context) int {
+	turn, _ := ctx.Value(turnKey{}).(int)
+	return turn
+}
+
+type requestKey struct{}
+
+// ContextWithRequest attaches req, without its input, as the settings
+// of the request a transform is called for. The loop attaches the
+// request base it built for the turn, with the model name, the
+// instructions and the definitions of the tools of the moment, before
+// it calls the transform, so a transform that folds against a budget
+// meant as a share of the model's context window counts what shares it
+// (RFC 0001 The request, step 2; #279). The before-model-call hook runs
+// after the transform and may still change them.
+func ContextWithRequest(ctx context.Context, req openresponses.Request) context.Context {
+	req.Input = nil
+	return context.WithValue(ctx, requestKey{}, req)
+}
+
+// RequestFromContext returns the settings [ContextWithRequest] attached
+// to ctx, and whether there were any. The request is a copy, each tool
+// definition, the include list and the maps included, so a transform
+// reads it and changes nothing the loop sends.
+func RequestFromContext(ctx context.Context) (openresponses.Request, bool) {
+	req, ok := ctx.Value(requestKey{}).(openresponses.Request)
+	if !ok {
+		return openresponses.Request{}, false
+	}
+	req.Tools = cloneTools(req.Tools)
+	req.Include = slices.Clone(req.Include)
+	req.Metadata = maps.Clone(req.Metadata)
+	req.Extra = maps.Clone(req.Extra)
+	return req, true
+}
+
+// cloneTools returns a copy of tools that shares nothing with it, each
+// definition decoded again from its wire form.
+func cloneTools(tools openresponses.Tools) openresponses.Tools {
+	if tools == nil {
+		return nil
+	}
+	data, err := json.Marshal(tools)
+	var out openresponses.Tools
+	if err != nil || json.Unmarshal(data, &out) != nil {
+		// A definition that does not round-trip is shared, as given.
+		return slices.Clone(tools)
+	}
+	return out
+}
+
+type foldRequestKey struct{}
+
+// ContextWithFoldRequest marks ctx as the context of a transform call
+// asked to fold whatever its budget. The loop marks the transform's
+// context so when it rebuilds a request the server refused as longer
+// than the model's context window: an attempt refused with
+// openresponses.CodeContextLengthExceeded is not sent again unchanged
+// (RFC 0001 Retry, #277). A host asks a transform of its own for a fold
+// on the next request through that transform, as compact's FoldNext
+// does.
+func ContextWithFoldRequest(ctx context.Context) context.Context {
+	return context.WithValue(ctx, foldRequestKey{}, true)
+}
+
+// FoldRequested reports whether ctx was marked by
+// [ContextWithFoldRequest]: a transform that folds against a budget
+// folds on this call whatever the estimate, as far as it can.
+func FoldRequested(ctx context.Context) bool {
+	v, _ := ctx.Value(foldRequestKey{}).(bool)
+	return v
 }
 
 // RunContext returns the context of the run a tool call, a hook, the
@@ -573,6 +698,18 @@ type runner struct {
 	// only way to block on it is to call Invoke from inside a hook.
 	hookMu sync.Mutex
 
+	// nestedMu guards recorded and nestedRan, which a nested call
+	// reads and writes from the goroutine of the tool that made it.
+	nestedMu sync.Mutex
+	// recorded holds, by parent, the nested calls a record holds under
+	// the calls a Resume approved, each consumed once an invocation
+	// matches it.
+	recorded map[string][]*recordedCall
+	// nestedRan holds, by the batch call they were made under, the
+	// nested calls this run made, for the pending list of a run that
+	// leaves that call pending.
+	nestedRan map[string][]NestedRecord
+
 	turn  int
 	added Transcript
 	// ctx is the run's context, for the hooks the stream calls.
@@ -618,6 +755,9 @@ type runner struct {
 	// reasoning says which model produced the reasoning items of the
 	// transcript it knows, so a request leaves another model's out.
 	reasoning ReasoningModels
+	// quarantine holds the items every request leaves out or sends as
+	// a placeholder: the agent's, shared, or the run's own for Run.
+	quarantine *quarantine
 
 	// held are the completed items of the attempt in flight that the
 	// transcript does not have yet, because nothing has committed the
@@ -659,6 +799,15 @@ type openedItem struct {
 	// itemID and modelCallID are the function call's as the model sent
 	// them, "" for none; done carries the call ID the loop decided.
 	itemID, modelCallID string
+	// call says the item opened as a function call, and callID is the
+	// call ID decided as it opened, which the call keeps when only the
+	// terminal response completes it.
+	call   bool
+	callID string
+	// fromResponse says done is a function call the terminal response
+	// completed, which the stream opened and never completed or never
+	// opened at all: the attempt appends it after renameCalls (#236).
+	fromResponse bool
 }
 
 // heldItem is a completed item waiting for its attempt to commit.
@@ -730,6 +879,9 @@ type approval struct {
 	reason string
 	key    string
 	decide bool
+	// nested are the nested calls the record holds under the call,
+	// which its tool's invocations are matched against.
+	nested []NestedRecord
 }
 
 // answerNoteItem is the message an answer's note reaches the model as,
@@ -943,9 +1095,12 @@ type noteSinkKey struct{}
 type notedKey struct{}
 
 // noteElicitor wraps the elicitor a run's tools ask through so that what
-// the user says answering a tool's own question reaches the model, as a
-// user message after the outputs of the call's batch: the tool may not
-// pass it on. A question [Ask] puts about a call
+// the answerer says answering a tool's own question reaches the model,
+// after the outputs of the call's batch, in its voice ([answerNoteItem]):
+// the tool may not pass it on. An answer naming a decider the session
+// format does not know is refused, as agenttool RFC 0001 requires: the
+// tool gets an error, the harness failing to ask, and the note is not
+// said. A question [Ask] puts about a call
 // carries its note on the decision instead. A run inside a tool, a
 // child agent's, wraps the elicitor it finds on its context, its
 // parent's, so the note goes to the run whose tool asked: the
@@ -957,23 +1112,61 @@ func (r *runner) noteElicitor(elicit agenttool.Elicitor) agenttool.Elicitor {
 			ctx = context.WithValue(ctx, notedKey{}, true)
 		}
 		ans, err := elicit(ctx, q)
-		if err != nil || ans.Note == "" || !mine {
+		if err != nil {
+			return ans, err
+		}
+		if err := knownDecider(ans.By); err != nil {
+			// Refused, never read as anyone's: the tool meets the
+			// harness failing to ask.
+			return agenttool.Answer{}, err
+		}
+		if ans.Note == "" || !mine {
 			return ans, err
 		}
 		if _, asked := AskedCallFrom(ctx); asked {
 			return ans, err
 		}
 		if call, ok := agenttool.CallFrom(ctx); ok {
-			// A person's words, in the person's voice.
-			r.sayUnder(openresponses.UserText(ans.Note), call.ID)
+			// The answerer's words, in their voice: a person's as a
+			// user message, a rule's or another model's as the
+			// harness's.
+			r.sayUnder(answerNoteItem(ans.Note, ans.By), call.ID)
 		}
 		return ans, err
 	}
 }
 
-// userSaid is how a note the user gave with an answer reads to the
-// model.
-func userSaid(note string) string { return "The user said: " + note }
+// knownDecider refuses a decider an answer names that the session
+// format does not know; empty names nobody, the user.
+func knownDecider(by string) error {
+	switch by {
+	case "", agenttool.ByHuman, agenttool.ByPolicy, agenttool.ByAgent:
+		return nil
+	}
+	return fmt.Errorf("agentturn: the answer names an unknown decider %q: an answer is by human, policy or agent, or names nobody", by)
+}
+
+// saidBy is how a note given with an answer reads to the model, named
+// for the decider that gave it, where it travels inside another
+// message rather than as one of its own.
+func saidBy(by, note string) string {
+	switch by {
+	case agenttool.ByPolicy:
+		return "The policy said: " + note
+	case agenttool.ByAgent:
+		return "Another agent said: " + note
+	}
+	return "The user said: " + note
+}
+
+// lowerFirst lowers the first letter of s, an ASCII one, for a phrase
+// that goes mid-sentence.
+func lowerFirst(s string) string {
+	if s == "" || s[0] < 'A' || s[0] > 'Z' {
+		return s
+	}
+	return string(s[0]+'a'-'A') + s[1:]
+}
 
 // run drives the loop and returns the RunEnd. terminate says the caller
 // asked the run to end once the answers are in, without a model call.
@@ -1016,6 +1209,9 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 			// the run ended, and the failure rides on it rather than
 			// vanishing.
 			end.Err = fmt.Errorf("%w: %w", context.Cause(ctx), err)
+			// And it is reported on its own, so a consumer that stops
+			// reading at the reason still finds it.
+			end.Failure = err
 		}
 	default:
 		end.Reason = ReasonError
@@ -1103,6 +1299,7 @@ func (r *runner) pending() []PendingCall {
 		if p.Tool == nil {
 			p.Tool = before.Tool
 		}
+		p.Nested = r.nestedOf(call.CallID, before.Nested)
 		out[i] = p
 	}
 	// The notes still waiting go with the calls they wait on.
@@ -1230,8 +1427,11 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 			return stop(ReasonAborted, context.Cause(ctx))
 		}
 		r.turn++
+		// Everything the turn calls can tell which turn it serves.
+		ctx := ContextWithTurn(ctx, r.turn)
+		r.ctx = ctx
 		if r.cfg.BeforeTurn != nil {
-			items, err := r.cfg.BeforeTurn(ctx, TurnStartInfo{RunID: r.runID, Turn: r.turn, Transcript: r.transcript, Inputs: append([]TurnInput(nil), r.arrived...)})
+			items, err := r.cfg.BeforeTurn(r.attributed(ctx), TurnStartInfo{RunID: r.runID, Turn: r.turn, Transcript: r.transcript, Inputs: append([]TurnInput(nil), r.arrived...)})
 			if err != nil {
 				if errors.Is(err, ErrGuard) {
 					return stopped(StopGuard, err)
@@ -1272,7 +1472,7 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 			return stop(ReasonInputRequired, nil)
 		}
 		if r.cfg.ShouldStopAfterTurn != nil {
-			halt, err := r.cfg.ShouldStopAfterTurn(ctx, TurnInfo{RunID: r.runID, Turn: r.turn, Response: resp, ToolResults: results, Final: len(calls) == 0, Transcript: r.transcript})
+			halt, err := r.cfg.ShouldStopAfterTurn(r.attributed(ctx), TurnInfo{RunID: r.runID, Turn: r.turn, Response: resp, ToolResults: results, Final: len(calls) == 0, Transcript: r.transcript})
 			if err != nil {
 				r.ending()
 				if errors.Is(err, ErrGuard) {
@@ -1437,54 +1637,174 @@ func (r *runner) appendOne(item openresponses.Item, mode InputMode, trigger, end
 	if item == nil {
 		return nil
 	}
-	item, hidden := Unhide(item)
-	if err := r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden}); err != nil {
+	item, hidden, copied := marks(item)
+	if err := r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden, Copied: copied}); err != nil {
 		return err
 	}
 	r.transcript = append(r.transcript, item)
 	r.added = append(r.added, item)
 	r.arrived = append(r.arrived, TurnInput{Item: item, Mode: mode, Trigger: trigger})
-	if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden, Trigger: endTrigger}); err != nil {
+	if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden, Copied: copied, Trigger: endTrigger}); err != nil {
 		return err
 	}
 	return nil
 }
 
 // request builds the request for this turn from config and the
-// filtered, transformed transcript.
-func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponses.Request, error) {
+// filtered, transformed transcript, and returns beside it that list
+// before the reasoning of other models was left out, from which a retry
+// moved to another model rebuilds the input for that model, and the
+// input the loop set, which the request still carries when the
+// before-model-call hook kept it.
+func (r *runner) request(ctx context.Context, tools agenttool.Set) (openresponses.Request, built, error) {
+	return r.requestWith(ctx, tools, nil)
+}
+
+// requestWith is request with the transform given settings, when not
+// nil, as the settings the request will carry in place of the
+// configuration's: a retry's revision that moved the turn to another
+// model is weighed as that model's request.
+func (r *runner) requestWith(ctx context.Context, tools agenttool.Set, settings *openresponses.Request) (openresponses.Request, built, error) {
+	return r.build(ctx, tools, settings, true)
+}
+
+// build is requestWith, building the request once more, when again is
+// set, if the before-model-call hook quarantined an item the transform
+// had folded into it, so the fold is made again without it.
+func (r *runner) build(ctx context.Context, tools agenttool.Set, settings *openresponses.Request, again bool) (openresponses.Request, built, error) {
+	outer := ctx
+	// The transform and BeforeModelCall run under the attribution and
+	// the quarantine too.
+	ctx = r.attributed(ctx)
+	// The settings come first, so the transform can weigh what the
+	// request will carry beside the input (#279).
+	req := r.cfg.baseRequest(tools)
+	weighed := req
+	if settings != nil {
+		weighed = *settings
+	}
 	input := Transcript(append(openresponses.Items(nil), r.transcript...))
 	if r.cfg.Transform != nil {
 		var err error
-		input, err = r.cfg.Transform(ctx, input)
+		input, err = r.cfg.Transform(ContextWithRequest(ctx, weighed), input)
 		if err != nil {
-			return openresponses.Request{}, fmt.Errorf("agentturn: transform: %w", err)
+			return openresponses.Request{}, built{}, fmt.Errorf("agentturn: transform: %w", err)
 		}
 	}
-	req := r.cfg.baseRequest(tools)
-	req.Input = r.reasoning.For(r.cfg.ModelName, r.cfg.filter()(input))
+	b := built{filtered: r.cfg.filter()(input)}
+	req.Input = r.inputFor(req.Model, b.filtered)
+	b.input = req.Input
 	if r.cfg.BeforeModelCall != nil {
+		before, gen := req, r.quarantine.generation()
 		if err := r.cfg.BeforeModelCall(ctx, &req); err != nil {
 			// The call was never made; the request as built is the
 			// record of what was refused, whether a policy stopped the
 			// run or the hook failed.
 			if eerr := r.emit(&ModelBlocked{RunID: r.runID, Turn: r.turn, Request: req, Err: err}); eerr != nil {
-				return openresponses.Request{}, eerr
+				return openresponses.Request{}, built{}, eerr
 			}
 			if errors.Is(err, ErrGuard) {
-				return openresponses.Request{}, stopped(StopGuard, err)
+				return openresponses.Request{}, built{}, stopped(StopGuard, err)
 			}
-			return openresponses.Request{}, fmt.Errorf("agentturn: before-model-call hook: %w", err)
+			return openresponses.Request{}, built{}, fmt.Errorf("agentturn: before-model-call hook: %w", err)
+		}
+		// A hook that moved the call to another model and kept the
+		// loop's input is sent that input as built for the model.
+		req = b.forModel(r, before, req)
+		if r.quarantine.generation() != gen && again && r.cfg.Transform != nil && foldedAway(r.quarantine, r.transcript, input) {
+			// The hook quarantined an item the transform had folded
+			// into this request, a summary of it say: the request is
+			// built again, so the fold is made without it (#281).
+			return r.build(outer, tools, settings, false)
+		}
+		// The quarantine holds whatever input the hook returns: the
+		// items it quarantined now, and quarantined items it put back,
+		// as a hook that replaces the input with items from elsewhere
+		// may. Applying it to the loop's own input changes nothing.
+		own := sameSlice(req.Input, b.input)
+		req.Input = r.quarantine.apply(req.Input)
+		if own {
+			b.input = req.Input
 		}
 	}
-	return req, nil
+	return req, b, nil
+}
+
+// foldedAway reports whether an item of transcript the quarantine holds
+// is not among what the transform returned, sent: the transform folded
+// it, or left it out, so what it returned may still carry its content.
+func foldedAway(q *quarantine, transcript, sent Transcript) bool {
+	kept := make(map[openresponses.Item]bool, len(sent))
+	for _, item := range sent {
+		if item != nil && reflect.TypeOf(item).Comparable() {
+			kept[item] = true
+		}
+	}
+	for _, item := range transcript {
+		if item != nil && reflect.TypeOf(item).Comparable() && !kept[item] && q.has(item) {
+			return true
+		}
+	}
+	return false
+}
+
+// built is what request built a turn's input from: filtered, the
+// transformed, filtered list, and input, the list the loop set as the
+// request's input, for filtered's model.
+type built struct {
+	filtered Transcript
+	input    openresponses.Items
+}
+
+// forModel returns req with its input rebuilt for model when req still
+// carries the input the loop built and names another model than the
+// one it was built for, so a retry the policy moved to another model
+// sends no reasoning another model produced (#286). A request whose
+// input a hook or the revision replaced is the hook's, and is returned
+// as it is.
+func (b *built) forModel(r *runner, prev, req openresponses.Request) openresponses.Request {
+	if req.Model == prev.Model || !sameSlice(req.Input, b.input) || !sameSlice(prev.Input, b.input) {
+		return req
+	}
+	req.Input = r.inputFor(req.Model, b.filtered)
+	b.input = req.Input
+	return req
+}
+
+// inputFor is the input a request naming model carries, from the
+// transformed, filtered list: without the reasoning another model
+// produced, and under the quarantine (RFC 0001 The request, step 3).
+func (r *runner) inputFor(model string, filtered Transcript) openresponses.Items {
+	return r.quarantine.apply(r.reasoning.For(model, filtered))
+}
+
+// sameItems reports whether a and b hold the same items, in order: the
+// very items, or items alike in every member, such as the placeholder
+// the quarantine makes afresh for one output on every request, so a
+// request rebuilt to the same content reads as unchanged.
+func sameItems(a, b openresponses.Items) bool {
+	return slices.EqualFunc(a, b, func(x, y openresponses.Item) bool {
+		if x == nil || y == nil || reflect.TypeOf(x) != reflect.TypeOf(y) {
+			return x == nil && y == nil
+		}
+		if reflect.TypeOf(x).Comparable() && x == y {
+			return true
+		}
+		return reflect.DeepEqual(x, y)
+	})
+}
+
+// sameSlice reports whether a and b are the same slice: one backing
+// array, one length.
+func sameSlice(a, b openresponses.Items) bool {
+	return len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0])
 }
 
 // modelTurn sends the turn's request, retrying a transient failure
 // under Config.Retry, emitting item events, and appends the completed
 // items to the transcript.
 func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openresponses.Response, error) {
-	req, err := r.request(ctx, tools)
+	req, b, err := r.request(ctx, tools)
 	if err != nil {
 		return nil, err
 	}
@@ -1493,10 +1813,16 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 		return nil, err
 	}
 	start := len(r.transcript)
-	for attempt := 1; ; attempt++ {
+	// call numbers the calls made, as model_retry reports them; attempt
+	// numbers the ones the retry policy counts, which a fold after a
+	// context-length refusal is not (#277). revised says the policy's
+	// revision made the request in flight.
+	folded, revised := false, false
+	for call, attempt := 1, 1; ; call++ {
 		resp, committed, err := r.stream(ctx, req)
-		// What the attempt kept is this model's, however it ended.
-		r.attribute(r.transcript[start:])
+		// What the attempt kept is the model its request named, however
+		// it ended: after a revision, not the configuration's (#286).
+		r.attribute(req.Model, r.transcript[start:])
 		if err == nil {
 			// The next turn's inputs are what joins from here.
 			r.mark, r.arrived = len(r.transcript), nil
@@ -1523,6 +1849,75 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 		if ctx.Err() != nil {
 			return nil, stop(ReasonAborted, context.Cause(ctx))
 		}
+		if errors.Is(err, ErrGuard) {
+			// The model, or a wrapper around it, refused the call with
+			// an error marked as a guard's: a policy stop, never retried,
+			// and recorded as an output guard's is. A response the
+			// attempt had committed to goes on record withheld, with
+			// what the transcript took from it, and the calls it made
+			// are closed, so the transcript is a valid input for the
+			// next run. One refused before anything of the answer opened
+			// left nothing in the transcript and has no response_end: a
+			// recorder writes the refused call as it writes one
+			// BeforeModelCall refused.
+			halt := &errStop{reason: ReasonStopped, cause: StopGuard, err: err}
+			if resp != nil && committed {
+				resp.Output = openresponses.Items(r.transcript[start:]).Clone()
+				if err := r.emit(&ResponseEnd{RunID: r.runID, Turn: r.turn, Response: resp, Withheld: true}); err != nil {
+					return nil, err
+				}
+				halt.withheld = true
+			} else {
+				// Nothing of the answer is in the transcript: the call
+				// is reported refused, with what the provider billed.
+				blocked := &ModelBlocked{RunID: r.runID, Turn: r.turn, Request: req, Err: err}
+				if resp != nil {
+					blocked.Usage = resp.Usage
+				}
+				if err := r.emit(blocked); err != nil {
+					return nil, err
+				}
+			}
+			if err := r.closeWithheld(r.transcript[start:]); err != nil {
+				return nil, err
+			}
+			return nil, halt
+		}
+		if !committed && !folded && r.cfg.Transform != nil && openresponses.IsContextLengthExceeded(err) {
+			// The server refused the request as longer than the model's
+			// window. It is never sent again unchanged: the request is
+			// rebuilt once through the transform with a fold asked for,
+			// and sent as a retry when the fold changed the input. The
+			// fold is reported and recorded as any other, before the
+			// attempt it shortened (#277).
+			folded = true
+			var settings *openresponses.Request
+			if revised {
+				// The revision's model and settings stay, and the
+				// transform weighs them, not the configuration's.
+				settings = &req
+			}
+			next, nb, rerr := r.requestWith(ContextWithFoldRequest(ctx), tools, settings)
+			if rerr != nil {
+				return nil, rerr
+			}
+			if revised {
+				input := next.Input
+				if sameSlice(next.Input, nb.input) {
+					input = r.inputFor(req.Model, nb.filtered)
+					nb.input = input
+				}
+				next = req
+				next.Input = input
+			}
+			if !sameItems(next.Input, req.Input) {
+				if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: call, Err: err, Request: next}); err != nil {
+					return nil, err
+				}
+				req, b = next, nb
+				continue
+			}
+		}
 		if committed || attempt >= r.cfg.Retry.MaxAttempts || !r.cfg.Retry.retryable(err) {
 			return nil, fmt.Errorf("agentturn: model: %w", err)
 		}
@@ -1534,14 +1929,17 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 			if out := revise(attempt, &next, err); out != nil {
 				next = *out
 			}
-			req = next
+			// The model a request names is the model its input is built
+			// for: a move to another model rebuilds the loop's input.
+			req, revised = b.forModel(r, req, next), true
 		}
-		if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: attempt, Err: err, Delay: delay, Request: req}); err != nil {
+		if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: call, Err: err, Delay: delay, Request: req}); err != nil {
 			return nil, err
 		}
 		if err := sleep(ctx, delay); err != nil {
 			return nil, stop(ReasonAborted, context.Cause(ctx))
 		}
+		attempt++
 	}
 }
 
@@ -1599,7 +1997,7 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 			continue
 		}
 		if err != nil {
-			return nil, committed, err
+			return guardedResponse(&acc, err), committed, err
 		}
 		acc.Add(ev)
 		commits, err := r.streamEvent(ev, &acc, committed)
@@ -1614,7 +2012,7 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 				// The server reported the failure as an event. Before
 				// the answer opened it is a failed attempt like a cut
 				// stream, and retried as one; after, it is final.
-				return nil, committed, wire.err
+				return guardedResponse(&acc, wire.err), committed, wire.err
 			}
 			return nil, true, err
 		}
@@ -1640,6 +2038,12 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 		if err := r.flushHeld(); err != nil {
 			return nil, true, err
 		}
+		// A function call only the response completed joins the
+		// transcript now, under the ID it opened with, so the batch runs
+		// no call the transcript does not hold (#236).
+		if err := r.appendFromResponse(resp.ID); err != nil {
+			return nil, true, err
+		}
 	}
 	if err := r.emit(&ResponseEnd{RunID: r.runID, Turn: r.turn, Response: resp}); err != nil {
 		return nil, true, err
@@ -1651,6 +2055,16 @@ func (r *runner) stream(ctx context.Context, req openresponses.Request) (resp *o
 		return nil, true, errors.New("response failed")
 	}
 	return resp, true, nil
+}
+
+// guardedResponse is the response a model call failed with an error
+// marked as a guard's had begun, withheld as an OutputGuard's is, or
+// nil for any other error or for a stream that named no response.
+func guardedResponse(acc *openresponses.Accumulator, err error) *openresponses.Response {
+	if !errors.Is(err, ErrGuard) || acc.Response() == nil {
+		return nil
+	}
+	return withheldResponse(acc, nil)
 }
 
 // withheldResponse is the response an OutputGuard withheld a message
@@ -1697,7 +2111,9 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 			// The call's ID is decided as it opens, so its item_start,
 			// every item_update and its item_end carry the same one.
 			r.decideCallID(call, e.OutputIndex)
-			r.opened[len(r.opened)-1].itemID, r.opened[len(r.opened)-1].modelCallID = call.ID, call.CallID
+			o := &r.opened[len(r.opened)-1]
+			o.itemID, o.modelCallID = call.ID, call.CallID
+			o.call, o.callID = true, r.callAt[e.OutputIndex].id
 			item = r.withCallID(item, e.OutputIndex)
 		}
 		commits := !committed && commitsAttempt(item)
@@ -1708,7 +2124,7 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 				return true, err
 			}
 		}
-		return commits, r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, ResponseID: responseID})
+		return commits, r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: snapshotItem(item), ResponseID: responseID})
 	case *openresponses.OutputItemDoneEvent:
 		item := e.Item
 		modelCallID := ""
@@ -1752,7 +2168,7 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 					}
 				}
 			}
-			replacement, err := r.cfg.OutputGuard(r.ctx, OutputInfo{RunID: r.runID, Turn: r.turn, ResponseID: responseID, Message: m, Output: before})
+			replacement, err := r.cfg.OutputGuard(r.attributed(r.ctx), OutputInfo{RunID: r.runID, Turn: r.turn, ResponseID: responseID, Message: m, Output: before})
 			if err != nil {
 				if errors.Is(err, ErrGuard) {
 					// A policy stop: the message is kept from the
@@ -1780,7 +2196,7 @@ func (r *runner) streamEvent(ev openresponses.StreamEvent, acc *openresponses.Ac
 	}
 	if idx, ok := outputIndex(ev); ok {
 		item, _ := acc.ItemAt(idx)
-		return false, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: r.withCallID(item, idx), Stream: ev, ResponseID: responseID})
+		return false, r.emit(&ItemUpdate{RunID: r.runID, Turn: r.turn, Item: snapshotItem(r.withCallID(item, idx)), Stream: ev, ResponseID: responseID})
 	}
 	return false, nil
 }
@@ -1861,6 +2277,64 @@ func (r *runner) withCallID(item openresponses.Item, index int) openresponses.It
 	return &renamed
 }
 
+// snapshotItem returns item as it stands, sharing nothing the stream's
+// accumulator changes as later events arrive: an event's members are the
+// facts as of the event (#218). The accumulator appends to a part's text
+// and a call's arguments and replaces parts by index, so the item, its
+// content lists and their streamed parts are copied; strings are
+// immutable and are shared, and so is a part's logprobs, which only
+// grow, capped at their length. An item of another type is cloned
+// through its wire form.
+func snapshotItem(item openresponses.Item) openresponses.Item {
+	switch v := item.(type) {
+	case nil:
+		return nil
+	case *openresponses.Message:
+		c := *v
+		c.Content = snapshotContents(v.Content)
+		return &c
+	case *openresponses.FunctionCall:
+		c := *v
+		return &c
+	case *openresponses.ReasoningItem:
+		c := *v
+		c.Summary = snapshotContents(v.Summary)
+		c.Content = snapshotContents(v.Content)
+		return &c
+	}
+	return openresponses.Items{item}.Clone()[0]
+}
+
+// snapshotContents copies a content list and the parts a stream writes
+// into in place.
+func snapshotContents(in openresponses.Contents) openresponses.Contents {
+	if in == nil {
+		return nil
+	}
+	out := make(openresponses.Contents, len(in))
+	for i, part := range in {
+		switch p := part.(type) {
+		case *openresponses.OutputText:
+			c := *p
+			c.Annotations = slices.Clone(p.Annotations)
+			c.Logprobs = p.Logprobs[:len(p.Logprobs):len(p.Logprobs)]
+			out[i] = &c
+		case *openresponses.Refusal:
+			c := *p
+			out[i] = &c
+		case *openresponses.SummaryText:
+			c := *p
+			out[i] = &c
+		case *openresponses.ReasoningText:
+			c := *p
+			out[i] = &c
+		default:
+			out[i] = part
+		}
+	}
+	return out
+}
+
 // maxCallIDPrefix is the longest prefix callIDPrefix keeps, so the ID
 // with openresponses.NewID's '_' and 24 hex digits is at most 64
 // characters, which OpenAI and Anthropic both take.
@@ -1899,70 +2373,184 @@ func (r *runner) openedAt(index int) int {
 }
 
 // renameCalls returns the response the turn acts on: resp with each of
-// its function calls replaced by the one the attempt completed for it,
-// which carries the call ID decideCallID gave it and the arguments it
+// its function calls replaced by the one the transcript holds for it,
+// which carries the call ID the loop decided and the arguments it
 // completed with, so the calls the batch runs are the ones the
-// transcript holds. The completed calls are in the order they opened,
-// which is the order the response lists them in, and each call of the response is
-// paired with one of them: by item ID when both carry one, else by the
-// call ID the model gave it among the completed calls not yet paired,
-// else by order. When a completed call is left unpaired, which a
-// terminal response built one item per output index leaves out when a
-// later call took the index, the response's calls give way, as a group,
-// to the completed calls in the order they opened, so every call the
-// transcript holds is run and answered, in the transcript's order. Renaming by output index alone, as before #210, named
-// the last call opened at an index for every call the response listed
-// there, so a stream that opened every call at index 0 with no item
-// IDs ran one call twice, or each with the other's output. An item that
-// is not a function call, and a function call the stream never
-// completed, which the response alone lists, keep today's name: the
-// call ID decided at their output index, when one was.
+// transcript holds. The calls the attempt opened or completed are in
+// the order they opened, which is the order the response lists them
+// in, and each call of the response is paired with one of them: by item
+// ID when both carry one, else by the call ID the model gave it among
+// those not yet paired, else by order; never by its position in the
+// response, which after a reused output index names another call. A
+// call the stream opened and never completed is completed from the
+// response it is paired with, under the ID decided as it opened, and a
+// call the response lists that the stream never opened is decided now;
+// both are marked fromResponse for the attempt to append before
+// response_end (#236). A failed response completes nothing: the run
+// ends with its error, and a call it alone lists keeps the ID decided
+// at its output index, as before. When a completed call is left
+// unpaired, which a terminal response built one item per output index
+// leaves out when a later call took the index, the response's calls
+// give way, as a group, to the transcript's calls in the order they
+// opened, so every call the transcript holds is run and answered, in
+// the transcript's order. Renaming by output index alone, as before
+// #210, named the last call opened at an index for every call the
+// response listed there, so a stream that opened every call at index 0
+// with no item IDs ran one call twice, or each with the other's output.
+// An item that is not a function call is left as the response gave it.
 func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Response {
-	var completed []*openedItem
-	for i := range r.opened {
-		if _, ok := r.opened[i].done.(*openresponses.FunctionCall); ok {
-			completed = append(completed, &r.opened[i])
+	complete := resp.Status != openresponses.ResponseStatusFailed
+	// calls are positions in r.opened: every function call the attempt
+	// completed, and, when the response completes calls, every one it
+	// opened and never completed.
+	var calls []int
+	for i, o := range r.opened {
+		_, done := o.done.(*openresponses.FunctionCall)
+		if done || (complete && o.done == nil && o.call) {
+			calls = append(calls, i)
 		}
 	}
 	paired := make([]int, len(resp.Output))
 	for i := range paired {
 		paired[i] = -1
 	}
-	taken := make([]bool, len(completed))
-	pair := func(index int, match func(*openedItem) bool) {
-		for j, c := range completed {
-			if !taken[j] && match(c) {
+	taken := make([]bool, len(calls))
+	// pair pairs the call at index of the response with the first call
+	// of the attempt not yet paired that match accepts, among the
+	// completed ones when completed is set and among those never
+	// completed otherwise.
+	pair := func(index int, completed bool, match func(*openedItem) bool) {
+		for j, at := range calls {
+			if o := &r.opened[at]; !taken[j] && (o.done != nil) == completed && match(o) {
 				paired[index], taken[j] = j, true
 				return
 			}
 		}
 	}
-	for index, item := range resp.Output {
-		if call, ok := item.(*openresponses.FunctionCall); ok && call.ID != "" {
-			pair(index, func(c *openedItem) bool { return c.itemID == call.ID })
+	// each runs pass over the response's calls not yet paired.
+	each := func(pass func(index int, call *openresponses.FunctionCall)) {
+		for index, item := range resp.Output {
+			if call, ok := item.(*openresponses.FunctionCall); ok && paired[index] < 0 {
+				pass(index, call)
+			}
 		}
 	}
-	for index, item := range resp.Output {
-		if call, ok := item.(*openresponses.FunctionCall); ok && paired[index] < 0 && call.CallID != "" {
-			pair(index, func(c *openedItem) bool { return c.modelCallID == call.CallID })
+	// An item ID names one call, completed or not.
+	each(func(index int, call *openresponses.FunctionCall) {
+		if call.ID != "" {
+			pair(index, true, func(c *openedItem) bool { return c.itemID == call.ID })
+		}
+		if call.ID != "" && paired[index] < 0 {
+			pair(index, false, func(c *openedItem) bool { return c.itemID == call.ID })
+		}
+	})
+	// A completed call is the one the response lists with its call ID
+	// and its arguments. A call ID the model gave more than one call
+	// names them in the order they opened, completed or not: a call
+	// never completed has no arguments to match, and a completed one
+	// whose arguments the response gives otherwise matches none, so
+	// neither takes the other's place by sharing the ID (#236).
+	each(func(index int, call *openresponses.FunctionCall) {
+		pair(index, true, func(c *openedItem) bool {
+			done := c.done.(*openresponses.FunctionCall)
+			return c.modelCallID == call.CallID && done.Arguments == call.Arguments
+		})
+	})
+	each(func(index int, call *openresponses.FunctionCall) {
+		if call.CallID == "" {
+			return
+		}
+		for j, at := range calls {
+			if o := &r.opened[at]; !taken[j] && o.modelCallID == call.CallID {
+				paired[index], taken[j] = j, true
+				return
+			}
+		}
+	})
+	each(func(index int, _ *openresponses.FunctionCall) {
+		pair(index, true, func(*openedItem) bool { return true })
+	})
+	each(func(index int, _ *openresponses.FunctionCall) {
+		pair(index, false, func(*openedItem) bool { return true })
+	})
+	if complete {
+		for index, item := range resp.Output {
+			call, ok := item.(*openresponses.FunctionCall)
+			if !ok {
+				continue
+			}
+			if j := paired[index]; j >= 0 {
+				if o := &r.opened[calls[j]]; o.done == nil {
+					// Opened and never completed: the response completes
+					// it, under the ID it opened with.
+					o.done, o.fromResponse = completedCall(call, o.callID, o.itemID), true
+					if o.modelCallID == "" {
+						o.modelCallID = call.CallID
+					}
+				}
+				continue
+			}
+			// The stream never opened it: decided as a call first seen
+			// as it completes is.
+			r.decideCallID(call, index)
+			id := r.callAt[index].id
+			r.opened = append(r.opened, openedItem{index: index, done: completedCall(call, id, ""), itemID: call.ID, modelCallID: call.CallID, call: true, callID: id, fromResponse: true})
+			calls = append(calls, len(r.opened)-1)
+			taken = append(taken, true)
+			paired[index] = len(calls) - 1
 		}
 	}
-	for index, item := range resp.Output {
-		if _, ok := item.(*openresponses.FunctionCall); ok && paired[index] < 0 {
-			pair(index, func(*openedItem) bool { return true })
+	// A call the stream opened and the response does not list is not in
+	// the transcript and is not run: its item_start has no item_end, as
+	// for an item an attempt dropped.
+	unpaired := false
+	for j, at := range calls {
+		if !taken[j] && r.opened[at].done != nil {
+			unpaired = true
 		}
 	}
-	if slices.Contains(taken, false) {
+	// The transcript holds the calls the stream completed in the order
+	// they opened and then the ones only the response completed, so a
+	// response that lists one of the latter before one of the former is
+	// out of the transcript's order. rank is a call's place there.
+	rank := func(j int) int {
+		if r.opened[calls[j]].fromResponse {
+			return len(calls) + j
+		}
+		return j
+	}
+	last := -1
+	for index := range resp.Output {
+		if j := paired[index]; j >= 0 {
+			if rank(j) < last {
+				unpaired = true
+			}
+			last = rank(j)
+		}
+	}
+	if unpaired {
 		// A completed call the response does not list, because the
 		// server built its terminal response one item per output index
 		// and a later call took the index, is in the transcript all the
 		// same and owed an output. Every call the response lists is
 		// paired by now, so the listed calls, as a group, give way to
-		// the completed calls in the order they opened, which is the
+		// the transcript's calls in the order they opened, which is the
 		// transcript's order, where the first of them stood; an item
-		// that is not a call keeps its place.
+		// that is not a call keeps its place. So do listed calls out of
+		// the transcript's order, a call only the response completed
+		// listed before one the stream completed.
+		var held, late openresponses.Items
+		for _, at := range calls {
+			switch o := r.opened[at]; {
+			case o.fromResponse:
+				late = append(late, o.done)
+			case o.done != nil:
+				held = append(held, o.done)
+			}
+		}
+		held = append(held, late...)
 		copied := *resp
-		copied.Output = make(openresponses.Items, 0, len(resp.Output)+len(completed))
+		copied.Output = make(openresponses.Items, 0, len(resp.Output)+len(held))
 		placed := false
 		for _, item := range resp.Output {
 			if _, ok := item.(*openresponses.FunctionCall); !ok {
@@ -1970,24 +2558,20 @@ func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Respon
 				continue
 			}
 			if !placed {
-				for _, c := range completed {
-					copied.Output = append(copied.Output, c.done)
-				}
+				copied.Output = append(copied.Output, held...)
 				placed = true
 			}
 		}
 		if !placed {
-			for _, c := range completed {
-				copied.Output = append(copied.Output, c.done)
-			}
+			copied.Output = append(copied.Output, held...)
 		}
 		return &copied
 	}
 	var out *openresponses.Response
 	for index, item := range resp.Output {
 		renamed := item
-		if j := paired[index]; j >= 0 {
-			renamed = completed[j].done
+		if j := paired[index]; j >= 0 && r.opened[calls[j]].done != nil {
+			renamed = r.opened[calls[j]].done
 		} else {
 			renamed = r.withCallID(item, index)
 		}
@@ -2005,6 +2589,39 @@ func (r *runner) renameCalls(resp *openresponses.Response) *openresponses.Respon
 		return resp
 	}
 	return out
+}
+
+// completedCall is call, as the terminal response lists it, under the
+// call ID id, carrying itemID when it carries no item ID of its own.
+func completedCall(call *openresponses.FunctionCall, id, itemID string) *openresponses.FunctionCall {
+	c := *call
+	c.CallID = id
+	if c.ID == "" {
+		c.ID = itemID
+	}
+	return &c
+}
+
+// appendFromResponse appends, in the order they opened, the function
+// calls renameCalls completed from the terminal response, each with its
+// item_end, which keeps the model's call ID beside the item when the
+// loop gave it another.
+func (r *runner) appendFromResponse(responseID string) error {
+	for _, o := range r.opened {
+		if !o.fromResponse {
+			continue
+		}
+		modelCallID := ""
+		if o.modelCallID != o.callID {
+			modelCallID = o.modelCallID
+		}
+		r.transcript = append(r.transcript, o.done)
+		r.added = append(r.added, o.done)
+		if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: o.done, ResponseID: responseID, ModelCallID: modelCallID}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // wireError carries an error event off the stream, so the attempt can
@@ -2153,18 +2770,40 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 	return r.collect(batch)
 }
 
+// attributed is ctx carrying the run's reasoning attribution as it
+// stands, which the context of every hook and tool carries, so a run one
+// of them starts over the run's items leaves out the reasoning another
+// model produced (#242).
+func (r *runner) attributed(ctx context.Context) context.Context {
+	return context.WithValue(ContextWithReasoningModels(ctx, r.reasoning), quarantineKey{}, r.quarantine)
+}
+
 // toolContext is the context hooks and tools run under: ctx with a
-// snapshot of the working transcript attached, and the invoker that
-// runs another of the turn's tools through the loop.
+// snapshot of the working transcript attached, the run's reasoning
+// attribution, so a run a tool starts over the parent's items leaves
+// out the reasoning another model produced as this run does (#242),
+// and the invoker that runs another of the turn's tools through the
+// loop.
 func (r *runner) toolContext(ctx context.Context, tools agenttool.Set) context.Context {
-	ctx = ContextWithTranscript(ctx, append(Transcript(nil), r.transcript...))
+	// A tool reads the conversation as a request carries it: what the
+	// quarantine leaves out is not there (#281).
+	ctx = ContextWithTranscript(ctx, Transcript(r.quarantine.apply(append(openresponses.Items(nil), r.transcript...))))
+	ctx = r.attributed(ctx)
 	// [Ask] says a person's accept note through the run whose hook or
 	// tool asked.
 	ctx = context.WithValue(ctx, noteSinkKey{}, r)
+	// runAsk is the run's elicitor, the one a nested call's deferral is
+	// put to, whatever elicitor the invoking tool puts on its own
+	// context: a tool does not answer for the policy that holds its
+	// calls. nil when the run asks nobody.
+	var runAsk agenttool.Elicitor
 	if r.cfg.ToolElicitor != nil {
-		ctx = agenttool.ContextWithElicitor(ctx, r.noteElicitor(r.cfg.ToolElicitor))
+		runAsk = r.noteElicitor(r.cfg.ToolElicitor)
 	} else if inherited, ok := agenttool.ElicitorFrom(ctx); ok {
-		ctx = agenttool.ContextWithElicitor(ctx, r.noteElicitor(inherited))
+		runAsk = r.noteElicitor(inherited)
+	}
+	if runAsk != nil {
+		ctx = agenttool.ContextWithElicitor(ctx, runAsk)
 	}
 	if r.steered != nil {
 		ctx = context.WithValue(ctx, steeredKey{}, r.steered())
@@ -2174,7 +2813,7 @@ func (r *runner) toolContext(ctx context.Context, tools agenttool.Set) context.C
 	// its own must not read a turn the loop is writing.
 	turn := r.turn
 	return context.WithValue(ctx, invokerKey{}, invoker(func(ctx context.Context, name string, args json.RawMessage) (agenttool.Result, error) {
-		return r.invoke(ctx, tools, turn, name, args)
+		return r.invoke(ctx, tools, turn, name, args, runAsk)
 	}))
 }
 
@@ -2577,6 +3216,7 @@ func (r *runner) approvedBatch(ctx context.Context, approved []approval) ([]agen
 		if ap.key != "" {
 			p.key = ap.key
 		}
+		r.expect(ap.nested)
 		if ap.note != "" {
 			// The person's note comes first; a note the hook gives the
 			// call below, or the one the decision that held it gave,
@@ -2751,6 +3391,11 @@ func (r *runner) settle(ctx context.Context, p *callState) error {
 			p.result, p.err = override.Result, override.Err
 		}
 	}
+	if isCancellation(p.err, ctx) {
+		// The tool returned the cancellation: it was cut off in flight,
+		// and has no result of its own to append.
+		p.cut = true
+	}
 	return r.finish(p)
 }
 
@@ -2778,7 +3423,7 @@ func (r *runner) finish(p *callState) error {
 	// delivery that fails is the consumer's failure, and the call is
 	// not ended a second time for it.
 	p.ended = true
-	return r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Reason: p.reason, Parent: p.parent, Withdrawn: p.dispatchErr != nil})
+	return r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Reason: p.reason, Parent: p.parent, Withdrawn: p.dispatchErr != nil, Cut: p.cut})
 }
 
 func validObject(raw json.RawMessage) bool {
@@ -2808,11 +3453,15 @@ var ErrNoInvoker = errors.New("agentturn: no loop on the context to invoke a too
 // not an object, or a call the hook refused, whose Reason is the error.
 // A nested call cannot be handed to the caller, since it belongs to a
 // tool that is running, so one the hook defers is put to the user
-// through the agenttool.Elicitor on ctx, when there is one, with [Ask]:
+// through the run's agenttool.Elicitor, when it has one, with [Ask],
+// never through one the tool put on ctx itself, which would let a tool
+// approve a call its policy deferred; the decision hook sees the run's
+// elicitor too:
 // the question names the call, and the elicitor's context carries it
 // as an [AskedCall], its ID, name, whole arguments and the deferral,
 // for [AskedCallFrom]. An accept runs it and a decline refuses it, and
-// tool_start carries that answer as the decision, by "human". Without
+// tool_start carries that answer as the decision, by the decider the
+// answer names, or "human" when it names none. Without
 // an elicitor, or on a cancel or a failure to ask, the deferral
 // refuses the call. Nothing is appended
 // to the transcript, so a nested call costs no items and a Terminate
@@ -2823,11 +3472,18 @@ var ErrNoInvoker = errors.New("agentturn: no loop on the context to invoke a too
 // implements the interface itself and wants the parent named passes
 // agenttool.WithCall. Outside a loop, Invoke returns [ErrNoInvoker].
 //
-// A nested call gets an idempotency key of its own, fresh on every
-// Invoke: nothing derives it from the key of the call that made it, so
-// a parent run again after a restart invokes with new keys, and a
-// keyed tool reached this way deduplicates nothing across the parent's
-// attempts; see the open question in RFC 0001.
+// A nested call gets an ID and an idempotency key of its own, unless
+// it matches one the record holds under the call that made it, which
+// [PendingCall.Nested] carries when that call runs again after a
+// restart or a cancellation: under one parent, the k-th invocation of
+// a tool with JSON-equal arguments matches the k-th recorded call of
+// that tool with those arguments, in any order, and keeps its ID. A
+// matched call that ended is given its recorded result without
+// running, tool_start and tool_end marked Replayed; one handed to its
+// tool that never ended runs again under its recorded key when
+// agenttool's replay rule allows, and is otherwise given the outcome
+// unknown as its error. An invocation with nothing left to match is a
+// new call.
 //
 // Call it from a tool, with the context the tool was given, and not
 // from a hook or a subscriber: BeforeToolCall and AfterToolCall take
@@ -2844,19 +3500,37 @@ func Invoke(ctx context.Context, name string, args json.RawMessage) (agenttool.R
 // invoke runs a nested call through the turn's hooks, events and
 // executor. It never touches the transcript: the call is the work of
 // the call that made it.
-func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name string, args json.RawMessage) (agenttool.Result, error) {
+func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name string, args json.RawMessage, runAsk agenttool.Elicitor) (agenttool.Result, error) {
 	parent := ""
 	if call, ok := agenttool.CallFrom(ctx); ok {
 		parent = call.ID
 	}
-	call := &openresponses.FunctionCall{CallID: openresponses.NewID("call"), Name: name, Arguments: string(args)}
+	// A nested call already on the record keeps its identity: the ID,
+	// and for one handed to its tool the key of that hand-off.
+	rec := r.match(parent, name, args)
+	id := openresponses.NewID("call")
+	if rec != nil {
+		id = rec.CallID
+	}
+	call := &openresponses.FunctionCall{CallID: id, Name: name, Arguments: string(args)}
+	r.adopt(call.CallID, parent)
+	if rec != nil && rec.Ended {
+		return r.replayNested(turn, call, parent, args, rec)
+	}
 	p := r.prepare(tools, turn, call, args)
 	p.parent = parent
-	r.adopt(call.CallID, parent)
+	if rec != nil && rec.Dispatched {
+		p.key = rec.IdempotencyKey
+	}
+	defer r.ranNested(p, args)
 	var decision *ToolDecision
 	if r.cfg.BeforeToolCall != nil {
 		var err error
-		decision, err = r.beforeToolCall(ctx, ToolCallInfo{RunID: r.runID, Turn: turn, Call: call, Tool: p.tool, Args: p.args, Batch: []*openresponses.FunctionCall{call}, Index: 0, Parent: parent})
+		// The hook, and the question a deferral puts, see the run's
+		// elicitor, not one the invoking tool installed: a tool must
+		// not approve a call its policy deferred by answering itself.
+		decideCtx := agenttool.ContextWithElicitor(ctx, runAsk)
+		decision, err = r.beforeToolCall(decideCtx, ToolCallInfo{RunID: r.runID, Turn: turn, Call: call, Tool: p.tool, Args: p.args, Batch: []*openresponses.FunctionCall{call}, Index: 0, Parent: parent})
 		if err != nil {
 			return agenttool.Result{}, fmt.Errorf("agentturn: before-tool-call hook: %w", err)
 		}
@@ -2866,10 +3540,10 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 			}
 			if decision.Action == Defer {
 				// A nested call cannot be handed to the caller, so the
-				// user is asked through the invoking tool's elicitor;
-				// without one, or with no answer, the deferral stands
-				// and refuses the call below.
-				if d, ok := Ask(ctx, AskedCall{Parent: parent, CallID: call.CallID, Name: name, Args: p.args, Decision: decision}); ok {
+				// user is asked through the run's elicitor; without
+				// one, or with no answer, the deferral stands and
+				// refuses the call below.
+				if d, ok := Ask(decideCtx, AskedCall{Parent: parent, CallID: call.CallID, Name: name, Args: p.args, Decision: decision}); ok {
 					decision = d
 				}
 			}
@@ -2895,7 +3569,16 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 			}
 		}
 	}
-	if err := r.emit(&ToolStart{RunID: r.runID, Turn: turn, CallID: call.CallID, Name: name, Args: p.args, Decision: decision, Parent: parent}); err != nil {
+	if rec != nil && rec.Dispatched && !p.blocked && p.tool != nil && validObject(p.args) {
+		// It was handed to its tool and never ended, so it may have
+		// run: it runs again under its recorded key only as agenttool's
+		// replay rule allows, and is otherwise given the outcome
+		// unknown without running.
+		if _, err := runAgain(ctx, p.tool, call.CallID, p.args, p.key, orEmpty(rec.DispatchArgs, string(rec.Args)), rec.IdempotencyKey); err != nil {
+			p.err = errOutcomeUnknown
+		}
+	}
+	if err := r.emit(&ToolStart{RunID: r.runID, Turn: turn, CallID: call.CallID, Name: name, Args: p.args, Decision: decision, Parent: parent, Invoked: args}); err != nil {
 		return agenttool.Result{}, r.endNested(p, err)
 	}
 	if err := r.check(ctx, p); err != nil {
@@ -2918,6 +3601,136 @@ func (r *runner) invoke(ctx context.Context, tools agenttool.Set, turn int, name
 		return agenttool.Result{}, r.endNested(p, err)
 	}
 	return p.result, p.err
+}
+
+// replayNested gives an invocation matched to a nested call that ended
+// on the record the result it ended with, without a decision or a
+// dispatch: tool_start and tool_end marked replayed.
+func (r *runner) replayNested(turn int, call *openresponses.FunctionCall, parent string, args json.RawMessage, rec *NestedRecord) (agenttool.Result, error) {
+	var err error
+	if rec.Err != "" {
+		err = errors.New(rec.Err)
+	}
+	ran := orEmpty(rec.DispatchArgs, string(rec.Args))
+	if e := r.emit(&ToolStart{RunID: r.runID, Turn: turn, CallID: call.CallID, Name: call.Name, Args: ran, Parent: parent, Invoked: args, Replayed: true}); e != nil {
+		return agenttool.Result{}, e
+	}
+	r.recordNested(parent, *rec)
+	if e := r.emit(&ToolEnd{RunID: r.runID, Turn: turn, CallID: call.CallID, Name: call.Name, Result: rec.Result, Err: err, Blocked: rec.Blocked, Reason: rec.Reason, Parent: parent, Replayed: true}); e != nil {
+		return agenttool.Result{}, e
+	}
+	return rec.Result, err
+}
+
+// recordedCall is a nested call on the record, and whether an
+// invocation has matched it.
+type recordedCall struct {
+	NestedRecord
+	taken bool
+}
+
+// expect adds the nested calls a record holds under an approved call
+// to those its tool's invocations are matched against.
+func (r *runner) expect(nested []NestedRecord) {
+	if len(nested) == 0 {
+		return
+	}
+	r.nestedMu.Lock()
+	defer r.nestedMu.Unlock()
+	if r.recorded == nil {
+		r.recorded = map[string][]*recordedCall{}
+	}
+	for _, n := range nested {
+		r.recorded[n.Parent] = append(r.recorded[n.Parent], &recordedCall{NestedRecord: n})
+	}
+}
+
+// match takes the first nested call on the record under parent, of the
+// tool name with arguments JSON-equal to args, that no invocation has
+// matched yet, or returns nil when there is none: the k-th such
+// invocation matches the k-th such record, whatever order they arrive
+// in.
+func (r *runner) match(parent, name string, args json.RawMessage) *NestedRecord {
+	if parent == "" {
+		return nil
+	}
+	r.nestedMu.Lock()
+	defer r.nestedMu.Unlock()
+	for _, c := range r.recorded[parent] {
+		if !c.taken && c.Name == name && sameArgs(orEmpty(c.Args, ""), orEmpty(args, "")) {
+			c.taken = true
+			rec := c.NestedRecord
+			return &rec
+		}
+	}
+	return nil
+}
+
+// ranNested keeps what this run did of the nested call p, invoked with
+// args, under the batch call it was made under.
+func (r *runner) ranNested(p *callState, args json.RawMessage) {
+	if !p.ended {
+		return
+	}
+	rec := NestedRecord{CallID: p.call.CallID, Parent: p.parent, Name: p.call.Name, Args: args}
+	if p.dispatched {
+		rec.Dispatched, rec.IdempotencyKey = true, p.key
+		if !sameArgs(p.args, orEmpty(args, "")) {
+			rec.DispatchArgs = p.args
+		}
+	}
+	if !p.cut {
+		rec.Ended, rec.Result, rec.Blocked, rec.Reason = true, p.result, p.blocked, p.reason
+		if p.err != nil {
+			rec.Err = p.err.Error()
+		}
+	}
+	r.recordNested(p.parent, rec)
+}
+
+// recordNested keeps rec, a nested call made under parent, under the
+// batch call parent was made under.
+func (r *runner) recordNested(parent string, rec NestedRecord) {
+	r.noteMu.Lock()
+	root, ok := r.roots[parent]
+	r.noteMu.Unlock()
+	if !ok {
+		root = parent
+	}
+	r.nestedMu.Lock()
+	defer r.nestedMu.Unlock()
+	if r.nestedRan == nil {
+		r.nestedRan = map[string][]NestedRecord{}
+	}
+	r.nestedRan[root] = append(r.nestedRan[root], rec)
+}
+
+// nestedOf is what the pending list says of the nested calls under the
+// call callID: those it was seeded with, each brought up to date by
+// what this run did of it, then those this run made new.
+func (r *runner) nestedOf(callID string, seeded []NestedRecord) []NestedRecord {
+	r.nestedMu.Lock()
+	ran := r.nestedRan[callID]
+	r.nestedMu.Unlock()
+	if len(ran) == 0 {
+		return seeded
+	}
+	out := slices.Clone(seeded)
+	for _, n := range ran {
+		i := slices.IndexFunc(out, func(o NestedRecord) bool { return o.CallID == n.CallID })
+		switch {
+		case i < 0:
+			out = append(out, n)
+		case n.Dispatched || n.Ended:
+			// A hand-off of this run is the last; one it did not make
+			// leaves the earlier's key standing.
+			if !n.Dispatched {
+				n.Dispatched, n.IdempotencyKey, n.DispatchArgs = out[i].Dispatched, out[i].IdempotencyKey, out[i].DispatchArgs
+			}
+			out[i] = n
+		}
+	}
+	return out
 }
 
 // endNested gives a nested call whose loop-side handling failed, a

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1110,11 +1111,20 @@ func TestForkReadsItsOrigin(t *testing.T) {
 				// fork reaches it through the origin's link in its
 				// prefix (agentsession#186's verifier checks the pair).
 				after = append(after, agentsession.NewSubsessionLink("child-of-call-1", call.CallID))
-				after = append(after, &agentsession.ItemEntry{Item: openresponses.NewFunctionCallOutput(call.CallID, "charged")})
+				// The page the charge read was untrusted, which the
+				// fork's copy carries (#237).
+				ranOut := openresponses.NewFunctionCallOutput(call.CallID, "charged")
+				ranOut.ID = "fco_1" // the provider's item ID, which a copy keeps
+				after = append(after, &agentsession.ItemEntry{Item: ranOut, Trust: &agentsession.Trust{Reads: []string{agentsession.TrustUntrusted}}})
 			}
+			ranEntry := ""
 			for _, e := range after {
-				if _, err := store.Append(ctx, origin.ID(), e); err != nil {
+				id, err := store.Append(ctx, origin.ID(), e)
+				if err != nil {
 					t.Fatal(err)
+				}
+				if _, ok := e.(*agentsession.ItemEntry); ok {
+					ranEntry = id
 				}
 			}
 
@@ -1187,6 +1197,17 @@ func TestForkReadsItsOrigin(t *testing.T) {
 						if tc.completed && tc.answer == nil && out.Output.Text != "charged" {
 							t.Errorf("output %q, want the one the origin holds", out.Output.Text)
 						}
+						// #237: an output repeating the origin's names
+						// that entry and carries its trust, so a reader
+						// reaches the origin's child through the
+						// origin's link, which the fork cannot hold.
+						copied := tc.origins && tc.completed && tc.answer == nil
+						if cf := e.CopiedFrom; copied && (cf == nil || cf.Session != origin.ID() || cf.Entry != ranEntry) || !copied && cf != nil {
+							t.Errorf("copied_from = %+v, want the origin's output %s in %s (%v)", cf, ranEntry, origin.ID(), copied)
+						}
+						if copied && (e.Trust == nil || !slices.Contains(e.Trust.Reads, agentsession.TrustUntrusted)) {
+							t.Errorf("trust = %+v, want the origin's untrusted", e.Trust)
+						}
 					}
 				}
 			}
@@ -1195,6 +1216,11 @@ func TestForkReadsItsOrigin(t *testing.T) {
 			}
 			if last == nil || last.Reason != tc.wantReason {
 				t.Errorf("last decision = %+v, want reason %q", last, tc.wantReason)
+			}
+			// The copy names an entry only with the item that entry
+			// holds and its trust.
+			if err := fork.VerifyCopies(func(id string) (*agentsession.Session, error) { return store.Open(ctx, id) }); err != nil {
+				t.Errorf("verify copies: %v", err)
 			}
 			if err := fork.VerifyRecords(fork.Leaf()); err != nil {
 				t.Errorf("verify records: %v", err)
@@ -1302,8 +1328,9 @@ func TestOriginReadErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start on a base whose origin cannot be read: %v", err)
 	}
-	if len(rec.ReadOptions()) != 1 {
-		t.Errorf("read options = %d, want the store's", len(rec.ReadOptions()))
+	// The store's origins, and its blobs for a sidecar session.
+	if len(rec.ReadOptions()) != 2 {
+		t.Errorf("read options = %d, want the store's origins and blobs", len(rec.ReadOptions()))
 	}
 	if _, err := Pending(fork, rec.ReadOptions()...); err == nil || !strings.Contains(err.Error(), "disk on fire") {
 		t.Errorf("pending with the origins: err = %v, want the read's", err)
@@ -1489,5 +1516,68 @@ func TestPendingCarriesTheHold(t *testing.T) {
 				t.Errorf("run end's decision subject %q held %v, the record's %q %v", live.Subject, live.Held, d.Subject, d.Held)
 			}
 		})
+	}
+}
+
+// TestAForkThatWithdrewItsOwnDispatchStillReadsTheOrigin pins the
+// review's L1: a withdrawal takes the fork's own dispatch off its path,
+// so a call in the fork's prefix is what the origin says it is, and a
+// call that completed in the origin is read with its output there,
+// not as one the file cannot say about.
+func TestAForkThatWithdrewItsOwnDispatchStillReadsTheOrigin(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	origin, err := store.Create(ctx, agentsession.Header{Records: agentsession.AllRecords})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append(ctx, origin.ID(), &agentsession.ItemEntry{Item: openresponses.UserText("charge me")}); err != nil {
+		t.Fatal(err)
+	}
+	call := &openresponses.FunctionCall{CallID: "call_1", Name: "charge", Arguments: `{"text":"t"}`}
+	target, err := store.Append(ctx, origin.ID(), &agentsession.ItemEntry{Item: call, ResponseID: "resp_1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := store.Append(ctx, origin.ID(), &agentsession.ResponseEntry{ResponseID: "resp_1", Status: openresponses.ResponseStatusCompleted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range []agentsession.Entry{
+		agentsession.NewDispatch(call.CallID, target).WithIdempotencyKey("k1"),
+		&agentsession.ItemEntry{Item: openresponses.NewFunctionCallOutput(call.CallID, "charged")},
+	} {
+		if _, err := store.Append(ctx, origin.ID(), e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec, fork, err := Start(ctx, store, agentsession.Header{Base: base, ParentSession: origin.ID()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fork handed the call off and withdrew the hand-off.
+	for _, e := range []agentsession.Entry{
+		agentsession.NewDispatch(call.CallID, target).WithIdempotencyKey("k2"),
+		agentsession.NewWithdrawal(call.CallID, target, "", "the audit log is down"),
+	} {
+		if _, err := store.Append(ctx, fork.ID(), e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if fork, err = store.Open(ctx, fork.ID()); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := Pending(fork, rec.ReadOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Reason != agentturn.PendingAborted || pending[0].IdempotencyKey != "k1" {
+		t.Fatalf("pending = %+v, want the origin's hand-off under k1", pending)
+	}
+	if p := pending[0]; p.Ran == nil || p.Ran.Output.Text != "charged" || p.RanWhere != ranInOriginReason {
+		t.Errorf("Ran = %+v where %q, want the origin's output", p.Ran, p.RanWhere)
+	}
+	if err := fork.VerifyRecords(fork.Leaf()); err != nil {
+		t.Errorf("verify: %v", err)
 	}
 }

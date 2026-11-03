@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -34,6 +35,7 @@ type scenario struct {
 	Results         map[string]*scriptedResult  `json:"results"`
 	Decisions       map[string]scriptedDecision `json:"decisions"`
 	Transcript      openresponses.Items         `json:"transcript"`
+	Pending         []scriptedPending           `json:"pending"`
 	Model           []scriptedAttempt           `json:"model"`
 	Runs            []scenarioRun               `json:"runs"`
 }
@@ -47,21 +49,50 @@ type scenarioConfig struct {
 	Retry            struct {
 		MaxAttempts int `json:"max_attempts"`
 	} `json:"retry"`
+	// Fold is what the transform folds the transcript to when the loop
+	// asks it for a fold; absent, the configuration has no transform.
+	Fold openresponses.Items `json:"fold"`
 }
 
 type scenarioTool struct {
 	Name       string          `json:"name"`
 	Sequential bool            `json:"sequential"`
 	Barrier    bool            `json:"barrier"`
+	Replay     string          `json:"replay"`
 	Result     *scriptedResult `json:"result"`
 }
 
+// scriptedPending is what a record says of a call of the transcript the
+// agent starts from: why it is pending, the key and the arguments of
+// the hand-off it would repeat, and the nested calls its tool made.
+type scriptedPending struct {
+	CallID         string           `json:"call_id"`
+	Reason         string           `json:"reason"`
+	IdempotencyKey string           `json:"idempotency_key"`
+	Args           json.RawMessage  `json:"args"`
+	Nested         []scriptedNested `json:"nested"`
+}
+
+type scriptedNested struct {
+	CallID         string          `json:"call_id"`
+	Parent         string          `json:"parent"`
+	Name           string          `json:"name"`
+	Args           json.RawMessage `json:"args"`
+	Dispatched     bool            `json:"dispatched"`
+	IdempotencyKey string          `json:"idempotency_key"`
+	DispatchArgs   json.RawMessage `json:"dispatch_args"`
+	Ended          bool            `json:"ended"`
+	Output         *string         `json:"output"`
+	Error          string          `json:"error"`
+}
+
 type scriptedResult struct {
-	Output    *string         `json:"output"`
-	Terminate bool            `json:"terminate"`
-	Error     string          `json:"error"`
-	Wait      string          `json:"wait"`
-	Invoke    *scriptedInvoke `json:"invoke"`
+	Output    *string          `json:"output"`
+	Terminate bool             `json:"terminate"`
+	Error     string           `json:"error"`
+	Wait      string           `json:"wait"`
+	Invoke    *scriptedInvoke  `json:"invoke"`
+	Invokes   []scriptedInvoke `json:"invokes"`
 }
 
 type scriptedInvoke struct {
@@ -80,14 +111,38 @@ type scriptedAttempt struct {
 	Output  openresponses.Items `json:"output"`
 	Partial openresponses.Items `json:"partial"`
 	Error   *scriptedError      `json:"error"`
+	// NoDone lists the output indexes whose output_item.done the stream
+	// leaves out, so only response.completed completes the item.
+	NoDone []int `json:"no_done"`
+	// AtIndexZero streams every item at output index 0, one after the
+	// other, while response.completed lists each at its own position.
+	AtIndexZero bool `json:"at_index_zero"`
 }
 
 type scriptedError struct {
 	Message   string `json:"message"`
 	Retryable bool   `json:"retryable"`
+	// Guard marks the error as a guard's refusal.
+	Guard bool `json:"guard"`
+	// Code is the Open Responses error code the error carries, such as
+	// context_length_exceeded.
+	Code string `json:"code"`
 }
 
 func (e *scriptedError) Error() string { return e.Message }
+
+// err is the error the scripted attempt fails with: the scripted error,
+// marked as a guard's or carrying its code as the script says.
+func (e *scriptedError) err() error {
+	var err error = e
+	if e.Code != "" {
+		err = errors.Join(err, &openresponses.Error{Type: openresponses.ErrorTypeInvalidRequest, Code: e.Code, Message: e.Message})
+	}
+	if e.Guard {
+		err = fmt.Errorf("%w: %w", agentturn.ErrGuard, err)
+	}
+	return err
+}
 
 type scenarioRun struct {
 	Prompt     openresponses.Items `json:"prompt"`
@@ -97,6 +152,7 @@ type scenarioRun struct {
 	FailAt     json.RawMessage     `json:"fail_at"`
 	SteerAt    *queueAt            `json:"steer_at"`
 	FollowUpAt *queueAt            `json:"follow_up_at"`
+	DeliverAt  *queueAt            `json:"deliver_at"`
 	Expect     scenarioExpect      `json:"expect"`
 }
 
@@ -204,6 +260,14 @@ func runScenario(t *testing.T, sc *scenario) {
 			},
 		},
 	}
+	if fold := sc.Config.Fold; fold != nil {
+		cfg.Transform = func(ctx context.Context, t agentturn.Transcript) (agentturn.Transcript, error) {
+			if agentturn.FoldRequested(ctx) {
+				return agentturn.Transcript(fold), nil
+			}
+			return t, nil
+		}
+	}
 	switch sc.Config.ToolExecution {
 	case "", "parallel":
 	case "sequential":
@@ -212,7 +276,15 @@ func runScenario(t *testing.T, sc *scenario) {
 		t.Fatalf("tool_execution %q", sc.Config.ToolExecution)
 	}
 	for _, st := range sc.Tools {
-		cfg.Tools = append(cfg.Tools, &scriptedTool{spec: st, results: sc.Results})
+		tool := &scriptedTool{spec: st, results: sc.Results}
+		switch st.Replay {
+		case "":
+			cfg.Tools = append(cfg.Tools, tool)
+		case "safe", "keyed", "unknown":
+			cfg.Tools = append(cfg.Tools, scriptedReplayTool{tool})
+		default:
+			t.Fatalf("tool %s: replay %q", st.Name, st.Replay)
+		}
 	}
 	if sc.Decisions != nil {
 		cfg.BeforeToolCall = func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
@@ -237,6 +309,9 @@ func runScenario(t *testing.T, sc *scenario) {
 	if sc.Transcript != nil {
 		opts = append(opts, agentturn.WithTranscript(agentturn.Transcript(sc.Transcript)))
 	}
+	if sc.Pending != nil {
+		opts = append(opts, agentturn.WithPending(seededPending(t, sc)))
+	}
 	agent := agentturn.New(cfg, opts...)
 
 	for i, run := range sc.Runs {
@@ -250,6 +325,38 @@ func runScenario(t *testing.T, sc *scenario) {
 	if err := model.leftover(); err != nil {
 		t.Error(err)
 	}
+}
+
+// seededPending is the scenario's pending calls as a host seeds them
+// from a record, each naming a function call of the transcript.
+func seededPending(t *testing.T, sc *scenario) []agentturn.PendingCall {
+	t.Helper()
+	calls := map[string]*openresponses.FunctionCall{}
+	for _, item := range sc.Transcript {
+		if c, ok := item.(*openresponses.FunctionCall); ok {
+			calls[c.CallID] = c
+		}
+	}
+	var out []agentturn.PendingCall
+	for _, sp := range sc.Pending {
+		call := calls[sp.CallID]
+		if call == nil {
+			t.Fatalf("scenario: pending call %s is not in the transcript", sp.CallID)
+		}
+		p := agentturn.PendingCall{Call: call, Reason: agentturn.PendingReason(sp.Reason), IdempotencyKey: sp.IdempotencyKey, Args: sp.Args}
+		for _, n := range sp.Nested {
+			rec := agentturn.NestedRecord{CallID: n.CallID, Parent: n.Parent, Name: n.Name, Args: n.Args, Dispatched: n.Dispatched, IdempotencyKey: n.IdempotencyKey, DispatchArgs: n.DispatchArgs, Ended: n.Ended, Err: n.Error}
+			if n.Output != nil {
+				rec.Result = agenttool.Text(*n.Output)
+			}
+			if n.Error != "" {
+				rec.Result = agenttool.ErrorResult(errors.New(n.Error))
+			}
+			p.Nested = append(p.Nested, rec)
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 func driveRun(t *testing.T, agent *agentturn.Agent, run scenarioRun) {
@@ -270,7 +377,7 @@ func driveRun(t *testing.T, agent *agentturn.Agent, run scenarioRun) {
 		}
 		return subset(want, ev, "") == ""
 	}
-	unsubscribe := agent.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+	unsubscribe := agent.Subscribe(func(evCtx context.Context, ev agentturn.Event) error {
 		p := project(t, ev)
 		mu.Lock()
 		if p != nil {
@@ -288,6 +395,13 @@ func driveRun(t *testing.T, agent *agentturn.Agent, run scenarioRun) {
 		}
 		if run.FollowUpAt != nil && matches(run.FollowUpAt.Event, p) {
 			agent.FollowUp(run.FollowUpAt.Items...)
+		}
+		if run.DeliverAt != nil && matches(run.DeliverAt.Event, p) {
+			// A delivery from inside the run, with the context it was
+			// handed, joins it as a steer and does not wait.
+			if _, _, err := agent.Deliver(evCtx, run.DeliverAt.Items...); err != nil {
+				t.Errorf("scenario: deliver: %v", err)
+			}
 		}
 		if matches(run.FailAt, p) {
 			return errors.New("scenario: the subscriber fails here")
@@ -536,6 +650,7 @@ func project(t *testing.T, ev agentturn.Event) map[string]any {
 		m["name"] = e.Name
 		m["args"] = rawJSON(t, e.Args)
 		m["parent"] = e.Parent
+		m["replayed"] = e.Replayed
 		if e.Decision != nil {
 			m["decision"] = map[string]any{
 				"action":    action(e.Decision.Action),
@@ -548,6 +663,7 @@ func project(t *testing.T, ev agentturn.Event) map[string]any {
 		m["call_id"] = e.CallID
 		m["name"] = e.Name
 		m["parent"] = e.Parent
+		m["idempotency_key"] = e.IdempotencyKey
 	case *agentturn.ToolUpdate:
 		m["turn"] = e.Turn
 		m["call_id"] = e.CallID
@@ -562,6 +678,9 @@ func project(t *testing.T, ev agentturn.Event) map[string]any {
 		m["deferred"] = e.Deferred
 		m["reason"] = e.Reason
 		m["parent"] = e.Parent
+		m["withdrawn"] = e.Withdrawn
+		m["cut"] = e.Cut
+		m["replayed"] = e.Replayed
 	case *agentturn.TurnEnd:
 		m["turn"] = e.Turn
 		m["response"] = toJSON(t, e.Response)
@@ -595,6 +714,7 @@ func projectEnd(e *agentturn.RunEnd) map[string]any {
 		"reason":   string(e.Reason),
 		"cause":    string(e.Cause),
 		"error":    e.Err != nil,
+		"failure":  e.Failure != nil,
 		"pending":  pending,
 		"withheld": e.Withheld,
 	}
@@ -645,6 +765,39 @@ func (m *scriptedModel) CreateStream(_ context.Context, req openresponses.Reques
 	if at.ID != "" {
 		resp.ID = at.ID
 	}
+	if at.AtIndexZero {
+		next := sink
+		sink = openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+			switch e := ev.(type) {
+			case *openresponses.OutputItemAddedEvent:
+				e.OutputIndex = 0
+			case *openresponses.OutputItemDoneEvent:
+				e.OutputIndex = 0
+			case *openresponses.FunctionCallArgumentsDeltaEvent:
+				e.OutputIndex = 0
+			case *openresponses.FunctionCallArgumentsDoneEvent:
+				e.OutputIndex = 0
+			case *openresponses.ContentPartAddedEvent:
+				e.OutputIndex = 0
+			case *openresponses.ContentPartDoneEvent:
+				e.OutputIndex = 0
+			case *openresponses.OutputTextDeltaEvent:
+				e.OutputIndex = 0
+			case *openresponses.OutputTextDoneEvent:
+				e.OutputIndex = 0
+			}
+			return next.Send(ev)
+		})
+	}
+	if len(at.NoDone) > 0 {
+		next := sink
+		sink = openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+			if done, ok := ev.(*openresponses.OutputItemDoneEvent); ok && slices.Contains(at.NoDone, done.OutputIndex) {
+				return nil
+			}
+			return next.Send(ev)
+		})
+	}
 	em := openresponses.NewEmitter(sink, resp)
 	if err := em.Start(); err != nil {
 		return err
@@ -659,7 +812,7 @@ func (m *scriptedModel) CreateStream(_ context.Context, req openresponses.Reques
 		}
 	}
 	if at.Error != nil {
-		return at.Error
+		return at.Error.err()
 	}
 	return em.Complete()
 }
@@ -729,6 +882,22 @@ func (s *scriptedTool) Parameters() json.RawMessage { return json.RawMessage(`{"
 func (s *scriptedTool) Sequential() bool            { return s.spec.Sequential }
 func (s *scriptedTool) Barrier() bool               { return s.spec.Barrier }
 
+// scriptedReplayTool is a scripted tool that says how a call of it may
+// run again.
+type scriptedReplayTool struct {
+	*scriptedTool
+}
+
+func (s scriptedReplayTool) Replay(context.Context, json.RawMessage) agenttool.Replay {
+	switch s.spec.Replay {
+	case "safe":
+		return agenttool.ReplaySafe
+	case "keyed":
+		return agenttool.ReplayKeyed
+	}
+	return agenttool.ReplayUnknown
+}
+
 func (s *scriptedTool) Execute(ctx context.Context, call agenttool.Call) (agenttool.Result, error) {
 	r := s.results[call.ID]
 	if r == nil {
@@ -741,15 +910,24 @@ func (s *scriptedTool) Execute(ctx context.Context, call agenttool.Call) (agentt
 		<-ctx.Done()
 		return agenttool.Result{}, ctx.Err()
 	}
+	invokes := r.Invokes
 	if r.Invoke != nil {
-		if _, err := agentturn.Invoke(ctx, r.Invoke.Name, r.Invoke.Arguments); err != nil {
+		invokes = append([]scriptedInvoke{*r.Invoke}, invokes...)
+	}
+	var invoked []string
+	for _, in := range invokes {
+		res, err := agentturn.Invoke(ctx, in.Name, in.Arguments)
+		if err != nil {
 			return agenttool.Result{}, err
 		}
+		invoked = append(invoked, res.Output.String())
 	}
 	if r.Error != "" {
 		return agenttool.Result{}, errors.New(r.Error)
 	}
-	out := ""
+	// Without an output of its own, the tool answers with what its
+	// nested calls returned, a line each.
+	out := strings.Join(invoked, "\n")
 	if r.Output != nil {
 		out = *r.Output
 	}

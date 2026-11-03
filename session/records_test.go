@@ -84,7 +84,7 @@ func TestRunEntriesCarrySourceTriggerAndReason(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h := s.Header(); strings.Join(h.Records, ",") != "run,dispatch,decision,queued" {
+	if h := s.Header(); strings.Join(h.Records, ",") != "run,dispatch,decision,queued,result" {
 		t.Errorf("header records = %v", h.Records)
 	}
 	deferAll := func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
@@ -366,7 +366,12 @@ func TestAbortRecordsInterruptedAndFinishedCalls(t *testing.T) {
 	if end == nil || end.Reason != agentturn.ReasonAborted || len(end.Pending) != 1 || end.Pending[0].Call.Name != "slow" || end.Pending[0].Reason != agentturn.PendingAborted {
 		t.Fatalf("end = %+v", end)
 	}
-	if got := entryTypes(s); got != "run config item:user item:function_call* item:function_call* response dispatch dispatch item:function_call_output run" {
+	// The fast call returned while the slow one ran, so its result is on
+	// the record before the batch appends its output (#273). The batch is
+	// parallel, so the fast call may return before the slow one is handed
+	// to its tool: its result is before or after the slow dispatch.
+	if got := entryTypes(s); got != "run config item:user item:function_call* item:function_call* response dispatch dispatch result item:function_call_output run" &&
+		got != "run config item:user item:function_call* item:function_call* response dispatch result dispatch item:function_call_output run" {
 		t.Errorf("entries = %q", got)
 	}
 	verifyAll(t, s)
@@ -843,7 +848,8 @@ func TestEnvInAChild(t *testing.T) {
 		if got := envNodes(child.Entries()); got != "node-1,node-2" {
 			t.Errorf("child env entries = %q, want node-1,node-2", got)
 		}
-		if first := child.Entries()[1]; !isEnv(first) {
+		// The child's name is first, then its run start.
+		if first := child.Entries()[2]; !isEnv(first) {
 			t.Errorf("the child's run start is followed by %s, want its env", first.EntryType())
 		}
 		if leaf, _ := child.Entry(child.Leaf()); !isEnv(leaf) {
@@ -1019,7 +1025,7 @@ func TestChildWithItsOwnWorkspace(t *testing.T) {
 				t.Errorf("child env entries = %q, want %q", got, tc.wantChild)
 			}
 			if tc.wantFirst {
-				if first := child.Entries()[1]; !isEnv(first) {
+				if first := child.Entries()[2]; !isEnv(first) {
 					t.Errorf("the child's run start is followed by %s, want its env", first.EntryType())
 				}
 				// The dispatch is filed under the env the child ran in.
@@ -1146,7 +1152,7 @@ func TestChildSessionIDIsDerivedFromTheCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h := cs.Header(); h.SpawnedBy != l[0].CallID || h.ParentSession != s.ID() || strings.Join(h.Records, ",") != "run,dispatch,decision" {
+	if h := cs.Header(); h.SpawnedBy != l[0].CallID || h.ParentSession != s.ID() || strings.Join(h.Records, ",") != "run,dispatch,decision,queued,result" {
 		t.Errorf("child header = %+v", h)
 	}
 	if n := verifyAll(t, cs); n != 1 {
@@ -1416,10 +1422,11 @@ func TestRecordableDetailsBecomeACustomEntry(t *testing.T) {
 	}
 	// Only the recordable value is written, after its call's dispatch
 	// and before the outputs; a Details value for subscribers alone is
-	// not.
+	// not. The first call settles while the second waits its turn, so
+	// its result comes with it (#273).
 	switch got := entryTypes(s); got {
-	case "run config item:user item:function_call* item:function_call* response dispatch dispatch custom item:function_call_output item:function_call_output item:assistant* response run",
-		"run config item:user item:function_call* item:function_call* response dispatch custom dispatch item:function_call_output item:function_call_output item:assistant* response run":
+	case "run config item:user item:function_call* item:function_call* response dispatch dispatch result custom item:function_call_output item:function_call_output item:assistant* response run",
+		"run config item:user item:function_call* item:function_call* response dispatch result custom dispatch item:function_call_output item:function_call_output item:assistant* response run":
 	default:
 		t.Errorf("entries = %q", got)
 	}
@@ -1534,7 +1541,7 @@ func TestNestedCallsAreRecorded(t *testing.T) {
 		}
 		nested = append(nested, n)
 	}
-	if len(nested) != 4 {
+	if len(nested) != 5 {
 		t.Fatalf("nested call entries = %d", len(nested))
 	}
 	parent := callsOf(t, s)["eval"]
@@ -1549,8 +1556,14 @@ func TestNestedCallsAreRecorded(t *testing.T) {
 	if nested[0].Name != "read" || nested[0].Phase != agentsession.RunStart || string(nested[0].Args) != `{"text":"go.mod"}` {
 		t.Errorf("first entry = %+v", nested[0])
 	}
-	if nested[1].Phase != agentsession.RunEnd || nested[1].Output != "the contents" {
+	// The hand-off is durable before the tool runs, with its key, so a
+	// parent run again runs it under the same one (#261).
+	if nested[1].Phase != "dispatch" || nested[1].CallID != nested[0].CallID || nested[1].IdempotencyKey == "" {
 		t.Errorf("second entry = %+v", nested[1])
+	}
+	nested = slices.Delete(nested, 1, 2)
+	if nested[1].Phase != agentsession.RunEnd || nested[1].Output != "the contents" {
+		t.Errorf("third entry = %+v", nested[1])
 	}
 	if nested[2].Name != "bash" || nested[2].Verdict != agentsession.VerdictReject || nested[2].Reason != "denied by bash(rm:*)" || nested[2].By != agentsession.ByPolicy {
 		t.Errorf("third entry = %+v", nested[2])
@@ -1633,9 +1646,14 @@ func TestAskedNestedCallsAreRecorded(t *testing.T) {
 				}
 			}
 			// #213: the question is on the record before it is put, the
-			// answer after, both before the nested call's own entries.
-			if strings.Join(order, " ") != "ask answer start end" {
-				t.Errorf("entries = %v", order)
+			// answer after, both before the nested call's own entries;
+			// an accepted call is handed to its tool (#261).
+			want := "ask answer start end"
+			if tc.action == agenttool.ActionAccept {
+				want = "ask answer start dispatch end"
+			}
+			if strings.Join(order, " ") != want {
+				t.Errorf("entries = %v, want %s", order, want)
 			}
 			if start == nil || start.Verdict != tc.verdict || start.By != agentsession.ByHuman || !strings.Contains(start.Reason, "ask bash(git push:*)") {
 				t.Fatalf("start entry = %+v", start)
@@ -1904,6 +1922,87 @@ func TestRevisedRetryIsAConfigDelta(t *testing.T) {
 	cfgs := configs(s)
 	if len(cfgs) != 2 || cfgs[0].Model != "a" || cfgs[1].Model != "b" {
 		t.Errorf("config entries = %d in %q", len(cfgs), entryTypes(s))
+	}
+}
+
+// fallbackReasoner answers every request with a reasoning item signed
+// for the requested model, then a call to the first tool until the input
+// holds two outputs, and a message after; it records the model and the
+// reasoning of every request and fails the second with an overloaded
+// server error, before anything of an answer.
+type fallbackReasoner struct {
+	n    int
+	sent []string
+}
+
+func (m *fallbackReasoner) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.n++
+	var sigs []string
+	outputs := 0
+	for _, item := range req.Input {
+		switch it := item.(type) {
+		case *openresponses.ReasoningItem:
+			sigs = append(sigs, it.EncryptedContent)
+		case *openresponses.FunctionCallOutput:
+			outputs++
+		}
+	}
+	m.sent = append(m.sent, req.Model+" "+fmt.Sprint(sigs))
+	if m.n == 2 {
+		return openresponses.ServerError("overloaded", "overloaded")
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if err := em.Item(&openresponses.ReasoningItem{Summary: openresponses.Contents{}, EncryptedContent: "sig:" + req.Model}); err != nil {
+		return err
+	}
+	if outputs < 2 {
+		w, err := em.FunctionCall("", req.Tools[0].(*openresponses.FunctionTool).Name)
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(`{"text":"x"}`); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	if err := em.Item(openresponses.AssistantText("ok")); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestARevisedRetryIsRecordedAsTheModelThatAnswered pins agentturn #286
+// on the record: a turn the retry policy moved from a to b after an
+// overloaded error sends b no reasoning of a's, the next turn on a sends
+// none of b's, and every response verifies, since the record's
+// other_models rule rebuilds each input for the model in force at it.
+func TestARevisedRetryIsRecordedAsTheModelThatAnswered(t *testing.T) {
+	rec, s, err := Start(context.Background(), agentsession.NewMemoryStore(), agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &fallbackReasoner{}
+	a := agentturn.New(agentturn.Config{Model: m, ModelName: "a", Tools: []agenttool.Tool{upper}, Retry: agentturn.Retry{
+		MaxAttempts: 2,
+		Backoff:     func(int, error) time.Duration { return 0 },
+		Revise: func(_ int, req *openresponses.Request, _ error) *openresponses.Request {
+			req.Model = "b"
+			return nil
+		},
+	}})
+	defer rec.Attach(a)()
+	end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("err=%v end=%+v", err, end)
+	}
+	if want := []string{"a []", "a [sig:a]", "b []", "a [sig:a]"}; !slices.Equal(m.sent, want) {
+		t.Errorf("requests = %q, want %q", m.sent, want)
+	}
+	if n := verifyAll(t, s); n != 3 {
+		t.Errorf("responses = %d, want 3", n)
 	}
 }
 
@@ -2234,7 +2333,7 @@ func TestEnvSurvivesACompaction(t *testing.T) {
 
 			var w *writer
 			if tc.child {
-				if w, err = rec.newChild(ctx, rec.root, callID, false); err != nil {
+				if w, err = rec.newChild(ctx, rec.root, callID, false, ""); err != nil {
 					t.Fatal(err)
 				}
 			} else {
@@ -2311,9 +2410,10 @@ func TestAnAnswerNamesWhoGaveIt(t *testing.T) {
 // TestAWithdrawnDispatchReadsAsNeverStarted pins the recorder half of
 // agentturn#119: a subscriber registered after the recorder that fails
 // on a call's tool_dispatch stops the tool after the dispatch is on the
-// record. The recorder then writes that the hand-off was withdrawn, so
-// Pending reads the call as never started, as the loop knew it, a
-// replay runs it, and its new dispatch is not recorded as a run again.
+// record. The recorder then writes that the hand-off was withdrawn, the
+// format's withdrawal (a reject carrying withdrawn, #278), so Pending
+// reads the call as never started, as the loop knew it, a replay runs
+// it, and its new dispatch is not recorded as a run again.
 func TestAWithdrawnDispatchReadsAsNeverStarted(t *testing.T) {
 	ctx := context.Background()
 	store := agentsession.NewMemoryStore()
@@ -2343,14 +2443,18 @@ func TestAWithdrawnDispatchReadsAsNeverStarted(t *testing.T) {
 	if ran != 0 {
 		t.Fatal("the tool ran after its dispatch was refused")
 	}
-	marks := customs(s, WithdrawnNS)
-	c := callsOf(t, s)["notify"]
-	if len(marks) != 1 || c == nil || len(c.Dispatches) != 1 || marks[0].CallID != c.ID() {
-		t.Fatalf("withdrawn entries = %d, call %+v", len(marks), c)
+	if marks := customs(s, WithdrawnNS); len(marks) != 0 {
+		t.Errorf("wrote %d %s entries, want the format's withdrawal", len(marks), WithdrawnNS)
 	}
-	var w Withdrawn
-	if err := json.Unmarshal(marks[0].Data, &w); err != nil || w.Dispatch != c.Dispatches[0].ID || !strings.Contains(w.Reason, "audit log") {
-		t.Errorf("withdrawn = %+v (%v), want the dispatch %s and the failure", w, err, c.Dispatches[0].ID)
+	c := callsOf(t, s)["notify"]
+	if c == nil || len(c.Dispatches) != 0 || len(c.Withdrawn) != 1 {
+		t.Fatalf("call = %+v, want one withdrawn hand-off and none made", c)
+	}
+	if w := c.Withdrawn[0]; w.Reject.CallID != c.ID() || !w.Reject.Withdrawn || !strings.Contains(w.Reject.Reason, "audit log") {
+		t.Errorf("withdrawal = %+v, want the failure as its reason", w.Reject)
+	}
+	if err := s.VerifyRecords(s.Leaf()); err != nil {
+		t.Errorf("verify: %v", err)
 	}
 
 	rec, s, err = Resume(ctx, store, s.ID())
@@ -2381,7 +2485,7 @@ func TestAWithdrawnDispatchReadsAsNeverStarted(t *testing.T) {
 		t.Errorf("the tool ran %d times on the replay, want once", ran)
 	}
 	c = callsOf(t, s)["notify"]
-	if c == nil || c.Output == nil || len(c.Dispatches) != 2 {
+	if c == nil || c.Output == nil || len(c.Dispatches) != 1 || len(c.Withdrawn) != 1 {
 		t.Fatalf("call after the replay = %+v", c)
 	}
 	for _, d := range c.Decisions {
@@ -2507,7 +2611,7 @@ func TestALiveRecorderCountsWithdrawalsAsARestartedOneDoes(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := callsOf(t, s)["notify"]
-	if c == nil || c.Output == nil || len(c.Dispatches) != 3 {
+	if c == nil || c.Output == nil || len(c.Dispatches) != 2 || len(c.Withdrawn) != 1 {
 		t.Fatalf("call = %+v", c)
 	}
 	if len(c.Decisions) != 2 || c.Decisions[0].By != c.Decisions[1].By {
@@ -3005,5 +3109,44 @@ func TestANoteSurvivesACrashBeforeItsItem(t *testing.T) {
 				t.Errorf("%q is in the transcript %d times, want once: %q", tc.note, n, messagesOf(b.State().Transcript))
 			}
 		})
+	}
+}
+
+// TestAnElicitationAnswerIsByTheDeciderItNames pins #267 for the
+// record: the answer entry names the decider the answer names, and the
+// label the elicitor was built with only when the answer names none.
+func TestAnElicitationAnswerIsByTheDeciderItNames(t *testing.T) {
+	for _, tc := range []struct{ by, want string }{
+		{agenttool.ByPolicy, agentsession.ByPolicy},
+		{"", agentsession.ByHuman},
+	} {
+		ctx := context.Background()
+		rec, s, err := Start(ctx, agentsession.NewMemoryStore(), agentsession.Header{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		answer := func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+			return agenttool.Answer{Action: agenttool.ActionAccept, By: tc.by}, nil
+		}
+		tool := agenttool.New("prune", "", func(ctx context.Context, _ echoArgs) (string, error) {
+			ask, _ := agenttool.ElicitorFrom(ctx)
+			if _, err := ask(ctx, agenttool.Elicitation{Message: "delete the branch?"}); err != nil {
+				return "", err
+			}
+			return "pruned", nil
+		})
+		a := agentturn.New(agentturn.Config{Model: allCalls{}, MaxTurns: 1, Tools: []agenttool.Tool{tool}, ToolElicitor: rec.Elicitor(agentsession.ByHuman, answer)})
+		unsub := rec.Attach(a)
+		if _, err := a.Prompt(ctx, openresponses.UserText("go")); err != nil {
+			t.Fatal(err)
+		}
+		unsub()
+		entries := customs(s, ElicitationNS)
+		if len(entries) != 2 {
+			t.Fatalf("elicitation entries = %d", len(entries))
+		}
+		if got := elicitationOf(t, entries[1]); got.Phase != ElicitationAnswer || got.By != tc.want {
+			t.Errorf("answer by %q recorded by %q, want %q", tc.by, got.By, tc.want)
+		}
 	}
 }

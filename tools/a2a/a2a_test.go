@@ -113,6 +113,9 @@ type scripted struct {
 	state   a2a.TaskState
 	message string
 	reply   bool // answer with a bare message instead of a task
+	// call puts a function_call data part on the status message, as
+	// front/a2a lists a call it puts to its caller.
+	call bool
 }
 
 func (s scripted) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q eventqueue.Queue) error {
@@ -128,6 +131,9 @@ func (s scripted) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q 
 	var msg *a2a.Message
 	if s.message != "" {
 		msg = a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: s.message})
+		if s.call {
+			msg.Parts = append(msg.Parts, a2a.DataPart{Data: map[string]any{"type": "function_call", "call_id": "call_x", "name": "issue_refund", "arguments": `{"amount":10}`}})
+		}
 	}
 	ev := a2a.NewStatusUpdateEvent(reqCtx, s.state, msg)
 	ev.Final = true
@@ -147,6 +153,7 @@ func TestTaskStates(t *testing.T) {
 		{name: "completed with file", exec: scripted{state: a2a.TaskStateCompleted, message: "done"}, wantText: "done"},
 		{name: "input required", exec: scripted{state: a2a.TaskStateInputRequired, message: "which one?"}, wantErr: "needs more input: which one?", input: true},
 		{name: "input required silent", exec: scripted{state: a2a.TaskStateInputRequired}, wantErr: "needs more input before", input: true},
+		{name: "input required on a call", exec: scripted{state: a2a.TaskStateInputRequired, message: "may I refund?", call: true}, wantErr: "needs more input: may I refund?", input: true},
 		{name: "failed", exec: scripted{state: a2a.TaskStateFailed, message: "boom"}, wantErr: "failed: boom"},
 		{name: "canceled", exec: scripted{state: a2a.TaskStateCanceled}, wantErr: "canceled"},
 		{name: "rejected", exec: scripted{state: a2a.TaskStateRejected, message: "no"}, wantErr: "rejected"},
@@ -179,6 +186,23 @@ func TestTaskStates(t *testing.T) {
 					}
 					if tc.input && (ir.TaskID == "" || ir.ContextID == "") {
 						t.Errorf("input required ids = %+v", ir)
+					}
+					// #84: one interface names what the task waits on,
+					// whatever composition tool failed so.
+					var waiting agentturn.InputRequired
+					if errors.As(err, &waiting) != tc.input {
+						t.Errorf("agentturn.InputRequired = %v, want %v", !tc.input, tc.input)
+					}
+					if tc.input {
+						items := waiting.PendingCalls()
+						switch {
+						case len(items) != 1 || items[0].Callee != string(ir.TaskID) || items[0].ID == "":
+							t.Errorf("waiting = %+v, want one item on task %s", items, ir.TaskID)
+						case tc.exec.call && (items[0].ID != "call_x" || items[0].Name != "issue_refund" || string(items[0].Args) != `{"amount":10}`):
+							t.Errorf("waiting = %+v, want the listed call", items[0])
+						case !tc.exec.call && (items[0].Name != "" || items[0].Args != nil):
+							t.Errorf("waiting = %+v, want a question, not a call", items[0])
+						}
 					}
 					return
 				}

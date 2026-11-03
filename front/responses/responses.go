@@ -82,17 +82,32 @@
 // the model's behalf; a sibling's output, or a blocked or failed
 // call's, is not taken for it.
 //
-// The adapter keeps nothing between requests, so the conversation's
-// next request starts under the adapter's configuration again, the
+// The adapter keeps nothing between requests but, under
+// [WithQuarantineScope], the quarantine, so the conversation's next
+// request starts under the adapter's configuration again, the
 // sender's, unless [WithStart] or [WithTransfers] picks another from
 // the input. The input's reasoning items are the caller's, of unknown
 // origin, and sent as they are unless [WithTransfers] attributes them.
+//
+// An item a hook or a tool quarantined (agentturn.Quarantine) in one
+// request stays quarantined in the later requests of its conversation,
+// as [WithQuarantineScope] keys it: a request whose input holds a copy
+// of it, equal in its JSON encoding but for its id and status, as the
+// caller sends the conversation back (agentturn.QuarantineSet.Bind),
+// sends it as the quarantine says, a function call output with
+// agentturn.QuarantinedOutput in place of its own. A request names no
+// conversation, so without the option a quarantine lasts one request,
+// the legs of its handoffs included (RFC 0001 The request, step 3;
+// #281).
 package responses
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"sync"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
@@ -107,6 +122,13 @@ type Adapter struct {
 	handoff             func(context.Context, *agentturn.RunEnd, []*agentturn.ToolEnd) (agentturn.Config, bool)
 	start               func(context.Context, agentturn.Transcript) (agentturn.Config, bool)
 	route               Route
+	maxHandoffs         int
+	trim                func(ctx context.Context, from, to agentturn.Config, t agentturn.Transcript) agentturn.Transcript
+	// scope keys a request's conversation for the quarantine, and
+	// quarantines holds, by that key, what its requests quarantined
+	// (#281).
+	scope       func(ctx context.Context, req openresponses.Request) (QuarantineScope, bool)
+	quarantines scopes
 }
 
 var _ openresponses.Adapter = (*Adapter)(nil)
@@ -143,16 +165,18 @@ func WithToolItems() Option {
 // destination is in a result's Details, which the model never sees,
 // or in end.Items, the terminating call and its output. It is asked
 // again each time a run it started stops the same way, so a pair of
-// agents that hand back and forth runs until fn declines or the
-// request's context ends; a host that wants a bound counts on a value
-// it puts on that context.
+// agents that hand back and forth runs until fn declines, the
+// request's context ends or the request has followed
+// [WithMaxHandoffs] of them, [DefaultMaxHandoffs] by default, after
+// which the response fails with [ErrTooManyHandoffs].
 //
 // The receiver's run is continued under
 // agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff",
 // Ref: sender.Name}), the sender being the configuration whose run
 // stopped, so the receiver's BeforeTurn context and its run_start say
 // why it ran, as they do for a host that continues the receiver in
-// process.
+// process. A ToolElicitor or ToolRecorder the receiver leaves nil is
+// the sender's.
 //
 // The handoff lasts for the response. The caller's next request is
 // started by [WithStart], or under the adapter's own configuration
@@ -165,7 +189,8 @@ func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*
 // conversation, the request's input with the message that opens it
 // last. A configuration it returns is used in place of the adapter's,
 // in both modes and under the request's model and instructions as the
-// adapter's own is; false keeps the adapter's. It is how the receiver
+// adapter's own is, with the adapter's ToolElicitor and ToolRecorder
+// where it leaves them nil; false keeps the adapter's. It is how the receiver
 // of a handoff answers the conversation's later requests: the adapter
 // keeps no state between requests, so the conversation says who has
 // it.
@@ -217,6 +242,137 @@ func WithTransfers(route Route) Option {
 	return func(a *Adapter) {
 		a.route = route
 	}
+}
+
+// ErrTooManyHandoffs says a request, a task or an input was handed
+// from agent to agent more times than its bound allows: the agents
+// handed the conversation back and forth. The receiver of the last
+// transfer has the conversation, unrun; the caller is told rather than
+// answered. agentturn/handoff and front/a2a return it too.
+var ErrTooManyHandoffs = errors.New("too many handoffs for one input")
+
+// DefaultMaxHandoffs is the bound on the handoffs one input causes
+// when nothing sets another: the [WithHandoff] switches one request
+// follows when [WithMaxHandoffs] gives none, and the default of
+// front/a2a's WithMaxHandoffs, per task, and of agentturn/handoff's
+// Team.MaxHandoffs, per Run.
+const DefaultMaxHandoffs = 10
+
+// WithMaxHandoffs bounds the [WithHandoff] switches one request
+// follows, as RFC 0001 requires of a host that takes handoffs: when a
+// run after n of them ends on one more that WithHandoff takes, the
+// response fails with a model_error of code too_many_handoffs, the
+// returned error matching [ErrTooManyHandoffs], so the caller is told
+// rather than answered with a transfer's text. Its next request starts
+// where [WithStart] or [WithTransfers] finds the conversation, with
+// the receiver of the last transfer. n of 0 or less means
+// [DefaultMaxHandoffs].
+func WithMaxHandoffs(n int) Option { return func(a *Adapter) { a.maxHandoffs = n } }
+
+// MaxQuarantineScopes is how many conversations' quarantines an
+// adapter keeps for one principal under [WithQuarantineScope]: past
+// it, the set of that principal's key used least recently is let go,
+// and that conversation's next request sends what it quarantined as
+// it is, unless its guard quarantines it again. A principal's keys
+// never evict another principal's, so what the adapter keeps is this
+// many sets per principal the host authenticates.
+const MaxQuarantineScopes = 256
+
+// WithQuarantineScope keeps what a request quarantined
+// (agentturn.Quarantine) for the later requests of its conversation:
+// fn says who asks and which of their conversations the request
+// belongs to, a [QuarantineScope], and the adapter keeps one
+// quarantine per principal and key, which every request fn gives that
+// scope builds under, an item the caller sends back matched by its
+// content, equal in its JSON encoding but for its id and status
+// (agentturn.QuarantineSet.Bind). A request names no conversation, and
+// Open Responses carries none the adapter is given, so the host says
+// which requests share one. The principal is the one the host
+// authenticated, never a name the caller chooses, since a scope two
+// callers share leaks to each whether the other quarantined some text
+// and drops it from the other's requests, and the bound is per
+// principal: a caller that rotates its keys, its prompt_cache_key
+// say, lets go of its own oldest sets, never another caller's. The key
+// may be the caller's own, the request's prompt_cache_key or a
+// metadata member. Callers the host does not tell apart share the
+// empty principal and its bound. A request fn gives no scope for, and
+// every request without the option, builds under a quarantine of its
+// own, which the legs of its handoffs share and nothing after it does.
+// Each principal keeps at most [MaxQuarantineScopes] keys, the least
+// recently used let go first (RFC 0001 The request, step 3; #281).
+func WithQuarantineScope(fn func(ctx context.Context, req openresponses.Request) (QuarantineScope, bool)) Option {
+	return func(a *Adapter) { a.scope = fn }
+}
+
+// QuarantineScope is what [WithQuarantineScope]'s function keys a
+// request's conversation with: the principal asking, as the host
+// authenticated it, and the conversation's key among that principal's.
+type QuarantineScope struct {
+	Principal string
+	Key       string
+}
+
+// scopes holds the quarantine of each scope [WithQuarantineScope]
+// gave, at most [MaxQuarantineScopes] keys per principal, the least
+// recently used of a principal's let go first. The zero value is ready
+// to use.
+type scopes struct {
+	mu         sync.Mutex
+	principals map[string]*keys
+}
+
+// keys is one principal's sets, by key, in the order they were used.
+type keys struct {
+	sets map[string]*list.Element
+	lru  list.List
+}
+
+type scoped struct {
+	key string
+	set *agentturn.QuarantineSet
+}
+
+// get returns the scope's set, made when it has none, and marks it
+// used.
+func (s *scopes) get(scope QuarantineScope) *agentturn.QuarantineSet {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.principals == nil {
+		s.principals = map[string]*keys{}
+	}
+	p := s.principals[scope.Principal]
+	if p == nil {
+		p = &keys{sets: map[string]*list.Element{}}
+		s.principals[scope.Principal] = p
+	}
+	if e, ok := p.sets[scope.Key]; ok {
+		p.lru.MoveToFront(e)
+		return e.Value.(*scoped).set
+	}
+	set, _ := agentturn.NewQuarantineSet()
+	p.sets[scope.Key] = p.lru.PushFront(&scoped{key: scope.Key, set: set})
+	for p.lru.Len() > MaxQuarantineScopes {
+		last := p.lru.Back()
+		p.lru.Remove(last)
+		delete(p.sets, last.Value.(*scoped).key)
+	}
+	return set
+}
+
+// WithHandoffTrim trims what the receiver of a [WithHandoff] switch
+// sees, once, between the sender's run and the receiver's: fn is given
+// the sender's configuration, the receiver's and the conversation as
+// it stands, and returns the conversation the receiver continues. One
+// the loop cannot continue, a transfer's preamble left last, is
+// continued with [HandoffNote] as the receiver's input, which the
+// response relays, so the caller's history holds it once. With [WithTransfers] the trim holds for the
+// conversation's later requests too: each starts from its input
+// trimmed at every handoff the route finds in it ([TrimHandedOff]),
+// while the caller keeps, and sends back, the history whole, which is
+// how the route finds the handoffs. agentturn/handoff's Team.Trim is
+// one.
+func WithHandoffTrim(fn func(ctx context.Context, from, to agentturn.Config, t agentturn.Transcript) agentturn.Transcript) Option {
+	return func(a *Adapter) { a.trim = fn }
 }
 
 // New builds an adapter over cfg.
@@ -272,7 +428,16 @@ func (a *Adapter) CreateStream(ctx context.Context, req openresponses.Request, s
 	models := agentturn.ReasoningModels{}
 	if a.route != nil {
 		models = a.attribute(transcript, req)
+		if a.trim != nil {
+			// The receiver sees the conversation trimmed as it was when
+			// the handoff was taken, on every later request (#276).
+			transcript = TrimHandedOff(ctx, transcript, a.cfg, a.route, a.trim)
+		}
 	}
+	// A request started under another configuration, the receiver the
+	// conversation was handed to, asks and records where the adapter's
+	// own does (#234).
+	base = inherit(base, a.cfg)
 	if base.Model == nil {
 		return openresponses.ServerError("no_model", "agent has no model")
 	}
@@ -284,6 +449,21 @@ func (a *Adapter) CreateStream(ctx context.Context, req openresponses.Request, s
 		resp.Instructions = &instructions
 	}
 	rl := newRelay(sink, resp)
+	// Every leg of a handoff continues one conversation, so what a
+	// leg's guard quarantined the next leg's requests leave out too.
+	// Under WithQuarantineScope what an earlier request of the
+	// conversation quarantined stays out of this one's, an item the
+	// caller sends back being a copy of the one quarantined, and what
+	// this request quarantines is kept for the next (#281).
+	quarantined, _ := agentturn.NewQuarantineSet()
+	if a.scope != nil {
+		if scope, ok := a.scope(ctx, req); ok {
+			held := a.quarantines.get(scope)
+			quarantined = held.Bind(transcript)
+			defer held.Merge(quarantined)
+		}
+	}
+	ctx = agentturn.ContextWithQuarantineSet(ctx, quarantined)
 	if len(callerTools) > 0 {
 		return a.oneTurn(ctx, base, req, transcript, models, callerTools, rl)
 	}
@@ -310,21 +490,41 @@ func (a *Adapter) fullRun(ctx context.Context, base agentturn.Config, req openre
 	var usage openresponses.Usage
 	var end *agentturn.RunEnd
 	var results []*agentturn.ToolEnd
-	for {
+	var prompts openresponses.Items
+	limit := a.maxHandoffs
+	if limit <= 0 {
+		limit = DefaultMaxHandoffs
+	}
+	for handoffs := 0; ; handoffs++ {
 		var err error
-		if end, results, err = a.relayRun(agentturn.ContextWithReasoningModels(runCtx, models), transcript, cfg, rl, &usage); err != nil {
+		if end, results, err = a.relayRun(agentturn.ContextWithReasoningModels(runCtx, models), transcript, prompts, cfg, rl, &usage); err != nil {
 			return err
 		}
 		next, ok := a.handsOff(ctx, end, results)
 		if !ok {
 			break
 		}
+		if handoffs == limit {
+			// The caller is told, not answered with the transfer's
+			// text: the agents handed the request back and forth.
+			msg := fmt.Sprintf("the agents handed the request on %d times and %s would hand it to %s again; stopped", limit, cfg.Name, next.Name)
+			return fmt.Errorf("%w: %w", ErrTooManyHandoffs, openresponses.ModelError("too_many_handoffs", msg))
+		}
 		// The receiver's requests leave the sender's reasoning out when
 		// it runs another model.
 		models.Attribute(cfg.ModelName, end.Items)
 		transcript = append(transcript, end.Items...)
+		prompts = nil
+		if a.trim != nil {
+			transcript = a.trim(ctx, cfg, next, append(agentturn.Transcript(nil), transcript...))
+			if !agentturn.CanContinue(transcript) {
+				// The note is the receiver's input, so it is relayed and
+				// the caller's history holds it from here (#276).
+				prompts = openresponses.Items{HandoffNote(TransferName(results), cfg, next)}
+			}
+		}
 		runCtx = agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff", Ref: cfg.Name})
-		cfg = a.perRequest(next, req)
+		cfg = a.perRequest(inherit(next, cfg), req)
 	}
 	switch end.Reason {
 	case agentturn.ReasonError:
@@ -376,10 +576,14 @@ func (a *Adapter) fullRun(ctx context.Context, base agentturn.Config, req openre
 
 // relayRun runs cfg over transcript, relaying its items and adding its
 // usage, and returns its end and the tool_end events of its last batch.
-func (a *Adapter) relayRun(ctx context.Context, transcript agentturn.Transcript, cfg agentturn.Config, rl *relay, usage *openresponses.Usage) (*agentturn.RunEnd, []*agentturn.ToolEnd, error) {
+func (a *Adapter) relayRun(ctx context.Context, transcript agentturn.Transcript, prompts openresponses.Items, cfg agentturn.Config, rl *relay, usage *openresponses.Usage) (*agentturn.RunEnd, []*agentturn.ToolEnd, error) {
 	var end *agentturn.RunEnd
 	var results []*agentturn.ToolEnd
-	for ev := range agentturn.Continue(ctx, transcript, cfg) {
+	events := agentturn.Continue(ctx, transcript, cfg)
+	if len(prompts) > 0 {
+		events = agentturn.Run(ctx, transcript, prompts, cfg)
+	}
+	for ev := range events {
 		switch e := ev.(type) {
 		case *agentturn.TurnStart:
 			results = nil
@@ -451,6 +655,20 @@ func (a *Adapter) handsOff(ctx context.Context, end *agentturn.RunEnd, results [
 	return a.handoff(ctx, end, results)
 }
 
+// inherit returns next with from's ToolElicitor and ToolRecorder
+// wherever next has none of its own, so a receiver of a handoff, within
+// a request or at the start of a later one, puts its tools' questions
+// to the same people and records their writes in the same place.
+func inherit(next, from agentturn.Config) agentturn.Config {
+	if next.ToolRecorder == nil {
+		next.ToolRecorder = from.ToolRecorder
+	}
+	if next.ToolElicitor == nil {
+		next.ToolElicitor = from.ToolElicitor
+	}
+	return next
+}
+
 // perRequest returns cfg under the request's model and instructions.
 func (a *Adapter) perRequest(cfg agentturn.Config, req openresponses.Request) agentturn.Config {
 	cfg.ModelName = modelName(cfg, req.Model)
@@ -482,6 +700,24 @@ func terminatingText(items agentturn.Transcript, results []*agentturn.ToolEnd) (
 	return "", false
 }
 
+// foldedAway reports whether an item of transcript the quarantine holds
+// is not among what the transform returned, sent: the transform folded
+// it, or left it out, so what it returned may still carry its content.
+func foldedAway(q agentturn.QuarantineView, transcript, sent agentturn.Transcript) bool {
+	kept := make(map[openresponses.Item]bool, len(sent))
+	for _, item := range sent {
+		if item != nil && reflect.TypeOf(item).Comparable() {
+			kept[item] = true
+		}
+	}
+	for _, item := range transcript {
+		if item != nil && reflect.TypeOf(item).Comparable() && !kept[item] && q.Has(item) {
+			return true
+		}
+	}
+	return false
+}
+
 // oneTurn calls the model of cfg once with the agent's and the
 // caller's tools and re-emits the response; calls are the caller's to
 // run. The request is the same one the loop would send,
@@ -505,33 +741,54 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 			return openresponses.InvalidRequest(openresponses.CodeInvalidValue, fmt.Sprintf("tool %q is owned by the agent", ct.Name), "tools")
 		}
 	}
-	input := transcript
-	if cfg.Transform != nil {
-		var err error
-		input, err = cfg.Transform(ctx, append(agentturn.Transcript(nil), transcript...))
-		if err != nil {
-			return fmt.Errorf("transform: %w", err)
-		}
-	}
 	filter := cfg.Filter
 	if filter == nil {
 		filter = agentturn.DefaultFilter
 	}
-	upstream := cfg.BaseRequest(ctx)
-	upstream.Input = models.For(cfg.ModelName, filter(input))
-	for _, ct := range callerTools {
-		upstream.Tools = append(upstream.Tools, ct)
-	}
-	if req.ToolChoice != (openresponses.ToolChoice{}) {
-		upstream.ToolChoice = req.ToolChoice
-	}
-	if cfg.BeforeModelCall != nil {
+	// The turn is built as the loop builds one, under the request's
+	// quarantine on ctx, so what the transform or a guard quarantines
+	// leaves the request (#281).
+	view := agentturn.QuarantineFromContext(ctx)
+	var upstream openresponses.Request
+	for again := true; ; again = false {
+		// The settings come first, the caller's tools among them, so
+		// the transform weighs what the request will carry beside the
+		// input, as the loop's does (#279).
+		upstream = cfg.BaseRequest(ctx)
+		for _, ct := range callerTools {
+			upstream.Tools = append(upstream.Tools, ct)
+		}
+		if req.ToolChoice != (openresponses.ToolChoice{}) {
+			upstream.ToolChoice = req.ToolChoice
+		}
+		input := transcript
+		if cfg.Transform != nil {
+			var err error
+			input, err = cfg.Transform(agentturn.ContextWithRequest(ctx, upstream), append(agentturn.Transcript(nil), transcript...))
+			if err != nil {
+				return fmt.Errorf("transform: %w", err)
+			}
+		}
+		upstream.Input = view.Apply(models.For(cfg.ModelName, filter(input)))
+		if cfg.BeforeModelCall == nil {
+			break
+		}
+		gen := view.Generation()
 		if err := cfg.BeforeModelCall(ctx, &upstream); err != nil {
 			if errors.Is(err, agentturn.ErrGuard) {
 				return rl.refuse()
 			}
 			return fmt.Errorf("before-model-call hook: %w", err)
 		}
+		if again && cfg.Transform != nil && view.Generation() != gen && foldedAway(view, transcript, input) {
+			// The hook quarantined an item the transform had folded
+			// into this request, a summary of it say: the request is
+			// built once more, so the fold is made without it, as the
+			// loop builds its own (#281).
+			continue
+		}
+		upstream.Input = view.Apply(upstream.Input)
+		break
 	}
 	var acc openresponses.Accumulator
 	var final *openresponses.Response

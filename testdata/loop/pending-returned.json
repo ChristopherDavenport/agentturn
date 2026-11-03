@@ -1,0 +1,45 @@
+{
+  "name": "pending-returned",
+  "description": "A call a record shows its tool returned for, pending as returned, is never run again: an approval of it is refused before the run starts, and a resume that answers it with an output appends that output and calls the model.",
+  "rules": ["#pending-calls-and-resume"],
+  "config": {"model": "m"},
+  "tools": [{"name": "deploy", "result": {"output": "deployed again"}}],
+  "transcript": [
+    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "deploy"}]},
+    {"type": "function_call", "call_id": "call_1", "name": "deploy", "arguments": "{}"}
+  ],
+  "pending": [{"call_id": "call_1", "reason": "returned"}],
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "deployed"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "resume": [{"call_id": "call_1", "approve": true}],
+      "expect": {"refused": true}
+    },
+    {
+      "resume": [{"call_id": "call_1", "output": "deployed"}],
+      "expect": {
+        "events": [
+          {"type": "run_start", "source": "resume"},
+          {"type": "item_start", "turn": 0, "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "turn": 0, "item": {"type": "function_call_output", "call_id": "call_1", "output": "deployed"}},
+          {"type": "turn_start", "turn": 1, "arrived": [{"mode": "resume"}]},
+          {"type": "item_start", "item": {"type": "message", "role": "assistant"}},
+          {"type": "item_end", "item": {"type": "message", "role": "assistant"}},
+          {"type": "response_end", "turn": 1},
+          {"type": "turn_end", "turn": 1, "tool_results": []},
+          {"type": "run_end", "reason": "done", "error": false, "pending": []}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "function_call", "call_id": "call_1"},
+          {"type": "function_call_output", "call_id": "call_1", "output": "deployed"},
+          {"type": "message", "role": "assistant"}
+        ]
+      }
+    }
+  ]
+}

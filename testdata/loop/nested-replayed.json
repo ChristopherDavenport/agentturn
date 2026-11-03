@@ -1,0 +1,55 @@
+{
+  "name": "nested-replayed",
+  "description": "A parent run again after a restart that invokes the nested calls the record holds as ended, in another order, gets each its recorded result under its recorded ID, without a decision or a dispatch.",
+  "rules": ["#nested-calls", "#pending-calls-and-resume"],
+  "config": {"model": "m"},
+  "tools": [
+    {"name": "run_code", "replay": "safe"},
+    {"name": "read"}
+  ],
+  "results": {
+    "call_1": {"invokes": [
+      {"name": "read", "arguments": {"path": "b"}},
+      {"name": "read", "arguments": {"path": "a"}}
+    ]}
+  },
+  "transcript": [
+    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run the script"}]},
+    {"type": "function_call", "call_id": "call_1", "name": "run_code", "arguments": "{}"}
+  ],
+  "pending": [
+    {"call_id": "call_1", "reason": "aborted", "idempotency_key": "key_1", "nested": [
+      {"call_id": "call_n1", "parent": "call_1", "name": "read", "args": {"path": "a"}, "dispatched": true, "idempotency_key": "key_n1", "ended": true, "output": "contents of a"},
+      {"call_id": "call_n2", "parent": "call_1", "name": "read", "args": {"path": "b"}, "dispatched": true, "idempotency_key": "key_n2", "ended": true, "output": "contents of b"}
+    ]}
+  ],
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "resume": [{"call_id": "call_1", "approve": true}],
+      "expect": {
+        "events": [
+          {"type": "run_start", "source": "resume"},
+          {"type": "tool_start", "turn": 0, "call_id": "call_1", "name": "run_code"},
+          {"type": "tool_dispatch", "turn": 0, "call_id": "call_1", "idempotency_key": "key_1"},
+          {"type": "tool_start", "turn": 0, "call_id": "call_n2", "name": "read", "args": {"path": "b"}, "parent": "call_1", "replayed": true},
+          {"type": "tool_end", "turn": 0, "call_id": "call_n2", "parent": "call_1", "result": {"output": "contents of b"}, "error": false, "replayed": true},
+          {"type": "tool_start", "turn": 0, "call_id": "call_n1", "name": "read", "args": {"path": "a"}, "parent": "call_1", "replayed": true},
+          {"type": "tool_end", "turn": 0, "call_id": "call_n1", "parent": "call_1", "result": {"output": "contents of a"}, "error": false, "replayed": true},
+          {"type": "tool_end", "turn": 0, "call_id": "call_1", "result": {"output": "contents of b\ncontents of a"}, "error": false, "replayed": false},
+          {"type": "item_start", "turn": 0, "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "item_end", "turn": 0, "item": {"type": "function_call_output", "call_id": "call_1"}},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end", "turn": 1},
+          {"type": "turn_end", "turn": 1},
+          {"type": "run_end", "reason": "done", "error": false, "pending": []}
+        ]
+      }
+    }
+  ]
+}

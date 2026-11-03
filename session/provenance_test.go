@@ -777,7 +777,7 @@ func TestQueuedTriggerKeepsItsExtra(t *testing.T) {
 			}
 			b := agentturn.New(agentturn.Config{Model: &echo.Adapter{}}, opts...)
 			defer rec2.Attach(b)()
-			if n := rec2.Requeue(context.Background(), b); n != 1 {
+			if n, _ := rec2.Requeue(context.Background(), b); n != 1 {
 				t.Fatalf("requeued %d", n)
 			}
 			if _, err := b.Prompt(context.Background(), openresponses.UserText("second")); err != nil {

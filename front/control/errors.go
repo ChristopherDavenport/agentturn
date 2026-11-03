@@ -46,6 +46,7 @@ var sentinels = []struct {
 	{"no_question", agentturn.ErrNoQuestion},
 	{"no_model", agentturn.ErrNoModel},
 	{"cannot_continue", agentturn.ErrCannotContinue},
+	{"terminated", agentturn.ErrTerminated},
 	{"no_prompt", agentturn.ErrNoPrompt},
 	{"guard", agentturn.ErrGuard},
 	{"trigger_extra", agentturn.ErrTriggerExtra},
@@ -53,6 +54,7 @@ var sentinels = []struct {
 	{"deadline_exceeded", context.DeadlineExceeded},
 	{"remote_tool", ErrRemoteTool},
 	{"unknown_command", ErrUnknownCommand},
+	{"no_delivery", ErrNoDelivery},
 	{"unauthenticated", ErrUnauthenticated},
 	{"forbidden", ErrForbidden},
 }

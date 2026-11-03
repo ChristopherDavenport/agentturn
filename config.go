@@ -49,6 +49,17 @@ type Config struct {
 	Description string
 
 	// Model streams responses. Required.
+	//
+	// The request carries every item the filter keeps, an item under a
+	// provider's slug such as anthropic.redacted_thinking included, for
+	// whichever model is configured: leaving out another provider's is
+	// the adapter's (openresponses docs/extensions.md section 1.6). The
+	// provider adapters do so. An openresponses.ClientAdapter forwards
+	// every item unless it was built with openresponses.WithProviderSlugs
+	// naming the providers its upstream accepts, so a host whose model
+	// is a provider's own Open Responses API, OpenAI's or a router's,
+	// builds it with WithProviderSlugs() and none, or a conversation
+	// that moves to it from Claude or Gemini is refused (#285).
 	Model Model
 	// ModelName is the model field of every request.
 	ModelName string
@@ -63,7 +74,9 @@ type Config struct {
 	// MCP server, is picked up on the next turn. It is called once per
 	// turn, before the model call, and the same list serves the turn's
 	// tool batch, so a call resolves against the tools the model was
-	// offered.
+	// offered. It is called as well wherever else the tools are
+	// resolved: for the batch a resume approved, for each approval a
+	// resume holds to the replay rule, and by [Config.BaseRequest].
 	//
 	// A provider that returns a snapshot offers a change one turn late
 	// when the change is still in flight as the turn starts: a tool
@@ -78,6 +91,24 @@ type Config struct {
 	//		_ = remote.Await(ctx)
 	//		return remote.Tools()
 	//	}
+	//
+	// The loop never closes what a provider returns: io.Closer on a
+	// tool is the host's, and a provider is called at least once per
+	// turn. A provider that builds tools owning anything, a pty, a
+	// container client or a pool, is responsible for releasing them,
+	// and should build them once per session and return the same values
+	// on every call rather than a new set each time, closing them when
+	// the session ends:
+	//
+	//	var built []agenttool.Tool
+	//	cfg.ToolProvider = func(ctx context.Context) []agenttool.Tool {
+	//		if built == nil {
+	//			built = tools.Builtins(ws)
+	//		}
+	//		return built
+	//	}
+	//	// … and when the session ends:
+	//	_ = agenttool.Set(built).Close()
 	ToolProvider func(ctx context.Context) []agenttool.Tool
 
 	// Reasoning is the reasoning field of every request: effort and
@@ -119,9 +150,12 @@ type Config struct {
 
 	// BeforeModelCall runs on the fully built request of each turn, just
 	// before it is sent and before turn_start reports it. It may change
-	// anything. A change to Input is one the record cannot describe, so
-	// a session recorder writes that call without a request hash; a
-	// change to a setting is recorded as a config delta. A hook that
+	// anything. A change to Input that the session format's omit can
+	// describe, items left out in order, outputs or images sent as a
+	// placeholder, is written as one by a session recorder and the call
+	// keeps its request hash, an item edited in place included; any other
+	// change to Input costs the call its hash. A change to a setting is
+	// recorded as a config delta. A hook that
 	// refuses the call ends the run with ReasonError after a
 	// [ModelBlocked] event carrying the request as built; an error that
 	// wraps [ErrGuard] is a policy stopping the run before the call,
@@ -646,8 +680,9 @@ func (c Config) tools(ctx context.Context) agenttool.Set {
 
 // ResolveTools returns the tools of the moment: ToolProvider's answer
 // when it is set, Tools otherwise. The loop consults it once per turn,
-// before the model call; a front that builds its own request uses it
-// so the provider fallback lives in one place.
+// before the model call, and for a resume's approvals and the batch it
+// approves; a front that builds its own request uses it so the
+// provider fallback lives in one place.
 func (c Config) ResolveTools(ctx context.Context) []agenttool.Tool {
 	if c.ToolProvider != nil {
 		return c.ToolProvider(ctx)

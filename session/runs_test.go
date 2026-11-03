@@ -86,10 +86,10 @@ func TestResumeClosesTheRunACutLeftOpen(t *testing.T) {
 	}
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"}, agentturn.WithTranscript(cx.Items))
 	defer rec.Attach(a)()
-	if n := rec.Requeue(context.Background(), a); n != 1 {
+	if n, _ := rec.Requeue(context.Background(), a); n != 1 {
 		t.Fatalf("requeued %d", n)
 	}
-	if n := rec.Requeue(context.Background(), a); n != 0 {
+	if n, _ := rec.Requeue(context.Background(), a); n != 0 {
 		t.Errorf("requeued %d a second time", n)
 	}
 	if st := a.State(); st.FollowUps != 1 {
@@ -771,7 +771,7 @@ func TestInboxHoldsOnlyWhatTheAgentHolds(t *testing.T) {
 		if owed, _ := s.PendingQueued(s.Leaf()); len(owed) != 0 {
 			t.Errorf("owed = %+v", owed)
 		}
-		if n := rec.Requeue(context.Background(), a); n != 0 {
+		if n, _ := rec.Requeue(context.Background(), a); n != 0 {
 			t.Errorf("requeued %d after a run closed them", n)
 		}
 	})

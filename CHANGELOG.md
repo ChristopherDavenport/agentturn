@@ -5,6 +5,750 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Fixed: `front/a2a`'s steer into a working task goes through what
+  records the conversation when the task's `RecorderFor` returns a
+  context carrying a `Redeliverer` (`ContextWithRedeliverer`), so the
+  steer is written before the agent holds it and survives a quit, and
+  the steers a task left for the message answering its calls go
+  through it too. Added `session.Recorder.Redeliver`, which writes the
+  queued entry, with `deliver`, first, and hands over an input the path
+  already owes under its entry rather than writing it twice, and does
+  nothing for one `Requeue` already handed back. A steer's trigger
+  names its A2A message in a `message` member, so two steers with the
+  same text are two. (#244, #287)
+- Fixed: `front/a2a.MaxSteers` counts only the steers a task holds
+  untaken: one the agent has taken no longer counts, where all the
+  steers since the last run's end did. (#287)
+- Fixed: RFC 0001 and `session.MoveTo` say what a rewind does to the
+  quarantine: the transcript at the entry is shaped by the `omit` in
+  force there, so what was quarantined before it stays out and what the
+  branch left quarantined after it does not. (#281)
+- Changed, breaking: `Agent.Deliver` starts no run once the last run
+  ended on a terminating result, `StopTerminate` or
+  `StopPartialTerminate`, and none has started since. It returns the new
+  `ErrTerminated` with that run's end and leaves the items queued for
+  the host's next run, which takes them before its first model call. A
+  detached call's result arriving while the sender's run stops on a
+  handoff's transfer therefore reaches the receiver, where it used to
+  start a run under the sender's configuration and leave
+  `handoff.Team`'s, `front/a2a`'s or the host's switch refused with
+  `ErrRunning`. A host whose terminating result was the run's answer
+  starts the run with `Continue`. `front/control` carries the
+  `terminated` code; the `WithDetach` docs of `tools/agent` and
+  `tools/a2a` say so. When no handoff follows the stop, or the handoff
+  bound stops it, `handoff.Team` and `front/a2a`'s relay continue the
+  agent so it takes the queued delivery, past the bound in one run
+  whose own transfer is not followed. (#244, #274, #290)
+- Fixed: a quarantine holds for the rest of a conversation served over
+  a wire. `front/a2a` keeps each conversation's quarantine across its
+  tasks, and `front/responses` across the requests the new
+  `WithQuarantineScope(fn)` gives one `QuarantineScope`, the principal
+  the host authenticated and a key among that principal's (at most
+  `MaxQuarantineScopes`, 256, keys per principal, the least recently
+  used let go, so one caller's keys never evict another's; without a
+  scope a quarantine lasts one request).
+  Each matches the copies of an item a store or a caller hands back, so
+  a tool output a guard quarantined in one task or request is sent as
+  `QuarantinedOutput` in the next rather than whole. Added
+  `WithQuarantineSet`, which gives an `Agent` a host's set, and
+  `QuarantineSet.Bind`, `Merge` and `Has`. The session recorder's
+  `Attach` has the agent quarantine what the record's `omit` says a
+  quarantine left out, so an agent seeded from a store that keeps the
+  conversation whole, as `front/a2a`'s is, does not send it again
+  after a reopen; it matches as `Bind` does, every copy. A quarantine
+  matches reloaded items by content, so a quarantined "yes" leaves out
+  every "yes" of the conversation loaded, as RFC 0001 now says. A
+  quarantined call leaves out its own output, the one after it, and no
+  other call's output under the same call ID. (#281)
+- Fixed: `front/responses`' single turn, a request carrying the caller's
+  tools, calls its transform under `agentturn.ContextWithRequest` with
+  the settings the request will carry, the caller's tools included, as
+  the loop does, so a fold against a share of the context window counts
+  them. (#279)
+- Changed, breaking: `session` writes format 0.16 sessions, which a
+  reader of format 0.15 or earlier refuses once the file is raised: the
+  recorder writes `result`, `deliver`, `copied_from` and the 0.15
+  header promises, and 0.16's `omit.outputs` groups.
+- Fixed: a request that sends function call outputs under two
+  placeholder texts, a host's trim clearing one as `[cleared]` and a
+  quarantine sending another as `QuarantinedOutput`, is described with
+  format 0.16's `omit.outputs` groups, a group to each text, rather
+  than leaving every later response without a hash. A single text is
+  still written as the default group, as format 0.14 reads it. (#233,
+  #281)
+- Dependencies: every module requires openresponses v0.0.18, up from
+  v0.0.15, and agenttool v0.0.28, up from v0.0.24; `session` requires
+  agentsession v0.0.33, up from v0.0.28. openresponses' `Reasoning` now carries members of its own, so the
+  recorder compares two reasoning settings by their JSON when it writes a
+  config delta.
+- Fixed: RFC 0001's Composition no longer says a recorder cannot write
+  a request that leaves items out of the middle of its history. Format
+  0.11's `omit.items`, and 0.14's `omit.outputs` and `omit.images`,
+  describe such a request, and only an input the format cannot describe
+  costs the responses after it their hash; the reference recorder
+  writing those omissions is #233.
+- Changed: RFC 0001 is draft 0.4. The record states how the sessions a
+  recorder creates are described, the root and each child alike. A
+  section, Changes in draft 0.4, lists what the draft added and marks
+  the new MUSTs a draft-0.3 loop, front or recorder can fail as
+  breaking, as Versioning calls them. The draft is made coherent: a
+  resume's answer has no default decider while a question's answer is
+  `human` when it names none; a resume's approved batch runs at turn 0;
+  the record table names `agentturn:unhashed` and the decider on a
+  question's answer; the conformance recorder rule names the `omit` and
+  `result` MUSTs; resolved open questions are gone. The scenario corpus
+  adds `deliver`, `pending-returned`, `model-blocked`,
+  `call-completed-by-response`, `calls-pair-by-item-id` and
+  `fold-retry`, and its runner a `fold` transform, `no_done`,
+  `at_index_zero`, `guard` and `code` errors and `deliver_at`; the RFC says which rules a scenario cannot express.
+  `TranscriptFromContext`'s doc says it is the quarantined view.
+- Fixed: `session.Start` writes the harness `WithHarness` names in the
+  root session's header when the header names none, as every child
+  session's already did; a header that names one keeps it. (#219)
+- Fixed: a child session the recorder creates takes the media form of
+  the session whose call spawned it, so a sidecar parent's child is a
+  sidecar session too. (#283)
+- Changed: a child session the recorder creates for a named
+  configuration starts with an `info` entry carrying `Config.Name`, so
+  a store lists children by name; a child session reopened for a later
+  run keeps the name it has. Observed children and children written
+  from their items alike. (#292)
+- Fixed: `Recorder.Observe` writes an observed child's `queued` reports.
+  One that names the child's run goes to that run's session; one that
+  names no run, an input steered or delivered while the child was idle,
+  is held until the run that takes it starts and written to its
+  session, so the drained item carries `queued_from` and its trigger as
+  `source`. Before, the observer dropped them and the item was written
+  bare. (#289)
+- Fixed: with the instructions recorded as parts, the recorder writes a
+  configuration change as a delta whenever one describes it, rather than
+  a replace whenever the delta is no shorter. A switch between agents
+  with disjoint tools was a replace, which starts the parts afresh, so
+  the hand-back after it repeated every part's text; it now names them
+  by hash. (#235)
+- Added: `Answer.Failed`, `Answer.WithFailed`, `ContextWithFailures`
+  and `FailedFromContext`. An output answer may say it reports that the
+  call failed; `OutcomeUnknown` sets it, and `Agent.Resume` carries it
+  unread on the run's context, as it carries an answer's reason and
+  origin. `front/control` carries it on the wire as `failed`.
+- Changed: `session`'s recorder marks an output's item entry `failed`
+  (format 0.14) when the call's `tool_end` carried the tool's error, or
+  when the answer it is reports a failure, as an outcome-unknown output
+  does, whether a host gives it or `ReplayAnswers` does. A refusal, a
+  block or the loop's own for an unknown tool or bad arguments, is
+  recorded by its reject and not marked. (#278)
+- Changed: a dispatch a later subscriber refuses is withdrawn with the
+  format's withdrawal, a `reject` carrying `withdrawn: true` with the
+  refusal as its reason, in place of the `agentturn:withdrawn` custom
+  entry, so any reader of format 0.14 reads the call as never started.
+  `Pending` and the recorder still read the custom entry on paths an
+  earlier version wrote, and no longer read a withdrawn dispatch on the
+  path as one off it. RFC 0001's open question on such a dispatch is
+  closed. (#119, #278)
+- Fixed: in a fork whose own dispatch of a call in its prefix was
+  withdrawn, `Pending` reads the call from the session the fork was made
+  from, as for a call the fork never dispatched, with the origin's key
+  and, when it completed there, its output as `Ran`. It read the call as
+  one the file cannot say about.
+- Added: `ToolEnd.Cut`, set when a cancellation or a failure cut the
+  call off before it had a result of its own, so its output is not
+  appended; `front/control` carries it as `cut`.
+- Changed: `session`'s recorder writes format 0.15's `result` for a call
+  whose tool returned while another call of its batch still runs,
+  durable before its `tool_end` returns, since the batch appends the
+  outputs only once every call has settled; the last call of a batch to
+  settle, and a batch of one, write none. `ReplayAnswers` answers a call
+  with a result and no output with that output, so a process that dies
+  mid-batch no longer runs a finished call again, and the recorder
+  appends it with no decision before it. An answer `ReplayAnswers` takes
+  from a branch's output, or from a result, is marked failed when that
+  output was. (#273)
+- Changed, breaking: a call a record holds a `result` for and no
+  output is pending as the new `PendingReturned`. `Pending` gives it,
+  with the result as `Ran`, in place of `PendingAborted`, so
+  `MayHaveRun` is false and `Agent.Resume` refuses an approval of it
+  with `ErrCallAnswered`. The recorder refuses a decision or a
+  dispatch for a call whose result is on the path, one it wrote itself
+  included, with agentsession's `ErrCallReturned`, so its tool does
+  not run again. A host that answers pending calls itself answers a
+  returned call with `Ran`. (#273)
+- Changed: the header `session.Start` writes when the caller's names no
+  records, and a child session written from its events, promise `result`
+  as well, since the recorder writes one for every call that settles
+  while the rest of its batch runs: a reader may take a dispatched call
+  with neither a result nor an output as one whose tool had not
+  returned. (#273)
+- Docs: `Config.ToolProvider` says the loop never closes what a
+  provider returns, and that a provider building tools that own a
+  resource caches them per session and closes them itself; RFC 0001's
+  configuration section states it as a SHOULD and its open question on
+  who closes a provided tool is closed. (#95)
+- Added: `RunEnd.Failure`. A subscriber or a hook that fails for a
+  reason of its own while the run is being aborted is still joined into
+  `Err` beside the cause, and is now reported on its own as well, so a
+  consumer that reads the reason still finds a recorder that could not
+  write. `front/control` carries it as `failure`; RFC 0001 states the
+  member and closes its open question on it. (#83)
+- Fixed: the item an `ItemStart` or `ItemUpdate` of a streamed item
+  carries is a snapshot of it as accumulated at that event. It was the
+  accumulator's own copy, so a subscriber that kept the event, as a
+  view's render queue does, drew the item as later deltas left it: an
+  assistant message's `ItemStart`, sent empty, drew the whole answer.
+  The copy shares strings and copies the item, its content lists and
+  their streamed parts, nothing proportional to the text. RFC 0001's
+  Events states the rule. (#218)
+- Added: `ContextWithTurn` and `TurnFromContext`. The context of
+  everything a turn calls, its hooks, the transform, the model and the
+  tools, carries the turn's number beside the run ID; it is 0 outside a
+  turn and in a resume's approved batch. (#275)
+- Changed, breaking: a model call that fails with an error wrapping
+  `ErrGuard`, as a moderation wrapper around the model marks its
+  refusal, stops the run with `ReasonStopped` and `StopGuard` and the
+  error on `RunEnd.Err`, without a retry, and closes the calls the stream completed before it
+  with `WithheldCallOutput`. It ended `ReasonError` before. (#275)
+- Fixed: a model guard error after the response began is the output
+  guard's stop in the record too: the loop delivers that response's
+  `ResponseEnd` marked withheld before the outputs that close its calls
+  and marks the end withheld, so the recorder writes the response
+  incomplete with `content_filter` and the outputs as `policy`'s rejects
+  after it. It wrote anonymous rejects before a failed response, and the
+  run end disagreed with its segment. (#275)
+- Added: `compact.MarkFold` and `compact.IsFold`. The model call a fold
+  makes for itself, `NewLocal`'s summary and `New`'s compaction call,
+  runs on a context marked so, and a model, a wrapping streamer or a
+  replay tells it from a turn's by `IsFold` when the call arrives,
+  rather than by a request with no tools and no instructions.
+  `WithRequest` no longer asks callers to leave those empty. RFC 0001
+  states the rule and closes its open question. (#88)
+
+- Fixed: the session recorder describes a request whose input differs
+  from what the path holds by edits the format can describe, rather
+  than leaving it unhashed. Item entries left out with their order
+  kept, function call outputs sent as placeholder texts and the
+  image parts of all but the last few sent as one placeholder are
+  written as a `config` entry whose `omit` names them, `items`,
+  `outputs` and `images`, before the response, and the response
+  carries its hash. A handoff that trims the transcript between runs,
+  a transform that keeps a window, or a host that clears old tool
+  results now verifies; an item left out and sent again is a replace.
+  Only an input the format cannot describe, an item added or
+  rewritten, is still unhashed. RFC 0001's The request states the rule
+  and drops the paragraph that said a transform's change to the input
+  could not be described. (#233)
+- Added: `session.Recorder.Omit(ctx, ids...)`, for a host that names
+  the entries it trimmed instead of leaving the recorder to find them,
+  and `session.ErrNotOmittable` for an ID that names no item entry of
+  the context. (#233)
+- Fixed: a recorder seeded from a path whose `omit` sends outputs or
+  images as placeholders holds those items as the path holds them, not
+  as the placeholder.
+- Changed: `session.Transcript`, `TranscriptModels`, `AgentOptions` and
+  `MoveTo` give the agent the context as the `omit` in force sends it:
+  the item entries it lists left out, and the outputs and image parts
+  it reaches as its placeholders, so a host's trim the record describes
+  holds after a restart instead of coming back whole. Reasoning the
+  `other_models` rule leaves out is still given, since the loop leaves
+  it out by its attribution and sends it again to its own model. (#233)
+
+- Fixed: the context a hook or tool runs under carries the run's
+  reasoning attribution, so a run a tool starts over the parent's
+  items, such as a `tools/agent` child on another model that
+  `WithCallConfig` opens with the conversation so far, leaves out the
+  reasoning the parent's model produced instead of sending it to a
+  provider that refuses it. The child's recorder describes the
+  omission with `omit.items`, so its request still verifies. The
+  hooks' contexts carry it as well, `BeforeTurn`, the transform,
+  `BeforeModelCall`, `OutputGuard` and `ShouldStopAfterTurn` beside the
+  tool hooks. (#242)
+
+- Fixed: in a sidecar session the recorder converts media as it
+  writes. Each inline medium an item, queued, result or compaction
+  entry holds, an image, video or file carried as a data URL, base64 or
+  percent-encoded, in a message, a tool output or an item type the
+  library does not model such as `computer_call_output`, is stored as a blob before
+  the entry and named by its `sidecar:` reference, and the request hash
+  is computed over the request with the same substitution. The loop and
+  the model keep the data URLs. A host no longer converts media in an
+  after-call hook and resolves it again in a model wrapper. Each blob
+  is put once per recorder, with the media type of the data URL it
+  replaced (agentsession's `TypedBlobWriter`), and the session is given
+  that type for it when the store holds types per session, or, over an
+  RFC 0003 client, the blob is put again the first time a session names
+  it, so a child naming its parent's blob after the upload's grace still
+  reaches it with its type; a data URL
+  whose type a store cannot keep stays inline. (#284)
+- Fixed, breaking: a resumed, reopened or rewound sidecar session no
+  longer hands the agent `sidecar:` URLs, which every provider, and
+  openresponses' `ClientAdapter`, refuses. `session.AgentOptions`,
+  `Transcript`, `TranscriptModels`, `Pending`, `OwedNotes`,
+  `ReplayAnswers`, `MoveTo` and `Recorder.Requeue` resolve each
+  reference to a base64 data URL of the type the session holds for the
+  blob (agentsession's `ReadSessionBlob`, which over RFC 0003 reads the
+  blob for the session), `application/octet-stream` for a blob held
+  with none, through the reader `session.WithBlobs` names;
+  `Recorder.ReadOptions` carries the recorder's: a `WithMedia` writer
+  that reads gives the bytes, and the store holding the session its
+  type, so a remote client kept for media alone resumes. Reading a sidecar
+  session's media with no reader is now `session.ErrNoBlobReader`
+  rather than a transcript a provider refuses, so a host calling
+  `AgentOptions(s)` on one passes `rec.ReadOptions()...`.
+  `Transcript`, `TranscriptModels` and `OwedNotes` take `ReadOption`s.
+  (#284)
+- Added: `session.WithMedia(bw)`, the blob writer a sidecar session's
+  media is stored with when it is not the store's; `session.WithBlobs`
+  and `session.ErrNoBlobReader`. (#284)
+
+- Changed: the session recorder no longer encodes the whole transcript
+  several times a turn. It keeps the canonical JSON of each item as it
+  recorded it, encodes each item a request carries at most once a turn
+  and compares the two, builds the request hash from those bytes, keeps
+  the request's settings without its input for the retry comparison,
+  and leaves the input out before it builds a config entry. An item a
+  hook edits in place after it was recorded is compared and hashed as
+  it was sent, never as the bytes recorded before the edit. The kept
+  bytes of items a fold or an `omit` takes out of the context are let
+  go. (#282)
+
+- Added: `Agent.WhileIdle(fn)`, which runs fn while no run is active
+  and refuses every run start until fn returns, the check one step with
+  a run's start, and `Agent.SetReasoningModels`, the setter beside
+  `WithReasoningModels`. (#220)
+- Changed, breaking: a rewind is one operation, as RFC 0001 now
+  requires; added `session.MoveTo(ctx, agent, recorder, entryID)`: it
+  rebases the record and replaces the agent's transcript, pending
+  calls, owed notes, reasoning attribution and reserved call IDs with
+  what the record holds at the entry, under `WhileIdle`, so a prompt
+  raced into it is refused rather than failing the move. A failure
+  after the record moved puts the record back, and the error names an
+  undo only when the undo failed. It replaces the five calls a host
+  made by hand. (#220)
+
+- Fixed: `Recorder.Rebase` takes an input the agent holds as already
+  queued on the new branch only when the branch owes an entry holding
+  the same input in the same mode under the same trigger, so a `MoveTo`
+  that fails after the record moved and moves it back writes no
+  duplicate `queued` entry and leaves the leaf where it was; an entry
+  for the same item that something else brought is left to that input,
+  and this one is queued on its own entry with its trigger. (#220)
+
+- Changed, breaking: a model call refused with a guard's error before
+  the attempt committed to an answer raises `ModelBlocked` in place of
+  its `response_end`, where it delivered an empty withheld
+  `response_end`; the event carries the request sent and the new
+  `ModelBlocked.Usage`, what the provider reported. The session
+  recorder writes the refused call as an `agentturn:model_blocked`
+  record with the request's hash and that usage, as for a
+  `BeforeModelCall` guard, rather than an empty response, so a call
+  that may have been billed is counted. `front/control` carries `usage`
+  on the wire. (#275)
+
+- Changed, breaking: a nested call made again when its parent runs
+  again keeps its ID and its key. Under one parent, the k-th
+  invocation of a tool with JSON-equal arguments matches the k-th
+  nested call of that tool with those arguments on the pending call's
+  new `PendingCall.Nested` (`NestedRecord`), in any order: one that
+  ended is given its recorded result without running, its `ToolStart`
+  and `ToolEnd` marked `Replayed`; one handed to its tool that never
+  ended runs again under its recorded key as agenttool's replay rule
+  allows, else is given the outcome unknown; an invocation with
+  nothing left to match is new. `ToolStart.Invoked` carries the
+  arguments a nested call was invoked with. A run that leaves a call
+  pending carries the nested calls it made under it. `session`'s
+  recorder writes a nested call's hand-off as a `dispatch` phase entry
+  carrying its key, durable before the tool runs, and its end with the
+  output's parts and whether it was cut or withdrawn, and
+  `session.Pending` reads them into `Nested`. RFC 0001's open question
+  on a key for a nested call is closed. (#261)
+
+- Added: `Deliverer`, the delivery a `Control` may offer beside `Queue`,
+  which `*Agent` implements. `front/control` serves it as `POST
+  /deliver` under `ScopeControl`, answering whether the items joined the
+  run in flight and the end of any run the delivery started, and
+  `Client.Deliver` implements it; a served `Control` that offers none
+  answers `ErrNoDelivery`. A remote party cannot tell from `/queue` and
+  `/state` whether a run will still take a steer. (#288)
+
+- Fixed: a delivery is recorded as one. `Queued.Input` says how an input
+  arrived, and `session`'s recorder writes format 0.15's `deliver: true`
+  on a delivered input's `queued` entry, again after a run end that
+  closed it. `Recorder.Deliver` writes the entry before the agent takes
+  the input, as `Recorder.Queue` does, so a delivery that arrives while
+  the agent waits on an approval survives a quit. `Recorder.Requeue`
+  hands an owed delivery back with the new `Agent.Redeliver`, so the
+  turn that takes it reads it as `deliver`, not as a steer; the host
+  starts the run that takes it with `Continue` when nothing else will.
+  `front/control` carries `input` on the queued report. (#244)
+- Fixed: a child session written from an observed child's events
+  promises `queued` in its header, as the root does, since the recorder
+  writes the child's queued reports. An input an observed child accepts
+  while its run's end is being delivered, reported naming no run, is
+  written to the child's session when it is reported, so it is on the
+  record whether or not the child runs again; before, it waited for a
+  run that might never come.
+
+- Fixed: a child opened with its parent's conversation records that
+  conversation as copied, not as its own. The new `Copied(item)` mark,
+  carried unread as `Copied` on the item events, is set by
+  `tools/agent`'s `WithCallConfig` on the items it takes from the
+  parent, the placeholder outputs of the calls in flight among them;
+  `session`'s recorder writes them with format 0.15's `copied_from`,
+  naming the parent session and the entry each repeats, with its
+  `trust`, and writes no decision for the copied call, where it wrote a
+  `reject` for its placeholder output before. agentsession's ATIF export
+  then reads them as copied context. (#243)
+- Fixed: an answer a fork gives a call in its prefix with the output
+  its origin recorded writes that output with `copied_from` naming the
+  origin's entry and carrying its `trust`, so a reader reaches the
+  origin's child session for the call, which the fork's own record
+  cannot link. (#237)
+- Changed: `front/control` carries `copied` on the item events.
+
+- Fixed: `Agent.Continue` runs when the steered items queued for its
+  first turn end in something the model can answer, so a delivery a
+  host handed back with `Redeliver` starts the run that takes it,
+  although the transcript ends with the model's answer; before, it was
+  refused with `ErrCannotContinue`. (#244)
+- Changed, breaking: `session.Recorder.Requeue` returns `(int, bool)`,
+  the count of the inputs it handed back and whether a delivery is
+  among them, so the host knows to start the run that takes it with
+  `Continue`. (#244)
+
+- Fixed: a delivery the agent refuses leaves nothing owed. `Agent.Deliver`
+  refuses during a `WhileIdle` hold with the new `ErrHeld` (still
+  `ErrRunning` to `errors.Is`), and `State.Held` says a hold is in
+  force; `Recorder.Deliver` writes no `queued` entry then, and an input
+  whose entry was written before the agent refused it, or before a
+  write failed, is neither handed back by `Requeue` nor written again
+  after the next run end. Before, it was owed after every run end and
+  delivered again after a restart, twice when the caller had retried.
+  `Recorder.Queue` does the same for a refused queue. `front/control`
+  carries `held` on the state. (#244)
+
+- Fixed: a copied item that names no entry, such as the placeholder
+  output a child's copy gives a call in flight, carries the trust of the
+  parent path it was copied from, as format 0.15 asks, so a label the
+  parent read reaches the child. The recorder reads the parent session
+  for it, and fails the write rather than name an entry without its
+  trust when it cannot. (#243)
+
+- Fixed: `ReplayAnswers` gives an output a fork's origin recorded whole,
+  its item ID and members of its own included, so the fork's copy is the
+  entry it names; the recorder names a copy's entry only when it writes
+  that entry's item unchanged, and otherwise the session alone with its
+  path's trust, so `VerifyCopies` holds. (#237)
+
+- Fixed: a prompt holding an item type that cannot be compared no
+  longer panics the loop when the hidden and copied marks are stripped.
+
+- Fixed: a nested call given its recorded result after a restart gets it
+  whole: the terminate hint, its recordable details as
+  `RecordedDetails`, and for a refusal `Blocked` and its reason on the
+  replayed `tool_end`, beside the output and the error's text. The
+  recorder writes them on the nested call's end entry. The error's Go
+  type does not survive the record; its text does. (#261)
+
+- Added: `session.Recorder.Control(a)`, the agent's `Control` with
+  `Queue` and `Deliver` going through the recorder's, which write the
+  `queued` entry first. A host serves it with `front/control.Handler`,
+  so a remote delivery made while the agent waits on an approval
+  survives a quit. (#244)
+
+- Fixed: a function call the stream opened and never completed, which
+  only the terminal response lists whole, is put in the transcript with
+  its `item_end` before `response_end`, under the ID decided when it
+  opened, and a call the response lists that the stream never opened is
+  decided and put there the same way. Before, the batch ran such a call
+  though the transcript did not hold it, and after a reused output index
+  ran it under another call's ID, so the next request sent an output
+  with no call and a recorder failed the run. The response's calls pair
+  with the attempt's by item ID, the model's call ID or open order,
+  never by output index, the completed calls first, by item ID or by
+  call ID and arguments, so a call completed at an index another call
+  opened at first runs once, under its own ID. RFC 0001 The model call
+  and Invariants. (#236)
+
+- Changed, breaking: a retry the policy's `Revise` moves to another
+  model, and a `BeforeModelCall` hook that does, keeping the input the
+  loop built, sends that input rebuilt for the model the request
+  names, without the reasoning another model produced; and the
+  reasoning an attempt produced is credited to the model its request
+  named, not to `Config.ModelName`. Before, the fallback was sent the
+  primary's reasoning, the next turn on the primary was sent the
+  fallback's, and a recorder left both responses unhashed. Provider
+  refusals of another issuer's reasoning were already answered by
+  openresponses v0.0.18. RFC 0001 The request step 3 and Retry. (#286)
+
+- Added: `(*compact.Transform).FoldNext(instructions)` makes the next
+  `Transform` call fold whatever its budget, with instructions for that
+  fold alone, which `NewLocal` sends after the summary prompt; the fold
+  is reported to `WithOnFold`, so a recorder writes it, and
+  `Fold.Forced` and `Fold.Instructions` say it was asked for.
+  `WithMinFold` still guards it; the back-off after a failed fold does
+  not. It is what a host's compact-on-request command calls. (#277)
+- Added: an attempt the server refuses as `context_length_exceeded` is
+  never sent again unchanged. With a transform configured, the loop
+  rebuilds the request once with a fold asked for, marking the
+  transform's context with `ContextWithFoldRequest` (`FoldRequested`),
+  and sends it as a retry reported by `model_retry`, whatever the retry
+  policy and without counting against it: `MaxAttempts`, the backoff
+  and `Revise` see the policy's attempts alone, while `model_retry`
+  numbers every call. After a `Revise` the fold-retry keeps the revised
+  model and settings, which the transform weighs. A transform that
+  cannot shorten it ends the run with the refusal, as before. RFC 0001
+  The request step 2 and Retry. (#277)
+
+- Changed: the transform's context carries the settings the request
+  will carry, built before the transform runs, as
+  `RequestFromContext` (`ContextWithRequest`), a copy. `compact`
+  counts the instructions and the tool definitions in its budget with
+  `EstimateSettings` (`WithSettingsEstimator` replaces it; a transform
+  given `WithEstimator` alone weighs items alone, since its units are
+  its own), so long instructions or many tools now fold a transcript
+  sooner. `compact.Estimate` weighs each image, an `input_image` part
+  or an image `input_file`, in a message or a function call output, by
+  its visual cost, `ImageTokens` from a PNG, JPEG or GIF header and
+  `DefaultImageTokens` (1600) otherwise, not by its base64, so a
+  screenshot no longer folds the transcript at every step. RFC 0001
+  The request step 2. (#279)
+
+- Changed: RFC 0001 The transcript says an item under a provider's
+  slug, such as `anthropic.redacted_thinking`, is kept by the filter and
+  sent for whichever model is configured, and that leaving it out for
+  another provider is the adapter's (openresponses v0.0.18,
+  docs/extensions.md section 1.6). `Config.Model`'s doc says a host
+  whose model is an `openresponses.ClientAdapter` over a provider's own
+  API builds it with `WithProviderSlugs`, without which it forwards such
+  an item and the provider refuses the request. Nothing in the loop or
+  the record changes. (#285)
+
+- Added: a quarantine. `Agent.Quarantine(items…)`, or
+  `agentturn.Quarantine(ctx, items…)` from a hook such as a
+  `BeforeModelCall` guard that found an injected instruction, names
+  items, by identity, that every request from then on leaves out, or,
+  for a function call output, sends with `QuarantinedOutput` in place of
+  its output; a quarantined call is left out with its outputs. The
+  loop applies it after the transform and the filter, keeps every item
+  in the transcript, applies a hook's quarantine to the request that
+  hook was given, and passes it to runs a tool starts over the
+  conversation. The session recorder writes it as `omit.outputs` and
+  `omit.items`, so every later response still verifies, a host's trim
+  that clears other outputs under another text included: each text is
+  a group of format 0.16's `omit.outputs`.
+  `Agent.Quarantined` lists the items. A quarantine covers everything
+  a request is built from: the transform reads it,
+  `QuarantineFromContext`, a `QuarantineView`, and `compact` leaves
+  quarantined items out of what a fold sends its summarizer and folds
+  again when a quarantine
+  reaches a prefix it already summarised; when a `BeforeModelCall`
+  guard quarantines an item the transform folded into that request,
+  the loop builds the request once more. A tool's
+  `TranscriptFromContext` is the quarantined view. A run a tool starts
+  takes the quarantine as it stands then. `QuarantineSet` with
+  `ContextWithQuarantineSet` carries one through `Run` and `Continue`,
+  and `front/responses` carries one across a handoff's legs and builds
+  its single caller-tools turn under one, so a guard's `Quarantine`
+  there leaves that request (`QuarantineSet.Apply`). The record
+  and its exports keep the items as they arrived. RFC 0001 The request
+  step 3. (#281)
+
+- Changed, breaking: a decision an answer to an asked call makes is by
+  the decider the answer names, agenttool's `Answer.By` (`human`,
+  `policy`, `agent`), or `human` when it names none, where `Ask` wrote
+  `human` whatever answered; an answer naming a decider the session
+  format does not know is refused, and the deferral stands. The
+  answer's note reaches the model as a user message only for `human`,
+  and as a developer message for a rule or another model, on a
+  question `Ask` puts and on a tool's own question alike; outside a
+  run, and in a decline's reason, it is named for whoever gave it
+  ("The policy said: …"). `front/control` carries `by` on a `Reply`'s
+  answer, kept only for a principal holding the `WithChosenBy` scope,
+  as for `Resume`, and `human` otherwise; a chosen decider the format
+  does not know is refused on both routes. RFC 0001 Nested calls,
+  Pending calls and resume. (#267)
+
+- Added: `front/a2a`'s `WithChosenBy(func(ctx, principal) bool)` lets
+  a host name the principals that may say who decided an approval, as
+  `front/control`'s `WithChosenBy` does. `Approval.By` (`human`,
+  `policy`, `agent`), a `by` member of the `agentturn.approval` data
+  part, is recorded on the decision only when the host's check passes;
+  without the option, or when it says no, an approval naming a decider
+  is refused as before, and an unknown decider is refused always. A
+  rule's or another model's approval note reaches the model as a
+  developer message. RFC 0001 Pending calls and resume. (#291)
+
+- Added: `agentturn.InputRequired`, an interface a composition tool's
+  input-required error implements, with `PendingCalls()` naming what
+  its callee waits on in one shape, `WaitingCall{ID, Name, Args,
+  Callee}`: tools/agent's `InputRequiredError` names each deferred call
+  of the child, the child's run as the callee, and tools/a2a's each
+  call the task's status message lists, else the question, the task as
+  the callee. One `errors.As` replaces a type switch per tool; the `Is`
+  methods stay. (#84)
+- Added: `tools/agent.WithAskParent` puts a call the child's own hook
+  defers to the elicitor of the call that started the child, with
+  `agentturn.Ask`, so an accept runs it and a decline refuses it inside
+  the child. A call the child's policy held only beside an asked one
+  follows its batch's answers: once every call asked about in its batch
+  was accepted, a resume of the child approves it as the policy decided
+  it; once one was declined, it is refused, unrun, by `policy`, and the
+  child goes on; only when nobody answered does it stay held. Only when
+  nobody can be asked does the call fail with input-required, naming
+  what waits. `ChildInfo.Items` holds the items of every run of the
+  call. RFC 0001 Composition (as a tool, as a peer) states the rule,
+  and its open question "Input required as an interface" is closed.
+  (#84)
+
+- Fixed: a task `front/a2a` starts under `WithStart`'s or
+  `WithTransfers`' receiver, the conversation's next message after a
+  transfer, gives the receiver the executor's `ToolElicitor` and
+  `ToolRecorder` when it has none, as a `WithHandoff` switch within a
+  task already did, so a call its hook holds is asked rather than
+  refused. `front/responses` does the same for a request's start and
+  for a `WithHandoff` receiver, which inherited neither. RFC 0001
+  Composition. (#234)
+
+- Docs: `front/a2a`'s package doc has a Durability section: the
+  conversation store and the SDK's task store are the host's, a durable
+  task store goes in through `RequestHandler(a2asrv.WithTaskStore(…))`,
+  and when a task is lost the next message on its context lists the
+  calls it left pending again under a new task. A test pins that path.
+  RFC 0001 Composition (as a peer) states the rule. (#257)
+
+- Added: the `handoff` package, the in-process handoff every product
+  with more than one agent wrote again. `handoff.New(agents…)` builds a
+  `Team`, each agent's configuration gaining a terminating
+  `transfer_to_<agent>` tool (`ToolName`) per handoff it offers
+  (`To{Agent, Filter, Enabled}`); `Team.Run` prompts an agent and
+  follows each transfer: it applies the handoff's filter once with
+  `SetTranscript` (`RemoveAllTools` is the Agents SDK's
+  `remove_all_tools`), switches with `SetConfig`, the receiver
+  inheriting the sender's `ToolElicitor` and `ToolRecorder` where it
+  has none, and continues under a `handoff` trigger naming the sender,
+  returning the path of agents. At `MaxHandoffs`, by default
+  `front/responses.DefaultMaxHandoffs` (10), it takes the last transfer
+  without running the receiver, so the next input goes to the agent the
+  transcript names, and returns `ErrTooManyHandoffs`. `Team.Route` is the
+  `front/responses.Route` both fronts' `WithTransfers` take, so the same
+  team is served over either. This reverses #96's "a handoff needs no
+  package". RFC 0001 Composition states the rules a host taking a
+  handoff meets, and its open question on the handoff is closed. (#274)
+- Changed, breaking: `front/a2a` and `front/responses` bound the
+  `WithHandoff` switches one task or request follows,
+  `WithMaxHandoffs(n)`, `front/responses.DefaultMaxHandoffs` (10) by
+  default, where a pair of agents handing back and forth ran until the
+  host declined or the task was canceled. At the bound the caller is
+  told: `front/a2a` fails the task with a status message, and
+  `front/responses` fails the response with a `model_error` of code
+  `too_many_handoffs`, both matching `ErrTooManyHandoffs`
+  (front/responses', which front/a2a and `handoff` share); the
+  conversation keeps the last transfer, so under `WithTransfers` its
+  next input starts with the receiver. (#274)
+- Fixed: RFC 0001, the README and `Agent.SetTranscript` say a handoff's
+  trim between runs must leave a transcript the loop can continue. When
+  a trim leaves the sender's preamble, a model output, last, the
+  receiver's run takes a developer message naming the transfer, the
+  sender and the receiver, `front/responses.HandoffNote`, as its input,
+  in `handoff.Team.Run` and both fronts, rather than the trim adding it
+  to the transcript: the loop appends it and a session recorder writes
+  it once, so every later request in the conversation keeps its hash.
+  `Team.Trim` and `TrimHandedOff` add no note, and a later task or
+  request finds it in the history. Added `responses.HandoffNote` and
+  `responses.TransferName`. (#276)
+
+- Fixed: `session.Recorder.Elicitor` writes the decider the answer
+  names (`agenttool.Answer.By`) on the answer entry, and the label it
+  was built with only when the answer names none; a rule's answer was
+  recorded under the wrapper's label while its decision said `policy`.
+  (#267)
+
+- Fixed: an answer to a tool's own question that names a decider the
+  session format does not know is refused, as agenttool RFC 0001
+  requires and as `Ask` already did: the tool gets an error, and the
+  note is not said, where it was passed to the tool and its note said
+  as a developer message. (#267)
+
+- Security, breaking: a nested call a tool makes with `Invoke` that the
+  policy defers is put to the run's elicitor, and its decision hook sees the
+  run's elicitor, never one the invoking tool put on its own context.
+  A tool could install an elicitor of its own and approve the call its
+  policy deferred, under any decider it named. A host that relied on a
+  tool's own elicitor answering its nested calls sets
+  `Config.ToolElicitor`, or puts it on the context the run is prompted
+  with, instead. RFC 0001 Nested calls.
+
+- Added: `handoff.Team.Resume` answers pending calls and follows the
+  transfers the resumed run ends on, as `Run` does; `Team.Handoff` and
+  `Team.Trim` are what the fronts' `WithHandoff` and the new
+  `WithHandoffTrim` take, so a team served through `front/responses` or
+  `front/a2a` relays a transfer within a request or task with the
+  handoff's filter applied, where serving it through `Route` alone
+  dropped its filters. A front's trim applies to the receiver's runs in
+  that request or task; the stored conversation keeps the history whole.
+  (#274)
+
+- Fixed: under `front/a2a`'s `WithEscalation`, a call the policy held
+  only beside an asked one is released only when every approval in the
+  caller's message accepts; when the caller refuses one, the held call
+  is answered with a refusal, unrun, by `policy`. It was released, and
+  ran, whatever the caller answered.
+
+- Fixed: a handoff's trim through a front holds for the receiver's
+  later tasks and requests. Under `WithTransfers` and `WithHandoffTrim`
+  each starts from the conversation trimmed at every handoff the route
+  finds (`front/responses.TrimHandedOff`), as the receiver saw it when
+  it took the handoff, while the stored or sent conversation keeps the
+  history whole for routing. Before, a later task showed the receiver
+  the sender's tool history again. RFC 0001 Composition states it.
+  (#276)
+- Added: `tools/a2a.WithDetach(fn)`, the background remote call. A
+  detached call returns once the remote agent names a task it has not
+  finished, with an output saying it is running; its callee is recorded
+  as a peer; the task is followed on the run context, by its stream or,
+  under `WithBlocking`, by a send that returns at once and `tasks/get`
+  every `WithPollInterval` (at least `MinPollInterval`, 50ms), and `fn`
+  gets its end, the task completed, failed or waiting on input or
+  credentials. An abort of the
+  parent's run cuts it (tasks/cancel, recorded); the batch or the run
+  ending does not. Until it returns on a running task the call is an
+  ordinary one: its own context ends it, its callee is its subsession,
+  and a task it fails on is cancelled. The `WithInputRequired` hook is
+  called on the run's context. `tools/a2a.Answer(final)` is the output a call would
+  have returned. The host delivers the result with `Agent.Deliver`
+  under the new `agentturn.CalleeTrigger(callID, task)` (kind
+  `TriggerCallee`), and `session.Recorder` writes an item that arrived
+  under it with format 0.14's `from_link` naming the call's `peer`
+  link, after a restart too. RFC 0001 Composition and the record's
+  `item_end` row state it. (#290)
+- Added: `front/a2a.WithDeliverWhileBusy()`, an opt-in steer of a
+  working task (A2A §3.3.3); refusing a busy conversation stays the
+  default. A message naming the working task is handed to its agent as
+  a delivery under the caller's trigger and answered with the task; the
+  task continues the agent while the delivery is still queued after a
+  run, keeps it for the answering message when the run stops for input,
+  and drops it when the run fails or is cancelled, or the input-required
+  task is cancelled; a task holds at most `MaxSteers` (16) steers not yet
+  taken and refuses the next. A message naming
+  only the context is still refused as busy; a data part or declared
+  caller tools are refused while the task runs. The steer is served by
+  `Executor.RequestHandler`; a handler built with `a2asrv.NewHandler`
+  refuses it, as before. `tools/a2a.Steer(ctx, client, info, parts...)`
+  sends one, to the task a `WithDetach` call follows among others. RFC
+  0001 Composition, as a peer, states it. (#287)
+- Fixed: `front/responses`' single turn, served when the caller
+  declares tools, builds its request once more when a
+  `BeforeModelCall` guard quarantines an item the transform folded into
+  that request, as the loop does, so the summary the model is sent
+  never carries the quarantined text. RFC 0001 The request, step 3,
+  says a front building its own request does so. (#281)
+- Changed, breaking: `front/a2a`'s `Executor.RequestHandler` returns the
+  A2A server's handler wrapped in one of its own, inside the
+  interceptors, so a steer's caller is authenticated and its ownership
+  of the task checked before the message reaches a running agent; a
+  host that type-asserts the handler, or relies on it being the SDK's
+  own, gets the wrapper. (#287)
+
 ## v0.0.34 - 2026-10-26
 
 - Added: `control.WithChallenge`. A `front/control` handler sends the

@@ -84,7 +84,8 @@
 // side: the call is put to Config.ToolElicitor with agentturn.Ask,
 // the call on the elicitor's context for agentturn.AskedCallFrom, and
 // the person's accept runs the tool while their decline refuses the
-// call, both recorded as decided by "human". Without an elicitor, or
+// call, both recorded as decided by the decider the answer names, or
+// "human" when it names none. Without an elicitor, or
 // with no answer, the call is refused with a reason saying it cannot
 // be handed to the caller, and the model sees that reason as the
 // call's output. The task therefore never goes input-required on a
@@ -154,9 +155,14 @@
 // as the policy decided it, its rewrite of the arguments, which the
 // question shows, and its note included. A call the policy held only
 // beside an asked one is not put to the caller; the policy releases it
-// with the caller's answers. The run the answer resumes is under the caller's principal,
+// with the caller's answers when every approval accepts, and it is
+// refused unrun when the caller refused one. The run the answer resumes is under the caller's principal,
 // and the caller's note reaches the model as the caller's words, in the
-// user's voice, never the developer's. It is for a headless agent nobody
+// user's voice, never as the serving side's instructions. Who decided
+// is recorded as nobody, unless the host lets the principal name a
+// decider with [WithChosenBy], when [Approval.By] is taken and a rule's
+// or another model's note is a developer message; an approval naming a
+// decider otherwise is refused. It is for a headless agent nobody
 // watches, whose caller's human plane should decide; without it each
 // system's policy is its own.
 //
@@ -226,4 +232,36 @@
 // input-required task among them, and a served agent whose tool sends
 // to its own conversation gets the error rather than waiting on
 // itself.
+//
+// [WithDeliverWhileBusy] lets a caller steer a working task: a message
+// that names the task, which [Executor.RequestHandler]'s handler hands
+// to the running agent as a delivery under the caller's trigger, its
+// text and files only, answering with the task, which runs on until
+// the delivery is taken. A message naming only the context is still
+// refused, and the conversation still runs one task at a time.
+// tools/a2a's Steer sends one.
+//
+// # Durability
+//
+// Two stores keep what a conversation needs, and both are the host's.
+// The [ConversationStore] holds the transcript, with the calls the last
+// task left pending, and the executor loads it for every message; the
+// default, [MemoryStore], ends with the process. The SDK's task store
+// holds the tasks themselves, their status and history, and is given
+// with the request handler: RequestHandler(a2asrv.WithTaskStore(s)),
+// or a2asrv.NewHandler(exec, a2asrv.WithTaskStore(s)); without one
+// the SDK keeps them in memory. A durable task store lets a caller
+// answer or cancel an input-required task after a restart, as it
+// would before. A2A asks for no durability: Get Task may answer
+// TaskNotFound for a task that is invalid, expired, or completed and
+// purged (§3.3.2). A task the task store has lost cannot be read,
+// answered or canceled: a message naming it is refused. The
+// conversation does not stall on it, since the transcript says what it
+// waits on: the next message on the same context ID, with no task ID,
+// lists the calls the lost task left pending again, under a task of its
+// own, and the caller answers them there, as it would have on the lost
+// one. A pending call is never answerable only through a task the
+// executor no longer knows. A host keeps its tasks as long as the
+// conversations that refer to them, or tells its callers to answer a
+// lost task on the context.
 package a2a

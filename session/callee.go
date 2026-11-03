@@ -9,6 +9,7 @@ import (
 	"maps"
 
 	"github.com/ChristopherDavenport/agentsession"
+	"github.com/ChristopherDavenport/agentturn"
 )
 
 // The namespaces of the records tools/a2a writes through
@@ -107,6 +108,30 @@ func (w *writer) calleeLink(ns string, raw json.RawMessage, callID string) *agen
 		}
 	}
 	return nil
+}
+
+// fromLink is the from_link of an item that arrived under source: when
+// source is an agentturn.TriggerCallee trigger, the latest peer link on
+// the path of the call it names, to the task it names when it names
+// one, and "" otherwise. The format lets from_link name a peer link
+// alone, never a cancel notice, which w.callees does not hold.
+func (w *writer) fromLink(source *agentsession.Trigger) string {
+	if source == nil || source.Kind != agentturn.TriggerCallee || source.Ref == "" {
+		return ""
+	}
+	var task string
+	if raw, ok := source.Unknown["task"]; ok && json.Unmarshal(raw, &task) != nil {
+		// A task member that is not a string names no task this
+		// writer linked.
+		return ""
+	}
+	for i := len(w.callees) - 1; i >= 0; i-- {
+		l := w.callees[i]
+		if l.Rel == agentsession.RelPeer && l.CallID == source.Ref && (task == "" || l.Task == task) {
+			return l.ID
+		}
+	}
+	return ""
 }
 
 // decodeStrict decodes raw, a single JSON value, into v, refusing a
