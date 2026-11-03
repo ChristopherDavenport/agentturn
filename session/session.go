@@ -1447,16 +1447,20 @@ func appendedSince(after []agentsession.Entry, notes []agentturn.Note) int {
 }
 
 // sameNoteItem reports whether an item on the path says what a note
-// says: a message by its role and text, as the loop compares notes.
+// says: a message by its role and text, as the loop compares notes, and
+// any other item by its JSON, as it is or, since a held note keeps its
+// media inline, with its media as a sidecar session's path names it.
 func sameNoteItem(a, b openresponses.Item) bool {
 	am, aok := a.(*openresponses.Message)
 	bm, bok := b.(*openresponses.Message)
 	if aok && bok {
 		return am.Role == bm.Role && am.Text() == bm.Text()
 	}
-	ja, errA := json.Marshal(a)
-	jb, errB := json.Marshal(b)
-	return errA == nil && errB == nil && string(ja) == string(jb)
+	if equalJSON(a, b) {
+		return true
+	}
+	conv, blobs := sidecarForm(b)
+	return len(blobs) > 0 && equalJSON(a, conv)
 }
 
 // OwedNotes returns the notes the session owes after outputs already on

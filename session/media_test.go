@@ -589,3 +589,22 @@ func TestAChildNamingItsParentsBlobAfterTheGraceHasItsType(t *testing.T) {
 		}
 	}
 }
+
+// TestANoteHeldInlineMatchesItsSidecarItem pins the final review of
+// #284: a held note keeps its media inline in its HeldNotesNS entry,
+// while the item that says it on a sidecar session's path names the
+// blob, so a note that is not a message is matched by the form the
+// path records, and one already said is not owed, and delivered, again.
+func TestANoteHeldInlineMatchesItsSidecarItem(t *testing.T) {
+	note := &openresponses.FunctionCallOutput{CallID: "call_1", Output: openresponses.FunctionCallOutputData{Parts: openresponses.Contents{
+		&openresponses.InputImage{ImageURL: pngURL([]byte("\x89PNG noted"))},
+	}}}
+	recorded, _ := sidecarForm(note)
+	if recorded == openresponses.Item(note) {
+		t.Fatal("the note's image was not converted")
+	}
+	after := []agentsession.Entry{&agentsession.ItemEntry{Item: recorded}}
+	if n := appendedSince(after, []agentturn.Note{{Item: note}}); n != 1 {
+		t.Errorf("appendedSince = %d, want the note the path already holds", n)
+	}
+}
