@@ -1,0 +1,27 @@
+{
+  "name": "model-blocked",
+  "description": "A model call refused with an error marked as a guard's before anything of the answer opened raises model_blocked in place of response_end, with the request sent, is not retried, and ends the run stopped with cause guard, the transcript holding nothing of the refused call.",
+  "rules": ["#the-model-call", "#ending-a-run", "#order"],
+  "config": {"model": "m", "retry": {"max_attempts": 3}},
+  "model": [
+    {"error": {"message": "the provider's filter refused the request", "retryable": true, "guard": true}}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+      "expect": {
+        "events": [
+          {"type": "run_start"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "turn_start", "turn": 1},
+          {"type": "model_blocked", "turn": 1, "error": true,
+           "request": {"input": [{"type": "message", "role": "user"}]}},
+          {"type": "run_end", "reason": "stopped", "cause": "guard", "error": true, "withheld": false}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"}
+        ]
+      }
+    }
+  ]
+}

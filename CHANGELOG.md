@@ -86,7 +86,20 @@ versions may break the API.
   costs the responses after it their hash; the reference recorder
   writing those omissions is #233.
 - Changed: RFC 0001 is draft 0.4. The record states how the sessions a
-  recorder creates are described, the root and each child alike.
+  recorder creates are described, the root and each child alike. A
+  section, Changes in draft 0.4, lists what the draft added and marks
+  the new MUSTs a draft-0.3 loop, front or recorder can fail as
+  breaking, as Versioning calls them. The draft is made coherent: a
+  resume's answer has no default decider while a question's answer is
+  `human` when it names none; a resume's approved batch runs at turn 0;
+  the record table names `agentturn:unhashed` and the decider on a
+  question's answer; the conformance recorder rule names the `omit` and
+  `result` MUSTs; resolved open questions are gone. The scenario corpus
+  adds `deliver`, `pending-returned`, `model-blocked`,
+  `call-completed-by-response` and `fold-retry`, and its runner a
+  `fold` transform, `no_done`, `guard` and `code` errors and
+  `deliver_at`; the RFC says which rules a scenario cannot express.
+  `TranscriptFromContext`'s doc says it is the quarantined view.
 - Fixed: `session.Start` writes the harness `WithHarness` names in the
   root session's header when the header names none, as every child
   session's already did; a header that names one keeps it. (#219)

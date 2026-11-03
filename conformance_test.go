@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -48,6 +49,9 @@ type scenarioConfig struct {
 	Retry            struct {
 		MaxAttempts int `json:"max_attempts"`
 	} `json:"retry"`
+	// Fold is what the transform folds the transcript to when the loop
+	// asks it for a fold; absent, the configuration has no transform.
+	Fold openresponses.Items `json:"fold"`
 }
 
 type scenarioTool struct {
@@ -107,14 +111,35 @@ type scriptedAttempt struct {
 	Output  openresponses.Items `json:"output"`
 	Partial openresponses.Items `json:"partial"`
 	Error   *scriptedError      `json:"error"`
+	// NoDone lists the output indexes whose output_item.done the stream
+	// leaves out, so only response.completed completes the item.
+	NoDone []int `json:"no_done"`
 }
 
 type scriptedError struct {
 	Message   string `json:"message"`
 	Retryable bool   `json:"retryable"`
+	// Guard marks the error as a guard's refusal.
+	Guard bool `json:"guard"`
+	// Code is the Open Responses error code the error carries, such as
+	// context_length_exceeded.
+	Code string `json:"code"`
 }
 
 func (e *scriptedError) Error() string { return e.Message }
+
+// err is the error the scripted attempt fails with: the scripted error,
+// marked as a guard's or carrying its code as the script says.
+func (e *scriptedError) err() error {
+	var err error = e
+	if e.Code != "" {
+		err = errors.Join(err, &openresponses.Error{Type: openresponses.ErrorTypeInvalidRequest, Code: e.Code, Message: e.Message})
+	}
+	if e.Guard {
+		err = fmt.Errorf("%w: %w", agentturn.ErrGuard, err)
+	}
+	return err
+}
 
 type scenarioRun struct {
 	Prompt     openresponses.Items `json:"prompt"`
@@ -124,6 +149,7 @@ type scenarioRun struct {
 	FailAt     json.RawMessage     `json:"fail_at"`
 	SteerAt    *queueAt            `json:"steer_at"`
 	FollowUpAt *queueAt            `json:"follow_up_at"`
+	DeliverAt  *queueAt            `json:"deliver_at"`
 	Expect     scenarioExpect      `json:"expect"`
 }
 
@@ -230,6 +256,14 @@ func runScenario(t *testing.T, sc *scenario) {
 				return errors.As(err, &se) && se.Retryable
 			},
 		},
+	}
+	if fold := sc.Config.Fold; fold != nil {
+		cfg.Transform = func(ctx context.Context, t agentturn.Transcript) (agentturn.Transcript, error) {
+			if agentturn.FoldRequested(ctx) {
+				return agentturn.Transcript(fold), nil
+			}
+			return t, nil
+		}
 	}
 	switch sc.Config.ToolExecution {
 	case "", "parallel":
@@ -340,7 +374,7 @@ func driveRun(t *testing.T, agent *agentturn.Agent, run scenarioRun) {
 		}
 		return subset(want, ev, "") == ""
 	}
-	unsubscribe := agent.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+	unsubscribe := agent.Subscribe(func(evCtx context.Context, ev agentturn.Event) error {
 		p := project(t, ev)
 		mu.Lock()
 		if p != nil {
@@ -358,6 +392,13 @@ func driveRun(t *testing.T, agent *agentturn.Agent, run scenarioRun) {
 		}
 		if run.FollowUpAt != nil && matches(run.FollowUpAt.Event, p) {
 			agent.FollowUp(run.FollowUpAt.Items...)
+		}
+		if run.DeliverAt != nil && matches(run.DeliverAt.Event, p) {
+			// A delivery from inside the run, with the context it was
+			// handed, joins it as a steer and does not wait.
+			if _, _, err := agent.Deliver(evCtx, run.DeliverAt.Items...); err != nil {
+				t.Errorf("scenario: deliver: %v", err)
+			}
 		}
 		if matches(run.FailAt, p) {
 			return errors.New("scenario: the subscriber fails here")
@@ -721,6 +762,15 @@ func (m *scriptedModel) CreateStream(_ context.Context, req openresponses.Reques
 	if at.ID != "" {
 		resp.ID = at.ID
 	}
+	if len(at.NoDone) > 0 {
+		next := sink
+		sink = openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+			if done, ok := ev.(*openresponses.OutputItemDoneEvent); ok && slices.Contains(at.NoDone, done.OutputIndex) {
+				return nil
+			}
+			return next.Send(ev)
+		})
+	}
 	em := openresponses.NewEmitter(sink, resp)
 	if err := em.Start(); err != nil {
 		return err
@@ -735,7 +785,7 @@ func (m *scriptedModel) CreateStream(_ context.Context, req openresponses.Reques
 		}
 	}
 	if at.Error != nil {
-		return at.Error
+		return at.Error.err()
 	}
 	return em.Complete()
 }

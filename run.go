@@ -392,8 +392,13 @@ func ContextWithTranscript(ctx context.Context, t Transcript) context.Context {
 
 // TranscriptFromContext returns the transcript the loop attached to the
 // context of a hook or a tool call: the working transcript as it stood
-// when the batch started, the calls of the batch included. It is a
-// snapshot; do not mutate it.
+// when the batch started, the calls of the batch included, under the
+// quarantine, as a request carries it: a quarantined item left out, a
+// quarantined output with [QuarantinedOutput] in place of its own
+// ([Quarantine]), so a tool that seeds another agent from it does not
+// hand on what a guard kept from the model. The agent's transcript
+// ([Agent.State]) keeps every item as it arrived. It is a snapshot; do
+// not mutate it.
 func TranscriptFromContext(ctx context.Context) (Transcript, bool) {
 	t, ok := ctx.Value(transcriptKey{}).(Transcript)
 	return t, ok

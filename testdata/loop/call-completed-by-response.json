@@ -1,0 +1,48 @@
+{
+  "name": "call-completed-by-response",
+  "description": "A function call the stream opened and only response.completed completes, its output_item.done never sent, is put in the transcript under the ID it was opened with before its batch runs, so every call the batch runs is one the transcript holds and its output is paired with it.",
+  "rules": ["#the-model-call", "#the-batch", "#invariants"],
+  "config": {"model": "m"},
+  "tools": [{"name": "read", "result": {"output": "contents"}}],
+  "model": [
+    {"id": "resp_1", "no_done": [0], "output": [
+      {"type": "function_call", "call_id": "call_x", "name": "read", "arguments": "{}"}
+    ]},
+    {"id": "resp_2", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "read"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read it"}]}],
+      "expect": {
+        "events": [
+          {"type": "run_start"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start", "item": {"type": "function_call", "call_id": "call_x"}},
+          {"type": "item_end", "item": {"type": "function_call", "call_id": "call_x", "name": "read"}},
+          {"type": "response_end", "turn": 1},
+          {"type": "tool_start", "call_id": "call_x"},
+          {"type": "tool_dispatch", "call_id": "call_x"},
+          {"type": "tool_end", "call_id": "call_x"},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_x"}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_x"}},
+          {"type": "turn_end", "turn": 1},
+          {"type": "turn_start", "turn": 2,
+           "request": {"input": [{"type": "message", "role": "user"}, {"type": "function_call", "call_id": "call_x"}, {"type": "function_call_output", "call_id": "call_x"}]}},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end", "turn": 2},
+          {"type": "turn_end", "turn": 2},
+          {"type": "run_end", "reason": "done", "error": false}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "function_call", "call_id": "call_x"},
+          {"type": "function_call_output", "call_id": "call_x"},
+          {"type": "message", "role": "assistant"}
+        ]
+      }
+    }
+  ]
+}
