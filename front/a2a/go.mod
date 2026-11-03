@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/ChristopherDavenport/agenttool v0.0.28
-	github.com/ChristopherDavenport/agentturn v0.0.34
+	github.com/ChristopherDavenport/agentturn v0.0.35
 	github.com/ChristopherDavenport/openresponses v0.0.18
 	github.com/a2aproject/a2a-go v0.3.15
 )

@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.35 - 2026-11-02
 
 - Fixed: `front/a2a`'s steer into a working task goes through what
   records the conversation when the task's `RecorderFor` returns a
