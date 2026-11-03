@@ -164,8 +164,9 @@ func WithRecorderFor(fn RecorderFor) Option {
 // the terminating call and its output. It is asked again each time a
 // run it started stops the same way, so a pair of agents that hand
 // back and forth runs until fn declines, the task is canceled or the
-// task has followed [WithMaxHandoffs] of them, [DefaultMaxHandoffs]
-// by default, after which the task fails with [ErrTooManyHandoffs].
+// task has followed [WithMaxHandoffs] of them,
+// [responses.DefaultMaxHandoffs] by default, after which the task
+// fails with [ErrTooManyHandoffs].
 //
 // The receiver's run is continued under
 // agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff",
@@ -186,10 +187,6 @@ func WithHandoff(fn func(ctx context.Context, end *agentturn.RunEnd, results []*
 	return func(e *Executor) { e.handoff = fn }
 }
 
-// DefaultMaxHandoffs is the bound on the [WithHandoff] switches one
-// task follows when [WithMaxHandoffs] gives none.
-const DefaultMaxHandoffs = 10
-
 // WithMaxHandoffs bounds the [WithHandoff] switches one task follows,
 // as RFC 0001 requires of a host that takes handoffs: when a run after
 // n of them ends on one more that WithHandoff takes, the task fails
@@ -197,7 +194,8 @@ const DefaultMaxHandoffs = 10
 // completing with a transfer's text. The conversation keeps the
 // transfer, so under [WithTransfers] its next task starts with the
 // receiver of the last one. n of 0 or less means
-// [DefaultMaxHandoffs].
+// [responses.DefaultMaxHandoffs], the one bound both fronts and
+// agentturn/handoff default to.
 func WithMaxHandoffs(n int) Option { return func(e *Executor) { e.maxHandoffs = n } }
 
 // ErrTooManyHandoffs is front/responses' [responses.ErrTooManyHandoffs],
@@ -716,7 +714,7 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 	end, err := run(runCtx)
 	limit := e.maxHandoffs
 	if limit <= 0 {
-		limit = DefaultMaxHandoffs
+		limit = responses.DefaultMaxHandoffs
 	}
 	for handoffs := 0; ; {
 		if end == nil {

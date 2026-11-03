@@ -54,10 +54,6 @@ import (
 	"github.com/ChristopherDavenport/openresponses"
 )
 
-// DefaultMaxHandoffs is the bound on the handoffs one [Team.Run]
-// follows when [Team.MaxHandoffs] is 0.
-const DefaultMaxHandoffs = 10
-
 // ErrTooManyHandoffs is returned by [Team.Run] and [Team.Resume] when a
 // run ends on a transfer after the team has followed
 // [Team.MaxHandoffs] of them for one input: two agents that hand the
@@ -93,7 +89,7 @@ type Agent struct {
 // with [New].
 type Team struct {
 	// MaxHandoffs bounds the handoffs one [Team.Run] follows; 0 means
-	// [DefaultMaxHandoffs].
+	// [responses.DefaultMaxHandoffs], the fronts' default too.
 	MaxHandoffs int
 
 	configs map[string]agentturn.Config
@@ -286,7 +282,7 @@ func (t *Team) Resume(ctx context.Context, a *agentturn.Agent, answers ...agentt
 func (t *Team) follow(ctx context.Context, a *agentturn.Agent, path []string, end *agentturn.RunEnd, err error) (*agentturn.RunEnd, []string, error) {
 	limit := t.MaxHandoffs
 	if limit <= 0 {
-		limit = DefaultMaxHandoffs
+		limit = responses.DefaultMaxHandoffs
 	}
 	for n := 0; err == nil && terminated(end); n++ {
 		to, ok := t.Handoff(ctx, end, nil)

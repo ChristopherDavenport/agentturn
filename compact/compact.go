@@ -820,7 +820,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 		// The instructions and tools share the window with the items.
 		settings = t.settings(req)
 	}
-	quarantined := agentturn.QuarantinedFromContext(ctx)
+	quarantined := agentturn.QuarantineFromContext(ctx)
 	t.mu.Lock()
 	forced, instructions := t.next || agentturn.FoldRequested(ctx), t.nextInstructions
 	t.next, t.nextInstructions = false, ""
@@ -946,7 +946,7 @@ func (t *Transform) pinned(prefix agentturn.Transcript) openresponses.Items {
 
 // view returns the transcript with the remembered fold applied, and how
 // many items it covers; zero when the memory no longer matches.
-func (t *Transform) view(items agentturn.Transcript, quarantined agentturn.Quarantined) (agentturn.Transcript, int) {
+func (t *Transform) view(items agentturn.Transcript, quarantined agentturn.QuarantineView) (agentturn.Transcript, int) {
 	if t.prefixHash != "" && t.prefixLen > 0 && len(items) >= t.prefixLen && PrefixHash(items[:t.prefixLen]) == t.prefixHash && !t.quarantinedSince(items[:t.prefixLen], quarantined) {
 		return t.join(items, t.prefixLen), t.prefixLen
 	}
@@ -959,7 +959,7 @@ func (t *Transform) view(items agentturn.Transcript, quarantined agentturn.Quara
 // remembered fold stands for, whose summary may then carry what the
 // quarantine leaves out. A growth that reaches none is taken as checked.
 // Called with the lock held.
-func (t *Transform) quarantinedSince(prefix agentturn.Transcript, quarantined agentturn.Quarantined) bool {
+func (t *Transform) quarantinedSince(prefix agentturn.Transcript, quarantined agentturn.QuarantineView) bool {
 	gen := quarantined.Generation()
 	if gen == t.prefixGen {
 		return false

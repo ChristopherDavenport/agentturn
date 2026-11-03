@@ -152,10 +152,10 @@ func (q *quarantine) has(item openresponses.Item) bool {
 
 type quarantineKey struct{}
 
-// quarantineFromContext returns the quarantine of the run whose hook,
+// quarantineOn returns the quarantine of the run whose hook,
 // transform or tool the context belongs to, else the [QuarantineSet]
 // a host attached, or nil.
-func quarantineFromContext(ctx context.Context) *quarantine {
+func quarantineOn(ctx context.Context) *quarantine {
 	if q, ok := ctx.Value(quarantineKey{}).(*quarantine); ok && q != nil {
 		return q
 	}
@@ -165,30 +165,30 @@ func quarantineFromContext(ctx context.Context) *quarantine {
 	return nil
 }
 
-// Quarantined is a read-only view of the quarantine a request is built
+// QuarantineView is a read-only view of the quarantine a request is built
 // under, as the transform's context carries it: a transform that sends
 // a model of its own any part of the conversation, such as a fold's
 // summary request, leaves out what the quarantine leaves out, and one
 // that remembers what it built over the conversation builds it again
 // when the quarantine reaches what it remembers (RFC 0001 The request,
 // step 3; #281). The zero value quarantines nothing.
-type Quarantined struct{ q *quarantine }
+type QuarantineView struct{ q *quarantine }
 
-// QuarantinedFromContext returns the quarantine of the run whose hook,
+// QuarantineFromContext returns the quarantine of the run whose hook,
 // transform or tool ctx belongs to, or the zero view outside a run.
-func QuarantinedFromContext(ctx context.Context) Quarantined {
-	return Quarantined{quarantineFromContext(ctx)}
+func QuarantineFromContext(ctx context.Context) QuarantineView {
+	return QuarantineView{quarantineOn(ctx)}
 }
 
 // Has reports whether item is left out of a request or sent as a
 // placeholder: quarantined itself, or the output of a quarantined call.
-func (v Quarantined) Has(item openresponses.Item) bool {
+func (v QuarantineView) Has(item openresponses.Item) bool {
 	return v.q != nil && v.q.has(item)
 }
 
 // Generation counts the items quarantined so far; it changes whenever
 // the quarantine grows, so a transform keys what it remembers on it.
-func (v Quarantined) Generation() int {
+func (v QuarantineView) Generation() int {
 	if v.q == nil {
 		return 0
 	}
@@ -199,7 +199,7 @@ func (v Quarantined) Generation() int {
 // a quarantined output with [QuarantinedOutput] in place of its own, a
 // quarantined call left out with its outputs, any other quarantined
 // item left out; items itself when nothing among them is quarantined.
-func (v Quarantined) Apply(items openresponses.Items) openresponses.Items {
+func (v QuarantineView) Apply(items openresponses.Items) openresponses.Items {
 	if v.q == nil {
 		return items
 	}
@@ -230,7 +230,7 @@ func (s *QuarantineSet) Add(items ...openresponses.Item) error { return s.q.add(
 func (s *QuarantineSet) Items() openresponses.Items { return s.q.list() }
 
 // Apply returns items as a request carries them under the set, as
-// [Quarantined.Apply] does: for a front that builds a request itself
+// [QuarantineView.Apply] does: for a front that builds a request itself
 // rather than through the loop.
 func (s *QuarantineSet) Apply(items openresponses.Items) openresponses.Items {
 	return s.q.apply(items)
@@ -265,7 +265,7 @@ func runQuarantine(ctx context.Context) *quarantine {
 // detached or spawned one, does not see what the parent quarantines
 // after that.
 func inheritQuarantine(ctx context.Context, q *quarantine) *quarantine {
-	if parent := quarantineFromContext(ctx); parent != nil && parent != q {
+	if parent := quarantineOn(ctx); parent != nil && parent != q {
 		_ = q.add(parent.list()...)
 	}
 	return q
@@ -294,7 +294,7 @@ func inheritQuarantine(ctx context.Context, q *quarantine) *quarantine {
 // append-only transcript (RFC 0001 The request, step 3; #281). It
 // returns [ErrNoQuarantine] outside a run.
 func Quarantine(ctx context.Context, items ...openresponses.Item) error {
-	q := quarantineFromContext(ctx)
+	q := quarantineOn(ctx)
 	if q == nil {
 		return ErrNoQuarantine
 	}

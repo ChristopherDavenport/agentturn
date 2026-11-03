@@ -232,8 +232,11 @@ func WithTransfers(route Route) Option {
 // answered. agentturn/handoff and front/a2a return it too.
 var ErrTooManyHandoffs = errors.New("too many handoffs for one input")
 
-// DefaultMaxHandoffs is the bound on the [WithHandoff] switches one
-// request follows when [WithMaxHandoffs] gives none.
+// DefaultMaxHandoffs is the bound on the handoffs one input causes
+// when nothing sets another: the [WithHandoff] switches one request
+// follows when [WithMaxHandoffs] gives none, and the default of
+// front/a2a's WithMaxHandoffs, per task, and of agentturn/handoff's
+// Team.MaxHandoffs, per Run.
 const DefaultMaxHandoffs = 10
 
 // WithMaxHandoffs bounds the [WithHandoff] switches one request
@@ -579,7 +582,7 @@ func terminatingText(items agentturn.Transcript, results []*agentturn.ToolEnd) (
 // foldedAway reports whether an item of transcript the quarantine holds
 // is not among what the transform returned, sent: the transform folded
 // it, or left it out, so what it returned may still carry its content.
-func foldedAway(q agentturn.Quarantined, transcript, sent agentturn.Transcript) bool {
+func foldedAway(q agentturn.QuarantineView, transcript, sent agentturn.Transcript) bool {
 	kept := make(map[openresponses.Item]bool, len(sent))
 	for _, item := range sent {
 		if item != nil && reflect.TypeOf(item).Comparable() {
@@ -626,7 +629,7 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 	if filter == nil {
 		filter = agentturn.DefaultFilter
 	}
-	view := agentturn.QuarantinedFromContext(ctx)
+	view := agentturn.QuarantineFromContext(ctx)
 	var upstream openresponses.Request
 	for again := true; ; again = false {
 		// The settings come first, the caller's tools among them, so

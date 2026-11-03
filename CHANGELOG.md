@@ -442,7 +442,7 @@ versions may break the API.
   `omit.items`, so every later response still verifies.
   `Agent.Quarantined` lists the items. A quarantine covers everything
   a request is built from: the transform reads it,
-  `QuarantinedFromContext`, and `compact` leaves quarantined items out
+  `QuarantineFromContext`, a `QuarantineView`, and `compact` leaves quarantined items out
   of what a fold sends its summarizer and folds again when a quarantine
   reaches a prefix it already summarised; when a `BeforeModelCall`
   guard quarantines an item the transform folded into that request,
