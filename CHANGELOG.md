@@ -285,7 +285,9 @@ versions may break the API.
   blob (agentsession's `ReadSessionBlob`, which over RFC 0003 reads the
   blob for the session), `application/octet-stream` for a blob held
   with none, through the reader `session.WithBlobs` names;
-  `Recorder.ReadOptions` carries the recorder's. Reading a sidecar
+  `Recorder.ReadOptions` carries the recorder's: a `WithMedia` writer
+  that reads gives the bytes, and the store holding the session its
+  type, so a remote client kept for media alone resumes. Reading a sidecar
   session's media with no reader is now `session.ErrNoBlobReader`
   rather than a transcript a provider refuses, so a host calling
   `AgentOptions(s)` on one passes `rec.ReadOptions()...`.

@@ -420,16 +420,27 @@ func TestAResumedSidecarSessionSendsItsMediaAsDataURLs(t *testing.T) {
 	}
 }
 
+// untypedStore is a store that keeps blobs and no media type: it offers
+// none of agentsession's typed blob interfaces.
+type untypedStore struct{ agentsession.Store }
+
+func (u untypedStore) PutBlob(ctx context.Context, data []byte) (string, error) {
+	return u.Store.(agentsession.BlobWriter).PutBlob(ctx, data)
+}
+
+func (u untypedStore) Blob(ctx context.Context, hash string) ([]byte, error) {
+	return u.Store.(agentsession.BlobReader).Blob(ctx, hash)
+}
+
 // TestASidecarBlobWithNoTypeResolvesAsOctetStream pins the rest of the
-// resume rule: a blob held with no media type, as one a writer that
-// keeps none stored, comes back as an application/octet-stream data
-// URL, and a sidecar session's items are not handed back at all with
-// no blob reader to resolve them.
+// resume rule: a blob held with no media type, as a store that keeps
+// none holds every blob, comes back as an application/octet-stream
+// data URL, and a sidecar session's items are not handed back at all
+// with no blob reader to resolve them.
 func TestASidecarBlobWithNoTypeResolvesAsOctetStream(t *testing.T) {
 	ctx := context.Background()
-	store := agentsession.NewMemoryStore()
-	// putCounter is no TypedBlobWriter, so the type is left behind.
-	rec, s, err := Start(ctx, store, agentsession.Header{Media: agentsession.MediaSidecar}, WithMedia(&putCounter{BlobWriter: store}))
+	store := untypedStore{agentsession.NewMemoryStore()}
+	rec, s, err := Start(ctx, store, agentsession.Header{Media: agentsession.MediaSidecar})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +451,7 @@ func TestASidecarBlobWithNoTypeResolvesAsOctetStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	detach()
-	rec2, s2, err := Resume(ctx, store, s.ID(), WithMedia(&putCounter{BlobWriter: store}))
+	rec2, s2, err := Resume(ctx, store, s.ID())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -454,5 +465,53 @@ func TestASidecarBlobWithNoTypeResolvesAsOctetStream(t *testing.T) {
 	want := "data:application/octet-stream;base64," + base64.StdEncoding.EncodeToString(shot)
 	if got, _ := json.Marshal(items[0]); !strings.Contains(string(got), want) {
 		t.Errorf("the prompt came back as %s, want its image as %s", got, want)
+	}
+}
+
+// TestAMediaWriterElsewhereResumesWithItsTypes pins the final review of
+// #284: blobs WithMedia keeps apart from the store, on an RFC 0003
+// server here, which holds none of the store's sessions, are stored
+// typed and the session given each type in the store, and a recorder
+// resumed with a new client reads each blob's bytes from the server
+// and its type from the store, rather than asking the server for a
+// session it does not hold.
+func TestAMediaWriterElsewhereResumesWithItsTypes(t *testing.T) {
+	ctx := context.Background()
+	h := remote.NewHandler(agentsession.NewMemoryStore(), remote.WithInsecureNoAuth())
+	srv := httptest.NewServer(h)
+	defer func() {
+		srv.CloseClientConnections()
+		srv.Close()
+		h.Close()
+	}()
+	dial := func() *remote.Client {
+		c, err := remote.Dial(srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{Media: agentsession.MediaSidecar}, WithMedia(dial()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: answers{}, ModelName: "m"})
+	detach := rec.Attach(a)
+	shot := []byte("\x89PNG kept elsewhere")
+	if _, err := a.Prompt(ctx, openresponses.UserMessage(&openresponses.InputImage{ImageURL: pngURL(shot)})); err != nil {
+		t.Fatal(err)
+	}
+	detach()
+	rec2, s2, err := Resume(ctx, store, s.ID(), WithMedia(dial()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := Transcript(s2, rec2.ReadOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := json.Marshal(items[0]); !strings.Contains(string(got), pngURL(shot)) {
+		t.Errorf("the prompt came back as %s, want its image as %s", got, pngURL(shot))
 	}
 }

@@ -39,15 +39,58 @@ func (r *Recorder) blobWriter() agentsession.BlobWriter {
 }
 
 // blobReader is the reader a sidecar session's blobs are read back
-// through: the writer [WithMedia] names when it reads too, else the
-// store when it is an agentsession.BlobReader, as every agentsession
-// store is; nil when neither reads.
+// through: the writer [WithMedia] names when it reads too, its bytes
+// with the type the store holds for the session, else the store when
+// it is an agentsession.BlobReader, as every agentsession store is; nil
+// when neither reads.
 func (r *Recorder) blobReader() agentsession.BlobReader {
 	if br, ok := r.blobs.(agentsession.BlobReader); ok {
-		return br
+		typer, _ := r.store.(agentsession.SessionBlobTyper)
+		return mediaReader{br: br, types: typer}
 	}
 	br, _ := r.store.(agentsession.BlobReader)
 	return br
+}
+
+// mediaReader reads the blobs a [WithMedia] writer keeps apart from the
+// store as a session holds them: the bytes, and the type, from the
+// writer, and the session's own type from the store, which holds the
+// session, when it holds one. The writer is not asked for the session,
+// which it need not hold: an RFC 0003 server answers a session it does
+// not hold with no blob.
+type mediaReader struct {
+	br    agentsession.BlobReader
+	types agentsession.SessionBlobTyper
+}
+
+// Blob implements agentsession.BlobReader.
+func (m mediaReader) Blob(ctx context.Context, hash string) ([]byte, error) {
+	return m.br.Blob(ctx, hash)
+}
+
+// SessionBlob implements agentsession.SessionBlobReader.
+func (m mediaReader) SessionBlob(ctx context.Context, session, hash string) ([]byte, string, error) {
+	var data []byte
+	var mt string
+	var err error
+	if tr, ok := m.br.(agentsession.TypedBlobReader); ok {
+		data, mt, err = tr.TypedBlob(ctx, hash)
+	} else {
+		data, err = m.br.Blob(ctx, hash)
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	if m.types != nil {
+		held, err := m.types.SessionBlobTypes(ctx, session)
+		if err != nil && !errors.Is(err, agentsession.ErrNoSession) {
+			return nil, "", fmt.Errorf("session: blob types: %w", err)
+		}
+		if t, ok := held[hash]; ok {
+			mt = t
+		}
+	}
+	return data, mt, nil
 }
 
 // blob is one inline medium a sidecar session stores: its bytes, and
@@ -107,10 +150,11 @@ func (w *writer) sidecar(ctx context.Context, item openresponses.Item) (openresp
 			}
 		}
 	}
-	// The session's own type for each blob, where the blobs are the
-	// store's: a type the store holds per blob is the first it was
-	// given, which another session may have given these bytes.
-	if typer, ok := w.rec.store.(agentsession.SessionBlobTyper); ok && w.rec.blobs == nil && len(types) > 0 {
+	// The session's own type for each blob, held by the store that
+	// holds the session, the blobs its own or a [WithMedia] writer's: a
+	// type a store holds per blob is the first it was given, which
+	// another session may have given these bytes.
+	if typer, ok := w.rec.store.(agentsession.SessionBlobTyper); ok && len(types) > 0 {
 		if err := typer.SetSessionBlobTypes(ctx, w.id, types); err != nil {
 			return nil, fmt.Errorf("session: blob types: %w", err)
 		}
