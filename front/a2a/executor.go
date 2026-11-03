@@ -53,6 +53,10 @@ type Executor struct {
 	deliverBusy bool
 	running     map[a2a.TaskID]*running
 	owed        map[string]owedSteers
+	// quarantines holds, by context ID, what the conversation's tasks
+	// quarantined, one copy of each item, which the next task's agent
+	// builds under (#281).
+	quarantines map[string]*agentturn.QuarantineSet
 }
 
 // ErrConversationBusy is the cause of the error a message gets when its
@@ -473,7 +477,10 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	if e.route != nil && e.trim != nil {
 		seen = responses.TrimHandedOff(runCtx, transcript, e.cfg, e.route, e.trim)
 	}
-	opts := []agentturn.Option{agentturn.WithTranscript(seen), agentturn.WithReasoningModels(models)}
+	// What an earlier task quarantined stays out of this one's requests:
+	// the set is the conversation's, bound to the transcript as loaded.
+	quarantined := e.quarantineFor(reqCtx.ContextID, seen)
+	opts := []agentturn.Option{agentturn.WithTranscript(seen), agentturn.WithReasoningModels(models), agentturn.WithQuarantineSet(quarantined)}
 	if len(approvals) > 0 {
 		// The calls the last run deferred, the caller's and the escalated
 		// ones alike, were never handed to a tool; an escalated one
@@ -538,6 +545,7 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 		run = func(ctx context.Context) (*agentturn.RunEnd, error) { return agent.Resume(ctx, answers...) }
 	}
 	out := e.relay(ctx, runCtx, cancel, reqCtx, q, agent, run, caller, rt)
+	e.keepQuarantine(reqCtx.ContextID, quarantined)
 	if err := e.persist(ctx, reqCtx.ContextID, transcript, out); err != nil {
 		return err
 	}
@@ -581,6 +589,40 @@ func (e *Executor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, q
 	}
 	release()
 	return e.conclude(ctx, reqCtx, q, out, escalated)
+}
+
+// quarantineFor returns the set a task's agent builds under: what the
+// conversation's earlier tasks quarantined, bound to t, the transcript
+// the task loaded.
+func (e *Executor) quarantineFor(contextID string, t agentturn.Transcript) *agentturn.QuarantineSet {
+	e.mu.Lock()
+	held := e.quarantines[contextID]
+	e.mu.Unlock()
+	if held == nil {
+		held, _ = agentturn.NewQuarantineSet()
+	}
+	return held.Bind(t)
+}
+
+// keepQuarantine adds to the conversation's set what the task's set,
+// from quarantineFor, holds beyond it, one copy of each item: what the
+// task's hooks and tools quarantined, and what a recorder attached to
+// its agent found quarantined in the record.
+func (e *Executor) keepQuarantine(contextID string, task *agentturn.QuarantineSet) {
+	if len(task.Items()) == 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	held := e.quarantines[contextID]
+	if held == nil {
+		held, _ = agentturn.NewQuarantineSet()
+		if e.quarantines == nil {
+			e.quarantines = map[string]*agentturn.QuarantineSet{}
+		}
+		e.quarantines[contextID] = held
+	}
+	held.Merge(task)
 }
 
 // errCanceled is what claim returns for a task a cancel ended with no

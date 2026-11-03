@@ -7,6 +7,18 @@ versions may break the API.
 
 ## Unreleased
 
+- Fixed: a quarantine holds for the rest of a conversation served over
+  a wire. `front/a2a` keeps each conversation's quarantine across its
+  tasks and `front/responses` across its requests, each matching the
+  copies of an item a store or a caller hands back, so a tool output a
+  guard quarantined in one task or request is sent as
+  `QuarantinedOutput` in the next rather than whole. Added
+  `WithQuarantineSet`, which gives an `Agent` a host's set, and
+  `QuarantineSet.Bind`, `Merge` and `Has`. The session recorder's
+  `Attach` has the agent quarantine what the record's `omit` says a
+  quarantine left out, so an agent seeded from a store that keeps the
+  conversation whole, as `front/a2a`'s is, does not send it again
+  after a reopen. (#281)
 - Fixed: `Recorder.Rebase` takes an entry the new branch owes as an
   input's own only when it holds the same input in the same mode under
   the same trigger; an entry for the same item that something else

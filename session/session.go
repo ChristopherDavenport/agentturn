@@ -3924,6 +3924,16 @@ func (r *Recorder) Store() agentsession.Store { return r.store }
 // run_start from then on, so a change through Agent.SetConfig reaches
 // the record as a config delta and as the filter in force.
 //
+// A recorder reopened on a session whose omit setting records a
+// quarantine, an output sent as agentturn.QuarantinedOutput or an item
+// left out, quarantines in a what a's transcript holds of it as a
+// attaches (Agent.Quarantine), so an agent seeded with the
+// conversation whole, from a store kept beside the record as
+// front/a2a's is, leaves out what the record says it left out rather
+// than sending it again. An agent seeded from the record, with
+// [AgentOptions] or [Transcript], holds the context as omit shaped it
+// and has nothing to quarantine (#281).
+//
 // Subscribers are called in registration order and the recorder writes
 // a call's dispatch when tool_dispatch reaches it, durably, before the
 // tool runs. A subscriber that may refuse a dispatch, a policy that
@@ -3932,11 +3942,17 @@ func (r *Recorder) Store() agentsession.Store { return r.store }
 // already on the record, and the record reads that call as possibly
 // run although the loop never handed it over.
 func (r *Recorder) Attach(a *agentturn.Agent) (unsubscribe func()) {
+	t := a.State().Transcript
 	r.mu.Lock()
 	r.agent = a
 	cfg := a.Config()
 	r.root.cfg = &cfg
+	quarantined := r.root.quarantinedIn(t)
 	r.mu.Unlock()
+	// What the record says is quarantined stays so: an agent seeded
+	// with the whole conversation, from a store beside the record,
+	// would otherwise send it again (#281).
+	_ = a.Quarantine(quarantined...)
 	unsub := a.Subscribe(r.Handle)
 	return func() {
 		unsub()

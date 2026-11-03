@@ -494,11 +494,19 @@ that a recorder holding the transcript and the settings rebuilds it:
    conversation's quarantine, a handoff's legs included, so what one
    leg's guard quarantined the next leg's requests leave out too; a
    host that drives the low-level loop carries the quarantine from run
-   to run, and a front that builds a turn's request itself builds it
-   under a quarantine as the loop does, applied after its
+   to run, and so does a front that starts an agent per task or per
+   request: it keeps the conversation's quarantine from one to the
+   next and applies it to the copy of each item it loads, which a
+   store or a caller hands back decoded afresh, so it names an item by
+   its content rather than its identity; a recorder reopened on a
+   record whose `omit` holds a quarantine has the agent it records
+   quarantine what its transcript holds of it, so an agent seeded from
+   a store that keeps the conversation whole leaves out what the record
+   says was left out. A front that builds a turn's request itself
+   builds it under a quarantine as the loop does, applied after its
    before-model-call hook, and builds it once more when that hook
-   quarantined an item the transform had folded into it. A recorder writes a quarantine as the `omit` setting that
-   describes it, `omit.outputs` for a placeholder and `omit.items` for
+   quarantined an item the transform had folded into it. A recorder
+   writes a quarantine as the `omit` setting that describes it, `omit.outputs` for a placeholder and `omit.items` for
    an item left out, as the consequences below say, so the requests
    after it rebuild and hash; a fold made again is recorded as any
    fold. The record keeps the item as it arrived, and so does whatever
@@ -1943,7 +1951,7 @@ maps onto it as follows:
 | the handoff | `handoff.New(agents…)` → `*Team` (`Agent{Config, Handoffs []To}`, `To{Agent, Filter, Enabled}`); `Team.Config`, `Team.Route` (a `front/responses.Route`, which both fronts' `WithTransfers` take), `Team.Run` (→ end, path), `Team.Resume`, `Team.Handoff` and `Team.Trim` (for the fronts' `WithHandoff` and `WithHandoffTrim`), `Team.MaxHandoffs`, `ErrTooManyHandoffs`, `ToolName`, `RemoveAllTools`, `Dest`; the fronts' `WithMaxHandoffs` and `WithHandoffTrim` |
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`, which implements `agentturn.InputRequired` (`PendingCalls() []WaitingCall`), as `tools/a2a`'s does; `WithAskParent`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)`; a detached call: `tools/a2a.WithDetach(fn)`, `WithPollInterval`, `Answer(final)`, and `CalleeTrigger(callID, task)` (`TriggerCallee`) to deliver its result under; a steer of a working task: `front/a2a.WithDeliverWhileBusy()`, served by `Executor.RequestHandler`, and `tools/a2a.Steer(ctx, client, info, parts…)` |
-| quarantine | `Agent.Quarantine`, `Agent.Quarantined`; `Quarantine(ctx, items…)` from a hook or a tool, `ErrNoQuarantine`, `ErrNotQuarantinable`; `QuarantinedOutput`, the placeholder; `QuarantineFromContext` → `QuarantineView` (`Has`, `Generation`, `Apply`) for a transform, which `compact` reads; `NewQuarantineSet` → `QuarantineSet` (`Add`, `Items`, `Apply`), `ContextWithQuarantineSet` for a host carrying one through `Run` and `Continue`, as `front/responses` does across a handoff's legs |
+| quarantine | `Agent.Quarantine`, `Agent.Quarantined`; `Quarantine(ctx, items…)` from a hook or a tool, `ErrNoQuarantine`, `ErrNotQuarantinable`; `QuarantinedOutput`, the placeholder; `QuarantineFromContext` → `QuarantineView` (`Has`, `Generation`, `Apply`) for a transform, which `compact` reads; `NewQuarantineSet` → `QuarantineSet` (`Add`, `Items`, `Has`, `Apply`), `ContextWithQuarantineSet` for a host carrying one through `Run` and `Continue`, and `WithQuarantineSet` for an `Agent`; `QuarantineSet.Bind` and `Merge` for a front keeping a conversation's set across tasks or requests, as both fronts do; `session` `Recorder.Attach` seeds it from the record's `omit` |
 | the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Queue`, `Deliver`, `Control` (`RecordedControl`, for a front), `Requeue`, `Rebase`; `session.MoveTo` for a rewind; `WithInstructionsParts`, `WithMedia`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`; the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
 
 Every error the package returns to its caller, sentinel or wrapped,

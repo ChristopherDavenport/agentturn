@@ -2,6 +2,7 @@ package agentturn
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -206,12 +207,17 @@ func (v QuarantineView) Apply(items openresponses.Items) openresponses.Items {
 	return v.q.apply(items)
 }
 
-// QuarantineSet is a conversation's quarantine a host holds across the
-// runs of the low-level loop, as an [Agent] holds its own: [Run] and
-// [Continue] given it on their context with [ContextWithQuarantineSet]
-// build every request under it, and a hook or tool of theirs that
-// quarantines adds to it, so the next run over the same conversation,
-// another agent's leg of a handoff included, leaves the same items out.
+// QuarantineSet is a conversation's quarantine a host holds across
+// runs: [Run] and [Continue] given it on their context with
+// [ContextWithQuarantineSet], and an [Agent] given it with
+// [WithQuarantineSet], build every request under it, and a hook or
+// tool of theirs that quarantines adds to it, so the next run over the
+// same conversation, another agent's leg of a handoff included, leaves
+// the same items out. A host that serves a conversation over a wire,
+// a front starting an agent per task or per request, keeps one per
+// conversation and gives each agent the set [QuarantineSet.Bind]
+// returns for the transcript it loaded, so a quarantine made in one
+// task holds in the next (#281).
 type QuarantineSet struct{ q quarantine }
 
 // NewQuarantineSet returns a set quarantining items.
@@ -229,11 +235,92 @@ func (s *QuarantineSet) Add(items ...openresponses.Item) error { return s.q.add(
 // Items returns the quarantined items, in no order.
 func (s *QuarantineSet) Items() openresponses.Items { return s.q.list() }
 
+// Has reports whether item is left out of a request or sent as a
+// placeholder under the set, as [QuarantineView.Has] does.
+func (s *QuarantineSet) Has(item openresponses.Item) bool { return s.q.has(item) }
+
 // Apply returns items as a request carries them under the set, as
 // [QuarantineView.Apply] does: for a front that builds a request itself
 // rather than through the loop.
 func (s *QuarantineSet) Apply(items openresponses.Items) openresponses.Items {
 	return s.q.apply(items)
+}
+
+// Bind returns a new set quarantining each item of t that s holds,
+// itself or a copy of it, equal in its JSON encoding but for the id
+// and status members a relay or a store may set on one copy and not
+// another: the set the next run over t builds under, for a host that
+// keeps a conversation's quarantine across loads of its transcript
+// that decode the items afresh, a store's, or the input a caller sends
+// back with each request. An item equal to a quarantined one is
+// quarantined whichever copy it is. What the run quarantines is added
+// to the set Bind returned, not to s; [QuarantineSet.Merge] keeps it
+// in s for the next load.
+func (s *QuarantineSet) Bind(t Transcript) *QuarantineSet {
+	out := &QuarantineSet{}
+	held := s.q.list()
+	if len(held) == 0 {
+		return out
+	}
+	keys := map[string]bool{}
+	ids := make(map[openresponses.Item]bool, len(held))
+	for _, item := range held {
+		ids[item] = true
+		if key, ok := copyKey(item); ok {
+			keys[key] = true
+		}
+	}
+	var bound openresponses.Items
+	for _, item := range t {
+		if item == nil || !reflect.TypeOf(item).Comparable() {
+			continue
+		}
+		if ids[item] {
+			bound = append(bound, item)
+			continue
+		}
+		if key, ok := copyKey(item); ok && keys[key] {
+			bound = append(bound, item)
+		}
+	}
+	_ = out.q.add(bound...)
+	return out
+}
+
+// copyKey is what two copies of one item share: its JSON encoding with
+// the id and status members left out, which a relay, a provider or a
+// store may set on one copy and not another, and the object's members
+// in order.
+func copyKey(item openresponses.Item) (string, bool) {
+	data, err := json.Marshal(item)
+	if err != nil {
+		return "", false
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		return "", false
+	}
+	delete(members, "id")
+	delete(members, "status")
+	data, err = json.Marshal(members)
+	if err != nil {
+		return "", false
+	}
+	return string(data), true
+}
+
+// Merge adds to s each item o holds of which s holds no copy, as
+// [QuarantineSet.Bind] matches one: what a run under the set [QuarantineSet.Bind]
+// returned quarantined, kept, one copy of each, for the next load of
+// the conversation.
+func (s *QuarantineSet) Merge(o *QuarantineSet) {
+	items := o.Items()
+	known := s.Bind(items)
+	for _, item := range items {
+		if !known.Has(item) {
+			_ = s.q.add(item)
+		}
+	}
 }
 
 type quarantineSetKey struct{}
@@ -314,4 +401,19 @@ func (a *Agent) Quarantine(items ...openresponses.Item) error {
 // conversation, in no order.
 func (a *Agent) Quarantined() openresponses.Items {
 	return a.quarantine.list()
+}
+
+// WithQuarantineSet has the agent hold s as its conversation's
+// quarantine, rather than one of its own: every run builds its
+// requests under s, and [Agent.Quarantine], or a hook or tool of a run
+// that quarantines, adds to it. It is how a host that starts an agent
+// per task or per request over a conversation it keeps, as front/a2a
+// and front/responses do, carries the quarantine from one to the next
+// (RFC 0001 The request, step 3; #281). A nil s is ignored.
+func WithQuarantineSet(s *QuarantineSet) Option {
+	return func(a *Agent) {
+		if s != nil {
+			a.quarantine = &s.q
+		}
+	}
 }
