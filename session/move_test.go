@@ -263,3 +263,49 @@ func TestARebaseTakesAnOwedEntryOnlyWithItsTrigger(t *testing.T) {
 		t.Errorf("owed entries with the person's trigger = %d, want the input queued on its own: %s", user, entryTypes(s))
 	}
 }
+
+// ctxKey marks the context a test hands MoveTo.
+type ctxKey struct{}
+
+// ctxBlobs is a memory store that records whether each blob read for a
+// session ran under a context carrying ctxKey.
+type ctxBlobs struct {
+	*agentsession.MemoryStore
+	reads, marked int
+}
+
+func (c *ctxBlobs) SessionBlob(ctx context.Context, session, hash string) ([]byte, string, error) {
+	c.reads++
+	if ctx.Value(ctxKey{}) != nil {
+		c.marked++
+	}
+	return c.MemoryStore.SessionBlob(ctx, session, hash)
+}
+
+// TestAMoveReadsBlobsUnderItsContext pins the final review of #284 with
+// #220: the blobs MoveTo reads to resolve a sidecar session's media
+// are read under the context it is given, so its deadline or
+// cancellation ends them.
+func TestAMoveReadsBlobsUnderItsContext(t *testing.T) {
+	ctx := context.Background()
+	store := &ctxBlobs{MemoryStore: agentsession.NewMemoryStore()}
+	rec, s, err := Start(ctx, store, agentsession.Header{Media: agentsession.MediaSidecar})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: answers{}, ModelName: "m"})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(ctx, openresponses.UserMessage(&openresponses.InputImage{ImageURL: pngURL([]byte("\x89PNG moved"))})); err != nil {
+		t.Fatal(err)
+	}
+	s, err = store.Open(ctx, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := MoveTo(context.WithValue(ctx, ctxKey{}, true), a, rec, s.Leaf()); err != nil {
+		t.Fatal(err)
+	}
+	if store.reads == 0 || store.marked != store.reads {
+		t.Errorf("MoveTo read %d blobs, %d under its context", store.reads, store.marked)
+	}
+}

@@ -58,7 +58,7 @@ func MoveTo(ctx context.Context, a *agentturn.Agent, r *Recorder, entryID string
 		if s, err = r.store.Open(ctx, r.SessionID()); err != nil {
 			return back(fmt.Errorf("session: move: %w", err))
 		}
-		items, models, pending, owed, ids, err := agentState(s, r.ReadOptions())
+		items, models, pending, owed, ids, err := agentState(s, append(r.ReadOptions(), WithContext(ctx)))
 		if err != nil {
 			return back(fmt.Errorf("session: move: %w", err))
 		}
