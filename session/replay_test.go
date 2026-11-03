@@ -1328,8 +1328,9 @@ func TestOriginReadErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start on a base whose origin cannot be read: %v", err)
 	}
-	if len(rec.ReadOptions()) != 1 {
-		t.Errorf("read options = %d, want the store's", len(rec.ReadOptions()))
+	// The store's origins, and its blobs for a sidecar session.
+	if len(rec.ReadOptions()) != 2 {
+		t.Errorf("read options = %d, want the store's origins and blobs", len(rec.ReadOptions()))
 	}
 	if _, err := Pending(fork, rec.ReadOptions()...); err == nil || !strings.Contains(err.Error(), "disk on fire") {
 		t.Errorf("pending with the origins: err = %v, want the read's", err)
