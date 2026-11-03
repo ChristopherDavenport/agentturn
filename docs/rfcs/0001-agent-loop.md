@@ -1430,7 +1430,11 @@ host's to read, a handoff's transfer above all, and a run the delivery
 started would answer under the sender's configuration and race the
 host's switch to the receiver. It leaves the item queued for the
 host's next run, the receiver's, which takes it before its first model
-call, and says so (#274, #290). A run
+call, and says so (#274, #290). A host that reads the result and
+follows no handoff, or stops at its bound, MUST then start a run that
+takes a delivery so left, under the configuration the agent holds, a
+transfer that run ends on past the bound not followed, so the delivery
+is not left for an input that may never come. A run
 that drained it and ended before the next request, on a guard, a
 cancellation or a failure, leaves it in the transcript unanswered,
 and the delivery reports that run's end rather than start another. The

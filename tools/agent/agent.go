@@ -473,7 +473,9 @@ func WithRunContext(fn func(ctx context.Context, callID string) context.Context)
 // receiver's run the host starts, handoff.Team's, front/a2a's relay
 // under WithHandoff, or the host's own Continue after its SetConfig,
 // takes it before its first model call; one that arrives while the
-// receiver's run is in flight joins it. fn treats ErrTerminated as
+// receiver's run is in flight joins it. A host that follows no handoff
+// on that stop, or stops at its bound, starts a run that takes it:
+// handoff.Team and front/a2a's relay do. fn treats ErrTerminated as
 // delivered, not as a failure.
 //
 // The child runs on agentturn.RunContext of the call, so an abort of

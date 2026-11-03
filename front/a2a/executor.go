@@ -789,12 +789,29 @@ func (e *Executor) relay(ctx, runCtx context.Context, cancel context.CancelFunc,
 				end, err = agent.Continue(agentturn.ContextWithTrigger(runCtx, trigger))
 				continue
 			}
+			if terminated(end) && agent.State().Steering > 0 {
+				// A delivery the terminating stop left queued, for which
+				// the agent started no run (agentturn.ErrTerminated), is
+				// taken by a run of this task: the task's agent goes with
+				// the task (#290).
+				end, err = agent.Continue(runCtx)
+				continue
+			}
 			return out
 		}
 		if handoffs == limit {
 			// The caller is told, not answered with the transfer's
 			// text: the agents handed the task back and forth.
 			out.bounded = fmt.Errorf("%w: the agents handed the task on %d times and %s would hand it to %s again; stopped", ErrTooManyHandoffs, limit, agent.Config().Name, next.Name)
+			if agent.State().Steering > 0 {
+				// A delivery waiting on the agent is taken in one run
+				// under the configuration it holds, whose own transfer
+				// is not followed, before the task fails (#290).
+				if end, _ = agent.Continue(runCtx); end != nil {
+					out.end = end
+					out.items = append(out.items, end.Items...)
+				}
+			}
 			e.outstanding(rt, nil)
 			return out
 		}

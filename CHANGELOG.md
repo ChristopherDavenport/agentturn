@@ -35,7 +35,10 @@ versions may break the API.
   `ErrRunning`. A host whose terminating result was the run's answer
   starts the run with `Continue`. `front/control` carries the
   `terminated` code; the `WithDetach` docs of `tools/agent` and
-  `tools/a2a` say so. (#244, #274, #290)
+  `tools/a2a` say so. When no handoff follows the stop, or the handoff
+  bound stops it, `handoff.Team` and `front/a2a`'s relay continue the
+  agent so it takes the queued delivery, past the bound in one run
+  whose own transfer is not followed. (#244, #274, #290)
 - Fixed: a quarantine holds for the rest of a conversation served over
   a wire. `front/a2a` keeps each conversation's quarantine across its
   tasks, and `front/responses` across the requests the new

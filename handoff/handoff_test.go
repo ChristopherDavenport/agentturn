@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
@@ -425,4 +426,113 @@ func TestATeamTrimsOverAFront(t *testing.T) {
 	if len(refundReqs.seen) != 2 || itemTypes(refundReqs.seen[1].Input) != "user assistant developer assistant user" {
 		t.Errorf("receiver's next input = %v, want it trimmed as the first", refundReqs.seen)
 	}
+}
+
+// handsOn calls its tool when the last input is the user saying "go",
+// or, with always, whenever the last input is not a user message, and
+// otherwise answers; it keeps the user texts it was sent.
+type handsOn struct {
+	tool   string
+	always bool
+	seen   *[]string
+}
+
+func (m handsOn) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	msg, user := req.Input[len(req.Input)-1].(*openresponses.Message)
+	user = user && msg.Role == openresponses.RoleUser
+	if user {
+		*m.seen = append(*m.seen, msg.Text())
+	}
+	if user && msg.Text() == "go" || !user && m.always {
+		w, err := em.FunctionCall("", m.tool)
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(`{}`); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	if err := em.Item(openresponses.AssistantText("ok")); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// deliverAtEnd delivers text to a when the run of the configuration
+// named from ends, and waits until the item is queued.
+func deliverAtEnd(a *agentturn.Agent, from, text string) <-chan error {
+	done := make(chan error, 1)
+	delivered := false
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if _, ok := ev.(*agentturn.RunEnd); !ok || delivered || a.Config().Name != from {
+			return nil
+		}
+		delivered = true
+		go func() {
+			_, _, err := a.Deliver(context.Background(), openresponses.UserText(text))
+			done <- err
+		}()
+		for a.State().Steering == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		return nil
+	})
+	return done
+}
+
+// TestADeliveryAfterATerminatingEndIsTaken pins the round-two review
+// of #274 × #290: a delivery left queued by a run that ended on a
+// terminating result the team does not hand off on, a tool's own
+// answer or a transfer past the bound, is taken by a run the team
+// starts for it, rather than waiting for the next input.
+func TestADeliveryAfterATerminatingEndIsTaken(t *testing.T) {
+	finish := agenttool.NewFunc("finish", "answers for the model", json.RawMessage(`{"type":"object"}`),
+		func(context.Context, agenttool.Call) (agenttool.Result, error) {
+			return agenttool.Result{Output: openresponses.FunctionCallOutputData{Text: "finished"}, Terminate: true}, nil
+		})
+	t.Run("declined", func(t *testing.T) {
+		var seen []string
+		team, err := New(Agent{Config: agentturn.Config{Name: "A", Model: handsOn{tool: "finish", seen: &seen}, Tools: []agenttool.Tool{finish}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := agentturn.New(team.Config("A"))
+		done := deliverAtEnd(a, "A", "the build passed")
+		if _, _, err := team.Run(context.Background(), a, openresponses.UserText("go")); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err != nil && !errors.Is(err, agentturn.ErrTerminated) {
+			t.Fatalf("Deliver: %v", err)
+		}
+		if strings.Join(seen, "|") != "go|the build passed" {
+			t.Errorf("the model was sent %q, want the delivery taken", seen)
+		}
+	})
+	t.Run("at the bound", func(t *testing.T) {
+		var seenA, seenB []string
+		team, err := New(
+			Agent{Config: agentturn.Config{Name: "A", Model: handsOn{tool: ToolName("B"), seen: &seenA}}, Handoffs: []To{{Agent: "B"}}},
+			Agent{Config: agentturn.Config{Name: "B", Model: handsOn{tool: ToolName("A"), always: true, seen: &seenB}}, Handoffs: []To{{Agent: "A"}}},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		team.MaxHandoffs = 1
+		a := agentturn.New(team.Config("A"))
+		done := deliverAtEnd(a, "B", "the build passed")
+		if _, _, err := team.Run(context.Background(), a, openresponses.UserText("go")); !errors.Is(err, ErrTooManyHandoffs) {
+			t.Fatalf("err = %v, want ErrTooManyHandoffs", err)
+		}
+		if err := <-done; err != nil && !errors.Is(err, agentturn.ErrTerminated) {
+			t.Fatalf("Deliver: %v", err)
+		}
+		if strings.Join(seenA, "|") != "go|the build passed" {
+			t.Errorf("A, which the last transfer handed to, was sent %q, want the delivery taken", seenA)
+		}
+	})
 }

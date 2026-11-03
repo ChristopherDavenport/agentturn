@@ -61,8 +61,12 @@ import (
 // unrun: the agent is switched to its receiver, with the handoff's
 // trim, as a front's WithTransfers starts the next input with the
 // receiver the transcript names, so the next prompt goes to the same
-// agent either way. It is front/responses' ErrTooManyHandoffs, which
-// the fronts return at their own bound.
+// agent either way. A delivery waiting on the agent is the exception:
+// the receiver takes it in one run, whose own transfer, if it ends on
+// one, is not followed. A run that ends on a terminating result no
+// handoff follows, with a delivery waiting, is continued so the agent
+// takes it. It is front/responses' ErrTooManyHandoffs, which the
+// fronts return at their own bound.
 var ErrTooManyHandoffs = responses.ErrTooManyHandoffs
 
 // To is one handoff an agent offers.
@@ -287,7 +291,16 @@ func (t *Team) follow(ctx context.Context, a *agentturn.Agent, path []string, en
 	for n := 0; err == nil && terminated(end); n++ {
 		to, ok := t.Handoff(ctx, end, nil)
 		if !ok {
-			break
+			if a.State().Steering == 0 {
+				break
+			}
+			// A delivery the terminating stop left queued, which the
+			// agent did not start a run for (agentturn.ErrTerminated),
+			// is the agent's to take: with no handoff to follow, the
+			// team runs it now rather than at the next input (#290).
+			end, err = a.Continue(ctx)
+			n--
+			continue
 		}
 		from := a.Config()
 		if _, filtered := t.filters[[2]string{from.Name, to.Name}]; filtered {
@@ -306,12 +319,23 @@ func (t *Team) follow(ctx context.Context, a *agentturn.Agent, path []string, en
 			// writes it (#276).
 			note = responses.HandoffNote(ToolName(to.Name), from, to)
 		}
+		handed := agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff", Ref: from.Name})
 		if n == limit {
 			// Taken, not run: the receiver has the conversation, as
-			// the transcript says, and answers the next input.
-			return end, path, fmt.Errorf("%w: %d followed, and %s would hand to %s again", ErrTooManyHandoffs, limit, from.Name, to.Name)
+			// the transcript says, and answers the next input, unless
+			// a delivery is waiting, which it takes now in one run
+			// whose own transfer is not followed (#290).
+			bounded := fmt.Errorf("%w: %d followed, and %s would hand to %s again", ErrTooManyHandoffs, limit, from.Name, to.Name)
+			if a.State().Steering == 0 {
+				return end, path, bounded
+			}
+			if note != nil {
+				end, err = a.Prompt(handed, note)
+			} else {
+				end, err = a.Continue(handed)
+			}
+			return end, path, errors.Join(bounded, err)
 		}
-		handed := agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: "handoff", Ref: from.Name})
 		if note != nil {
 			end, err = a.Prompt(handed, note)
 		} else {

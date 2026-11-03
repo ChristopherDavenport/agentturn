@@ -247,7 +247,9 @@ func WithInputRounds(n int) Option { return func(r *remote) { r.inputRounds = n 
 // receiver's run the host starts, handoff.Team's, front/a2a's relay
 // under WithHandoff, or the host's own Continue after its SetConfig,
 // takes it before its first model call; one that arrives while the
-// receiver's run is in flight joins it. fn treats ErrTerminated as
+// receiver's run is in flight joins it. A host that follows no handoff
+// on that stop, or stops at its bound, starts a run that takes it:
+// handoff.Team and front/a2a's relay do. fn treats ErrTerminated as
 // delivered, not as a failure.
 func WithDetach(fn func(callID string, info TaskInfo, final *a2a.Task, err error)) Option {
 	return func(r *remote) { r.detach = fn }
