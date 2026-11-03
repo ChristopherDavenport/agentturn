@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 
 	"github.com/ChristopherDavenport/agentsession"
@@ -651,5 +652,22 @@ func (w *writer) quarantinedIn(t agentturn.Transcript) openresponses.Items {
 	if err != nil {
 		return nil
 	}
-	return set.Bind(t).Items()
+	// In a sidecar session the record holds media as sidecar:
+	// references and the agent as data URLs: t is bound in the form the
+	// record holds, and each match is the agent's own item.
+	conv := make(agentturn.Transcript, len(t))
+	back := map[openresponses.Item]openresponses.Item{}
+	for k, item := range t {
+		conv[k] = w.recordForm(item)
+		if item != nil && reflect.TypeOf(item).Comparable() && reflect.TypeOf(conv[k]).Comparable() && conv[k] != item {
+			back[conv[k]] = item
+		}
+	}
+	bound := set.Bind(conv).Items()
+	for k, item := range bound {
+		if orig, ok := back[item]; ok {
+			bound[k] = orig
+		}
+	}
+	return bound
 }
