@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"iter"
 	"maps"
+	"sync"
 
 	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/openresponses"
@@ -90,6 +91,11 @@ type running struct {
 	agent     *agentturn.Agent
 	// via is the [Redeliverer] the task's RecorderFor returned, or nil.
 	via Redeliverer
+	// mu guards open and steered, and is held across a steer's
+	// hand-over, a recorder's durable write among it, so no other
+	// conversation waits on that write: the executor's own lock is
+	// taken only inside it, never around it.
+	mu sync.Mutex
 	// open is whether the task still takes a steer; it is closed in the
 	// same step as the check that finds none outstanding.
 	open    bool
@@ -115,19 +121,24 @@ type steer struct {
 // task now answers, through via when the task's RecorderFor gave one.
 // It returns the task's record.
 func (e *Executor) track(ctx context.Context, task a2a.TaskID, contextID string, agent *agentturn.Agent, via Redeliverer) *running {
+	rt := &running{task: task, contextID: contextID, agent: agent, via: via, open: true}
+	// The owed steers go first: a steer that finds the task meanwhile
+	// waits on rt.mu.
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if e.running == nil {
 		e.running = map[a2a.TaskID]*running{}
 	}
-	rt := &running{task: task, contextID: contextID, agent: agent, via: via, open: true}
-	for _, s := range e.owed[contextID].steers {
+	owed := e.owed[contextID].steers
+	delete(e.owed, contextID)
+	e.running[task] = rt
+	e.mu.Unlock()
+	for _, s := range owed {
 		if rt.redeliver(agentturn.ContextWithTrigger(ctx, s.trigger), s.item) == nil {
 			rt.steered = append(rt.steered, s)
 		}
 	}
-	delete(e.owed, contextID)
-	e.running[task] = rt
 	return rt
 }
 
@@ -141,7 +152,7 @@ func (rt *running) redeliver(ctx context.Context, items ...openresponses.Item) e
 }
 
 // untaken drops from rt's steers the ones its agent has taken, and
-// returns the rest. The caller holds e.mu.
+// returns the rest. The caller holds rt.mu.
 func (rt *running) untaken() []steer {
 	queued := map[openresponses.Item]bool{}
 	for _, item := range rt.agent.State().Steered {
@@ -160,11 +171,14 @@ func (rt *running) untaken() []steer {
 // untrack forgets task's running agent.
 func (e *Executor) untrack(task a2a.TaskID) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if rt := e.running[task]; rt != nil {
-		rt.open = false
-	}
+	rt := e.running[task]
 	delete(e.running, task)
+	e.mu.Unlock()
+	if rt != nil {
+		rt.mu.Lock()
+		rt.open = false
+		rt.mu.Unlock()
+	}
 }
 
 // outstanding reports the trigger to continue rt's agent under when a
@@ -178,14 +192,16 @@ func (e *Executor) outstanding(rt *running, end *agentturn.RunEnd) (agentturn.Tr
 	if rt == nil {
 		return agentturn.Trigger{}, false
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
 	left := rt.untaken()
 	if len(left) > 0 && end != nil && (end.Reason == agentturn.ReasonDone || end.Reason == agentturn.ReasonStopped) {
 		return left[0].trigger, true
 	}
 	rt.open = false
 	if len(left) > 0 && end != nil && end.Reason == agentturn.ReasonInputRequired {
+		e.mu.Lock()
+		defer e.mu.Unlock()
 		if e.owed == nil {
 			e.owed = map[string]owedSteers{}
 		}
@@ -242,8 +258,8 @@ func (e *Executor) deliver(ctx context.Context, msg *a2a.Message) (bool, error) 
 	// a recorder that takes a steer it already owes only once.
 	trigger := steerTrigger(agentturn.TriggerFromContext(ctx), msg.ID)
 	ctx = agentturn.ContextWithTrigger(ctx, trigger)
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
 	if !rt.open {
 		return false, nil
 	}

@@ -609,3 +609,75 @@ func TestTwoSteersWithOneTextAreTwo(t *testing.T) {
 		}
 	}
 }
+
+// blocking is a Redeliverer whose write takes until it is released.
+type blocking struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (r *blocking) Redeliver(ctx context.Context, a *agentturn.Agent, items ...openresponses.Item) error {
+	close(r.entered)
+	<-r.release
+	return a.Redeliver(ctx, items...)
+}
+
+// TestASlowSteerWriteHoldsUpNoOtherConversation pins the round-two
+// review of #287 × #244: while a recorder writes a steer into one
+// task, durably and slowly, another conversation's message is served,
+// since the executor does not hold its own lock across the write.
+func TestASlowSteerWriteHoldsUpNoOtherConversation(t *testing.T) {
+	model := &worksOnce{}
+	entered, release := make(chan struct{}), make(chan struct{})
+	work := agenttool.New("work", "works until released", func(ctx context.Context, _ struct{}) (string, error) {
+		select {
+		case <-entered:
+			return "worked", nil
+		default:
+		}
+		close(entered)
+		<-release
+		return "worked", nil
+	})
+	via := &blocking{entered: make(chan struct{}), release: make(chan struct{})}
+	recorded := func(ctx context.Context, _ string, _ *agentturn.Agent) (context.Context, func(), error) {
+		return ContextWithRedeliverer(ctx, via), nil, nil
+	}
+	h := New(agentturn.Config{Model: model, Tools: []agenttool.Tool{work}}, WithDeliverWhileBusy(), WithRecorderFor(recorded)).RequestHandler()
+	first := userMessage("lint the repo")
+	first.ContextID = "c1"
+	res, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: first, Config: nonBlocking})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := res.(*a2a.Task)
+	<-entered
+	steered := make(chan error, 1)
+	go func() {
+		steer := a2a.NewMessageForTask(a2a.MessageRoleUser, task, a2a.TextPart{Text: "also check the cache"})
+		_, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: steer, Config: nonBlocking})
+		steered <- err
+	}()
+	<-via.entered
+	other := make(chan error, 1)
+	go func() {
+		msg := userMessage("hello")
+		msg.ContextID = "c2"
+		_, err := h.OnSendMessage(context.Background(), &a2a.MessageSendParams{Message: msg, Config: nonBlocking})
+		other <- err
+	}()
+	select {
+	case err := <-other:
+		if err != nil {
+			t.Errorf("the other conversation: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("the other conversation waited on the steer's write")
+	}
+	close(via.release)
+	if err := <-steered; err != nil {
+		t.Errorf("steer: %v", err)
+	}
+	close(release)
+	finalTask(t, h, task.ID)
+}
