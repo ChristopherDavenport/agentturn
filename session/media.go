@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"slices"
@@ -37,11 +38,35 @@ func (r *Recorder) blobWriter() agentsession.BlobWriter {
 	return bw
 }
 
+// blobReader is the reader a sidecar session's blobs are read back
+// through: the writer [WithMedia] names when it reads too, else the
+// store when it is an agentsession.BlobReader, as every agentsession
+// store is; nil when neither reads.
+func (r *Recorder) blobReader() agentsession.BlobReader {
+	if br, ok := r.blobs.(agentsession.BlobReader); ok {
+		return br
+	}
+	br, _ := r.store.(agentsession.BlobReader)
+	return br
+}
+
+// blob is one inline medium a sidecar session stores: its bytes, and
+// the media type its data URL carried, "" for none.
+type blob struct {
+	data      []byte
+	mediaType string
+}
+
 // sidecar returns item as the writer's session records it: in a sidecar
 // session, with each inline image or file among its parts stored as a
 // blob, before the entry that names it, and named by its sidecar:
 // reference; item itself in an inline session and for an item with no
-// inline media. The item the loop holds is not changed (#284).
+// inline media. The item the loop holds is not changed (#284). A blob
+// is stored with the media type of the data URL it replaced, through
+// agentsession.TypedBlobWriter when the writer is one, and the session
+// is given that type for it when the store holds types per session
+// (agentsession.SessionBlobTyper), so a resume reads each reference
+// back as the data URL it was.
 func (w *writer) sidecar(ctx context.Context, item openresponses.Item) (openresponses.Item, error) {
 	if w.media != agentsession.MediaSidecar || item == nil {
 		return item, nil
@@ -54,19 +79,47 @@ func (w *writer) sidecar(ctx context.Context, item openresponses.Item) (openresp
 	if bw == nil {
 		return nil, fmt.Errorf("session: media of a sidecar session: %w", agentsession.ErrNoBlobWriter)
 	}
+	var types map[string]string
 	for _, b := range blobs {
-		hash := agentsession.HashBytes(b)
-		if w.rec.stored[hash] {
-			continue
+		hash := agentsession.HashBytes(b.data)
+		if !w.rec.stored[hash] {
+			var got string
+			var err error
+			if tw, ok := bw.(agentsession.TypedBlobWriter); ok {
+				got, err = tw.PutTypedBlob(ctx, b.data, b.mediaType)
+			} else {
+				got, err = bw.PutBlob(ctx, b.data)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("session: store blob: %w", err)
+			}
+			if got != hash {
+				return nil, fmt.Errorf("session: store blob: stored as %s, its bytes hash to %s", got, hash)
+			}
+			w.rec.stored[hash] = true
 		}
-		got, err := bw.PutBlob(ctx, b)
-		if err != nil {
-			return nil, fmt.Errorf("session: store blob: %w", err)
+		if b.mediaType != "" && !w.typed[hash] {
+			if types == nil {
+				types = map[string]string{}
+			}
+			if _, ok := types[hash]; !ok {
+				types[hash] = b.mediaType
+			}
 		}
-		if got != hash {
-			return nil, fmt.Errorf("session: store blob: stored as %s, its bytes hash to %s", got, hash)
+	}
+	// The session's own type for each blob, where the blobs are the
+	// store's: a type the store holds per blob is the first it was
+	// given, which another session may have given these bytes.
+	if typer, ok := w.rec.store.(agentsession.SessionBlobTyper); ok && w.rec.blobs == nil && len(types) > 0 {
+		if err := typer.SetSessionBlobTypes(ctx, w.id, types); err != nil {
+			return nil, fmt.Errorf("session: blob types: %w", err)
 		}
-		w.rec.stored[hash] = true
+	}
+	for hash := range types {
+		if w.typed == nil {
+			w.typed = map[string]bool{}
+		}
+		w.typed[hash] = true
 	}
 	return conv, nil
 }
@@ -89,86 +142,117 @@ var mediaKeys = map[string]bool{"image_url": true, "video_url": true, "file_url"
 // sidecarForm returns a copy of item with each inline medium it carries,
 // a data URL in an image, video or file part or in any member those
 // names give an item type the library does not model, replaced by the
-// sidecar: reference to its bytes, and those bytes, in order; item
-// itself and no bytes when it carries none.
-func sidecarForm(item openresponses.Item) (openresponses.Item, [][]byte) {
-	switch v := item.(type) {
-	case *openresponses.Message:
-		parts, blobs := sidecarParts(v.Content)
-		if blobs == nil {
-			return item, nil
+// sidecar: reference to its bytes, and those bytes with their types, in
+// order; item itself and no blobs when it carries none. A data URL
+// whose type is not one a store keeps stays inline.
+func sidecarForm(item openresponses.Item) (openresponses.Item, []blob) {
+	var blobs []blob
+	conv, changed, _ := mapMedia(item, "data:", func(url string) (string, bool, error) {
+		b, ok := inlineBlob(url)
+		if !ok {
+			return url, false, nil
 		}
-		cp := *v
-		cp.Content = parts
-		return &cp, blobs
-	case *openresponses.FunctionCallOutput:
-		if v.Output.Parts == nil {
-			return item, nil
-		}
-		parts, blobs := sidecarParts(v.Output.Parts)
-		if blobs == nil {
-			return item, nil
-		}
-		cp := *v
-		cp.Output = openresponses.FunctionCallOutputData{Parts: parts}
-		return &cp, blobs
-	}
-	// Any other item, a provider's computer_call_output among them, by
-	// its JSON: the members that carry media are named alike.
-	data, err := json.Marshal(item)
-	if err != nil || !bytes.Contains(data, []byte(`"data:`)) {
-		return item, nil
-	}
-	raw, blobs := sidecarJSON(data)
-	if blobs == nil {
-		return item, nil
-	}
-	conv, err := openresponses.UnmarshalItem(raw)
-	if err != nil {
+		blobs = append(blobs, b)
+		return sidecarScheme + agentsession.HashBytes(b.data), true, nil
+	})
+	if !changed {
 		return item, nil
 	}
 	return conv, blobs
 }
 
-// sidecarParts is parts with each inline medium replaced, as
-// sidecarForm does, and nil bytes when none was.
-func sidecarParts(parts openresponses.Contents) (openresponses.Contents, [][]byte) {
-	var out openresponses.Contents
-	var blobs [][]byte
-	ref := func(url string) (string, bool) {
-		data, ok := dataURLBytes(url)
-		if !ok {
-			return url, false
+// mapMedia returns a copy of item with f applied to each medium it
+// carries, the URL or data of an image, video or file part of a message
+// or a function call output, or of any member [mediaKeys] names at any
+// depth of an item or part type the library does not model, which is
+// read when its JSON holds marker; item itself and false when f
+// changed none. f returns the value to carry and whether it differs.
+func mapMedia(item openresponses.Item, marker string, f func(string) (string, bool, error)) (openresponses.Item, bool, error) {
+	switch v := item.(type) {
+	case *openresponses.Message:
+		parts, changed, err := mapParts(v.Content, marker, f)
+		if err != nil || !changed {
+			return item, false, err
 		}
-		blobs = append(blobs, data)
-		return sidecarScheme + agentsession.HashBytes(data), true
+		cp := *v
+		cp.Content = parts
+		return &cp, true, nil
+	case *openresponses.FunctionCallOutput:
+		if v.Output.Parts == nil {
+			return item, false, nil
+		}
+		parts, changed, err := mapParts(v.Output.Parts, marker, f)
+		if err != nil || !changed {
+			return item, false, err
+		}
+		cp := *v
+		cp.Output = openresponses.FunctionCallOutputData{Parts: parts}
+		return &cp, true, nil
 	}
+	// Any other item, a provider's computer_call_output among them, by
+	// its JSON: the members that carry media are named alike.
+	data, err := json.Marshal(item)
+	if err != nil || !bytes.Contains(data, []byte(`"`+marker)) {
+		return item, false, nil
+	}
+	raw, changed, err := mapJSON(data, marker, f)
+	if err != nil || !changed {
+		return item, false, err
+	}
+	conv, err := openresponses.UnmarshalItem(raw)
+	if err != nil {
+		return item, false, nil
+	}
+	return conv, true, nil
+}
+
+// mapParts is parts with f applied to each medium, as mapMedia does,
+// and false when f changed none.
+func mapParts(parts openresponses.Contents, marker string, f func(string) (string, bool, error)) (openresponses.Contents, bool, error) {
+	var out openresponses.Contents
 	for k, p := range parts {
 		var conv openresponses.Content
 		switch v := p.(type) {
 		case *openresponses.InputImage:
-			if u, ok := ref(v.ImageURL); ok {
+			u, ok, err := f(v.ImageURL)
+			if err != nil {
+				return parts, false, err
+			}
+			if ok {
 				cp := *v
 				cp.ImageURL = u
 				conv = &cp
 			}
 		case *openresponses.InputVideo:
-			if u, ok := ref(v.VideoURL); ok {
+			u, ok, err := f(v.VideoURL)
+			if err != nil {
+				return parts, false, err
+			}
+			if ok {
 				cp := *v
 				cp.VideoURL = u
 				conv = &cp
 			}
 		case *openresponses.InputFile:
 			cp := *v
-			d, okData := ref(v.FileData)
-			u, okURL := ref(v.FileURL)
+			d, okData, err := f(v.FileData)
+			if err != nil {
+				return parts, false, err
+			}
+			u, okURL, err := f(v.FileURL)
+			if err != nil {
+				return parts, false, err
+			}
 			if okData || okURL {
 				cp.FileData, cp.FileURL = d, u
 				conv = &cp
 			}
 		case *openresponses.UnknownContent:
-			if raw, b := sidecarJSON(v.Raw); b != nil {
-				blobs = append(blobs, b...)
+			raw, ok, err := mapJSON(v.Raw, marker, f)
+			if err != nil {
+				return parts, false, err
+			}
+			if ok {
 				conv = &openresponses.UnknownContent{Type: v.Type, Raw: raw}
 			}
 		}
@@ -181,77 +265,205 @@ func sidecarParts(parts openresponses.Contents) (openresponses.Contents, [][]byt
 		out[k] = conv
 	}
 	if out == nil {
-		return parts, nil
+		return parts, false, nil
 	}
-	return out, blobs
+	return out, true, nil
 }
 
-// sidecarJSON is a JSON value with each data URL a media member holds,
-// at any depth, replaced by its sidecar: reference, and the bytes, in
-// document order; the value as given and nil when it holds none.
-func sidecarJSON(raw []byte) ([]byte, [][]byte) {
-	if !bytes.Contains(raw, []byte(`"data:`)) {
-		return raw, nil
+// mapJSON is a JSON value with f applied to each string a media member
+// holds, at any depth, in document order, and false when f changed
+// none or the value is not one marker is found in.
+func mapJSON(raw []byte, marker string, f func(string) (string, bool, error)) ([]byte, bool, error) {
+	if !bytes.Contains(raw, []byte(`"`+marker)) {
+		return raw, false, nil
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var v any
 	if err := dec.Decode(&v); err != nil {
-		return raw, nil
+		return raw, false, nil
 	}
-	var blobs [][]byte
-	var walk func(any)
-	walk = func(v any) {
+	changed := false
+	var walk func(any) error
+	walk = func(v any) error {
 		switch x := v.(type) {
 		case map[string]any:
 			for _, k := range sortedKeys(x) {
 				if s, ok := x[k].(string); ok && mediaKeys[k] {
-					if data, ok := dataURLBytes(s); ok {
-						x[k] = sidecarScheme + agentsession.HashBytes(data)
-						blobs = append(blobs, data)
+					u, ok, err := f(s)
+					if err != nil {
+						return err
+					}
+					if ok {
+						x[k], changed = u, true
 					}
 					continue
 				}
-				walk(x[k])
+				if err := walk(x[k]); err != nil {
+					return err
+				}
 			}
 		case []any:
 			for _, e := range x {
-				walk(e)
+				if err := walk(e); err != nil {
+					return err
+				}
 			}
 		}
+		return nil
 	}
-	walk(v)
-	if blobs == nil {
-		return raw, nil
+	if err := walk(v); err != nil {
+		return raw, false, err
+	}
+	if !changed {
+		return raw, false, nil
 	}
 	out, err := json.Marshal(v)
 	if err != nil {
-		return raw, nil
+		return raw, false, nil
 	}
-	return out, blobs
+	return out, true, nil
 }
 
-// dataURLBytes returns the bytes a data URL carries, base64 or
-// percent-encoded, and false for anything else.
-func dataURLBytes(s string) ([]byte, bool) {
+// inlineBlob returns the medium a data URL carries, base64 or
+// percent-encoded, with its media type as a store keeps it: the type
+// before ";base64", "text/plain;charset=US-ASCII" when it names none,
+// as RFC 2397 has it, and "" for application/octet-stream. It reports
+// false for anything else, and for a data URL whose type a store
+// refuses, which stays inline, as agentsession RFC 0002 has an item
+// that needs a type of its own do.
+func inlineBlob(s string) (blob, bool) {
 	rest, ok := strings.CutPrefix(s, "data:")
 	if !ok {
-		return nil, false
+		return blob{}, false
 	}
 	meta, payload, ok := strings.Cut(rest, ",")
 	if !ok {
-		return nil, false
+		return blob{}, false
 	}
-	if strings.HasSuffix(meta, ";base64") {
-		data, err := base64.StdEncoding.DecodeString(payload)
+	var data []byte
+	if mt, ok := strings.CutSuffix(meta, ";base64"); ok {
+		d, err := base64.StdEncoding.DecodeString(payload)
 		if err != nil {
-			return nil, false
+			return blob{}, false
 		}
-		return data, true
+		data, meta = d, mt
+	} else {
+		d, err := url.PathUnescape(payload)
+		if err != nil {
+			return blob{}, false
+		}
+		data = []byte(d)
 	}
-	data, err := url.PathUnescape(payload)
+	switch {
+	case meta == "":
+		meta = "text/plain;charset=US-ASCII"
+	case strings.HasPrefix(meta, ";"):
+		meta = "text/plain" + meta
+	}
+	mt, err := agentsession.BlobMediaType(meta)
 	if err != nil {
-		return nil, false
+		return blob{}, false
 	}
-	return []byte(data), true
+	return blob{data: data, mediaType: mt}, true
+}
+
+// ErrNoBlobReader is returned when a sidecar session's items are read
+// to hand to an agent, by [AgentOptions], [Transcript] and the rest, and
+// one names a blob with no blob reader given to resolve it: an agent
+// handed a sidecar: URL would send it to a provider, which cannot
+// resolve it. [WithBlobs], or [Recorder.ReadOptions], gives one.
+var ErrNoBlobReader = errors.New("session: a sidecar: reference and no blob reader to resolve it")
+
+// WithBlobs has [AgentOptions], [Transcript], [TranscriptModels],
+// [Pending], [OwedNotes] and [ReplayAnswers] read a sidecar session's
+// blobs through br, resolving each sidecar: reference among the items
+// they hand back to a base64 data URL of the blob's media type, as the
+// session holds it ([agentsession.ReadSessionBlob]), and of
+// application/octet-stream for a blob held with none, so no sidecar:
+// URL reaches the agent or a provider. Without it they refuse a
+// sidecar session's item that names a blob, with [ErrNoBlobReader].
+// [Recorder.ReadOptions] carries the recorder's reader.
+func WithBlobs(br agentsession.BlobReader) ReadOption {
+	return ReadOption{apply: func(o *origins) { o.blobs = br }}
+}
+
+// mediaResolver resolves the sidecar: references of a sidecar
+// session's items to data URLs, each blob read once.
+type mediaResolver struct {
+	ctx  context.Context
+	br   agentsession.BlobReader
+	urls map[string]string
+}
+
+// resolverFor is the resolver for s read with opts, nil for a session
+// whose media is inline, whose items name no blob.
+func resolverFor(s *agentsession.Session, opts []ReadOption) *mediaResolver {
+	if s == nil || s.Header().Media != agentsession.MediaSidecar {
+		return nil
+	}
+	o := &origins{ctx: context.Background()}
+	for _, opt := range opts {
+		if opt.apply != nil {
+			opt.apply(o)
+		}
+	}
+	return &mediaResolver{ctx: o.ctx, br: o.blobs, urls: map[string]string{}}
+}
+
+// item is item with each sidecar: reference it carries resolved as
+// session holds the blob; item itself when it carries none, and for a
+// nil resolver.
+func (m *mediaResolver) item(session string, item openresponses.Item) (openresponses.Item, error) {
+	if m == nil || item == nil {
+		return item, nil
+	}
+	conv, _, err := mapMedia(item, sidecarScheme, func(ref string) (string, bool, error) {
+		hash, ok := strings.CutPrefix(ref, sidecarScheme)
+		if !ok {
+			return ref, false, nil
+		}
+		u, err := m.dataURL(session, hash)
+		return u, err == nil, err
+	})
+	return conv, err
+}
+
+// items resolves each of items in place, as item does.
+func (m *mediaResolver) items(session string, items openresponses.Items) error {
+	for i, item := range items {
+		conv, err := m.item(session, item)
+		if err != nil {
+			return err
+		}
+		items[i] = conv
+	}
+	return nil
+}
+
+// dataURL is the data URL the blob hash resolves to as session holds it.
+func (m *mediaResolver) dataURL(session, hash string) (string, error) {
+	key := session + "\x00" + hash
+	if u, ok := m.urls[key]; ok {
+		return u, nil
+	}
+	if m.br == nil {
+		return "", fmt.Errorf("%w: %s%s in session %s", ErrNoBlobReader, sidecarScheme, hash, session)
+	}
+	data, mt, err := agentsession.ReadSessionBlob(m.ctx, m.br, session, hash)
+	if err != nil {
+		return "", fmt.Errorf("session: blob %s of session %s: %w", hash, session, err)
+	}
+	if got := agentsession.HashBytes(data); got != hash {
+		return "", fmt.Errorf("session: blob %s of session %s hashes to %s: %w", hash, session, got, agentsession.ErrBlobMismatch)
+	}
+	if mt, err = agentsession.BlobMediaType(mt); err != nil {
+		return "", fmt.Errorf("session: blob %s of session %s: %w", hash, session, err)
+	}
+	if mt == "" {
+		mt = agentsession.DefaultMediaType
+	}
+	u := "data:" + mt + ";base64," + base64.StdEncoding.EncodeToString(data)
+	m.urls[key] = u
+	return u, nil
 }

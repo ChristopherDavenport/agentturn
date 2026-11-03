@@ -4,16 +4,22 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/ChristopherDavenport/agentsession"
+	"github.com/ChristopherDavenport/agentsession/remote"
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
 	"github.com/ChristopherDavenport/agentturn/tools/agent"
 	"github.com/ChristopherDavenport/openresponses"
+	"github.com/ChristopherDavenport/openresponses/echo"
 )
 
 // screenshots are the images the shot tool returns in turn: two
@@ -82,6 +88,11 @@ type countingBlobs struct {
 func (c *countingBlobs) PutBlob(ctx context.Context, data []byte) (string, error) {
 	c.puts++
 	return c.MemoryStore.PutBlob(ctx, data)
+}
+
+func (c *countingBlobs) PutTypedBlob(ctx context.Context, data []byte, mediaType string) (string, error) {
+	c.puts++
+	return c.MemoryStore.PutTypedBlob(ctx, data, mediaType)
 }
 
 // TestTheRecorderConvertsASidecarSessionsMedia pins #284: in a sidecar
@@ -270,5 +281,178 @@ func TestEveryInlineMediaFormIsStoredAsABlob(t *testing.T) {
 	}
 	if store.puts != 4 {
 		t.Errorf("%d blobs were put, want the screenshot, the video, the file and the image", store.puts)
+	}
+}
+
+// capturedInputs is a model that answers every request with a message
+// and keeps each request's input as JSON, served over HTTP as an
+// upstream provider's endpoint.
+type capturedInputs struct {
+	echo.Adapter
+	mu   sync.Mutex
+	sent []string
+}
+
+func (m *capturedInputs) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	data, err := json.Marshal(req.Input)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.sent = append(m.sent, string(data))
+	m.mu.Unlock()
+	return answers{}.CreateStream(ctx, req, sink)
+}
+
+// TestAResumedSidecarSessionSendsItsMediaAsDataURLs is the round 11
+// media probe's resume: a sidecar session recorded with a PNG and a
+// JPEG in its prompt and a follow-up image queued and left owed, then
+// resumed in a new process through AgentOptions and Requeue and
+// prompted through openresponses' ClientAdapter against an upstream
+// served over HTTP. The recorder stores each blob with its data URL's
+// media type and resolves every sidecar: reference it hands the agent
+// back to a data URL of that type, so the adapter, which refuses a
+// sidecar: URL, sends the request, the upstream receives each image as
+// it was given, and every response verifies. Over RFC 0003 the
+// resuming client reads each blob for the session, as a new principal
+// must.
+func TestAResumedSidecarSessionSendsItsMediaAsDataURLs(t *testing.T) {
+	png, jpeg, owed := []byte("\x89PNG the screen"), []byte("\xff\xd8\xff a photo"), []byte("\x89PNG queued later")
+	jpegURL := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(jpeg)
+	stores := map[string]func(t *testing.T) (first, second agentsession.Store){
+		"memory": func(*testing.T) (agentsession.Store, agentsession.Store) {
+			st := agentsession.NewMemoryStore()
+			return st, st
+		},
+		"remote": func(t *testing.T) (agentsession.Store, agentsession.Store) {
+			h := remote.NewHandler(agentsession.NewMemoryStore(), remote.WithInsecureNoAuth())
+			srv := httptest.NewServer(h)
+			t.Cleanup(func() {
+				srv.CloseClientConnections()
+				srv.Close()
+				h.Close()
+			})
+			dial := func() agentsession.Store {
+				c, err := remote.Dial(srv.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return c
+			}
+			return dial(), dial()
+		},
+	}
+	for name, open := range stores {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			first, second := open(t)
+			rec, s, err := Start(ctx, first, agentsession.Header{Media: agentsession.MediaSidecar})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := agentturn.New(agentturn.Config{Model: answers{}, ModelName: "m"})
+			detach := rec.Attach(a)
+			prompt := openresponses.UserMessage(&openresponses.InputText{Text: "compare these"},
+				&openresponses.InputImage{ImageURL: pngURL(png)}, &openresponses.InputImage{ImageURL: jpegURL})
+			if end, err := a.Prompt(ctx, prompt); err != nil || end.Reason != agentturn.ReasonDone {
+				t.Fatalf("prompt: err=%v end=%+v", err, end)
+			}
+			// An input queued while the agent is idle, which the path owes
+			// when the process ends.
+			if err := rec.Queue(ctx, a, agentturn.QueueFollowUp, openresponses.UserMessage(
+				&openresponses.InputText{Text: "and this"}, &openresponses.InputImage{ImageURL: pngURL(owed)})); err != nil {
+				t.Fatal(err)
+			}
+			detach()
+			// The process ends, and with it the first client's lease.
+			if c, ok := first.(io.Closer); ok && first != second {
+				if err := c.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// A new process.
+			rec2, s2, err := Resume(ctx, second, s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts, err := AgentOptions(s2, rec2.ReadOptions()...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			model := &capturedInputs{}
+			upstream := httptest.NewServer(openresponses.NewHandler(model))
+			defer upstream.Close()
+			b := agentturn.New(agentturn.Config{Model: openresponses.NewClient(upstream.URL).AsAdapter(), ModelName: "m"}, opts...)
+			defer rec2.Attach(b)()
+			if n, _ := rec2.Requeue(ctx, b); n != 1 {
+				t.Errorf("Requeue handed back %d inputs, want the owed follow-up", n)
+			}
+			if end, err := b.Prompt(ctx, openresponses.UserText("again")); err != nil || end.Reason != agentturn.ReasonDone {
+				t.Fatalf("prompt after the resume: err=%v end=%+v", err, end)
+			}
+			if len(model.sent) == 0 {
+				t.Fatal("the upstream received no request")
+			}
+			for _, want := range []string{pngURL(png), jpegURL, pngURL(owed)} {
+				if !strings.Contains(strings.Join(model.sent, "\n"), want) {
+					t.Errorf("the upstream never received %.40s…", want)
+				}
+			}
+			for k, sent := range model.sent {
+				if strings.Contains(sent, "sidecar:") {
+					t.Errorf("request %d sent a sidecar: reference: %s", k, sent)
+				}
+			}
+			s3, err := second.Open(ctx, s.ID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n := verifyAll(t, s3); n < 3 {
+				t.Errorf("responses = %d, want the first run's and the resumed run's", n)
+			}
+			for _, e := range s3.Entries() {
+				if line, _ := agentsession.MarshalEntry(e); bytes.Contains(line, []byte(`"data:`)) {
+					t.Errorf("%s entry holds inline media: %s", e.EntryType(), line)
+				}
+			}
+		})
+	}
+}
+
+// TestASidecarBlobWithNoTypeResolvesAsOctetStream pins the rest of the
+// resume rule: a blob held with no media type, as one a writer that
+// keeps none stored, comes back as an application/octet-stream data
+// URL, and a sidecar session's items are not handed back at all with
+// no blob reader to resolve them.
+func TestASidecarBlobWithNoTypeResolvesAsOctetStream(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	// putCounter is no TypedBlobWriter, so the type is left behind.
+	rec, s, err := Start(ctx, store, agentsession.Header{Media: agentsession.MediaSidecar}, WithMedia(&putCounter{BlobWriter: store}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: answers{}, ModelName: "m"})
+	detach := rec.Attach(a)
+	shot := []byte("\x89PNG untyped")
+	if _, err := a.Prompt(ctx, openresponses.UserMessage(&openresponses.InputImage{ImageURL: pngURL(shot)})); err != nil {
+		t.Fatal(err)
+	}
+	detach()
+	rec2, s2, err := Resume(ctx, store, s.ID(), WithMedia(&putCounter{BlobWriter: store}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Transcript(s2); !errors.Is(err, ErrNoBlobReader) {
+		t.Errorf("Transcript with no blob reader: err = %v, want ErrNoBlobReader", err)
+	}
+	items, err := Transcript(s2, rec2.ReadOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "data:application/octet-stream;base64," + base64.StdEncoding.EncodeToString(shot)
+	if got, _ := json.Marshal(items[0]); !strings.Contains(string(got), want) {
+		t.Errorf("the prompt came back as %s, want its image as %s", got, want)
 	}
 }

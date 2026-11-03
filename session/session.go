@@ -981,6 +981,9 @@ type writer struct {
 	// media is the media form the session's header names, which a child
 	// session takes too: its parent's blobs and its own live together.
 	media string
+	// typed holds the hash of each blob the session was given a media
+	// type for, so it is given once.
+	typed map[string]bool
 
 	settings agentsession.Settings
 	// wroteConfig is set once a config entry is on the path, written by
@@ -1461,7 +1464,7 @@ func sameNoteItem(a, b openresponses.Item) bool {
 // no call, which a failed
 // run could not append. [AgentOptions] seeds an agent with them; with
 // calls pending, [Pending] puts the notes on the last of them instead.
-func OwedNotes(s *agentsession.Session) ([]agentturn.Note, error) {
+func OwedNotes(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Note, error) {
 	if s.Leaf() == "" {
 		return nil, nil
 	}
@@ -1482,8 +1485,12 @@ func OwedNotes(s *agentsession.Session) ([]agentturn.Note, error) {
 		}
 	}
 	var out []agentturn.Note
+	m := resolverFor(s, opts)
 	for _, n := range lastHeldNotes(path) {
 		if n.CallID == "" || answered[n.CallID] {
+			if n.Item, err = m.item(s.ID(), n.Item); err != nil {
+				return nil, err
+			}
 			out = append(out, n)
 		}
 	}
@@ -1872,15 +1879,15 @@ func Pending(s *agentsession.Session, opts ...ReadOption) ([]agentturn.PendingCa
 	return pending, err
 }
 
-// ReadOption configures how [Pending], [AgentOptions] and
-// [ReplayAnswers] read a session. [WithOrigins] and [WithContext] make
-// one.
+// ReadOption configures how [Pending], [AgentOptions],
+// [ReplayAnswers], [Transcript], [TranscriptModels] and [OwedNotes] read
+// a session. [WithOrigins], [WithBlobs] and [WithContext] make one.
 type ReadOption struct {
 	apply func(*origins)
 }
 
-// WithContext has [Pending] and [AgentOptions] read a fork's origins
-// under ctx, so a deadline or a cancellation on it ends the reads;
+// WithContext has [Pending] and [AgentOptions] read a fork's origins,
+// and a sidecar session's blobs, under ctx, so a deadline or a cancellation on it ends the reads;
 // without it they read under context.Background(). [ReplayAnswers]
 // takes a context of its own and reads under that one whatever this
 // option says.
@@ -1905,14 +1912,20 @@ func WithOrigins(r agentsession.Reader) ReadOption {
 // ReadOptions returns the options that have [Pending], [AgentOptions]
 // and [ReplayAnswers] read a session as the recorder reads it when it
 // is seeded: [WithOrigins] with the recorder's store, when the store
-// is an agentsession.Reader, and none otherwise. A caller with a
-// deadline on the reads, a request handler for one, adds
-// [WithContext] beside them.
+// is an agentsession.Reader, and [WithBlobs] with the reader the
+// recorder's blobs are read through, the [WithMedia] writer's when it
+// reads and the store's otherwise, so a sidecar session's media comes
+// back as data URLs. A caller with a deadline on the reads, a request
+// handler for one, adds [WithContext] beside them.
 func (r *Recorder) ReadOptions() []ReadOption {
+	var opts []ReadOption
 	if rd, ok := r.store.(agentsession.Reader); ok {
-		return []ReadOption{WithOrigins(rd)}
+		opts = append(opts, WithOrigins(rd))
 	}
-	return nil
+	if br := r.blobReader(); br != nil {
+		opts = append(opts, WithBlobs(br))
+	}
+	return opts
 }
 
 // origins reads the sessions a fork was made from. lenient takes an
@@ -1923,6 +1936,8 @@ type origins struct {
 	ctx     context.Context
 	r       agentsession.Reader
 	lenient bool
+	// blobs reads a sidecar session's blobs, for [WithBlobs].
+	blobs agentsession.BlobReader
 }
 
 // dispatchOff returns the last dispatch of the call held by the entry
@@ -1998,12 +2013,16 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 	}
 	var out []agentturn.PendingCall
 	ranAt := map[string]ranFrom{}
+	m := resolverFor(s, opts)
 	path := s.Path(s.Leaf())
 	withdrawn := withdrawnDispatches(path)
 	open := openQuestions(path)
 	nested := nestedRecords(path)
 	for _, c := range calls {
 		p := agentturn.PendingCall{Call: c.Call, Reason: agentturn.PendingUnknown}
+		// ranIn is the session whose path holds the output p.Ran is,
+		// whose blobs it names.
+		ranIn := s.ID()
 		state := c.State(s.Header())
 		never := allWithdrawn(c, withdrawn)
 		switch state {
@@ -2055,6 +2074,7 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 				var failed bool
 				if p.Ran, entry, failed = outputAfterFailed(at, d, c.Entry.ID); p.Ran != nil {
 					ranAt[p.Call.CallID], p.RanWhere = ranFrom{entry: entry, failed: failed}, ranOffReason
+					ranIn = at.ID()
 					if at != s {
 						p.RanWhere = ranInOriginReason
 					}
@@ -2085,10 +2105,23 @@ func pendingCalls(s *agentsession.Session, opts []ReadOption) ([]agentturn.Pendi
 		}
 		p.Question = open[c.Call.CallID]
 		p.Nested = nested[c.Call.CallID]
+		if p.Ran != nil {
+			ran, err := m.item(ranIn, p.Ran)
+			if err != nil {
+				return nil, nil, err
+			}
+			p.Ran = ran.(*openresponses.FunctionCallOutput)
+		}
 		out = append(out, p)
 	}
 	if len(out) > 0 {
-		out[len(out)-1].Notes = lastHeldNotes(path)
+		notes := lastHeldNotes(path)
+		for i := range notes {
+			if notes[i].Item, err = m.item(s.ID(), notes[i].Item); err != nil {
+				return nil, nil, err
+			}
+		}
+		out[len(out)-1].Notes = notes
 	}
 	return out, ranAt, nil
 }
@@ -2246,7 +2279,11 @@ func callAt(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry st
 // as [Pending] does. The transcript is [Transcript]'s, its reasoning
 // items attributed as [TranscriptModels] attributes them, so the loop
 // leaves another model's out of each request after a resume, as it
-// does for the items its own runs produced.
+// does for the items its own runs produced. In a sidecar session every
+// item it hands the agent carries its media as data URLs, each
+// sidecar: reference resolved through [WithBlobs], which
+// [Recorder.ReadOptions] carries, and it fails with [ErrNoBlobReader]
+// for one it has no reader to resolve.
 func AgentOptions(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Option, error) {
 	items, models, pending, owed, ids, err := agentState(s, opts)
 	if err != nil {
@@ -2264,7 +2301,9 @@ func AgentOptions(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Opti
 // saw before. It is the transcript
 // [AgentOptions] seeds an agent with, and the one to give
 // Agent.SetTranscript after [Recorder.Rebase] or to seed the agent of
-// a [Start] on a base with; Context.Items differs from it by those
+// a [Start] on a base with, its media resolved to data URLs in a
+// sidecar session as [AgentOptions] resolves it, through [WithBlobs];
+// Context.Items differs from it by those
 // items, which the filter keeps out of every request anyway, and by
 // the reasoning the omit setting's other_models rule leaves out of a
 // request to the model at the leaf, which a request to another model
@@ -2274,12 +2313,15 @@ func AgentOptions(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Opti
 // which model produced each reasoning item so the loop leaves out of
 // a request what that model must not be sent. Each call decodes those
 // items afresh.
-func Transcript(s *agentsession.Session) (openresponses.Items, error) {
+func Transcript(s *agentsession.Session, opts ...ReadOption) (openresponses.Items, error) {
 	cx, err := s.Context()
 	if err != nil {
 		return nil, fmt.Errorf("session: context at leaf: %w", err)
 	}
 	items, _ := agentTranscriptOf(cx)
+	if err := resolverFor(s, opts).items(s.ID(), items); err != nil {
+		return nil, err
+	}
 	return items, nil
 }
 
@@ -2295,12 +2337,15 @@ func Transcript(s *agentsession.Session) (openresponses.Items, error) {
 // agentturn.WithReasoningModels or agentturn.ContextWithReasoningModels;
 // attribution holds an item by identity, so models attributes no other
 // copy of the transcript.
-func TranscriptModels(s *agentsession.Session) (openresponses.Items, agentturn.ReasoningModels, error) {
+func TranscriptModels(s *agentsession.Session, opts ...ReadOption) (openresponses.Items, agentturn.ReasoningModels, error) {
 	cx, err := s.Context()
 	if err != nil {
 		return nil, nil, fmt.Errorf("session: context at leaf: %w", err)
 	}
 	items, entries := agentTranscriptOf(cx)
+	if err := resolverFor(s, opts).items(s.ID(), items); err != nil {
+		return nil, nil, err
+	}
 	produced := producedModels(s.Path(s.Leaf()))
 	models := agentturn.ReasoningModels{}
 	for i, item := range items {
@@ -3171,7 +3216,10 @@ func (w *writer) owedDelivery(item openresponses.Item, trigger *agentsession.Tri
 		if in.declined || in.entry == "" || !in.deliver || in.mode != agentsession.ModeSteer || in.held && !in.awaiting {
 			continue
 		}
-		if equalJSON(in.item, item) && equalJSON(in.trigger, trigger) {
+		// An input read back from a sidecar session's path holds its
+		// media as resolved, which the host's may have encoded
+		// otherwise: the two are compared as the path records them.
+		if equalJSON(w.recordForm(in.item), w.recordForm(item)) && equalJSON(in.trigger, trigger) {
 			return in
 		}
 	}
@@ -3782,8 +3830,15 @@ func (w *writer) seed(ctx context.Context, s *agentsession.Session, owed bool) e
 		if err != nil {
 			return fmt.Errorf("session: queued inputs at leaf: %w", err)
 		}
+		// Requeue hands each to the agent, so its media is resolved
+		// as AgentOptions resolves the transcript's.
+		m := resolverFor(s, append(w.rec.ReadOptions(), WithContext(ctx)))
 		for _, q := range queued {
-			w.inbox = append(w.inbox, &inboxItem{item: q.Item, mode: q.Mode, trigger: q.Trigger, entry: q.ID, deliver: q.Deliver})
+			item, err := m.item(s.ID(), q.Item)
+			if err != nil {
+				return fmt.Errorf("session: queued input %s: %w", q.ID, err)
+			}
+			w.inbox = append(w.inbox, &inboxItem{item: item, mode: q.Mode, trigger: q.Trigger, entry: q.ID, deliver: q.Deliver})
 		}
 	}
 	// Every call on the path, a call with its output included, so a

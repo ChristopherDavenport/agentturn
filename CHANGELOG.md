@@ -265,9 +265,28 @@ versions may break the API.
   is computed over the request with the same substitution. The loop and
   the model keep the data URLs. A host no longer converts media in an
   after-call hook and resolves it again in a model wrapper. Each blob
-  is put once per recorder. (#284)
+  is put once per recorder, with the media type of the data URL it
+  replaced (agentsession's `TypedBlobWriter`), and the session is given
+  that type for it when the store holds types per session; a data URL
+  whose type a store cannot keep stays inline. (#284)
+- Fixed, breaking: a resumed, reopened or rewound sidecar session no
+  longer hands the agent `sidecar:` URLs, which every provider, and
+  openresponses' `ClientAdapter`, refuses. `session.AgentOptions`,
+  `Transcript`, `TranscriptModels`, `Pending`, `OwedNotes`,
+  `ReplayAnswers`, `MoveTo` and `Recorder.Requeue` resolve each
+  reference to a base64 data URL of the type the session holds for the
+  blob (agentsession's `ReadSessionBlob`, which over RFC 0003 reads the
+  blob for the session), `application/octet-stream` for a blob held
+  with none, through the reader `session.WithBlobs` names;
+  `Recorder.ReadOptions` carries the recorder's. Reading a sidecar
+  session's media with no reader is now `session.ErrNoBlobReader`
+  rather than a transcript a provider refuses, so a host calling
+  `AgentOptions(s)` on one passes `rec.ReadOptions()...`.
+  `Transcript`, `TranscriptModels` and `OwedNotes` take `ReadOption`s.
+  (#284)
 - Added: `session.WithMedia(bw)`, the blob writer a sidecar session's
-  media is stored with when it is not the store's. (#284)
+  media is stored with when it is not the store's; `session.WithBlobs`
+  and `session.ErrNoBlobReader`. (#284)
 
 - Changed: the session recorder no longer encodes the whole transcript
   several times a turn. It keeps the canonical JSON of each item as it

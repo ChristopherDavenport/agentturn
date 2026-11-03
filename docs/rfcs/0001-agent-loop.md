@@ -1903,9 +1903,20 @@ base64 or percent-encoded, in any item type that carries one, and in
 item, queued, result and compaction entries alike, as a blob before
 the entry, write the entry with the
 blob's `sidecar:` reference, and compute the request hash over the
-request with the same substitution, the form a reader rebuilds. The
-loop and the model keep the inline form, so no `sidecar:` URL the
-recorder writes reaches a provider (#284). A session created for a
+request with the same substitution, the form a reader rebuilds. It
+MUST store each blob with the media type its data URL carried, as
+agentsession RFC 0002's Media section has a writer give it, the
+session being given that type for the blob; a data URL whose type the
+store cannot keep stays inline, as an item that needs a type of its
+own does there. The loop and the model keep the inline form, and what
+the record hands back to an agent, the transcript, the pending calls'
+outputs, the notes and the queued inputs a resume, a reopen or a
+rewind seeds it with, MUST carry each `sidecar:` reference resolved to
+a data URL of the type the session holds for the blob, read for that
+session, and of `application/octet-stream` for a blob held with none,
+as agentsession RFC 0001's Request hash has a writer resolve one; a
+reference with no reader to resolve it is an error, never handed on.
+So no `sidecar:` URL reaches the agent or a provider (#284). A session created for a
 run under a named configuration, such as a child the loop-as-a-tool
 runs, MUST carry that name as its display name, an `info` entry before
 the run's first entry, unless the host names the session otherwise; a
@@ -1994,7 +2005,7 @@ maps onto it as follows:
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`, which implements `agentturn.InputRequired` (`PendingCalls() []WaitingCall`), as `tools/a2a`'s does; `WithAskParent`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)`; a detached call: `tools/a2a.WithDetach(fn)`, `WithPollInterval`, `Answer(final)`, and `CalleeTrigger(callID, task)` (`TriggerCallee`) to deliver its result under; a steer of a working task: `front/a2a.WithDeliverWhileBusy()`, served by `Executor.RequestHandler`, `MaxSteers`, `Redeliverer` and `ContextWithRedeliverer` for a recorded one (`session.Recorder.Redeliver`), and `tools/a2a.Steer(ctx, client, info, parts…)` |
 | quarantine | `Agent.Quarantine`, `Agent.Quarantined`; `Quarantine(ctx, items…)` from a hook or a tool, `ErrNoQuarantine`, `ErrNotQuarantinable`; `QuarantinedOutput`, the placeholder; `QuarantineFromContext` → `QuarantineView` (`Has`, `Generation`, `Apply`) for a transform, which `compact` reads; `NewQuarantineSet` → `QuarantineSet` (`Add`, `Items`, `Has`, `Apply`), `ContextWithQuarantineSet` for a host carrying one through `Run` and `Continue`, and `WithQuarantineSet` for an `Agent`; `QuarantineSet.Bind` and `Merge` for a front keeping a conversation's set across tasks or requests, as `front/a2a` does per context and `front/responses` under `WithQuarantineScope` (`QuarantineScope`, `MaxQuarantineScopes` per principal); `session` `Recorder.Attach` seeds it from the record's `omit` |
-| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Queue`, `Deliver`, `Redeliver`, `Control` (`RecordedControl`, for a front), `Requeue`, `Rebase`; `session.MoveTo` for a rewind; `WithInstructionsParts`, `WithMedia`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`; the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
+| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Queue`, `Deliver`, `Redeliver`, `Control` (`RecordedControl`, for a front), `Requeue`, `Rebase`; `session.MoveTo` for a rewind; `WithInstructionsParts`, `WithMedia`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`, read with `Recorder.ReadOptions`, `session.WithBlobs` resolving a sidecar session's media (`session.ErrNoBlobReader` without one); the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
 
 Every error the package returns to its caller, sentinel or wrapped,
 begins with `agentturn:`; the error texts a call's output carries,
@@ -2286,7 +2297,10 @@ it.
   steer of a working task (#287).
 - **The record.** The sessions a recorder creates name its harness,
   take their parent's media form and are named after their
-  configuration (#219, #283, #292); breaking. A recorder writes a
+  configuration (#219, #283, #292); breaking. In a sidecar session the
+  recorder stores media as typed blobs as it writes, and resolves every
+  reference it hands back to an agent to a data URL of its type (#284);
+  breaking. A recorder writes a
   call's `result` when it settles before its batch (#273), a delivery's
   `deliver` (#244), a copy's `copied_from` (#243, #237), a late
   result's `from_link` (#290), a withdrawn dispatch as the format's

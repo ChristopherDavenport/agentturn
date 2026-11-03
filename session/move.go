@@ -82,7 +82,7 @@ func MoveTo(ctx context.Context, a *agentturn.Agent, r *Recorder, entryID string
 // agentState reads what an agent continuing s at its leaf holds, as
 // [AgentOptions] does.
 func agentState(s *agentsession.Session, opts []ReadOption) (items openresponses.Items, models agentturn.ReasoningModels, pending []agentturn.PendingCall, owed []agentturn.Note, ids []string, err error) {
-	if items, models, err = TranscriptModels(s); err != nil {
+	if items, models, err = TranscriptModels(s, opts...); err != nil {
 		return
 	}
 	if pending, err = Pending(s, opts...); err != nil {
@@ -91,6 +91,6 @@ func agentState(s *agentsession.Session, opts []ReadOption) (items openresponses
 	if ids, err = CallIDs(s); err != nil {
 		return
 	}
-	owed, err = OwedNotes(s)
+	owed, err = OwedNotes(s, opts...)
 	return
 }

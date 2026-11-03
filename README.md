@@ -204,11 +204,12 @@ this way:
 
 ```go
 rec, s, _ := session.Resume(ctx, store, id)
-opts, _ := session.AgentOptions(s)
+// ReadOptions reads a fork's origin and a sidecar session's blobs.
+opts, _ := session.AgentOptions(s, rec.ReadOptions()...)
 a := agentturn.New(cfg, opts...)
 defer rec.Attach(a)()
 // The tools the resume will run: cfg.ResolveTools asks a ToolProvider.
-answers, _ := session.ReplayAnswers(ctx, s, cfg.ResolveTools(ctx)) // plus the held calls' answers
+answers, _ := session.ReplayAnswers(ctx, s, cfg.ResolveTools(ctx), rec.ReadOptions()...) // plus the held calls' answers
 end, err := a.Resume(ctx, answers...)
 ```
 
