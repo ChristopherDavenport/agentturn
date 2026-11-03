@@ -146,8 +146,11 @@ func (q *quarantine) apply(items openresponses.Items) openresponses.Items {
 	return out
 }
 
-// has reports whether item is quarantined itself, or is the output of
-// a quarantined function call, and so is left out of a request.
+// has reports whether item is quarantined itself, or is an output with
+// the call ID of a quarantined function call. Given one item, it cannot
+// tell which call before it an output answers, so with a provider that
+// reuses call IDs it reports another call's output too, which apply,
+// pairing an output with the call before it, sends.
 func (q *quarantine) has(item openresponses.Item) bool {
 	if item == nil {
 		return false
@@ -198,7 +201,13 @@ func QuarantineFromContext(ctx context.Context) QuarantineView {
 }
 
 // Has reports whether item is left out of a request or sent as a
-// placeholder: quarantined itself, or the output of a quarantined call.
+// placeholder: quarantined itself, or an output with the call ID of a
+// quarantined call. It is given the item alone, so it matches an
+// output by its call ID: with a provider that reuses call IDs it also
+// reports another call's output under the quarantined call's ID, which
+// [QuarantineView.Apply], pairing each output with the call before it,
+// sends. A transform that leaves out what Has reports leaves out too
+// much there, never too little.
 func (v QuarantineView) Has(item openresponses.Item) bool {
 	return v.q != nil && v.q.has(item)
 }
@@ -252,7 +261,8 @@ func (s *QuarantineSet) Add(items ...openresponses.Item) error { return s.q.add(
 func (s *QuarantineSet) Items() openresponses.Items { return s.q.list() }
 
 // Has reports whether item is left out of a request or sent as a
-// placeholder under the set, as [QuarantineView.Has] does.
+// placeholder under the set, as [QuarantineView.Has] does, an output
+// matched by its call ID alone.
 func (s *QuarantineSet) Has(item openresponses.Item) bool { return s.q.has(item) }
 
 // Apply returns items as a request carries them under the set, as
