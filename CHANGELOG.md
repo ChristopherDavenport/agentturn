@@ -67,13 +67,13 @@ versions may break the API.
   the settings the request will carry, the caller's tools included, as
   the loop does, so a fold against a share of the context window counts
   them. (#279)
-- Changed, breaking: `session` writes format 0.15 sessions, which a
-  reader of format 0.14 refuses once the file is raised: the recorder
-  writes `result`, `deliver`, `copied_from` and the 0.15 header
-  promises.
+- Changed, breaking: `session` writes format 0.16 sessions, which a
+  reader of format 0.15 or earlier refuses once the file is raised: the
+  recorder writes `result`, `deliver`, `copied_from` and the 0.15
+  header promises.
 - Dependencies: every module requires openresponses v0.0.18, up from
   v0.0.15, and agenttool v0.0.28, up from v0.0.24; `session` requires
-  agentsession v0.0.32, up from v0.0.28. openresponses' `Reasoning` now carries members of its own, so the
+  agentsession v0.0.33, up from v0.0.28. openresponses' `Reasoning` now carries members of its own, so the
   recorder compares two reasoning settings by their JSON when it writes a
   config delta.
 - Fixed: RFC 0001's Composition no longer says a recorder cannot write
