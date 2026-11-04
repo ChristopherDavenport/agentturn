@@ -622,6 +622,21 @@ func (r *Recorder) Omit(ctx context.Context, ids ...string) error {
 // record has the context's items, which omit already shaped, and finds
 // none.
 func (w *writer) quarantinedIn(t agentturn.Transcript) openresponses.Items {
+	if len(t) == 0 {
+		return nil
+	}
+	set := w.quarantineSet()
+	if set == nil {
+		return nil
+	}
+	return w.bindQuarantine(set, t)
+}
+
+// quarantineSet returns what the omit setting in force at the writer's
+// leaf says a quarantine left out, as [writer.quarantinedIn] reads it,
+// each item in the agent's form and the record's, or nil when it says
+// nothing is.
+func (w *writer) quarantineSet() *agentturn.QuarantineSet {
 	o := w.settings.Omit
 	listed := idSet(o.Items)
 	outs := map[string]bool{}
@@ -634,7 +649,7 @@ func (w *writer) quarantinedIn(t agentturn.Transcript) openresponses.Items {
 			}
 		}
 	}
-	if len(listed) == 0 && len(outs) == 0 || len(t) == 0 {
+	if len(listed) == 0 && len(outs) == 0 {
 		return nil
 	}
 	var recorded openresponses.Items
@@ -648,10 +663,18 @@ func (w *writer) quarantinedIn(t agentturn.Transcript) openresponses.Items {
 		}
 		recorded = append(recorded, w.values[i], w.recordedItem(i))
 	}
+	if len(recorded) == 0 {
+		return nil
+	}
 	set, err := agentturn.NewQuarantineSet(recorded...)
 	if err != nil {
 		return nil
 	}
+	return set
+}
+
+// bindQuarantine returns the items of t set holds.
+func (w *writer) bindQuarantine(set *agentturn.QuarantineSet, t agentturn.Transcript) openresponses.Items {
 	// In a sidecar session the record holds media as sidecar:
 	// references and the agent as data URLs: t is bound in the form the
 	// record holds, and each match is the agent's own item.

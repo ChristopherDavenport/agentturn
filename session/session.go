@@ -4130,6 +4130,16 @@ func (r *Recorder) ChildContext(ctx context.Context, callID string) context.Cont
 // subsession, as any is. The writer of each of the child's runs is
 // released at the run's end.
 //
+// A run started inside the parent's run, from its hook or its tool,
+// takes the parent run's quarantine, as a tool's child does. Made with
+// a context that carries none, as a pass after a turn's is, the
+// context returned carries what the parent's record quarantined as an
+// agentturn.QuarantineSet, which the child's agent takes when its run
+// starts: it names the parent's items by identity, so a child seeded
+// with the items the parent's agent holds leaves them out, and a host
+// that seeds it from a copy binds the copy itself
+// (agentturn.QuarantineSet.Bind).
+//
 // spawnID is the host's to choose, a UUIDv7 from
 // agentsession.NewSpawnID serving, and is drawn from ASCII letters,
 // digits, '_' and '-'. One the parent's session already carries, on
@@ -4231,8 +4241,18 @@ func (r *Recorder) spawnWriter(ctx context.Context) (*writer, error) {
 
 // spawnContext returns ctx carrying ref and the child's session ID, for
 // the host to prompt the child with. w is the writer of the session
-// holding the link. The caller holds r.mu.
+// holding the link. When ctx carries no quarantine, made outside the
+// parent's run as a pass after a turn is, it also carries what the
+// parent's record says is quarantined, as an
+// agentturn.QuarantineSet, so a child seeded with the parent's
+// conversation leaves it out as a child a tool starts inside the run
+// does (RFC 0001 The request, step 3). The caller holds r.mu.
 func (r *Recorder) spawnContext(ctx context.Context, w *writer, ref spawnRef) context.Context {
+	if agentturn.QuarantineFromContext(ctx).Generation() == 0 {
+		if set := w.quarantineSet(); set != nil {
+			ctx = agentturn.ContextWithQuarantineSet(ctx, set)
+		}
+	}
 	return ContextWithSessionID(context.WithValue(ctx, spawnKey{}, ref), ref.child)
 }
 

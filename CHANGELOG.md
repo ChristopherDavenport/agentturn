@@ -26,7 +26,10 @@ versions may break the API.
   a run under it too, and `Recorder.ContinueChild(ctx, spawnID)` gives
   a context for a spawn the parent's path links, writing nothing and
   reserving the child's call IDs, for a host that kept none; a spawn
-  the path does not link is refused with `session.ErrNoSpawn`. (#294)
+  the path does not link is refused with `session.ErrNoSpawn`. Made
+  outside the parent's run, the context carries what the parent's
+  record quarantined, so a child seeded with the parent's items leaves
+  them out. (#294)
 - Fixed: a call child a child session's agent started, prompted again
   through `agent.WithSpawn` after that child's run ended, continues its
   own session under that child's, where it was filed under the
@@ -34,6 +37,12 @@ versions may break the API.
   observed run's parent is the session the recorder remembers for the
   ended run, reopened at its leaf, and that reopened writer knows the
   calls its path already links. (#294)
+- Fixed: a child session reopened at its leaf, for a record a job
+  writes after the child's run ended or an idle child's queued input,
+  takes its media form and working directory from its header, where it
+  had neither: in a sidecar child the queued entry's media is stored as
+  a blob, as RFC 0001 has a recorder do, rather than left inline, and a
+  session linked from it takes its media form and directory. (#294)
 - Changed: RFC 0001 is draft 0.5. The record states the rule for a
   child the host starts: a subsession linked by a `spawn_id`, the link
   before the child's header, a `spawn_id` never repeated in the

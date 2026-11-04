@@ -1938,18 +1938,24 @@ MUST record it as a subsession of the session it serves. It writes the
 parent's `subsession` link with a `spawn_id` before the child's header,
 and the child's header names the parent in `parent_session` and the
 `spawn_id` in `spawned_by` (agentsession RFC 0001, `link`). A
-`spawn_id` MUST NOT repeat within the parent session. A recorder
-derives the child's ID over `["spawn","<parent>","<spawn_id>"]`, as
-that format's header table has it, so a reader computes it from the
-link alone, and refuses a `spawn_id` the session already carries, on
-any branch, writing nothing, as the format's `spawn_id_repeated` does.
-Its session is otherwise one the recorder creates for a child: it names
-the recorder's harness, takes the parent's media form, is named after
-the configuration it runs under, and is written from its run's events;
-a later run of the same child continues it at its leaf, and a child it
-starts through a tool is its own subsession. Verify, export and cost
-(agentsession's `DelegatedWork`) then reach its work as they reach a
-tool's child's (#294).
+`spawn_id` MUST NOT repeat within the parent session. Such a child is
+not the loop-as-a-tool's spawned child, which a call started and the
+spawn callback of Composition hands the host: that one is linked by
+its call. A recorder that offers the host a way to start one SHOULD
+derive the child's ID over `["spawn","<parent>","<spawn_id>"]`, as
+agentsession RFC 0001's header table recommends, so a reader computes
+it from the link alone, and MUST refuse a `spawn_id` the session
+already carries, on any branch, writing nothing, as that format's
+`link` rule has a writer do (agentsession RFC 0003 carries the refusal
+as `spawn_id_repeated`). Its session is otherwise one the recorder
+creates for a child: it names the recorder's harness, takes the
+parent's media form, is named after the configuration it runs under,
+and is written from its run's events; a later run of the same child
+continues it at its leaf, and a child it starts through a tool is its
+own subsession. A child started outside the parent's run, which so
+holds none of the run's quarantine, leaves out what the parent's
+record quarantined. Verification, export and delegated-work accounting
+then reach its work as they reach a tool's child's (#294).
 
 A recorder that continues a path on which a run is open that it is
 not running owns that run and closes it before it writes anything
@@ -2074,9 +2080,15 @@ and from nothing earlier; describes an input that differs from the
 path only by edits the format's `omit` can say, a trim or a
 quarantine among them, with a `config` delta written before the
 response and hashes it, declining a request hash only for an input
-the path cannot rebuild; and writes a `result` entry, durable before
+the path cannot rebuild; writes a `result` entry, durable before
 `tool_end` returns, for a call whose tool returned while another call
-of its batch has not settled, and none for the last of its batch.
+of its batch has not settled, and none for the last of its batch; and,
+when it offers the host a way to start a child of its own, writes the
+`spawn_id` link before the child's header and refuses a `spawn_id` the
+session carries on any branch, writing nothing. The rule on a host
+that starts such a child is not checked here: this section has no
+class for a host, and a host meets it by starting the child through a
+conforming recorder.
 
 ### The scenario corpus
 
@@ -2261,9 +2273,12 @@ it.
   a model's function call, records it as a subsession linked by a
   `spawn_id`: the link before the child's header, the header's
   `parent_session` and `spawned_by`, the child's ID derived over
-  `["spawn",…]`, and a repeated `spawn_id` refused (agentsession RFC
-  0001 0.19, #294); breaking for a host that starts such a child and
-  does not record it.
+  `["spawn",…]` (SHOULD), a repeated `spawn_id` refused (MUST, on a
+  recorder), and the parent's recorded quarantine carried to a child
+  started outside its run (agentsession RFC 0001 0.19, `link`; #294);
+  breaking for a host that starts such a child and does not record it.
+- **Conformance.** A conforming recorder that starts a host's child
+  writes its link first and refuses a repeated `spawn_id` (#294).
 
 ## Changes in draft 0.4
 
