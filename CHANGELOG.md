@@ -63,7 +63,14 @@ versions may break the API.
   `ModelRetry` now carry the run's quarantine as `Quarantined`, a copy
   of the items it holds, and the recorder records it as `omit`, outputs
   as the placeholder and other items left out, whether or not it can
-  describe the request. (#294)
+  describe the request. A quarantine made after a run's last request,
+  by a tool of its last batch before `input_required` or a stop, a hook
+  after that request or `Agent.Quarantine` during the run, reached no
+  event and leaked after `Resume` the same way, on a hashed path too,
+  as did one a `BeforeModelCall` made before refusing the request:
+  `RunEnd` and `ModelBlocked` carry `Quarantined` as well, and the
+  recorder writes it after their entries as a `config` carrying only
+  the `omit` it adds. (#294)
 - Changed: RFC 0001 is draft 0.5. The record states the rule for a
   child the host starts: a subsession linked by a `spawn_id`, the link
   before the child's header, a `spawn_id` never repeated in the

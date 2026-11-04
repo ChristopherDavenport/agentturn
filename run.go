@@ -1233,6 +1233,7 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 	r.ending()
 	// A subscriber that fails on run_end cannot change the outcome; the
 	// run has already ended.
+	end.Quarantined = r.quarantined()
 	_ = r.emit(end)
 	return end
 }
@@ -1700,7 +1701,7 @@ func (r *runner) build(ctx context.Context, tools agenttool.Set, settings *openr
 			// The call was never made; the request as built is the
 			// record of what was refused, whether a policy stopped the
 			// run or the hook failed.
-			if eerr := r.emit(&ModelBlocked{RunID: r.runID, Turn: r.turn, Request: req, Err: err}); eerr != nil {
+			if eerr := r.emit(&ModelBlocked{RunID: r.runID, Turn: r.turn, Request: req, Err: err, Quarantined: r.quarantined()}); eerr != nil {
 				return openresponses.Request{}, built{}, eerr
 			}
 			if errors.Is(err, ErrGuard) {
@@ -1870,7 +1871,7 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 			} else {
 				// Nothing of the answer is in the transcript: the call
 				// is reported refused, with what the provider billed.
-				blocked := &ModelBlocked{RunID: r.runID, Turn: r.turn, Request: req, Err: err}
+				blocked := &ModelBlocked{RunID: r.runID, Turn: r.turn, Request: req, Err: err, Quarantined: r.quarantined()}
 				if resp != nil {
 					blocked.Usage = resp.Usage
 				}

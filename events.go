@@ -271,6 +271,10 @@ type ModelBlocked struct {
 	// Usage is what the provider reported for a call the model's guard
 	// refused, nil otherwise.
 	Usage *openresponses.Usage
+	// Quarantined is the run's quarantine as the refused request was
+	// built under it, as [TurnStart.Quarantined] is: a hook that
+	// quarantines and then refuses leaves no later request to carry it.
+	Quarantined openresponses.Items
 }
 
 // EventType returns "model_blocked".
@@ -643,6 +647,13 @@ type RunEnd struct {
 	// or [Agent.SetNotes], with their Mode, Trigger and CallID. With
 	// calls pending the notes are on [PendingCall.Notes] instead.
 	Notes []Note
+	// Quarantined is the run's quarantine as the run ended, as
+	// [TurnStart.Quarantined] is: what a tool of the last batch, a hook
+	// after the last request or [Agent.Quarantine] during the run
+	// quarantined reaches no request of this run, so a recorder records
+	// it from here (RFC 0001 The record). What the host quarantines
+	// after the run ends reaches the next run's first turn_start.
+	Quarantined openresponses.Items
 	// Withheld says the run ended because [Config.OutputGuard]
 	// withheld a message, or the model call failed with an error
 	// wrapping [ErrGuard] after its response began, with Reason

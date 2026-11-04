@@ -756,3 +756,29 @@ func (w *writer) quarantineOver(base agentsession.Omit, quarantined openresponse
 	}
 	return want
 }
+
+// recordQuarantine writes the quarantine in force, as a run's end or a
+// refused request carries it, when the omit in force does not already
+// say it: a config entry carrying the omit delta alone, which changes
+// no setting, the form settle writes when only what is left out moved.
+// It follows the last request's entries, so no response is hashed
+// under it, and the next request is (RFC 0001 The record).
+func (w *writer) recordQuarantine(ctx context.Context, quarantined openresponses.Items) error {
+	if len(quarantined) == 0 || !w.wroteConfig {
+		return nil
+	}
+	want := w.quarantineOver(w.settings.Omit, quarantined, w.settings.Model)
+	omit, ok := w.settings.OmitDelta(want)
+	if !ok || omit == nil {
+		return nil
+	}
+	entry := &agentsession.ConfigEntry{Omit: omit}
+	id, err := w.append(ctx, entry)
+	if err != nil {
+		return err
+	}
+	entry.ID = id
+	w.settings = w.settings.Apply(entry)
+	w.forgetLeftOut()
+	return nil
+}

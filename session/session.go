@@ -5619,17 +5619,21 @@ func (w *writer) blocked(ctx context.Context, e *agentturn.ModelBlocked) error {
 		if err != nil {
 			return fmt.Errorf("session: encode model blocked: %w", err)
 		}
-		_, err = w.append(ctx, &agentsession.CustomEntry{NS: ModelBlockedNS, Data: raw})
-		return err
+		if _, err = w.append(ctx, &agentsession.CustomEntry{NS: ModelBlockedNS, Data: raw}); err != nil {
+			return err
+		}
+		return w.recordQuarantine(ctx, e.Quarantined)
 	}
 	w.responses++
 	w.lastCalls = false
-	_, err = w.append(ctx, &agentsession.ResponseEntry{
+	if _, err = w.append(ctx, &agentsession.ResponseEntry{
 		Status:      openresponses.ResponseStatusFailed,
 		Error:       errorPayload(e.Err),
 		RequestHash: hash,
-	})
-	return err
+	}); err != nil {
+		return err
+	}
+	return w.recordQuarantine(ctx, e.Quarantined)
 }
 
 // settle brings the recorded settings to those of req, writing a full
@@ -6468,6 +6472,11 @@ func (w *writer) runEnd(ctx context.Context, e *agentturn.RunEnd) error {
 	}
 	if w.run == "" {
 		return nil
+	}
+	// What the run quarantined after its last request, a tool of the
+	// last batch or a hook after it, reached no turn_start.
+	if err := w.recordQuarantine(ctx, e.Quarantined); err != nil {
+		return err
 	}
 	// What waits at the end, on the pending calls or owed: written when
 	// it differs from what notes_held last reported.
