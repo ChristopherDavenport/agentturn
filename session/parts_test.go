@@ -128,6 +128,15 @@ func TestInstructionsPartsAreRecorded(t *testing.T) {
 		},
 		steps: stringSteps,
 	}, {
+		name: "a part in a delta's form falls back to the string",
+		mangle: func(p []agentsession.InstructionPart, o []agentsession.OmittedPart) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
+			// It joins, but names a hash, which only a delta carries
+			// and agentsession v0.0.37 refuses on a part.
+			p[0].Hash = agentsession.HashText(p[0].Text)
+			return p, o
+		},
+		steps: stringSteps,
+	}, {
 		name: "an omitted part with no ID is dropped alone",
 		mangle: func(p []agentsession.InstructionPart, o []agentsession.OmittedPart) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
 			return p, append(o, agentsession.OmittedPart{Reason: "nameless"})

@@ -5,6 +5,16 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Dependencies: `session` requires agentsession v0.0.37, up from
+  v0.0.33, so the sessions it writes are format 0.20 and a reader of
+  0.18 or 0.19 refuses them. agentsession's `ConfigFromRequestParts`
+  now refuses a part carrying a `Hash` or a `Keep`, which it used to
+  drop; the recorder falls back to the instructions string for parts
+  a host names in that form, as it does for parts that do not join,
+  rather than fail the run. (#294)
+
 ## v0.0.35 - 2026-11-02
 
 - Fixed: `front/a2a`'s steer into a working task goes through what

@@ -5285,7 +5285,9 @@ func (w *writer) instructionParts(ctx context.Context, req openresponses.Request
 	}
 	seen := make(map[string]bool, len(parts))
 	for _, p := range parts {
-		if p.ID == "" || seen[p.ID] {
+		// A part named by a hash or a keep is a delta's, which the
+		// recorder writes and the host never names.
+		if p.ID == "" || seen[p.ID] || p.Hash != "" || p.Keep != 0 {
 			return nil, nil
 		}
 		seen[p.ID] = true
