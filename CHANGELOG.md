@@ -21,8 +21,12 @@ versions may break the API.
   carries is refused with `agentsession.ErrSpawnIDRepeated`, by a
   resumed recorder too, and one outside the format's form with an
   error. A later run of the child under the context continues its
-  session, and a child it runs through a tool is its subsession.
-  (#294)
+  session, and a child it runs through a tool is its subsession. The
+  context carries the spawn, so a recorder resumed on the parent files
+  a run under it too, and `Recorder.ContinueChild(ctx, spawnID)` gives
+  a context for a spawn the parent's path links, writing nothing and
+  reserving the child's call IDs, for a host that kept none; a spawn
+  the path does not link is refused with `session.ErrNoSpawn`. (#294)
 - Fixed: a call child a child session's agent started, prompted again
   through `agent.WithSpawn` after that child's run ended, continues its
   own session under that child's, where it was filed under the

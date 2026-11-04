@@ -347,3 +347,70 @@ func TestAHostStartedChildsWriterIsReleased(t *testing.T) {
 		t.Errorf("child links after the helper's second run = %+v, want the one", l)
 	}
 }
+
+// TestAHostStartedChildContinuesAfterAResume pins the review of #294
+// (F6): a spawn's state is on the context, so a recorder resumed on the
+// parent files a run under a context an earlier recorder's StartChild
+// returned into the child; and ContinueChild gives a context for a
+// spawn the parent's path links, writing nothing, so a host that kept
+// no context continues the child, its call IDs reserved for an agent
+// that knows none of them. A spawn the path does not link is refused,
+// and StartChild still refuses the repeat.
+func TestAHostStartedChildContinuesAfterAResume(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spawnID := agentsession.NewSpawnID()
+	cctx, err := rec.StartChild(ctx, spawnID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := agentturn.Config{Name: "pass", Model: &echo.Adapter{}, ModelName: "m"}
+	runSpawned(t, rec, cctx, cfg, "first")
+	id := agentsession.SpawnedSessionID(s.ID(), spawnID)
+
+	rec2, s2, err := Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runSpawned(t, rec2, cctx, cfg, "second")
+	cs, err := store.Open(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := verifyAll(t, cs); n != 2 || len(cs.Path(cs.Leaf())) != len(cs.Entries()) {
+		t.Errorf("the child holds %d responses after a resumed recorder's run, want 2 on one path", n)
+	}
+
+	rec3, _, err := Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := len(s2.Entries())
+	c3, err := rec3.ContinueChild(ctx, spawnID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := SessionIDFromContext(c3); got != id {
+		t.Errorf("ContinueChild names %q, want %q", got, id)
+	}
+	if n := len(s2.Entries()); n != before {
+		t.Errorf("ContinueChild wrote %d entries", n-before)
+	}
+	runSpawned(t, rec3, c3, cfg, "third")
+	if n := verifyAll(t, cs); n != 3 || len(cs.Path(cs.Leaf())) != len(cs.Entries()) {
+		t.Errorf("the child holds %d responses after ContinueChild's run, want 3 on one path", n)
+	}
+	if l := links(s2); len(l) != 1 {
+		t.Errorf("parent links = %+v, want the spawn alone", l)
+	}
+	if _, err := rec3.ContinueChild(ctx, agentsession.NewSpawnID()); !errors.Is(err, ErrNoSpawn) {
+		t.Errorf("ContinueChild of a spawn not linked = %v, want ErrNoSpawn", err)
+	}
+	if _, err := rec3.StartChild(ctx, spawnID); !errors.Is(err, agentsession.ErrSpawnIDRepeated) {
+		t.Errorf("StartChild of a linked spawn = %v, want ErrSpawnIDRepeated", err)
+	}
+}

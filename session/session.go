@@ -4123,14 +4123,19 @@ func (r *Recorder) ChildContext(ctx context.Context, callID string) context.Cont
 // after the configuration agent.ContextWithConfig puts on the
 // context, so a link whose session does not exist says the child never
 // ran. A later run of the same agent under the context continues the
-// session at its leaf; a call child the host's child runs through a
-// tool is that child's subsession, as any is.
+// session at its leaf, and [Recorder.ContinueChild] gives a context
+// for the spawn again, to a recorder resumed on the parent among
+// others, since the context, not the recorder, holds the spawn; a call
+// child the host's child runs through a tool is that child's
+// subsession, as any is. The writer of each of the child's runs is
+// released at the run's end.
 //
 // spawnID is the host's to choose, a UUIDv7 from
 // agentsession.NewSpawnID serving, and is drawn from ASCII letters,
 // digits, '_' and '-'. One the parent's session already carries, on
 // any branch, is refused with agentsession.ErrSpawnIDRepeated, as one
-// in another form is with an error, and nothing is written. A recorder
+// in another form is with an error, and nothing is written: a child
+// already started is continued with ContinueChild. A recorder
 // made with [WithoutChildSessions] writes none and refuses.
 func (r *Recorder) StartChild(ctx context.Context, spawnID string) (context.Context, error) {
 	if !validSpawnID(spawnID) {
@@ -4139,23 +4144,89 @@ func (r *Recorder) StartChild(ctx context.Context, spawnID string) (context.Cont
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !r.children {
-		return ctx, errors.New("session: the recorder writes no child sessions")
+		return ctx, errNoChildSessions
 	}
-	w := r.writerOf(ctx)
-	if w == r.root {
-		cw, err := r.reopen(ctx)
-		if err != nil {
-			return ctx, err
-		}
-		if cw != nil {
-			w = cw
-		}
+	w, err := r.spawnWriter(ctx)
+	if err != nil {
+		return ctx, err
 	}
 	id := agentsession.SpawnedSessionID(w.id, spawnID)
 	if _, err := w.append(context.WithoutCancel(ctx), agentsession.NewSpawnLink(id, spawnID)); err != nil {
 		return ctx, err
 	}
 	return r.spawnContext(ctx, w, spawnRef{parent: w.id, spawnID: spawnID, child: id, call: callOnContext(ctx)}), nil
+}
+
+// ErrNoSpawn is the error of [Recorder.ContinueChild] for a spawn ID
+// no subsession link on the parent's path carries.
+var ErrNoSpawn = errors.New("session: no subsession link on the path carries the spawn ID")
+
+// ContinueChild returns a context for a child the host started with
+// [Recorder.StartChild], whose link the parent's path holds, as
+// StartChild returned one, and writes nothing: a host that did not keep
+// that context, a recorder resumed in another process for one,
+// continues the child under it, and a run prompted with it and
+// observed by [Recorder.Observe] continues the child's session at its
+// leaf. The parent is the session StartChild would link from for ctx.
+// When the child's session exists the context also reserves every call
+// ID in it with agentturn.ContextWithReservedCallIDs, as
+// [Recorder.ChildContext] does, since the agent continuing it may be
+// new and know none of them. A spawn ID no link on the path carries is
+// refused with [ErrNoSpawn], as is one whose link names a callee in
+// another system; StartChild, not ContinueChild, starts a child, and
+// refuses a spawn ID the session carries.
+func (r *Recorder) ContinueChild(ctx context.Context, spawnID string) (context.Context, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.children {
+		return ctx, errNoChildSessions
+	}
+	w, err := r.spawnWriter(ctx)
+	if err != nil {
+		return ctx, err
+	}
+	s, err := r.store.Open(context.WithoutCancel(ctx), w.id)
+	if err != nil {
+		return ctx, fmt.Errorf("session: open %s for its spawn links: %w", w.id, err)
+	}
+	var link *agentsession.LinkEntry
+	for _, e := range s.Path(s.Leaf()) {
+		if l, ok := e.(*agentsession.LinkEntry); ok && l.Rel == agentsession.RelSubsession && l.SpawnID == spawnID && l.Cancel == "" {
+			link = l
+		}
+	}
+	if spawnID == "" || link == nil || link.URL != "" {
+		return ctx, fmt.Errorf("%w: %q in %s", ErrNoSpawn, spawnID, w.id)
+	}
+	ctx = r.spawnContext(ctx, w, spawnRef{parent: w.id, spawnID: spawnID, child: link.Session, call: callOnContext(ctx)})
+	if cs, err := r.store.Open(context.WithoutCancel(ctx), link.Session); err == nil {
+		r.addChild(cs.ID())
+		if ids, err := CallIDs(cs); err == nil {
+			ctx = agentturn.ContextWithReservedCallIDs(ctx, ids...)
+		}
+	}
+	return ctx, nil
+}
+
+// errNoChildSessions refuses a spawn to a recorder made with
+// [WithoutChildSessions].
+var errNoChildSessions = errors.New("session: the recorder writes no child sessions")
+
+// spawnWriter returns the writer of the session a spawn made with ctx
+// is linked from: the one [Recorder.Annotate] files an entry in. The
+// caller holds r.mu.
+func (r *Recorder) spawnWriter(ctx context.Context) (*writer, error) {
+	w := r.writerOf(ctx)
+	if w == r.root {
+		cw, err := r.reopen(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if cw != nil {
+			w = cw
+		}
+	}
+	return w, nil
 }
 
 // spawnContext returns ctx carrying ref and the child's session ID, for
