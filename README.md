@@ -10,7 +10,11 @@ that feeds prompts in and consumes events out, or a subscriber.
   item a harness adds for the model and not for the user, an interrupt
   report or an advisory, is wrapped in `agentturn.Hidden` where it is
   appended: the model still reads it, and its item events and its
-  session entry say a renderer should not show it.
+  session entry say a renderer should not show it. Text the person did
+  not write, an instruction file, a template or an MCP server's prompt,
+  is marked with `agentturn.WithProvenance`, so the record says where
+  it came from and whether it is trusted rather than reading it as the
+  person's words.
 - The model is any `openresponses.Streamer`: a remote server through
   `Client.AsAdapter`, a local adapter, or another agent served by
   `front/responses`.

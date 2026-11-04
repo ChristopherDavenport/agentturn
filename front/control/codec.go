@@ -102,7 +102,7 @@ func wireOf(ev agentturn.Event) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return wireItemStart{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Item: item, ResponseID: e.ResponseID, Hidden: e.Hidden, Copied: e.Copied}, nil
+		return wireItemStart{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Item: item, ResponseID: e.ResponseID, Hidden: e.Hidden, Copied: e.Copied, Provenance: provenanceOut(e.Provenance)}, nil
 	case *agentturn.ItemUpdate:
 		item, err := itemOut(e.Item)
 		if err != nil {
@@ -120,7 +120,7 @@ func wireOf(ev agentturn.Event) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return wireItemEnd{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Item: item, ResponseID: e.ResponseID, Hidden: e.Hidden, Copied: e.Copied, Trigger: triggerOut(e.Trigger), ModelCallID: e.ModelCallID}, nil
+		return wireItemEnd{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, Item: item, ResponseID: e.ResponseID, Hidden: e.Hidden, Copied: e.Copied, Trigger: triggerOut(e.Trigger), ModelCallID: e.ModelCallID, Provenance: provenanceOut(e.Provenance)}, nil
 	case *agentturn.ResponseEnd:
 		resp, err := responseOut(e.Response)
 		if err != nil {
@@ -169,7 +169,7 @@ func wireOf(ev agentturn.Event) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return wireQueued{Type: e.EventType(), RunID: e.RunID, Item: item, Mode: string(e.Mode), Input: string(e.Input), Hidden: e.Hidden, Trigger: triggerOut(e.Trigger)}, nil
+		return wireQueued{Type: e.EventType(), RunID: e.RunID, Item: item, Mode: string(e.Mode), Input: string(e.Input), Hidden: e.Hidden, Trigger: triggerOut(e.Trigger), Provenance: provenanceOut(e.Provenance)}, nil
 	case *agentturn.Question:
 		return wireQuestion{Type: e.EventType(), ID: e.ID, RunID: e.RunID, CallID: e.CallID, Call: askedCallOut(e.Call), Elicitation: elicitationOut(e.Elicitation)}, nil
 	case *agentturn.QuestionClosed:
@@ -248,7 +248,7 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 		if err != nil {
 			return nil, err
 		}
-		return &agentturn.ItemStart{RunID: w.RunID, Turn: w.Turn, Item: item, ResponseID: w.ResponseID, Hidden: w.Hidden, Copied: w.Copied}, nil
+		return &agentturn.ItemStart{RunID: w.RunID, Turn: w.Turn, Item: item, ResponseID: w.ResponseID, Hidden: w.Hidden, Copied: w.Copied, Provenance: provenanceIn(w.Provenance)}, nil
 	},
 	agentturn.EventItemUpdate: func(data []byte) (agentturn.Event, error) {
 		var w wireItemUpdate
@@ -276,7 +276,7 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 		if err != nil {
 			return nil, err
 		}
-		return &agentturn.ItemEnd{RunID: w.RunID, Turn: w.Turn, Item: item, ResponseID: w.ResponseID, Hidden: w.Hidden, Copied: w.Copied, Trigger: triggerIn(w.Trigger), ModelCallID: w.ModelCallID}, nil
+		return &agentturn.ItemEnd{RunID: w.RunID, Turn: w.Turn, Item: item, ResponseID: w.ResponseID, Hidden: w.Hidden, Copied: w.Copied, Trigger: triggerIn(w.Trigger), ModelCallID: w.ModelCallID, Provenance: provenanceIn(w.Provenance)}, nil
 	},
 	agentturn.EventResponseEnd: func(data []byte) (agentturn.Event, error) {
 		var w wireResponseEnd
@@ -353,7 +353,7 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 		if err != nil {
 			return nil, err
 		}
-		return &agentturn.Queued{RunID: w.RunID, Item: item, Mode: agentturn.QueueMode(w.Mode), Input: agentturn.InputMode(w.Input), Hidden: w.Hidden, Trigger: triggerIn(w.Trigger)}, nil
+		return &agentturn.Queued{RunID: w.RunID, Item: item, Mode: agentturn.QueueMode(w.Mode), Input: agentturn.InputMode(w.Input), Hidden: w.Hidden, Trigger: triggerIn(w.Trigger), Provenance: provenanceIn(w.Provenance)}, nil
 	},
 	agentturn.EventQuarantineAdded: func(data []byte) (agentturn.Event, error) {
 		var w wireQuarantineAdded
@@ -438,6 +438,7 @@ type wireItemStart struct {
 	ResponseID string          `json:"response_id,omitempty"`
 	Hidden     bool            `json:"hidden,omitempty"`
 	Copied     bool            `json:"copied,omitempty"`
+	Provenance *wireProvenance `json:"provenance,omitempty"`
 }
 
 type wireItemUpdate struct {
@@ -459,6 +460,7 @@ type wireItemEnd struct {
 	Copied      bool            `json:"copied,omitempty"`
 	Trigger     *wireTrigger    `json:"trigger,omitempty"`
 	ModelCallID string          `json:"model_call_id,omitempty"`
+	Provenance  *wireProvenance `json:"provenance,omitempty"`
 }
 
 type wireResponseEnd struct {
@@ -540,13 +542,14 @@ type wireRunEnd struct {
 }
 
 type wireQueued struct {
-	Type    string          `json:"type"`
-	RunID   string          `json:"run_id,omitempty"`
-	Item    json.RawMessage `json:"item"`
-	Mode    string          `json:"mode"`
-	Input   string          `json:"input,omitempty"`
-	Hidden  bool            `json:"hidden,omitempty"`
-	Trigger *wireTrigger    `json:"trigger,omitempty"`
+	Type       string          `json:"type"`
+	RunID      string          `json:"run_id,omitempty"`
+	Item       json.RawMessage `json:"item"`
+	Mode       string          `json:"mode"`
+	Input      string          `json:"input,omitempty"`
+	Hidden     bool            `json:"hidden,omitempty"`
+	Trigger    *wireTrigger    `json:"trigger,omitempty"`
+	Provenance *wireProvenance `json:"provenance,omitempty"`
 }
 
 type wireQuestion struct {
@@ -644,6 +647,59 @@ func triggerOut(t agentturn.Trigger) *wireTrigger {
 		return nil
 	}
 	return &wireTrigger{Kind: t.Kind, Ref: t.Ref, Source: t.Source, Extra: t.Extra}
+}
+
+// wireProvenance is an agentturn.Provenance: where an item the host
+// composed came from and whether it is trusted. Trust is absent when
+// the host said nothing and an object with an empty reads when it
+// judged the content and found neither label.
+type wireProvenance struct {
+	Layers []wireLayer  `json:"layers,omitempty"`
+	Source *wireTrigger `json:"source,omitempty"`
+	Trust  *wireTrust   `json:"trust,omitempty"`
+}
+
+type wireLayer struct {
+	ID     string `json:"id,omitempty"`
+	Source string `json:"source"`
+}
+
+type wireTrust struct {
+	Reads []agenttool.Label `json:"reads"`
+}
+
+func provenanceOut(p *agentturn.Provenance) *wireProvenance {
+	if p == nil {
+		return nil
+	}
+	w := &wireProvenance{Source: triggerOut(p.Source)}
+	for _, l := range p.Layers {
+		w.Layers = append(w.Layers, wireLayer{ID: l.ID, Source: l.Source})
+	}
+	if p.Trust != nil {
+		w.Trust = &wireTrust{Reads: p.Trust.Reads}
+		if w.Trust.Reads == nil {
+			w.Trust.Reads = []agenttool.Label{}
+		}
+	}
+	return w
+}
+
+func provenanceIn(w *wireProvenance) *agentturn.Provenance {
+	if w == nil {
+		return nil
+	}
+	p := &agentturn.Provenance{Source: triggerIn(w.Source)}
+	for _, l := range w.Layers {
+		p.Layers = append(p.Layers, agentturn.Layer{ID: l.ID, Source: l.Source})
+	}
+	if w.Trust != nil {
+		p.Trust = &agentturn.Trust{Reads: w.Trust.Reads}
+		if p.Trust.Reads == nil {
+			p.Trust.Reads = []agenttool.Label{}
+		}
+	}
+	return p
 }
 
 func triggerIn(w *wireTrigger) agentturn.Trigger {

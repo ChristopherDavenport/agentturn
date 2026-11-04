@@ -36,14 +36,17 @@ func sampleEvents(t *testing.T) map[string]agentturn.Event {
 	if err != nil {
 		t.Fatal(err)
 	}
+	prov := &agentturn.Provenance{Layers: []agentturn.Layer{{ID: "/repo/AGENTS.md", Source: "agentsmd"}, {Source: "agentmemory"}},
+		Source: agentturn.Trigger{Kind: "mcp_prompt", Ref: "docs/review", Source: "mcp", Extra: map[string]any{"server": "docs"}},
+		Trust:  &agentturn.Trust{Reads: []agenttool.Label{agenttool.LabelUntrusted}}}
 	return map[string]agentturn.Event{
 		"RunStart":     &agentturn.RunStart{RunID: "run_1", Source: agentturn.SourceInput, Trigger: trigger},
 		"TurnStart":    &agentturn.TurnStart{RunID: "run_1", Turn: 1, Request: req, Inputs: openresponses.Items{openresponses.UserText("hi")}, Arrived: []agentturn.TurnInput{{Item: openresponses.UserText("hi"), Mode: agentturn.InputPrompt, Trigger: trigger}}},
 		"ModelRetry":   &agentturn.ModelRetry{RunID: "run_1", Turn: 1, Attempt: 2, Err: agentturn.ErrNoModel, Delay: 1500 * time.Millisecond, Request: req},
 		"ModelBlocked": &agentturn.ModelBlocked{RunID: "run_1", Turn: 1, Request: req, Err: agentturn.ErrGuard},
-		"ItemStart":    &agentturn.ItemStart{RunID: "run_1", Turn: 1, Item: call, ResponseID: "resp_1", Hidden: true, Copied: true},
+		"ItemStart":    &agentturn.ItemStart{RunID: "run_1", Turn: 1, Item: call, ResponseID: "resp_1", Hidden: true, Copied: true, Provenance: prov},
 		"ItemUpdate":   &agentturn.ItemUpdate{RunID: "run_1", Turn: 1, Item: call, Stream: stream, ResponseID: "resp_1"},
-		"ItemEnd":      &agentturn.ItemEnd{RunID: "run_1", Turn: 1, Item: call, ResponseID: "resp_1", Hidden: true, Copied: true, Trigger: trigger, ModelCallID: "m_1"},
+		"ItemEnd":      &agentturn.ItemEnd{RunID: "run_1", Turn: 1, Item: call, ResponseID: "resp_1", Hidden: true, Copied: true, Trigger: trigger, ModelCallID: "m_1", Provenance: prov},
 		"ResponseEnd":  &agentturn.ResponseEnd{RunID: "run_1", Turn: 1, Response: resp, Withheld: true},
 		"ToolStart":    &agentturn.ToolStart{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Args: json.RawMessage(`{"text":"a"}`), Decision: decision, Parent: "call_0", Invoked: json.RawMessage(`{"text":"A"}`), Replayed: true},
 		"ToolDispatch": &agentturn.ToolDispatch{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Parent: "call_0", IdempotencyKey: "k"},
@@ -57,7 +60,7 @@ func sampleEvents(t *testing.T) map[string]agentturn.Event {
 				Notes:    []agentturn.Note{{Item: openresponses.UserText("only the unit tests"), Mode: agentturn.InputResume, Trigger: trigger, CallID: "call_1"}},
 				Question: &agentturn.OpenQuestion{ID: "entry_1", Message: "Allow notify?", Call: &agentturn.AskedCall{Parent: "call_1", CallID: "call_2", Name: "notify"}},
 			}}, Notes: []agentturn.Note{{Item: openresponses.DeveloperText("owed"), Mode: agentturn.InputTool}}},
-		"Queued":          &agentturn.Queued{RunID: "run_1", Item: openresponses.UserText("more"), Mode: agentturn.QueueSteer, Input: agentturn.InputDeliver, Hidden: true, Trigger: trigger},
+		"Queued":          &agentturn.Queued{RunID: "run_1", Item: openresponses.UserText("more"), Mode: agentturn.QueueSteer, Input: agentturn.InputDeliver, Hidden: true, Trigger: trigger, Provenance: prov},
 		"Question":        &agentturn.Question{ID: "question_1", RunID: "run_1", CallID: "call_0", Call: &agentturn.AskedCall{Parent: "call_0", CallID: "call_1", Name: "upper", Args: json.RawMessage(`{}`), Decision: decision}, Elicitation: agenttool.Elicitation{Message: "ok?", Schema: json.RawMessage(`{"type":"object"}`), URL: "https://example.test"}},
 		"QuarantineAdded": &agentturn.QuarantineAdded{},
 		"NotesHeld":       &agentturn.NotesHeld{RunID: "run_1", Notes: []agentturn.Note{{Item: openresponses.DeveloperText("a ran in the sandbox"), Mode: agentturn.InputTool}}},
@@ -348,6 +351,58 @@ func TestACopiedItemCrossesTheWire(t *testing.T) {
 				t.Errorf("item_end = %+v, want copied", e)
 			}
 		}
+	}
+}
+
+// TestProvenanceCrossesTheWire pins that a remote view or recorder
+// reads where text the person did not write came from and whether it
+// is trusted, as a local one does (RFC 0001 The record): the layers,
+// the source with its own members and the trust, an empty trust kept
+// apart from none.
+func TestProvenanceCrossesTheWire(t *testing.T) {
+	want := &agentturn.Provenance{Layers: []agentturn.Layer{{ID: "/repo/AGENTS.md", Source: "agentsmd"}, {Source: "agentmemory"}},
+		Source: agentturn.Trigger{Kind: "mcp_prompt", Ref: "docs/review", Source: "mcp", Extra: map[string]any{"server": "docs"}},
+		Trust:  &agentturn.Trust{Reads: []agenttool.Label{agenttool.LabelUntrusted}}}
+	for _, name := range []string{"ItemStart", "ItemEnd", "Queued"} {
+		data, err := MarshalEvent(sampleEvents(t)[name])
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := UnmarshalEvent(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var p *agentturn.Provenance
+		switch e := got.(type) {
+		case *agentturn.ItemStart:
+			p = e.Provenance
+		case *agentturn.ItemEnd:
+			p = e.Provenance
+		case *agentturn.Queued:
+			p = e.Provenance
+		}
+		if !reflect.DeepEqual(p, want) {
+			t.Errorf("%s provenance = %+v, want %+v", name, p, want)
+		}
+	}
+	judged := &agentturn.ItemEnd{RunID: "run_1", Item: openresponses.UserText("x"), Provenance: &agentturn.Provenance{Trust: &agentturn.Trust{Reads: []agenttool.Label{}}}}
+	data, err := MarshalEvent(judged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := got.(*agentturn.ItemEnd).Provenance; p == nil || p.Trust == nil || len(p.Trust.Reads) != 0 {
+		t.Errorf("a judged item's provenance = %+v, want an empty trust", p)
+	}
+	plain, err := UnmarshalEvent([]byte(`{"type":"item_end","run_id":"run_1","turn":1,"item":{"type":"message","role":"user","content":"x"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := plain.(*agentturn.ItemEnd).Provenance; p != nil {
+		t.Errorf("a plain item's provenance = %+v, want none", p)
 	}
 }
 
