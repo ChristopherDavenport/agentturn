@@ -38,6 +38,16 @@ versions may break the API.
   came from and whether it is trusted, and a recorder MUST record both
   on the item. The new MUST is breaking for a recorder that does not.
   (#300)
+- Changed: RFC 0001 states the rule for a batch hold, which
+  `session.Recorder` already met: a hold written for a call deferred
+  only because another call of its batch was asked about MUST be
+  marked held (`agentturn:held`, `session.HeldMember`) and SHOULD carry
+  the part of the call the deferral is about (`agentturn:subject`,
+  `session.SubjectMember`), and a reader that seeds pending calls MUST
+  read both back. A test pins it for a sidecar session read with the
+  recorder's read options, through `Pending`, `AgentOptions` and a
+  resumed recorder. The new MUST is breaking for a recorder or reader
+  that does not. (#299)
 
 ## v0.0.36 - 2026-11-03
 

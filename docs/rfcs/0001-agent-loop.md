@@ -2014,6 +2014,21 @@ what sent it, which on a queued input is also the `queued` entry's
 `trigger`, since the item that drains an entry carries the trigger the
 entry held (#300).
 
+A decision that defers a call MAY mark it **held**, deferred only
+because another call of its batch was asked about, as a policy that
+holds the calls it would allow beside one it asks about does, and MAY
+name the part of the call it is about, one command of a compound shell
+line. A recorder that writes `hold` for a call deferred only because another
+call of its batch was asked about MUST mark that hold as held, and
+SHOULD record the part of the call the deferral is about. A reader that
+seeds pending calls from the record MUST read both back. The reference
+recorder writes them as the hold's `agentturn:held`, `true`, and
+`agentturn:subject` members, and reads them back onto the pending
+call's decision however it reads the session, a sidecar one's blobs
+through its read options included, so a front over a restarted session
+asks about the asked call alone and says which part it is about
+(#299).
+
 ## Bindings
 
 ### Go
@@ -2048,7 +2063,7 @@ maps onto it as follows:
 | reason, cause | `Reason` (`ReasonDone`, `ReasonStopped`, `ReasonInputRequired`, `ReasonAborted`, `ReasonError`); `StopCause` (`StopMaxTurns`, `StopHook`, `StopGuard`, `StopTerminate`, `StopPartialTerminate`, `StopRefused`) |
 | idempotency key | `ToolDispatch.IdempotencyKey`, on `agenttool.Call` for the tool |
 | pending call | `PendingCall{Call, Reason, Tool, Dispatched, IdempotencyKey, Args, Nested}`, `PendingCall.MayHaveRun`; `PendingReason` (`PendingDeferred`, `PendingAborted`, `PendingUndispatched`, `PendingUnknown`, `PendingAnswered`, `PendingRejected`, `PendingReturned`); `PendingCalls` |
-| decision | `ToolDecision{Action, Reason, Terminate, Args, By, Note}`; `ToolAction` (`Allow`, `Block`, `Defer`) |
+| decision | `ToolDecision{Action, Reason, Terminate, Args, By, Note, Held, Subject}`; `ToolAction` (`Allow`, `Block`, `Defer`) |
 | answer | `Answer{CallID, Output, Args, Note, Terminate, By, Reason, Origin, Failed, IdempotencyKey, RunAgain}`; `Output`, `Approve`, `ApproveWith`, `Refuse`, `OutcomeUnknown`, `WithNote`, `WithBy`, `WithReason`, `WithOrigin`, `WithFailed`, `WithIdempotencyKey`, `WithRunAgain`, `RunAgainReason`, `OutcomeUnknownReason`; `ContextWithDeciders`/`DeciderFromContext`, `ContextWithReasons`/`ReasonFromContext`, `ContextWithOrigins`/`OriginFromContext` and `ContextWithFailures`/`FailedFromContext` for a host driving `Run` |
 | hooks | `Config.BeforeTurn`, `BeforeModelCall`, `OutputGuard`, `BeforeToolCall`, `AfterToolCall`, `ShouldStopAfterTurn` |
 | guard stop | an error wrapping `ErrGuard` from `ShouldStopAfterTurn`, `BeforeTurn`, `BeforeModelCall`, `OutputGuard` or the model; the output of a call a withheld response made is `WithheldCallOutput` |
@@ -2116,7 +2131,8 @@ of its batch has not settled, and none for the last of its batch; and,
 when it offers the host a way to start a child of its own, writes the
 `spawn_id` link before the child's header and refuses a `spawn_id` the
 session carries on any branch, writing nothing; and records an item's
-provenance on its entry as `instructions_part`, `trust` and `source`.
+provenance on its entry as `instructions_part`, `trust` and `source`, and a hold for a call held beside an asked one
+marked held.
 The rule on a host
 that starts such a child is not checked here: this section has no
 class for a host, and a host meets it by starting the child through a
@@ -2310,6 +2326,11 @@ it.
   `queued` entry's `trigger` (#300); breaking for a recorder.
 - **Events.** `item_start`, `item_end` and `queued` carry the
   provenance, and `queued` the item's source as its trigger (#300).
+- **The record.** A hold written for a call deferred only beside an
+  asked call of its batch MUST be marked held, and SHOULD carry the
+  part of the call the deferral is about; a reader that seeds pending
+  calls MUST read both back (#299); breaking for a recorder or a reader
+  that does not.
 
 ## Changes in draft 0.5
 
