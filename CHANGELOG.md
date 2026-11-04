@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.37 - 2026-11-04
 
 - Added: `WithProvenance(item, Provenance{Layers, Source, Trust})` lets
   a host or a hook say where an item it composed from text the person
