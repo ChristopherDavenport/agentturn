@@ -230,3 +230,33 @@ func TestAnOwedQueuedInputKeepsItsMarksAcrossARestart(t *testing.T) {
 		t.Errorf("drained reminder = %+v", it)
 	}
 }
+
+// TestACopysTrustIsNotSilentlyNarrowed pins the choice made for a
+// copied item that also carries a provenance trust: the format has a
+// copy carry the trust of what it copies as written, so the host's
+// labels cannot be added; a recorder that would drop one refuses
+// instead, and one the copy's trust already holds loses nothing.
+func TestACopysTrustIsNotSilentlyNarrowed(t *testing.T) {
+	copyOf := func(reads ...string) *agentsession.ItemEntry {
+		return &agentsession.ItemEntry{Item: openresponses.UserText("copied"), CopiedFrom: &agentsession.CopiedFrom{Session: "s"}, Trust: &agentsession.Trust{Reads: reads}}
+	}
+	prov := func(reads ...agenttool.Label) *agentturn.Provenance {
+		return &agentturn.Provenance{Trust: &agentturn.Trust{Reads: reads}}
+	}
+	e := copyOf("untrusted")
+	if err := recordProvenance(e, prov(agenttool.LabelUntrusted)); err != nil || !slices.Equal(e.Trust.Reads, []string{"untrusted"}) {
+		t.Errorf("held labels: err=%v trust=%+v", err, e.Trust)
+	}
+	e = copyOf()
+	if err := recordProvenance(e, prov()); err != nil {
+		t.Errorf("an empty trust: %v", err)
+	}
+	e = copyOf("untrusted")
+	if err := recordProvenance(e, prov(agenttool.LabelPrivate)); err == nil {
+		t.Errorf("a label the copy cannot hold was dropped: trust %+v", e.Trust)
+	}
+	e = &agentsession.ItemEntry{Item: openresponses.UserText("copied"), CopiedFrom: &agentsession.CopiedFrom{Session: "s"}}
+	if err := recordProvenance(e, prov(agenttool.LabelUntrusted)); err == nil {
+		t.Errorf("a label dropped from a copy with no trust: trust %+v", e.Trust)
+	}
+}

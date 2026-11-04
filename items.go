@@ -80,7 +80,9 @@ func Unhide(item openresponses.Item) (openresponses.Item, bool) {
 // with agentsession RFC 0001's copied_from, naming where it came from,
 // and writes no decision for a call so marked or its output, since the
 // call is not this session's. Use it where [Hidden] may be used; the
-// two compose, and [Unhide] strips both.
+// marks compose, and [Unhide] strips them all. A copy's trust is the
+// trust of what it copies, so a [Provenance] trust on a copied item is
+// not written; see [Provenance.Trust].
 func Copied(item openresponses.Item) openresponses.Item {
 	if item == nil {
 		return nil
@@ -119,7 +121,10 @@ type Provenance struct {
 	// Zero leaves the item the trigger it is handed in under.
 	Source Trigger
 	// Trust is what the host knows of the content's trust; nil says
-	// nothing.
+	// nothing. On an item also marked [Copied] it adds nothing: a copy
+	// carries the trust of what it copies, as written, and a session
+	// recorder refuses one whose Trust names a label that trust does
+	// not hold rather than drop it.
 	Trust *Trust
 }
 

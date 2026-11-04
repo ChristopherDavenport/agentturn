@@ -44,6 +44,16 @@ versions may break the API.
   `Recorder.Requeue` hands the input back marked and the item that
   drains it is recorded hidden, with its layers and trust, not as the
   person's visible input. (#300)
+- Added: a turn's inputs (`TurnInput.Trigger`, `TurnStart.Arrived`)
+  name a prompted or hook-added item's provenance source over the
+  run's trigger, as its queued report and its record do. (#300)
+- Added: `session.Recorder` refuses a copied item whose provenance
+  trust names a label the trust it was copied with does not hold,
+  ending the run with an error, rather than drop the label: the format
+  has a copy carry its source's trust as written. `front/control`'s
+  doc says the items a client hands in carry no marks to the server,
+  by design: a client is the person, and text the person did not
+  write is the host's to mark. (#300)
 - Changed: RFC 0001 is draft 0.6. The record states the rule: a host
   that adds text the person did not write MUST be able to say where it
   came from and whether it is trusted, and a recorder MUST record both

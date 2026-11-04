@@ -45,6 +45,7 @@ func TestProvenanceRidesOnTheItemEvents(t *testing.T) {
 		}})
 	got := map[string]*Provenance{}
 	var queued *Queued
+	arrived := map[string]Trigger{}
 	a.Subscribe(func(_ context.Context, ev Event) error {
 		switch e := ev.(type) {
 		case *ItemEnd:
@@ -55,6 +56,12 @@ func TestProvenanceRidesOnTheItemEvents(t *testing.T) {
 			if m, ok := e.Item.(*openresponses.Message); ok && e.ResponseID == "" && m.Text() == "review this" && e.Provenance == nil {
 				t.Error("item_start of a composed item carries no provenance")
 			}
+		case *TurnStart:
+			for _, in := range e.Arrived {
+				if m, ok := in.Item.(*openresponses.Message); ok {
+					arrived[m.Text()] = in.Trigger
+				}
+			}
 		case *Queued:
 			queued = e
 		}
@@ -63,8 +70,23 @@ func TestProvenanceRidesOnTheItemEvents(t *testing.T) {
 	if err := a.Queue(context.Background(), QueueSteer, steered); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.Prompt(context.Background(), openresponses.UserText("mine"), prompted); err != nil {
+	human := Trigger{Kind: "human", Ref: "tty"}
+	if _, err := a.Prompt(ContextWithTrigger(context.Background(), human), openresponses.UserText("mine"), prompted); err != nil {
 		t.Fatal(err)
+	}
+	// The turn's inputs name each item's own source over the run's
+	// trigger, as its queued report does, and the run's for the rest.
+	for text, want := range map[string]string{"mine": "human", "review this": "mcp_prompt", "resource text": "mcp_prompt", "<reminder>AGENTS.md</reminder>": "mcp_prompt"} {
+		if text == "<reminder>AGENTS.md</reminder>" {
+			// The hook's item names no source and arrives under none.
+			if got, ok := arrived[text]; !ok || !got.IsZero() {
+				t.Errorf("turn input %q trigger = %+v (%v), want none", text, got, ok)
+			}
+			continue
+		}
+		if got := arrived[text]; got.Kind != want {
+			t.Errorf("turn input %q trigger = %+v, want kind %q", text, got, want)
+		}
 	}
 	if p := got["mine"]; p != nil {
 		t.Errorf("a plain prompt carries provenance %+v", p)

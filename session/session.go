@@ -5975,10 +5975,11 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 // composed: the layers a message was composed from as
 // instructions_part, a single object for one and a list for several,
 // and its trust, unless the item is a copy, whose trust is the one it
-// was copied with.
-func recordProvenance(e *agentsession.ItemEntry, prov *agentturn.Provenance) {
+// was copied with: it refuses a copy whose provenance carries a label
+// that trust does not hold, rather than drop it.
+func recordProvenance(e *agentsession.ItemEntry, prov *agentturn.Provenance) error {
 	if prov == nil {
-		return
+		return nil
 	}
 	if _, ok := e.Item.(*openresponses.Message); ok && len(prov.Layers) > 0 {
 		layers := make([]agentsession.LayerRef, len(prov.Layers))
@@ -5991,13 +5992,30 @@ func recordProvenance(e *agentsession.ItemEntry, prov *agentturn.Provenance) {
 			e.InstructionsLayers = layers
 		}
 	}
-	if prov.Trust != nil && e.CopiedFrom == nil {
-		reads := make([]string, len(prov.Trust.Reads))
-		for i, l := range prov.Trust.Reads {
-			reads[i] = string(l)
-		}
-		e.Trust = &agentsession.Trust{Reads: reads}
+	if prov.Trust == nil {
+		return nil
 	}
+	reads := make([]string, len(prov.Trust.Reads))
+	for i, l := range prov.Trust.Reads {
+		reads[i] = string(l)
+	}
+	if e.CopiedFrom == nil {
+		e.Trust = &agentsession.Trust{Reads: reads}
+		return nil
+	}
+	// A copy carries the trust of what it copies, as written: the
+	// host's labels cannot be added to it, and one it does not hold
+	// would be dropped without a word, so the item is refused.
+	var held []string
+	if e.Trust != nil {
+		held = e.Trust.Reads
+	}
+	for _, l := range reads {
+		if !slices.Contains(held, l) {
+			return fmt.Errorf("session: copied %s item: its provenance labels it %q, which the trust it was copied with does not hold and a copy cannot add", e.Item.ItemType(), l)
+		}
+	}
+	return nil
 }
 
 // itemTrigger is the trigger item is queued under: the source of its
@@ -6254,7 +6272,9 @@ func (w *writer) itemFrom(ctx context.Context, item openresponses.Item, response
 			}
 			e.CopiedFrom, e.Trust = &cf, trust
 		}
-		recordProvenance(e, prov)
+		if err := recordProvenance(e, prov); err != nil {
+			return err
+		}
 		if hidden {
 			visible := false
 			e.Visible = &visible

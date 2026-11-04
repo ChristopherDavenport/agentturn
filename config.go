@@ -616,7 +616,8 @@ type TurnInput struct {
 	Mode InputMode
 	// Trigger is the run's trigger for a prompt's item and the trigger
 	// its Queued report carried for a steered, followed-up or delivered
-	// item; zero otherwise.
+	// item; zero otherwise. An item whose [Provenance] names a Source
+	// arrives under that source instead, wherever it came in.
 	Trigger Trigger
 }
 

@@ -1639,6 +1639,11 @@ func (r *runner) appendOne(item openresponses.Item, mode InputMode, trigger, end
 		return nil
 	}
 	prov := provenance(item)
+	if prov != nil && !prov.Source.IsZero() {
+		// The item's own source stands over the trigger it arrived
+		// under, for it alone, as it does on its queued report.
+		trigger = prov.Source
+	}
 	item, hidden, copied := marks(item)
 	if err := r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden, Copied: copied, Provenance: prov}); err != nil {
 		return err
