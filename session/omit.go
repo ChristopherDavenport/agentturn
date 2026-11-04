@@ -694,3 +694,65 @@ func (w *writer) bindQuarantine(set *agentturn.QuarantineSet, t agentturn.Transc
 	}
 	return bound
 }
+
+// quarantineOver returns base, the omit setting in force, with the
+// item entries of the path that quarantined, the run's quarantine as
+// turn_start or model_retry carries it, holds added: a function call
+// output to the outputs sent as [agentturn.QuarantinedOutput], a call
+// and its outputs, and any other item, to the items left out. It is
+// what the settle writes for a request whose input the format cannot
+// describe, a hook's addition or a run on a root of its own that sends
+// items the path does not hold among them: the response goes unhashed,
+// and the quarantine in force is recorded all the same, so a resume, an
+// agent attached after one and a spawn read it from the record (RFC
+// 0001 The record). An entry is matched as agentturn.QuarantineSet.Bind
+// matches an item, itself or a copy equal in content, so a writer
+// seeded from the store finds the items the agent quarantined.
+func (w *writer) quarantineOver(base agentsession.Omit, quarantined openresponses.Items, model string) agentsession.Omit {
+	if len(quarantined) == 0 {
+		return base
+	}
+	set, err := agentturn.NewQuarantineSet(quarantined...)
+	if err != nil {
+		return base
+	}
+	held := map[openresponses.Item]bool{}
+	for _, item := range set.Bind(agentturn.Transcript(w.values)).Items() {
+		held[item] = true
+	}
+	if len(held) == 0 {
+		return base
+	}
+	calls := map[string]bool{}
+	for item := range held {
+		if c, ok := item.(*openresponses.FunctionCall); ok {
+			calls[c.CallID] = true
+		}
+	}
+	listed := idSet(base.Items)
+	want := agentsession.Omit{Reasoning: base.Reasoning, Items: slices.Clone(base.Items), Outputs: base.Outputs, Images: base.Images}
+	var outs []string
+	for i, v := range w.values {
+		if w.custom[i] || w.meta[i].folded || listed[w.items[i]] || w.leftOut(i, model, base) {
+			continue
+		}
+		out, isOutput := v.(*openresponses.FunctionCallOutput)
+		switch {
+		case isOutput && calls[out.CallID]:
+			want.Items = append(want.Items, w.items[i])
+		case isOutput && held[v]:
+			if base.Outputs != nil {
+				if _, ok := base.Outputs.TextFor(w.items[i]); ok {
+					continue
+				}
+			}
+			outs = append(outs, w.items[i])
+		case held[v]:
+			want.Items = append(want.Items, w.items[i])
+		}
+	}
+	if len(outs) > 0 {
+		want.Outputs = withOutputs(base.Outputs, []string{agentturn.QuarantinedOutput}, map[string][]string{agentturn.QuarantinedOutput: outs})
+	}
+	return want
+}

@@ -204,6 +204,17 @@ type TurnStart struct {
 	Request openresponses.Request
 	Inputs  openresponses.Items
 	Arrived []TurnInput
+	// Quarantined is the run's quarantine as the request was built
+	// under it: the items it holds, in no order, each named as
+	// [Quarantine] named it (RFC 0001 The request, step 3). The request
+	// leaves each out, or sends an output as [QuarantinedOutput], but a
+	// subscriber reading the request alone cannot always tell a
+	// quarantine from another difference, a hook's addition or a
+	// transcript its record does not hold, so a recorder records the
+	// quarantine in force from here whatever else the input holds (RFC
+	// 0001 The record). It is a copy: what is quarantined later is in a
+	// later event's.
+	Quarantined openresponses.Items
 }
 
 // EventType returns "turn_start".
@@ -229,6 +240,9 @@ type ModelRetry struct {
 	// does on turn_start, so a fallback to another model reaches the
 	// path as a config delta.
 	Request openresponses.Request
+	// Quarantined is the run's quarantine as the next attempt's request
+	// is built under it, as [TurnStart.Quarantined] is.
+	Quarantined openresponses.Items
 }
 
 // EventType returns "model_retry".

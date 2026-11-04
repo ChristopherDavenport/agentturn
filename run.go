@@ -1809,7 +1809,7 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 		return nil, err
 	}
 	inputs := append(openresponses.Items(nil), r.transcript[min(r.mark, len(r.transcript)):]...)
-	if err := r.emit(&TurnStart{RunID: r.runID, Turn: r.turn, Request: req, Inputs: inputs, Arrived: append([]TurnInput(nil), r.arrived...)}); err != nil {
+	if err := r.emit(&TurnStart{RunID: r.runID, Turn: r.turn, Request: req, Inputs: inputs, Arrived: append([]TurnInput(nil), r.arrived...), Quarantined: r.quarantined()}); err != nil {
 		return nil, err
 	}
 	start := len(r.transcript)
@@ -1911,7 +1911,7 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 				next.Input = input
 			}
 			if !sameItems(next.Input, req.Input) {
-				if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: call, Err: err, Request: next}); err != nil {
+				if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: call, Err: err, Request: next, Quarantined: r.quarantined()}); err != nil {
 					return nil, err
 				}
 				req, b = next, nb
@@ -1933,7 +1933,7 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 			// for: a move to another model rebuilds the loop's input.
 			req, revised = b.forModel(r, req, next), true
 		}
-		if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: call, Err: err, Delay: delay, Request: req}); err != nil {
+		if err := r.emit(&ModelRetry{RunID: r.runID, Turn: r.turn, Attempt: call, Err: err, Delay: delay, Request: req, Quarantined: r.quarantined()}); err != nil {
 			return nil, err
 		}
 		if err := sleep(ctx, delay); err != nil {
@@ -2768,6 +2768,18 @@ func (r *runner) toolBatch(ctx context.Context, tools agenttool.Set, calls []*op
 		return nil, nil, err
 	}
 	return r.collect(batch)
+}
+
+// quarantined is a copy of the items the run's quarantine holds, nil
+// when it holds none, for the events that carry it.
+func (r *runner) quarantined() openresponses.Items {
+	if r.quarantine == nil {
+		return nil
+	}
+	if items := r.quarantine.list(); len(items) > 0 {
+		return items
+	}
+	return nil
 }
 
 // attributed is ctx carrying the run's reasoning attribution as it

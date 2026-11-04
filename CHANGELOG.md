@@ -50,6 +50,20 @@ versions may break the API.
   had neither: in a sidecar child the queued entry's media is stored as
   a blob, as RFC 0001 has a recorder do, rather than left inline, and a
   session linked from it takes its media form and directory. (#294)
+- Fixed (security): a quarantine made in a request the recorder could
+  not describe was not recorded, so it leaked after a reopen. When a
+  hook added to the input, or a child's run on a root of its own
+  (`agent.ContextWithRetry`) sent the run before it, the response was
+  rightly left unhashed (`agentturn:unhashed`) but no `omit` was
+  written for what the run's guard quarantined. An agent attached after
+  `Resume` and seeded with the conversation whole sent the quarantined
+  output to the model again, and from this release so would a child
+  `StartChild` or `ContinueChild` starts after the run. This predates
+  #294: v0.0.35 and earlier leak after `Resume`. `TurnStart` and
+  `ModelRetry` now carry the run's quarantine as `Quarantined`, a copy
+  of the items it holds, and the recorder records it as `omit`, outputs
+  as the placeholder and other items left out, whether or not it can
+  describe the request. (#294)
 - Changed: RFC 0001 is draft 0.5. The record states the rule for a
   child the host starts: a subsession linked by a `spawn_id`, the link
   before the child's header, a `spawn_id` never repeated in the

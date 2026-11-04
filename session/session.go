@@ -5344,6 +5344,9 @@ func (w *writer) turnStart(ctx context.Context, e *agentturn.TurnStart) error {
 	if err != nil {
 		return err
 	}
+	if unhashed != nil {
+		omit = w.quarantineOver(omit, e.Quarantined, req.Model)
+	}
 	w.settleReq, w.settleOmit = &req, omit
 	if w.attempt, err = settingsJSON(req); err != nil {
 		return err
@@ -5403,6 +5406,9 @@ func (w *writer) retry(ctx context.Context, e *agentturn.ModelRetry) error {
 	hash, omit, unhashed, err := w.hash(req)
 	if err != nil {
 		return err
+	}
+	if unhashed != nil {
+		omit = w.quarantineOver(omit, e.Quarantined, req.Model)
 	}
 	next, err := settingsJSON(req)
 	if err != nil {
