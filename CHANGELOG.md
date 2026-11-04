@@ -25,11 +25,15 @@ versions may break the API.
   context carries the spawn, so a recorder resumed on the parent files
   a run under it too, and `Recorder.ContinueChild(ctx, spawnID)` gives
   a context for a spawn the parent's path links, writing nothing and
-  reserving the child's call IDs, for a host that kept none; a spawn
-  the path does not link is refused with `session.ErrNoSpawn`. Made
-  outside the parent's run, the context carries what the parent's
-  record quarantined, so a child seeded with the parent's items leaves
-  them out. (#294)
+  reserving the child's call IDs, for a host that kept none, and is
+  where a new agent continuing the child takes its context from, since
+  StartChild's reserves nothing; a spawn the path does not link is
+  refused with `session.ErrNoSpawn`. Made outside the parent's run, or
+  after a call child's run ended, the context carries what the
+  parent's record quarantined, so a child seeded with the parent's
+  items leaves them out. An agent a hook of the child starts with its
+  context and no call is a child of the child's session with no
+  anchor, not the spawn again. (#294)
 - Fixed: a call child a child session's agent started, prompted again
   through `agent.WithSpawn` after that child's run ended, continues its
   own session under that child's, where it was filed under the

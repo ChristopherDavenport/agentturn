@@ -459,8 +459,12 @@ A child the host starts itself, not through a model's call, such as a
 memory pass after a turn, is recorded the same way under a `spawn_id`:
 `StartChild` writes the parent's link and returns the context to prompt
 the child with, observed by `rec.Observe`, so verify, export and cost
-reach its work. `ContinueChild` gives the context again for a spawn
-the parent links, to a resumed recorder too.
+reach its work. `StartChild` returns an error, and writes nothing,
+for a spawn ID the session already carries
+(`agentsession.ErrSpawnIDRepeated`) or one outside the format's form.
+`ContinueChild` gives the context again for a spawn the parent links,
+reserving the child's call IDs, and is where a new agent continuing
+the child, after a resume or for each pass, takes its context from.
 
 ```go
 ctx, err := rec.StartChild(ctx, agentsession.NewSpawnID())
