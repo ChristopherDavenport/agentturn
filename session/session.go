@@ -4286,6 +4286,39 @@ func (r *Recorder) spawnContext(ctx context.Context, w *writer, ref spawnRef) co
 	return ContextWithSessionID(context.WithValue(ctx, spawnKey{}, ref), ref.child)
 }
 
+// recordChildQuarantine records quarantined, a child agent's
+// quarantine as [agentturn.QuarantineAdded] carries it, in the child
+// session id: through the writer of a run of it the recorder holds, or
+// else one seeded from the session's leaf, as a later run's would be.
+// The child's agent's items are kept beside what its writers left, for
+// a spawn made from the child. The caller holds r.mu.
+func (r *Recorder) recordChildQuarantine(ctx context.Context, id string, quarantined openresponses.Items) error {
+	if set, err := agentturn.NewQuarantineSet(quarantined...); err == nil && len(quarantined) > 0 {
+		if r.quarantined == nil {
+			r.quarantined = map[string]*agentturn.QuarantineSet{}
+		}
+		r.quarantined[id] = unionQuarantine(r.quarantined[id], set)
+	}
+	for _, w := range r.runs {
+		if w.id == id {
+			return w.recordQuarantine(context.WithoutCancel(ctx), quarantined)
+		}
+	}
+	if !r.childIDs[id] {
+		return nil
+	}
+	s, err := r.store.Open(context.WithoutCancel(ctx), id)
+	if err != nil {
+		return err
+	}
+	w := newWriter(r, id)
+	w.cwd, w.media = s.Header().CWD, s.Header().Media
+	if err := w.seed(context.WithoutCancel(ctx), s, false); err != nil {
+		return err
+	}
+	return w.recordQuarantine(context.WithoutCancel(ctx), quarantined)
+}
+
 // unionQuarantine returns a set holding every item of a and of b, by
 // identity, either nil.
 func unionQuarantine(a, b *agentturn.QuarantineSet) *agentturn.QuarantineSet {
@@ -4569,6 +4602,14 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 	// An observer cannot fail the child run, so a store failure ends
 	// the record of that child where it is: later events find no writer
 	// and the parent's tool_end falls back to the items.
+	if e, ok := ev.(*agentturn.QuarantineAdded); ok {
+		// An idle child quarantined: its session, which no run of it is
+		// being written to, records it at its leaf.
+		if _, _, id, err := r.observedChild(ctx); err == nil && id != "" {
+			_ = r.recordChildQuarantine(ctx, id, e.Quarantined)
+		}
+		return
+	}
 	if e, ok := ev.(*agentturn.Queued); ok && e.RunID == "" {
 		// An idle child reports an input before the run that takes it
 		// starts, so its session is not known yet.
@@ -4923,6 +4964,8 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 		return w.queued(ctx, e)
 	case *agentturn.NotesHeld:
 		return w.holdNotes(ctx, e.Notes)
+	case *agentturn.QuarantineAdded:
+		return w.recordQuarantine(ctx, e.Quarantined)
 	}
 	return nil
 }

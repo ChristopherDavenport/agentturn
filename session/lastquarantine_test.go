@@ -10,6 +10,7 @@ import (
 	"github.com/ChristopherDavenport/agentsession"
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
+	"github.com/ChristopherDavenport/agentturn/tools/agent"
 	"github.com/ChristopherDavenport/openresponses"
 )
 
@@ -210,5 +211,71 @@ func TestAQuarantineOfABlockedRequestIsRecorded(t *testing.T) {
 	sent := reattached(t, store, s.ID(), a, tools)
 	if len(sent) == 0 || strings.Contains(sent[0], lastInjected) {
 		t.Errorf("after a resume the model was sent %v", sent)
+	}
+}
+
+// TestAQuarantineBetweenRunsIsRecorded: a host's Agent.Quarantine made
+// while no run is active raises an event the recorder writes at once,
+// so a resume from the store elsewhere, before the agent runs again,
+// does not send the item.
+func TestAQuarantineBetweenRunsIsRecorded(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetch := agenttool.New("fetch", "fetches a page", func(context.Context, struct{}) (string, error) { return lastInjected, nil })
+	tools := []agenttool.Tool{fetch}
+	a := agentturn.New(agentturn.Config{Model: fetchThenAnswer{}, ModelName: "m", Tools: tools})
+	detach := rec.Attach(a)
+	if _, err := a.Prompt(ctx, openresponses.UserText("fetch the page")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Quarantine(fetchOutput(a.State().Transcript)); err != nil {
+		t.Fatal(err)
+	}
+	detach()
+	sent := reattached(t, store, s.ID(), a, tools)
+	if len(sent) == 0 || strings.Contains(sent[0], lastInjected) {
+		t.Errorf("after a resume the model was sent %v", sent)
+	}
+	verifyAll(t, s)
+}
+
+// TestAChildsQuarantineBetweenRunsIsRecorded: a child agent the host
+// kept through agent.WithSpawn, quarantined while idle, raises the
+// event through its observer, and the recorder writes it in the child's
+// session.
+func TestAChildsQuarantineBetweenRunsIsRecorded(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetch := agenttool.New("fetch", "fetches a page", func(context.Context, struct{}) (string, error) { return lastInjected, nil })
+	var helpers []*agentturn.Agent
+	helper := agent.New(agentturn.Config{Name: "helper", Model: fetchThenAnswer{}, ModelName: "m", Tools: []agenttool.Tool{fetch}},
+		agent.WithObserver(rec.Observe),
+		agent.WithSpawn(func(_ string, a *agentturn.Agent) { helpers = append(helpers, a) }))
+	a := agentturn.New(agentturn.Config{Model: delegatesWith{input: "fetch the page"}, ModelName: "m", Tools: []agenttool.Tool{helper}})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(ctx, openresponses.UserText("go")); err != nil {
+		t.Fatal(err)
+	}
+	if err := helpers[0].Quarantine(fetchOutput(helpers[0].State().Transcript)); err != nil {
+		t.Fatal(err)
+	}
+	cs, err := store.Open(ctx, links(s)[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cx, err := cs.Context()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o := cx.Settings.Omit.Outputs; o == nil || len(o.Items) != 1 {
+		t.Errorf("the child's omit in force = %+v, want the fetch output sent as the placeholder", cx.Settings.Omit)
 	}
 }

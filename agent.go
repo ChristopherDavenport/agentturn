@@ -133,6 +133,13 @@ type Agent struct {
 	steer      []queuedItem
 	followUp   []queuedItem
 	running    bool
+	// runEnded is set once the run's end has been delivered, so a
+	// quarantine made between it and the run's return is reported
+	// ([QuarantineAdded]) rather than carried by no event.
+	runEnded bool
+	// quarantineOwed are the [QuarantineAdded] events Agent.Quarantine
+	// raised that have not been delivered yet.
+	quarantineOwed []*QuarantineAdded
 	// held is set while [Agent.WhileIdle] runs its function: no run
 	// starts, and nothing else is refused.
 	held bool
@@ -1227,6 +1234,9 @@ func (a *Agent) deliver(ctx context.Context, ev Event) error {
 	if err := a.dispatch(ctx, ev); err != nil {
 		return err
 	}
+	if err := a.flushQuarantine(ctx); err != nil {
+		return err
+	}
 	if _, last := ev.(*RunEnd); last {
 		// Nothing follows the run's end, so what a subscriber accepted
 		// while it was being delivered is reported now rather than
@@ -1261,6 +1271,7 @@ func (a *Agent) dispatch(ctx context.Context, ev Event) error {
 	switch e := ev.(type) {
 	case *RunStart:
 		a.runID = e.RunID
+		a.runEnded = false
 	case *TurnStart:
 		a.turn = e.Turn
 	case *ItemEnd:
@@ -1269,6 +1280,13 @@ func (a *Agent) dispatch(ctx context.Context, ev Event) error {
 		a.pending = e.Pending
 		a.notes = e.Notes
 		a.lastEnd = e
+		// Taken under a.mu with the end marked, so a quarantine made
+		// since the run took its copy is in it or reported after it,
+		// never in neither.
+		if q := a.quarantine.list(); len(q) > 0 {
+			e.Quarantined = q
+		}
+		a.runEnded = true
 	case *Question:
 		a.waiting = append(a.waiting, e)
 	case *QuestionClosed:

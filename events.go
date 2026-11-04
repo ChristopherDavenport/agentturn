@@ -14,7 +14,8 @@ import (
 // Event is one step of a run. Concrete types are [RunStart], [TurnStart],
 // [ModelRetry], [ModelBlocked], [ItemStart], [ItemUpdate], [ItemEnd],
 // [ResponseEnd], [ToolStart], [ToolDispatch], [ToolUpdate], [ToolEnd],
-// [TurnEnd] and [RunEnd], [Queued], which belongs to no run, and
+// [TurnEnd] and [RunEnd], [Queued] and [QuarantineAdded], which
+// belong to no run, and
 // [Question] and [QuestionClosed], which a running call raises. Decoded
 // values are pointers, so switch on *ItemUpdate and so on.
 type Event interface {
@@ -39,6 +40,8 @@ const (
 	EventRunEnd       = "run_end"
 	EventQueued       = "queued"
 	EventNotesHeld    = "notes_held"
+	// EventQuarantineAdded names [QuarantineAdded].
+	EventQuarantineAdded = "quarantine_added"
 )
 
 // Reason says why a run ended.
@@ -279,6 +282,23 @@ type ModelBlocked struct {
 
 // EventType returns "model_blocked".
 func (*ModelBlocked) EventType() string { return EventModelBlocked }
+
+// QuarantineAdded reports items [Agent.Quarantine] quarantined while no
+// run of the agent was active, or after its run's end was delivered,
+// which no event of a run carries. Items are the ones the call added,
+// Quarantined a copy of the conversation's quarantine after it, as
+// [TurnStart.Quarantined] is. It belongs to no run and is delivered
+// through the barrier at once: from a subscriber, right after the
+// event being delivered. A recorder records the quarantine from here
+// (RFC 0001 The record), so a resume before the agent runs again does
+// not send the items.
+type QuarantineAdded struct {
+	Items       openresponses.Items
+	Quarantined openresponses.Items
+}
+
+// EventType returns "quarantine_added".
+func (*QuarantineAdded) EventType() string { return EventQuarantineAdded }
 
 // ItemStart announces an item entering the transcript: a prompt or
 // queued message, an assistant item as the stream opens it, or a

@@ -707,7 +707,12 @@ func (w *writer) bindQuarantine(set *agentturn.QuarantineSet, t agentturn.Transc
 // agent attached after one and a spawn read it from the record (RFC
 // 0001 The record). An entry is matched as agentturn.QuarantineSet.Bind
 // matches an item, itself or a copy equal in content, so a writer
-// seeded from the store finds the items the agent quarantined.
+// seeded from the store finds the items the agent quarantined. Content
+// matching errs on the side of leaving out: two entries alike but for
+// id and status, two user messages saying "yes", are both listed when
+// one is quarantined, so the record leaves out one the request sent,
+// and the requests after it go unhashed until a config replaces the
+// omit; nothing quarantined is ever recorded as sent.
 func (w *writer) quarantineOver(base agentsession.Omit, quarantined openresponses.Items, model string) agentsession.Omit {
 	if len(quarantined) == 0 {
 		return base

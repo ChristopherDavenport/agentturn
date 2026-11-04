@@ -70,7 +70,13 @@ versions may break the API.
   as did one a `BeforeModelCall` made before refusing the request:
   `RunEnd` and `ModelBlocked` carry `Quarantined` as well, and the
   recorder writes it after their entries as a `config` carrying only
-  the `omit` it adds. (#294)
+  the `omit` it adds. `Agent.Quarantine` made while no run is active,
+  or after its run's end was delivered, raises the new
+  `QuarantineAdded` event at once, which the recorder writes the same
+  way, in a child's session for an idle child too, so a resume before
+  the agent runs again does not send the item. `front/control` writes
+  `quarantine_added` as its type alone and puts no quarantine on the
+  wire. (#294)
 - Changed: RFC 0001 is draft 0.5. The record states the rule for a
   child the host starts: a subsession linked by a `spawn_id`, the link
   before the child's header, a `spawn_id` never repeated in the

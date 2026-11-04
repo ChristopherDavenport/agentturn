@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sync"
 
 	"github.com/ChristopherDavenport/openresponses"
@@ -419,8 +420,57 @@ func Quarantine(ctx context.Context, items ...openresponses.Item) error {
 // next request on, a run in flight's included, each is left out, or a
 // function call output sent with [QuarantinedOutput]. The transcript
 // keeps them. An item is named by identity, as [Agent.State] hands it.
+// Made while no run is active, or after the run's end was delivered,
+// it is reported to the subscribers as [QuarantineAdded], at once, or,
+// from inside a delivery, right after the event being delivered, so a
+// recorder records it before the agent runs again; while a run is
+// active the run's next turn_start, or its run_end, carries it. An
+// error a subscriber returns for the event is returned.
 func (a *Agent) Quarantine(items ...openresponses.Item) error {
-	return a.quarantine.add(items...)
+	a.mu.Lock()
+	gen := a.quarantine.generation()
+	if err := a.quarantine.add(items...); err != nil {
+		a.mu.Unlock()
+		return err
+	}
+	// A run's events carry what is quarantined while it runs, up to its
+	// end; anything else is reported on its own.
+	report := a.quarantine.generation() != gen && (!a.running || a.runEnded)
+	if report {
+		added := slices.DeleteFunc(slices.Clone(items), func(item openresponses.Item) bool { return item == nil })
+		a.quarantineOwed = append(a.quarantineOwed, &QuarantineAdded{Items: added, Quarantined: a.quarantine.list()})
+	}
+	a.mu.Unlock()
+	if !report {
+		return nil
+	}
+	if a.emitMu.TryLock() {
+		defer a.emitMu.Unlock()
+		return a.flushQuarantine(context.Background())
+	}
+	// A delivery is under way, perhaps the one calling this: it reports
+	// the event after its own, and this does so otherwise.
+	go func() {
+		a.emitMu.Lock()
+		defer a.emitMu.Unlock()
+		_ = a.flushQuarantine(context.Background())
+	}()
+	return nil
+}
+
+// flushQuarantine delivers the [QuarantineAdded] events owed. The
+// caller holds a.emitMu.
+func (a *Agent) flushQuarantine(ctx context.Context) error {
+	a.mu.Lock()
+	owed := a.quarantineOwed
+	a.quarantineOwed = nil
+	a.mu.Unlock()
+	for _, ev := range owed {
+		if err := a.dispatch(ctx, ev); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Quarantined returns the items quarantined in the agent's

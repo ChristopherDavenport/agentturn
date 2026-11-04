@@ -57,10 +57,11 @@ func sampleEvents(t *testing.T) map[string]agentturn.Event {
 				Notes:    []agentturn.Note{{Item: openresponses.UserText("only the unit tests"), Mode: agentturn.InputResume, Trigger: trigger, CallID: "call_1"}},
 				Question: &agentturn.OpenQuestion{ID: "entry_1", Message: "Allow notify?", Call: &agentturn.AskedCall{Parent: "call_1", CallID: "call_2", Name: "notify"}},
 			}}, Notes: []agentturn.Note{{Item: openresponses.DeveloperText("owed"), Mode: agentturn.InputTool}}},
-		"Queued":         &agentturn.Queued{RunID: "run_1", Item: openresponses.UserText("more"), Mode: agentturn.QueueSteer, Input: agentturn.InputDeliver, Hidden: true, Trigger: trigger},
-		"Question":       &agentturn.Question{ID: "question_1", RunID: "run_1", CallID: "call_0", Call: &agentturn.AskedCall{Parent: "call_0", CallID: "call_1", Name: "upper", Args: json.RawMessage(`{}`), Decision: decision}, Elicitation: agenttool.Elicitation{Message: "ok?", Schema: json.RawMessage(`{"type":"object"}`), URL: "https://example.test"}},
-		"NotesHeld":      &agentturn.NotesHeld{RunID: "run_1", Notes: []agentturn.Note{{Item: openresponses.DeveloperText("a ran in the sandbox"), Mode: agentturn.InputTool}}},
-		"QuestionClosed": &agentturn.QuestionClosed{ID: "question_1", RunID: "run_1", Answer: &agenttool.Answer{Action: agenttool.ActionDecline, Content: json.RawMessage(`{"a":1}`), Note: "not now"}, By: trigger},
+		"Queued":          &agentturn.Queued{RunID: "run_1", Item: openresponses.UserText("more"), Mode: agentturn.QueueSteer, Input: agentturn.InputDeliver, Hidden: true, Trigger: trigger},
+		"Question":        &agentturn.Question{ID: "question_1", RunID: "run_1", CallID: "call_0", Call: &agentturn.AskedCall{Parent: "call_0", CallID: "call_1", Name: "upper", Args: json.RawMessage(`{}`), Decision: decision}, Elicitation: agenttool.Elicitation{Message: "ok?", Schema: json.RawMessage(`{"type":"object"}`), URL: "https://example.test"}},
+		"QuarantineAdded": &agentturn.QuarantineAdded{},
+		"NotesHeld":       &agentturn.NotesHeld{RunID: "run_1", Notes: []agentturn.Note{{Item: openresponses.DeveloperText("a ran in the sandbox"), Mode: agentturn.InputTool}}},
+		"QuestionClosed":  &agentturn.QuestionClosed{ID: "question_1", RunID: "run_1", Answer: &agenttool.Answer{Action: agenttool.ActionDecline, Content: json.RawMessage(`{"a":1}`), Note: "not now"}, By: trigger},
 	}
 }
 
@@ -346,6 +347,26 @@ func TestACopiedItemCrossesTheWire(t *testing.T) {
 			if !e.Copied {
 				t.Errorf("item_end = %+v, want copied", e)
 			}
+		}
+	}
+}
+
+// TestTheQuarantineDoesNotTravel: what a guard withheld is not put on
+// the wire for a remote viewer, in the events that carry the run's
+// quarantine or in quarantine_added.
+func TestTheQuarantineDoesNotTravel(t *testing.T) {
+	secret := openresponses.UserText("the withheld text")
+	for _, ev := range []agentturn.Event{
+		&agentturn.QuarantineAdded{Items: openresponses.Items{secret}, Quarantined: openresponses.Items{secret}},
+		&agentturn.TurnStart{RunID: "run_1", Turn: 1, Quarantined: openresponses.Items{secret}},
+		&agentturn.RunEnd{RunID: "run_1", Reason: agentturn.ReasonDone, Quarantined: openresponses.Items{secret}},
+	} {
+		data, err := MarshalEvent(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(data, []byte("withheld text")) {
+			t.Errorf("%s carries the quarantined text: %s", ev.EventType(), data)
 		}
 	}
 }
