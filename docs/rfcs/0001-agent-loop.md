@@ -2026,12 +2026,13 @@ RFC 0001's `instructions_part` has a writer carry them: the host, which
 alone knows the layers' labels, supplies that union. A copied item
 carries the trust of what it copies, as written, so a recorder MUST
 NOT drop a label its provenance names that the copy's trust does not
-hold, and refuses the item instead (#300). An input queued with its marks, hidden or with a
+hold, and refuses the item instead, until agentsession RFC 0001 lets a
+copy's trust be wider than its source's (agentsession#279) (#300). An input queued with its marks, hidden or with a
 provenance, and still owed when the process stops is handed back after
 a restart marked as it was queued, so the item that drains it is
 recorded as the item it was: agentsession RFC 0001's `queued` entry
 has no member for an item's display flag, trust or layers, so until it
-does a recorder writes them on every `queued` entry it writes for the
+does (agentsession#278) a recorder writes them on every `queued` entry it writes for the
 input, a run end's again included, as `agentturn:visible` (`false`),
 `agentturn:trust` and `agentturn:instructions_part`, each in the form
 the format's member of that name has on an `item`, and reads them back
@@ -2351,7 +2352,7 @@ it.
   trust is never narrowed; an owed queued input keeps its marks across
   a restart in `agentturn:visible`, `agentturn:trust` and
   `agentturn:instructions_part` members until agentsession's `queued`
-  entry defines them.
+  entry defines them (agentsession#278).
 - **Events.** `item_start`, `item_end` and `queued` carry the
   provenance, and `queued` the item's source as its trigger (#300).
 - **The record.** A hold written for a call deferred only beside an

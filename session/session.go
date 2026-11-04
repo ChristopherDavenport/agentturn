@@ -769,7 +769,7 @@ const HeldMember = "agentturn:held"
 // VisibleMember, TrustMember and InstructionsPartMember are members
 // of a queued entry that keep what the host marked the input with,
 // until agentsession RFC 0001's queued entry has members of its own for
-// them: false for an input marked agentturn.Hidden, and the trust and
+// them (agentsession#278): false for an input marked agentturn.Hidden, and the trust and
 // the instruction layers of its agentturn.Provenance, each in the form
 // the member of the same name has on an item entry (visible, trust,
 // instructions_part). The recorder writes them on every queued entry
@@ -1258,11 +1258,21 @@ func (in *inboxItem) markFrom(item openresponses.Item) *inboxItem {
 	return in
 }
 
-// marked is the input marked as it was queued, for the agent.
+// marked is the input marked as it was queued, for the agent. Layers
+// read back in a form the provenance rules refuse, as a redaction that
+// rewrote an instruction file's id leaves them, are dropped alone: the
+// display flag and the trust still say the input is not the person's
+// visible words.
 func (in *inboxItem) marked() openresponses.Item {
 	item := in.item
 	if in.prov != nil {
-		if m, err := agentturn.WithProvenance(item, *in.prov); err == nil {
+		m, err := agentturn.WithProvenance(item, *in.prov)
+		if err != nil && len(in.prov.Layers) > 0 {
+			p := *in.prov
+			p.Layers = nil
+			m, err = agentturn.WithProvenance(item, p)
+		}
+		if err == nil {
 			item = m
 		}
 	}

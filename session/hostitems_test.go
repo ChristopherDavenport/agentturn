@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"slices"
 	"testing"
 
@@ -258,5 +259,33 @@ func TestACopysTrustIsNotSilentlyNarrowed(t *testing.T) {
 	e = &agentsession.ItemEntry{Item: openresponses.UserText("copied"), CopiedFrom: &agentsession.CopiedFrom{Session: "s"}}
 	if err := recordProvenance(e, prov(agenttool.LabelUntrusted)); err == nil {
 		t.Errorf("a label dropped from a copy with no trust: trust %+v", e.Trust)
+	}
+}
+
+// TestAnUnreadableLayerDropsOnlyTheLayers pins that an owed input whose
+// queued entry holds an agentturn:instructions_part the provenance
+// rules refuse, as a redaction that rewrote an instruction file's id
+// away leaves it, is handed back hidden and with its trust, losing only
+// the layers: the trust and the display flag still say it is not the
+// person's visible words.
+func TestAnUnreadableLayerDropsOnlyTheLayers(t *testing.T) {
+	q := agentsession.NewQueued(openresponses.UserText("<reminder>[redacted]</reminder>"), agentsession.ModeFollowUp)
+	q.Unknown = map[string]json.RawMessage{
+		VisibleMember:          json.RawMessage(`false`),
+		TrustMember:            json.RawMessage(`{"reads":["untrusted"]}`),
+		InstructionsPartMember: json.RawMessage(`{"source":"agentsmd"}`),
+	}
+	in := &inboxItem{item: q.Item}
+	in.hidden, in.prov = queuedMarks(q)
+	item := in.marked()
+	if _, hidden := agentturn.Unhide(item); !hidden {
+		t.Error("the input lost its hidden mark")
+	}
+	p, ok := agentturn.ProvenanceOf(item)
+	if !ok || p.Trust == nil || !slices.Equal(p.Trust.Reads, []agenttool.Label{agenttool.LabelUntrusted}) {
+		t.Errorf("provenance = %+v (%v), want the trust kept", p, ok)
+	}
+	if len(p.Layers) != 0 {
+		t.Errorf("layers = %+v, want the unreadable one dropped", p.Layers)
 	}
 }

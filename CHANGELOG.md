@@ -43,14 +43,20 @@ versions may break the API.
   and a recorder seeded from the path reads them back, so
   `Recorder.Requeue` hands the input back marked and the item that
   drains it is recorded hidden, with its layers and trust, not as the
-  person's visible input. (#300)
+  person's visible input. Layers read back in a form the provenance
+  rules refuse, as a redaction may leave them, are dropped alone; the
+  hidden mark and the trust are kept. The members give way to
+  agentsession's own when its `queued` entry defines them
+  (agentsession#278). (#300)
 - Added: a turn's inputs (`TurnInput.Trigger`, `TurnStart.Arrived`)
   name a prompted or hook-added item's provenance source over the
   run's trigger, as its queued report and its record do. (#300)
 - Added: `session.Recorder` refuses a copied item whose provenance
   trust names a label the trust it was copied with does not hold,
   ending the run with an error, rather than drop the label: the format
-  has a copy carry its source's trust as written. `front/control`'s
+  has a copy carry its source's trust as written. The item is then in
+  the agent's transcript and not in the record, until agentsession lets
+  a copy's trust be wider (agentsession#279). `front/control`'s
   doc says the items a client hands in carry no marks to the server,
   by design: a client is the person, and text the person did not
   write is the host's to mark. (#300)
