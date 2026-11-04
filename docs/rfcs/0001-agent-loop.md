@@ -1998,21 +1998,31 @@ the loop unread: the trigger of a run, who decided an answer and why,
 where an answer's output was taken from when a record held it,
 whether an answer's output reports that the call failed, whether
 an item a run is prompted with was taken from another conversation,
-and an item's provenance. The loop learns nothing from any of them.
+and an item's provenance. The loop acts on none of them, but takes an
+item's provenance source as the trigger the item arrived under.
 
-A host that adds to the conversation text the person did not write
-MUST be able to say where it came from and whether it is trusted, and
-a recorder MUST record both on the item, so a reader never takes it for
-the person's words. The loop offers the way, the provenance an item
-carries (The transcript), at every point it takes an item from the
-host: a prompt, a queue, a delivery and what the before-turn hook
-returns. A recorder writes it on the item's entry in the members
-agentsession RFC 0001 defines for it and invents none: `instructions_part`
-for a message composed from instruction layers, which a replay then
-does not send again as an input of its run; `trust`; and `source` for
-what sent it, which on a queued input is also the `queued` entry's
+A loop MUST let a host that adds to the conversation text the person
+did not write say where it came from and whether it is trusted, the
+provenance an item carries (The transcript), at every point it takes
+an item from the host: a prompt, a queue, a delivery and what the
+before-turn hook returns. It MUST carry the provenance unread on the
+item's events, and MUST refuse instruction layers on an item that is
+not a message. A recorder MUST record both on the item, so a reader
+never takes it for the person's words. It writes them on the item's
+entry in the members agentsession RFC 0001 defines and invents none:
+`instructions_part` for a message composed from instruction layers,
+which a replay then does not send again as an input of its run, and
+never on an item that is not a message; `trust`; and `source` for what
+sent it, which on a queued input is also the `queued` entry's
 `trigger`, since the item that drains an entry carries the trigger the
-entry held (#300). An input queued with its marks, hidden or with a
+entry held. A layer named here carries no trust of its own, so the
+item's trust MUST hold every label the host knows of each layer it
+names, beside any the content has for another reason, as agentsession
+RFC 0001's `instructions_part` has a writer carry them: the host, which
+alone knows the layers' labels, supplies that union. A copied item
+carries the trust of what it copies, as written, so a recorder MUST
+NOT drop a label its provenance names that the copy's trust does not
+hold, and refuses the item instead (#300). An input queued with its marks, hidden or with a
 provenance, and still owed when the process stops is handed back after
 a restart marked as it was queued, so the item that drains it is
 recorded as the item it was: agentsession RFC 0001's `queued` entry
@@ -2139,13 +2149,12 @@ whether or not it can describe the input; writes a
 of its batch has not settled, and none for the last of its batch; and,
 when it offers the host a way to start a child of its own, writes the
 `spawn_id` link before the child's header and refuses a `spawn_id` the
-session carries on any branch, writing nothing; and records an item's
-provenance on its entry as `instructions_part`, `trust` and `source`, and a hold for a call held beside an asked one
-marked held.
-The rule on a host
-that starts such a child is not checked here: this section has no
-class for a host, and a host meets it by starting the child through a
-conforming recorder.
+session carries on any branch, writing nothing; records an item's
+provenance on its entry as `instructions_part`, `trust` and `source`;
+and marks held a hold for a call held only beside an asked one. The
+rule on a host that starts such a child is not checked here: this
+section has no class for a host, and a host meets it by starting the
+child through a conforming recorder.
 
 ### The scenario corpus
 

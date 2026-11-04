@@ -13,10 +13,11 @@ import (
 // markedItem marks an item the caller hands the loop: one the model
 // reads and a renderer should not show ([Hidden]), one taken from
 // another conversation ([Copied]), one the host composed from text the
-// person did not write ([WithProvenance]), or any of them together. It is a wrapper the loop
-// strips when it appends the item, so nothing downstream sees it: the
-// transcript, the request and every type switch on an item work on the
-// item itself, and only the item events carry the marks. It marshals
+// person did not write ([WithProvenance]), or any of them together. It
+// is a wrapper the loop strips when it appends the item, so nothing
+// downstream sees it: the transcript, the request and every type
+// switch on an item work on the item itself, and only the item events
+// carry the marks. It marshals
 // as the item it wraps, so one that reaches a server or a store anyway
 // is the item and not an envelope.
 type markedItem struct {

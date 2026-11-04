@@ -54,11 +54,15 @@ versions may break the API.
   doc says the items a client hands in carry no marks to the server,
   by design: a client is the person, and text the person did not
   write is the host's to mark. (#300)
-- Changed: RFC 0001 is draft 0.6. The record states the rule: a host
-  that adds text the person did not write MUST be able to say where it
-  came from and whether it is trusted, and a recorder MUST record both
-  on the item. The new MUST is breaking for a recorder that does not.
-  (#300)
+- Changed: RFC 0001 is draft 0.6. The record states the rule: a loop
+  MUST let a host that adds text the person did not write say where it
+  came from and whether it is trusted, MUST carry it unread on the
+  item's events and refuse instruction layers on an item that is not a
+  message, and a recorder MUST record both on the item, never
+  `instructions_part` on a non-message. The item's trust MUST hold the
+  labels the host knows of each layer it names, a union only the host
+  can supply, and a recorder MUST NOT drop a label from a copy. The new
+  MUSTs are breaking for a loop or a recorder that does not. (#300)
 - Changed: RFC 0001 states the rule for a batch hold, which
   `session.Recorder` already met: a hold written for a call deferred
   only because another call of its batch was asked about MUST be
