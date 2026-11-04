@@ -63,7 +63,9 @@ versions may break the API.
   labels the host knows of each layer it names, a union only the host
   can supply, and a recorder MUST NOT drop a label from a copy. The new
   MUSTs are breaking for a loop or a recorder that does not. (#300)
-- Changed: RFC 0001 states the rule for a batch hold, which
+- Changed: RFC 0001 states the rule for a batch hold, naming the
+  members normatively, in The record, the `tool_start` row and Pending
+  calls, which
   `session.Recorder` already met: a hold written for a call deferred
   only because another call of its batch was asked about MUST be
   marked held (`agentturn:held`, `session.HeldMember`) and SHOULD carry
