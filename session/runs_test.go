@@ -877,3 +877,54 @@ func TestQueueWritesBeforeItQueues(t *testing.T) {
 		t.Errorf("verify records: %v", err)
 	}
 }
+
+// TestACutRunsOwedDeliveryStaysADelivery pins that the inputs a cut
+// run owed, queued again after the end a resume writes, are queued as
+// they were: a delivery keeps deliver, so Requeue hands it back as one
+// and it starts a run, and the marks the recorder keeps beside the
+// format's members, agentturn:visible, agentturn:trust and
+// agentturn:instructions_part, go with it.
+func TestACutRunsOwedDeliveryStaysADelivery(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	s := cutRun(t, store)
+	d := agentsession.NewDelivery(openresponses.UserText("<reminder>the build passed</reminder>"))
+	d.Unknown = map[string]json.RawMessage{
+		VisibleMember:          json.RawMessage(`false`),
+		TrustMember:            json.RawMessage(`{"reads":["untrusted"]}`),
+		InstructionsPartMember: json.RawMessage(`{"id":"/repo/AGENTS.md","source":"agentsmd"}`),
+	}
+	if _, err := store.Append(ctx, s.ID(), d); err != nil {
+		t.Fatal(err)
+	}
+	rec, s, err := Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owed, err := s.PendingQueued(s.Leaf())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var again *agentsession.QueuedEntry
+	for _, q := range owed {
+		if m, ok := q.Item.(*openresponses.Message); ok && m.Text() == "<reminder>the build passed</reminder>" {
+			again = q
+		}
+	}
+	if again == nil || again.ID == d.ID {
+		t.Fatalf("owed after resume = %+v, want the delivery queued again", owed)
+	}
+	if !again.Deliver || again.Mode != agentsession.ModeSteer {
+		t.Errorf("queued again as mode %q deliver %v, want a delivery", again.Mode, again.Deliver)
+	}
+	for name, want := range d.Unknown {
+		if string(again.Unknown[name]) != string(want) {
+			t.Errorf("queued again with %s = %s, want %s", name, again.Unknown[name], want)
+		}
+	}
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"})
+	defer rec.Attach(a)()
+	if _, deliver := rec.Requeue(ctx, a); !deliver {
+		t.Error("Requeue did not hand the delivery back as one")
+	}
+}

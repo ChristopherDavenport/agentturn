@@ -1607,9 +1607,9 @@ func (r *runner) appendItems(items openresponses.Items, mode InputMode) error {
 // appendWith appends items as arriving by mode: trigger is what the
 // next turn's inputs carry for each, and endTrigger what each item_end
 // carries, the run's for an item the run was prompted with. An item the
-// caller marked with [Hidden] is unwrapped here, so the transcript and
-// the request hold the item itself and only its events say it is
-// hidden.
+// caller marked with [Hidden], [Copied] or [WithProvenance] is
+// unwrapped here, so the transcript and the request hold the item
+// itself and only its events carry the marks.
 func (r *runner) appendWith(items openresponses.Items, mode InputMode, trigger, endTrigger Trigger) error {
 	for _, item := range items {
 		if err := r.appendOne(item, mode, trigger, endTrigger); err != nil {
@@ -1638,14 +1638,20 @@ func (r *runner) appendOne(item openresponses.Item, mode InputMode, trigger, end
 	if item == nil {
 		return nil
 	}
+	prov := provenance(item)
+	if prov != nil && !prov.Source.IsZero() {
+		// The item's own source stands over the trigger it arrived
+		// under, for it alone, as it does on its queued report.
+		trigger = prov.Source
+	}
 	item, hidden, copied := marks(item)
-	if err := r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden, Copied: copied}); err != nil {
+	if err := r.emit(&ItemStart{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden, Copied: copied, Provenance: prov}); err != nil {
 		return err
 	}
 	r.transcript = append(r.transcript, item)
 	r.added = append(r.added, item)
 	r.arrived = append(r.arrived, TurnInput{Item: item, Mode: mode, Trigger: trigger})
-	if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden, Copied: copied, Trigger: endTrigger}); err != nil {
+	if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden, Copied: copied, Trigger: endTrigger, Provenance: prov.clone()}); err != nil {
 		return err
 	}
 	return nil

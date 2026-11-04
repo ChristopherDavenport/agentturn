@@ -103,7 +103,10 @@
 //     run was prompted with carries the run's trigger as its source,
 //     other than an output Agent.Resume appends for a pending call,
 //     whose decision says who gave it, and a queued input the trigger
-//     it was queued with, Extra and all. A function call the loop gave
+//     it was queued with, Extra and all. An item the host marked with
+//     agentturn.WithProvenance carries its layers as instructions_part,
+//     its trust as trust and its source as source, over the run's
+//     trigger. A function call the loop gave
 //     an ID of its own, since the model's repeated one in the session,
 //     carries the model's in a [ModelCallIDMember] member beside the
 //     item, as the format asks. An
@@ -763,6 +766,23 @@ const SubjectMember = "agentturn:subject"
 // reads it back onto the call's Decision.
 const HeldMember = "agentturn:held"
 
+// VisibleMember, TrustMember and InstructionsPartMember are members
+// of a queued entry that keep what the host marked the input with,
+// until agentsession RFC 0001's queued entry has members of its own for
+// them (agentsession#278): false for an input marked agentturn.Hidden, and the trust and
+// the instruction layers of its agentturn.Provenance, each in the form
+// the member of the same name has on an item entry (visible, trust,
+// instructions_part). The recorder writes them on every queued entry
+// it writes for the input, a run end's again included, and reads them
+// back when it seeds its inbox from the path, so an input owed across a
+// restart is handed back by [Recorder.Requeue] marked as it was queued
+// and recorded so when a run drains it.
+const (
+	VisibleMember          = "agentturn:visible"
+	TrustMember            = "agentturn:trust"
+	InstructionsPartMember = "agentturn:instructions_part"
+)
+
 // NoteMember is the member of a hold decision that keeps the deferring
 // decision's own note ([agentturn.ToolDecision.Note]), which the loop
 // says as a developer message when an approval releases the call.
@@ -1221,6 +1241,112 @@ type inboxItem struct {
 	// the agent then refused: nobody holds it, Requeue does not hand it
 	// back, and the next run end drops it.
 	declined bool
+	// hidden and prov are what the host marked the input with,
+	// agentturn.Hidden and agentturn.WithProvenance, which its queued
+	// entry keeps as [VisibleMember], [TrustMember] and
+	// [InstructionsPartMember] and Requeue hands back.
+	hidden bool
+	prov   *agentturn.Provenance
+}
+
+// markFrom sets on in the marks item carries.
+func (in *inboxItem) markFrom(item openresponses.Item) *inboxItem {
+	_, in.hidden = agentturn.Unhide(item)
+	if p, ok := agentturn.ProvenanceOf(item); ok {
+		in.prov = &p
+	}
+	return in
+}
+
+// marked is the input marked as it was queued, for the agent. Layers
+// read back in a form the provenance rules refuse, as a redaction that
+// rewrote an instruction file's id leaves them, are dropped alone: the
+// display flag and the trust still say the input is not the person's
+// visible words.
+func (in *inboxItem) marked() openresponses.Item {
+	item := in.item
+	if in.prov != nil {
+		m, err := agentturn.WithProvenance(item, *in.prov)
+		if err != nil && len(in.prov.Layers) > 0 {
+			p := *in.prov
+			p.Layers = nil
+			m, err = agentturn.WithProvenance(item, p)
+		}
+		if err == nil {
+			item = m
+		}
+	}
+	if in.hidden {
+		item = agentturn.Hidden(item)
+	}
+	return item
+}
+
+// setQueuedMarks writes the input's marks on its queued entry; see
+// [VisibleMember].
+func setQueuedMarks(q *agentsession.QueuedEntry, hidden bool, prov *agentturn.Provenance) {
+	if hidden {
+		setMember(&q.EntryBase, VisibleMember, json.RawMessage("false"))
+	}
+	if prov == nil {
+		return
+	}
+	if prov.Trust != nil {
+		reads := make([]string, len(prov.Trust.Reads))
+		for i, l := range prov.Trust.Reads {
+			reads[i] = string(l)
+		}
+		raw, _ := json.Marshal(agentsession.Trust{Reads: reads})
+		setMember(&q.EntryBase, TrustMember, raw)
+	}
+	if _, ok := q.Item.(*openresponses.Message); ok && len(prov.Layers) > 0 {
+		layers := make([]agentsession.LayerRef, len(prov.Layers))
+		for i, l := range prov.Layers {
+			layers[i] = agentsession.LayerRef{ID: l.ID, Source: l.Source}
+		}
+		var raw []byte
+		if len(layers) == 1 {
+			raw, _ = json.Marshal(layers[0])
+		} else {
+			raw, _ = json.Marshal(layers)
+		}
+		setMember(&q.EntryBase, InstructionsPartMember, raw)
+	}
+}
+
+// queuedMarks reads back the marks [setQueuedMarks] wrote on a queued
+// entry; a member in another form is read as absent.
+func queuedMarks(q *agentsession.QueuedEntry) (hidden bool, prov *agentturn.Provenance) {
+	if raw, ok := q.Unknown[VisibleMember]; ok {
+		var visible bool
+		hidden = json.Unmarshal(raw, &visible) == nil && !visible
+	}
+	var p agentturn.Provenance
+	if raw, ok := q.Unknown[TrustMember]; ok {
+		var t agentsession.Trust
+		if json.Unmarshal(raw, &t) == nil {
+			p.Trust = &agentturn.Trust{Reads: make([]agenttool.Label, len(t.Reads))}
+			for i, l := range t.Reads {
+				p.Trust.Reads[i] = agenttool.Label(l)
+			}
+		}
+	}
+	if raw, ok := q.Unknown[InstructionsPartMember]; ok {
+		var one agentsession.LayerRef
+		var many []agentsession.LayerRef
+		if json.Unmarshal(raw, &one) == nil && one.Source != "" {
+			many = []agentsession.LayerRef{one}
+		} else if json.Unmarshal(raw, &many) != nil {
+			many = nil
+		}
+		for _, l := range many {
+			p.Layers = append(p.Layers, agentturn.Layer{ID: l.ID, Source: l.Source})
+		}
+	}
+	if p.Trust == nil && len(p.Layers) == 0 {
+		return hidden, nil
+	}
+	return hidden, &p
 }
 
 // childKey names an observed child by the call it runs under, or by
@@ -1264,7 +1390,7 @@ func (h *heldReport) inbox() *inboxItem {
 		mode = agentsession.ModeSteer
 	}
 	trigger, _ := sessionTrigger(h.q.Trigger)
-	return &inboxItem{item: h.q.Item, mode: mode, trigger: trigger, deliver: h.q.Input == agentturn.InputDeliver, entry: h.entry, held: true}
+	return &inboxItem{item: h.q.Item, mode: mode, trigger: trigger, deliver: h.q.Input == agentturn.InputDeliver, entry: h.entry, held: true, hidden: h.q.Hidden, prov: h.q.Provenance}
 }
 
 // callRecord is what the path holds for one function call.
@@ -2885,9 +3011,10 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 		return nil
 	}
 	for _, q := range owed {
-		again := agentsession.NewQueued(q.Item, q.Mode)
-		again.Trigger = q.Trigger.Clone()
-		if _, err := w.append(ctx, again); err != nil {
+		// Queued again as it was: a delivery stays one, and its ref
+		// and the members the format does not define, the marks
+		// [VisibleMember] names among them, go with it.
+		if _, err := w.append(ctx, q.Requeue()); err != nil {
 			return err
 		}
 	}
@@ -3104,6 +3231,7 @@ func (w *writer) requeue(ctx context.Context) error {
 		q := agentsession.NewQueued(item, in.mode)
 		q.Deliver = in.deliver && in.mode == agentsession.ModeSteer
 		q.Trigger = in.trigger.Clone()
+		setQueuedMarks(q, in.hidden, in.prov)
 		id, err := w.append(ctx, q)
 		if err != nil {
 			return err
@@ -3130,11 +3258,13 @@ func (r *Recorder) Queue(ctx context.Context, a *agentturn.Agent, mode agentturn
 			continue
 		}
 		base, _ := agentturn.Unhide(item)
-		in := &inboxItem{item: base, mode: agentsession.ModeFollowUp, held: true, awaiting: true}
+		in := (&inboxItem{item: base, mode: agentsession.ModeFollowUp, held: true, awaiting: true}).markFrom(item)
 		if mode == agentturn.QueueSteer {
 			in.mode = agentsession.ModeSteer
 		}
-		in.trigger = trigger.Clone()
+		if in.trigger, err = itemTrigger(item, trigger); err != nil {
+			return err
+		}
 		r.mu.Lock()
 		r.root.inbox = append(r.root.inbox, in)
 		err := r.root.requeue(context.WithoutCancel(ctx))
@@ -3183,7 +3313,13 @@ func (r *Recorder) Deliver(ctx context.Context, a *agentturn.Agent, items ...ope
 			continue
 		}
 		base, _ := agentturn.Unhide(item)
-		r.root.inbox = append(r.root.inbox, &inboxItem{item: base, mode: agentsession.ModeSteer, deliver: true, held: true, awaiting: true, trigger: trigger.Clone()})
+		t, err := itemTrigger(item, trigger)
+		if err != nil {
+			r.root.inbox = r.root.inbox[:n]
+			r.mu.Unlock()
+			return false, nil, err
+		}
+		r.root.inbox = append(r.root.inbox, (&inboxItem{item: base, mode: agentsession.ModeSteer, deliver: true, held: true, awaiting: true, trigger: t}).markFrom(item))
 	}
 	added := slices.Clone(r.root.inbox[n:])
 	if err := r.root.requeue(context.WithoutCancel(ctx)); err != nil {
@@ -3231,8 +3367,12 @@ func (r *Recorder) Redeliver(ctx context.Context, a *agentturn.Agent, items ...o
 			continue
 		}
 		base, _ := agentturn.Unhide(item)
+		t, err := itemTrigger(item, trigger)
+		if err != nil {
+			return err
+		}
 		r.mu.Lock()
-		in := r.root.owedDelivery(base, trigger)
+		in := r.root.owedDelivery(base, t)
 		switch {
 		case in != nil && in.held && in.holder == a:
 			// Requeue already handed it back and this agent holds it:
@@ -3241,10 +3381,11 @@ func (r *Recorder) Redeliver(ctx context.Context, a *agentturn.Agent, items ...o
 			continue
 		case in != nil && !in.held:
 			in.item, in.held, in.awaiting, in.holder = base, true, true, a
+			in.markFrom(item)
 		default:
 			// A new input, or one another agent holds, as when a host
 			// reuses one recorder across tasks: this agent gets its own.
-			in = &inboxItem{item: base, mode: agentsession.ModeSteer, deliver: true, held: true, awaiting: true, trigger: trigger.Clone(), holder: a}
+			in = (&inboxItem{item: base, mode: agentsession.ModeSteer, deliver: true, held: true, awaiting: true, trigger: t, holder: a}).markFrom(item)
 			r.root.inbox = append(r.root.inbox, in)
 			if err := r.root.requeue(context.WithoutCancel(ctx)); err != nil {
 				r.root.inbox = r.root.inbox[:len(r.root.inbox)-1]
@@ -3371,11 +3512,13 @@ func (r *Recorder) Requeue(ctx context.Context, a *agentturn.Agent) (n int, deli
 		// A trigger read back from the path was written, so the agent
 		// does not refuse it.
 		if in.deliver {
-			_ = a.Redeliver(qctx, in.item)
+			_ = a.Redeliver(qctx, in.marked())
 			deliver = true
 			continue
 		}
-		_ = a.Queue(qctx, mode, in.item)
+		// Handed back marked as it was queued, so the item that
+		// drains it is recorded hidden, with its layers and trust.
+		_ = a.Queue(qctx, mode, in.marked())
 	}
 	return len(owed), deliver
 }
@@ -3901,7 +4044,9 @@ func (w *writer) seed(ctx context.Context, s *agentsession.Session, owed bool) e
 			if err != nil {
 				return fmt.Errorf("session: queued input %s: %w", q.ID, err)
 			}
-			w.inbox = append(w.inbox, &inboxItem{item: item, mode: q.Mode, trigger: q.Trigger, entry: q.ID, deliver: q.Deliver})
+			in := &inboxItem{item: item, mode: q.Mode, trigger: q.Trigger, entry: q.ID, deliver: q.Deliver}
+			in.hidden, in.prov = queuedMarks(q)
+			w.inbox = append(w.inbox, in)
 		}
 	}
 	// Every call on the path, a call with its output included, so a
@@ -4931,11 +5076,16 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 	case *agentturn.ModelBlocked:
 		return w.blocked(ctx, e)
 	case *agentturn.ItemEnd:
-		source, err := sessionTrigger(e.Trigger)
+		trigger := e.Trigger
+		if e.Provenance != nil && !e.Provenance.Source.IsZero() {
+			// What sent the item stands over the run's trigger.
+			trigger = e.Provenance.Source
+		}
+		source, err := sessionTrigger(trigger)
 		if err != nil {
 			return err
 		}
-		if w.inFlight && e.ResponseID == "" && !e.Hidden && !e.Copied && source == nil {
+		if w.inFlight && e.ResponseID == "" && !e.Hidden && !e.Copied && e.Provenance == nil && source == nil {
 			// The loop appends nothing of its own while a model call
 			// is in flight, so this is the model's, from a stream that
 			// has not named its response yet: it is written once it
@@ -4949,7 +5099,7 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 				return err
 			}
 		}
-		return w.itemFrom(ctx, e.Item, e.ResponseID, e.Hidden, source, e.ModelCallID, from)
+		return w.itemFrom(ctx, e.Item, e.ResponseID, e.Hidden, source, e.ModelCallID, from, e.Provenance)
 	case *agentturn.ResponseEnd:
 		return w.response(ctx, e)
 	case *agentturn.ToolStart:
@@ -4991,7 +5141,7 @@ func (w *writer) queued(ctx context.Context, e *agentturn.Queued) error {
 	if err != nil {
 		return err
 	}
-	in := &inboxItem{item: e.Item, mode: mode, held: true, trigger: trigger, deliver: e.Input == agentturn.InputDeliver}
+	in := &inboxItem{item: e.Item, mode: mode, held: true, trigger: trigger, deliver: e.Input == agentturn.InputDeliver, hidden: e.Hidden, prov: e.Provenance}
 	w.inbox = append(w.inbox, in)
 	return w.requeue(ctx)
 }
@@ -5827,7 +5977,64 @@ func (w *writer) instructionParts(ctx context.Context, req openresponses.Request
 // trigger for an item the run was prompted with, and modelCallID the
 // ID the model gave a call the loop renamed.
 func (w *writer) item(ctx context.Context, item openresponses.Item, responseID string, hidden bool, source *agentsession.Trigger, modelCallID string) error {
-	return w.itemFrom(ctx, item, responseID, hidden, source, modelCallID, nil)
+	return w.itemFrom(ctx, item, responseID, hidden, source, modelCallID, nil, nil)
+}
+
+// recordProvenance writes on e what the host said of the item it
+// composed: the layers a message was composed from as
+// instructions_part, a single object for one and a list for several,
+// and its trust, unless the item is a copy, whose trust is the one it
+// was copied with: it refuses a copy whose provenance carries a label
+// that trust does not hold, rather than drop it.
+func recordProvenance(e *agentsession.ItemEntry, prov *agentturn.Provenance) error {
+	if prov == nil {
+		return nil
+	}
+	if _, ok := e.Item.(*openresponses.Message); ok && len(prov.Layers) > 0 {
+		layers := make([]agentsession.LayerRef, len(prov.Layers))
+		for i, l := range prov.Layers {
+			layers[i] = agentsession.LayerRef{ID: l.ID, Source: l.Source}
+		}
+		if len(layers) == 1 {
+			e.InstructionsPart = &layers[0]
+		} else {
+			e.InstructionsLayers = layers
+		}
+	}
+	if prov.Trust == nil {
+		return nil
+	}
+	reads := make([]string, len(prov.Trust.Reads))
+	for i, l := range prov.Trust.Reads {
+		reads[i] = string(l)
+	}
+	if e.CopiedFrom == nil {
+		e.Trust = &agentsession.Trust{Reads: reads}
+		return nil
+	}
+	// A copy carries the trust of what it copies, as written: the
+	// host's labels cannot be added to it, and one it does not hold
+	// would be dropped without a word, so the item is refused.
+	var held []string
+	if e.Trust != nil {
+		held = e.Trust.Reads
+	}
+	for _, l := range reads {
+		if !slices.Contains(held, l) {
+			return fmt.Errorf("session: copied %s item: its provenance labels it %q, which the trust it was copied with does not hold and a copy cannot add", e.Item.ItemType(), l)
+		}
+	}
+	return nil
+}
+
+// itemTrigger is the trigger item is queued under: the source of its
+// provenance when that names one, which stands over the call's, and
+// trigger otherwise.
+func itemTrigger(item openresponses.Item, trigger *agentsession.Trigger) (*agentsession.Trigger, error) {
+	if p, ok := agentturn.ProvenanceOf(item); ok && !p.Source.IsZero() {
+		return sessionTrigger(p.Source)
+	}
+	return trigger.Clone(), nil
 }
 
 // copySource is where a copied item was taken from: the entry's
@@ -5907,7 +6114,11 @@ func (w *writer) parentPath(ctx context.Context, fresh bool) (*agentsession.Sess
 // itemFrom is [writer.item] for an item taken from another session's
 // conversation when from is set: its entry carries copied_from and the
 // source's trust, and a copied call and its output take no decision.
-func (w *writer) itemFrom(ctx context.Context, item openresponses.Item, responseID string, hidden bool, source *agentsession.Trigger, modelCallID string, from *copySource) error {
+// An item the host composed carries its provenance, prov, which the
+// entry records as the format's instructions_part and trust, so a
+// reader never takes it for the person's words; a copy keeps the trust
+// of what it copies, which the format requires as written.
+func (w *writer) itemFrom(ctx context.Context, item openresponses.Item, responseID string, hidden bool, source *agentsession.Trigger, modelCallID string, from *copySource, prov *agentturn.Provenance) error {
 	if item == nil {
 		return nil
 	}
@@ -6069,6 +6280,9 @@ func (w *writer) itemFrom(ctx context.Context, item openresponses.Item, response
 				cf.Entry, trust = "", from.pathTrust
 			}
 			e.CopiedFrom, e.Trust = &cf, trust
+		}
+		if err := recordProvenance(e, prov); err != nil {
+			return err
 		}
 		if hidden {
 			visible := false

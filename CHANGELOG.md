@@ -5,6 +5,90 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Added: `WithProvenance(item, Provenance{Layers, Source, Trust})` lets
+  a host or a hook say where an item it composed from text the person
+  did not write came from and whether it is trusted: the instruction
+  layers a message was composed from (`Layer{ID, Source}`), what sent
+  it, as a `Trigger`, and its trust labels (`Trust{Reads}`, agenttool's
+  labels; an empty list says the host judged it clean). It marks the
+  item as `Hidden` does, wherever the loop takes an item from the host
+  (a prompt, `Steer`, `FollowUp`, `Queue`, `Deliver` and
+  `Config.BeforeTurn`'s items), and refuses with `ErrProvenance` what
+  the record cannot hold: layers on an item that is not a message, a
+  layer with no source, an instruction file's with no ID, a layer named
+  twice, an empty or repeated label, a source `Trigger.Validate`
+  refuses. `ProvenanceOf` reads it back. `ItemStart`, `ItemEnd` and
+  `Queued` carry it as `Provenance`, the item's source stands over the
+  trigger it was handed in under for that item alone, `Queued.Trigger`
+  included, and `front/control` carries it on the wire. (#300)
+- Added: `session.Recorder` records an item's provenance on its entry
+  in agentsession RFC 0001's members: its layers as
+  `instructions_part`, one object for one layer and a list for several,
+  so a replay does not send the message again as the person's input;
+  its trust as `trust`, except on a copied item, which keeps the trust
+  it was copied with; and its source as `source`, over the run's
+  trigger, and as the `trigger` of the `queued` entry
+  `Recorder.Queue`, `Deliver` and `Redeliver` write for it. Before, a
+  message a host composed from an instruction file, a template or an
+  MCP server's prompt was recorded as the person's words. (#300)
+- Added: an input queued hidden or with a provenance, and still owed
+  when the process stops, keeps its marks across the restart.
+  agentsession RFC 0001's `queued` entry has no member for them, so
+  `session.Recorder` writes them on every queued entry it writes for
+  the input, a run end's included, as `agentturn:visible`,
+  `agentturn:trust` and `agentturn:instructions_part`
+  (`session.VisibleMember`, `TrustMember`, `InstructionsPartMember`),
+  and a recorder seeded from the path reads them back, so
+  `Recorder.Requeue` hands the input back marked and the item that
+  drains it is recorded hidden, with its layers and trust, not as the
+  person's visible input. Layers read back in a form the provenance
+  rules refuse, as a redaction may leave them, are dropped alone; the
+  hidden mark and the trust are kept. The members give way to
+  agentsession's own when its `queued` entry defines them
+  (agentsession#278). (#300)
+- Added: a turn's inputs (`TurnInput.Trigger`, `TurnStart.Arrived`)
+  name a prompted or hook-added item's provenance source over the
+  run's trigger, as its queued report and its record do. (#300)
+- Added: `session.Recorder` refuses a copied item whose provenance
+  trust names a label the trust it was copied with does not hold,
+  ending the run with an error, rather than drop the label: the format
+  has a copy carry its source's trust as written. The item is then in
+  the agent's transcript and not in the record, until agentsession lets
+  a copy's trust be wider (agentsession#279). `front/control`'s
+  doc says the items a client hands in carry no marks to the server,
+  by design: a client is the person, and text the person did not
+  write is the host's to mark. (#300)
+- Fixed: the inputs a cut run owed, queued again after the end a
+  `session.Resume` writes for it, are queued as they were. A delivery
+  lost `deliver` and its `ref`, so `Recorder.Requeue` handed it back as
+  a plain steer that started no run; it is now written again with
+  agentsession's `QueuedEntry.Requeue`, members of its own and the
+  `agentturn:visible`, `agentturn:trust` and
+  `agentturn:instructions_part` marks included.
+- Changed: RFC 0001 is draft 0.6. The record states the rule: a loop
+  MUST let a host that adds text the person did not write say where it
+  came from and whether it is trusted, MUST carry it unread on the
+  item's events and refuse instruction layers on an item that is not a
+  message, and a recorder MUST record both on the item, never
+  `instructions_part` on a non-message. The item's trust MUST hold the
+  labels the host knows of each layer it names, a union only the host
+  can supply, and a recorder MUST NOT drop a label from a copy. The new
+  MUSTs are breaking for a loop or a recorder that does not. (#300)
+- Changed: RFC 0001 states the rule for a batch hold, naming the
+  members normatively, in The record, the `tool_start` row and Pending
+  calls, which
+  `session.Recorder` already met: a hold written for a call deferred
+  only because another call of its batch was asked about MUST be
+  marked held (`agentturn:held`, `session.HeldMember`) and SHOULD carry
+  the part of the call the deferral is about (`agentturn:subject`,
+  `session.SubjectMember`), and a reader that seeds pending calls MUST
+  read both back. A test pins it for a sidecar session read with the
+  recorder's read options, through `Pending`, `AgentOptions` and a
+  resumed recorder. The new MUST is breaking for a recorder or reader
+  that does not. (#299)
+
 ## v0.0.36 - 2026-11-03
 
 - Added: `session.Recorder.StartChild(ctx, spawnID)` records a child

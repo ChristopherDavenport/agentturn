@@ -18,6 +18,13 @@
 // beside this handler), and the stream replays nothing but a question
 // still waiting.
 //
+// The events carry an item's marks, hidden, copied and its provenance,
+// to a client; the items a client prompts, queues or delivers carry
+// none to the server, by design. A client is the person, and text the
+// person did not write is the host's to compose and mark: a client that
+// could label its own text an instruction layer or trusted would take
+// it out of the run's inputs or clear a label the host gave it.
+//
 // A run belongs to the agent, not to the request that started it: a
 // connection that drops does not abort it, since over a wire that is
 // not the person's intent, and only an abort does. A [Client] keeps the

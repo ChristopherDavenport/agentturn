@@ -1696,7 +1696,14 @@ func (a *Agent) queue(trigger Trigger, mode QueueMode, how InputMode, items open
 			continue
 		}
 		base, hidden := Unhide(item)
-		entry := queuedItem{item: item, mode: how, trigger: trigger}
+		prov := provenance(item)
+		// An item's own source stands over the trigger it was queued
+		// under, for it alone.
+		itemTrigger := trigger
+		if prov != nil && !prov.Source.IsZero() {
+			itemTrigger = prov.Source
+		}
+		entry := queuedItem{item: item, mode: how, trigger: itemTrigger}
 		if mode == QueueSteer {
 			a.steer = append(a.steer, entry)
 			select {
@@ -1707,7 +1714,7 @@ func (a *Agent) queue(trigger Trigger, mode QueueMode, how InputMode, items open
 		} else {
 			a.followUp = append(a.followUp, entry)
 		}
-		a.queued = append(a.queued, &Queued{RunID: runID, Item: base, Mode: mode, Input: how, Hidden: hidden, Trigger: trigger})
+		a.queued = append(a.queued, &Queued{RunID: runID, Item: base, Mode: mode, Input: how, Hidden: hidden, Trigger: itemTrigger, Provenance: prov})
 	}
 }
 

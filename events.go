@@ -333,6 +333,10 @@ type ItemStart struct {
 	// Copied is set for an item the caller marked with [Copied]: taken
 	// from another conversation, not produced in this one.
 	Copied bool
+	// Provenance is what the caller marked the item with through
+	// [WithProvenance], nil for none: where text the person did not
+	// write came from and whether it is trusted.
+	Provenance *Provenance
 }
 
 // EventType returns "item_start".
@@ -387,6 +391,12 @@ type ItemEnd struct {
 	// is. A session recorder writes its entry with copied_from, and no
 	// decision for a call so marked or for its output.
 	Copied bool
+	// Provenance is what the caller marked the item with through
+	// [WithProvenance], nil for none: where text the person did not
+	// write came from and whether it is trusted. A session recorder
+	// writes its layers as instructions_part, its trust as trust and
+	// its source as the item's source, over Trigger.
+	Provenance *Provenance
 	// Trigger, for an item the run was prompted with, is the run's
 	// [Trigger], so a recorder can write how the input arrived; it is
 	// zero for every other item, a queued input included, whose own
@@ -1064,8 +1074,13 @@ type Queued struct {
 	// Trigger is what brought the item in, from the context given to
 	// [Agent.Queue], zero for [Agent.Steer] and [Agent.FollowUp]: the
 	// run start names what started the run, and an input that joins it
-	// has a provenance of its own.
+	// has a provenance of its own. It is the Source of the item's
+	// [Provenance] when that names one.
 	Trigger Trigger
+	// Provenance is what the caller marked the item with through
+	// [WithProvenance], nil for none. The item's own events carry it
+	// again when a run appends it.
+	Provenance *Provenance
 }
 
 // EventType returns "queued".
