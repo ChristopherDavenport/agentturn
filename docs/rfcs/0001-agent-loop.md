@@ -2012,7 +2012,16 @@ for a message composed from instruction layers, which a replay then
 does not send again as an input of its run; `trust`; and `source` for
 what sent it, which on a queued input is also the `queued` entry's
 `trigger`, since the item that drains an entry carries the trigger the
-entry held (#300).
+entry held (#300). An input queued with its marks, hidden or with a
+provenance, and still owed when the process stops is handed back after
+a restart marked as it was queued, so the item that drains it is
+recorded as the item it was: agentsession RFC 0001's `queued` entry
+has no member for an item's display flag, trust or layers, so until it
+does a recorder writes them on every `queued` entry it writes for the
+input, a run end's again included, as `agentturn:visible` (`false`),
+`agentturn:trust` and `agentturn:instructions_part`, each in the form
+the format's member of that name has on an `item`, and reads them back
+where it reads the inputs the path owes.
 
 A decision that defers a call MAY mark it **held**, deferred only
 because another call of its batch was asked about, as a policy that

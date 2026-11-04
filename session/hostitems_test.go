@@ -135,3 +135,98 @@ func TestHostComposedItemsAreRecordedWithTheirProvenance(t *testing.T) {
 		}
 	}
 }
+
+// TestAnOwedQueuedInputKeepsItsMarksAcrossARestart pins that an input
+// the host composed and queued, hidden, with instruction layers and
+// trust, and owed when the process quits, is drained after a restart as
+// what it was: the queued entry keeps the marks the format's queued
+// entry has no member for, as agentturn:visible, agentturn:trust and
+// agentturn:instructions_part, Requeue hands the input back marked, and
+// the item that drains it is recorded hidden, with its layers and its
+// trust, not as the person's visible words. A run end before the drain
+// writes the entry again with them.
+func TestAnOwedQueuedInputKeepsItsMarksAcrossARestart(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{Records: agentsession.AllRecords})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"}
+	a := agentturn.New(cfg)
+	unsub := rec.Attach(a)
+	if _, err := a.Prompt(ctx, openresponses.UserText("first")); err != nil {
+		t.Fatal(err)
+	}
+	reminder, err := agentturn.WithProvenance(agentturn.Hidden(openresponses.UserText("<reminder>sub/AGENTS.md</reminder>")), agentturn.Provenance{
+		Layers: []agentturn.Layer{{ID: "/repo/sub/AGENTS.md", Source: agentsession.LayerAgentsMD}},
+		Trust:  &agentturn.Trust{Reads: []agenttool.Label{agenttool.LabelUntrusted}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Queue(ctx, a, agentturn.QueueFollowUp, reminder); err != nil {
+		t.Fatal(err)
+	}
+	unsub()
+
+	// The process quits with the input owed; a new one resumes.
+	rec, s, err = Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts, err := AgentOptions(s, rec.ReadOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The new process's first run stops for an approval, so its end
+	// closes the reminder's entry and writes it again, before a resume
+	// drains it.
+	asked := false
+	cfgB := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{upper},
+		BeforeToolCall: func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+			if asked {
+				return nil, nil
+			}
+			asked = true
+			return &agentturn.ToolDecision{Action: agentturn.Defer}, nil
+		}}
+	b := agentturn.New(cfgB, opts...)
+	defer rec.Attach(b)()
+	if n, _ := rec.Requeue(ctx, b); n != 1 {
+		t.Fatalf("requeued %d, want the reminder", n)
+	}
+	end, err := b.Prompt(ctx, openresponses.UserText("second"))
+	if err != nil || end.Reason != agentturn.ReasonInputRequired {
+		t.Fatalf("second: %v, %+v", err, end)
+	}
+	if _, err := b.Resume(ctx, agentturn.Approve(end.Pending[0].Call.CallID)); err != nil {
+		t.Fatal(err)
+	}
+	read, err := store.Open(ctx, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyAll(t, read)
+	var queued []*agentsession.QueuedEntry
+	for _, e := range read.Entries() {
+		if q, ok := e.(*agentsession.QueuedEntry); ok {
+			queued = append(queued, q)
+		}
+	}
+	if len(queued) != 2 {
+		t.Fatalf("queued entries = %d, want the reminder's and the one its run end wrote again", len(queued))
+	}
+	for _, q := range queued {
+		if string(q.Unknown[VisibleMember]) != "false" || string(q.Unknown[TrustMember]) != `{"reads":["untrusted"]}` ||
+			string(q.Unknown[InstructionsPartMember]) != `{"id":"/repo/sub/AGENTS.md","source":"agentsmd"}` {
+			t.Errorf("queued entry %s members = %s", q.ID, q.Unknown)
+		}
+	}
+	it := itemEntries(read)["<reminder>sub/AGENTS.md</reminder>"]
+	if it == nil || it.QueuedFrom == "" || it.Visible == nil || *it.Visible ||
+		it.InstructionsPart == nil || *it.InstructionsPart != (agentsession.LayerRef{ID: "/repo/sub/AGENTS.md", Source: agentsession.LayerAgentsMD}) ||
+		it.Trust == nil || !slices.Equal(it.Trust.Reads, []string{"untrusted"}) {
+		t.Errorf("drained reminder = %+v", it)
+	}
+}

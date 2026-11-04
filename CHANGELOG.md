@@ -33,6 +33,17 @@ versions may break the API.
   `Recorder.Queue`, `Deliver` and `Redeliver` write for it. Before, a
   message a host composed from an instruction file, a template or an
   MCP server's prompt was recorded as the person's words. (#300)
+- Added: an input queued hidden or with a provenance, and still owed
+  when the process stops, keeps its marks across the restart.
+  agentsession RFC 0001's `queued` entry has no member for them, so
+  `session.Recorder` writes them on every queued entry it writes for
+  the input, a run end's included, as `agentturn:visible`,
+  `agentturn:trust` and `agentturn:instructions_part`
+  (`session.VisibleMember`, `TrustMember`, `InstructionsPartMember`),
+  and a recorder seeded from the path reads them back, so
+  `Recorder.Requeue` hands the input back marked and the item that
+  drains it is recorded hidden, with its layers and trust, not as the
+  person's visible input. (#300)
 - Changed: RFC 0001 is draft 0.6. The record states the rule: a host
   that adds text the person did not write MUST be able to say where it
   came from and whether it is trusted, and a recorder MUST record both
