@@ -54,6 +54,13 @@ versions may break the API.
   doc says the items a client hands in carry no marks to the server,
   by design: a client is the person, and text the person did not
   write is the host's to mark. (#300)
+- Fixed: the inputs a cut run owed, queued again after the end a
+  `session.Resume` writes for it, are queued as they were. A delivery
+  lost `deliver` and its `ref`, so `Recorder.Requeue` handed it back as
+  a plain steer that started no run; it is now written again with
+  agentsession's `QueuedEntry.Requeue`, members of its own and the
+  `agentturn:visible`, `agentturn:trust` and
+  `agentturn:instructions_part` marks included.
 - Changed: RFC 0001 is draft 0.6. The record states the rule: a loop
   MUST let a host that adds text the person did not write say where it
   came from and whether it is trusted, MUST carry it unread on the

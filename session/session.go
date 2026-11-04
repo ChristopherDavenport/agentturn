@@ -3001,11 +3001,10 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 		return nil
 	}
 	for _, q := range owed {
-		again := agentsession.NewQueued(q.Item, q.Mode)
-		again.Trigger = q.Trigger.Clone()
-		hidden, prov := queuedMarks(q)
-		setQueuedMarks(again, hidden, prov)
-		if _, err := w.append(ctx, again); err != nil {
+		// Queued again as it was: a delivery stays one, and its ref
+		// and the members the format does not define, the marks
+		// [VisibleMember] names among them, go with it.
+		if _, err := w.append(ctx, q.Requeue()); err != nil {
 			return err
 		}
 	}
