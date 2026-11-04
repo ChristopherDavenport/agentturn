@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -928,5 +929,93 @@ func TestASpawnFromAnEndedRunTakesTheLiveQuarantine(t *testing.T) {
 	}
 	if sent := model.sent[0]; strings.Contains(sent, injected) || strings.Count(sent, agentturn.QuarantinedOutput) != 2 {
 		t.Errorf("the spawn was sent %s", sent)
+	}
+}
+
+// TestAReleasedChildKeepsEveryRunsQuarantine pins the fourth review of
+// #294 (R4-1): the set a child's writer leaves at release is joined
+// with the one its earlier runs left, not put in its place, and a
+// writer holding none leaves what was there, so a spawn made after the
+// child's next run ended still leaves out what an earlier run
+// quarantined, named as that run's agent held it.
+func TestAReleasedChildKeepsEveryRunsQuarantine(t *testing.T) {
+	rec := New(agentsession.NewMemoryStore(), agentsession.NewSessionID())
+	const id = "child"
+	first := openresponses.UserText("quarantined in the first run")
+	set, err := agentturn.NewQuarantineSet(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.quarantined = map[string]*agentturn.QuarantineSet{id: set}
+	// The next run's writer, on a root of its own, records no
+	// quarantine.
+	w := newWriter(rec, id)
+	rec.runs["run_2"] = w
+	rec.release("run_2", w)
+	got, ok := rec.quarantined[id]
+	if !ok || !slices.Contains(got.Items(), openresponses.Item(first)) {
+		t.Fatalf("after the next run's release the set holds %v, want the first run's item", got)
+	}
+	if q := rec.recordedQuarantine(context.Background(), newWriter(rec, id)); q == nil || !slices.Contains(q.Items(), openresponses.Item(first)) {
+		t.Errorf("a spawn from the ended child takes %v", q)
+	}
+}
+
+// TestAFreshSpawnIDRepeatedIsDrawnAgain pins R4-2: a spawn ID the
+// recorder draws for a run a host's child's hook starts, refused as one
+// the session carries, is drawn once more rather than leaving the run
+// unrecorded.
+func TestAFreshSpawnIDRepeatedIsDrawnAgain(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{"dup", "dup", "fresh-1"}
+	rec.newSpawnID = func() string {
+		id := ids[0]
+		ids = ids[1:]
+		return id
+	}
+	cctx, err := rec.StartChild(ctx, agentsession.NewSpawnID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := false
+	hook := func(hctx context.Context, _ *openresponses.Request) error {
+		if started {
+			return nil
+		}
+		started = true
+		for _, text := range []string{"one", "two"} {
+			inner := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"})
+			inner.Subscribe(func(ctx context.Context, ev agentturn.Event) error {
+				rec.Observe(ctx, ev)
+				return nil
+			})
+			if _, err := inner.Prompt(hctx, openresponses.UserText(text)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	runSpawned(t, rec, cctx, agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", BeforeModelCall: hook}, "pass")
+	cs, err := store.Open(ctx, links(s)[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := links(cs)
+	if len(l) != 2 || l[0].SpawnID != "dup" || l[1].SpawnID != "fresh-1" {
+		t.Fatalf("the host's child links = %+v, want dup and fresh-1", l)
+	}
+	for _, link := range l {
+		gs, err := store.Open(ctx, link.Session)
+		if err != nil {
+			t.Fatalf("the run linked by %s: %v", link.SpawnID, err)
+		}
+		if n := verifyAll(t, gs); n != 1 {
+			t.Errorf("the run linked by %s holds %d responses", link.SpawnID, n)
+		}
 	}
 }

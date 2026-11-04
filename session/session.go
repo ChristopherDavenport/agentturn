@@ -952,6 +952,9 @@ type Recorder struct {
 	// writer reopened from the store does not have, for a spawn made
 	// from the child after its run ended.
 	quarantined map[string]*agentturn.QuarantineSet
+	// newSpawnID draws the spawn ID of a run a host's child starts with
+	// its context and no call; agentsession.NewSpawnID, a test's own.
+	newSpawnID func() string
 	// heldQueued holds, by the call the child runs under or the spawn
 	// that started it, the queued reports of an observed child that
 	// named no run: inputs accepted while it was idle, for the run that
@@ -1737,13 +1740,14 @@ func WithReopened(fn func(*agentsession.Session)) Option {
 // reopens one with its settings replayed, which New does not do.
 func New(store agentsession.Store, sessionID string, opts ...Option) *Recorder {
 	r := &Recorder{
-		store:    store,
-		filter:   agentturn.DefaultFilter,
-		children: true,
-		now:      time.Now,
-		runs:     map[string]*writer{},
-		ended:    map[string]string{},
-		stored:   map[string]bool{},
+		store:      store,
+		filter:     agentturn.DefaultFilter,
+		children:   true,
+		now:        time.Now,
+		runs:       map[string]*writer{},
+		ended:      map[string]string{},
+		stored:     map[string]bool{},
+		newSpawnID: agentsession.NewSpawnID,
 	}
 	r.root = newWriter(r, sessionID)
 	for _, opt := range opts {
@@ -4597,9 +4601,17 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 			// before the child's header, as StartChild writes one; a
 			// link is no part of the context, so the parent's request
 			// hashes stand.
-			spawnID := agentsession.NewSpawnID()
-			by = childKey{spawn: spawnID, id: agentsession.SpawnedSessionID(parent.id, spawnID)}
-			if _, err := parent.append(context.WithoutCancel(ctx), agentsession.NewSpawnLink(by.id, spawnID)); err != nil {
+			var err error
+			// A drawn ID the session carries already is drawn once
+			// more, rather than leave the run unrecorded.
+			for range 2 {
+				spawnID := r.newSpawnID()
+				by = childKey{spawn: spawnID, id: agentsession.SpawnedSessionID(parent.id, spawnID)}
+				if _, err = parent.append(context.WithoutCancel(ctx), agentsession.NewSpawnLink(by.id, spawnID)); !errors.Is(err, agentsession.ErrSpawnIDRepeated) {
+					break
+				}
+			}
+			if err != nil {
 				return
 			}
 		}
@@ -4653,13 +4665,15 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 func (r *Recorder) release(runID string, w *writer) {
 	delete(r.runs, runID)
 	r.ended[runID] = w.id
-	if set := w.quarantineSet(); set != nil {
+	// Joined with what earlier runs left, never in its place: a run on
+	// a root of its own, or seeded from the store, names none of an
+	// earlier run's items as that run's agent holds them, and the agent
+	// a spawn is seeded from may still hold them.
+	if set := unionQuarantine(r.quarantined[w.id], w.quarantineSet()); set != nil {
 		if r.quarantined == nil {
 			r.quarantined = map[string]*agentturn.QuarantineSet{}
 		}
 		r.quarantined[w.id] = set
-	} else {
-		delete(r.quarantined, w.id)
 	}
 }
 
