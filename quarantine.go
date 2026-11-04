@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sync"
 
 	"github.com/ChristopherDavenport/openresponses"
@@ -419,8 +420,96 @@ func Quarantine(ctx context.Context, items ...openresponses.Item) error {
 // next request on, a run in flight's included, each is left out, or a
 // function call output sent with [QuarantinedOutput]. The transcript
 // keeps them. An item is named by identity, as [Agent.State] hands it.
+// Made while no run is active, or after the run's end was delivered,
+// it is reported to the subscribers as [QuarantineAdded], at once, or,
+// from inside a delivery, right after the event being delivered, so a
+// recorder records it before the agent runs again; while a run is
+// active the run's next turn_start, or its run_end, carries it. The
+// event is delivered under the values of the context the agent's last
+// run was started with, so a subscriber that files it by the context,
+// a recorder for a child the host started, finds that run's session.
+// Called while an event is being delivered, from a subscriber or
+// another goroutine, it only owes the event, which that delivery
+// reports before it lets the barrier go, right after the event it is
+// delivering; otherwise the event is delivered before Quarantine
+// returns, and an error a subscriber returns for it is returned.
 func (a *Agent) Quarantine(items ...openresponses.Item) error {
-	return a.quarantine.add(items...)
+	a.mu.Lock()
+	gen := a.quarantine.generation()
+	if err := a.quarantine.add(items...); err != nil {
+		a.mu.Unlock()
+		return err
+	}
+	// A run's events carry what is quarantined while it runs, up to its
+	// end; anything else is reported on its own.
+	report := a.quarantine.generation() != gen && (!a.running || a.runEnded)
+	if report {
+		added := slices.DeleteFunc(slices.Clone(items), func(item openresponses.Item) bool { return item == nil })
+		a.quarantineOwed = append(a.quarantineOwed, &QuarantineAdded{Items: added, Quarantined: a.quarantine.list()})
+	}
+	a.mu.Unlock()
+	if !report {
+		return nil
+	}
+	// The event is owed before the barrier is tried, so whoever holds
+	// it, a delivery under way, the one calling this from a subscriber
+	// among them, finds it when it lets the barrier go (unlockEmit).
+	if !a.emitMu.TryLock() {
+		return nil
+	}
+	err := a.flushQuarantine(a.eventContext())
+	if uerr := a.unlockEmit(); err == nil {
+		err = uerr
+	}
+	return err
+}
+
+// eventContext is the context an event that belongs to no run is
+// delivered under: the values of the last run's context, lastCtx.
+func (a *Agent) eventContext() context.Context {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.lastCtx != nil {
+		return a.lastCtx
+	}
+	return context.Background()
+}
+
+// unlockEmit lets the delivery barrier go and delivers the
+// [QuarantineAdded] events owed since its holder last flushed them:
+// one Agent.Quarantine owed while the barrier was held, which it could
+// not take. It takes the barrier again only when it is free; when it is
+// not, the holder runs this as it lets go, so no owed event is left
+// behind. The caller holds a.emitMu.
+func (a *Agent) unlockEmit() error {
+	for {
+		a.emitMu.Unlock()
+		a.mu.Lock()
+		owed := len(a.quarantineOwed) > 0
+		a.mu.Unlock()
+		if !owed || !a.emitMu.TryLock() {
+			return nil
+		}
+		if err := a.flushQuarantine(a.eventContext()); err != nil {
+			a.emitMu.Unlock()
+			return err
+		}
+	}
+}
+
+// flushQuarantine delivers the [QuarantineAdded] events owed. The
+// caller holds a.emitMu.
+func (a *Agent) flushQuarantine(ctx context.Context) error {
+	a.mu.Lock()
+	owed := a.quarantineOwed
+	a.quarantineOwed = nil
+	a.mu.Unlock()
+	for _, ev := range owed {
+		if err := a.dispatch(ctx, ev); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Quarantined returns the items quarantined in the agent's

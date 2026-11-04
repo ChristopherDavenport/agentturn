@@ -5,6 +5,95 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Added: `session.Recorder.StartChild(ctx, spawnID)` records a child
+  agent the host starts itself, not through a model's function call,
+  such as a memory pass after a turn, as a subsession of the session
+  it serves (agentsession RFC 0001 0.19, `link` with `spawn_id`). It
+  writes the parent's `subsession` link carrying the spawn ID before
+  the child's header exists and returns a context naming the child's
+  session, derived as `agentsession.SpawnedSessionID`; a run prompted
+  with that context and observed by `Recorder.Observe` is written
+  there, its header naming the parent in `parent_session` and the
+  spawn in `spawned_by`, so verify, the ATIF export and
+  `DelegatedWork` reach its work. A spawn ID the session already
+  carries is refused with `agentsession.ErrSpawnIDRepeated`, by a
+  resumed recorder too, and one outside the format's form with an
+  error. A later run of the child under the context continues its
+  session, and a child it runs through a tool is its subsession. The
+  context carries the spawn, so a recorder resumed on the parent files
+  a run under it too, and `Recorder.ContinueChild(ctx, spawnID)` gives
+  a context for a spawn the parent's path links, writing nothing and
+  reserving the child's call IDs, for a host that kept none, and is
+  where a new agent continuing the child takes its context from, since
+  StartChild's reserves nothing; a spawn the path does not link is
+  refused with `session.ErrNoSpawn`. Made outside the parent's run, or
+  after a call child's run ended, the context carries what the
+  parent's record quarantined, so a child seeded with the parent's
+  items leaves them out: for a session with a live run, what that
+  run's writer holds beside what its earlier run's left. An agent a
+  hook of the child starts with its context and no call is not the
+  spawn again but a child of the child's session, which the recorder
+  links there by a spawn ID of its own at its run's start, so
+  `DelegatedWork` and the export count it. (#294)
+- Fixed: a call child a child session's agent started, prompted again
+  through `agent.WithSpawn` after that child's run ended, continues its
+  own session under that child's, where it was filed under the
+  recorder's own session with an ID derived from the wrong parent. The
+  observed run's parent is the session the recorder remembers for the
+  ended run, reopened at its leaf, and that reopened writer knows the
+  calls its path already links. (#294)
+- Fixed: a child session reopened at its leaf, for a record a job
+  writes after the child's run ended or an idle child's queued input,
+  takes its media form and working directory from its header, where it
+  had neither: in a sidecar child the queued entry's media is stored as
+  a blob, as RFC 0001 has a recorder do, rather than left inline, and a
+  session linked from it takes its media form and directory. (#294)
+- Fixed (security): a quarantine made in a request the recorder could
+  not describe was not recorded, so it leaked after a reopen. When a
+  hook added to the input, or a child's run on a root of its own
+  (`agent.ContextWithRetry`) sent the run before it, the response was
+  rightly left unhashed (`agentturn:unhashed`) but no `omit` was
+  written for what the run's guard quarantined. An agent attached after
+  `Resume` and seeded with the conversation whole sent the quarantined
+  output to the model again, and from this release so would a child
+  `StartChild` or `ContinueChild` starts after the run. This predates
+  #294: v0.0.35 and earlier leak after `Resume`. `TurnStart` and
+  `ModelRetry` now carry the run's quarantine as `Quarantined`, a copy
+  of the items it holds, and the recorder records it as `omit`, outputs
+  as the placeholder and other items left out, whether or not it can
+  describe the request. A quarantine made after a run's last request,
+  by a tool of its last batch before `input_required` or a stop, a hook
+  after that request or `Agent.Quarantine` during the run, reached no
+  event and leaked after `Resume` the same way, on a hashed path too,
+  as did one a `BeforeModelCall` made before refusing the request:
+  `RunEnd` and `ModelBlocked` carry `Quarantined` as well, and the
+  recorder writes it after their entries as a `config` carrying only
+  the `omit` it adds. `Agent.Quarantine` made while no run is active,
+  or after its run's end was delivered, raises the new
+  `QuarantineAdded` event at once, under the values of the context the
+  agent's last run was started with, which the recorder writes the same
+  way, in a child's session for an idle child too, one `StartChild`
+  started among them, so a resume before
+  the agent runs again does not send the item. `front/control` writes
+  `quarantine_added` as its type alone and puts no quarantine on the
+  wire. (#294)
+- Changed: RFC 0001 is draft 0.5. The record states the rule for a
+  child the host starts: a subsession linked by a `spawn_id`, the link
+  before the child's header, a `spawn_id` never repeated in the
+  session. The new MUST is breaking for a host that starts such a
+  child and does not record it. (#294)
+- Dependencies: `session` requires agentsession v0.0.37, up from
+  v0.0.33, so the sessions it writes are format 0.20 and a reader of
+  0.18 or 0.19 refuses them. agentsession's `ConfigFromRequestParts`
+  now refuses a part carrying a `Hash` or a `Keep`, which it used to
+  drop. The recorder clears a host part's `Keep`, and a `Hash` equal
+  to its text's, and records the parts with their sources and trust as
+  before; a part whose hash is not its text's falls back to the
+  instructions string, as parts that do not join do, rather than fail
+  the run. (#294)
+
 ## v0.0.35 - 2026-11-02
 
 - Fixed: `front/a2a`'s steer into a working task goes through what

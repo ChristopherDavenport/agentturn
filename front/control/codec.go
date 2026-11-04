@@ -22,6 +22,15 @@ import (
 // time.Duration's text, and a tool result's Details as its JSON, or
 // not at all when it has none.
 //
+// The quarantine an event carries does not travel: the Quarantined of
+// turn_start, model_retry, model_blocked and run_end, and the items of
+// quarantine_added, which is written as its type alone, so a remote
+// viewer learns that the quarantine grew and never sees the text a
+// guard withheld. A recorder fed the decoded events therefore records
+// no quarantine, and RFC 0001's rule that a recorder records the one in
+// force holds only for one subscribed beside the agent, as
+// agentturn/session's is.
+//
 // The form is this front's, not the loop's: an event in process is a
 // value with live fields, and the choices above are what crossing a
 // wire costs. It is exported for a host that writes events somewhere
@@ -171,6 +180,8 @@ func wireOf(ev agentturn.Event) (any, error) {
 			return nil, err
 		}
 		return wireNotesHeld{Type: e.EventType(), RunID: e.RunID, Notes: notes}, nil
+	case *agentturn.QuarantineAdded:
+		return wireQuarantineAdded{Type: e.EventType()}, nil
 	}
 	return nil, fmt.Errorf("control: event %T has no wire form", ev)
 }
@@ -343,6 +354,13 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 			return nil, err
 		}
 		return &agentturn.Queued{RunID: w.RunID, Item: item, Mode: agentturn.QueueMode(w.Mode), Input: agentturn.InputMode(w.Input), Hidden: w.Hidden, Trigger: triggerIn(w.Trigger)}, nil
+	},
+	agentturn.EventQuarantineAdded: func(data []byte) (agentturn.Event, error) {
+		var w wireQuarantineAdded
+		if err := json.Unmarshal(data, &w); err != nil {
+			return nil, err
+		}
+		return &agentturn.QuarantineAdded{}, nil
 	},
 	agentturn.EventNotesHeld: func(data []byte) (agentturn.Event, error) {
 		var w wireNotesHeld
@@ -579,6 +597,12 @@ func (w *wireNote) UnmarshalJSON(data []byte) error {
 	}
 	type plain wireNote
 	return json.Unmarshal(data, (*plain)(w))
+}
+
+// wireQuarantineAdded is the type alone: what was quarantined does not
+// travel (see [MarshalEvent]).
+type wireQuarantineAdded struct {
+	Type string `json:"type"`
 }
 
 type wireNotesHeld struct {

@@ -1,6 +1,6 @@
 # RFC 0001: Agent Loop
 
-Status: draft 0.4
+Status: draft 0.5
 Author: Christopher Davenport
 Discussion: to be opened against this repository, then proposed to the
 Open Responses community as a companion specification. The Go module at
@@ -62,7 +62,7 @@ executor, the session format begins where an entry is appended, and
 the loop is everything in between.
 
 Each draft describes the Go module as released with it; [Changes in
-draft 0.4](#changes-in-draft-04) lists what this draft added. Where the
+draft 0.5](#changes-in-draft-05) lists what this draft added. Where the
 module falls short of what is written here, or where a rule is
 contested, the shortfall is under open questions with the issue that
 tracks it.
@@ -324,7 +324,9 @@ it raises and the hooks it calls; the events are defined
    ends it with reason `error` otherwise; no call was made, and the
    event is what tells a recorder that from one that was made and
    failed.
-5. **`turn_start`** carries the request exactly as it will be sent and
+5. **`turn_start`** carries the request exactly as it will be sent,
+   the run's quarantine as the request was built under it
+   (**quarantined**, the items it holds, a copy), and
    the **inputs** of the turn: the items appended since the previous
    turn's response, or since the run started for the first turn. They
    are what this turn's response answers. Beside them it carries the
@@ -1196,9 +1198,9 @@ turn number. The catalogue, with the members beyond those two:
 | event | members | when |
 | --- | --- | --- |
 | `run_start` | `source`, `trigger` | first event of a run |
-| `turn_start` | `request`, `inputs` | after the request is built and before it is sent |
-| `model_retry` | `attempt`, `error`, `delay`, `request` | after an uncommitted attempt failed and before the next is sent |
-| `model_blocked` | `request`, `error`, `usage` | in place of `turn_start` when the before-model-call hook refused; in place of `response_end` when the model refused with a guard's error before the attempt committed, with the usage the provider reported, if any; the last event before `run_end` |
+| `turn_start` | `request`, `inputs`, `quarantined` | after the request is built and before it is sent |
+| `model_retry` | `attempt`, `error`, `delay`, `request`, `quarantined` | after an uncommitted attempt failed and before the next is sent |
+| `model_blocked` | `request`, `error`, `usage`, `quarantined` | in place of `turn_start` when the before-model-call hook refused; in place of `response_end` when the model refused with a guard's error before the attempt committed, with the usage the provider reported, if any; the last event before `run_end` |
 | `item_start` | `item`, `response_id`, `hidden`, `copied` | an item entering the transcript: an input as it is appended, an output item as the stream opens it |
 | `item_update` | `item`, `stream`, `response_id` | one wire event of an output item, with the item as accumulated |
 | `item_end` | `item`, `response_id`, `hidden`, `copied`, `trigger`, `model_call_id` | the item is complete and in the transcript; `copied` when the caller marked the item as taken from another conversation; `model_call_id` is the ID the model gave a call the loop renamed; `trigger` is the run's for an item the run was prompted with, other than an output a resume appends for a pending call, whose decision names who gave it |
@@ -1208,7 +1210,8 @@ turn number. The catalogue, with the members beyond those two:
 | `tool_update` | `call_id`, `name`, `partial` | a progress update from a running tool |
 | `tool_end` | `call_id`, `name`, `result`, `error`, `blocked`, `deferred`, `reason`, `parent`, `withdrawn`, `cut`, `replayed` | the call settled, in completion order; `reason` is the decision's for a blocked or deferred call; `withdrawn` when a consumer refused its `tool_dispatch`, so its tool never ran; `cut` when a cancellation or a failure cut it off before it had a result of its own, so its output is not appended and it stays pending; `replayed` when the result is the one a record held for a nested call that ended |
 | `turn_end` | `response`, `tool_results` | after the batch's outputs are appended |
-| `run_end` | `items`, `reason`, `cause`, `error`, `failure`, `pending`, `withheld` | last event of a run; `withheld` when the output guard's stop ended it; `failure` when a consumer or a hook failed for a reason of its own while the run was being cancelled |
+| `quarantine_added` | `items`, `quarantined` | the host quarantined while no run of the agent was active, or after its run's end was delivered; belongs to no run, and is delivered at once, or after the event being delivered |
+| `run_end` | `items`, `reason`, `cause`, `error`, `failure`, `pending`, `withheld`, `quarantined` | last event of a run; `withheld` when the output guard's stop ended it; `failure` when a consumer or a hook failed for a reason of its own while the run was being cancelled |
 | `queued` | `item`, `mode`, `input`, `hidden` | an item accepted into a queue; belongs to no run; `input` says how it arrived, `steer` or `follow_up` for an item queued and `deliver` for one delivered |
 
 An event's members are the facts as of the event. A loop MUST deliver
@@ -1868,7 +1871,7 @@ of the events.
 | event | entry |
 | --- | --- |
 | `run_start` | `run` start, with the loop's source as the format's, which agrees with the format's reading of the segment: a resume's first output, decision or dispatch takes up a call pending when it began, a note typed before it aside, and an input's does not, the trigger joined as `kind:ref`, or whichever is set, as `ref`, and the trigger's kind, ref and source apart as `trigger`, with the trigger's richer facts as members of that object beside them, refused when one names kind, ref or source; an `env` entry, compared with the last one written members it does not define included, when the host supplies one and it changed; the full initial `config` from the configuration's base request when nothing has been written yet, and a `config` delta from it when the configuration changed since the last run, so the items the new configuration's before-turn hook appends are filed under it. The run entry carries the hash of the configuration's base request in a member of the recorder's own, so a recorder seeded from a stored path, by a resume, a fork, a rebase, a continuation or a child session reopened under its call, compares its first run with the base that path's last run started under; a path that recorded none is compared by its settings at the leaf, leaving out instructions the host composes as parts when the base does not join them |
-| `turn_start` | a `config` delta when the request's settings differ from the path's; the request hash is computed here and written on the response. When the host names the parts the request's instructions are composed of, for any session the recorder writes, a child run's included, and they join to the instructions sent, the entries carry `instructions_parts`, a delta naming the parts that moved and each run of unchanged parts as a `keep`, and `instructions_omitted` for what the host left out when it differs from the list in force, which stays in force until a `config` changes it: on a delta each run of parts unchanged in the list in force as a `keep`, `[]` when nothing is left out any more, and on a replace whole whenever it is non-empty. With the instructions recorded as parts, a recorder SHOULD write a configuration change as a delta whenever a delta can describe it, a switch to a configuration whose tools are disjoint included: a replace starts the path's parts afresh, after which a later hand-back can no longer name them by hash, so length alone is not a reason to replace; parts that do not join are dropped and the string is written, since the record describes what was sent |
+| `turn_start` | a `config` delta when the request's settings differ from the path's; the request hash is computed here and written on the response. When the host names the parts the request's instructions are composed of, for any session the recorder writes, a child run's included, and they join to the instructions sent, the entries carry `instructions_parts`, a delta naming the parts that moved and each run of unchanged parts as a `keep`, and `instructions_omitted` for what the host left out when it differs from the list in force, which stays in force until a `config` changes it: on a delta each run of parts unchanged in the list in force as a `keep`, `[]` when nothing is left out any more, and on a replace whole whenever it is non-empty. With the instructions recorded as parts, a recorder SHOULD write a configuration change as a delta whenever a delta can describe it, a switch to a configuration whose tools are disjoint included: a replace starts the path's parts afresh, after which a later hand-back can no longer name them by hash, so length alone is not a reason to replace; parts that do not join, or that the format refuses, a part with no ID, two sharing one, or one whose hash is not that of its text, are dropped and the string is written, since the record describes what was sent; a part carrying its text and also a keep or the hash of that text is written with both cleared, its source and trust kept, since the text says all they would. The quarantine in force, the event's `quarantined`, MUST be recorded as the format's `omit`, its outputs sent as the placeholder and every other item, a call with its outputs, left out, even when the recorder cannot describe how the request's input differs from the path and so writes no request hash, as for a run on a root of its own that sends the items of the run before it or an input a hook added to: otherwise a resume, an agent attached after one, or a child started from the record sends what the run withheld. The MUST covers a quarantine made after the run's last request, by a tool of its last batch, a hook after that request or the host during the run, which `run_end` carries, one a refused request's hook made, which `model_blocked` carries, and one the host made while no run was active, which `quarantine_added` carries, so the record holds every quarantine before the agent runs again: the recorder writes it after that event's other entries, as a `config` carrying only the `omit` it adds, so no response is hashed under it and the next request is (#294) |
 | `model_retry` | a record entry with the attempt, the error, the delay, the failed attempt's model and whether the retry policy revised the request, before the response of the attempt that answers; the revised request's settings are settled with that attempt, so only the attempt that answered is configured on the path. The record entry stays beside the count below, since it says what the count cannot |
 | `model_blocked` | for an error marked as a guard's, a custom entry in `agentturn:model_blocked` carrying the guard's error, the request hash, the model and the usage the event carries, when it carries any, since the run stopped rather than failed and a failed `response` would make its end read as a failure; for any other error, a failed `response` carrying the hook's error and the request hash. Either way the call that was refused is told from one that was made and failed |
 | `item_end` | an `item`, with the display flag off for a hidden item, and the run's trigger as `source` for an item the run was prompted with, an answer's output on a resume excepted. Items a run is prompted with that were taken from another conversation, marked `copied`, as a child prompted with its parent's conversation is, are recorded marked as copied, with agentsession RFC 0001's `copied_from` naming the session they came from, the session whose call spawned the run's, and the entry of it each repeats unchanged, none for an item made for the copy such as a placeholder output for a call in flight, and carrying that entry's `trust`, or, for an item that names no entry, the trust of the path it was copied from, as agentsession RFC 0001 has it; a recorder writes no decision, dispatch or result for a call so marked or its output, since the call is not this session's, and a reader treats such items as context, not as this session's model output or tool calls (#243). An input that arrived under a trigger of kind `callee`, a detached call's late result whether delivered, queued or handed back owed after a restart, carries agentsession RFC 0001's `from_link` naming the latest `peer` link on the path of the call the trigger's ref names, of the task its `task` member names when it names one, and none when the path holds no such link, a cancel notice never (#290). Before a caller-supplied output for a call that was neither dispatched nor rejected, a `reject` decision with the output's text as its reason and the decider the caller named, and `policy` as the decider when the loop refused the call itself in this run, for a name no tool has or arguments that are not an object, or closed it because the output guard withheld the response that made it; before one for a call that may have run, dispatched in an earlier run or on a path that does not promise dispatch records, an `answer` decision with the answer's decider and reason, since a `proceed` would say the call went on toward its tool and a `reject` that it never reached it, and no second `dispatch` says the tool did not run again; before one for a call the path already shows answered, nothing; one for a call that has its output is refused with agentsession's `ErrCallCompleted`, since the context would hold two. The answer's output for a call that completed off the path the run continues, which the caller marked with where it was taken from, is written with a `link` to the child session that produced the output it repeats, when the record holds one: the `subsession` link a branch of this session holding the original output has for the call, written again on this branch before the `answer`, since a link on a branch left says nothing of this one; a fork writes none, since a `subsession` link names a child of the session that writes it and the child is the origin's: an `answer` whose output repeats one that ran in the session a fork was made from MUST name that output's entry and session in the output's `copied_from`, carrying its `trust`, so a reader reaches the child session that produced it through the origin's link for the call, which the fork's prefix lacks when the fork was made at the call (#237). A call the loop renamed keeps the model's ID in an `agentturn:model_call_id` member beside the `item`. An output's `item` MUST be marked `failed` when the call's `tool_end` carried the tool's error for a hand-off of this run, or when the answer it is reports that the call failed, as an output saying a cut call's outcome is unknown does; a call refused, by a block, by the loop for a name no tool has or arguments that are not an object, or by an answer's output for a call that never started, is recorded by its `reject` and MUST NOT be marked |
@@ -1931,6 +1934,31 @@ the `queued` row, in the `records` of every
 session it creates and writes from events, so a reader takes a call
 with a `dispatch`, no `result` and no output as one whose tool had not
 returned when the record stopped.
+
+A host that starts a child agent itself, not through a model's
+function call, such as a pass that consolidates memory after a turn,
+MUST record it as a subsession of the session it serves. It writes the
+parent's `subsession` link with a `spawn_id` before the child's header,
+and the child's header names the parent in `parent_session` and the
+`spawn_id` in `spawned_by` (agentsession RFC 0001, `link`). A
+`spawn_id` MUST NOT repeat within the parent session. Such a child is
+not the loop-as-a-tool's spawned child, which a call started and the
+spawn callback of Composition hands the host: that one is linked by
+its call. A recorder that offers the host a way to start one SHOULD
+derive the child's ID over `["spawn","<parent>","<spawn_id>"]`, as
+agentsession RFC 0001's header table recommends, so a reader computes
+it from the link alone, and MUST refuse a `spawn_id` the session
+already carries, on any branch, writing nothing, as that format's
+`link` rule has a writer do (agentsession RFC 0003 carries the refusal
+as `spawn_id_repeated`). Its session is otherwise one the recorder
+creates for a child: it names the recorder's harness, takes the
+parent's media form, is named after the configuration it runs under,
+and is written from its run's events; a later run of the same child
+continues it at its leaf, and a child it starts through a tool is its
+own subsession. A child started outside the parent's run, which so
+holds none of the run's quarantine, leaves out what the parent's
+record quarantined. Verification, export and delegated-work accounting
+then reach its work as they reach a tool's child's (#294).
 
 A recorder that continues a path on which a run is open that it is
 not running owns that run and closes it before it writes anything
@@ -2009,7 +2037,7 @@ maps onto it as follows:
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`, which implements `agentturn.InputRequired` (`PendingCalls() []WaitingCall`), as `tools/a2a`'s does; `WithAskParent`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)`; a detached call: `tools/a2a.WithDetach(fn)`, `WithPollInterval`, `Answer(final)`, and `CalleeTrigger(callID, task)` (`TriggerCallee`) to deliver its result under; a steer of a working task: `front/a2a.WithDeliverWhileBusy()`, served by `Executor.RequestHandler`, `MaxSteers`, `Redeliverer` and `ContextWithRedeliverer` for a recorded one (`session.Recorder.Redeliver`), and `tools/a2a.Steer(ctx, client, info, parts…)` |
 | quarantine | `Agent.Quarantine`, `Agent.Quarantined`; `Quarantine(ctx, items…)` from a hook or a tool, `ErrNoQuarantine`, `ErrNotQuarantinable`; `QuarantinedOutput`, the placeholder; `QuarantineFromContext` → `QuarantineView` (`Has`, `Generation`, `Apply`) for a transform, which `compact` reads; `NewQuarantineSet` → `QuarantineSet` (`Add`, `Items`, `Has`, `Apply`), `ContextWithQuarantineSet` for a host carrying one through `Run` and `Continue`, and `WithQuarantineSet` for an `Agent`; `QuarantineSet.Bind` and `Merge` for a front keeping a conversation's set across tasks or requests, as `front/a2a` does per context and `front/responses` under `WithQuarantineScope` (`QuarantineScope`, `MaxQuarantineScopes` per principal); `session` `Recorder.Attach` seeds it from the record's `omit` |
-| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Queue`, `Deliver`, `Redeliver`, `Control` (`RecordedControl`, for a front), `Requeue`, `Rebase`; `session.MoveTo` for a rewind; `WithInstructionsParts`, `WithMedia`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`, read with `Recorder.ReadOptions`, `session.WithBlobs` resolving a sidecar session's media (`session.ErrNoBlobReader` without one); the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
+| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `StartChild` and `ContinueChild` for a child the host starts, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Queue`, `Deliver`, `Redeliver`, `Control` (`RecordedControl`, for a front), `Requeue`, `Rebase`; `session.MoveTo` for a rewind; `WithInstructionsParts`, `WithMedia`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`, read with `Recorder.ReadOptions`, `session.WithBlobs` resolving a sidecar session's media (`session.ErrNoBlobReader` without one); the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
 
 Every error the package returns to its caller, sentinel or wrapped,
 begins with `agentturn:`; the error texts a call's output carries,
@@ -2055,9 +2083,18 @@ and from nothing earlier; describes an input that differs from the
 path only by edits the format's `omit` can say, a trim or a
 quarantine among them, with a `config` delta written before the
 response and hashes it, declining a request hash only for an input
-the path cannot rebuild; and writes a `result` entry, durable before
+the path cannot rebuild, and records the quarantine `turn_start`,
+`model_blocked`, `run_end` and `quarantine_added` carry as `omit`
+whether or not it can describe the input; writes a
+`result` entry, durable before
 `tool_end` returns, for a call whose tool returned while another call
-of its batch has not settled, and none for the last of its batch.
+of its batch has not settled, and none for the last of its batch; and,
+when it offers the host a way to start a child of its own, writes the
+`spawn_id` link before the child's header and refuses a `spawn_id` the
+session carries on any branch, writing nothing. The rule on a host
+that starts such a child is not checked here: this section has no
+class for a host, and a host meets it by starting the child through a
+conforming recorder.
 
 ### The scenario corpus
 
@@ -2232,6 +2269,29 @@ The scenario corpus is versioned with this document. A scenario is
 added when a rule is, and changes only when the rule it pins does, in
 the same draft; a scenario that a conforming loop fails is a defect in
 the scenario, fixed without a change of rule.
+
+## Changes in draft 0.5
+
+Draft 0.5 adds the rule below to draft 0.4, marked as Versioning has
+it.
+
+- **The record.** A host that starts a child agent itself, not through
+  a model's function call, records it as a subsession linked by a
+  `spawn_id`: the link before the child's header, the header's
+  `parent_session` and `spawned_by`, the child's ID derived over
+  `["spawn",…]` (SHOULD), a repeated `spawn_id` refused (MUST, on a
+  recorder), and the parent's recorded quarantine carried to a child
+  started outside its run (agentsession RFC 0001 0.19, `link`; #294);
+  breaking for a host that starts such a child and does not record it.
+- **Events and the record.** `turn_start`, `model_retry`,
+  `model_blocked` and `run_end` carry the run's quarantine as
+  `quarantined`, a new `quarantine_added` reports one the host made
+  while no run was active, and a recorder MUST record it as `omit` even
+  for a request whose difference from the path it cannot describe, for
+  a quarantine made after the run's last request and for one made
+  between runs (#294); breaking for a recorder.
+- **Conformance.** A conforming recorder that starts a host's child
+  writes its link first and refuses a repeated `spawn_id` (#294).
 
 ## Changes in draft 0.4
 

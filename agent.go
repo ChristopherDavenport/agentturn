@@ -133,6 +133,19 @@ type Agent struct {
 	steer      []queuedItem
 	followUp   []queuedItem
 	running    bool
+	// runEnded is set once the run's end has been delivered, so a
+	// quarantine made between it and the run's return is reported
+	// ([QuarantineAdded]) rather than carried by no event.
+	runEnded bool
+	// lastCtx is the values of the context the last run was started
+	// with, without its cancellation: the context an event that
+	// belongs to no run, [QuarantineAdded], is delivered under, so a
+	// subscriber that tells sessions apart by the context, a recorder
+	// filing a host's child, finds the run's.
+	lastCtx context.Context
+	// quarantineOwed are the [QuarantineAdded] events Agent.Quarantine
+	// raised that have not been delivered yet.
+	quarantineOwed []*QuarantineAdded
 	// held is set while [Agent.WhileIdle] runs its function: no run
 	// starts, and nothing else is refused.
 	held bool
@@ -1151,6 +1164,7 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, notes []
 	runCtx, runCancel := linkRunContext(ctx)
 	ctx, cancel := context.WithCancelCause(ctx)
 	a.running = true
+	a.lastCtx = context.WithoutCancel(ctx)
 	a.closing = false
 	// The run's ID is known from here, so an item queued before its
 	// run_start names it rather than the run before.
@@ -1218,13 +1232,20 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, notes []
 // outlived its run or sent to a new subscriber, and neither from a
 // subscriber, so a subscriber never waits on a barrier it is itself
 // holding: steering from inside an event queues the item and returns.
-func (a *Agent) deliver(ctx context.Context, ev Event) error {
+func (a *Agent) deliver(ctx context.Context, ev Event) (err error) {
 	a.emitMu.Lock()
-	defer a.emitMu.Unlock()
+	defer func() {
+		if ferr := a.unlockEmit(); err == nil {
+			err = ferr
+		}
+	}()
 	if err := a.drainQueued(ctx); err != nil {
 		return err
 	}
 	if err := a.dispatch(ctx, ev); err != nil {
+		return err
+	}
+	if err := a.flushQuarantine(ctx); err != nil {
 		return err
 	}
 	if _, last := ev.(*RunEnd); last {
@@ -1261,6 +1282,7 @@ func (a *Agent) dispatch(ctx context.Context, ev Event) error {
 	switch e := ev.(type) {
 	case *RunStart:
 		a.runID = e.RunID
+		a.runEnded = false
 	case *TurnStart:
 		a.turn = e.Turn
 	case *ItemEnd:
@@ -1269,6 +1291,13 @@ func (a *Agent) dispatch(ctx context.Context, ev Event) error {
 		a.pending = e.Pending
 		a.notes = e.Notes
 		a.lastEnd = e
+		// Taken under a.mu with the end marked, so a quarantine made
+		// since the run took its copy is in it or reported after it,
+		// never in neither.
+		if q := a.quarantine.list(); len(q) > 0 {
+			e.Quarantined = q
+		}
+		a.runEnded = true
 	case *Question:
 		a.waiting = append(a.waiting, e)
 	case *QuestionClosed:
@@ -1360,7 +1389,7 @@ func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe fu
 // subscriber, which holds the barrier already.
 func (a *Agent) flushReplay(id int, fn func(context.Context, Event) error) {
 	a.emitMu.Lock()
-	defer a.emitMu.Unlock()
+	defer func() { _ = a.unlockEmit() }()
 	a.mu.Lock()
 	qs := a.replays[id]
 	delete(a.replays, id)

@@ -128,6 +128,38 @@ func TestInstructionsPartsAreRecorded(t *testing.T) {
 		},
 		steps: stringSteps,
 	}, {
+		name: "a hash matching the text and a keep are cleared, the parts kept",
+		mangle: func(p []agentsession.InstructionPart, o []agentsession.OmittedPart) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
+			// The text is there, so the hash says nothing more and a
+			// keep on a named part means nothing; agentsession v0.0.37
+			// refuses both on a part with its text.
+			p[0].Hash = agentsession.HashText(p[0].Text)
+			p[1].Keep = 2
+			p[2].Trust = &agentsession.Trust{Reads: []string{"untrusted"}}
+			return p, o
+		},
+		steps: []step{{
+			want: func(t *testing.T, added []*agentsession.ConfigEntry) {
+				if len(added) != 1 || added[0].Instructions != nil || len(added[0].InstructionsParts) != 3 || len(added[0].InstructionsOmitted) != 1 {
+					t.Fatalf("first config = %+v", added)
+				}
+				ps := added[0].InstructionsParts
+				if ps[0].Hash != "" || ps[1].Keep != 0 || ps[0].Text == "" {
+					t.Errorf("parts = %+v, want the hash and the keep cleared", ps)
+				}
+				if ps[2].Trust == nil || !slices.Equal(ps[2].Trust.Reads, []string{"untrusted"}) {
+					t.Errorf("memory part trust = %+v, want untrusted kept", ps[2].Trust)
+				}
+			},
+		}},
+	}, {
+		name: "a hash contradicting the text falls back to the string",
+		mangle: func(p []agentsession.InstructionPart, o []agentsession.OmittedPart) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
+			p[0].Hash = agentsession.HashText("another text")
+			return p, o
+		},
+		steps: stringSteps,
+	}, {
 		name: "an omitted part with no ID is dropped alone",
 		mangle: func(p []agentsession.InstructionPart, o []agentsession.OmittedPart) ([]agentsession.InstructionPart, []agentsession.OmittedPart) {
 			return p, append(o, agentsession.OmittedPart{Reason: "nameless"})

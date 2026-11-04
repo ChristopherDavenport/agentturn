@@ -14,7 +14,8 @@ import (
 // Event is one step of a run. Concrete types are [RunStart], [TurnStart],
 // [ModelRetry], [ModelBlocked], [ItemStart], [ItemUpdate], [ItemEnd],
 // [ResponseEnd], [ToolStart], [ToolDispatch], [ToolUpdate], [ToolEnd],
-// [TurnEnd] and [RunEnd], [Queued], which belongs to no run, and
+// [TurnEnd] and [RunEnd], [Queued] and [QuarantineAdded], which
+// belong to no run, and
 // [Question] and [QuestionClosed], which a running call raises. Decoded
 // values are pointers, so switch on *ItemUpdate and so on.
 type Event interface {
@@ -39,6 +40,8 @@ const (
 	EventRunEnd       = "run_end"
 	EventQueued       = "queued"
 	EventNotesHeld    = "notes_held"
+	// EventQuarantineAdded names [QuarantineAdded].
+	EventQuarantineAdded = "quarantine_added"
 )
 
 // Reason says why a run ended.
@@ -204,6 +207,17 @@ type TurnStart struct {
 	Request openresponses.Request
 	Inputs  openresponses.Items
 	Arrived []TurnInput
+	// Quarantined is the run's quarantine as the request was built
+	// under it: the items it holds, in no order, each named as
+	// [Quarantine] named it (RFC 0001 The request, step 3). The request
+	// leaves each out, or sends an output as [QuarantinedOutput], but a
+	// subscriber reading the request alone cannot always tell a
+	// quarantine from another difference, a hook's addition or a
+	// transcript its record does not hold, so a recorder records the
+	// quarantine in force from here whatever else the input holds (RFC
+	// 0001 The record). It is a copy: what is quarantined later is in a
+	// later event's.
+	Quarantined openresponses.Items
 }
 
 // EventType returns "turn_start".
@@ -229,6 +243,9 @@ type ModelRetry struct {
 	// does on turn_start, so a fallback to another model reaches the
 	// path as a config delta.
 	Request openresponses.Request
+	// Quarantined is the run's quarantine as the next attempt's request
+	// is built under it, as [TurnStart.Quarantined] is.
+	Quarantined openresponses.Items
 }
 
 // EventType returns "model_retry".
@@ -257,10 +274,31 @@ type ModelBlocked struct {
 	// Usage is what the provider reported for a call the model's guard
 	// refused, nil otherwise.
 	Usage *openresponses.Usage
+	// Quarantined is the run's quarantine as the refused request was
+	// built under it, as [TurnStart.Quarantined] is: a hook that
+	// quarantines and then refuses leaves no later request to carry it.
+	Quarantined openresponses.Items
 }
 
 // EventType returns "model_blocked".
 func (*ModelBlocked) EventType() string { return EventModelBlocked }
+
+// QuarantineAdded reports items [Agent.Quarantine] quarantined while no
+// run of the agent was active, or after its run's end was delivered,
+// which no event of a run carries. Items are the ones the call added,
+// Quarantined a copy of the conversation's quarantine after it, as
+// [TurnStart.Quarantined] is. It belongs to no run and is delivered
+// through the barrier at once: from a subscriber, right after the
+// event being delivered. A recorder records the quarantine from here
+// (RFC 0001 The record), so a resume before the agent runs again does
+// not send the items.
+type QuarantineAdded struct {
+	Items       openresponses.Items
+	Quarantined openresponses.Items
+}
+
+// EventType returns "quarantine_added".
+func (*QuarantineAdded) EventType() string { return EventQuarantineAdded }
 
 // ItemStart announces an item entering the transcript: a prompt or
 // queued message, an assistant item as the stream opens it, or a
@@ -629,6 +667,13 @@ type RunEnd struct {
 	// or [Agent.SetNotes], with their Mode, Trigger and CallID. With
 	// calls pending the notes are on [PendingCall.Notes] instead.
 	Notes []Note
+	// Quarantined is the run's quarantine as the run ended, as
+	// [TurnStart.Quarantined] is: what a tool of the last batch, a hook
+	// after the last request or [Agent.Quarantine] during the run
+	// quarantined reaches no request of this run, so a recorder records
+	// it from here (RFC 0001 The record). What the host quarantines
+	// after the run ends reaches the next run's first turn_start.
+	Quarantined openresponses.Items
 	// Withheld says the run ended because [Config.OutputGuard]
 	// withheld a message, or the model call failed with an error
 	// wrapping [ErrGuard] after its response began, with Reason
