@@ -273,3 +273,77 @@ func TestAHostStartedChildSurvivesAReopen(t *testing.T) {
 		t.Errorf("a repeated spawn_id = %v, want ErrSpawnIDRepeated", err)
 	}
 }
+
+// TestAHostStartedChildsWriterIsReleased pins the review of #294 (F4,
+// F5): the writer of a spawned child's run is released at its run end,
+// so a host running a pass after every turn holds none of them, a
+// record made with the run's context still goes to the child, and a
+// call child the spawned child started, prompted again after the
+// spawned child's run ended, continues its own session under the
+// spawned child's rather than being filed as the spawn.
+func TestAHostStartedChildsWriterIsReleased(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spawnID := agentsession.NewSpawnID()
+	cctx, err := rec.StartChild(ctx, spawnID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var helpers []*agentturn.Agent
+	helper := agent.New(agentturn.Config{Name: "helper", Model: &echo.Adapter{}},
+		agent.WithObserver(rec.Observe),
+		agent.WithSpawn(func(_ string, a *agentturn.Agent) { helpers = append(helpers, a) }))
+	cfg := agentturn.Config{Name: "background", Model: delegates{}, ModelName: "m", Tools: []agenttool.Tool{helper}}
+	var runID string
+	child := agentturn.New(cfg)
+	child.Subscribe(func(ctx context.Context, ev agentturn.Event) error {
+		if e, ok := ev.(*agentturn.RunStart); ok {
+			runID = e.RunID
+		}
+		rec.Observe(ctx, ev)
+		return nil
+	})
+	if _, err := child.Prompt(agent.ContextWithConfig(cctx, cfg), openresponses.UserText("first")); err != nil {
+		t.Fatal(err)
+	}
+	id := agentsession.SpawnedSessionID(s.ID(), spawnID)
+	for r, w := range rec.runs {
+		if w.id == id {
+			t.Errorf("run %s still holds a writer of the spawned child after its end", r)
+		}
+	}
+	if got := rec.SessionOf(agentturn.ContextWithRunID(ctx, runID)); got != id {
+		t.Errorf("SessionOf the ended run = %q, want the child %q", got, id)
+	}
+	cs, err := store.Open(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := len(cs.Entries())
+	cl := links(cs)
+	if len(helpers) != 1 || len(cl) != 1 {
+		t.Fatalf("helpers %d, child links %+v", len(helpers), cl)
+	}
+	// The helper is prompted again after the spawned child's run ended:
+	// its observer's context carries the spawn and the helper's call.
+	if _, err := helpers[0].Prompt(ctx, openresponses.UserText("again")); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(cs.Entries()); n != before {
+		t.Errorf("the helper's second run wrote %d entries to the spawned child", n-before)
+	}
+	gs, err := store.Open(ctx, cl[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := verifyAll(t, gs); n != 2 {
+		t.Errorf("the helper's session holds %d responses, want both runs'", n)
+	}
+	if l := links(cs); len(l) != 1 {
+		t.Errorf("child links after the helper's second run = %+v, want the one", l)
+	}
+}

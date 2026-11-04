@@ -23,6 +23,13 @@ versions may break the API.
   error. A later run of the child under the context continues its
   session, and a child it runs through a tool is its subsession.
   (#294)
+- Fixed: a call child a child session's agent started, prompted again
+  through `agent.WithSpawn` after that child's run ended, continues its
+  own session under that child's, where it was filed under the
+  recorder's own session with an ID derived from the wrong parent. The
+  observed run's parent is the session the recorder remembers for the
+  ended run, reopened at its leaf, and that reopened writer knows the
+  calls its path already links. (#294)
 - Changed: RFC 0001 is draft 0.5. The record states the rule for a
   child the host starts: a subsession linked by a `spawn_id`, the link
   before the child's header, a `spawn_id` never repeated in the
