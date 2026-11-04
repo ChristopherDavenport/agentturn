@@ -7,6 +7,27 @@ versions may break the API.
 
 ## Unreleased
 
+- Added: `session.Recorder.StartChild(ctx, spawnID)` records a child
+  agent the host starts itself, not through a model's function call,
+  such as a memory pass after a turn, as a subsession of the session
+  it serves (agentsession RFC 0001 0.19, `link` with `spawn_id`). It
+  writes the parent's `subsession` link carrying the spawn ID before
+  the child's header exists and returns a context naming the child's
+  session, derived as `agentsession.SpawnedSessionID`; a run prompted
+  with that context and observed by `Recorder.Observe` is written
+  there, its header naming the parent in `parent_session` and the
+  spawn in `spawned_by`, so verify, the ATIF export and
+  `DelegatedWork` reach its work. A spawn ID the session already
+  carries is refused with `agentsession.ErrSpawnIDRepeated`, by a
+  resumed recorder too, and one outside the format's form with an
+  error. A later run of the child under the context continues its
+  session, and a child it runs through a tool is its subsession.
+  (#294)
+- Changed: RFC 0001 is draft 0.5. The record states the rule for a
+  child the host starts: a subsession linked by a `spawn_id`, the link
+  before the child's header, a `spawn_id` never repeated in the
+  session. The new MUST is breaking for a host that starts such a
+  child and does not record it. (#294)
 - Dependencies: `session` requires agentsession v0.0.37, up from
   v0.0.33, so the sessions it writes are format 0.20 and a reader of
   0.18 or 0.19 refuses them. agentsession's `ConfigFromRequestParts`

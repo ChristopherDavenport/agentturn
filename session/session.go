@@ -363,6 +363,13 @@
 // written, the child's after its run ended, and what the context names
 // or the recorder's own otherwise.
 //
+// A child the host starts itself, not through a model's function call,
+// such as a pass that consolidates memory after a turn, is a
+// subsession too, linked by a spawn ID in place of a call's:
+// [Recorder.StartChild] writes the link and returns the context to
+// prompt the child with, and Observe writes the run it starts to the
+// session the link names.
+//
 // # Request hashes and compaction
 //
 // The hash recorded on a response is computed from the request as sent,
@@ -939,14 +946,18 @@ type Recorder struct {
 	// the child's session whether or not the host put the session's ID
 	// on that context.
 	ended map[string]string
-	// heldQueued holds, by the call the child runs under, the queued
-	// reports of an observed child that named no run: inputs accepted
-	// while it was idle, for the run that takes them. One for a call
-	// whose child has a session already is written there when it is
-	// reported, so it is on the record whether or not the child runs
-	// again; one for a call with none yet is written at the start of
-	// the run that takes it.
-	heldQueued map[string][]*heldReport
+	// heldQueued holds, by the call the child runs under or the spawn
+	// that started it, the queued reports of an observed child that
+	// named no run: inputs accepted while it was idle, for the run that
+	// takes them. One for a child that has a session already is written
+	// there when it is reported, so it is on the record whether or not
+	// the child runs again; one for a child with none yet is written at
+	// the start of the run that takes it.
+	heldQueued map[childKey][]*heldReport
+	// spawns maps the ID of each child session [Recorder.StartChild]
+	// linked to the spawn that names it, for the run the host starts
+	// under the context it returned.
+	spawns map[string]*spawn
 	// childIDs holds the ID of every child session the recorder has
 	// written, so a record naming one by [SessionIDFromContext] after
 	// its run ended is filed there rather than at the root.
@@ -1200,6 +1211,20 @@ type inboxItem struct {
 	// the agent then refused: nobody holds it, Requeue does not hand it
 	// back, and the next run end drops it.
 	declined bool
+}
+
+// childKey names an observed child by the call it runs under, or by
+// the spawn ID of the link [Recorder.StartChild] wrote for it; neither
+// for a tool run outside a loop with no call on its context.
+type childKey struct {
+	call, spawn string
+}
+
+// spawn is a child the host started itself, linked by
+// [Recorder.StartChild] from the session parent with spawnID.
+type spawn struct {
+	parent  string
+	spawnID string
 }
 
 // heldReport is a queued report of an observed child that named no
@@ -3607,6 +3632,9 @@ func (r *Recorder) reopenID(ctx context.Context, id string) (*writer, error) {
 	}
 	w := newWriter(r, id)
 	w.parentID = s.Header().ParentSession
+	// What a child of this session takes from it, a host's spawn
+	// started after its run ended among them.
+	w.cwd, w.media = s.Header().CWD, s.Header().Media
 	if err := w.seedCalls(ctx, s, calls); err != nil {
 		return nil, err
 	}
@@ -4050,6 +4078,126 @@ func (r *Recorder) ChildContext(ctx context.Context, callID string) context.Cont
 	return ctx
 }
 
+// StartChild records a child agent the host starts itself, not
+// through a model's function call, such as a pass that consolidates
+// memory after a turn, as a subsession of the session it serves (RFC
+// 0001, The record; agentsession RFC 0001, link). The parent is the
+// session [Recorder.Annotate] files an entry in for ctx: the session
+// of the run on ctx, a child's after its run ended, or the recorder's
+// own. StartChild writes the parent's subsession link carrying
+// spawnID, durably, before the child's header exists, and returns ctx
+// carrying the child's ID, derived as
+// agentsession.SpawnedSessionID(parent, spawnID), as
+// [SessionIDFromContext] reads it. A run prompted with that context
+// and observed by [Recorder.Observe] is written to the child, whose
+// header names the parent in parent_session and spawnID in
+// spawned_by:
+//
+//	ctx, err := rec.StartChild(ctx, agentsession.NewSpawnID())
+//	if err != nil {
+//		return err
+//	}
+//	child := agentturn.New(cfg)
+//	defer child.Subscribe(func(ctx context.Context, ev agentturn.Event) error {
+//		rec.Observe(ctx, ev)
+//		return nil
+//	})()
+//	_, err = child.Prompt(agent.ContextWithConfig(ctx, cfg), input)
+//
+// The child's session is created at its first run's start, named
+// after the configuration agent.ContextWithConfig puts on the
+// context, so a link whose session does not exist says the child never
+// ran. A later run of the same agent under the context continues the
+// session at its leaf; a call child the host's child runs through a
+// tool is that child's subsession, as any is.
+//
+// spawnID is the host's to choose, a UUIDv7 from
+// agentsession.NewSpawnID serving, and is drawn from ASCII letters,
+// digits, '_' and '-'. One the parent's session already carries, on
+// any branch, is refused with agentsession.ErrSpawnIDRepeated, as one
+// in another form is with an error, and nothing is written. A recorder
+// made with [WithoutChildSessions] writes none and refuses.
+func (r *Recorder) StartChild(ctx context.Context, spawnID string) (context.Context, error) {
+	if !validSpawnID(spawnID) {
+		return ctx, fmt.Errorf("session: spawn ID %q is not a non-empty string of ASCII letters, digits, '_' and '-'", spawnID)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.children {
+		return ctx, errors.New("session: the recorder writes no child sessions")
+	}
+	w := r.writerOf(ctx)
+	if w == r.root {
+		cw, err := r.reopen(ctx)
+		if err != nil {
+			return ctx, err
+		}
+		if cw != nil {
+			w = cw
+		}
+	}
+	id := agentsession.SpawnedSessionID(w.id, spawnID)
+	if _, err := w.append(context.WithoutCancel(ctx), agentsession.NewSpawnLink(id, spawnID)); err != nil {
+		return ctx, err
+	}
+	if r.spawns == nil {
+		r.spawns = map[string]*spawn{}
+	}
+	r.spawns[id] = &spawn{parent: w.id, spawnID: spawnID}
+	return ContextWithSessionID(context.WithValue(ctx, spawnKey{}, id), id), nil
+}
+
+// spawnKey is the context key of the child session [Recorder.StartChild]
+// linked.
+type spawnKey struct{}
+
+// validSpawnID reports whether id is in the form the format takes a
+// spawn_id in: non-empty, of ASCII letters, digits, '_' and '-'.
+func validSpawnID(id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, c := range []byte(id) {
+		switch {
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9', c == '_', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// observedChild returns the writer of the session an observed run on
+// ctx is a child of, the key naming the child and the child's derived
+// ID, "" for a child with neither a call nor a spawn. The run is the
+// host's spawn when ctx carries the child [Recorder.StartChild] linked
+// and the run on ctx, if any, is the spawn's parent's: a call child the
+// spawned child runs through a tool carries the spawn on its context
+// too, under the spawned child's run. The caller holds r.mu.
+func (r *Recorder) observedChild(ctx context.Context) (*writer, childKey, string, error) {
+	parent, inRun := r.runs[agentturn.RunIDFromContext(ctx)]
+	if !inRun {
+		parent = r.root
+	}
+	if id, _ := ctx.Value(spawnKey{}).(string); id != "" {
+		if sp := r.spawns[id]; sp != nil && (!inRun || parent.id == sp.parent) {
+			p, err := r.writerByID(ctx, sp.parent)
+			if err != nil {
+				return nil, childKey{}, "", err
+			}
+			if p == nil {
+				return nil, childKey{}, "", fmt.Errorf("session: the parent %s of spawned session %s is not written here", sp.parent, id)
+			}
+			return p, childKey{spawn: sp.spawnID}, id, nil
+		}
+	}
+	call, ok := agenttool.CallFrom(ctx)
+	if !ok || call.ID == "" {
+		return parent, childKey{}, "", nil
+	}
+	return parent, childKey{call: call.ID}, agentsession.SubsessionID(parent.id, call.ID), nil
+}
+
 // SessionID returns the ID of the session being written.
 func (r *Recorder) SessionID() string { return r.root.id }
 
@@ -4143,7 +4291,10 @@ func (r *Recorder) Handle(ctx context.Context, ev agentturn.Event) error {
 // at once, since the call has been dispatched; and writes the child's
 // configuration, which tools/agent puts on the context, as its first
 // entry. Every later event of the run is written to that session as
-// [Recorder.Handle] writes the agent's.
+// [Recorder.Handle] writes the agent's. A run prompted with the context
+// [Recorder.StartChild] returned is the host's child instead: its
+// session is the one the spawn's link names, under the session that
+// wrote the link, and no link is written at its start.
 func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -4156,39 +4307,31 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 	if e, ok := ev.(*agentturn.Queued); ok && e.RunID == "" {
 		// An idle child reports an input before the run that takes it
 		// starts, so its session is not known yet.
-		callID := ""
-		if call, ok := agenttool.CallFrom(ctx); ok {
-			callID = call.ID
+		_, key, id, err := r.observedChild(ctx)
+		if err != nil {
+			return
 		}
 		if r.heldQueued == nil {
-			r.heldQueued = map[string][]*heldReport{}
+			r.heldQueued = map[childKey][]*heldReport{}
 		}
 		h := &heldReport{q: e}
-		parent := r.root
-		if p, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
-			parent = p
-		}
-		if id := agentsession.SubsessionID(parent.id, callID); callID != "" && r.childIDs[id] {
+		if id != "" && r.childIDs[id] {
 			// The child's session continues at its leaf: the input is
 			// owed there from now, after the run that ended.
 			if w, err := r.reopenID(ctx, id); err == nil && w != nil && w.queued(ctx, e) == nil && len(w.inbox) > 0 {
 				h.session, h.entry = id, w.inbox[len(w.inbox)-1].entry
 			}
 		}
-		r.heldQueued[callID] = append(r.heldQueued[callID], h)
+		r.heldQueued[key] = append(r.heldQueued[key], h)
 		return
 	}
 	if e, ok := ev.(*agentturn.RunStart); ok {
-		parent := r.root
-		if p, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
-			parent = p
-		}
-		callID := ""
-		if call, ok := agenttool.CallFrom(ctx); ok {
-			callID = call.ID
+		parent, key, _, err := r.observedChild(ctx)
+		if err != nil {
+			return
 		}
 		cfg, hasCfg := agent.ConfigFromContext(ctx)
-		w, err := r.newChild(ctx, parent, callID, true, cfg.Name)
+		w, err := r.newChild(ctx, parent, key, true, cfg.Name)
 		if err != nil {
 			return
 		}
@@ -4196,13 +4339,13 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 			w.cfg = &cfg
 		}
 		r.runs[e.RunID] = w
-		if callID != "" {
+		if key.call != "" {
 			// The link is written at dispatch, which is now: the call
-			// is running.
-			_ = parent.link(ctx, w.id, callID)
+			// is running. A spawn's was written by StartChild.
+			_ = parent.link(ctx, w.id, key.call)
 		}
-		held := r.heldQueued[callID]
-		delete(r.heldQueued, callID)
+		held := r.heldQueued[key]
+		delete(r.heldQueued, key)
 		retry := agent.RetryFromContext(ctx)
 		for _, h := range held {
 			if h.entry != "" && h.session == w.id && !retry {
@@ -4269,8 +4412,9 @@ func (r *Recorder) Fold(ctx context.Context, f compact.Fold) error {
 // directory, which is the child's too: it runs in the same process and
 // the same directory, and a store that buckets sessions by directory
 // would otherwise file every child under none. With a call ID the
-// session's ID is derived from the parent's and the call's, so a
-// reader can compute it from the parent's link alone.
+// session's ID is derived from the parent's and the call's, and with a
+// spawn from the parent's and the spawn ID, so a reader can compute it
+// from the parent's link alone.
 //
 // A second run under the same call goes where its context says. One
 // marked with agent.ContextWithRetry starts a new root in the existing
@@ -4291,15 +4435,19 @@ func (r *Recorder) Fold(ctx context.Context, f compact.Fold) error {
 // session created for it is named so, by an info entry before anything
 // else, and one reopened keeps whatever name it has, so a name a
 // person set later stands.
-func (r *Recorder) newChild(ctx context.Context, parent *writer, callID string, live bool, name string) (*writer, error) {
-	h := agentsession.Header{ParentSession: parent.id, Harness: r.harness, SpawnedBy: callID, CWD: parent.cwd, Media: parent.media}
+func (r *Recorder) newChild(ctx context.Context, parent *writer, by childKey, live bool, name string) (*writer, error) {
+	h := agentsession.Header{ParentSession: parent.id, Harness: r.harness, SpawnedBy: by.call, CWD: parent.cwd, Media: parent.media}
 	if live {
 		// Written from its events, the child's queued reports among
 		// them, as the root is.
 		h.Records = append(append([]string(nil), agentsession.AllRecords...), agentsession.TypeQueued, agentsession.TypeResult)
 	}
-	if callID != "" {
-		h.ID = agentsession.SubsessionID(parent.id, callID)
+	switch {
+	case by.spawn != "":
+		h.SpawnedBy = by.spawn
+		h.ID = agentsession.SpawnedSessionID(parent.id, by.spawn)
+	case by.call != "":
+		h.ID = agentsession.SubsessionID(parent.id, by.call)
 	}
 	s, err := r.store.Create(ctx, h)
 	if errors.Is(err, agentsession.ErrSessionExists) {
@@ -6379,7 +6527,7 @@ func (w *writer) child(ctx context.Context, callID string, info agent.ChildInfo)
 	if running {
 		return nil
 	}
-	cw, err := r.newChild(ctx, w, callID, false, info.Agent)
+	cw, err := r.newChild(ctx, w, childKey{call: callID}, false, info.Agent)
 	if err != nil {
 		return err
 	}

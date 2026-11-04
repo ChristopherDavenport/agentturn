@@ -1,6 +1,6 @@
 # RFC 0001: Agent Loop
 
-Status: draft 0.4
+Status: draft 0.5
 Author: Christopher Davenport
 Discussion: to be opened against this repository, then proposed to the
 Open Responses community as a companion specification. The Go module at
@@ -62,7 +62,7 @@ executor, the session format begins where an entry is appended, and
 the loop is everything in between.
 
 Each draft describes the Go module as released with it; [Changes in
-draft 0.4](#changes-in-draft-04) lists what this draft added. Where the
+draft 0.5](#changes-in-draft-05) lists what this draft added. Where the
 module falls short of what is written here, or where a rule is
 contested, the shortfall is under open questions with the issue that
 tracks it.
@@ -1932,6 +1932,25 @@ session it creates and writes from events, so a reader takes a call
 with a `dispatch`, no `result` and no output as one whose tool had not
 returned when the record stopped.
 
+A host that starts a child agent itself, not through a model's
+function call, such as a pass that consolidates memory after a turn,
+MUST record it as a subsession of the session it serves. It writes the
+parent's `subsession` link with a `spawn_id` before the child's header,
+and the child's header names the parent in `parent_session` and the
+`spawn_id` in `spawned_by` (agentsession RFC 0001, `link`). A
+`spawn_id` MUST NOT repeat within the parent session. A recorder
+derives the child's ID over `["spawn","<parent>","<spawn_id>"]`, as
+that format's header table has it, so a reader computes it from the
+link alone, and refuses a `spawn_id` the session already carries, on
+any branch, writing nothing, as the format's `spawn_id_repeated` does.
+Its session is otherwise one the recorder creates for a child: it names
+the recorder's harness, takes the parent's media form, is named after
+the configuration it runs under, and is written from its run's events;
+a later run of the same child continues it at its leaf, and a child it
+starts through a tool is its own subsession. Verify, export and cost
+(agentsession's `DelegatedWork`) then reach its work as they reach a
+tool's child's (#294).
+
 A recorder that continues a path on which a run is open that it is
 not running owns that run and closes it before it writes anything
 else, as agentsession RFC 0001 has it: on resuming a session a crash
@@ -2009,7 +2028,7 @@ maps onto it as follows:
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`, which implements `agentturn.InputRequired` (`PendingCalls() []WaitingCall`), as `tools/a2a`'s does; `WithAskParent`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)`; a detached call: `tools/a2a.WithDetach(fn)`, `WithPollInterval`, `Answer(final)`, and `CalleeTrigger(callID, task)` (`TriggerCallee`) to deliver its result under; a steer of a working task: `front/a2a.WithDeliverWhileBusy()`, served by `Executor.RequestHandler`, `MaxSteers`, `Redeliverer` and `ContextWithRedeliverer` for a recorded one (`session.Recorder.Redeliver`), and `tools/a2a.Steer(ctx, client, info, parts…)` |
 | quarantine | `Agent.Quarantine`, `Agent.Quarantined`; `Quarantine(ctx, items…)` from a hook or a tool, `ErrNoQuarantine`, `ErrNotQuarantinable`; `QuarantinedOutput`, the placeholder; `QuarantineFromContext` → `QuarantineView` (`Has`, `Generation`, `Apply`) for a transform, which `compact` reads; `NewQuarantineSet` → `QuarantineSet` (`Add`, `Items`, `Has`, `Apply`), `ContextWithQuarantineSet` for a host carrying one through `Run` and `Continue`, and `WithQuarantineSet` for an `Agent`; `QuarantineSet.Bind` and `Merge` for a front keeping a conversation's set across tasks or requests, as `front/a2a` does per context and `front/responses` under `WithQuarantineScope` (`QuarantineScope`, `MaxQuarantineScopes` per principal); `session` `Recorder.Attach` seeds it from the record's `omit` |
-| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Queue`, `Deliver`, `Redeliver`, `Control` (`RecordedControl`, for a front), `Requeue`, `Rebase`; `session.MoveTo` for a rewind; `WithInstructionsParts`, `WithMedia`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`, read with `Recorder.ReadOptions`, `session.WithBlobs` resolving a sidecar session's media (`session.ErrNoBlobReader` without one); the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
+| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `StartChild` for a child the host starts, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Queue`, `Deliver`, `Redeliver`, `Control` (`RecordedControl`, for a front), `Requeue`, `Rebase`; `session.MoveTo` for a rewind; `WithInstructionsParts`, `WithMedia`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`, read with `Recorder.ReadOptions`, `session.WithBlobs` resolving a sidecar session's media (`session.ErrNoBlobReader` without one); the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
 
 Every error the package returns to its caller, sentinel or wrapped,
 begins with `agentturn:`; the error texts a call's output carries,
@@ -2232,6 +2251,19 @@ The scenario corpus is versioned with this document. A scenario is
 added when a rule is, and changes only when the rule it pins does, in
 the same draft; a scenario that a conforming loop fails is a defect in
 the scenario, fixed without a change of rule.
+
+## Changes in draft 0.5
+
+Draft 0.5 adds the rule below to draft 0.4, marked as Versioning has
+it.
+
+- **The record.** A host that starts a child agent itself, not through
+  a model's function call, records it as a subsession linked by a
+  `spawn_id`: the link before the child's header, the header's
+  `parent_session` and `spawned_by`, the child's ID derived over
+  `["spawn",…]`, and a repeated `spawn_id` refused (agentsession RFC
+  0001 0.19, #294); breaking for a host that starts such a child and
+  does not record it.
 
 ## Changes in draft 0.4
 

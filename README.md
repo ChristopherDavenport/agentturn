@@ -455,6 +455,22 @@ the child's rather than the parent's (`session.SessionIDFromContext`).
 A second run under one call continues the child's session at its leaf;
 `agent.ContextWithRetry` says the other thing.
 
+A child the host starts itself, not through a model's call, such as a
+memory pass after a turn, is recorded the same way under a `spawn_id`:
+`StartChild` writes the parent's link and returns the context to prompt
+the child with, observed by `rec.Observe`, so verify, export and cost
+reach its work.
+
+```go
+ctx, err := rec.StartChild(ctx, agentsession.NewSpawnID())
+child := agentturn.New(cfg)
+defer child.Subscribe(func(ctx context.Context, ev agentturn.Event) error {
+	rec.Observe(ctx, ev)
+	return nil
+})()
+_, err = child.Prompt(agent.ContextWithConfig(ctx, cfg), input)
+```
+
 ## Design
 
 The contract is `docs/rfcs/0001-agent-loop.md`, the plan behind it

@@ -2333,7 +2333,7 @@ func TestEnvSurvivesACompaction(t *testing.T) {
 
 			var w *writer
 			if tc.child {
-				if w, err = rec.newChild(ctx, rec.root, callID, false, ""); err != nil {
+				if w, err = rec.newChild(ctx, rec.root, childKey{call: callID}, false, ""); err != nil {
 					t.Fatal(err)
 				}
 			} else {
