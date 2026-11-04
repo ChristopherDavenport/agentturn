@@ -1227,6 +1227,11 @@ type inboxItem struct {
 // context.
 type childKey struct {
 	call, spawn, id string
+	// fresh marks a run the host's spawned child's hook or tool started
+	// with the child's context and no call: the recorder links it from
+	// the session it hangs from by a spawn ID of its own at its run's
+	// start, as a host's child is linked, so it is counted.
+	fresh bool
 }
 
 // spawnRef is what the context [Recorder.StartChild] or
@@ -4142,9 +4147,11 @@ func (r *Recorder) ChildContext(ctx context.Context, callID string) context.Cont
 // child the host's child runs through a tool is that child's
 // subsession, as any is, and an agent a hook or tool of the child
 // starts with its context and no call is not the spawn again, which it
-// would interleave with, but a child of the child's session with no
-// anchor: such an agent is linked by StartChild made with that
-// context, which links it from the child's session. The writer of each
+// would interleave with, but a child of the child's session, which the
+// recorder links from there by a spawn ID of its own when its run
+// starts, a fresh one for each run, so it is counted as delegated
+// work; a host that wants to continue it starts it with StartChild
+// from that context instead. The writer of each
 // of the child's runs is released at the run's end.
 //
 // A run started inside the parent's run, from its hook or its tool,
@@ -4275,9 +4282,29 @@ func (r *Recorder) spawnContext(ctx context.Context, w *writer, ref spawnRef) co
 	return ContextWithSessionID(context.WithValue(ctx, spawnKey{}, ref), ref.child)
 }
 
+// unionQuarantine returns a set holding every item of a and of b, by
+// identity, either nil.
+func unionQuarantine(a, b *agentturn.QuarantineSet) *agentturn.QuarantineSet {
+	var items openresponses.Items
+	for _, s := range []*agentturn.QuarantineSet{a, b} {
+		if s != nil {
+			items = append(items, s.Items()...)
+		}
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	set, err := agentturn.NewQuarantineSet(items...)
+	if err != nil {
+		return nil
+	}
+	return set
+}
+
 // recordedQuarantine returns what the record of w's session says is
-// quarantined at its leaf. A writer the recorder keeps, the root's or
-// a run's, holds it, naming the agent's own items. One reopened for a
+// quarantined at its leaf. A writer the recorder keeps for the
+// session, the root's or a live run's, found by the session's ID,
+// holds it, naming the agent's own items. One reopened for a
 // child whose run ended knows only the calls on its path: the set the
 // child's writer held when it was released is taken, naming the
 // child's agent's items, and for a child this recorder did not write,
@@ -4285,16 +4312,33 @@ func (r *Recorder) spawnContext(ctx context.Context, w *writer, ref spawnRef) co
 // after, whose set names the items as the record holds them, which an
 // agent seeded from the record holds too. The caller holds r.mu.
 func (r *Recorder) recordedQuarantine(ctx context.Context, w *writer) *agentturn.QuarantineSet {
-	if w == r.root {
-		return w.quarantineSet()
+	// The writer is found by its session: a spawn made with the
+	// context of a run that ended is linked through a writer reopened
+	// for it while the session's next run may be live, whose writer
+	// holds what that run has quarantined since. A live writer seeded
+	// from the store names what earlier runs quarantined as the store
+	// holds it, and the set an earlier writer left at its release names
+	// the same items as that run's agent held them, so both are taken:
+	// a quarantine names an item by identity.
+	if w.id == r.root.id {
+		return r.root.quarantineSet()
 	}
-	for _, live := range r.runs {
-		if live == w {
-			return w.quarantineSet()
+	var live *agentturn.QuarantineSet
+	found := false
+	for _, lw := range r.runs {
+		if lw.id == w.id {
+			live, found = lw.quarantineSet(), true
+			break
 		}
 	}
-	if set, ok := r.quarantined[w.id]; ok {
-		return set
+	released, wasReleased := r.quarantined[w.id]
+	switch {
+	case found && wasReleased:
+		return unionQuarantine(live, released)
+	case found:
+		return live
+	case wasReleased:
+		return released
 	}
 	s, err := r.store.Open(context.WithoutCancel(ctx), w.id)
 	if err != nil {
@@ -4346,9 +4390,9 @@ func validSpawnID(id string) bool {
 // spawn on its context too, under a call of its own, and an agent a
 // hook of the spawned child starts with the hook's context carries it
 // under the spawned child's run, beside which it would interleave. The
-// latter is a child with no anchor under the spawned child's session,
-// as any run with no call is. Its parent is the session the spawn's
-// link is in. A call child's parent is the session
+// latter is a child of the spawned child's session, which the recorder
+// links at its run's start by a spawn ID of its own (childKey.fresh).
+// A spawn's parent is the session the spawn's link is in. A call child's parent is the session
 // of the run on ctx: the one being written, or, for a run that ended,
 // the session the recorder remembers for it, reopened at its leaf, so
 // a call child prompted again after its parent's run ended continues
@@ -4356,7 +4400,8 @@ func validSpawnID(id string) bool {
 func (r *Recorder) observedChild(ctx context.Context) (*writer, childKey, string, error) {
 	runID := agentturn.RunIDFromContext(ctx)
 	callID := callOnContext(ctx)
-	if sp, ok := ctx.Value(spawnKey{}).(spawnRef); ok && sp.call == callID && r.runSession(runID) != sp.child {
+	sp, hasSpawn := ctx.Value(spawnKey{}).(spawnRef)
+	if hasSpawn && sp.call == callID && r.runSession(runID) != sp.child {
 		p, err := r.spawnParent(ctx, sp.parent)
 		if err != nil {
 			return nil, childKey{}, "", err
@@ -4375,6 +4420,11 @@ func (r *Recorder) observedChild(ctx context.Context) (*writer, childKey, string
 				parent = p
 			}
 		}
+	}
+	if hasSpawn && sp.call == callID {
+		// Under the spawned child's own run: a child of it the host
+		// started, which no link would otherwise name.
+		return parent, childKey{fresh: true}, "", nil
 	}
 	if callID == "" {
 		return parent, childKey{}, "", nil
@@ -4541,15 +4591,27 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 		if err != nil {
 			return
 		}
+		by := key
+		if key.fresh {
+			// The link, with a spawn ID of the recorder's, is written
+			// before the child's header, as StartChild writes one; a
+			// link is no part of the context, so the parent's request
+			// hashes stand.
+			spawnID := agentsession.NewSpawnID()
+			by = childKey{spawn: spawnID, id: agentsession.SpawnedSessionID(parent.id, spawnID)}
+			if _, err := parent.append(context.WithoutCancel(ctx), agentsession.NewSpawnLink(by.id, spawnID)); err != nil {
+				return
+			}
+		}
 		cfg, hasCfg := agent.ConfigFromContext(ctx)
-		w, err := r.newChild(ctx, parent, key, true, cfg.Name)
+		w, err := r.newChild(ctx, parent, by, true, cfg.Name)
 		if err != nil {
 			return
 		}
 		if hasCfg {
 			w.cfg = &cfg
 		}
-		w.spawned = key.spawn != ""
+		w.spawned = by.spawn != ""
 		r.runs[e.RunID] = w
 		if key.call != "" {
 			// The link is written at dispatch, which is now: the call

@@ -31,9 +31,12 @@ versions may break the API.
   refused with `session.ErrNoSpawn`. Made outside the parent's run, or
   after a call child's run ended, the context carries what the
   parent's record quarantined, so a child seeded with the parent's
-  items leaves them out. An agent a hook of the child starts with its
-  context and no call is a child of the child's session with no
-  anchor, not the spawn again. (#294)
+  items leaves them out: for a session with a live run, what that
+  run's writer holds beside what its earlier run's left. An agent a
+  hook of the child starts with its context and no call is not the
+  spawn again but a child of the child's session, which the recorder
+  links there by a spawn ID of its own at its run's start, so
+  `DelegatedWork` and the export count it. (#294)
 - Fixed: a call child a child session's agent started, prompted again
   through `agent.WithSpawn` after that child's run ended, continues its
   own session under that child's, where it was filed under the
