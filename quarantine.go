@@ -428,10 +428,11 @@ func Quarantine(ctx context.Context, items ...openresponses.Item) error {
 // event is delivered under the values of the context the agent's last
 // run was started with, so a subscriber that files it by the context,
 // a recorder for a child the host started, finds that run's session.
-// An error a subscriber returns for the event is returned when it is
-// delivered before Quarantine returns; one delivered after, because
-// another goroutine was delivering, is not, and the event may then
-// follow the return.
+// Called while an event is being delivered, from a subscriber or
+// another goroutine, it only owes the event, which that delivery
+// reports before it lets the barrier go, right after the event it is
+// delivering; otherwise the event is delivered before Quarantine
+// returns, and an error a subscriber returns for it is returned.
 func (a *Agent) Quarantine(items ...openresponses.Item) error {
 	a.mu.Lock()
 	gen := a.quarantine.generation()
@@ -446,26 +447,54 @@ func (a *Agent) Quarantine(items ...openresponses.Item) error {
 		added := slices.DeleteFunc(slices.Clone(items), func(item openresponses.Item) bool { return item == nil })
 		a.quarantineOwed = append(a.quarantineOwed, &QuarantineAdded{Items: added, Quarantined: a.quarantine.list()})
 	}
-	ctx := a.lastCtx
 	a.mu.Unlock()
 	if !report {
 		return nil
 	}
-	if ctx == nil {
-		ctx = context.Background()
+	// The event is owed before the barrier is tried, so whoever holds
+	// it, a delivery under way, the one calling this from a subscriber
+	// among them, finds it when it lets the barrier go (unlockEmit).
+	if !a.emitMu.TryLock() {
+		return nil
 	}
-	if a.emitMu.TryLock() {
-		defer a.emitMu.Unlock()
-		return a.flushQuarantine(ctx)
+	err := a.flushQuarantine(a.eventContext())
+	if uerr := a.unlockEmit(); err == nil {
+		err = uerr
 	}
-	// A delivery is under way, perhaps the one calling this: it reports
-	// the event after its own, and this does so otherwise.
-	go func() {
-		a.emitMu.Lock()
-		defer a.emitMu.Unlock()
-		_ = a.flushQuarantine(ctx)
-	}()
-	return nil
+	return err
+}
+
+// eventContext is the context an event that belongs to no run is
+// delivered under: the values of the last run's context, lastCtx.
+func (a *Agent) eventContext() context.Context {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.lastCtx != nil {
+		return a.lastCtx
+	}
+	return context.Background()
+}
+
+// unlockEmit lets the delivery barrier go and delivers the
+// [QuarantineAdded] events owed since its holder last flushed them:
+// one Agent.Quarantine owed while the barrier was held, which it could
+// not take. It takes the barrier again only when it is free; when it is
+// not, the holder runs this as it lets go, so no owed event is left
+// behind. The caller holds a.emitMu.
+func (a *Agent) unlockEmit() error {
+	for {
+		a.emitMu.Unlock()
+		a.mu.Lock()
+		owed := len(a.quarantineOwed) > 0
+		a.mu.Unlock()
+		if !owed || !a.emitMu.TryLock() {
+			return nil
+		}
+		if err := a.flushQuarantine(a.eventContext()); err != nil {
+			a.emitMu.Unlock()
+			return err
+		}
+	}
 }
 
 // flushQuarantine delivers the [QuarantineAdded] events owed. The

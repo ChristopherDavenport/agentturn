@@ -1232,9 +1232,13 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, notes []
 // outlived its run or sent to a new subscriber, and neither from a
 // subscriber, so a subscriber never waits on a barrier it is itself
 // holding: steering from inside an event queues the item and returns.
-func (a *Agent) deliver(ctx context.Context, ev Event) error {
+func (a *Agent) deliver(ctx context.Context, ev Event) (err error) {
 	a.emitMu.Lock()
-	defer a.emitMu.Unlock()
+	defer func() {
+		if ferr := a.unlockEmit(); err == nil {
+			err = ferr
+		}
+	}()
 	if err := a.drainQueued(ctx); err != nil {
 		return err
 	}
@@ -1385,7 +1389,7 @@ func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe fu
 // subscriber, which holds the barrier already.
 func (a *Agent) flushReplay(id int, fn func(context.Context, Event) error) {
 	a.emitMu.Lock()
-	defer a.emitMu.Unlock()
+	defer func() { _ = a.unlockEmit() }()
 	a.mu.Lock()
 	qs := a.replays[id]
 	delete(a.replays, id)
