@@ -304,3 +304,60 @@ func TestAQuarantinedCallTakesOnlyItsOwnOutput(t *testing.T) {
 		t.Errorf("sent %d calls, want the first alone", calls)
 	}
 }
+
+// TestQuarantineAddedDelivery pins RFC 0001's delivery rules for a
+// quarantine the host makes: during a run it is carried by the run's
+// events, its run_end among them, and raises no quarantine_added; from
+// a run_end subscriber it is reported after run_end, before Prompt
+// returns; while the agent is idle it is reported before Quarantine
+// returns, under the context of the agent's last run.
+func TestQuarantineAddedDelivery(t *testing.T) {
+	type marker struct{}
+	ctx := context.WithValue(context.Background(), marker{}, "the prompt's")
+	first := openresponses.UserText("one")
+	second := openresponses.UserText("two")
+	third := openresponses.UserText("three")
+	var a *Agent
+	var seen []string
+	var added []*QuarantineAdded
+	var addedCtx []any
+	var end *RunEnd
+	stop := func(context.Context, TurnInfo) (bool, error) {
+		return true, a.Quarantine(first)
+	}
+	a = New(Config{Model: &caller{}, ShouldStopAfterTurn: stop})
+	a.Subscribe(func(evCtx context.Context, ev Event) error {
+		seen = append(seen, ev.EventType())
+		switch e := ev.(type) {
+		case *RunEnd:
+			end = e
+			return a.Quarantine(second)
+		case *QuarantineAdded:
+			added = append(added, e)
+			addedCtx = append(addedCtx, evCtx.Value(marker{}))
+		}
+		return nil
+	})
+	if _, err := a.Prompt(ctx, openresponses.UserText("hi")); err != nil {
+		t.Fatal(err)
+	}
+	if end == nil || len(end.Quarantined) != 1 || end.Quarantined[0] != first {
+		t.Fatalf("run_end carries %v, want the quarantine made during the run", end)
+	}
+	if len(added) != 1 || len(added[0].Items) != 1 || added[0].Items[0] != second || seen[len(seen)-1] != EventQuarantineAdded || seen[len(seen)-2] != EventRunEnd {
+		t.Fatalf("events %v, added %v: want the run_end subscriber's quarantine reported after run_end, before Prompt returned", seen, added)
+	}
+	if err := a.Quarantine(third); err != nil {
+		t.Fatal(err)
+	}
+	if len(added) != 2 || added[1].Items[0] != third || len(added[1].Quarantined) != 3 {
+		t.Fatalf("added %v, want the idle quarantine reported before Quarantine returned, the whole set beside it", added)
+	}
+	if addedCtx[1] != "the prompt's" {
+		t.Errorf("the idle quarantine was delivered under %v, want the last run's context", addedCtx[1])
+	}
+	// One already held raises nothing.
+	if err := a.Quarantine(third); err != nil || len(added) != 2 {
+		t.Errorf("a repeated quarantine: err %v, added %d", err, len(added))
+	}
+}

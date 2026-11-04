@@ -424,8 +424,14 @@ func Quarantine(ctx context.Context, items ...openresponses.Item) error {
 // it is reported to the subscribers as [QuarantineAdded], at once, or,
 // from inside a delivery, right after the event being delivered, so a
 // recorder records it before the agent runs again; while a run is
-// active the run's next turn_start, or its run_end, carries it. An
-// error a subscriber returns for the event is returned.
+// active the run's next turn_start, or its run_end, carries it. The
+// event is delivered under the values of the context the agent's last
+// run was started with, so a subscriber that files it by the context,
+// a recorder for a child the host started, finds that run's session.
+// An error a subscriber returns for the event is returned when it is
+// delivered before Quarantine returns; one delivered after, because
+// another goroutine was delivering, is not, and the event may then
+// follow the return.
 func (a *Agent) Quarantine(items ...openresponses.Item) error {
 	a.mu.Lock()
 	gen := a.quarantine.generation()
@@ -440,20 +446,24 @@ func (a *Agent) Quarantine(items ...openresponses.Item) error {
 		added := slices.DeleteFunc(slices.Clone(items), func(item openresponses.Item) bool { return item == nil })
 		a.quarantineOwed = append(a.quarantineOwed, &QuarantineAdded{Items: added, Quarantined: a.quarantine.list()})
 	}
+	ctx := a.lastCtx
 	a.mu.Unlock()
 	if !report {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if a.emitMu.TryLock() {
 		defer a.emitMu.Unlock()
-		return a.flushQuarantine(context.Background())
+		return a.flushQuarantine(ctx)
 	}
 	// A delivery is under way, perhaps the one calling this: it reports
 	// the event after its own, and this does so otherwise.
 	go func() {
 		a.emitMu.Lock()
 		defer a.emitMu.Unlock()
-		_ = a.flushQuarantine(context.Background())
+		_ = a.flushQuarantine(ctx)
 	}()
 	return nil
 }

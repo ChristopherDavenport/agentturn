@@ -72,8 +72,10 @@ versions may break the API.
   recorder writes it after their entries as a `config` carrying only
   the `omit` it adds. `Agent.Quarantine` made while no run is active,
   or after its run's end was delivered, raises the new
-  `QuarantineAdded` event at once, which the recorder writes the same
-  way, in a child's session for an idle child too, so a resume before
+  `QuarantineAdded` event at once, under the values of the context the
+  agent's last run was started with, which the recorder writes the same
+  way, in a child's session for an idle child too, one `StartChild`
+  started among them, so a resume before
   the agent runs again does not send the item. `front/control` writes
   `quarantine_added` as its type alone and puts no quarantine on the
   wire. (#294)

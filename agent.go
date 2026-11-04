@@ -137,6 +137,12 @@ type Agent struct {
 	// quarantine made between it and the run's return is reported
 	// ([QuarantineAdded]) rather than carried by no event.
 	runEnded bool
+	// lastCtx is the values of the context the last run was started
+	// with, without its cancellation: the context an event that
+	// belongs to no run, [QuarantineAdded], is delivered under, so a
+	// subscriber that tells sessions apart by the context, a recorder
+	// filing a host's child, finds the run's.
+	lastCtx context.Context
 	// quarantineOwed are the [QuarantineAdded] events Agent.Quarantine
 	// raised that have not been delivered yet.
 	quarantineOwed []*QuarantineAdded
@@ -1158,6 +1164,7 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, notes []
 	runCtx, runCancel := linkRunContext(ctx)
 	ctx, cancel := context.WithCancelCause(ctx)
 	a.running = true
+	a.lastCtx = context.WithoutCancel(ctx)
 	a.closing = false
 	// The run's ID is known from here, so an item queued before its
 	// run_start names it rather than the run before.

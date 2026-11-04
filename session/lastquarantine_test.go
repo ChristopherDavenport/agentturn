@@ -279,3 +279,38 @@ func TestAChildsQuarantineBetweenRunsIsRecorded(t *testing.T) {
 		t.Errorf("the child's omit in force = %+v, want the fetch output sent as the placeholder", cx.Settings.Omit)
 	}
 }
+
+// TestAnIdleHostChildsQuarantineIsRecorded pins R6-2: a child the host
+// started, observed as the README shows, quarantined while idle, is
+// reported under the context of its last run, which names the spawn, so
+// the recorder writes it in the child's session.
+func TestAnIdleHostChildsQuarantineIsRecorded(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spawnID := agentsession.NewSpawnID()
+	cctx, err := rec.StartChild(ctx, spawnID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetch := agenttool.New("fetch", "fetches a page", func(context.Context, struct{}) (string, error) { return lastInjected, nil })
+	cfg := agentturn.Config{Model: fetchThenAnswer{}, ModelName: "m", Tools: []agenttool.Tool{fetch}}
+	child := runSpawned(t, rec, cctx, cfg, "fetch the page")
+	if err := child.Quarantine(fetchOutput(child.State().Transcript)); err != nil {
+		t.Fatal(err)
+	}
+	cs, err := store.Open(ctx, agentsession.SpawnedSessionID(s.ID(), spawnID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cx, err := cs.Context()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o := cx.Settings.Omit.Outputs; o == nil || len(o.Items) != 1 {
+		t.Errorf("the host's child's omit in force = %+v, want the fetch output sent as the placeholder", cx.Settings.Omit)
+	}
+}
