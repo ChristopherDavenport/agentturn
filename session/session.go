@@ -1673,7 +1673,12 @@ func WithEnv(fn func(context.Context) (*agentsession.EnvEntry, error)) Option {
 // the string as it does without this option, since the record must
 // describe what the model was sent and must not fail the run over how
 // a product composed it; so are parts the format refuses, one with no
-// ID or two sharing one. The omitted parts stay in force until a later
+// ID, two sharing one, or one whose hash is not that of its text. A
+// part carrying its text and also a keep, or a hash of that text, which
+// only a delta carries, is recorded with the keep and the hash cleared,
+// its source and trust kept. The recorder has no log of its own: a
+// fallback shows in the record as the string, and the parts it was
+// given are not written. The omitted parts stay in force until a later
 // config changes them, so they are written on a config entry only
 // when they differ from the list in force, on an entry of their own
 // when the settings did not move, and as an empty list when nothing is
@@ -5415,9 +5420,11 @@ func (w *writer) forgetLeftOut() {
 
 // instructionParts asks the host for the parts of req's instructions
 // and what it left out, and returns them when the format can hold them
-// and the parts join to the instructions the request carries. Parts
-// that do not join, or that the format refuses, a part with no ID or
-// two with one, are dropped, and the omitted parts with them, since
+// and the parts join to the instructions the request carries. A part's
+// keep, and a hash equal to its text's, are cleared. Parts that do not
+// join, or that the format refuses, a part with no ID, two with one, or
+// one whose hash is not its text's, are dropped, and the omitted parts
+// with them, since
 // they describe a composition that is not the one sent or cannot be
 // written; an omitted part with no ID is dropped alone. The record
 // falls back to the string rather than fail the run. The host is
@@ -5432,13 +5439,25 @@ func (w *writer) instructionParts(ctx context.Context, req openresponses.Request
 		return nil, nil
 	}
 	seen := make(map[string]bool, len(parts))
-	for _, p := range parts {
-		// A part named by a hash or a keep is a delta's, which the
-		// recorder writes and the host never names.
-		if p.ID == "" || seen[p.ID] || p.Hash != "" || p.Keep != 0 {
+	parts = slices.Clone(parts)
+	for i := range parts {
+		p := &parts[i]
+		if p.ID == "" || seen[p.ID] {
 			return nil, nil
 		}
 		seen[p.ID] = true
+		// A hash and a keep are a delta's, which the recorder writes:
+		// on a part carrying its text a keep means nothing and a hash
+		// of that text says nothing more, so both are cleared and the
+		// part, with its source and trust, is kept. A hash of another
+		// text contradicts the part, which describes no composition.
+		p.Keep = 0
+		if p.Hash != "" {
+			if p.Hash != agentsession.HashText(p.Text) {
+				return nil, nil
+			}
+			p.Hash = ""
+		}
 	}
 	var named []agentsession.OmittedPart
 	for _, o := range omitted {

@@ -32,9 +32,11 @@ versions may break the API.
   v0.0.33, so the sessions it writes are format 0.20 and a reader of
   0.18 or 0.19 refuses them. agentsession's `ConfigFromRequestParts`
   now refuses a part carrying a `Hash` or a `Keep`, which it used to
-  drop; the recorder falls back to the instructions string for parts
-  a host names in that form, as it does for parts that do not join,
-  rather than fail the run. (#294)
+  drop. The recorder clears a host part's `Keep`, and a `Hash` equal
+  to its text's, and records the parts with their sources and trust as
+  before; a part whose hash is not its text's falls back to the
+  instructions string, as parts that do not join do, rather than fail
+  the run. (#294)
 
 ## v0.0.35 - 2026-11-02
 
