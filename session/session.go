@@ -4587,33 +4587,41 @@ func (r *Recorder) ChildRecord(ctx context.Context, call agenttool.Call, cfg age
 	if call.ID == "" || call.IdempotencyKey == "" {
 		return nil, nil
 	}
+	// The recorder's lock is held only to read and write its own
+	// state: the store's reads and writes and the host's code, the
+	// child's ToolProvider and its tools' Replay, run without it, so
+	// neither stalls the recording of every other event nor deadlocks
+	// on a host that asks the recorder something.
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	parent := r.root
 	if p, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
 		parent = p
 	}
+	parentID, children := parent.id, r.children
+	r.mu.Unlock()
 	// What is read and written here is the record of work that may
 	// have happened, so a cancel does not cut it short.
 	bg := context.WithoutCancel(ctx)
-	ps, err := r.store.Open(bg, parent.id)
+	ps, err := r.store.Open(bg, parentID)
 	if err != nil {
-		return nil, fmt.Errorf("session: open %s for the call's child: %w", parent.id, err)
+		return nil, fmt.Errorf("session: open %s for the call's child: %w", parentID, err)
 	}
 	childID, repeat := linkedUnder(ps.Path(ps.Leaf()), call.ID, call.IdempotencyKey)
 	switch {
 	case !repeat:
 		return nil, nil
-	case !r.children:
+	case !children:
 		return nil, fmt.Errorf("%w (the recorder keeps no child sessions)", agent.ErrNoRecord)
 	case childID == "":
-		return nil, fmt.Errorf("%w (session %s links no child to call %s after its hand-off)", agent.ErrNoRecord, parent.id, call.ID)
+		return nil, fmt.Errorf("%w (session %s links no child to call %s after its hand-off)", agent.ErrNoRecord, parentID, call.ID)
 	}
 	cs, err := r.store.Open(bg, childID)
 	if err != nil {
 		return nil, fmt.Errorf("session: open the child session %s: %w", childID, err)
 	}
+	r.mu.Lock()
 	r.addChild(cs.ID())
+	r.mu.Unlock()
 	if cs.Leaf() == "" {
 		return nil, nil
 	}
@@ -4642,9 +4650,20 @@ func (r *Recorder) ChildRecord(ctx context.Context, call agenttool.Call, cfg age
 		return nil, err
 	}
 	out := &agent.Record{RunID: last.RunID(), Pending: pending}
-	if out.Queued, err = r.handBack(ctx, cs, opts); err != nil {
+	var held []*inboxItem
+	if out.Queued, held, err = handBack(cs, opts); err != nil {
 		return nil, err
 	}
+	r.mu.Lock()
+	if len(held) == 0 {
+		delete(r.handedBack, cs.ID())
+	} else {
+		if r.handedBack == nil {
+			r.handedBack = map[string][]*inboxItem{}
+		}
+		r.handedBack[cs.ID()] = held
+	}
+	r.mu.Unlock()
 	if len(pending) == 0 && len(out.Queued) == 0 {
 		items, err := runItems(cs, last, opts)
 		if err != nil {
@@ -4667,17 +4686,16 @@ func (r *Recorder) ChildRecord(ctx context.Context, call agenttool.Call, cfg age
 
 // handBack returns the inputs the child session cs owes at its leaf,
 // as the continued child is handed them, in the order they were
-// accepted, and remembers them for the child's reports of them, which
-// then write nothing: the path holds each, closed and queued again by
-// the end that closed the cut run. The caller holds r.mu.
-func (r *Recorder) handBack(ctx context.Context, cs *agentsession.Session, opts []ReadOption) ([]agent.QueuedInput, error) {
+// accepted, and the inbox items the recorder remembers them by, so the
+// child's reports of them write nothing: the path holds each, closed
+// and queued again by the end that closed the cut run.
+func handBack(cs *agentsession.Session, opts []ReadOption) ([]agent.QueuedInput, []*inboxItem, error) {
 	owed, err := cs.PendingQueued(cs.Leaf())
 	if err != nil {
-		return nil, fmt.Errorf("session: queued inputs of %s: %w", cs.ID(), err)
+		return nil, nil, fmt.Errorf("session: queued inputs of %s: %w", cs.ID(), err)
 	}
-	delete(r.handedBack, cs.ID())
 	if len(owed) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	// Resolved as Requeue resolves the root's, so a sidecar session's
 	// media comes back as the agent holds it.
@@ -4687,7 +4705,7 @@ func (r *Recorder) handBack(ctx context.Context, cs *agentsession.Session, opts 
 	for _, q := range owed {
 		item, err := m.item(cs.ID(), q.Item)
 		if err != nil {
-			return nil, fmt.Errorf("session: queued input %s: %w", q.ID, err)
+			return nil, nil, fmt.Errorf("session: queued input %s: %w", q.ID, err)
 		}
 		in := &inboxItem{item: item, mode: q.Mode, trigger: q.Trigger, entry: q.ID, deliver: q.Deliver, held: true, awaiting: true}
 		in.hidden, in.prov = queuedMarks(q)
@@ -4702,11 +4720,7 @@ func (r *Recorder) handBack(ctx context.Context, cs *agentsession.Session, opts 
 		}
 		out = append(out, agent.QueuedInput{Item: in.marked(), Mode: mode, Deliver: in.deliver, Trigger: trigger})
 	}
-	if r.handedBack == nil {
-		r.handedBack = map[string][]*inboxItem{}
-	}
-	r.handedBack[cs.ID()] = held
-	return out, nil
+	return out, held, nil
 }
 
 // takeHandedBack returns the input handed back to the child session id

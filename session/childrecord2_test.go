@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ChristopherDavenport/agentsession"
 	"github.com/ChristopherDavenport/agenttool"
@@ -394,50 +395,7 @@ func TestARecordedEndIsTheLastRunsOwn(t *testing.T) {
 	}{{name: "cut before its first item", cut: true}, {name: "ended"}} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			store := &cutStore{Store: agentsession.NewMemoryStore()}
-			rec, s, err := Start(ctx, store, agentsession.Header{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			// The parent's call, handed off under K, its child linked,
-			// and handed off again under K: the call run again.
-			callID := "call_c"
-			target, err := store.Append(ctx, s.ID(), &agentsession.ItemEntry{Item: &openresponses.FunctionCall{CallID: callID, Name: "child", Arguments: `{"input":"one"}`}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := store.Append(ctx, s.ID(), agentsession.NewDispatch(callID, target).WithIdempotencyKey("K")); err != nil {
-				t.Fatal(err)
-			}
-			childID := agentsession.SubsessionID(s.ID(), callID)
-			crec, _, err := Start(ctx, store, agentsession.Header{ID: childID, ParentSession: s.ID(), SpawnedBy: callID})
-			if err != nil {
-				t.Fatal(err)
-			}
-			child := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"})
-			unsub := crec.Attach(child)
-			if _, err := child.Prompt(ctx, openresponses.UserText("one")); err != nil {
-				t.Fatal(err)
-			}
-			if tc.cut {
-				// The process dies once the second run's start is
-				// written.
-				child.Subscribe(func(_ context.Context, ev agentturn.Event) error {
-					if _, ok := ev.(*agentturn.RunStart); ok {
-						store.cut.Store(true)
-					}
-					return nil
-				})
-			}
-			_, _ = child.Prompt(ctx, openresponses.UserText("two"))
-			unsub()
-			store.cut.Store(false)
-			for _, e := range []agentsession.Entry{agentsession.NewSubsessionLink(childID, callID), agentsession.NewDispatch(callID, target).WithIdempotencyKey("K")} {
-				if _, err := store.Append(ctx, s.ID(), e); err != nil {
-					t.Fatal(err)
-				}
-			}
-
+			rec, callID := recordedChild(t, tc.cut)
 			got, err := rec.ChildRecord(ctx, agenttool.Call{ID: callID, IdempotencyKey: "K"}, agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"})
 			if err != nil {
 				t.Fatal(err)
@@ -465,5 +423,81 @@ func TestARecordedEndIsTheLastRunsOwn(t *testing.T) {
 				t.Errorf("the end's items read %q, want the last run's own: its prompt and its answer", texts)
 			}
 		})
+	}
+}
+
+// recordedChild records a parent's call call_c handed off under the
+// key K, its child linked, and handed off again under K, the call run
+// again; the child, an echo agent, prompted "one" and then "two", the
+// second run cut once its start is written when cut is set. It returns
+// the parent's recorder and the call's ID.
+func recordedChild(t *testing.T, cut bool) (*Recorder, string) {
+	t.Helper()
+	ctx := context.Background()
+	store := &cutStore{Store: agentsession.NewMemoryStore()}
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	callID := "call_c"
+	target, err := store.Append(ctx, s.ID(), &agentsession.ItemEntry{Item: &openresponses.FunctionCall{CallID: callID, Name: "child", Arguments: `{"input":"one"}`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append(ctx, s.ID(), agentsession.NewDispatch(callID, target).WithIdempotencyKey("K")); err != nil {
+		t.Fatal(err)
+	}
+	childID := agentsession.SubsessionID(s.ID(), callID)
+	crec, _, err := Start(ctx, store, agentsession.Header{ID: childID, ParentSession: s.ID(), SpawnedBy: callID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"})
+	unsub := crec.Attach(child)
+	if _, err := child.Prompt(ctx, openresponses.UserText("one")); err != nil {
+		t.Fatal(err)
+	}
+	if cut {
+		child.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+			if _, ok := ev.(*agentturn.RunStart); ok {
+				store.cut.Store(true)
+			}
+			return nil
+		})
+	}
+	_, _ = child.Prompt(ctx, openresponses.UserText("two"))
+	unsub()
+	store.cut.Store(false)
+	for _, e := range []agentsession.Entry{agentsession.NewSubsessionLink(childID, callID), agentsession.NewDispatch(callID, target).WithIdempotencyKey("K")} {
+		if _, err := store.Append(ctx, s.ID(), e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return rec, callID
+}
+
+// TestChildRecordCallsTheHostOutsideTheRecordersLock is l6-3e's L2:
+// ChildRecord reads the store and calls the host's code, the child's
+// ToolProvider among it, without holding the recorder's lock, so a
+// provider that asks the recorder something does not deadlock it.
+func TestChildRecordCallsTheHostOutsideTheRecordersLock(t *testing.T) {
+	ctx := context.Background()
+	rec, callID := recordedChild(t, true)
+	cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", ToolProvider: func(ctx context.Context) []agenttool.Tool {
+		_ = rec.SessionOf(ctx)
+		return nil
+	}}
+	done := make(chan error, 1)
+	go func() {
+		_, err := rec.ChildRecord(ctx, agenttool.Call{ID: callID, IdempotencyKey: "K"}, cfg)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ChildRecord deadlocked: the child's ToolProvider waits on the recorder's lock")
 	}
 }
