@@ -177,6 +177,11 @@ versions may break the API.
   answers once the agent has it, so a second steer typed while a quiet
   tool runs is not held behind the first's outcome. RFC 0001 draft
   0.7, Queues. (#302)
+- Changed: a delivery, `Deliver` or `Accept`, whose run in flight is
+  aborted before taking its items starts no run: it reports the aborted
+  end and leaves the items queued for the host's next run, so an
+  interrupt does not restart the agent with a steer forwarded through
+  `Accept`. RFC 0001 draft 0.7, Queues. (#302)
 - Changed: a run in flight reports a `Queued` event without waiting
   for its next event: at once, on a goroutine of its own, when no
   event is being delivered as `Queue`, `Steer`, `FollowUp`, `Deliver`

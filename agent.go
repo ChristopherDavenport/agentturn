@@ -1762,6 +1762,11 @@ func (a *Agent) Redeliver(ctx context.Context, items ...openresponses.Item) erro
 // delivery that arrives once the receiver's run is in flight joins it
 // as any delivery does.
 //
+// A run in flight that is aborted before it drains the items leaves
+// them queued, and Deliver returns joined false with that run's end and
+// starts nothing: the abort stopped the agent, whoever asked, and a run
+// started for the items would undo it. The host's next run takes them.
+//
 // A run that drained the items and then ended before a model call, on
 // a guard before the call, an abort or a failure, has them in its
 // transcript unanswered: Deliver returns joined false with the end of
@@ -1783,7 +1788,7 @@ func (a *Agent) Redeliver(ctx context.Context, items ...openresponses.Item) erro
 // A job running on [RunContext], and anything called with a context not
 // derived from the run's, waits as any caller does.
 func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joined bool, end *RunEnd, err error) {
-	drains, settled, err := a.acceptDelivery(ctx, items)
+	mark, settled, err := a.acceptDelivery(ctx, items)
 	if err != nil {
 		return false, nil, err
 	}
@@ -1791,7 +1796,7 @@ func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joine
 	if settled != nil {
 		return settled.joined, settled.end, settled.err
 	}
-	return a.settleDelivery(ctx, drains)
+	return a.settleDelivery(ctx, mark)
 }
 
 // Accept is [Agent.Deliver] in two steps ([Accepter]): it queues the
@@ -1803,7 +1808,9 @@ func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joine
 // the run that takes them once that run has ended, on ctx's values
 // without its cancellation, so the caller going away neither stops
 // that run nor leaves the items for an input that may never come. Only
-// [Agent.Abort] stops a run so started. A run in flight reports the
+// [Agent.Abort] stops a run so started, and an abort of the run in
+// flight before it takes the items settles the delivery on that run's
+// end, starting none, as Deliver says. A run in flight reports the
 // items as [Queued] as [Agent.Steer] says, without waiting for its
 // next event.
 //
@@ -1815,7 +1822,7 @@ func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joine
 // before queueing: [ErrHeld] during [Agent.WhileIdle], [ErrNoPrompt]
 // for no items, and [ErrTriggerExtra].
 func (a *Agent) Accept(ctx context.Context, items ...openresponses.Item) (*Delivery, error) {
-	drains, settled, err := a.acceptDelivery(ctx, items)
+	mark, settled, err := a.acceptDelivery(ctx, items)
 	if err != nil {
 		return nil, err
 	}
@@ -1826,7 +1833,7 @@ func (a *Agent) Accept(ctx context.Context, items ...openresponses.Item) (*Deliv
 		return d, nil
 	}
 	ctx = context.WithoutCancel(ctx)
-	go func() { settle(a.settleDelivery(ctx, drains)) }()
+	go func() { settle(a.settleDelivery(ctx, mark)) }()
 	return d, nil
 }
 
@@ -1837,14 +1844,23 @@ type deliveryOutcome struct {
 	err    error
 }
 
-// acceptDelivery queues items as a delivery and returns the count of
-// steer drains its outcome is measured from. It returns an error, and
-// queues nothing, for a delivery refused before queueing, and an
-// outcome for one settled at once: one made from inside the run, which
-// waits on the caller.
-func (a *Agent) acceptDelivery(ctx context.Context, items openresponses.Items) (int, *deliveryOutcome, error) {
+// deliveryMark is where a delivery was accepted, which its outcome is
+// measured from: the count of steer drains, and the end of the last
+// run then, so an end since is told from it.
+type deliveryMark struct {
+	drains int
+	end    *RunEnd
+}
+
+// acceptDelivery queues items as a delivery and returns the mark its
+// outcome is measured from. It returns an error, and queues nothing,
+// for a delivery refused before queueing, and an outcome for one
+// settled at once: one made from inside the run, which waits on the
+// caller.
+func (a *Agent) acceptDelivery(ctx context.Context, items openresponses.Items) (deliveryMark, *deliveryOutcome, error) {
+	var none deliveryMark
 	if err := TriggerFromContext(ctx).Validate(); err != nil {
-		return 0, nil, err
+		return none, nil, err
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -1852,32 +1868,32 @@ func (a *Agent) acceptDelivery(ctx context.Context, items openresponses.Items) (
 		// No run starts during WhileIdle, so the items would wait for
 		// whatever the hold made of the agent: refused before anything
 		// is queued.
-		return 0, nil, ErrHeld
+		return none, nil, ErrHeld
 	}
-	drains, before := a.drains, len(a.steer)
+	mark, before := deliveryMark{drains: a.drains, end: a.lastEnd}, len(a.steer)
 	a.queue(TriggerFromContext(ctx), QueueSteer, InputDeliver, a.outside(ctx), items)
 	if len(a.steer) == before {
-		return 0, nil, ErrNoPrompt
+		return none, nil, ErrNoPrompt
 	}
 	if a.running && !a.closing && ctx.Value(inRunKey{a}) == a.runID {
 		// Called from inside the run, by a tool, a hook, a subscriber or
 		// a child run a tool made, which the run waits on: the items
 		// join it as a steer, and waiting for its next request would
 		// wait on the caller.
-		return drains, &deliveryOutcome{joined: true}, nil
+		return mark, &deliveryOutcome{joined: true}, nil
 	}
 	if a.running && ctx.Value(inRunKey{a}) == a.runID {
 		// Inside a run past its last drain, which ends only once the
 		// caller returns: the items wait for the next run.
-		return drains, &deliveryOutcome{err: ErrRunning}, nil
+		return mark, &deliveryOutcome{err: ErrRunning}, nil
 	}
-	return drains, nil, nil
+	return mark, nil, nil
 }
 
-// settleDelivery waits for the outcome of a delivery accepted when the
-// steer queue had been drained drains times, and starts the run that
-// takes it on ctx when no run will.
-func (a *Agent) settleDelivery(ctx context.Context, drains int) (joined bool, end *RunEnd, err error) {
+// settleDelivery waits for the outcome of a delivery accepted at mark,
+// and starts the run that takes it on ctx when no run will.
+func (a *Agent) settleDelivery(ctx context.Context, mark deliveryMark) (joined bool, end *RunEnd, err error) {
+	drains := mark.drains
 	a.mu.Lock()
 	for {
 		if a.seen > drains {
@@ -1907,6 +1923,14 @@ func (a *Agent) settleDelivery(ctx context.Context, drains int) (joined bool, en
 		if end != nil && end.Reason == ReasonError {
 			return false, end, end.Err
 		}
+		return false, end, nil
+	}
+	if end := a.lastEnd; end != nil && end != mark.end && end.Reason == ReasonAborted {
+		// The run in flight was aborted before it took the items: an
+		// abort is the host's, or the person's, to stop the agent, and
+		// a run started here would undo it. The items stay queued for
+		// the host's next run.
+		a.mu.Unlock()
 		return false, end, nil
 	}
 	if len(a.pending) > 0 {

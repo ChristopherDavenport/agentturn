@@ -1496,17 +1496,22 @@ the delivery waits until a model call has seen it. A delivery MUST
 accept its items, in the order given, before it waits, and a caller
 MUST be able to take the acceptance without waiting for the outcome,
 which the agent still settles: it joins the run in flight or starts
-one once that run ends (#302). The waiting is the point, since the
+one once that run ends, as below (#302). The waiting is the point, since the
 outcome is what closes the race below (#288); the split lets a view
 that forwards a person's steer answer once the agent has it, so a
 second steer typed while a quiet tool runs is not held behind the
 first's outcome. A delivery so accepted is settled by the agent,
 whoever waits: a run it starts is the agent's, and runs when the
-caller has gone away, until an abort. A delivery refused before its
+caller has gone away, until an abort. A delivery MUST NOT start a run
+once the run in flight when it was accepted was aborted before taking
+it: the abort stopped the agent, a person's interrupt among them, and
+a run the delivery started would undo it. The item stays queued for
+the host's next run, and the delivery reports the aborted run's end. A delivery refused before its
 items are queued, while the agent is held idle, accepts nothing. A run in flight
 that drains it and then sends a request has taken it. A run that stops
-after its turn or ends without draining it leaves it queued, and the
-delivery starts a run that takes it once that run has ended, as a
+after its turn or ends without draining it leaves it queued, and,
+unless it was aborted, the delivery starts a run that takes it once
+that run has ended, as a
 continue after a steer would, unless calls are pending, when it is
 left for the resume and the delivery says input is required. A
 delivery MUST NOT start a run once the last run ended on a terminating

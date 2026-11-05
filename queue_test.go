@@ -828,3 +828,58 @@ func TestOutsideAcceptsDuringAReportAreReported(t *testing.T) {
 		t.Fatalf("end = %+v", end)
 	}
 }
+
+// TestAnAbortSettlesAnAcceptedDelivery pins the abort in RFC 0001's
+// Queues: a delivery accepted while a run is in flight that the run is
+// aborted before taking is settled on the aborted end and starts no run,
+// its items left queued for the host's next run, so a person's Esc does
+// not restart the agent with a steer forwarded through Accept.
+func TestAnAbortSettlesAnAcceptedDelivery(t *testing.T) {
+	entered := make(chan struct{})
+	var calls atomic.Int32
+	a := New(Config{Model: &echo.Adapter{}, MaxTurns: 3, BeforeModelCall: func(ctx context.Context, _ *openresponses.Request) error {
+		if calls.Add(1) > 1 {
+			return nil
+		}
+		// The first request waits for the abort, past the drain that
+		// would have taken a steer.
+		close(entered)
+		<-ctx.Done()
+		return ctx.Err()
+	}})
+	var starts atomic.Int32
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if _, ok := ev.(*RunStart); ok {
+			starts.Add(1)
+		}
+		return nil
+	})
+	done := make(chan *RunEnd, 1)
+	go func() {
+		end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+		done <- end
+	}()
+	<-entered
+	d, err := a.Accept(context.Background(), openresponses.UserText("steer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Abort()
+	if end := <-done; end == nil || end.Reason != ReasonAborted {
+		t.Fatalf("prompt end = %+v, want aborted", end)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	joined, end, err := d.Wait(ctx)
+	if err != nil || joined || end == nil || end.Reason != ReasonAborted {
+		t.Fatalf("delivery: joined %v, end %+v, err %v; want the aborted end", joined, end, err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	st := a.State()
+	if n := starts.Load(); n != 1 || st.Running {
+		t.Errorf("%d runs started, running %v: the delivery started a run after the abort", n, st.Running)
+	}
+	if st.Steering != 1 {
+		t.Errorf("steering = %d, want the delivery left queued", st.Steering)
+	}
+}
