@@ -12,6 +12,17 @@ versions may break the API.
   recorder writes is format 0.21. Nothing here broke: the recorder
   exports no sidecar session to ATIF, and the root does not use
   agenttool's `mcpclient`.
+- Changed (breaking for a reader of the record): `session.Recorder`
+  writes an owed queued input's marks in agentsession RFC 0001 0.21's
+  `visible`, `trust` and `instructions_part` on its `queued` entry,
+  where v0.0.37 wrote `agentturn:visible`, `agentturn:trust` and
+  `agentturn:instructions_part`. It still reads those from a session
+  v0.0.37 recorded, so an input owed across the upgrade is handed back
+  marked, and a run end that queues such an input again writes the
+  marks in 0.21's members and drops the interim ones.
+  `VisibleMember`, `TrustMember` and `InstructionsPartMember` are
+  deprecated, kept for a reader of such a session. RFC 0001 draft 0.7.
+  (agentsession#278)
 
 ## v0.0.37 - 2026-11-04
 

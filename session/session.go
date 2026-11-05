@@ -766,17 +766,21 @@ const SubjectMember = "agentturn:subject"
 // reads it back onto the call's Decision.
 const HeldMember = "agentturn:held"
 
-// VisibleMember, TrustMember and InstructionsPartMember are members
-// of a queued entry that keep what the host marked the input with,
-// until agentsession RFC 0001's queued entry has members of its own for
-// them (agentsession#278): false for an input marked agentturn.Hidden, and the trust and
-// the instruction layers of its agentturn.Provenance, each in the form
-// the member of the same name has on an item entry (visible, trust,
-// instructions_part). The recorder writes them on every queued entry
-// it writes for the input, a run end's again included, and reads them
-// back when it seeds its inbox from the path, so an input owed across a
-// restart is handed back by [Recorder.Requeue] marked as it was queued
-// and recorded so when a run drains it.
+// VisibleMember, TrustMember and InstructionsPartMember are the
+// members of a queued entry in which agentturn v0.0.37 kept what the
+// host marked the input with, before agentsession RFC 0001's queued
+// entry had members of its own for them: false for an input marked
+// agentturn.Hidden, and the trust and the instruction layers of its
+// agentturn.Provenance, each in the form the member of the same name
+// has on an item entry.
+//
+// Deprecated: format 0.21 defines visible, trust and instructions_part
+// on a queued entry (agentsession#278), and the recorder writes those.
+// It still reads these members when it seeds its inbox from a session
+// v0.0.37 wrote, so an input owed across that upgrade is handed back
+// marked as it was queued, and a run end that queues such an input
+// again writes its marks in 0.21's members and drops these. They are
+// kept for a reader of such a session.
 const (
 	VisibleMember          = "agentturn:visible"
 	TrustMember            = "agentturn:trust"
@@ -1243,8 +1247,8 @@ type inboxItem struct {
 	declined bool
 	// hidden and prov are what the host marked the input with,
 	// agentturn.Hidden and agentturn.WithProvenance, which its queued
-	// entry keeps as [VisibleMember], [TrustMember] and
-	// [InstructionsPartMember] and Requeue hands back.
+	// entry keeps in format 0.21's visible, trust and instructions_part
+	// and Requeue hands back.
 	hidden bool
 	prov   *agentturn.Provenance
 }
@@ -1282,11 +1286,14 @@ func (in *inboxItem) marked() openresponses.Item {
 	return item
 }
 
-// setQueuedMarks writes the input's marks on its queued entry; see
-// [VisibleMember].
+// setQueuedMarks writes the input's marks on its queued entry, in
+// format 0.21's visible, trust and instructions_part (agentsession#278),
+// in the forms an item entry has them, so the item that drains the
+// input carries them as written.
 func setQueuedMarks(q *agentsession.QueuedEntry, hidden bool, prov *agentturn.Provenance) {
 	if hidden {
-		setMember(&q.EntryBase, VisibleMember, json.RawMessage("false"))
+		visible := false
+		q.Visible = &visible
 	}
 	if prov == nil {
 		return
@@ -1296,57 +1303,128 @@ func setQueuedMarks(q *agentsession.QueuedEntry, hidden bool, prov *agentturn.Pr
 		for i, l := range prov.Trust.Reads {
 			reads[i] = string(l)
 		}
-		raw, _ := json.Marshal(agentsession.Trust{Reads: reads})
-		setMember(&q.EntryBase, TrustMember, raw)
+		q.Trust = &agentsession.Trust{Reads: reads}
 	}
 	if _, ok := q.Item.(*openresponses.Message); ok && len(prov.Layers) > 0 {
 		layers := make([]agentsession.LayerRef, len(prov.Layers))
 		for i, l := range prov.Layers {
 			layers[i] = agentsession.LayerRef{ID: l.ID, Source: l.Source}
 		}
-		var raw []byte
 		if len(layers) == 1 {
-			raw, _ = json.Marshal(layers[0])
+			q.InstructionsPart = &layers[0]
 		} else {
-			raw, _ = json.Marshal(layers)
+			q.InstructionsLayers = layers
 		}
-		setMember(&q.EntryBase, InstructionsPartMember, raw)
 	}
 }
 
-// queuedMarks reads back the marks [setQueuedMarks] wrote on a queued
-// entry; a member in another form is read as absent.
+// queuedMarks reads back the marks on a queued entry: format 0.21's
+// visible, trust and instructions_part, and, for each the entry does
+// not carry, the interim member agentturn v0.0.37 wrote for it
+// ([VisibleMember]). A member in another form is read as absent.
 func queuedMarks(q *agentsession.QueuedEntry) (hidden bool, prov *agentturn.Provenance) {
-	if raw, ok := q.Unknown[VisibleMember]; ok {
-		var visible bool
-		hidden = json.Unmarshal(raw, &visible) == nil && !visible
+	if q.Visible != nil {
+		hidden = !*q.Visible
+	} else if v, ok := legacyVisible(q); ok {
+		hidden = !v
 	}
 	var p agentturn.Provenance
-	if raw, ok := q.Unknown[TrustMember]; ok {
-		var t agentsession.Trust
-		if json.Unmarshal(raw, &t) == nil {
-			p.Trust = &agentturn.Trust{Reads: make([]agenttool.Label, len(t.Reads))}
-			for i, l := range t.Reads {
-				p.Trust.Reads[i] = agenttool.Label(l)
-			}
+	t := q.Trust
+	if t == nil {
+		t = legacyTrust(q)
+	}
+	if t != nil {
+		p.Trust = &agentturn.Trust{Reads: make([]agenttool.Label, len(t.Reads))}
+		for i, l := range t.Reads {
+			p.Trust.Reads[i] = agenttool.Label(l)
 		}
 	}
-	if raw, ok := q.Unknown[InstructionsPartMember]; ok {
-		var one agentsession.LayerRef
-		var many []agentsession.LayerRef
-		if json.Unmarshal(raw, &one) == nil && one.Source != "" {
-			many = []agentsession.LayerRef{one}
-		} else if json.Unmarshal(raw, &many) != nil {
-			many = nil
-		}
-		for _, l := range many {
-			p.Layers = append(p.Layers, agentturn.Layer{ID: l.ID, Source: l.Source})
-		}
+	layers := q.Layers()
+	if layers == nil {
+		layers = legacyLayers(q)
+	}
+	for _, l := range layers {
+		p.Layers = append(p.Layers, agentturn.Layer{ID: l.ID, Source: l.Source})
 	}
 	if p.Trust == nil && len(p.Layers) == 0 {
 		return hidden, nil
 	}
 	return hidden, &p
+}
+
+// legacyVisible reads [VisibleMember], as agentturn v0.0.37 wrote it.
+func legacyVisible(q *agentsession.QueuedEntry) (visible, ok bool) {
+	raw, ok := q.Unknown[VisibleMember]
+	if !ok || json.Unmarshal(raw, &visible) != nil {
+		return false, false
+	}
+	return visible, true
+}
+
+// legacyTrust reads [TrustMember], as agentturn v0.0.37 wrote it.
+func legacyTrust(q *agentsession.QueuedEntry) *agentsession.Trust {
+	raw, ok := q.Unknown[TrustMember]
+	if !ok {
+		return nil
+	}
+	var t agentsession.Trust
+	if json.Unmarshal(raw, &t) != nil {
+		return nil
+	}
+	return &t
+}
+
+// legacyLayers reads [InstructionsPartMember], one object or a list,
+// as agentturn v0.0.37 wrote it.
+func legacyLayers(q *agentsession.QueuedEntry) []agentsession.LayerRef {
+	raw, ok := q.Unknown[InstructionsPartMember]
+	if !ok {
+		return nil
+	}
+	var one agentsession.LayerRef
+	var many []agentsession.LayerRef
+	if json.Unmarshal(raw, &one) == nil && one.Source != "" {
+		return []agentsession.LayerRef{one}
+	}
+	if json.Unmarshal(raw, &many) != nil {
+		return nil
+	}
+	return many
+}
+
+// upgradeQueuedMarks moves the marks agentturn v0.0.37 wrote on a
+// queued entry in its interim members into format 0.21's, on the entry
+// that queues the input again: each it reads takes the member 0.21
+// defines, where the entry does not already carry it, and the interim
+// member goes. One it cannot read stays as written, as data.
+func upgradeQueuedMarks(q *agentsession.QueuedEntry) {
+	if v, ok := legacyVisible(q); ok {
+		if q.Visible == nil {
+			q.Visible = &v
+		}
+		delete(q.Unknown, VisibleMember)
+	}
+	if t := legacyTrust(q); t != nil {
+		if q.Trust == nil {
+			q.Trust = t
+		}
+		delete(q.Unknown, TrustMember)
+	}
+	if _, isMessage := q.Item.(*openresponses.Message); isMessage {
+		if layers := legacyLayers(q); layers != nil {
+			if q.Layers() == nil {
+				if len(layers) == 1 {
+					q.InstructionsPart = &layers[0]
+				} else {
+					q.InstructionsLayers = layers
+				}
+			}
+			delete(q.Unknown, InstructionsPartMember)
+		}
+	}
+	if len(q.Unknown) == 0 {
+		q.Unknown = nil
+	}
 }
 
 // childKey names an observed child by the call it runs under, or by
@@ -3011,10 +3089,13 @@ func (w *writer) closeOpenRun(ctx context.Context, s *agentsession.Session, reas
 		return nil
 	}
 	for _, q := range owed {
-		// Queued again as it was: a delivery stays one, and its ref
-		// and the members the format does not define, the marks
-		// [VisibleMember] names among them, go with it.
-		if _, err := w.append(ctx, q.Requeue()); err != nil {
+		// Queued again as it was: a delivery stays one, and its ref,
+		// its marks and the members the format does not define go
+		// with it; marks agentturn v0.0.37 kept in interim members
+		// are written in format 0.21's ([VisibleMember]).
+		again := q.Requeue()
+		upgradeQueuedMarks(again)
+		if _, err := w.append(ctx, again); err != nil {
 			return err
 		}
 	}

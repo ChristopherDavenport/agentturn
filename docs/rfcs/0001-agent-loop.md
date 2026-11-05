@@ -1,6 +1,6 @@
 # RFC 0001: Agent Loop
 
-Status: draft 0.6
+Status: draft 0.7
 Author: Christopher Davenport
 Discussion: to be opened against this repository, then proposed to the
 Open Responses community as a companion specification. The Go module at
@@ -62,7 +62,7 @@ executor, the session format begins where an entry is appended, and
 the loop is everything in between.
 
 Each draft describes the Go module as released with it; [Changes in
-draft 0.5](#changes-in-draft-05) lists what this draft added. Where the
+draft 0.7](#changes-in-draft-07) lists what this draft added. Where the
 module falls short of what is written here, or where a rule is
 contested, the shortfall is under open questions with the issue that
 tracks it.
@@ -2030,13 +2030,17 @@ hold, and refuses the item instead, until agentsession RFC 0001 lets a
 copy's trust be wider than its source's (agentsession#279) (#300). An input queued with its marks, hidden or with a
 provenance, and still owed when the process stops is handed back after
 a restart marked as it was queued, so the item that drains it is
-recorded as the item it was: agentsession RFC 0001's `queued` entry
-has no member for an item's display flag, trust or layers, so until it
-does (agentsession#278) a recorder writes them on every `queued` entry it writes for the
-input, a run end's again included, as `agentturn:visible` (`false`),
-`agentturn:trust` and `agentturn:instructions_part`, each in the form
-the format's member of that name has on an `item`, and reads them back
-where it reads the inputs the path owes.
+recorded as the item it was: a recorder writes them on every `queued`
+entry it writes for the input, a run end's again included, as
+agentsession RFC 0001's `visible` (`false`), `trust` and
+`instructions_part` on the `queued` entry (format 0.21,
+agentsession#278), and reads them back where it reads the inputs the
+path owes. A recorder MUST also read them, for each the entry does not
+carry in the format's member, from the interim `agentturn:visible`,
+`agentturn:trust` and `agentturn:instructions_part` members a draft 0.6
+recorder wrote, each in the form the format's member of that name has
+on an `item`, and MUST NOT write those members: an entry that queues
+such an input again carries the marks in the format's members alone.
 
 A decision that defers a call MAY mark it **held**, deferred only
 because another call of its batch was asked about, as a policy that
@@ -2335,6 +2339,18 @@ The scenario corpus is versioned with this document. A scenario is
 added when a rule is, and changes only when the rule it pins does, in
 the same draft; a scenario that a conforming loop fails is a defect in
 the scenario, fixed without a change of rule.
+
+## Changes in draft 0.7
+
+Draft 0.7 adds the rules below to draft 0.6, marked as Versioning has
+it.
+
+- **The record.** An owed queued input's marks are written in
+  agentsession RFC 0001 0.21's `visible`, `trust` and
+  `instructions_part` on the `queued` entry, and the interim
+  `agentturn:` members draft 0.6 wrote are read back, never written
+  (agentsession#278); breaking for a recorder that wrote them, and for
+  a reader of a session that does not read the format's members.
 
 ## Changes in draft 0.6
 

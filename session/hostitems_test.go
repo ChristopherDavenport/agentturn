@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/ChristopherDavenport/agentsession"
@@ -140,9 +141,10 @@ func TestHostComposedItemsAreRecordedWithTheirProvenance(t *testing.T) {
 // TestAnOwedQueuedInputKeepsItsMarksAcrossARestart pins that an input
 // the host composed and queued, hidden, with instruction layers and
 // trust, and owed when the process quits, is drained after a restart as
-// what it was: the queued entry keeps the marks the format's queued
-// entry has no member for, as agentturn:visible, agentturn:trust and
-// agentturn:instructions_part, Requeue hands the input back marked, and
+// what it was: the queued entry keeps the marks in format 0.21's
+// visible, trust and instructions_part (agentsession#278), and none of
+// the interim agentturn: members v0.0.37 wrote, Requeue hands the input
+// back marked, and
 // the item that drains it is recorded hidden, with its layers and its
 // trust, not as the person's visible words. A run end before the drain
 // writes the entry again with them.
@@ -219,9 +221,14 @@ func TestAnOwedQueuedInputKeepsItsMarksAcrossARestart(t *testing.T) {
 		t.Fatalf("queued entries = %d, want the reminder's and the one its run end wrote again", len(queued))
 	}
 	for _, q := range queued {
-		if string(q.Unknown[VisibleMember]) != "false" || string(q.Unknown[TrustMember]) != `{"reads":["untrusted"]}` ||
-			string(q.Unknown[InstructionsPartMember]) != `{"id":"/repo/sub/AGENTS.md","source":"agentsmd"}` {
-			t.Errorf("queued entry %s members = %s", q.ID, q.Unknown)
+		if q.Visible == nil || *q.Visible || q.Trust == nil || !slices.Equal(q.Trust.Reads, []string{"untrusted"}) ||
+			q.InstructionsPart == nil || *q.InstructionsPart != (agentsession.LayerRef{ID: "/repo/sub/AGENTS.md", Source: agentsession.LayerAgentsMD}) {
+			t.Errorf("queued entry %s: visible %v trust %+v instructions_part %+v, want format 0.21's members", q.ID, q.Visible, q.Trust, q.InstructionsPart)
+		}
+		for name := range q.Unknown {
+			if strings.HasPrefix(name, "agentturn:") {
+				t.Errorf("queued entry %s carries the interim member %s", q.ID, name)
+			}
 		}
 	}
 	it := itemEntries(read)["<reminder>sub/AGENTS.md</reminder>"]
@@ -287,5 +294,33 @@ func TestAnUnreadableLayerDropsOnlyTheLayers(t *testing.T) {
 	}
 	if len(p.Layers) != 0 {
 		t.Errorf("layers = %+v, want the unreadable one dropped", p.Layers)
+	}
+}
+
+// TestQueuedMarksReadBothForms pins agentsession#278's follow-up: an
+// owed input's marks are read from format 0.21's visible, trust and
+// instructions_part on its queued entry, and, for a session agentturn
+// v0.0.37 recorded, from the interim agentturn: members it wrote there.
+func TestQueuedMarksReadBothForms(t *testing.T) {
+	visible := false
+	current := agentsession.NewQueued(openresponses.UserText("<reminder>x</reminder>"), agentsession.ModeFollowUp)
+	current.Visible = &visible
+	current.Trust = &agentsession.Trust{Reads: []string{"untrusted"}}
+	current.InstructionsLayers = []agentsession.LayerRef{{ID: "/repo/AGENTS.md", Source: agentsession.LayerAgentsMD}, {Source: agentsession.LayerAgentMemory}}
+	interim := agentsession.NewQueued(openresponses.UserText("<reminder>x</reminder>"), agentsession.ModeFollowUp)
+	interim.Unknown = map[string]json.RawMessage{
+		VisibleMember:          json.RawMessage(`false`),
+		TrustMember:            json.RawMessage(`{"reads":["untrusted"]}`),
+		InstructionsPartMember: json.RawMessage(`[{"id":"/repo/AGENTS.md","source":"agentsmd"},{"source":"agentmemory"}]`),
+	}
+	wantLayers := []agentturn.Layer{{ID: "/repo/AGENTS.md", Source: agentsession.LayerAgentsMD}, {Source: agentsession.LayerAgentMemory}}
+	for name, q := range map[string]*agentsession.QueuedEntry{"0.21": current, "v0.0.37": interim} {
+		hidden, prov := queuedMarks(q)
+		if !hidden {
+			t.Errorf("%s: not hidden", name)
+		}
+		if prov == nil || prov.Trust == nil || !slices.Equal(prov.Trust.Reads, []agenttool.Label{agenttool.LabelUntrusted}) || !slices.Equal(prov.Layers, wantLayers) {
+			t.Errorf("%s: provenance = %+v", name, prov)
+		}
 	}
 }

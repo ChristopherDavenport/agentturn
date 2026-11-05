@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -881,9 +882,10 @@ func TestQueueWritesBeforeItQueues(t *testing.T) {
 // TestACutRunsOwedDeliveryStaysADelivery pins that the inputs a cut
 // run owed, queued again after the end a resume writes, are queued as
 // they were: a delivery keeps deliver, so Requeue hands it back as one
-// and it starts a run, and the marks the recorder keeps beside the
-// format's members, agentturn:visible, agentturn:trust and
-// agentturn:instructions_part, go with it.
+// and it starts a run, and its marks go with it, in format 0.21's
+// visible, trust and instructions_part even where agentturn v0.0.37
+// wrote them as agentturn:visible, agentturn:trust and
+// agentturn:instructions_part.
 func TestACutRunsOwedDeliveryStaysADelivery(t *testing.T) {
 	ctx := context.Background()
 	store := agentsession.NewMemoryStore()
@@ -917,9 +919,15 @@ func TestACutRunsOwedDeliveryStaysADelivery(t *testing.T) {
 	if !again.Deliver || again.Mode != agentsession.ModeSteer {
 		t.Errorf("queued again as mode %q deliver %v, want a delivery", again.Mode, again.Deliver)
 	}
-	for name, want := range d.Unknown {
-		if string(again.Unknown[name]) != string(want) {
-			t.Errorf("queued again with %s = %s, want %s", name, again.Unknown[name], want)
+	// The interim members v0.0.37 wrote are read and written again as
+	// format 0.21's own.
+	if again.Visible == nil || *again.Visible || again.Trust == nil || !slices.Equal(again.Trust.Reads, []string{"untrusted"}) ||
+		again.InstructionsPart == nil || *again.InstructionsPart != (agentsession.LayerRef{ID: "/repo/AGENTS.md", Source: agentsession.LayerAgentsMD}) {
+		t.Errorf("queued again with visible %v trust %+v instructions_part %+v, want format 0.21's members", again.Visible, again.Trust, again.InstructionsPart)
+	}
+	for name := range d.Unknown {
+		if _, ok := again.Unknown[name]; ok {
+			t.Errorf("queued again with the interim member %s", name)
 		}
 	}
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"})
