@@ -380,6 +380,84 @@ func TestAcceptOverTheWire(t *testing.T) {
 			t.Errorf("err = %v, want ErrNoDelivery", err)
 		}
 	})
+	t.Run("behind a wrapper that cannot flush itself", func(t *testing.T) {
+		// A logging middleware's writer that unwraps to the server's
+		// but implements no Flush.
+		h := Handler(agentturn.New(agentturn.Config{Model: &echo.Adapter{}, MaxTurns: 1}), WithInsecureNoAuth())
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h.ServeHTTP(unflushed{w}, r)
+		}))
+		t.Cleanup(srv.Close)
+		c, err := Dial(t.Context(), srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, err := c.Accept(t.Context(), openresponses.UserText("x"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, end, err := d.Wait(ctx); err != nil || end == nil {
+			t.Fatalf("end %+v, err %v; want a run", end, err)
+		}
+	})
+	t.Run("a client gone after the accept, the agent settles it", func(t *testing.T) {
+		running, release := make(chan struct{}, 2), make(chan struct{})
+		// One turn: the run stops after its batch without draining the
+		// delivery, which then needs a run of its own.
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, MaxTurns: 1, Tools: []agenttool.Tool{blocker(running, release)}})
+		ends := make(chan *agentturn.RunEnd, 4)
+		a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+			if e, ok := ev.(*agentturn.RunEnd); ok {
+				ends <- e
+			}
+			return nil
+		})
+		srv := httptest.NewServer(Handler(a, WithInsecureNoAuth()))
+		t.Cleanup(srv.Close)
+		go func() { _, _ = a.Prompt(context.Background(), openresponses.UserText("go")) }()
+		<-running
+		var released sync.Once
+		defer released.Do(func() { close(release) })
+		raw, err := itemsOut(openresponses.Items{openresponses.UserText("later")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := json.Marshal(struct {
+			Items json.RawMessage `json:"items"`
+		}{raw})
+		ctx, cancel := context.WithCancel(t.Context())
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/accept", strings.NewReader(string(body)))
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var first acceptReply
+		if err := json.NewDecoder(resp.Body).Decode(&first); err != nil || !first.Accepted {
+			t.Fatalf("first = %+v, err %v", first, err)
+		}
+		// The client goes away before the outcome.
+		cancel()
+		resp.Body.Close()
+		released.Do(func() { close(release) })
+		for i := range 2 {
+			select {
+			case <-ends:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("%d runs ended; the delivery was not settled once its client went away", i)
+			}
+		}
+		var texts []string
+		for _, item := range a.State().Transcript {
+			if m, ok := item.(*openresponses.Message); ok && m.Role == openresponses.RoleUser {
+				texts = append(texts, m.Text())
+			}
+		}
+		if !slices.Contains(texts, "later") {
+			t.Errorf("user messages = %q, want the delivery taken", texts)
+		}
+	})
 	t.Run("a server without the route", func(t *testing.T) {
 		h := Handler(agentturn.New(agentturn.Config{Model: &echo.Adapter{}}), WithInsecureNoAuth())
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -399,6 +477,15 @@ func TestAcceptOverTheWire(t *testing.T) {
 		}
 	})
 }
+
+// unflushed is a middleware's response writer that unwraps to the one
+// it wraps but does not implement http.Flusher itself.
+type unflushed struct{ w http.ResponseWriter }
+
+func (u unflushed) Header() http.Header         { return u.w.Header() }
+func (u unflushed) Write(b []byte) (int, error) { return u.w.Write(b) }
+func (u unflushed) WriteHeader(code int)        { u.w.WriteHeader(code) }
+func (u unflushed) Unwrap() http.ResponseWriter { return u.w }
 
 func TestAbortMidBatch(t *testing.T) {
 	running := make(chan struct{}, 1)

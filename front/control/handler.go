@@ -549,8 +549,8 @@ func (h *handler) accept(w http.ResponseWriter, r *http.Request, p Principal) {
 		h.writeFailure(w, http.StatusNotImplemented, ErrNoDelivery)
 		return
 	}
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	flush := flusherOf(w)
+	if flush == nil {
 		h.writeFailure(w, http.StatusInternalServerError, errors.New("control: the response cannot stream"))
 		return
 	}
@@ -581,7 +581,7 @@ func (h *handler) accept(w http.ResponseWriter, r *http.Request, p Principal) {
 	if enc.Encode(acceptReply{Accepted: true}) != nil {
 		return
 	}
-	flusher.Flush()
+	flush()
 	joined, end, err := d.Wait(r.Context())
 	if r.Context().Err() != nil {
 		// The client went away; the agent settles the delivery anyway.
@@ -715,10 +715,30 @@ func (h *handler) decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	return true
 }
 
+// flusherOf returns what flushes w, found as http.ResponseController
+// finds it: w itself, or what a middleware's writer unwraps to, since
+// a logging or metrics wrapper rarely implements Flush. nil when
+// nothing along the chain can.
+func flusherOf(w http.ResponseWriter) func() {
+	for {
+		switch f := w.(type) {
+		case interface{ FlushError() error }:
+			return func() { _ = f.FlushError() }
+		case http.Flusher:
+			return f.Flush
+		}
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return nil
+		}
+		w = u.Unwrap()
+	}
+}
+
 // events serves Subscribe as a server-sent event stream.
 func (h *handler) events(w http.ResponseWriter, r *http.Request, _ Principal) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	flush := flusherOf(w)
+	if flush == nil {
 		h.writeFailure(w, http.StatusInternalServerError, errors.New("control: the response cannot stream"))
 		return
 	}
@@ -754,7 +774,7 @@ func (h *handler) events(w http.ResponseWriter, r *http.Request, _ Principal) {
 	if writeFrame(w, "ready", []byte("{}")) != nil {
 		return
 	}
-	flusher.Flush()
+	flush()
 
 	// drain writes what else is queued, without waiting for more.
 	drain := func() bool {
@@ -781,18 +801,18 @@ func (h *handler) events(w http.ResponseWriter, r *http.Request, _ Principal) {
 				return
 			}
 			_ = writeFrame(w, "overflow", []byte(`{"message":"the stream fell too far behind the agent; catch up from the record and subscribe again"}`))
-			flusher.Flush()
+			flush()
 			return
 		case data := <-frames:
 			if writeFrame(w, "", data) != nil || !drain() {
 				return
 			}
-			flusher.Flush()
+			flush()
 		case <-ping.C:
 			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
 				return
 			}
-			flusher.Flush()
+			flush()
 		}
 	}
 }

@@ -296,8 +296,13 @@ var _ agentturn.Deliverer = (*Client)(nil)
 // it returns is settled with what [Client.Deliver] would have returned
 // once the agent has settled the delivery, which it does whether or not
 // anyone waits. The outcome arrives on the same response, which stays
-// open until then; a client whose WithHTTPClient sets a Timeout cuts it
-// off. Cancelling ctx before the accept arrives returns ctx's error,
+// open until then, whether or not the handle is waited on: each accept
+// holds one connection of the HTTP client's until the server's agent
+// settles it, a view that steers often and never waits among them, so
+// a client with a per-host connection limit counts them against it. A
+// client whose WithHTTPClient sets a Timeout cuts the response off. A
+// proxy that buffers responses holds the accept back until the outcome
+// too, so Accept then returns no sooner than [Client.Deliver]. Cancelling ctx before the accept arrives returns ctx's error,
 // and the items may have been queued all the same; once Accept has
 // returned, ctx bounds nothing. A connection lost before the outcome
 // settles the delivery with an error wrapping [ErrConnectionLost], the
