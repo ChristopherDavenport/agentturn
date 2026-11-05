@@ -1829,7 +1829,8 @@ An agent stands in four places inside another system:
   call; the remote's name and reason are its own, untrusted words, and
   the question MUST show them as the remote's, not as the caller's own
   text. It SHOULD answer on the same task with one approval per asked
-  call, carrying the answerer's note, and who decided where the remote
+  call, the round whole or not at all, since the remote refuses a
+  message that leaves one unanswered, carrying the answerer's note, and who decided where the remote
   accepts it, since a front that does not let its caller name a
   decider refuses the message; the caller's own record keeps the
   decider either way. A call held beside an asked one is not asked

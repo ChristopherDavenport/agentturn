@@ -210,7 +210,12 @@ func WithInputRequired(fn InputRequired) Option { return func(r *remote) { r.inp
 // answerer's note, and who decided only under [WithSendBy]. A call the
 // remote held beside an asked one is not asked about: the remote
 // settles it by the answers. The task then goes on, as many times as
-// [WithInputRounds] allows.
+// [WithInputRounds] allows. A round is answered whole, since the
+// remote takes an answer to every escalated call in one message and
+// refuses a message that leaves one unanswered: when one call of the
+// round cannot be asked, the answers already given are not sent, and
+// the task is left as below with every call of the round; a question
+// already answered stays filed under this call in the caller's record.
 //
 // A task that also waits on other input, a call to a tool the caller
 // executes or a question that is not a call, is not answered so, and
@@ -497,7 +502,8 @@ func (r *remote) follow(ctx context.Context, call agenttool.Call, msg *a2a.Messa
 // askEscalated puts the calls a task's status message says the remote
 // escalated to its caller to the elicitor on ctx, as [WithAskCaller]
 // describes, and returns one approval part per call, or false when the
-// task waits on anything else or nobody answered.
+// task waits on anything else or any call went unanswered: the round
+// is sent whole or not at all.
 func (r *remote) askEscalated(ctx context.Context, status *a2a.Message) ([]a2a.Part, bool) {
 	if status == nil {
 		return nil, false

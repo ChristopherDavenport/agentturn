@@ -105,7 +105,9 @@ versions may break the API.
   agent, and answered on the same task with an `Approval` carrying the
   answerer's note. `WithSendBy` adds who decided, for a remote whose
   `WithChosenBy` accepts it. With nobody to ask, or other input
-  waited on, the call still fails input-required. A detached call's
+  waited on, the call still fails input-required; a round is sent whole
+  or not at all, so one cancelled question leaves every escalated call
+  of the round to `WithInputRequired`. A detached call's
   task asks nobody, even with an elicitor on the context the host
   prompted with, and keeps `WithInputRequired`. `AskedCall.Callee`
   names the agent that would run an asked call that is not this run's;

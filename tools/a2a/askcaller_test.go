@@ -383,3 +383,42 @@ func TestAskCallerLeavesATaskWaitingOnOtherInput(t *testing.T) {
 		t.Errorf("answered %v (%v) after asking %d times; want it left to WithInputRequired", parts, ok, asked)
 	}
 }
+
+// TestAskCallerAnswersAllOrNothing pins that a round of escalated calls
+// is answered whole: the remote takes an answer to each in one message,
+// so when the second question is cancelled the first answer is not
+// sent, and the call fails input-required naming both calls.
+func TestAskCallerAnswersAllOrNothing(t *testing.T) {
+	askBoth := func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+		return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "a person approves " + info.Call.Name}, nil
+	}
+	remote, client, card := serveEscalating(t, []string{"issue_refund", "void_charge"}, askBoth, false)
+	asked := 0
+	local := agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{New(client, card, WithAskCaller())}, MaxTurns: 1,
+		ToolElicitor: func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+			asked++
+			if asked == 1 {
+				return agenttool.Answer{Action: agenttool.ActionAccept}, nil
+			}
+			return agenttool.Answer{Action: agenttool.ActionCancel}, nil
+		}}
+	var end *agentturn.ToolEnd
+	for ev := range agentturn.Run(context.Background(), nil, openresponses.Items{openresponses.UserText("refund and void")}, local) {
+		if e, ok := ev.(*agentturn.ToolEnd); ok {
+			end = e
+		}
+	}
+	if end == nil {
+		t.Fatal("the remote agent was never called")
+	}
+	var waiting agentturn.InputRequired
+	if !errors.As(end.Err, &waiting) {
+		t.Fatalf("err = %v, want input required", end.Err)
+	}
+	if calls := waiting.PendingCalls(); len(calls) != 2 {
+		t.Errorf("waiting on %+v, want both escalated calls", calls)
+	}
+	if asked != 2 || remote.runs("issue_refund") != 0 || remote.runs("void_charge") != 0 {
+		t.Errorf("asked %d times, ran %d and %d; want both asked and nothing run", asked, remote.runs("issue_refund"), remote.runs("void_charge"))
+	}
+}
