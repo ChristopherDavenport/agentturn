@@ -24,8 +24,12 @@
 // front that wants to persist the result registers [WithOnFold], which
 // reports every fold, successful or not, with the index at which the
 // transcript was split; [Transform.Last] returns the latest summary.
-// [WithPin] keeps chosen items of the folded prefix verbatim after the
-// summary, for context a harness injected that must not become
+// A fold keeps the person's own messages of the folded prefix verbatim
+// after the summary, those the loop names on the transform's context
+// (agentturn.PersonMessagesFromContext) up to [WithPersonBound], so
+// after two folds the request still holds what the person asked for
+// and not a summary's paraphrase of it. [WithPin] keeps more chosen
+// items so, for context a harness injected that must not become
 // whatever the summary made of it. [WithRequest] edits the summary
 // request [NewLocal] sends, so it can carry the reasoning setting the
 // agent's own requests do.
@@ -186,9 +190,10 @@ func WithBackOff(enabled bool) Option { return func(t *Transform) { t.noBackOff 
 // request, in their order, and the fold that summarised them
 // summarised them too, so nothing is lost if the pin is later dropped.
 // It is for context a harness injected and must not lose to a summary:
-// a stream rule's reminder, a policy notice, an instruction the user
-// gave once. [WithKeepLast] keeps a window at the end; this keeps a
-// member of the part that is folded.
+// a stream rule's reminder, a policy notice. [WithKeepLast] keeps a
+// window at the end; this keeps a member of the part that is folded.
+// The person's own messages are kept so without it, as
+// [WithPersonBound] says; what fn reports is added to them.
 //
 // A pinned item is on the request and not in the transcript, so a
 // session recorder names it in the compaction entry, whose pinned
@@ -198,6 +203,25 @@ func WithBackOff(enabled bool) Option { return func(t *Transform) { t.noBackOff 
 func WithPin(fn func(openresponses.Item) bool) Option {
 	return func(t *Transform) { t.pin = fn }
 }
+
+// DefaultPersonBound is the size, in bytes of the message's JSON,
+// up to which a fold keeps the person's own messages verbatim when
+// [WithPersonBound] is not given.
+const DefaultPersonBound = 8 << 10
+
+// WithPersonBound sets the size, in bytes of a message's JSON, up to
+// which a fold keeps verbatim each of the person's own messages in the
+// part it folds: the messages the loop names on the transform's
+// context (agentturn.PersonMessagesFromContext), which a person typed
+// under a trigger of kind human and the host did not compose, copy or
+// hide (agentturn RFC 0001 The request, step 2; #298). They follow
+// the summary in the request, in their order, as [WithPin]'s items do,
+// and are reported in [Fold.Pinned], so a session recorder names them
+// in the compaction entry. A message over the bound, a long paste say,
+// is folded like any other item, and so is one the host composed. The
+// default is [DefaultPersonBound]; zero or less keeps none of them,
+// and [WithPin] still keeps what it names.
+func WithPersonBound(bytes int) Option { return func(t *Transform) { t.personBound = bytes } }
 
 // WithFilter sets the filter applied to the items sent to be folded,
 // so app-only items never reach the server. The default is
@@ -277,8 +301,9 @@ type Fold struct {
 	// Attempts is the number of model calls the fold made: one, or two
 	// for a [NewLocal] fold that asked again.
 	Attempts int
-	// Pinned are the items of the folded prefix that [WithPin] kept, in
-	// their order. They follow Output on the request and are not part
+	// Pinned are the items of the folded prefix the fold kept, in their
+	// order: the person's own messages within [WithPersonBound] and the
+	// items [WithPin] names. They follow Output on the request and are not part
 	// of it.
 	Pinned openresponses.Items
 	// Request is the request [NewLocal] sent for the fold's last
@@ -368,6 +393,7 @@ type Transform struct {
 	prompt      string
 	summaryItem func(string) openresponses.Item
 	pin         func(openresponses.Item) bool
+	personBound int
 	request     func(*openresponses.Request)
 
 	mu sync.Mutex
@@ -641,6 +667,7 @@ func newTransform(opts []Option) *Transform {
 		filter:      agentturn.DefaultFilter,
 		prompt:      DefaultSummaryPrompt,
 		summaryItem: SummaryMessage,
+		personBound: DefaultPersonBound,
 	}
 	for _, opt := range opts {
 		opt(t)
@@ -785,7 +812,7 @@ func (t *Transform) Last() openresponses.Item {
 // its budget, with instructions, when not empty, for that fold alone:
 // [NewLocal] sends them after the summary prompt, and [New], whose
 // compaction endpoint takes no prompt, ignores them. The fold is the
-// one a call over budget makes, kept tail and [WithPin] included, and
+// one a call over budget makes, kept tail and pinned items included, and
 // is reported to [WithOnFold] as any other, so a recorder writes it.
 // [WithMinFold] still guards it: a prefix too small to fold is left as
 // it is, and so is a transcript whose older part the remembered fold
@@ -828,6 +855,8 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 		settings = t.settings(req)
 	}
 	quarantined := agentturn.QuarantineFromContext(ctx)
+	// The person's own messages, which a fold keeps verbatim (#298).
+	persons := agentturn.PersonMessagesFromContext(ctx)
 	t.mu.Lock()
 	// A fold FoldNext asked for is requested; one only the loop's
 	// retry after an overflow asked for is forced and not requested.
@@ -892,7 +921,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 		t.mu.Unlock()
 		return view, nil
 	}
-	pinned := t.pinned(items[:split])
+	pinned := t.pinned(items[:split], persons)
 	var first openresponses.Item
 	if split < len(items) {
 		first = items[split]
@@ -938,20 +967,31 @@ func (t *Transform) backOff(items agentturn.Transcript, split, tokens int) bool 
 	return PrefixHash(items[:t.failLen]) == t.failHash
 }
 
-// pinned returns the items of the folded prefix that the pin keeps, in
-// their order, filtered as the request is so an app-only item never
-// reaches the server.
-func (t *Transform) pinned(prefix agentturn.Transcript) openresponses.Items {
-	if t.pin == nil {
+// pinned returns the items of the folded prefix that the pin keeps and
+// the person's own messages among them within the bound, in their
+// order, filtered as the request is so an app-only item never reaches
+// the server.
+func (t *Transform) pinned(prefix agentturn.Transcript, persons agentturn.PersonMessages) openresponses.Items {
+	if t.pin == nil && (len(persons) == 0 || t.personBound <= 0) {
 		return nil
 	}
 	var out openresponses.Items
 	for _, item := range t.filter(prefix) {
-		if t.pin(item) {
+		if (t.pin != nil && t.pin(item)) || t.keepsPerson(persons, item) {
 			out = append(out, item)
 		}
 	}
 	return out
+}
+
+// keepsPerson reports whether item is one of the person's own messages
+// and within the bound [WithPersonBound] sets.
+func (t *Transform) keepsPerson(persons agentturn.PersonMessages, item openresponses.Item) bool {
+	if t.personBound <= 0 || !persons.Has(item) {
+		return false
+	}
+	data, err := json.Marshal(item)
+	return err == nil && len(data) <= t.personBound
 }
 
 // view returns the transcript with the remembered fold applied, and how

@@ -448,6 +448,21 @@ that a recorder holding the transcript and the settings rebuilds it:
    those settings in the budget, and SHOULD weigh an image by the
    provider's visual cost, a fixed cost or one derived from the
    image's dimensions, rather than by its encoded size (#279).
+   The loop MUST make available to the transform which items of the
+   transcript are the person's own messages: the user messages it
+   appended as a prompt, a steer or a follow-up under a trigger of
+   kind `human`, other than one composed from instruction layers,
+   copied or hidden, which a recorder writes without that kind (see
+   The record). A host that rebuilds a transcript gives them back, as
+   it gives the producers of its reasoning items (step 3), and one
+   that seeds an agent from a record reads them there by agentsession
+   RFC 0001's rule for `human`, a message a fold pinned included. A
+   transform that folds SHOULD keep each of them verbatim, up to a
+   size bound the host sets, and MUST record those it kept as pinned.
+   A message over the bound, or one the host composed, is folded like
+   any other item. Only the transform's context carries them: a run a
+   hook or a tool starts is prompted with copies, which are not the
+   person's (#298).
 3. Apply the **filter** to the result, which removes what the model
    must not see. Then leave out every reasoning item the loop knows a
    model under another model name produced: a reasoning item carries a
@@ -2142,7 +2157,7 @@ maps onto it as follows:
 | copied item | `Copied(item)`, which `tools/agent`'s `WithCallConfig` sets on the items it takes from the parent; `Copied` on the item events |
 | filter | `Config.Filter`; `DefaultFilter`, `VisibleFilter(types…)` |
 | reasoning another model produced | `ReasoningModels` (`Attribute`, `For`); `WithReasoningModels` for an agent, `ContextWithReasoningModels` for `Run` and `Continue`, and on every hook's and tool's context |
-| transform | `Config.Transform`; `compact.New`, `compact.NewLocal` as the reference; `compact.MarkFold`/`compact.IsFold` for a fold's own model call; `(*compact.Transform).FoldNext(instructions)` for a fold on request, `ContextWithFoldRequest`/`FoldRequested` for the loop's after an overflow, `compact.Fold.Forced`, and `Requested`/`Instructions` for a fold asked for through `FoldNext` alone; the settings a transform reads, `ContextWithRequest`/`RequestFromContext`, weighed by `compact.EstimateSettings`, and images by `compact.ImageTokens` in `compact.Estimate` |
+| transform | `Config.Transform`; `compact.New`, `compact.NewLocal` as the reference; `compact.MarkFold`/`compact.IsFold` for a fold's own model call; the person's own messages, `PersonMessages` (`Has`), `PersonMessagesFromContext` for a transform, `WithPersonMessages`/`Agent.SetPersonMessages` for an agent and `ContextWithPersonMessages` for `Run` and `Continue`, kept by `compact` under `compact.WithPersonBound` (`compact.DefaultPersonBound`) beside `compact.WithPin`, and read from a record by `session.TranscriptMarks`, which `session.AgentOptions` and `MoveTo` use; `(*compact.Transform).FoldNext(instructions)` for a fold on request, `ContextWithFoldRequest`/`FoldRequested` for the loop's after an overflow, `compact.Fold.Forced`, and `Requested`/`Instructions` for a fold asked for through `FoldNext` alone; the settings a transform reads, `ContextWithRequest`/`RequestFromContext`, weighed by `compact.EstimateSettings`, and images by `compact.ImageTokens` in `compact.Estimate` |
 | configuration | `Config`; `Config.BaseRequest`, `Config.ResolveTools` |
 | tools of the moment | `Config.Tools`, `Config.ToolProvider` |
 | execution mode, bound | `Config.ToolExecution` (`ExecParallel`, `ExecSequential`), `Config.MaxParallelTools` |
@@ -2456,6 +2471,11 @@ it.
   calls the remote escalated to its caller to the elicitor of the call
   that started the task, and answers them on the same task with an
   approval each (#296).
+- **The request, step 2.** The loop makes available to the transform
+  which items are the person's own messages, and a host that rebuilds
+  a transcript gives them back; a transform that folds keeps them
+  verbatim up to a bound the host sets and records them as pinned
+  (#298).
 
 ## Changes in draft 0.6
 

@@ -173,6 +173,7 @@ func observe(ctx context.Context, t Transcript, prompts openresponses.Items, cfg
 				transcript: append(Transcript(nil), t...),
 				runCtx:     runCtx,
 				reasoning:  reasoningFromContext(ctx).merged(nil),
+				persons:    personsFromContext(ctx).merged(nil),
 				quarantine: runQuarantine(ctx),
 				// Every event is sent, cancelled or not: the consumer
 				// below drains the channel until the run returns, so a
@@ -755,6 +756,9 @@ type runner struct {
 	// reasoning says which model produced the reasoning items of the
 	// transcript it knows, so a request leaves another model's out.
 	reasoning ReasoningModels
+	// persons names the person's own messages of the transcript it
+	// knows, which the transform reads from its context (#298).
+	persons PersonMessages
 	// quarantine holds the items every request leaves out or sends as
 	// a placeholder: the agent's, shared, or the run's own for Run.
 	quarantine *quarantine
@@ -1651,6 +1655,17 @@ func (r *runner) appendOne(item openresponses.Item, mode InputMode, trigger, end
 	r.transcript = append(r.transcript, item)
 	r.added = append(r.added, item)
 	r.arrived = append(r.arrived, TurnInput{Item: item, Mode: mode, Trigger: trigger})
+	// The trigger the item's record names: the one it arrived under,
+	// its own source over it, or, for a prompt a resume carries and a
+	// note, the one its item_end carries.
+	named := trigger
+	if named.IsZero() {
+		named = endTrigger
+	}
+	if r.persons == nil {
+		r.persons = PersonMessages{}
+	}
+	r.persons.add(item, named, prov, hidden, copied)
 	if err := r.emit(&ItemEnd{RunID: r.runID, Turn: r.turn, Item: item, Hidden: hidden, Copied: copied, Trigger: endTrigger, Provenance: prov.clone()}); err != nil {
 		return err
 	}
@@ -1693,7 +1708,10 @@ func (r *runner) build(ctx context.Context, tools agenttool.Set, settings *openr
 	input := Transcript(append(openresponses.Items(nil), r.transcript...))
 	if r.cfg.Transform != nil {
 		var err error
-		input, err = r.cfg.Transform(ContextWithRequest(ctx, weighed), input)
+		// The transform reads which items are the person's own
+		// messages, which no hook or tool does (#298).
+		tctx := context.WithValue(ContextWithRequest(ctx, weighed), personsKey{}, r.persons)
+		input, err = r.cfg.Transform(tctx, input)
 		if err != nil {
 			return openresponses.Request{}, built{}, fmt.Errorf("agentturn: transform: %w", err)
 		}
@@ -2792,9 +2810,11 @@ func (r *runner) quarantined() openresponses.Items {
 // attributed is ctx carrying the run's reasoning attribution as it
 // stands, which the context of every hook and tool carries, so a run one
 // of them starts over the run's items leaves out the reasoning another
-// model produced (#242).
+// model produced (#242). It carries no person's messages: a run a hook
+// or a tool starts is prompted with copies of the run's items, which
+// are not the person's (#298).
 func (r *runner) attributed(ctx context.Context) context.Context {
-	return context.WithValue(ContextWithReasoningModels(ctx, r.reasoning), quarantineKey{}, r.quarantine)
+	return context.WithValue(ContextWithReasoningModels(withoutPersons(ctx), r.reasoning), quarantineKey{}, r.quarantine)
 }
 
 // toolContext is the context hooks and tools run under: ctx with a

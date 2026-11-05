@@ -2579,17 +2579,20 @@ func callAt(s *agentsession.Session, d *agentsession.DispatchEntry, callEntry st
 // as [Pending] does. The transcript is [Transcript]'s, its reasoning
 // items attributed as [TranscriptModels] attributes them, so the loop
 // leaves another model's out of each request after a resume, as it
-// does for the items its own runs produced. In a sidecar session every
+// does for the items its own runs produced, and the person's own
+// messages of it marked as [TranscriptMarks] reads them, so a fold
+// after the resume keeps them verbatim as one before it did
+// (agentturn.WithPersonMessages; #298). In a sidecar session every
 // item it hands the agent carries its media as data URLs, each
 // sidecar: reference resolved through [WithBlobs], which
 // [Recorder.ReadOptions] carries, and it fails with [ErrNoBlobReader]
 // for one it has no reader to resolve.
 func AgentOptions(s *agentsession.Session, opts ...ReadOption) ([]agentturn.Option, error) {
-	items, models, pending, owed, ids, err := agentState(s, opts)
+	items, models, persons, pending, owed, ids, err := agentState(s, opts)
 	if err != nil {
 		return nil, err
 	}
-	return []agentturn.Option{agentturn.WithTranscript(items), agentturn.WithReasoningModels(models), agentturn.WithPending(pending), agentturn.WithNotes(owed), agentturn.WithReservedCallIDs(ids)}, nil
+	return []agentturn.Option{agentturn.WithTranscript(items), agentturn.WithReasoningModels(models), agentturn.WithPersonMessages(persons), agentturn.WithPending(pending), agentturn.WithNotes(owed), agentturn.WithReservedCallIDs(ids)}, nil
 }
 
 // Transcript returns the agent's transcript at the session's leaf: the
@@ -2638,17 +2641,44 @@ func Transcript(s *agentsession.Session, opts ...ReadOption) (openresponses.Item
 // attribution holds an item by identity, so models attributes no other
 // copy of the transcript.
 func TranscriptModels(s *agentsession.Session, opts ...ReadOption) (openresponses.Items, agentturn.ReasoningModels, error) {
+	items, models, _, err := TranscriptMarks(s, opts...)
+	return items, models, err
+}
+
+// TranscriptMarks is [TranscriptModels] with, beside it, which messages
+// of the transcript the person wrote, keyed to those very items, for
+// agentturn.WithPersonMessages, Agent.SetPersonMessages or
+// agentturn.ContextWithPersonMessages, so a transform keeps them after
+// a resume as it did before (#298). A message is the person's when its
+// entry reads as theirs by agentsession RFC 0001's trigger rule
+// (agentsession.WordsOf) and is neither hidden nor copied, which
+// agentturn writes without the kind human: a user message whose source
+// has the kind human, composed from no instruction layers and
+// forwarded from no link. One a fold pinned, which the context holds
+// from its compaction entry, is the person's when the path before it
+// holds that message, as written, as the person's. A record whose
+// writer stamped human on what it composed, as one before format 0.21
+// may have, is read as written.
+func TranscriptMarks(s *agentsession.Session, opts ...ReadOption) (openresponses.Items, agentturn.ReasoningModels, agentturn.PersonMessages, error) {
 	cx, err := s.Context()
 	if err != nil {
-		return nil, nil, fmt.Errorf("session: context at leaf: %w", err)
+		return nil, nil, nil, fmt.Errorf("session: context at leaf: %w", err)
 	}
 	items, entries := agentTranscriptOf(cx)
+	path := s.Path(s.Leaf())
+	// Whose words each item is, read from the items as the path holds
+	// them, before a sidecar's media is resolved.
+	theirs := personsOf(path, items, entries)
 	if err := resolverFor(s, opts).items(s.ID(), items); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	produced := producedModels(s.Path(s.Leaf()))
+	produced := producedModels(path)
 	models := agentturn.ReasoningModels{}
+	persons := agentturn.PersonMessages{}
 	for i, item := range items {
+		if m, ok := item.(*openresponses.Message); ok && theirs[i] {
+			persons[m] = true
+		}
 		r, ok := item.(*openresponses.ReasoningItem)
 		if !ok {
 			continue
@@ -2657,7 +2687,51 @@ func TranscriptModels(s *agentsession.Session, opts ...ReadOption) (openresponse
 			models[r] = model
 		}
 	}
-	return items, models, nil
+	return items, models, persons, nil
+}
+
+// personsOf reports, for each of items, which entries names, whether
+// it is a message the person wrote, as [TranscriptMarks] reads it.
+func personsOf(path []agentsession.Entry, items openresponses.Items, entries []string) []bool {
+	byID := make(map[string]agentsession.Entry, len(path))
+	// The person's messages of the path, as written, for a pinned copy
+	// of one to be matched with.
+	var written [][]byte
+	for _, e := range path {
+		byID[e.Base().ID] = e
+		if ie, ok := e.(*agentsession.ItemEntry); ok && personEntry(ie) {
+			if c, ok := canonicalValue(ie.Item); ok {
+				written = append(written, c)
+			}
+		}
+	}
+	out := make([]bool, len(items))
+	for i, item := range items {
+		if m, ok := item.(*openresponses.Message); !ok || m.Role != openresponses.RoleUser {
+			continue
+		}
+		switch e := byID[entries[i]].(type) {
+		case *agentsession.ItemEntry:
+			out[i] = personEntry(e)
+		case *agentsession.CompactionEntry:
+			// The summary is the compaction's too; a pinned message is
+			// told from it by being one the path holds as the person's.
+			if c, ok := canonicalValue(item); ok {
+				out[i] = slices.ContainsFunc(written, func(w []byte) bool { return bytes.Equal(w, c) })
+			}
+		}
+	}
+	return out
+}
+
+// personEntry reports whether e holds a message the person wrote: one
+// agentsession.WordsOf reads as theirs that is neither hidden nor
+// copied, which agentturn never writes as the person's (#303).
+func personEntry(e *agentsession.ItemEntry) bool {
+	if agentsession.WordsOf(e) != agentsession.WordsPerson || e.CopiedFrom != nil {
+		return false
+	}
+	return e.Visible == nil || *e.Visible
 }
 
 // producedModels returns, for each entry of path that holds a

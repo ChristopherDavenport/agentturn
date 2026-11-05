@@ -195,6 +195,9 @@ type Agent struct {
 	// transcript it knows, so a run leaves another model's out of its
 	// requests.
 	reasoning ReasoningModels
+	// persons names the person's own messages of the transcript it
+	// knows, which a run puts on the transform's context.
+	persons PersonMessages
 	// quarantine holds the items quarantined for the rest of the
 	// conversation, shared with each run.
 	quarantine *quarantine
@@ -442,6 +445,7 @@ func (a *Agent) SetTranscript(t Transcript) error {
 	known := a.pending
 	a.transcript = append(Transcript(nil), t...)
 	a.reasoning = a.reasoning.retain(a.transcript)
+	a.persons = a.persons.retain(a.transcript)
 	a.pending = pendingCalls(unansweredCalls(a.transcript), PendingUnknown)
 	mergePending(a.pending, known)
 	// The notes waiting on the calls pending before stay while one of
@@ -1287,6 +1291,7 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, notes []
 			prior:       prior,
 			reserved:    a.reserved,
 			reasoning:   a.reasoning.merged(reasoningFromContext(ctx)),
+			persons:     a.persons.merged(personsFromContext(ctx)),
 			quarantine:  inheritQuarantine(ctx, a.quarantine),
 			runID:       runID,
 			resuming:    resuming,
@@ -1298,6 +1303,7 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, notes []
 
 		a.mu.Lock()
 		a.reasoning = r.reasoning.retain(a.transcript)
+		a.persons = r.persons.retain(a.transcript)
 		a.running = false
 		a.closing = false
 		a.cancel, a.runCancel = nil, nil

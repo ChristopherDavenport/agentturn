@@ -262,6 +262,10 @@ type Config struct {
 	// takes over the conversation and should see less of it, belongs in
 	// [Agent.SetTranscript] between runs: a transform that drops items
 	// does so on every call, the receiver's own tool outputs included.
+	// Its context carries the settings the request will carry
+	// ([RequestFromContext]) and the person's own messages among the
+	// transcript ([PersonMessagesFromContext]), which a transform that
+	// folds keeps verbatim (#298).
 	Transform func(context.Context, Transcript) (Transcript, error)
 
 	// BeforeToolCall runs once per call, in the model's order, before any

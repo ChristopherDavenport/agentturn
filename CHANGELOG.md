@@ -100,6 +100,21 @@ versions may break the API.
   names the agent that would run an asked call that is not this run's;
   `Ask` names it in the question and leaves the answerer's note for its
   caller to send on. RFC 0001 draft 0.7, Composition. (#296)
+- Added: the transform's context names the person's own messages,
+  `PersonMessagesFromContext` (`PersonMessages`): the user messages a
+  run appended under a trigger of kind `human` that the host did not
+  compose from layers, copy or hide. The agent keeps them across runs;
+  `WithPersonMessages`, `Agent.SetPersonMessages` and
+  `ContextWithPersonMessages` give them for a rebuilt transcript.
+  `compact`'s folds keep them verbatim after the summary, as pinned
+  items, up to `WithPersonBound` bytes (`DefaultPersonBound`, 8 KiB),
+  so after two folds the request still holds what the person asked;
+  `WithPin` adds to them. `session.TranscriptMarks` reads them from a
+  record, a message a fold pinned included, and `session.AgentOptions`
+  and `MoveTo` seed the agent with them. A host that relied on a fold
+  summarising every message the person typed under `human` passes
+  `compact.WithPersonBound(0)`. RFC 0001 draft 0.7, The request.
+  (#298)
 
 ## v0.0.37 - 2026-11-04
 
