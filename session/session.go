@@ -1002,6 +1002,12 @@ type Recorder struct {
 	// the child runs again; one for a child with none yet is written at
 	// the start of the run that takes it.
 	heldQueued map[childKey][]*heldReport
+	// handedBack holds, by child session, the inputs [Recorder.ChildRecord]
+	// handed back to a child it continues, which the child's record
+	// owes under entries it holds already: the child's report of each,
+	// made before the run that takes it, writes nothing and names that
+	// entry.
+	handedBack map[string][]*inboxItem
 	// childIDs holds the ID of every child session the recorder has
 	// written, so a record naming one by [SessionIDFromContext] after
 	// its run ended is filed there rather than at the root.
@@ -4635,7 +4641,10 @@ func (r *Recorder) ChildRecord(ctx context.Context, call agenttool.Call, cfg age
 		return nil, err
 	}
 	out := &agent.Record{RunID: last.RunID(), Pending: pending}
-	if len(pending) == 0 {
+	if out.Queued, err = r.handBack(ctx, cs, opts); err != nil {
+		return nil, err
+	}
+	if len(pending) == 0 && len(out.Queued) == 0 {
 		items, err := Transcript(cs, opts...)
 		if err != nil {
 			return nil, err
@@ -4653,6 +4662,64 @@ func (r *Recorder) ChildRecord(ctx context.Context, call agenttool.Call, cfg age
 		return nil, err
 	}
 	return out, nil
+}
+
+// handBack returns the inputs the child session cs owes at its leaf,
+// as the continued child is handed them, in the order they were
+// accepted, and remembers them for the child's reports of them, which
+// then write nothing: the path holds each, closed and queued again by
+// the end that closed the cut run. The caller holds r.mu.
+func (r *Recorder) handBack(ctx context.Context, cs *agentsession.Session, opts []ReadOption) ([]agent.QueuedInput, error) {
+	owed, err := cs.PendingQueued(cs.Leaf())
+	if err != nil {
+		return nil, fmt.Errorf("session: queued inputs of %s: %w", cs.ID(), err)
+	}
+	delete(r.handedBack, cs.ID())
+	if len(owed) == 0 {
+		return nil, nil
+	}
+	// Resolved as Requeue resolves the root's, so a sidecar session's
+	// media comes back as the agent holds it.
+	m := resolverFor(cs, opts)
+	var out []agent.QueuedInput
+	var held []*inboxItem
+	for _, q := range owed {
+		item, err := m.item(cs.ID(), q.Item)
+		if err != nil {
+			return nil, fmt.Errorf("session: queued input %s: %w", q.ID, err)
+		}
+		in := &inboxItem{item: item, mode: q.Mode, trigger: q.Trigger, entry: q.ID, deliver: q.Deliver, held: true, awaiting: true}
+		in.hidden, in.prov = queuedMarks(q)
+		held = append(held, in)
+		mode := agentturn.QueueFollowUp
+		if in.mode == agentsession.ModeSteer {
+			mode = agentturn.QueueSteer
+		}
+		var trigger agentturn.Trigger
+		if in.trigger != nil {
+			trigger = agentTrigger(in.trigger)
+		}
+		out = append(out, agent.QueuedInput{Item: in.marked(), Mode: mode, Deliver: in.deliver, Trigger: trigger})
+	}
+	if r.handedBack == nil {
+		r.handedBack = map[string][]*inboxItem{}
+	}
+	r.handedBack[cs.ID()] = held
+	return out, nil
+}
+
+// takeHandedBack returns the input handed back to the child session id
+// that item is, once, and nil when there is none. The caller holds
+// r.mu.
+func (r *Recorder) takeHandedBack(id string, item openresponses.Item) *inboxItem {
+	for i, in := range r.handedBack[id] {
+		if in.awaiting && in.item == item {
+			r.handedBack[id] = append(r.handedBack[id][:i:i], r.handedBack[id][i+1:]...)
+			in.awaiting = false
+			return in
+		}
+	}
+	return nil
 }
 
 // linkedUnder reads path for the call callID running under key, whose
@@ -5242,7 +5309,11 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 			r.heldQueued = map[childKey][]*heldReport{}
 		}
 		h := &heldReport{q: e}
-		if id != "" && r.childIDs[id] {
+		if in := r.takeHandedBack(id, e.Item); in != nil {
+			// An input ChildRecord handed back: the child's session
+			// owes it under its entry, which the run takes it from.
+			h.session, h.entry = id, in.entry
+		} else if id != "" && r.childIDs[id] {
 			// The child's session continues at its leaf: the input is
 			// owed there from now, after the run that ended.
 			if w, err := r.reopenID(ctx, id); err == nil && w != nil && w.queued(ctx, e) == nil && len(w.inbox) > 0 {
@@ -5294,6 +5365,9 @@ func (r *Recorder) Observe(ctx context.Context, ev agentturn.Event) {
 		}
 		held := r.heldQueued[key]
 		delete(r.heldQueued, key)
+		// What was handed back and not reported is not the run's: its
+		// end closes the entry, as it closes any owed input nobody took.
+		delete(r.handedBack, w.id)
 		retry := agent.RetryFromContext(ctx)
 		for _, h := range held {
 			if h.entry != "" && h.session == w.id && !retry {

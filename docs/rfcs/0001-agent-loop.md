@@ -1812,7 +1812,9 @@ An agent stands in four places inside another system:
   afresh, so a deferral that was open when the process stopped is
   asked again under the same call, and its answer decides the
   callee's call: the child continues its session from the record,
-  every call it left pending answered by the replay rule, a call its
+  the inputs it had accepted and not taken handed back to it first, as
+  Queues has a recorder hand back what it owes, every call it left
+  pending answered by the replay rule, a call its
   policy was deciding, which never started, put to the policy again,
   and one it held with nobody answering put to the policy again when
   the tool puts the child's deferrals to the caller's elicitor; a
@@ -2600,7 +2602,8 @@ it.
 - **Composition, as a tool.** A composition tool that can continue its
   callee from the record SHOULD report itself keyed, and a call run
   again under its key SHOULD continue that callee, so a deferral open
-  when the process stopped is asked again under the same call; one
+  when the process stopped is asked again under the same call, and the
+  inputs the callee owed are handed back to it; one
   whose callee the record does not hold fails with the outcome
   unknown rather than start it afresh (#297).
 

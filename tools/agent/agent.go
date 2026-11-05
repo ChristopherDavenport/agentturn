@@ -525,6 +525,24 @@ type Record struct {
 	// with nothing pending: the call returns what that end says and
 	// runs nothing. Err says why for an end without an answer.
 	End *agentturn.RunEnd
+	// Queued are the inputs the child accepted and had not taken when
+	// the process stopped, which the record still owes it, in the order
+	// they were accepted: the call hands them back to the continued
+	// child before its run, as a recorder hands the root its owed inputs
+	// (RFC 0001, Queues), so the run takes them under the entries the
+	// record holds.
+	Queued []QueuedInput
+}
+
+// QueuedInput is an input a child's record owes it, handed back the
+// way it arrived: Item with the marks it was accepted with, the queue
+// it joined, whether it came as a delivery, which goes back through
+// agentturn.Agent.Redeliver, and the trigger that brought it in.
+type QueuedInput struct {
+	Item    openresponses.Item
+	Mode    agentturn.QueueMode
+	Deliver bool
+	Trigger agentturn.Trigger
 }
 
 // ErrNoRecord is what a [WithRecord] loader returns, wrapped, for a
@@ -560,7 +578,8 @@ var ErrNoRecord = errors.New("outcome unknown: the call was run again after it w
 // A child the record holds continues on a new agent seeded with
 // [Record.Options], its run not marked [ContextWithRetry], so its
 // session goes on at its leaf. Its pending calls are answered with
-// [Record.Answers]; one its policy held, a deferral nobody answered,
+// [Record.Answers], and the inputs it owes ([Record.Queued]) are
+// handed back to it first; one its policy held, a deferral nobody answered,
 // goes back to its BeforeToolCall under [WithAskParent], which asks the
 // elicitor of the call that started the child again, under that call,
 // and otherwise the call fails input-required naming it, as the child
@@ -862,6 +881,22 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 			done = true
 			mu.Unlock()
 		})
+	}
+	if restored != nil {
+		// The inputs the child owes go back to it before its run, so
+		// the run takes them.
+		for _, q := range restored.Queued {
+			qctx := agentturn.ContextWithTrigger(ctx, q.Trigger)
+			var err error
+			if q.Deliver {
+				err = child.Redeliver(qctx, q.Item)
+			} else {
+				err = child.Queue(qctx, q.Mode, q.Item)
+			}
+			if err != nil {
+				return agenttool.Result{}, fmt.Errorf("agent %q: hand back the child's owed input: %w", a.cfg.Name, err)
+			}
+		}
 	}
 	var end *agentturn.RunEnd
 	switch {

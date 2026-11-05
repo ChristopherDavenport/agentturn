@@ -17,7 +17,9 @@ versions may break the API.
   new root; its pending calls are answered by the replay rule, and a
   call its policy was deciding goes back to `BeforeToolCall`, so under
   `WithAskParent` the question open when the process stopped is asked
-  again under the parent's call. A child that had ended with nothing
+  again under the parent's call. The inputs it had accepted and not
+  taken (`Record.Queued`, `QueuedInput`) are handed back to it before
+  its run, which takes them under the entries its record holds. A child that had ended with nothing
   pending returns that end and runs nothing; a call under a new key,
   and a detached one, start afresh as before. A call that repeats a
   hand-off whose child the record does not hold, a recorder made with
