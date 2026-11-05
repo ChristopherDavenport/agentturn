@@ -1061,9 +1061,12 @@ const (
 // Queued reports an item [Agent.Steer] or [Agent.FollowUp] accepted
 // into a queue, before any run appends it, so a host writing what it
 // accepted can tell an item it was given from one a run produced. It
-// belongs to no run: the goroutine that owns delivery reports it at its
-// next event, which is why it is not the accept itself and a
-// subscriber's error cannot refuse the item.
+// belongs to no run: it is delivered under the delivery barrier after
+// the accept, by a run in flight without waiting for its next event
+// (#302) and by an idle agent at the next run's start, which is why it
+// is not the accept itself and a subscriber's error cannot refuse the
+// item. A subscriber's error on a report made between the run's events
+// ends the run at its next event.
 //
 // RunID names the run that was in flight when the item was accepted,
 // from the moment it was started, and is empty when the agent was idle

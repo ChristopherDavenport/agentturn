@@ -481,18 +481,29 @@ func (a *Agent) eventContext() context.Context {
 // not take. It takes the barrier again only when it is free; when it is
 // not, the holder runs this as it lets go, so no owed event is left
 // behind. The caller holds a.emitMu.
+//
+// It reports, too, the items a run in flight accepted while the barrier
+// was held ([Agent.reportQueued]), in one pass: an item a subscriber
+// accepts while those are reported waits for the run's next event, so
+// a subscriber that queues on every queued report does not spin here.
 func (a *Agent) unlockEmit() error {
+	reported := false
 	for {
 		a.emitMu.Unlock()
 		a.mu.Lock()
 		owed := len(a.quarantineOwed) > 0
+		queued := !reported && a.queuedOwed()
 		a.mu.Unlock()
-		if !owed || !a.emitMu.TryLock() {
+		if !owed && !queued || !a.emitMu.TryLock() {
 			return nil
 		}
 		if err := a.flushQuarantine(a.eventContext()); err != nil {
 			a.emitMu.Unlock()
 			return err
+		}
+		if queued {
+			reported = true
+			a.flushQueued()
 		}
 	}
 }

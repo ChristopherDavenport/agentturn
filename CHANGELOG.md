@@ -144,6 +144,32 @@ versions may break the API.
   offer. The configurations `Team.Config`, `Team.Route` and the switch
   hand out carry it; unset, nothing changes. RFC 0001 draft 0.7,
   Composition. (#307)
+- Added: `Agent.Accept`, a delivery in two steps: it returns once the
+  items are queued, with a `*Delivery` whose `Wait` (and `Done`) gives
+  what `Deliver` returns once the agent has settled it, which it does
+  whether or not anyone waits, starting the run that takes the items
+  on the caller's values without its cancellation. `Accepter` names it
+  for a `Control`, and `NewDelivery` lets another implementation hand
+  one back. `front/control` serves it as `POST /accept`, the accept and
+  then the outcome on one response, `Client.Accept` takes it, and
+  `session.Recorder.Accept` and `RecordedControl` write the `queued`
+  entry before the agent accepts. A view forwarding a person's steer
+  answers once the agent has it, so a second steer typed while a quiet
+  tool runs is not held behind the first's outcome. RFC 0001 draft
+  0.7, Queues. (#302)
+- Changed: a run in flight reports a `Queued` event without waiting
+  for its next event: at once, on a goroutine of its own, when no
+  event is being delivered as `Queue`, `Steer`, `FollowUp`, `Deliver`
+  or `Accept` accepts, and otherwise right after the event that is, so a steer accepted while a quiet tool
+  runs is reported while it runs. A subscriber's error on such a report
+  ends the run at its next event. RFC 0001 draft 0.7, Queues. (#302)
+- Changed (breaking for a wrapper that embeds `*Agent`): a type that
+  embeds `*agentturn.Agent` and overrides `Deliver` to write first, as
+  `session`'s `RecordedControl` does, now also has the embedded
+  `Accept`, which skips its write; such a wrapper overrides `Accept`
+  too. (#302)
+- Added: `front/control` carries `ErrHeld` across the wire as the code
+  `held`. (#302)
 
 ## v0.0.37 - 2026-11-04
 

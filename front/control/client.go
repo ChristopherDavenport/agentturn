@@ -271,6 +271,109 @@ func (c *Client) Deliver(ctx context.Context, items ...openresponses.Item) (bool
 
 var _ agentturn.Deliverer = (*Client)(nil)
 
+// Accept implements agentturn.Accepter: it returns once the server's
+// agent has queued the items as a delivery, and the [agentturn.Delivery]
+// it returns is settled with what [Client.Deliver] would have returned
+// once the agent has settled the delivery, which it does whether or not
+// anyone waits. The outcome arrives on the same response, which stays
+// open until then; a client whose WithHTTPClient sets a Timeout cuts it
+// off. Cancelling ctx before the accept arrives returns ctx's error,
+// and the items may have been queued all the same; once Accept has
+// returned, ctx bounds nothing. A connection lost before the outcome
+// settles the delivery with an error wrapping [ErrConnectionLost], the
+// agent settling it all the same. A server whose Control offers no
+// two-step delivery, or that serves no POST /accept, answers
+// [ErrNoDelivery].
+func (c *Client) Accept(ctx context.Context, items ...openresponses.Item) (*agentturn.Delivery, error) {
+	raw, err := itemsOut(items)
+	if err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(struct {
+		Items json.RawMessage `json:"items"`
+	}{raw})
+	if err != nil {
+		return nil, err
+	}
+	// The response outlives ctx once the accept is in: the outcome
+	// follows on it.
+	reqCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stop := context.AfterFunc(ctx, cancel)
+	fail := func(resp *http.Response, err error) (*agentturn.Delivery, error) {
+		stop()
+		cancel()
+		if resp != nil {
+			resp.Body.Close()
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.base.JoinPath("accept").String(), bytes.NewReader(body))
+	if err != nil {
+		return fail(nil, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return fail(nil, err)
+	}
+	if resp.StatusCode/100 != 2 {
+		data, rerr := io.ReadAll(io.LimitReader(resp.Body, c.maxBody))
+		if rerr != nil {
+			return fail(resp, rerr)
+		}
+		var e errReply
+		switch {
+		case json.Unmarshal(data, &e) == nil && e.Err != nil:
+			return fail(resp, errorIn(e.Err))
+		case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed:
+			// A server that predates the two-step delivery.
+			return fail(resp, fmt.Errorf("%w: POST accept: %s", ErrNoDelivery, resp.Status))
+		}
+		return fail(resp, fmt.Errorf("control: POST accept: %s", resp.Status))
+	}
+	dec := json.NewDecoder(io.LimitReader(resp.Body, c.maxBody))
+	var first acceptReply
+	if err := dec.Decode(&first); err != nil {
+		return fail(resp, err)
+	}
+	if first.Err != nil || !first.Accepted {
+		err := errorIn(first.Err)
+		if err == nil {
+			err = errors.New("control: accept: the server did not accept the items")
+		}
+		return fail(resp, err)
+	}
+	// Accepted: from here ctx bounds nothing. Should it have ended in
+	// between, the outcome's read fails, and the delivery says the
+	// connection was lost.
+	stop()
+	d, settle := agentturn.NewDelivery()
+	go func() {
+		defer cancel()
+		defer resp.Body.Close()
+		var out deliverReply
+		if err := dec.Decode(&out); err != nil {
+			settle(false, nil, fmt.Errorf("%w: %w", ErrConnectionLost, err))
+			return
+		}
+		var end *agentturn.RunEnd
+		if out.End != nil {
+			var err error
+			if end, err = runEndIn(*out.End); err != nil {
+				settle(false, nil, err)
+				return
+			}
+		}
+		settle(out.Joined, end, errorIn(out.Err))
+	}()
+	return d, nil
+}
+
+var _ agentturn.Accepter = (*Client)(nil)
+
 // Abort implements agentturn.Control. A failure goes to the
 // [WithStreamErrors] function.
 func (c *Client) Abort() {

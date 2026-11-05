@@ -3528,16 +3528,61 @@ func (r *Recorder) Queue(ctx context.Context, a *agentturn.Agent, mode agentturn
 // delivered, and the error says so; nothing is delivered then. It
 // returns what Deliver returns.
 func (r *Recorder) Deliver(ctx context.Context, a *agentturn.Agent, items ...openresponses.Item) (bool, *agentturn.RunEnd, error) {
-	trigger, err := sessionTrigger(agentturn.TriggerFromContext(ctx))
+	added, err := r.writeDelivery(ctx, a, items)
 	if err != nil {
 		return false, nil, err
+	}
+	joined, end, err := a.Deliver(ctx, items...)
+	if errors.Is(err, agentturn.ErrHeld) {
+		// A hold began after the check: the agent took nothing.
+		r.mu.Lock()
+		decline(added)
+		r.mu.Unlock()
+	}
+	return joined, end, err
+}
+
+// Accept is [Recorder.Deliver] in two steps, as agentturn.Agent.Accept
+// is Deliver's: each item's queued entry, carrying deliver, is written
+// durably before the agent accepts it (#244), and Accept returns once
+// the agent has, with the delivery whose Wait gives what Deliver
+// returns (#302). An error means nothing was delivered: an entry that
+// could not be written, or the agent's refusal, after which the
+// entries written are left to the next run end to drop, as for
+// Deliver.
+func (r *Recorder) Accept(ctx context.Context, a *agentturn.Agent, items ...openresponses.Item) (*agentturn.Delivery, error) {
+	added, err := r.writeDelivery(ctx, a, items)
+	if err != nil {
+		return nil, err
+	}
+	d, err := a.Accept(ctx, items...)
+	if err != nil {
+		// The agent queued nothing, held idle or given no item.
+		r.mu.Lock()
+		decline(added)
+		r.mu.Unlock()
+		return nil, err
+	}
+	return d, nil
+}
+
+// writeDelivery writes each item's queued entry, carrying deliver,
+// before a delivery hands them to a, and returns the inbox's inputs it
+// added. Nothing is written for an agent held idle, which would refuse
+// the delivery; an entry that cannot be written leaves none of them
+// held.
+func (r *Recorder) writeDelivery(ctx context.Context, a *agentturn.Agent, items []openresponses.Item) ([]*inboxItem, error) {
+	trigger, err := sessionTrigger(agentturn.TriggerFromContext(ctx))
+	if err != nil {
+		return nil, err
 	}
 	if a.State().Held {
 		// The agent would refuse it before queueing anything: nothing
 		// is written, so nothing is owed for an input nobody took.
-		return false, nil, agentturn.ErrHeld
+		return nil, agentturn.ErrHeld
 	}
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	n := len(r.root.inbox)
 	for _, item := range items {
 		if item == nil {
@@ -3547,14 +3592,12 @@ func (r *Recorder) Deliver(ctx context.Context, a *agentturn.Agent, items ...ope
 		t, err := itemTrigger(item, trigger)
 		if err != nil {
 			r.root.inbox = r.root.inbox[:n]
-			r.mu.Unlock()
-			return false, nil, err
+			return nil, err
 		}
 		in := (&inboxItem{item: base, mode: agentsession.ModeSteer, deliver: true, held: true, awaiting: true, trigger: t}).markFrom(item)
 		if err := r.root.resolveCopy(context.WithoutCancel(ctx), in); err != nil {
 			r.root.inbox = r.root.inbox[:n]
-			r.mu.Unlock()
-			return false, nil, err
+			return nil, err
 		}
 		r.root.inbox = append(r.root.inbox, in)
 	}
@@ -3564,18 +3607,9 @@ func (r *Recorder) Deliver(ctx context.Context, a *agentturn.Agent, items ...ope
 		// closes them; the agent holds none of the items, and a caller
 		// that retries delivers them anew.
 		decline(added)
-		r.mu.Unlock()
-		return false, nil, err
+		return nil, err
 	}
-	r.mu.Unlock()
-	joined, end, err := a.Deliver(ctx, items...)
-	if errors.Is(err, agentturn.ErrHeld) {
-		// A hold began after the check: the agent took nothing.
-		r.mu.Lock()
-		decline(added)
-		r.mu.Unlock()
-	}
-	return joined, end, err
+	return added, nil
 }
 
 // Redeliver queues items into a as agentturn.Agent.Redeliver does, a
@@ -3665,20 +3699,22 @@ func (w *writer) owedDelivery(item openresponses.Item, trigger *agentsession.Tri
 }
 
 // RecordedControl is the agentturn.Control a recorder offers for an
-// agent it records, with the delivery beside it: what a front serving
-// the agent to remote parties, front/control's Handler among them, is
-// given, so input queued or delivered over the wire is written before
-// the agent takes it.
+// agent it records, with the delivery beside it, in one step and in
+// two: what a front serving the agent to remote parties, front/control's
+// Handler among them, is given, so input queued or delivered over the
+// wire is written before the agent takes it.
 type RecordedControl interface {
 	agentturn.Control
 	agentturn.Deliverer
+	agentturn.Accepter
 }
 
 // Control returns a's Control with its Queue going through
-// [Recorder.Queue] and its Deliver through [Recorder.Deliver], so an
-// input a remote party hands in while the agent is idle or waits on an
-// approval is on the record before the agent takes it and survives a
-// quit. Every other method is a's own.
+// [Recorder.Queue], its Deliver through [Recorder.Deliver] and its
+// Accept through [Recorder.Accept], so an input a remote party hands in
+// while the agent is idle or waits on an approval is on the record
+// before the agent takes it and survives a quit. Every other method is
+// a's own.
 func (r *Recorder) Control(a *agentturn.Agent) RecordedControl {
 	return recordedControl{Agent: a, r: r}
 }
@@ -3698,6 +3734,13 @@ func (c recordedControl) Queue(ctx context.Context, mode agentturn.QueueMode, it
 // delivers it.
 func (c recordedControl) Deliver(ctx context.Context, items ...openresponses.Item) (bool, *agentturn.RunEnd, error) {
 	return c.r.Deliver(ctx, c.Agent, items...)
+}
+
+// Accept writes each item's queued entry, carrying deliver, then has
+// the agent accept it. Without it the embedded agent's Accept would
+// take the items unwritten.
+func (c recordedControl) Accept(ctx context.Context, items ...openresponses.Item) (*agentturn.Delivery, error) {
+	return c.r.Accept(ctx, c.Agent, items...)
 }
 
 // decline marks inputs whose entries were written and which the agent

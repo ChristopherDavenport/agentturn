@@ -410,7 +410,9 @@ behind the same hook.
   (JSON requests, a server-sent event stream of the events in a JSON
   envelope, scopes per method: read, control, answer, command);
   `Dial` returns a `Client` that is a `Control`, so a TUI drives an
-  agent elsewhere unchanged. The stream replays nothing but a waiting
+  agent elsewhere unchanged, and offers the delivery in one step
+  (`POST /deliver`) or two (`POST /accept`: the accept, then the
+  outcome). The stream replays nothing but a waiting
   question; what is committed comes from the record. A product's own
   controls are named commands beside the contract, never in it.
 

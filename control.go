@@ -69,6 +69,68 @@ type Deliverer interface {
 
 var _ Deliverer = (*Agent)(nil)
 
+// Accepter is the delivery a [Control] may offer in two steps, which
+// [Agent.Accept] is: Accept returns once the items are queued, in the
+// order given, and hands back a [Delivery] whose Wait gives what
+// [Deliverer]'s Deliver returns. The agent, not the caller, settles it:
+// the items join the run in flight, or the agent starts a run that
+// takes them once that run has ended, whether or not anyone waits. A
+// view that forwards a person's steer takes the accept and answers at
+// once, and a second steer typed while a quiet tool runs is not held
+// behind the first's outcome (#302). An error from Accept means
+// nothing was queued. *Agent implements it, and so do front/control's
+// Client and agentturn/session's RecordedControl, which writes the
+// items before the agent accepts them (#244).
+type Accepter interface {
+	Accept(ctx context.Context, items ...openresponses.Item) (*Delivery, error)
+}
+
+var _ Accepter = (*Agent)(nil)
+
+// Delivery is a delivery an [Accepter] took: its items are queued, and
+// its outcome, the one [Agent.Deliver] returns, arrives once the agent
+// has settled it. It is settled once and never changes after.
+type Delivery struct {
+	done   chan struct{}
+	once   sync.Once
+	joined bool
+	end    *RunEnd
+	err    error
+}
+
+// NewDelivery returns a delivery not yet settled and the function that
+// settles it with its outcome, for an [Accepter] other than the
+// agent's, a client across a wire among them. A second call of settle
+// is ignored.
+func NewDelivery() (*Delivery, func(joined bool, end *RunEnd, err error)) {
+	d := &Delivery{done: make(chan struct{})}
+	return d, func(joined bool, end *RunEnd, err error) {
+		d.once.Do(func() {
+			d.joined, d.end, d.err = joined, end, err
+			close(d.done)
+		})
+	}
+}
+
+// Done is closed once the delivery is settled.
+func (d *Delivery) Done() <-chan struct{} { return d.done }
+
+// Wait returns the delivery's outcome once it is settled, as
+// [Agent.Deliver] returns it: joined true when the run in flight took
+// the items and a model call has seen them; otherwise the end of the
+// run the agent started for them, or of the run that took them and
+// ended before a model call saw them, and the error that says why
+// none could start. A ctx that ends first returns its error and
+// changes nothing: the agent settles the delivery all the same.
+func (d *Delivery) Wait(ctx context.Context) (joined bool, end *RunEnd, err error) {
+	select {
+	case <-d.done:
+		return d.joined, d.end, d.err
+	case <-ctx.Done():
+		return false, nil, ctx.Err()
+	}
+}
+
 // Question event type names.
 const (
 	EventQuestion       = "question"

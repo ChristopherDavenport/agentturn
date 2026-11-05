@@ -168,8 +168,18 @@ type Agent struct {
 	lastEnd *RunEnd
 	// queued holds the accepts not yet reported: Steer and FollowUp
 	// append, and the goroutine that owns delivery reports them at its
-	// next event.
+	// next event, or, while a run is in flight, the accept itself when
+	// no event is being delivered and otherwise the delivery under way
+	// as it lets the barrier go (reportQueued, #302).
 	queued []*Queued
+	// events is the context the run in flight delivers its events
+	// under, which a queued report made outside its events is
+	// delivered under too.
+	events context.Context
+	// queuedErr is a subscriber's error on a queued report made
+	// outside the run's events, which the run's next event returns,
+	// ending the run as an error on a report ahead of it would.
+	queuedErr error
 	// steered is closed by a steer and replaced when the steer queue is
 	// drained, so a tool's batch hears a steer made during it.
 	steered chan struct{}
@@ -1271,13 +1281,15 @@ func (a *Agent) start(ctx context.Context, prompts openresponses.Items, notes []
 	transcript := append(Transcript(nil), a.transcript...)
 	cfg := a.cfg
 	runID := a.runID
+	// Subscribers get the values of ctx but never its cancellation:
+	// an abort cuts the model and the tools, and what they leave
+	// behind still has to be written.
+	subCtx := context.WithoutCancel(context.WithValue(ctx, inRunKey{a}, runID))
+	a.events = subCtx
+	a.queuedErr = nil
 
 	return func() (*RunEnd, error) {
-		// Subscribers get the values of ctx but never its cancellation:
-		// an abort cuts the model and the tools, and what they leave
-		// behind still has to be written.
 		ctx := context.WithValue(ctx, inRunKey{a}, runID)
-		subCtx := context.WithoutCancel(ctx)
 		r := &runner{
 			cfg:         cfg,
 			transcript:  transcript,
@@ -1336,6 +1348,16 @@ func (a *Agent) deliver(ctx context.Context, ev Event) (err error) {
 			err = ferr
 		}
 	}()
+	a.mu.Lock()
+	qerr := a.queuedErr
+	a.queuedErr = nil
+	a.mu.Unlock()
+	if _, last := ev.(*RunEnd); qerr != nil && !last {
+		// A queued report made outside the run's events failed: the
+		// run ends before this event, as for a report ahead of it. On
+		// run_end there is nothing left to end.
+		return qerr
+	}
 	if err := a.drainQueued(ctx); err != nil {
 		return err
 	}
@@ -1370,6 +1392,59 @@ func (a *Agent) drainQueued(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// reportQueued reports the items accepted since the last event, for a
+// run in flight, when no event is being delivered: a quiet tool raises
+// none, and a host showing what it accepted would otherwise show a
+// steer typed while the tool runs only once it ends (#302). A delivery
+// under way reports them as it lets the barrier go ([Agent.unlockEmit]),
+// and a subscriber's own accept is always reported so, since its
+// delivery holds the barrier. An idle agent's wait for the next run's
+// start. Called with neither a.mu nor a.emitMu held.
+//
+// The caller takes the barrier only when it is free, which a
+// subscriber's never is, and hands it to a goroutine that reports: the
+// accept returns at once, and no subscriber runs on the caller's
+// goroutine, under whatever locks it holds.
+func (a *Agent) reportQueued() {
+	a.mu.Lock()
+	owed := a.queuedOwed()
+	a.mu.Unlock()
+	if !owed || !a.emitMu.TryLock() {
+		return
+	}
+	go func() {
+		a.flushQueued()
+		_ = a.unlockEmit()
+	}()
+}
+
+// flushQueued is one pass of drainQueued for a run in flight, under the
+// run's context, and reports whether it delivered anything. A
+// subscriber's error is kept for the run's next event. The caller holds
+// a.emitMu.
+func (a *Agent) flushQueued() bool {
+	a.mu.Lock()
+	ctx, owed := a.events, a.queuedOwed()
+	a.mu.Unlock()
+	if !owed {
+		return false
+	}
+	if err := a.drainQueued(ctx); err != nil {
+		a.mu.Lock()
+		a.queuedErr = err
+		a.mu.Unlock()
+	}
+	return true
+}
+
+// queuedOwed reports, with a.mu held, whether a run in flight has
+// accepts to report outside its events: none once its run_end is
+// delivered, whose own delivery reports what is left, and none after
+// a report failed, which the run's next event answers.
+func (a *Agent) queuedOwed() bool {
+	return a.running && !a.runEnded && len(a.queued) > 0 && a.queuedErr == nil && a.events != nil
 }
 
 // dispatch updates state from the event and calls every subscriber in
@@ -1507,11 +1582,14 @@ func (a *Agent) flushReplay(id int, fn func(context.Context, Event) error) {
 // host writing what it accepted has it before the run appends it and
 // can tell an item it accepted from one a run produced. The report is
 // not the accept: the item is queued when this returns, and the event
-// is delivered by whichever goroutine owns delivery, at its next event.
-// A run in flight reports it before its next event; an idle agent
-// reports it at the start of the next run, so a host that must not
-// lose an input writes it before calling here rather than from the
-// event. A run in flight takes it unless it is past its last drain,
+// is delivered under the delivery barrier. A run in flight reports it
+// without waiting for its next event (#302): at once, on a goroutine
+// of its own, when no event is being delivered, and otherwise right
+// after the event that is, so a steer made while a quiet tool runs is
+// reported while it runs; one a subscriber makes while that report is delivered waits
+// for the run's next event. An idle agent reports it at the start of
+// the next run, so a host that must not lose an input writes it before
+// calling here rather than from the event. A run in flight takes it unless it is past its last drain,
 // after its final turn_end or once it has decided to stop, when it
 // waits for the next run like an item steered into an idle agent; a
 // host whose input arrives on its own time and must reach the model
@@ -1584,8 +1662,9 @@ func (a *Agent) Queue(ctx context.Context, mode QueueMode, items ...openresponse
 		how = InputFollowUp
 	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.queue(trigger, mode, how, items)
+	a.mu.Unlock()
+	a.reportQueued()
 	return nil
 }
 
@@ -1613,7 +1692,9 @@ func (a *Agent) Redeliver(ctx context.Context, items ...openresponses.Item) erro
 // own time: a background task's result, a detached child's answer. The
 // items are queued as [Agent.Queue] queues a steer, with the [Trigger]
 // on ctx, and Deliver waits until a model call has seen them or no run
-// will take them. They reach the turn that takes them as [InputDeliver]
+// will take them. [Agent.Accept] is the same delivery in two steps, for
+// a caller that must answer once the items are queued, a view
+// forwarding a person's steer. They reach the turn that takes them as [InputDeliver]
 // among [TurnStartInfo.Inputs], where a steered item reads
 // [InputSteer], so a [Config.BeforeTurn] hook that acts on a user's
 // message tells a delivery from a steer, which the transcript's tail,
@@ -1664,37 +1745,102 @@ func (a *Agent) Redeliver(ctx context.Context, items ...openresponses.Item) erro
 // A job running on [RunContext], and anything called with a context not
 // derived from the run's, waits as any caller does.
 func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joined bool, end *RunEnd, err error) {
-	if err := TriggerFromContext(ctx).Validate(); err != nil {
+	drains, settled, err := a.acceptDelivery(ctx, items)
+	if err != nil {
 		return false, nil, err
 	}
+	a.reportQueued()
+	if settled != nil {
+		return settled.joined, settled.end, settled.err
+	}
+	return a.settleDelivery(ctx, drains)
+}
+
+// Accept is [Agent.Deliver] in two steps ([Accepter]): it queues the
+// items as Deliver does, with the [Trigger] on ctx, and returns once
+// they are queued, without waiting for a run to take them. The
+// [Delivery] it returns gives what Deliver would have returned, once
+// the agent has settled it, and the agent settles it whether or not
+// anyone waits: the items join the run in flight, or the agent starts
+// the run that takes them once that run has ended, on ctx's values
+// without its cancellation, so the caller going away neither stops
+// that run nor leaves the items for an input that may never come. Only
+// [Agent.Abort] stops a run so started. A run in flight reports the
+// items as [Queued] as [Agent.Steer] says, without waiting for its
+// next event.
+//
+// Deliver's rules settle it: the outcomes, the errors that leave the
+// items queued, and the exception for a run that ended on a
+// terminating result. Called from inside the run it is settled at once,
+// joined, or with [ErrRunning] when the run is past its last drain.
+// Accept returns an error, and queues nothing, when Deliver refuses
+// before queueing: [ErrHeld] during [Agent.WhileIdle], [ErrNoPrompt]
+// for no items, and [ErrTriggerExtra].
+func (a *Agent) Accept(ctx context.Context, items ...openresponses.Item) (*Delivery, error) {
+	drains, settled, err := a.acceptDelivery(ctx, items)
+	if err != nil {
+		return nil, err
+	}
+	a.reportQueued()
+	d, settle := NewDelivery()
+	if settled != nil {
+		settle(settled.joined, settled.end, settled.err)
+		return d, nil
+	}
+	ctx = context.WithoutCancel(ctx)
+	go func() { settle(a.settleDelivery(ctx, drains)) }()
+	return d, nil
+}
+
+// deliveryOutcome is a delivery's, settled as it was accepted.
+type deliveryOutcome struct {
+	joined bool
+	end    *RunEnd
+	err    error
+}
+
+// acceptDelivery queues items as a delivery and returns the count of
+// steer drains its outcome is measured from. It returns an error, and
+// queues nothing, for a delivery refused before queueing, and an
+// outcome for one settled at once: one made from inside the run, which
+// waits on the caller.
+func (a *Agent) acceptDelivery(ctx context.Context, items openresponses.Items) (int, *deliveryOutcome, error) {
+	if err := TriggerFromContext(ctx).Validate(); err != nil {
+		return 0, nil, err
+	}
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.held {
 		// No run starts during WhileIdle, so the items would wait for
 		// whatever the hold made of the agent: refused before anything
 		// is queued.
-		a.mu.Unlock()
-		return false, nil, ErrHeld
+		return 0, nil, ErrHeld
 	}
 	drains, before := a.drains, len(a.steer)
 	a.queue(TriggerFromContext(ctx), QueueSteer, InputDeliver, items)
 	if len(a.steer) == before {
-		a.mu.Unlock()
-		return false, nil, ErrNoPrompt
+		return 0, nil, ErrNoPrompt
 	}
 	if a.running && !a.closing && ctx.Value(inRunKey{a}) == a.runID {
 		// Called from inside the run, by a tool, a hook, a subscriber or
 		// a child run a tool made, which the run waits on: the items
 		// join it as a steer, and waiting for its next request would
 		// wait on the caller.
-		a.mu.Unlock()
-		return true, nil, nil
+		return drains, &deliveryOutcome{joined: true}, nil
 	}
 	if a.running && ctx.Value(inRunKey{a}) == a.runID {
 		// Inside a run past its last drain, which ends only once the
 		// caller returns: the items wait for the next run.
-		a.mu.Unlock()
-		return false, nil, ErrRunning
+		return drains, &deliveryOutcome{err: ErrRunning}, nil
 	}
+	return drains, nil, nil
+}
+
+// settleDelivery waits for the outcome of a delivery accepted when the
+// steer queue had been drained drains times, and starts the run that
+// takes it on ctx when no run will.
+func (a *Agent) settleDelivery(ctx context.Context, drains int) (joined bool, end *RunEnd, err error) {
+	a.mu.Lock()
 	for {
 		if a.seen > drains {
 			// A request went out after the drain that took the items.

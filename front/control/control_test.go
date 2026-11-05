@@ -289,6 +289,117 @@ func TestDeliverOverTheWire(t *testing.T) {
 	})
 }
 
+// TestAcceptOverTheWire pins #302 across the wire: the control front
+// carries a delivery's two steps, so a view forwarding a person's
+// steers answers each once the server's agent has it, while a quiet
+// tool still runs, and learns the outcome after.
+func TestAcceptOverTheWire(t *testing.T) {
+	t.Run("during a run, both are accepted before the tool ends", func(t *testing.T) {
+		running, release := make(chan struct{}, 1), make(chan struct{})
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, MaxTurns: 3, Tools: []agenttool.Tool{blocker(running, release)}})
+		c := serve(t, a)
+		done := make(chan *agentturn.RunEnd, 1)
+		go func() {
+			end, _ := c.Prompt(context.Background(), openresponses.UserText("go"))
+			done <- end
+		}()
+		<-running
+		var released sync.Once
+		defer released.Do(func() { close(release) })
+		accepted := make(chan *agentturn.Delivery, 2)
+		go func() {
+			for _, text := range []string{"one", "two"} {
+				d, err := c.Accept(context.Background(), openresponses.UserText(text))
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				accepted <- d
+			}
+		}()
+		var ds []*agentturn.Delivery
+		for len(ds) < 2 {
+			select {
+			case d := <-accepted:
+				ds = append(ds, d)
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%d of two accepted while the tool ran", len(ds))
+			}
+		}
+		if n := a.State().Steering; n != 2 {
+			t.Errorf("steering = %d, want both", n)
+		}
+		released.Do(func() { close(release) })
+		for i, d := range ds {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			joined, end, err := d.Wait(ctx)
+			cancel()
+			if err != nil || !joined || end != nil {
+				t.Errorf("delivery %d: joined %v, end %+v, err %v; want joined", i, joined, end, err)
+			}
+		}
+		<-done
+	})
+	t.Run("to an idle agent, the agent starts the run", func(t *testing.T) {
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, MaxTurns: 1})
+		c := serve(t, a)
+		ctx, cancel := context.WithCancel(context.Background())
+		d, err := c.Accept(ctx, openresponses.UserText("the build passed"))
+		// The caller goes away at once: the agent settles it anyway.
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		wctx, wcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer wcancel()
+		joined, end, err := d.Wait(wctx)
+		if err != nil || joined || end == nil || end.Reason != agentturn.ReasonDone {
+			t.Fatalf("joined %v, end %+v, err %v; want a run started and done", joined, end, err)
+		}
+	})
+	t.Run("a refusal queues nothing", func(t *testing.T) {
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, MaxTurns: 1})
+		c := serve(t, a)
+		var err error
+		if herr := a.WhileIdle(func() error {
+			_, err = c.Accept(t.Context(), openresponses.UserText("x"))
+			return nil
+		}); herr != nil {
+			t.Fatal(herr)
+		}
+		if !errors.Is(err, agentturn.ErrHeld) {
+			t.Errorf("err = %v, want ErrHeld", err)
+		}
+		if n := a.State().Steering; n != 0 {
+			t.Errorf("steering = %d, want nothing queued", n)
+		}
+	})
+	t.Run("a Control without one", func(t *testing.T) {
+		c := serve(t, struct{ agentturn.Control }{agentturn.New(agentturn.Config{Model: &echo.Adapter{}})})
+		if _, err := c.Accept(t.Context(), openresponses.UserText("x")); !errors.Is(err, ErrNoDelivery) {
+			t.Errorf("err = %v, want ErrNoDelivery", err)
+		}
+	})
+	t.Run("a server without the route", func(t *testing.T) {
+		h := Handler(agentturn.New(agentturn.Config{Model: &echo.Adapter{}}), WithInsecureNoAuth())
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/accept" {
+				http.NotFound(w, r)
+				return
+			}
+			h.ServeHTTP(w, r)
+		}))
+		t.Cleanup(srv.Close)
+		c, err := Dial(t.Context(), srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Accept(t.Context(), openresponses.UserText("x")); !errors.Is(err, ErrNoDelivery) {
+			t.Errorf("err = %v, want ErrNoDelivery", err)
+		}
+	})
+}
+
 func TestAbortMidBatch(t *testing.T) {
 	running := make(chan struct{}, 1)
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{blocker(running, nil)}})

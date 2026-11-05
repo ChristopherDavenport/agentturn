@@ -29,7 +29,7 @@ type Scope string
 const (
 	// ScopeRead follows the agent: Subscribe and State.
 	ScopeRead Scope = "read"
-	// ScopeControl drives it: Prompt, Queue, Deliver and Abort.
+	// ScopeControl drives it: Prompt, Queue, Deliver, Accept and Abort.
 	ScopeControl Scope = "control"
 	// ScopeAnswer answers it: Resume and Reply, which let a call run
 	// that the policy asked a person about. No other scope implies it.
@@ -99,7 +99,8 @@ type Command struct {
 var ErrUnknownCommand = errors.New("control: no such command")
 
 // ErrNoDelivery is the answer to a delivery when the Control the
-// handler serves is no agentturn.Deliverer.
+// handler serves is no agentturn.Deliverer, and to an accept when it is
+// no agentturn.Accepter or the handler predates POST /accept.
 var ErrNoDelivery = errors.New("control: the agent offers no delivery")
 
 // Option configures a Handler.
@@ -197,6 +198,8 @@ type handler struct {
 //	POST /prompt           Prompt; returns the run's end     control
 //	POST /queue            Queue: steer or follow_up         control
 //	POST /deliver          Deliver, when c offers it         control
+//	POST /accept           Accept, when c offers it; the     control
+//	                       accept, then the outcome
 //	POST /abort            Abort                             control
 //	POST /resume           Resume; returns the run's end     answer
 //	POST /reply            Reply                             answer
@@ -235,6 +238,7 @@ func Handler(c agentturn.Control, opts ...Option) http.Handler {
 	mux.HandleFunc("POST /prompt", h.guard(ScopeControl, h.prompt))
 	mux.HandleFunc("POST /queue", h.guard(ScopeControl, h.queue))
 	mux.HandleFunc("POST /deliver", h.guard(ScopeControl, h.deliver))
+	mux.HandleFunc("POST /accept", h.guard(ScopeControl, h.accept))
 	mux.HandleFunc("POST /abort", h.guard(ScopeControl, h.abort))
 	mux.HandleFunc("POST /resume", h.guard(ScopeAnswer, h.resume))
 	mux.HandleFunc("POST /reply", h.guard(ScopeAnswer, h.reply))
@@ -440,6 +444,72 @@ func (h *handler) deliver(w http.ResponseWriter, r *http.Request, _ Principal) {
 		out.End = &we
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// acceptReply is the first value POST /accept answers with: the items
+// are queued, or the error that says why none was. The outcome follows
+// as a [deliverReply] once the agent has settled the delivery.
+type acceptReply struct {
+	Accepted bool       `json:"accepted"`
+	Err      *wireError `json:"error,omitempty"`
+}
+
+// accept serves agentturn.Accepter, which c offers or not: the two
+// steps of a delivery in one response, two JSON values. The first says
+// the items are queued, or why not, and is written as soon as the agent
+// has them; the second is the delivery's outcome, once it is settled.
+// The agent settles it whether or not the response is still read: it
+// runs on the request's context with its cancellation lifted, and a
+// client that goes away stops only the wait.
+func (h *handler) accept(w http.ResponseWriter, r *http.Request, _ Principal) {
+	acc, ok := h.c.(agentturn.Accepter)
+	if !ok {
+		h.writeFailure(w, http.StatusNotImplemented, ErrNoDelivery)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		h.writeFailure(w, http.StatusInternalServerError, errors.New("control: the response cannot stream"))
+		return
+	}
+	var req struct {
+		Items json.RawMessage `json:"items"`
+	}
+	if !h.decode(w, r, &req) {
+		return
+	}
+	items, err := itemsIn(req.Items)
+	if err != nil {
+		h.writeFailure(w, http.StatusBadRequest, err)
+		return
+	}
+	d, err := acc.Accept(context.WithoutCancel(r.Context()), items...)
+	if err != nil {
+		writeJSON(w, http.StatusOK, acceptReply{Err: errorOut(err)})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	enc := json.NewEncoder(w)
+	if enc.Encode(acceptReply{Accepted: true}) != nil {
+		return
+	}
+	flusher.Flush()
+	joined, end, err := d.Wait(r.Context())
+	if r.Context().Err() != nil {
+		// The client went away; the agent settles the delivery anyway.
+		return
+	}
+	out := deliverReply{Joined: joined, Err: errorOut(err)}
+	if end != nil {
+		we, merr := runEndOut(end)
+		if merr != nil {
+			out.Err = errorOut(merr)
+		} else {
+			out.End = &we
+		}
+	}
+	_ = enc.Encode(out)
 }
 
 func (h *handler) abort(w http.ResponseWriter, _ *http.Request, _ Principal) {

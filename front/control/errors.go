@@ -39,6 +39,7 @@ var sentinels = []struct {
 	err  error
 }{
 	{"running", agentturn.ErrRunning},
+	{"held", agentturn.ErrHeld},
 	{"input_required", agentturn.ErrInputRequired},
 	{"not_pending", agentturn.ErrNotPending},
 	{"ambiguous_call", agentturn.ErrAmbiguousCall},

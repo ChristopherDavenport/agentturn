@@ -1255,7 +1255,7 @@ turn number. The catalogue, with the members beyond those two:
 | `turn_end` | `response`, `tool_results` | after the batch's outputs are appended |
 | `quarantine_added` | `items`, `quarantined` | the host quarantined while no run of the agent was active, or after its run's end was delivered; belongs to no run, and is delivered at once, or after the event being delivered |
 | `run_end` | `items`, `reason`, `cause`, `error`, `failure`, `pending`, `withheld`, `quarantined` | last event of a run; `withheld` when the output guard's stop ended it; `failure` when a consumer or a hook failed for a reason of its own while the run was being cancelled |
-| `queued` | `item`, `mode`, `input`, `hidden`, `copied`, `trigger`, `provenance` | an item accepted into a queue; belongs to no run; `input` says how it arrived, `steer` or `follow_up` for an item queued and `deliver` for one delivered; `copied` when the caller marked the item as taken from another conversation; `trigger` is the item's provenance's source when it names one |
+| `queued` | `item`, `mode`, `input`, `hidden`, `copied`, `trigger`, `provenance` | an item accepted into a queue; belongs to no run; while a run is in flight, without waiting for its next phase (#302); `input` says how it arrived, `steer` or `follow_up` for an item queued and `deliver` for one delivered; `copied` when the caller marked the item as taken from another conversation; `trigger` is the item's provenance's source when it names one |
 
 An event's members are the facts as of the event. A loop MUST deliver
 each event so that a consumer that keeps it, as a view's render queue
@@ -1451,12 +1451,22 @@ Accepting an item MUST NOT block on the delivery barrier, so steering
 from inside a subscriber is safe. Each accepted item is reported as a
 `queued` event, with which queue it went into and the run that was in
 flight, empty when the agent was idle. The report is not the accept:
-the item is queued when the call returns, and the goroutine that owns
-delivery reports it at its next event, before anything that item
-produces. A run in flight reports it before its next event; an idle
-agent at the start of the next run. A host that must not lose an input
-therefore writes it before queueing it rather than from the event, and
-a subscriber's error cannot refuse the item.
+the item is queued when the call returns, and the report is delivered
+under the barrier, before anything that item produces. A run in
+flight SHOULD report an accepted item without waiting for its next
+phase (#302): a quiet tool raises no event, and a host showing what it
+accepted would otherwise show a steer typed during the tool only once
+the tool ends. The reference reports it at once when no event is being
+delivered, from a goroutine of its own so the accept still returns
+without running a subscriber, and otherwise right after the event that
+is; an item a subscriber accepts while such a report is being
+delivered waits for the run's next event, so a subscriber that queues
+on every report does not spin. An idle agent reports it at the start
+of the next run. A host that must not lose an input therefore writes
+it before queueing it rather than from the event, and a subscriber's
+error cannot refuse the item; an error on a report delivered between
+the run's events ends the run at its next event, as one on a report
+delivered ahead of that event does.
 
 A run that stops after a turn, on its turn limit, a stop hook, a
 terminating result or a call that needs input, decides so before it
@@ -1474,7 +1484,18 @@ or a failure, is marked as it leaves the loop, and drains nothing between.
 
 An agent offers a **delivery** for an input that arrives on its own
 time, a background task's result: the item is queued as a steer, and
-the delivery waits until a model call has seen it. A run in flight
+the delivery waits until a model call has seen it. A delivery MUST
+accept its items, in the order given, before it waits, and a caller
+MUST be able to take the acceptance without waiting for the outcome,
+which the agent still settles: it joins the run in flight or starts
+one once that run ends (#302). The waiting is the point, since the
+outcome is what closes the race below (#288); the split lets a view
+that forwards a person's steer answer once the agent has it, so a
+second steer typed while a quiet tool runs is not held behind the
+first's outcome. A delivery so accepted is settled by the agent,
+whoever waits: a run it starts is the agent's, and runs when the
+caller has gone away, until an abort. A delivery refused before its
+items are queued, while the agent is held idle, accepts nothing. A run in flight
 that drains it and then sends a request has taken it. A run that stops
 after its turn or ends without draining it leaves it queued, and the
 delivery starts a run that takes it once that run has ended, as a
@@ -1506,7 +1527,10 @@ offer the delivery, with these semantics: the item joins the run in
 flight when that run will still take it, and otherwise starts a run
 once the run in flight has ended, unless calls are pending or that run
 ended on a terminating result. The front
-reports whether the item joined and the end of any run it started. A
+reports whether the item joined and the end of any run it started. It
+SHOULD carry both steps of a delivery, the accept as soon as the
+agent has the items and the outcome once the agent has settled it, so
+a remote view takes the accept as a local one does (#302). A
 remote party cannot observe atomically whether a run will take a
 steer, since a run past its last drain still reads as running, so a
 queue and a read of the state are a race that only the delivery closes
@@ -1533,7 +1557,9 @@ with nothing else to start a run is the host's to start one for, as
 the delivery would have, with a continue. A recorder
 offers a delivery that writes the `queued` entry before the agent
 accepts the input, as it does for a queue, so a delivery that arrives
-while the agent waits on an approval survives a quit (#244). An input
+while the agent waits on an approval survives a quit (#244); its
+delivery in two steps writes the entry before the accept too, so the
+accept a caller takes at once is on the record (#302). An input
 the agent refuses, held idle, MUST leave nothing owed: the recorder
 writes no entry for it when it can tell the agent will refuse, and
 otherwise neither hands it back nor writes it again after the next
@@ -2191,8 +2217,8 @@ maps onto it as follows:
 | turn limit | `Config.MaxTurns` |
 | retry policy | `Config.Retry{MaxAttempts, Backoff, Retryable, Revise}`; `DefaultBackoff`, `DefaultRetryable` |
 | low-level loop | `Run(ctx, t, prompts, cfg)`, `Continue(ctx, t, cfg)` → `iter.Seq[Event]`; `EventBuffer`; `CanContinue` |
-| delivery a control offers | `Deliverer`, which `*Agent` and `front/control`'s `Client` implement; `front/control` serves it as `POST /deliver`, `ErrNoDelivery` when the control offers none |
-| agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`, `WithPending`, `SetPending`, `WithReservedCallIDs`, `ReserveCallIDs`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Deliver`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `WhileIdle`, `State`, `SetConfig`, `SetTranscript`, `SetReasoningModels`, `Config` |
+| delivery a control offers | `Deliverer`, which `*Agent` and `front/control`'s `Client` implement; `front/control` serves it as `POST /deliver`, `ErrNoDelivery` when the control offers none; in two steps, `Accepter` (`Accept` → `*Delivery`, whose `Wait` and `Done` give the outcome; `NewDelivery` for another implementation), which `*Agent`, `front/control`'s `Client` and `session`'s `RecordedControl` implement, served as `POST /accept`: the accept, then the outcome, on one response |
+| agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`, `WithPending`, `SetPending`, `WithReservedCallIDs`, `ReserveCallIDs`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Deliver`, `Accept`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `WhileIdle`, `State`, `SetConfig`, `SetTranscript`, `SetReasoningModels`, `Config` |
 | refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning` (`ErrHeld` for a delivery during a hold, `State.Held`), `ErrTerminated` (a delivery after a terminating stop), `ErrAmbiguousCall`, `ErrCallAnswered`, `ErrTriggerExtra` (`Trigger.Validate`) |
 | run ID, turn, trigger, transcript on the context | `ContextWithRunID`/`RunIDFromContext`, `ContextWithTurn`/`TurnFromContext`, `ContextWithTrigger`/`TriggerFromContext`, `ContextWithTranscript`/`TranscriptFromContext`, `ContextWithReservedCallIDs` |
 | run context, steer signal | `RunContext(ctx)`, `Steered(ctx)` |
@@ -2216,7 +2242,7 @@ maps onto it as follows:
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`, which implements `agentturn.InputRequired` (`PendingCalls() []WaitingCall`), as `tools/a2a`'s does; `WithAskParent`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)`; an escalated call put to the caller's elicitor: `tools/a2a.WithAskCaller()`, `WithSendBy()`, `AskedCall.Callee`; a detached call: `tools/a2a.WithDetach(fn)`, `WithPollInterval`, `Answer(final)`, and `CalleeTrigger(callID, task)` (`TriggerCallee`) to deliver its result under; a steer of a working task: `front/a2a.WithDeliverWhileBusy()`, served by `Executor.RequestHandler`, `MaxSteers`, `Redeliverer` and `ContextWithRedeliverer` for a recorded one (`session.Recorder.Redeliver`), and `tools/a2a.Steer(ctx, client, info, parts…)` |
 | quarantine | `Agent.Quarantine`, `Agent.Quarantined`; `Quarantine(ctx, items…)` from a hook or a tool, `ErrNoQuarantine`, `ErrNotQuarantinable`; `QuarantinedOutput`, the placeholder; `QuarantineFromContext` → `QuarantineView` (`Has`, `Generation`, `Apply`) for a transform, which `compact` reads; `NewQuarantineSet` → `QuarantineSet` (`Add`, `Items`, `Has`, `Apply`), `ContextWithQuarantineSet` for a host carrying one through `Run` and `Continue`, and `WithQuarantineSet` for an `Agent`; `QuarantineSet.Bind` and `Merge` for a front keeping a conversation's set across tasks or requests, as `front/a2a` does per context and `front/responses` under `WithQuarantineScope` (`QuarantineScope`, `MaxQuarantineScopes` per principal); `session` `Recorder.Attach` seeds it from the record's `omit` |
-| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `StartChild` and `ContinueChild` for a child the host starts, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Queue`, `Deliver`, `Redeliver`, `Control` (`RecordedControl`, for a front), `Requeue`, `Rebase`; `session.MoveTo` for a rewind; `WithInstructionsParts`, `WithMedia`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`, read with `Recorder.ReadOptions`, `session.WithBlobs` resolving a sidecar session's media (`session.ErrNoBlobReader` without one); the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
+| the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `StartChild` and `ContinueChild` for a child the host starts, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Queue`, `Deliver`, `Accept`, `Redeliver`, `Control` (`RecordedControl`, for a front), `Requeue`, `Rebase`; `session.MoveTo` for a rewind; `WithInstructionsParts`, `WithMedia`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`, read with `Recorder.ReadOptions`, `session.WithBlobs` resolving a sidecar session's media (`session.ErrNoBlobReader` without one); the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
 
 Every error the package returns to its caller, sentinel or wrapped,
 begins with `agentturn:`; the error texts a call's output carries,
@@ -2508,6 +2534,13 @@ it.
   a transcript gives them back; a transform that folds keeps them
   verbatim up to a bound the host sets, the newest within a total
   less than the request's budget, and records them as pinned (#298).
+- **Queues.** A delivery accepts its items before it waits, and a
+  caller can take the acceptance without waiting for the outcome,
+  which the agent settles; a front SHOULD carry both steps, and a
+  recorder writes the entry before the accept. A run in flight SHOULD
+  report an accepted item without waiting for its next phase, and a
+  subscriber's error on such a report ends the run at its next event
+  (#302).
 
 ## Changes in draft 0.6
 
