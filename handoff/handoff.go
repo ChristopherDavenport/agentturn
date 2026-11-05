@@ -104,9 +104,27 @@ type Team struct {
 	// list the request carries, so a filter that removes a tool from
 	// the offer, a policy's, and a wrapper around the agent's tools
 	// apply to the transfers too (RFC 0001 Composition, as itself, under
-	// new settings; #307). agent is the agent's Config.Name. A host
-	// checks there, too, that no tool of the moment takes a transfer's
-	// name, which [New] checks only against the static Config.Tools.
+	// new settings; #307). agent is the agent's Config.Name.
+	//
+	// A wrapper keeps a transfer's name and its result as they are:
+	// the team knows a transfer by its name ([Team.Route]) and a
+	// handoff by the transfer's own output text after the call
+	// (front/responses.Handoffs). A wrapper that renames the tool, or
+	// changes the text, as an audit suffix would, makes the call run
+	// and not hand off, as a call a policy blocked or a tool that failed
+	// does not, and nothing tells the two apart afterwards. A wrapper
+	// that refuses the call is the way to stop a transfer.
+	//
+	// A tool of the moment that takes a transfer's name, a remote MCP
+	// server's, which [New] cannot see in the static Config.Tools, fails
+	// the turn by the loop's own check that a request's tools have
+	// distinct names; Offer need not check it.
+	//
+	// What Offer removes is gone from the request and from the tools a
+	// call resolves against, but Config.Tools of what [Team.Config]
+	// returns still lists every transfer: read the tools of a request
+	// through Config.ResolveTools.
+	//
 	// Set it before the team's configurations are used: [Team.Config],
 	// [Team.Route] and the switch read it when they hand one out.
 	Offer func(ctx context.Context, agent string, tools []agenttool.Tool) []agenttool.Tool
@@ -207,7 +225,8 @@ func New(agents ...Agent) (*Team, error) {
 // offer returns cfg with transfers among its tools. A transfer whose
 // Enabled is set, or a configuration whose tools come from a provider,
 // is offered through a ToolProvider that asks each request; Tools
-// lists every transfer either way, for whoever reads the tools whole.
+// lists every transfer either way, for whoever reads the tools whole,
+// [Team.Offer]'s removals not applied.
 func offer(cfg agentturn.Config, transfers []agenttool.Tool, enabled []func(context.Context) bool) agentturn.Config {
 	if len(transfers) == 0 {
 		return cfg

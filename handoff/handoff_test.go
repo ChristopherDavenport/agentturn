@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -588,6 +589,95 @@ func TestTheHostsOfferCoversTheTransfers(t *testing.T) {
 		}
 		if got := offered["Refund agent"]; len(got) == 0 || got[0] != "issue_refund" {
 			t.Errorf("allowed: the offer saw %v for the receiver", got)
+		}
+	}
+}
+
+// TestAnOfferWrapperKeepsTheTransfer is the l6-3c review's L1 and L6: a
+// wrapper [Team.Offer] puts around every tool, a policy's or an
+// audit's, reaches the transfer and runs for it, and the handoff is
+// taken while the wrapper keeps the transfer's name and result; one
+// that changes the result makes the call no handoff, as a blocked
+// call is not, so the team stays with the sender, as Offer's doc
+// says.
+func TestAnOfferWrapperKeepsTheTransfer(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(agenttool.Result) agenttool.Result
+		path   string
+	}{
+		{name: "kept", change: func(r agenttool.Result) agenttool.Result { return r }, path: "Triage agent,Refund agent"},
+		{name: "changed", change: func(r agenttool.Result) agenttool.Result {
+			r.Output.Text += " (audited)"
+			return r
+		}, path: "Triage agent"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			team, err := New(
+				Agent{Config: agentturn.Config{Name: "Triage agent", Model: transfers{name: "triage", to: "Refund agent"}, Tools: []agenttool.Tool{issueRefund}},
+					Handoffs: []To{{Agent: "Refund agent"}}},
+				Agent{Config: agentturn.Config{Name: "Refund agent", Model: transfers{name: "refunds"}, Tools: []agenttool.Tool{issueRefund}}},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ran []string
+			team.Offer = func(_ context.Context, _ string, tools []agenttool.Tool) []agenttool.Tool {
+				out := make([]agenttool.Tool, len(tools))
+				for i, tool := range tools {
+					out[i] = agenttool.Wrap(tool, func(ctx context.Context, call agenttool.Call) (agenttool.Result, error) {
+						ran = append(ran, tool.Name())
+						r, err := tool.Execute(ctx, call)
+						return tc.change(r), err
+					})
+				}
+				return out
+			}
+			_, path, err := team.Run(context.Background(), agentturn.New(team.Config("Triage agent")), openresponses.UserText("I was double charged"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Contains(ran, ToolName("Refund agent")) {
+				t.Errorf("the wrapper ran for %v, not the transfer", ran)
+			}
+			if got := strings.Join(path, ","); got != tc.path {
+				t.Errorf("path = %s, want %s", got, tc.path)
+			}
+		})
+	}
+}
+
+// TestATransferNameAmongTheToolsOfTheMoment is the l6-3c review's L2:
+// a tool of the moment that takes a transfer's name, an MCP server's
+// transfer_to_refund_agent, which [New] cannot see in Config.Tools,
+// fails the turn by the loop's check that the tools of a request have
+// distinct names, with [Team.Offer] set or not.
+func TestATransferNameAmongTheToolsOfTheMoment(t *testing.T) {
+	for _, offer := range []bool{false, true} {
+		clash := agenttool.NewFunc(ToolName("Refund agent"), "a remote server's tool", json.RawMessage(`{"type":"object"}`),
+			func(context.Context, agenttool.Call) (agenttool.Result, error) { return agenttool.Text("remote"), nil })
+		team, err := New(
+			Agent{Config: agentturn.Config{Name: "Triage agent", Model: transfers{name: "triage", to: "Refund agent"},
+				ToolProvider: func(context.Context) []agenttool.Tool { return []agenttool.Tool{issueRefund, clash} }},
+				Handoffs: []To{{Agent: "Refund agent"}}},
+			Agent{Config: agentturn.Config{Name: "Refund agent", Model: transfers{name: "refunds"}, Tools: []agenttool.Tool{issueRefund}}},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if offer {
+			team.Offer = func(_ context.Context, _ string, tools []agenttool.Tool) []agenttool.Tool { return tools }
+		}
+		end, path, err := team.Run(context.Background(), agentturn.New(team.Config("Triage agent")), openresponses.UserText("I was double charged"))
+		if err == nil && (end == nil || end.Err == nil) {
+			t.Errorf("offer %v: the run took the clash, path %v, end %+v", offer, path, end)
+			continue
+		}
+		if err == nil {
+			err = end.Err
+		}
+		if !strings.Contains(err.Error(), "duplicate name") {
+			t.Errorf("offer %v: err = %v, want a duplicate name", offer, err)
 		}
 	}
 }

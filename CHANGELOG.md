@@ -136,11 +136,14 @@ versions may break the API.
 - Added: `handoff.Team.Offer`, applied on every request to each
   agent's whole tool list, its own tools of the moment and its
   transfers, so a host's filter that removes a tool, a policy's, and
-  its tool wrappers reach the transfer tools too, and its name check
-  sees a tool of the moment that takes a transfer's name. The
-  configurations `Team.Config`, `Team.Route` and the switch hand out
-  carry it; unset, nothing changes. RFC 0001 draft 0.7, Composition.
-  (#307)
+  its tool wrappers reach the transfer tools too. A wrapper must keep a
+  transfer's name and result as they are, or the call runs without
+  handing off. A tool of the moment that takes a transfer's name fails
+  the turn by the loop's distinct-name check, with or without Offer.
+  `Config.Tools` still lists every transfer; `ResolveTools` gives the
+  offer. The configurations `Team.Config`, `Team.Route` and the switch
+  hand out carry it; unset, nothing changes. RFC 0001 draft 0.7,
+  Composition. (#307)
 
 ## v0.0.37 - 2026-11-04
 

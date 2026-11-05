@@ -1864,8 +1864,13 @@ An agent stands in four places inside another system:
   inherits the sender's (#274). A host that offers transfer tools
   SHOULD offer them as it offers the agent's other tools: a filter
   that removes a tool from the offer, and a wrapper around the agent's
-  tools, apply to the transfers too, on every request, and a check
-  that no two tools of a request share a name covers them (#307). A
+  tools, apply to the transfers too, on every request, and the
+  check that a set of tools has distinct names (The tools of the
+  moment) covers them, a tool of the moment that takes a transfer's
+  name failing the turn. A wrapper keeps a transfer's name and its
+  result as they are, since the host reads a handoff from the call's
+  name and the transfer's own output; a wrapper that changes either
+  makes the call no handoff, as a blocked call is none (#307). A
   trim between runs that hands a
   conversation to a receiver MUST leave a transcript the loop can
   continue: when the trim would leave a model output last, a transfer's
