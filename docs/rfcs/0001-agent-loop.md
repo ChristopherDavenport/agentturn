@@ -1804,7 +1804,20 @@ An agent stands in four places inside another system:
   answers to pending calls, or any data part, is refused while the
   task runs, since nothing it answers has been asked. The consuming
   tool offers a way to send to a working task, the task a detached
-  call follows among them (#287).
+  call follows among them (#287). A tool consuming a remote agent
+  whose task waits only on calls the remote escalated SHOULD put each
+  asked call to the elicitor of the call that started the task, naming
+  the call, the remote's reason and the remote agent, filed under that
+  call. It SHOULD answer on the same task with one approval per asked
+  call, carrying the answerer's note, and who decided where the remote
+  accepts it, since a front that does not let its caller name a
+  decider refuses the message; the caller's own record keeps the
+  decider either way. A call held beside an asked one is not asked
+  about. With nobody to ask, or with the task also waiting on other
+  input, the call fails input-required and names those calls, as it
+  does without the rule. A detached call's task, followed on the run
+  context, has no elicitor there, and keeps the host's own answer
+  (#296).
 - **As itself, under new settings.** The configuration replaced and the
   transcript kept, so the next run continues the same conversation
   under another agent's instructions, tools and model. This is what an
@@ -2159,7 +2172,7 @@ maps onto it as follows:
 | handoffs a front takes | `WithHandoff`, `WithStart`, `WithTransfers(route)` in both fronts; `front/responses.Route`, `Handoffs`, `HandedTo`, `Attribute`, re-exported by `front/a2a` but for `Attribute`; `front/responses.TrimHandedOff`, `HandoffNote`, `TransferName` |
 | the handoff | `handoff.New(agents…)` → `*Team` (`Agent{Config, Handoffs []To}`, `To{Agent, Filter, Enabled}`); `Team.Config`, `Team.Route` (a `front/responses.Route`, which both fronts' `WithTransfers` take), `Team.Run` (→ end, path), `Team.Resume`, `Team.Handoff` and `Team.Trim` (for the fronts' `WithHandoff` and `WithHandoffTrim`), `Team.MaxHandoffs`, `ErrTooManyHandoffs`, `ToolName`, `RemoveAllTools`, `Dest`; the fronts' `WithMaxHandoffs` and `WithHandoffTrim` |
 | the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`, which implements `agentturn.InputRequired` (`PendingCalls() []WaitingCall`), as `tools/a2a`'s does; `WithAskParent`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
-| the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)`; a detached call: `tools/a2a.WithDetach(fn)`, `WithPollInterval`, `Answer(final)`, and `CalleeTrigger(callID, task)` (`TriggerCallee`) to deliver its result under; a steer of a working task: `front/a2a.WithDeliverWhileBusy()`, served by `Executor.RequestHandler`, `MaxSteers`, `Redeliverer` and `ContextWithRedeliverer` for a recorded one (`session.Recorder.Redeliver`), and `tools/a2a.Steer(ctx, client, info, parts…)` |
+| the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)`; an escalated call put to the caller's elicitor: `tools/a2a.WithAskCaller()`, `WithSendBy()`, `AskedCall.Callee`; a detached call: `tools/a2a.WithDetach(fn)`, `WithPollInterval`, `Answer(final)`, and `CalleeTrigger(callID, task)` (`TriggerCallee`) to deliver its result under; a steer of a working task: `front/a2a.WithDeliverWhileBusy()`, served by `Executor.RequestHandler`, `MaxSteers`, `Redeliverer` and `ContextWithRedeliverer` for a recorded one (`session.Recorder.Redeliver`), and `tools/a2a.Steer(ctx, client, info, parts…)` |
 | quarantine | `Agent.Quarantine`, `Agent.Quarantined`; `Quarantine(ctx, items…)` from a hook or a tool, `ErrNoQuarantine`, `ErrNotQuarantinable`; `QuarantinedOutput`, the placeholder; `QuarantineFromContext` → `QuarantineView` (`Has`, `Generation`, `Apply`) for a transform, which `compact` reads; `NewQuarantineSet` → `QuarantineSet` (`Add`, `Items`, `Has`, `Apply`), `ContextWithQuarantineSet` for a host carrying one through `Run` and `Continue`, and `WithQuarantineSet` for an `Agent`; `QuarantineSet.Bind` and `Merge` for a front keeping a conversation's set across tasks or requests, as `front/a2a` does per context and `front/responses` under `WithQuarantineScope` (`QuarantineScope`, `MaxQuarantineScopes` per principal); `session` `Recorder.Attach` seeds it from the record's `omit` |
 | the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `StartChild` and `ContinueChild` for a child the host starts, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Queue`, `Deliver`, `Redeliver`, `Control` (`RecordedControl`, for a front), `Requeue`, `Rebase`; `session.MoveTo` for a rewind; `WithInstructionsParts`, `WithMedia`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`, read with `Recorder.ReadOptions`, `session.WithBlobs` resolving a sidecar session's media (`session.ErrNoBlobReader` without one); the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
 
@@ -2439,6 +2452,10 @@ it.
 - **Nested calls.** A deferral may carry a decline text, which the
   asking model reads in place of the loop's `declined when asked` when
   the answer declines, followed by the answerer's note (#304).
+- **Composition, as a peer.** A tool consuming a remote agent puts the
+  calls the remote escalated to its caller to the elicitor of the call
+  that started the task, and answers them on the same task with an
+  approval each (#296).
 
 ## Changes in draft 0.6
 

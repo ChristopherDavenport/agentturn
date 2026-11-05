@@ -42,6 +42,7 @@ import (
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
+	fronta2a "github.com/ChristopherDavenport/agentturn/front/a2a"
 	"github.com/ChristopherDavenport/openresponses"
 	"github.com/a2aproject/a2a-go/a2a"
 	"github.com/a2aproject/a2a-go/a2aclient"
@@ -194,6 +195,41 @@ type InputRequired func(ctx context.Context, info TaskInfo, question *a2a.Messag
 // does, unless the callee is a peer.
 func WithInputRequired(fn InputRequired) Option { return func(r *remote) { r.inputRequired = fn } }
 
+// WithAskCaller answers a task that waits only on calls the remote
+// agent's own policy escalated to its caller, as front/a2a's
+// WithEscalation puts them (the status message's
+// [fronta2a.MetaEscalatedCalls]): each such call is put to the
+// elicitor of the call that started the task, through agentturn.Ask,
+// as tools/agent's WithAskParent puts a child's deferred call. The
+// question names the call, its arguments, the remote's reason and the
+// remote agent ([agentturn.AskedCall.Callee]), and is filed under this
+// call, which is on the elicitor's context. The answers go back on the
+// same task, one [fronta2a.Approval] per asked call, carrying the
+// answerer's note, and who decided only under [WithSendBy]. A call the
+// remote held beside an asked one is not asked about: the remote
+// settles it by the answers. The task then goes on, as many times as
+// [WithInputRounds] allows.
+//
+// A task that also waits on other input, a call to a tool the caller
+// executes or a question that is not a call, is not answered so, and
+// neither is one when there is nobody to ask: no elicitor, a failure to
+// ask, a cancel or an answer naming an unknown decider. Then
+// [WithInputRequired] answers it if it is set, and otherwise the call
+// fails input-required naming the calls, as it does without the
+// option. A detached call's task, followed on the run's context, has
+// no elicitor there, and keeps [WithInputRequired] (#296).
+func WithAskCaller() Option { return func(r *remote) { r.askCaller = true } }
+
+// WithSendBy sends, on each approval [WithAskCaller] gives, who decided
+// it in the session format's terms, "human" for an answer that names
+// nobody. Use it only for a remote agent that accepts it from this
+// caller, as front/a2a's WithChosenBy lets a host say: such a front
+// refuses the whole message with an approval naming a decider it does
+// not accept. Without it the approval names nobody, and the remote
+// records an anonymous decision; the caller's own record keeps the
+// decider either way, on the question it files under this call.
+func WithSendBy() Option { return func(r *remote) { r.sendBy = true } }
+
 // DefaultInputRounds is how many times a call answers a task's
 // questions through [WithInputRequired] before it ends input-required.
 const DefaultInputRounds = 8
@@ -316,6 +352,7 @@ func New(client *a2aclient.Client, card *a2a.AgentCard, opts ...Option) agenttoo
 	r := &remote{client: client, inputRounds: DefaultInputRounds, pollInterval: DefaultPollInterval}
 	if card != nil {
 		r.name = functionName(card.Name)
+		r.agent = card.Name
 		r.description = describe(card)
 	}
 	for _, opt := range opts {
@@ -354,6 +391,11 @@ type remote struct {
 	detach        func(callID string, info TaskInfo, final *a2a.Task, err error)
 	pollInterval  time.Duration
 	schema        json.RawMessage
+	// agent is the remote agent's name, from its card, which a question
+	// [WithAskCaller] asks names.
+	agent     string
+	askCaller bool
+	sendBy    bool
 }
 
 func (r *remote) Name() string                { return r.name }
@@ -401,7 +443,17 @@ func (r *remote) follow(ctx context.Context, call agenttool.Call, msg *a2a.Messa
 			c.leave(ctx, out)
 			return agenttool.Result{}, err
 		}
-		if out.state != a2a.TaskStateInputRequired || r.inputRequired == nil || out.taskID == "" || rounds >= r.inputRounds {
+		if out.state != a2a.TaskStateInputRequired || out.taskID == "" || rounds >= r.inputRounds {
+			break
+		}
+		if r.askCaller {
+			if answer, ok := r.askEscalated(ctx, out.status); ok {
+				msg = a2a.NewMessageForTask(a2a.MessageRoleUser, a2a.TaskInfo{TaskID: out.taskID, ContextID: out.contextID}, answer...)
+				out.answered()
+				continue
+			}
+		}
+		if r.inputRequired == nil {
 			break
 		}
 		info := TaskInfo{TaskID: out.taskID, ContextID: out.contextID, State: out.state}
@@ -431,6 +483,63 @@ func (r *remote) follow(ctx context.Context, call agenttool.Call, msg *a2a.Messa
 	// stops it.
 	c.leave(ctx, out)
 	return out.result()
+}
+
+// askEscalated puts the calls a task's status message says the remote
+// escalated to its caller to the elicitor on ctx, as [WithAskCaller]
+// describes, and returns one approval part per call, or false when the
+// task waits on anything else or nobody answered.
+func (r *remote) askEscalated(ctx context.Context, status *a2a.Message) ([]a2a.Part, bool) {
+	if status == nil {
+		return nil, false
+	}
+	if ids, _ := status.Metadata[fronta2a.MetaPendingCalls].([]any); len(ids) > 0 {
+		// It also waits on outputs of the caller's own tools.
+		return nil, false
+	}
+	escalated, _ := status.Metadata[fronta2a.MetaEscalatedCalls].([]any)
+	if len(escalated) == 0 {
+		return nil, false
+	}
+	elicit, ok := agenttool.ElicitorFrom(ctx)
+	if !ok {
+		return nil, false
+	}
+	callee := r.agent
+	if callee == "" {
+		callee = r.name
+	}
+	parts := make([]a2a.Part, 0, len(escalated))
+	for _, e := range escalated {
+		m, _ := e.(map[string]any)
+		id, _ := m["call_id"].(string)
+		name, _ := m["name"].(string)
+		args, _ := m["arguments"].(string)
+		reason, _ := m["reason"].(string)
+		if id == "" || name == "" {
+			return nil, false
+		}
+		// The answer's note goes to the remote as the answerer said it,
+		// so the elicitor's answer is kept as given.
+		var said agenttool.Answer
+		keep := func(ctx context.Context, q agenttool.Elicitation) (agenttool.Answer, error) {
+			a, err := elicit(ctx, q)
+			said = a
+			return a, err
+		}
+		asked := agentturn.AskedCall{CallID: id, Name: name, Args: json.RawMessage(args), Callee: callee,
+			Decision: &agentturn.ToolDecision{Action: agentturn.Defer, Reason: reason}}
+		d, ok := agentturn.Ask(agenttool.ContextWithElicitor(ctx, keep), asked)
+		if !ok {
+			return nil, false
+		}
+		approval := fronta2a.Approval{CallID: id, Approve: d.Action == agentturn.Allow, Note: said.Note}
+		if r.sendBy {
+			approval.By = d.By
+		}
+		parts = append(parts, fronta2a.ApprovalPart(approval))
+	}
+	return parts, true
 }
 
 // detached sends msg and returns once the remote agent names a task it

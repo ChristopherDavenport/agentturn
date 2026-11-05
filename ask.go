@@ -31,6 +31,11 @@ type AskedCall struct {
 	// Decision is the hook's deferral as it stood when the question was
 	// asked; its Reason is the rule that asked.
 	Decision *ToolDecision
+	// Callee names the agent that would run the call when it is not
+	// this run's: the remote agent whose own policy escalated it to its
+	// caller, as tools/a2a's WithAskCaller asks. Empty for a call of
+	// this run or of a child it runs.
+	Callee string
 }
 
 type askedCallKey struct{}
@@ -51,8 +56,10 @@ func ContextWithAskedCall(ctx context.Context, call AskedCall) context.Context {
 
 // Ask puts call to the elicitor on ctx, as the loop puts a nested call
 // the hook deferred: with the question "Allow <name> with arguments
-// <args>? <reason>", the arguments clipped at 500 bytes, and the call
-// on the elicitor's context for [AskedCallFrom]. It returns the
+// <args>? <reason>", or "Allow agent <callee> to run <name> ..." for a
+// call another agent would run ([AskedCall.Callee]), the arguments
+// clipped at 500 bytes, and the call on the elicitor's context for
+// [AskedCallFrom]. It returns the
 // decision the answer makes, by the decider the answer names
 // ([agenttool.Answer.By]), or "human" when it names none, since an
 // answer that names nobody is the user's: Allow with the deferral's
@@ -69,7 +76,8 @@ func ContextWithAskedCall(ctx context.Context, call AskedCall) context.Context {
 // user message for "human", in the person's voice, and a developer
 // message for a rule or another model, whose words are not the user's.
 // The decision's Note stays the policy's, a developer message. Outside
-// a run there is nothing to hold it with, and the decision's Note
+// a run there is nothing to hold it with, nor for a call another agent
+// would run, whose note its caller sends on, and the decision's Note
 // carries it as "The user said: <note>" ("The policy said", "Another
 // agent said"). It returns nil and false when ctx carries no elicitor,
 // the ask failed, the answer was a cancel or it named a decider the
@@ -82,6 +90,9 @@ func Ask(ctx context.Context, call AskedCall) (*ToolDecision, bool) {
 		return nil, false
 	}
 	msg := fmt.Sprintf("Allow %s with arguments %s?", call.Name, clip(string(call.Args), maxAskedArgs))
+	if call.Callee != "" {
+		msg = fmt.Sprintf("Allow agent %s to run %s with arguments %s?", call.Callee, call.Name, clip(string(call.Args), maxAskedArgs))
+	}
 	if call.Decision.Reason != "" {
 		msg += " " + call.Decision.Reason
 	}
@@ -110,7 +121,7 @@ func Ask(ctx context.Context, call AskedCall) (*ToolDecision, bool) {
 			decided.Reason = "allowed when asked"
 		}
 		if ans.Note != "" {
-			if r, ok := ctx.Value(noteSinkKey{}).(*runner); ok {
+			if r, ok := ctx.Value(noteSinkKey{}).(*runner); ok && call.Callee == "" {
 				// The answerer's words are theirs, a message in their
 				// voice held with the call, apart from the decision's
 				// own Note. A
@@ -126,7 +137,9 @@ func Ask(ctx context.Context, call AskedCall) (*ToolDecision, bool) {
 				}
 				r.sayUnder(answerNoteItem(ans.Note, by), call.CallID, call.Parent, asking)
 			} else {
-				// No run to hold it with: the decision carries it.
+				// No run to hold it with, or the call is another
+				// agent's, whose caller sends the note on: the decision
+				// carries it.
 				if decided.Note != "" {
 					decided.Note += "\n"
 				}

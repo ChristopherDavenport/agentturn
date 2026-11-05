@@ -89,6 +89,17 @@ versions may break the API.
   hold's text. `ChainBeforeToolCall` keeps it with the deferral that
   asks, and front/control's decision carries it as `decline_text`.
   RFC 0001 draft 0.7, Nested calls. (#304)
+- Added: `tools/a2a.WithAskCaller`, which answers a remote task that
+  waits only on calls front/a2a's `WithEscalation` put to its caller:
+  each is asked of the elicitor of the call that started the task,
+  through `Ask`, naming the call, the remote's reason and the remote
+  agent, and answered on the same task with an `Approval` carrying the
+  answerer's note. `WithSendBy` adds who decided, for a remote whose
+  `WithChosenBy` accepts it. With nobody to ask, or other input
+  waited on, the call still fails input-required. `AskedCall.Callee`
+  names the agent that would run an asked call that is not this run's;
+  `Ask` names it in the question and leaves the answerer's note for its
+  caller to send on. RFC 0001 draft 0.7, Composition. (#296)
 
 ## v0.0.37 - 2026-11-04
 
