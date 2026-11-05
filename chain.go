@@ -157,8 +157,11 @@ func ChainShouldStopAfterTurn(fns ...func(context.Context, TurnInfo) (bool, erro
 // because the reason has to explain the decision that stands and a
 // block's reason is what the model reads. Two deferrals make a call
 // held ([ToolDecision.Held]) only if both held it: a deferral that asks
-// about it wins, with its reason, subject and decline text. The first
-// decline text among the deferrals stands. The first note stands, and
+// about it wins, with its reason, subject and decline text. The decline
+// text comes only from a deferral of the kind that stands: for a call
+// asked about, the first among the deferrals that ask, never a hold's,
+// which is worded for a refusal beside a declined sibling; for a held
+// call, the first among the holds. The first note stands, and
 // Terminate is set when any decision sets it. Arguments a decision rewrites are passed to the
 // hooks after it, so each sees what the call will actually run with and
 // the last rewrite is what the tool receives. The first error stops the
@@ -237,7 +240,8 @@ func (d *ToolDecision) merge(next *ToolDecision) {
 	if d.By == "" {
 		d.By = next.By
 	}
-	if d.DeclineText == "" && d.Action == Defer && next.Action == Defer {
+	if d.DeclineText == "" && d.Action == Defer && next.Action == Defer && d.Held == next.Held {
+		// Only a deferral of the kind that stands words its refusal.
 		d.DeclineText = next.DeclineText
 	}
 	if d.Note == "" {

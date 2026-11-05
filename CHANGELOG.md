@@ -89,7 +89,8 @@ versions may break the API.
   hold's text, and so do `front/a2a`'s refusals under `WithEscalation`:
   a call the caller refuses reads the deferral's text, the caller's
   note after it, and a call held beside it its own hold's.
-  `ChainBeforeToolCall` keeps it with the deferral that asks, and
+  `ChainBeforeToolCall` takes it only from a deferral of the kind that
+  stands, so an asked call never reads a hold's text, and
   front/control's decision carries it as `decline_text`.
   RFC 0001 draft 0.7, Nested calls. (#304)
 - Added: `session.Recorder` writes a deferral's decline text on its
