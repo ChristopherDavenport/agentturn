@@ -1791,6 +1791,19 @@ An agent stands in four places inside another system:
   level of nesting; a **spawn** callback hands the host the child's
   agent, keyed by the call, so a hub can steer it, cancel it without
   cutting its siblings, or prompt it again once the tool has returned.
+  A composition tool that can continue its callee from the record
+  SHOULD report itself keyed (agenttool RFC 0001's replay). A call run
+  again under its key SHOULD continue that callee rather than start it
+  afresh, so a deferral that was open when the process stopped is
+  asked again under the same call, and its answer decides the
+  callee's call: the child continues its session from the record,
+  every call it left pending answered by the replay rule, a call its
+  policy was deciding, which never started, put to the policy again,
+  and one it held with nobody answering put to the policy again when
+  the tool puts the child's deferrals to the caller's elicitor; a
+  child whose run had ended with nothing pending returns that end and
+  runs nothing. A call run again under another key is another
+  operation, and starts its callee afresh (#297).
   A **detached** child is the background task: the call returns once
   the child's run has started, the child runs on the run context, so
   the parent's cancellation still cuts it and the parent's run ending
@@ -2251,7 +2264,7 @@ maps onto it as follows:
 | the loop as a model | `front/responses.New(cfg)` → `openresponses.Adapter` |
 | handoffs a front takes | `WithHandoff`, `WithStart`, `WithTransfers(route)` in both fronts; `front/responses.Route`, `Handoffs`, `HandedTo`, `Attribute`, re-exported by `front/a2a` but for `Attribute`; `front/responses.TrimHandedOff`, `HandoffNote`, `TransferName` |
 | the handoff | `handoff.New(agents…)` → `*Team` (`Agent{Config, Handoffs []To}`, `To{Agent, Filter, Enabled}`); `Team.Config`, `Team.Offer` for the host's offer over each agent's whole list, transfers included, `Team.Route` (a `front/responses.Route`, which both fronts' `WithTransfers` take), `Team.Run` (→ end, path), `Team.Resume`, `Team.Handoff` and `Team.Trim` (for the fronts' `WithHandoff` and `WithHandoffTrim`), `Team.MaxHandoffs`, `ErrTooManyHandoffs`, `ToolName`, `RemoveAllTools`, `Dest`; the fronts' `WithMaxHandoffs` and `WithHandoffTrim` |
-| the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`, which implements `agentturn.InputRequired` (`PendingCalls() []WaitingCall`), as `tools/a2a`'s does; `WithAskParent`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry` |
+| the loop as a tool | `tools/agent.New(cfg, opts…)` → `agenttool.Tool`; `ChildInfo`; `InputRequiredError`, which implements `agentturn.InputRequired` (`PendingCalls() []WaitingCall`), as `tools/a2a`'s does; `WithAskParent`; `WithArgs`, `WithStrictArgs`, `WithTranscript`, `WithObserver`, `WithSpawn`, `WithRunContext`, `WithDetach`, `WithNoAnswer`, `WithToolName`; `ContextWithRetry`; `WithRecord` (`Record`), with `session.Recorder.ChildRecord` as its loader, for a call run again under its key |
 | the loop as a peer | `front/a2a.New(cfg)`, `front/a2a.AgentCard`, `front/a2a.WithRecorderFor`; `tools/a2a.New(client, card)`; an escalated call put to the caller's elicitor: `tools/a2a.WithAskCaller()`, `WithSendBy()`, `AskedCall.Callee`; a detached call: `tools/a2a.WithDetach(fn)`, `WithPollInterval`, `Answer(final)`, and `CalleeTrigger(callID, task)` (`TriggerCallee`) to deliver its result under; a steer of a working task: `front/a2a.WithDeliverWhileBusy()`, served by `Executor.RequestHandler`, `MaxSteers`, `Redeliverer` and `ContextWithRedeliverer` for a recorded one (`session.Recorder.Redeliver`), and `tools/a2a.Steer(ctx, client, info, parts…)` |
 | quarantine | `Agent.Quarantine`, `Agent.Quarantined`; `Quarantine(ctx, items…)` from a hook or a tool, `ErrNoQuarantine`, `ErrNotQuarantinable`; `QuarantinedOutput`, the placeholder; `QuarantineFromContext` → `QuarantineView` (`Has`, `Generation`, `Apply`) for a transform, which `compact` reads; `NewQuarantineSet` → `QuarantineSet` (`Add`, `Items`, `Has`, `Apply`), `ContextWithQuarantineSet` for a host carrying one through `Run` and `Continue`, and `WithQuarantineSet` for an `Agent`; `QuarantineSet.Bind` and `Merge` for a front keeping a conversation's set across tasks or requests, as `front/a2a` does per context and `front/responses` under `WithQuarantineScope` (`QuarantineScope`, `MaxQuarantineScopes` per principal); `session` `Recorder.Attach` seeds it from the record's `omit` |
 | the record | `session.Recorder`; `Start`, `Resume`, `Continue`, `Attach`, `Handle`, `Observe`, `ChildContext`, `StartChild` and `ContinueChild` for a child the host starts, `Fold`, `Annotate`, `EntryOf`, `Omit`, `RecordFunc`, `Elicitor`, `Queue`, `Deliver`, `Accept`, `Redeliver`, `Control` (`RecordedControl`, for a front), `Requeue`, `Rebase`; `session.MoveTo` for a rewind; `WithInstructionsParts`, `WithMedia`; `session.RequestHash`; the replay rule from the record: `session.AgentOptions`, `session.Pending`, `session.ReplayAnswers`, `session.CallIDs`, read with `Recorder.ReadOptions`, `session.WithBlobs` resolving a sidecar session's media (`session.ErrNoBlobReader` without one); the compaction back-off from the record: `session.CompactOptions`, `session.LastFailedFold`, `compact.WithFailedFold`, `compact.PrefixHash` |
@@ -2558,6 +2571,10 @@ it.
   runs the input under it only for a principal the host has authorised
   to claim one, otherwise under its own kind; the control front's
   `control` stays the default (#303).
+- **Composition, as a tool.** A composition tool that can continue its
+  callee from the record SHOULD report itself keyed, and a call run
+  again under its key SHOULD continue that callee, so a deferral open
+  when the process stopped is asked again under the same call (#297).
 
 ## Changes in draft 0.6
 

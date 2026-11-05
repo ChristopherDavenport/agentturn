@@ -462,6 +462,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -3176,7 +3177,7 @@ func resume(ctx context.Context, s *agentsession.Session, store agentsession.Sto
 	}
 	r.root.cwd = s.Header().CWD
 	r.root.media = s.Header().Media
-	if err := r.root.closeOpenRun(ctx, s, agentsession.ReasonError, "cut off: closed on resume", true); err != nil {
+	if err := r.root.closeOpenRun(ctx, s, agentsession.ReasonError, cutOffRef, true); err != nil {
 		return nil, nil, err
 	}
 	s, err := r.held(ctx, s)
@@ -4535,6 +4536,170 @@ func (r *Recorder) ChildContext(ctx context.Context, callID string) context.Cont
 		}
 	}
 	return ctx
+}
+
+// cutOffRef is the ref of the end a writer writes for a run the
+// process cut, closing it before it goes on.
+const cutOffRef = "cut off: closed on resume"
+
+// ChildRecord is the loader agent.WithRecord takes: what the record
+// holds of the child a tools/agent call started, for the call run
+// again under the key of the dispatch that started it, as the loop's
+// replay rule runs a call that was in flight when the process stopped
+// (RFC 0001, Composition, As a tool; #297):
+//
+//	specialist := agent.New(childCfg,
+//		agent.WithObserver(rec.Observe),
+//		agent.WithRunContext(rec.ChildContext),
+//		agent.WithRecord(rec.ChildRecord))
+//
+// The parent is the session of the run on ctx, as for
+// [Recorder.ChildContext]. The child is the session the last
+// subsession link for the call on the parent's path names, when the
+// dispatch of the call before that link carried call's key: a call run
+// again under another key is another operation, and gets nil, so the
+// tool starts it afresh, as it does a call no link names yet. A run of
+// the child the process left open is closed, as [Resume] closes the
+// root's, and the record returned seeds a new agent with the child's
+// state at its leaf, as [AgentOptions] does, lists its pending calls,
+// as [Pending] does, and answers those not held by the replay rule, as
+// [ReplayAnswers] does with the tools cfg resolves; a call that never
+// started, one the child's policy was deciding when the process
+// stopped, is approved, which puts it to the policy again. A child
+// whose last run had ended with nothing pending, or was cut after its
+// answer, is returned as that end, which the tool returns without
+// running: Reason, Cause and the transcript as the record has them,
+// and Err naming the end for one without an answer. The child's run
+// is observed as any is, and goes on at the session's leaf. A recorder
+// made with [WithoutChildSessions] holds no child and returns nil.
+func (r *Recorder) ChildRecord(ctx context.Context, call agenttool.Call, cfg agentturn.Config) (*agent.Record, error) {
+	if call.ID == "" || call.IdempotencyKey == "" {
+		return nil, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.children {
+		return nil, nil
+	}
+	parent := r.root
+	if p, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
+		parent = p
+	}
+	// What is read and written here is the record of work that may
+	// have happened, so a cancel does not cut it short.
+	bg := context.WithoutCancel(ctx)
+	ps, err := r.store.Open(bg, parent.id)
+	if err != nil {
+		return nil, fmt.Errorf("session: open %s for the call's child: %w", parent.id, err)
+	}
+	childID := linkedUnder(ps.Path(ps.Leaf()), call.ID, call.IdempotencyKey)
+	if childID == "" {
+		return nil, nil
+	}
+	cs, err := r.store.Open(bg, childID)
+	if err != nil {
+		return nil, fmt.Errorf("session: open the child session %s: %w", childID, err)
+	}
+	r.addChild(cs.ID())
+	if cs.Leaf() == "" {
+		return nil, nil
+	}
+	runs, err := cs.Runs(cs.Leaf())
+	if err != nil {
+		return nil, fmt.Errorf("session: runs of %s: %w", childID, err)
+	}
+	if len(runs) == 0 {
+		return nil, nil
+	}
+	last := runs[len(runs)-1]
+	if last.End == nil {
+		// The process stopped inside the run: the writer that goes on
+		// closes it, as Resume closes the root's.
+		w := newWriter(r, childID)
+		if err := w.closeOpenRun(bg, cs, agentsession.ReasonError, cutOffRef, true); err != nil {
+			return nil, err
+		}
+		if cs, err = r.store.Open(bg, childID); err != nil {
+			return nil, fmt.Errorf("session: open the child session %s: %w", childID, err)
+		}
+	}
+	opts := append(r.ReadOptions(), WithContext(ctx))
+	pending, err := Pending(cs, opts...)
+	if err != nil {
+		return nil, err
+	}
+	out := &agent.Record{RunID: last.RunID(), Pending: pending}
+	if len(pending) == 0 {
+		items, err := Transcript(cs, opts...)
+		if err != nil {
+			return nil, err
+		}
+		end := recordedEnd(last, items)
+		if end != nil {
+			out.End = end
+			return out, nil
+		}
+	}
+	if out.Options, err = AgentOptions(cs, opts...); err != nil {
+		return nil, err
+	}
+	if out.Answers, err = ReplayAnswers(ctx, cs, cfg.ResolveTools(ctx), opts...); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// linkedUnder returns the child session the last subsession link for
+// callID on path names, when the last dispatch of the call before that
+// link carried key, and "" otherwise.
+func linkedUnder(path []agentsession.Entry, callID, key string) string {
+	dispatched, child := "", ""
+	for _, e := range path {
+		switch v := e.(type) {
+		case *agentsession.DispatchEntry:
+			if v.CallID == callID {
+				dispatched = v.IdempotencyKey
+			}
+		case *agentsession.LinkEntry:
+			if v.Rel != agentsession.RelSubsession || v.CallID != callID || v.URL != "" || v.Cancel != "" || v.SpawnID != "" {
+				continue
+			}
+			child = ""
+			if dispatched == key {
+				child = v.Session
+			}
+		}
+	}
+	return child
+}
+
+// recordedEnd is the end of run, the child's last, with nothing
+// pending, as a call that runs again returns it, items being the
+// child's transcript: nil for a run the process cut before its answer,
+// which goes on. A run that ended without an answer carries an error
+// naming its end.
+func recordedEnd(run *agentsession.Run, items openresponses.Items) *agentturn.RunEnd {
+	end := &agentturn.RunEnd{RunID: run.RunID(), Items: agentturn.Transcript(items)}
+	if run.End == nil || run.End.Ref == cutOffRef {
+		// Cut: an answer the model gave before the cut stands.
+		if _, ok := end.Answer(); !ok {
+			return nil
+		}
+		end.Reason = agentturn.ReasonDone
+		return end
+	}
+	switch run.End.Reason {
+	case agentsession.ReasonDone:
+		end.Reason = agentturn.ReasonDone
+	case agentsession.ReasonStopped:
+		end.Reason = agentturn.ReasonStopped
+		cause, _, _ := strings.Cut(run.End.Ref, ":")
+		end.Cause = agentturn.StopCause(cause)
+	default:
+		end.Reason = agentturn.ReasonError
+		end.Err = fmt.Errorf("its run %s ended %s on the record: %s", run.RunID(), run.End.Reason, run.End.Ref)
+	}
+	return end
 }
 
 // StartChild records a child agent the host starts itself, not
@@ -7478,6 +7643,12 @@ func (w *writer) child(ctx context.Context, callID string, info agent.ChildInfo)
 	if running {
 		return nil
 	}
+	if id := r.holdsRun(ctx, w, callID, info.RunID); id != "" {
+		// A run of the child the record holds already, the end
+		// agent.WithRecord returns for a call run again: nothing new
+		// ran, and the call's session is linked again.
+		return w.link(ctx, id, callID)
+	}
 	cw, err := r.newChild(ctx, w, childKey{call: callID}, false, info.Agent)
 	if err != nil {
 		return err
@@ -7495,6 +7666,30 @@ func (w *writer) child(ctx context.Context, callID string, info agent.ChildInfo)
 		}
 	}
 	return w.link(ctx, cw.id, callID)
+}
+
+// holdsRun returns the ID of the call's child session of w when it
+// holds the run runID, and "" otherwise.
+func (r *Recorder) holdsRun(ctx context.Context, w *writer, callID, runID string) string {
+	if runID == "" {
+		return ""
+	}
+	id := agentsession.SubsessionID(w.id, callID)
+	s, err := r.store.Open(context.WithoutCancel(ctx), id)
+	if err != nil || s.Leaf() == "" {
+		return ""
+	}
+	runs, err := s.Runs(s.Leaf())
+	if err != nil {
+		return ""
+	}
+	for _, run := range runs {
+		if run.RunID() == runID {
+			r.addChild(id)
+			return id
+		}
+	}
+	return ""
 }
 
 // link writes the subsession link for callID once.

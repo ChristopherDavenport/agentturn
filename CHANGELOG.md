@@ -7,6 +7,25 @@ versions may break the API.
 
 ## Unreleased
 
+- Added: `tools/agent.WithRecord` (`Record`) continues the child a call
+  started from the host's record when the call runs again under the
+  key of the dispatch that started it, and the tool then reports
+  itself keyed (`agenttool.ReplayKeyed`), so the replay rule runs a
+  call that was in flight when the process stopped again under its
+  key. The child's agent is seeded from the record and its run is not
+  marked a retry, so its session goes on at its leaf rather than on a
+  new root; its pending calls are answered by the replay rule, and a
+  call its policy was deciding goes back to `BeforeToolCall`, so under
+  `WithAskParent` the question open when the process stopped is asked
+  again under the parent's call. A child that had ended with nothing
+  pending returns that end and runs nothing; a call under a new key,
+  and a detached one, start afresh as before. `session.Recorder.ChildRecord`
+  is the loader for a child recorded with `Observe`: it closes the
+  child's run the process cut and reads the child's state as
+  `AgentOptions`, `Pending` and `ReplayAnswers` do. A recorded end the
+  call returns is not written into the child's session again. RFC 0001
+  draft 0.7, Composition, As a tool. agentkit wires it in agentkit#124.
+  (#297)
 - Changed: requires openresponses v0.0.19 and agenttool v0.0.30 in every
   module, and `session` requires agentsession v0.0.38, so a session the
   recorder writes is format 0.21. Nothing here broke: the recorder
