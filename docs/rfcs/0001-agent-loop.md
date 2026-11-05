@@ -1462,9 +1462,14 @@ accepted would otherwise show a steer typed during the tool only once
 the tool ends. The reference reports it at once when no event is being
 delivered, from a goroutine of its own so the accept still returns
 without running a subscriber, and otherwise right after the event that
-is; an item a subscriber accepts while such a report is being
+is. An item a subscriber accepts while such a report is being
 delivered waits for the run's next event, so a subscriber that queues
-on every report does not spin. An idle agent reports it at the start
+on every report does not spin; an item accepted from elsewhere while
+it is delivered, a second person's steer, is reported right after it,
+since only the subscriber's own accepts can chase the reports. The
+reference tells a subscriber's accept by the context it hands the
+subscriber, and counts a steer or follow-up queued with no context as
+the subscriber's. An idle agent reports it at the start
 of the next run. A host that must not lose an input therefore writes
 it before queueing it rather than from the event, and a subscriber's
 error cannot refuse the item; an error on a report delivered between

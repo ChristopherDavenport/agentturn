@@ -758,3 +758,73 @@ func TestAQueuedReportDoesNotSpinASubscriber(t *testing.T) {
 		t.Fatalf("end = %+v", end)
 	}
 }
+
+// TestOutsideAcceptsDuringAReportAreReported pins the bound on #302's
+// reports to what a subscriber itself queues: an outside caller's
+// accept that arrives while a queued report is being delivered, a
+// second typed steer, is reported before a quiet tool ends, however
+// many arrive one after another during the reports before it.
+func TestOutsideAcceptsDuringAReportAreReported(t *testing.T) {
+	running, release := make(chan struct{}, 1), make(chan struct{})
+	a := New(Config{Model: &echo.Adapter{}, MaxTurns: 3, Tools: []agenttool.Tool{heldTool(running, release)}})
+	var holding atomic.Bool
+	holding.Store(true)
+	reported, proceed := make(chan string, 4), make(chan struct{})
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		e, ok := ev.(*Queued)
+		if !ok || !holding.Load() {
+			return nil
+		}
+		m, _ := e.Item.(*openresponses.Message)
+		reported <- m.Text()
+		// Held inside the report until the test has accepted the next
+		// item from outside.
+		<-proceed
+		return nil
+	})
+	done := make(chan *RunEnd, 1)
+	go func() {
+		end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+		done <- end
+	}()
+	<-running
+	var released sync.Once
+	defer released.Do(func() { close(release) })
+	person := ContextWithTrigger(context.Background(), Trigger{Kind: TriggerHuman})
+	steer := func(text string) {
+		t.Helper()
+		if err := a.Queue(person, QueueSteer, openresponses.UserText(text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	steer("one")
+	for _, next := range []string{"two", "three"} {
+		select {
+		case <-reported:
+		case <-time.After(2 * time.Second):
+			holding.Store(false)
+			close(proceed)
+			t.Fatalf("the report before %q waited for the tool to end", next)
+		}
+		// The report under way is inside the subscriber: this accept
+		// cannot take the barrier.
+		steer(next)
+		proceed <- struct{}{}
+	}
+	select {
+	case text := <-reported:
+		if text != "three" {
+			t.Errorf("reported %q, want three", text)
+		}
+	case <-time.After(2 * time.Second):
+		holding.Store(false)
+		close(proceed)
+		t.Fatal("the second outside accept during a report waited for the tool to end")
+	}
+	holding.Store(false)
+	close(proceed)
+	released.Do(func() { close(release) })
+	if end := <-done; end == nil || end.Reason != ReasonDone {
+		t.Fatalf("end = %+v", end)
+	}
+}

@@ -172,6 +172,11 @@ type Agent struct {
 	// no event is being delivered and otherwise the delivery under way
 	// as it lets the barrier go (reportQueued, #302).
 	queued []*Queued
+	// queuedOutside counts the accepts among queued that came from
+	// outside the agent's subscribers, which a delivery under way keeps
+	// reporting as it lets the barrier go; a subscriber's own waits for
+	// the run's next event once one pass has been made (unlockEmit).
+	queuedOutside int
 	// events is the context the run in flight delivers its events
 	// under, which a queued report made outside its events is
 	// delivered under too.
@@ -1384,7 +1389,7 @@ func (a *Agent) deliver(ctx context.Context, ev Event) (err error) {
 func (a *Agent) drainQueued(ctx context.Context) error {
 	a.mu.Lock()
 	evs := a.queued
-	a.queued = nil
+	a.queued, a.queuedOutside = nil, 0
 	a.mu.Unlock()
 	for _, ev := range evs {
 		if err := a.dispatch(ctx, ev); err != nil {
@@ -1482,6 +1487,7 @@ func (a *Agent) dispatch(ctx context.Context, ev Event) error {
 	subs := append([]subscription(nil), a.subs...)
 	replays := a.takeReplays(subs)
 	a.mu.Unlock()
+	ctx = a.subscriberContext(ctx)
 	for _, s := range subs {
 		for _, q := range replays[s.id] {
 			if err := s.fn(ctx, q); err != nil {
@@ -1566,8 +1572,9 @@ func (a *Agent) flushReplay(id int, fn func(context.Context, Event) error) {
 	qs := a.replays[id]
 	delete(a.replays, id)
 	a.mu.Unlock()
+	ctx := a.subscriberContext(context.Background())
 	for _, q := range qs {
-		if fn(context.Background(), q) != nil {
+		if fn(ctx, q) != nil {
 			return
 		}
 	}
@@ -1586,8 +1593,13 @@ func (a *Agent) flushReplay(id int, fn func(context.Context, Event) error) {
 // without waiting for its next event (#302): at once, on a goroutine
 // of its own, when no event is being delivered, and otherwise right
 // after the event that is, so a steer made while a quiet tool runs is
-// reported while it runs; one a subscriber makes while that report is delivered waits
-// for the run's next event. An idle agent reports it at the start of
+// reported while it runs; one a subscriber makes while that report is
+// delivered waits for the run's next event, so a subscriber that steers
+// on every report does not spin. Steer carries no context to tell a
+// subscriber's call from another's, so a steer made from elsewhere
+// while a report is delivered waits so too: a host whose input must be
+// reported at once queues it with [Agent.Queue], whose context tells
+// it from a subscriber's, the one it was handed. An idle agent reports it at the start of
 // the next run, so a host that must not lose an input writes it before
 // calling here rather than from the event. A run in flight takes it unless it is past its last drain,
 // after its final turn_end or once it has decided to stop, when it
@@ -1627,7 +1639,7 @@ func (a *Agent) flushReplay(id int, fn func(context.Context, Event) error) {
 // a trigger of kind [TriggerHuman].
 func (a *Agent) Steer(items ...openresponses.Item) {
 	// No trigger, so nothing to refuse.
-	_ = a.Queue(context.Background(), QueueSteer, items...)
+	_ = a.enqueue(context.Background(), QueueSteer, false, items)
 }
 
 // FollowUp queues items to be injected when the run would otherwise
@@ -1637,7 +1649,7 @@ func (a *Agent) Steer(items ...openresponses.Item) {
 // follow-up a person typed goes through [Agent.Queue] under a trigger
 // of kind [TriggerHuman] to count as theirs.
 func (a *Agent) FollowUp(items ...openresponses.Item) {
-	_ = a.Queue(context.Background(), QueueFollowUp, items...)
+	_ = a.enqueue(context.Background(), QueueFollowUp, false, items)
 }
 
 // Queue is [Agent.Steer] or [Agent.FollowUp], as mode says, for an
@@ -1650,6 +1662,13 @@ func (a *Agent) FollowUp(items ...openresponses.Item) {
 // follow-up. A trigger whose Extra cannot be written is refused with
 // [ErrTriggerExtra], and nothing is queued.
 func (a *Agent) Queue(ctx context.Context, mode QueueMode, items ...openresponses.Item) error {
+	return a.enqueue(ctx, mode, a.outside(ctx), items)
+}
+
+// enqueue is Queue; outside says whether the accept is known to come
+// from outside the agent's subscribers, which Steer and FollowUp,
+// having no context to tell by, cannot say.
+func (a *Agent) enqueue(ctx context.Context, mode QueueMode, outside bool, items openresponses.Items) error {
 	if mode != QueueSteer {
 		mode = QueueFollowUp
 	}
@@ -1662,10 +1681,29 @@ func (a *Agent) Queue(ctx context.Context, mode QueueMode, items ...openresponse
 		how = InputFollowUp
 	}
 	a.mu.Lock()
-	a.queue(trigger, mode, how, items)
+	a.queue(trigger, mode, how, outside, items)
 	a.mu.Unlock()
 	a.reportQueued()
 	return nil
+}
+
+// fromSubscriberKey marks the context an agent hands its subscribers,
+// so an accept made with it is known as a subscriber's own.
+type fromSubscriberKey struct{ a *Agent }
+
+// subscriberContext is ctx as the agent's subscribers are handed it.
+func (a *Agent) subscriberContext(ctx context.Context) context.Context {
+	if ctx.Value(fromSubscriberKey{a}) != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, fromSubscriberKey{a}, true)
+}
+
+// outside reports whether an accept made with ctx comes from outside
+// the agent's subscribers: its context is not one a subscriber of the
+// agent was handed.
+func (a *Agent) outside(ctx context.Context) bool {
+	return ctx.Value(fromSubscriberKey{a}) == nil
 }
 
 // Redeliver queues items as [Agent.Deliver] queues them, a steer that
@@ -1684,7 +1722,7 @@ func (a *Agent) Redeliver(ctx context.Context, items ...openresponses.Item) erro
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.queue(trigger, QueueSteer, InputDeliver, items)
+	a.queue(trigger, QueueSteer, InputDeliver, a.outside(ctx), items)
 	return nil
 }
 
@@ -1817,7 +1855,7 @@ func (a *Agent) acceptDelivery(ctx context.Context, items openresponses.Items) (
 		return 0, nil, ErrHeld
 	}
 	drains, before := a.drains, len(a.steer)
-	a.queue(TriggerFromContext(ctx), QueueSteer, InputDeliver, items)
+	a.queue(TriggerFromContext(ctx), QueueSteer, InputDeliver, a.outside(ctx), items)
 	if len(a.steer) == before {
 		return 0, nil, ErrNoPrompt
 	}
@@ -1936,8 +1974,9 @@ func inputsOf(q []queuedItem) []TurnInput {
 }
 
 // queue is Queue with a.mu held; how says how the items arrived, which
-// mode alone does not, since Deliver queues a steer.
-func (a *Agent) queue(trigger Trigger, mode QueueMode, how InputMode, items openresponses.Items) {
+// mode alone does not, since Deliver queues a steer, and outside
+// whether the accept came from outside the agent's subscribers.
+func (a *Agent) queue(trigger Trigger, mode QueueMode, how InputMode, outside bool, items openresponses.Items) {
 	runID := ""
 	if a.running && !a.closing {
 		runID = a.runID
@@ -1966,6 +2005,9 @@ func (a *Agent) queue(trigger Trigger, mode QueueMode, how InputMode, items open
 			a.followUp = append(a.followUp, entry)
 		}
 		a.queued = append(a.queued, &Queued{RunID: runID, Item: base, Mode: mode, Input: how, Hidden: hidden, Copied: copied, Trigger: itemTrigger, Provenance: prov})
+		if outside {
+			a.queuedOutside++
+		}
 	}
 }
 

@@ -483,16 +483,20 @@ func (a *Agent) eventContext() context.Context {
 // behind. The caller holds a.emitMu.
 //
 // It reports, too, the items a run in flight accepted while the barrier
-// was held ([Agent.reportQueued]), in one pass: an item a subscriber
-// accepts while those are reported waits for the run's next event, so
-// a subscriber that queues on every queued report does not spin here.
+// was held ([Agent.reportQueued]): every pass while an accept from
+// outside the agent's subscribers is owed, and otherwise one. An item a
+// subscriber accepts while those are reported, with the context it was
+// handed or by Steer or FollowUp, which carry none, waits for the run's
+// next event, so a subscriber that queues on every queued report does
+// not spin here, while a second caller's accept that arrives during a
+// report is not left behind it.
 func (a *Agent) unlockEmit() error {
 	reported := false
 	for {
 		a.emitMu.Unlock()
 		a.mu.Lock()
 		owed := len(a.quarantineOwed) > 0
-		queued := !reported && a.queuedOwed()
+		queued := a.queuedOwed() && (!reported || a.queuedOutside > 0)
 		a.mu.Unlock()
 		if !owed && !queued || !a.emitMu.TryLock() {
 			return nil

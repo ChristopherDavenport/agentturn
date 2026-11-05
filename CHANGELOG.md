@@ -181,8 +181,12 @@ versions may break the API.
   for its next event: at once, on a goroutine of its own, when no
   event is being delivered as `Queue`, `Steer`, `FollowUp`, `Deliver`
   or `Accept` accepts, and otherwise right after the event that is, so a steer accepted while a quiet tool
-  runs is reported while it runs. A subscriber's error on such a report
-  ends the run at its next event. RFC 0001 draft 0.7, Queues. (#302)
+  runs is reported while it runs. Only a subscriber's own accept made
+  while such a report is delivered, with the context it was handed or
+  by `Steer` or `FollowUp`, which carry none, waits for the next event;
+  a second caller's accept arriving then is reported right after it.
+  A subscriber's error on such a report ends the run at its next
+  event. RFC 0001 draft 0.7, Queues. (#302)
 - Changed (breaking for a wrapper that embeds `*Agent`): a type that
   embeds `*agentturn.Agent` and overrides `Deliver` to write first, as
   `session`'s `RecordedControl` does, now also has the embedded
