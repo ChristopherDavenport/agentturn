@@ -109,8 +109,9 @@ versions may break the API.
   task asks nobody, even with an elicitor on the context the host
   prompted with, and keeps `WithInputRequired`. `AskedCall.Callee`
   names the agent that would run an asked call that is not this run's;
-  `Ask` names it in the question and leaves the answerer's note for its
-  caller to send on. RFC 0001 draft 0.7, Composition. (#296)
+  `Ask` names it in the question, quoted, with its reason said to be
+  its own (`Agent "<callee>" says: ...`), and leaves the answerer's
+  note for its caller to send on. RFC 0001 draft 0.7, Composition. (#296)
 - Added: the transform's context names the person's own messages,
   `PersonMessagesFromContext` (`PersonMessages`): the user messages a
   run appended under a trigger of kind `human` that the host did not

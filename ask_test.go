@@ -91,6 +91,9 @@ func TestAsk(t *testing.T) {
 		wantNote   string
 		// wantBy is the decision's decider; empty means "human".
 		wantBy string
+		// callee names the agent that would run the call; question is
+		// then the question asked.
+		callee, question string
 	}{
 		{name: "no elicitor", reason: "rule r"},
 		{name: "accept", elicit: answers(agenttool.Answer{Action: agenttool.ActionAccept}), reason: "rule r", wantOK: true, wantAction: Allow, wantReason: "rule r"},
@@ -105,6 +108,12 @@ func TestAsk(t *testing.T) {
 		{name: "accept by a rule, with a note", elicit: answers(agenttool.Answer{Action: agenttool.ActionAccept, Note: "only this once", By: agenttool.ByPolicy}), reason: "rule r", wantOK: true, wantAction: Allow, wantReason: "rule r", wantNote: "The policy said: only this once", wantBy: "policy"},
 		{name: "decline by another model, with a note", elicit: answers(agenttool.Answer{Action: agenttool.ActionDecline, Note: "use the fixture", By: agenttool.ByAgent}), reason: "rule r", wantOK: true, wantAction: Block, wantReason: "declined when asked: rule r; another agent said: use the fixture", wantBy: "agent"},
 		{name: "accept by a person named", elicit: answers(agenttool.Answer{Action: agenttool.ActionAccept, By: agenttool.ByHuman}), reason: "rule r", wantOK: true, wantAction: Allow, wantReason: "rule r"},
+		// The remote's name and reason are its own words, quoted and
+		// said to be its.
+		{name: "another agent's call", elicit: answers(agenttool.Answer{Action: agenttool.ActionAccept}), reason: "a person approves reads", callee: "Refunds", wantOK: true, wantAction: Allow, wantReason: "a person approves reads",
+			question: `Allow agent "Refunds" to run read with arguments {"text":"go.mod"}? Agent "Refunds" says: a person approves reads`},
+		{name: "another agent's call, no reason", elicit: answers(agenttool.Answer{Action: agenttool.ActionAccept}), callee: "Refunds", wantOK: true, wantAction: Allow, wantReason: "allowed when asked",
+			question: `Allow agent "Refunds" to run read with arguments {"text":"go.mod"}?`},
 		{name: "an unknown decider", elicit: answers(agenttool.Answer{Action: agenttool.ActionAccept, By: "system"}), reason: "rule r"},
 		{name: "cancel", elicit: answers(agenttool.Answer{Action: agenttool.ActionCancel}), reason: "rule r"},
 		{name: "elicitor error", elicit: func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
@@ -125,7 +134,7 @@ func TestAsk(t *testing.T) {
 				})
 			}
 			deferral := &ToolDecision{Action: Defer, Reason: tc.reason, By: "policy", DeclineText: tc.decline}
-			call := AskedCall{Parent: "call_p", CallID: "call_n", Name: "read", Args: json.RawMessage(`{"text":"go.mod"}`), Decision: deferral}
+			call := AskedCall{Parent: "call_p", CallID: "call_n", Name: "read", Args: json.RawMessage(`{"text":"go.mod"}`), Decision: deferral, Callee: tc.callee}
 			d, ok := Ask(ctx, call)
 			if ok != tc.wantOK {
 				t.Fatalf("Ask = %+v, %v; want ok %v", d, ok, tc.wantOK)
@@ -139,6 +148,9 @@ func TestAsk(t *testing.T) {
 				want := `Allow read with arguments {"text":"go.mod"}?`
 				if tc.reason != "" {
 					want += " " + tc.reason
+				}
+				if tc.callee != "" {
+					want = tc.question
 				}
 				if len(got) != 1 || got[0].Message != want {
 					t.Errorf("asked %+v, want one question %q", got, want)

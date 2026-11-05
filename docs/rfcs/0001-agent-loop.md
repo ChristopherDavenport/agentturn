@@ -1826,7 +1826,9 @@ An agent stands in four places inside another system:
   whose task waits only on calls the remote escalated SHOULD put each
   asked call to the elicitor of the call that started the task, naming
   the call, the remote's reason and the remote agent, filed under that
-  call. It SHOULD answer on the same task with one approval per asked
+  call; the remote's name and reason are its own, untrusted words, and
+  the question MUST show them as the remote's, not as the caller's own
+  text. It SHOULD answer on the same task with one approval per asked
   call, carrying the answerer's note, and who decided where the remote
   accepts it, since a front that does not let its caller name a
   decider refuses the message; the caller's own record keeps the

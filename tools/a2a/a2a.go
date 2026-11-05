@@ -202,7 +202,9 @@ func WithInputRequired(fn InputRequired) Option { return func(r *remote) { r.inp
 // elicitor of the call that started the task, through agentturn.Ask,
 // as tools/agent's WithAskParent puts a child's deferred call. The
 // question names the call, its arguments, the remote's reason and the
-// remote agent ([agentturn.AskedCall.Callee]), and is filed under this
+// remote agent ([agentturn.AskedCall.Callee]), the agent's name quoted
+// and its reason said to be the agent's, since both are the remote's
+// untrusted words, and is filed under this
 // call, which is on the elicitor's context. The answers go back on the
 // same task, one [fronta2a.Approval] per asked call, carrying the
 // answerer's note, and who decided only under [WithSendBy]. A call the

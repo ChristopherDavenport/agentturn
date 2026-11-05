@@ -56,8 +56,10 @@ func ContextWithAskedCall(ctx context.Context, call AskedCall) context.Context {
 
 // Ask puts call to the elicitor on ctx, as the loop puts a nested call
 // the hook deferred: with the question "Allow <name> with arguments
-// <args>? <reason>", or "Allow agent <callee> to run <name> ..." for a
-// call another agent would run ([AskedCall.Callee]), the arguments
+// <args>? <reason>", or, for a call another agent would run
+// ([AskedCall.Callee]), "Allow agent "<callee>" to run <name> with
+// arguments <args>? Agent "<callee>" says: <reason>", since the name
+// and the reason are that agent's words, not this run's; the arguments
 // clipped at 500 bytes, and the call on the elicitor's context for
 // [AskedCallFrom]. It returns the
 // decision the answer makes, by the decider the answer names
@@ -90,11 +92,17 @@ func Ask(ctx context.Context, call AskedCall) (*ToolDecision, bool) {
 		return nil, false
 	}
 	msg := fmt.Sprintf("Allow %s with arguments %s?", call.Name, clip(string(call.Args), maxAskedArgs))
+	reason := call.Decision.Reason
 	if call.Callee != "" {
-		msg = fmt.Sprintf("Allow agent %s to run %s with arguments %s?", call.Callee, call.Name, clip(string(call.Args), maxAskedArgs))
+		// The other agent's name and reason are its own words, not this
+		// run's: the name is quoted and the reason said to be its.
+		msg = fmt.Sprintf("Allow agent %q to run %s with arguments %s?", call.Callee, call.Name, clip(string(call.Args), maxAskedArgs))
+		if reason != "" {
+			reason = fmt.Sprintf("Agent %q says: %s", call.Callee, reason)
+		}
 	}
-	if call.Decision.Reason != "" {
-		msg += " " + call.Decision.Reason
+	if reason != "" {
+		msg += " " + reason
 	}
 	ans, err := elicit(ContextWithAskedCall(ctx, call), agenttool.Elicitation{Message: msg})
 	if err != nil {
