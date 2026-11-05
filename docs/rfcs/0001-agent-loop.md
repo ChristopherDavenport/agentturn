@@ -1836,7 +1836,9 @@ An agent stands in four places inside another system:
   the outcome unknown, as a call that may have run and must not run
   again does. A hand-off its call's output or result followed ended
   that operation, and a link written before it names no callee of a
-  later one.
+  later one. A nested call to a composition tool, one a tool made
+  through Invoke, follows the same rule, its hand-offs and its end
+  read from its nested call records (Nested calls).
   A **detached** child is the background task: the call returns once
   the child's run has started, the child runs on the run context, so
   the parent's cancellation still cuts it and the parent's run ending
@@ -2613,7 +2615,8 @@ it.
   when the process stopped is asked again under the same call, and the
   inputs the callee owed are handed back to it; one
   whose callee the record does not hold fails with the outcome
-  unknown rather than start it afresh (#297).
+  unknown rather than start it afresh, a nested call as much as one
+  the model made (#297).
 
 ## Changes in draft 0.6
 

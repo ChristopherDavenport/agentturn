@@ -4569,7 +4569,9 @@ const cutOffRef = "cut off: closed on resume"
 // process having stopped after the child started and before its link
 // was written, or the recorder being made with [WithoutChildSessions],
 // which holds no child, the call gets agent.ErrNoRecord and fails with
-// the outcome unknown rather than repeat the child's work. A run of
+// the outcome unknown rather than repeat the child's work. A nested
+// call, one a tool made through agentturn.Invoke, is read by the same
+// rule from its [NestedCallNS] entries. A run of
 // the child the process left open is closed, as [Resume] closes the
 // root's, and the record returned seeds a new agent with the child's
 // state at its leaf, as [AgentOptions] does, lists its pending calls,
@@ -4768,10 +4770,36 @@ func (r *Recorder) takeHandedBack(id string, item openresponses.Item) *inboxItem
 // withdrawn one never happened, and an output or a result ends the
 // operation. child is the session the last subsession link for the
 // call after such an earlier hand-off names, "" when none does.
+//
+// A nested call, one a tool made through agentturn.Invoke, is read
+// from its [NestedCallNS] entries by the same rule: its dispatch phase
+// is a hand-off under the key it carries, an end it was withdrawn on
+// undoes the hand-off before it, and an end of its own, one not cut
+// off, ends the operation.
 func linkedUnder(path []agentsession.Entry, callID, key string) (child string, repeat bool) {
 	handOffs := 0
 	for _, e := range path {
 		switch v := e.(type) {
+		case *agentsession.CustomEntry:
+			if v.NS != NestedCallNS {
+				continue
+			}
+			var n NestedCall
+			if json.Unmarshal(v.Data, &n) != nil || n.CallID != callID {
+				continue
+			}
+			switch {
+			case n.Phase == nestedDispatch && n.IdempotencyKey != key:
+				handOffs, child = 0, ""
+			case n.Phase == nestedDispatch:
+				handOffs++
+			case n.Phase == agentsession.RunEnd && n.Withdrawn:
+				if handOffs > 0 {
+					handOffs--
+				}
+			case n.Phase == agentsession.RunEnd && !n.Cut:
+				handOffs, child = 0, ""
+			}
 		case *agentsession.DispatchEntry:
 			if v.CallID != callID {
 				continue

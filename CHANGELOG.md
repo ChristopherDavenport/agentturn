@@ -25,7 +25,9 @@ versions may break the API.
   hand-off whose child the record does not hold, a recorder made with
   `WithoutChildSessions` or a process that stopped before the parent's
   link, fails with `agent.ErrNoRecord`, the outcome unknown, rather
-  than start the child afresh and repeat its work. `session.Recorder.ChildRecord`
+  than start the child afresh and repeat its work. A nested call to the
+  tool, made through `agentturn.Invoke`, is matched by the same rule
+  from its `agentturn:nested_call` entries. `session.Recorder.ChildRecord`
   is the loader for a child recorded with `Observe`: it closes the
   child's run the process cut and reads the child's state as
   `AgentOptions`, `Pending` and `ReplayAnswers` do. A recorded end the
