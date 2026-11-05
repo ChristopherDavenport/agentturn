@@ -46,6 +46,16 @@ versions may break the API.
   steer's `queued` entry still says where it arrived from. An owed
   input recorded so by v0.0.37 is queued again as recorded. RFC 0001
   draft 0.7. (#303)
+- Added: `Queued.Copied`, set for an item queued with the `Copied`
+  mark, carried by front/control's `queued` event as `copied`, and
+  `IsCopied`, which reports the mark. (#303)
+- Fixed: `session.Recorder` wrote a copied input's `queued` entry
+  under the person's trigger with the provenance's trust alone, so the
+  copy that drained it was recorded `human` beside `copied_from`, and a
+  copy whose source had trust did not match its entry, which
+  agentsession's record check reports. The entry now carries the
+  trigger without the kind `human` and the copy's merged trust. RFC
+  0001 draft 0.7. (#303)
 - Added: `compact.Fold.Requested`, set only for a fold
   `Transform.FoldNext` asked for, apart from `Forced`, which a fold the
   loop asks for to retry a request the provider refused as too long

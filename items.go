@@ -96,6 +96,14 @@ func Copied(item openresponses.Item) openresponses.Item {
 	return m
 }
 
+// IsCopied reports whether item carries the [Copied] mark, for a host
+// or a recorder that takes an input before the loop does, as
+// agentturn/session's Recorder.Queue does.
+func IsCopied(item openresponses.Item) bool {
+	_, _, copied := marks(item)
+	return copied
+}
+
 // Provenance says where an item the host or a hook composed came from
 // and whether it is trusted, for text the person did not write that is
 // added to the conversation as a message: an instruction file a hook

@@ -1230,7 +1230,7 @@ turn number. The catalogue, with the members beyond those two:
 | `turn_end` | `response`, `tool_results` | after the batch's outputs are appended |
 | `quarantine_added` | `items`, `quarantined` | the host quarantined while no run of the agent was active, or after its run's end was delivered; belongs to no run, and is delivered at once, or after the event being delivered |
 | `run_end` | `items`, `reason`, `cause`, `error`, `failure`, `pending`, `withheld`, `quarantined` | last event of a run; `withheld` when the output guard's stop ended it; `failure` when a consumer or a hook failed for a reason of its own while the run was being cancelled |
-| `queued` | `item`, `mode`, `input`, `hidden`, `trigger`, `provenance` | an item accepted into a queue; belongs to no run; `input` says how it arrived, `steer` or `follow_up` for an item queued and `deliver` for one delivered; `trigger` is the item's provenance's source when it names one |
+| `queued` | `item`, `mode`, `input`, `hidden`, `copied`, `trigger`, `provenance` | an item accepted into a queue; belongs to no run; `input` says how it arrived, `steer` or `follow_up` for an item queued and `deliver` for one delivered; `copied` when the caller marked the item as taken from another conversation; `trigger` is the item's provenance's source when it names one |
 
 An event's members are the facts as of the event. A loop MUST deliver
 each event so that a consumer that keeps it, as a view's render queue
@@ -2063,6 +2063,14 @@ carry in the format's member, from the interim `agentturn:visible`,
 recorder wrote, each in the form the format's member of that name has
 on an `item`, and MUST NOT write those members: an entry that queues
 such an input again carries the marks in the format's members alone.
+An input queued marked copied is recorded as the copy it is on its
+`queued` entry too: the entry's `trigger` without the kind `human`, as
+the item's `source` has it, and its `trust` the trust the item that
+drains it carries, the copy's merged with the provenance's, since the
+drained item carries its entry's trust as written. The format's
+`queued` entry has no member for the copy mark itself, so an input
+owed across a restart is handed back with that trigger and trust,
+unmarked.
 
 A decision that defers a call MAY mark it **held**, deferred only
 because another call of its batch was asked about, as a policy that
@@ -2386,6 +2394,10 @@ it.
   other members (#303); breaking for a host
   that names such a source, and for a recorder that wrote the run's
   trigger on every prompt item.
+- **Events and the record.** The `queued` event carries `copied`, and
+  a recorder writes a copied input's `queued` entry with the copy's
+  merged trust and without the kind `human`, so the item that drains
+  it matches it (#303).
 - **The record.** A fold a host or a person asked for is recorded with
   agentsession RFC 0001 0.21's `requested` and its `instructions`, and
   one the budget or an overflow's retry forced with neither (#306).

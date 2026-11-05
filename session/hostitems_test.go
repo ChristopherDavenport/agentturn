@@ -10,6 +10,7 @@ import (
 	"github.com/ChristopherDavenport/agentsession"
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
+	"github.com/ChristopherDavenport/agentturn/tools/agent"
 	"github.com/ChristopherDavenport/openresponses"
 	"github.com/ChristopherDavenport/openresponses/echo"
 )
@@ -423,5 +424,88 @@ func TestComposedInputIsNeverRecordedAsThePersons(t *testing.T) {
 		if layers != nil && trigger != nil && trigger.Kind == agentsession.TriggerHuman {
 			t.Errorf("%s %s carries human beside instructions_part", e.EntryType(), e.Base().ID)
 		}
+	}
+}
+
+// TestACopiedInputQueuedIsRecordedAsACopy pins that an input marked
+// copied and put on a queue is recorded as the copy it is, on its queued
+// entry as on the item that drains it: a child queued its parent's
+// message under the person's trigger, with a label the host adds, writes
+// the queued entry with the trigger's ref and source but not the kind
+// human, and with the trust the drained copy carries, its source's
+// labels merged with the host's, so the drain verifies and the copy is
+// never read as the person's words.
+func TestACopiedInputQueuedIsRecordedAsACopy(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{Records: agentsession.AllRecords})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"})
+	defer rec.Attach(parent)()
+	secret := openresponses.UserText("secret")
+	private, err := agentturn.WithProvenance(secret, agentturn.Provenance{Trust: &agentturn.Trust{Reads: []agenttool.Label{agenttool.LabelPrivate}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parent.Prompt(ctx, private); err != nil {
+		t.Fatal(err)
+	}
+	spawnID := agentsession.NewSpawnID()
+	cctx, err := rec.StartChild(ctx, spawnID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cctx = agentturn.ContextWithTrigger(cctx, agentturn.Trigger{Kind: agentturn.TriggerHuman, Ref: "slack:1758412800.0002", Source: "gateway"})
+	cfg := agentturn.Config{Name: "helper", Model: &echo.Adapter{}, ModelName: "child"}
+	child := agentturn.New(cfg)
+	child.Subscribe(func(ctx context.Context, ev agentturn.Event) error {
+		rec.Observe(ctx, ev)
+		return nil
+	})
+	copied, err := agentturn.WithProvenance(secret, agentturn.Provenance{Trust: &agentturn.Trust{Reads: []agenttool.Label{agenttool.LabelUntrusted}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Queue(cctx, agentturn.QueueFollowUp, agentturn.Copied(copied)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := child.Prompt(agent.ContextWithConfig(cctx, cfg), openresponses.UserText("go")); err != nil {
+		t.Fatal(err)
+	}
+	cs, err := store.Open(ctx, agentsession.SpawnedSessionID(s.ID(), spawnID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.VerifyRecords(cs.Leaf()); err != nil {
+		t.Errorf("verify records: %v", err)
+	}
+	if err := cs.VerifyCopies(func(id string) (*agentsession.Session, error) { return store.Open(ctx, id) }); err != nil {
+		t.Errorf("verify copies: %v", err)
+	}
+	arrival := &agentsession.Trigger{Ref: "slack:1758412800.0002", Source: "gateway"}
+	wantTrust := []string{"private", "untrusted"}
+	var queued *agentsession.QueuedEntry
+	for _, e := range cs.Entries() {
+		if q, ok := e.(*agentsession.QueuedEntry); ok {
+			queued = q
+		}
+	}
+	if queued == nil {
+		t.Fatal("no queued entry")
+	}
+	if !queued.Trigger.Equal(arrival) || queued.Trust == nil || !slices.Equal(queued.Trust.Reads, wantTrust) {
+		t.Errorf("queued trigger %+v trust %+v, want %+v and %v", queued.Trigger, queued.Trust, arrival, wantTrust)
+	}
+	it := itemEntries(cs)["secret"]
+	if it == nil {
+		t.Fatal("the copy was not drained")
+	}
+	if it.QueuedFrom != queued.ID || it.CopiedFrom == nil || !it.Source.Equal(arrival) || it.Trust == nil || !slices.Equal(it.Trust.Reads, wantTrust) {
+		t.Errorf("drained copy: queued_from %q copied_from %+v source %+v trust %+v", it.QueuedFrom, it.CopiedFrom, it.Source, it.Trust)
+	}
+	if got := agentsession.WordsOf(it); got == agentsession.WordsPerson {
+		t.Errorf("the copy reads as the person's words")
 	}
 }

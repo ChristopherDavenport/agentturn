@@ -1695,7 +1695,7 @@ func (a *Agent) queue(trigger Trigger, mode QueueMode, how InputMode, items open
 		if item == nil {
 			continue
 		}
-		base, hidden := Unhide(item)
+		base, hidden, copied := marks(item)
 		prov := provenance(item)
 		// An item's own source stands over the trigger it was queued
 		// under, for it alone.
@@ -1714,7 +1714,7 @@ func (a *Agent) queue(trigger Trigger, mode QueueMode, how InputMode, items open
 		} else {
 			a.followUp = append(a.followUp, entry)
 		}
-		a.queued = append(a.queued, &Queued{RunID: runID, Item: base, Mode: mode, Input: how, Hidden: hidden, Trigger: itemTrigger, Provenance: prov})
+		a.queued = append(a.queued, &Queued{RunID: runID, Item: base, Mode: mode, Input: how, Hidden: hidden, Copied: copied, Trigger: itemTrigger, Provenance: prov})
 	}
 }
 

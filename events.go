@@ -1083,6 +1083,11 @@ type Queued struct {
 	Input InputMode
 	// Hidden is set for an item the caller marked with [Hidden].
 	Hidden bool
+	// Copied is set for an item the caller marked with [Copied], taken
+	// from another conversation: a session recorder writes its queued
+	// entry with the trust the copy carries and without the kind
+	// [TriggerHuman], as it writes the item that drains it.
+	Copied bool
 	// Trigger is what brought the item in, from the context given to
 	// [Agent.Queue], zero for [Agent.Steer] and [Agent.FollowUp]: the
 	// run start names what started the run, and an input that joins it

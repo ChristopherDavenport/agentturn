@@ -1251,15 +1251,49 @@ type inboxItem struct {
 	// and Requeue hands back.
 	hidden bool
 	prov   *agentturn.Provenance
+	// copied says the host marked the input agentturn.Copied, and from
+	// is where the copy was taken from, resolved as it was queued, so
+	// its queued entry carries the trust the item that drains it does;
+	// nil in a session with no parent. The format's queued entry has no
+	// member for the mark: an input owed across a restart is handed
+	// back with the trust and trigger its entry holds, unmarked.
+	copied bool
+	from   *copySource
 }
 
 // markFrom sets on in the marks item carries.
 func (in *inboxItem) markFrom(item openresponses.Item) *inboxItem {
 	_, in.hidden = agentturn.Unhide(item)
+	in.copied = agentturn.IsCopied(item)
 	if p, ok := agentturn.ProvenanceOf(item); ok {
 		in.prov = &p
 	}
 	return in
+}
+
+// resolveCopy resolves where a copied input was taken from, once, for
+// its queued entry and the item that drains it.
+func (w *writer) resolveCopy(ctx context.Context, in *inboxItem) error {
+	if !in.copied || in.from != nil {
+		return nil
+	}
+	from, err := w.copiedFrom(ctx, in.item)
+	if err != nil {
+		return err
+	}
+	in.from = from
+	return nil
+}
+
+// heldCopy is where the held input item was copied from, as its queued
+// entry was written, nil when no held input is item or none was copied.
+func (w *writer) heldCopy(item openresponses.Item) *copySource {
+	for _, in := range w.inbox {
+		if in.held && in.item == item {
+			return in.from
+		}
+	}
+	return nil
 }
 
 // marked is the input marked as it was queued, for the agent. Layers
@@ -1468,7 +1502,7 @@ func (h *heldReport) inbox() *inboxItem {
 		mode = agentsession.ModeSteer
 	}
 	trigger, _ := queuedTrigger(h.q)
-	return &inboxItem{item: h.q.Item, mode: mode, trigger: trigger, deliver: h.q.Input == agentturn.InputDeliver, entry: h.entry, held: true, hidden: h.q.Hidden, prov: h.q.Provenance}
+	return &inboxItem{item: h.q.Item, mode: mode, trigger: trigger, deliver: h.q.Input == agentturn.InputDeliver, entry: h.entry, held: true, hidden: h.q.Hidden, prov: h.q.Provenance, copied: h.q.Copied}
 }
 
 // callRecord is what the path holds for one function call.
@@ -3313,6 +3347,17 @@ func (w *writer) requeue(ctx context.Context) error {
 		q.Deliver = in.deliver && in.mode == agentsession.ModeSteer
 		q.Trigger = in.trigger.Clone()
 		setQueuedMarks(q, in.hidden, in.prov)
+		if in.from != nil {
+			// A copy carries the trust of what it copies, with the
+			// host's labels merged in, and so does its queued entry.
+			e := &agentsession.ItemEntry{Item: item}
+			cf, trust := in.from.entryFor(item)
+			e.CopiedFrom, e.Trust = &cf, trust
+			if err := recordProvenance(e, in.prov); err != nil {
+				return err
+			}
+			q.Trust = e.Trust
+		}
 		id, err := w.append(ctx, q)
 		if err != nil {
 			return err
@@ -3347,6 +3392,10 @@ func (r *Recorder) Queue(ctx context.Context, a *agentturn.Agent, mode agentturn
 			return err
 		}
 		r.mu.Lock()
+		if err := r.root.resolveCopy(context.WithoutCancel(ctx), in); err != nil {
+			r.mu.Unlock()
+			return err
+		}
 		r.root.inbox = append(r.root.inbox, in)
 		err := r.root.requeue(context.WithoutCancel(ctx))
 		if err != nil {
@@ -3400,7 +3449,13 @@ func (r *Recorder) Deliver(ctx context.Context, a *agentturn.Agent, items ...ope
 			r.mu.Unlock()
 			return false, nil, err
 		}
-		r.root.inbox = append(r.root.inbox, (&inboxItem{item: base, mode: agentsession.ModeSteer, deliver: true, held: true, awaiting: true, trigger: t}).markFrom(item))
+		in := (&inboxItem{item: base, mode: agentsession.ModeSteer, deliver: true, held: true, awaiting: true, trigger: t}).markFrom(item)
+		if err := r.root.resolveCopy(context.WithoutCancel(ctx), in); err != nil {
+			r.root.inbox = r.root.inbox[:n]
+			r.mu.Unlock()
+			return false, nil, err
+		}
+		r.root.inbox = append(r.root.inbox, in)
 	}
 	added := slices.Clone(r.root.inbox[n:])
 	if err := r.root.requeue(context.WithoutCancel(ctx)); err != nil {
@@ -3467,6 +3522,10 @@ func (r *Recorder) Redeliver(ctx context.Context, a *agentturn.Agent, items ...o
 			// A new input, or one another agent holds, as when a host
 			// reuses one recorder across tasks: this agent gets its own.
 			in = (&inboxItem{item: base, mode: agentsession.ModeSteer, deliver: true, held: true, awaiting: true, trigger: t, holder: a}).markFrom(item)
+			if err := r.root.resolveCopy(context.WithoutCancel(ctx), in); err != nil {
+				r.mu.Unlock()
+				return err
+			}
 			r.root.inbox = append(r.root.inbox, in)
 			if err := r.root.requeue(context.WithoutCancel(ctx)); err != nil {
 				r.root.inbox = r.root.inbox[:len(r.root.inbox)-1]
@@ -5176,7 +5235,11 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 			return nil
 		}
 		var from *copySource
-		if e.Copied {
+		if e.Copied && e.ResponseID == "" {
+			// A queued copy is written as its queued entry resolved it.
+			from = w.heldCopy(e.Item)
+		}
+		if e.Copied && from == nil {
 			if from, err = w.copiedFrom(ctx, e.Item); err != nil {
 				return err
 			}
@@ -5223,7 +5286,10 @@ func (w *writer) queued(ctx context.Context, e *agentturn.Queued) error {
 	if err != nil {
 		return err
 	}
-	in := &inboxItem{item: e.Item, mode: mode, held: true, trigger: trigger, deliver: e.Input == agentturn.InputDeliver, hidden: e.Hidden, prov: e.Provenance}
+	in := &inboxItem{item: e.Item, mode: mode, held: true, trigger: trigger, deliver: e.Input == agentturn.InputDeliver, hidden: e.Hidden, prov: e.Provenance, copied: e.Copied}
+	if err := w.resolveCopy(ctx, in); err != nil {
+		return err
+	}
 	w.inbox = append(w.inbox, in)
 	return w.requeue(ctx)
 }
@@ -6117,18 +6183,22 @@ func recordProvenance(e *agentsession.ItemEntry, prov *agentturn.Provenance) err
 
 // itemTrigger is the trigger item is queued under: the source of its
 // provenance when that names one, which stands over the call's, and
-// trigger otherwise, though never one of kind human for a message
-// composed from layers ([inputTrigger]).
+// trigger otherwise, though never with the kind human for a message
+// composed from layers or an item copied ([inputTrigger]).
 func itemTrigger(item openresponses.Item, trigger *agentsession.Trigger) (*agentsession.Trigger, error) {
 	p, ok := agentturn.ProvenanceOf(item)
-	if ok && !p.Source.IsZero() {
-		return sessionTrigger(p.Source)
-	}
 	var prov *agentturn.Provenance
 	if ok {
 		prov = &p
 	}
-	return inputTrigger(trigger.Clone(), prov, false), nil
+	t := trigger.Clone()
+	if ok && !p.Source.IsZero() {
+		var err error
+		if t, err = sessionTrigger(p.Source); err != nil {
+			return nil, err
+		}
+	}
+	return inputTrigger(t, prov, agentturn.IsCopied(item)), nil
 }
 
 // inputTrigger is t as the source of an input item, or the trigger of
@@ -6165,7 +6235,7 @@ func queuedTrigger(q *agentturn.Queued) (*agentsession.Trigger, error) {
 	if err != nil {
 		return nil, err
 	}
-	return inputTrigger(t, q.Provenance, false), nil
+	return inputTrigger(t, q.Provenance, q.Copied), nil
 }
 
 // copySource is where a copied item was taken from: the entry's
@@ -6179,6 +6249,18 @@ type copySource struct {
 	// that item unchanged.
 	pathTrust *agentsession.Trust
 	item      openresponses.Item
+}
+
+// entryFor is the copied_from and the trust an entry holding recorded,
+// the item as the record holds it, carries as a copy from src: the
+// entry src names with its trust when it holds recorded member for
+// member, and otherwise the session alone, with its path's trust.
+func (src *copySource) entryFor(recorded openresponses.Item) (agentsession.CopiedFrom, *agentsession.Trust) {
+	cf, trust := src.from, src.trust
+	if cf.Entry != "" && (src.item == nil || !equalJSON(src.item, recorded)) {
+		cf.Entry, trust = "", src.pathTrust
+	}
+	return cf, trust
 }
 
 // copiedFrom resolves an item the loop marks copied, one a child was
@@ -6404,12 +6486,7 @@ func (w *writer) itemFrom(ctx context.Context, item openresponses.Item, response
 	} else {
 		e := &agentsession.ItemEntry{Item: recorded, ResponseID: responseID, Failed: failed}
 		if from != nil {
-			cf, trust := from.from, from.trust
-			if cf.Entry != "" && (from.item == nil || !equalJSON(from.item, recorded)) {
-				// Not the entry's item member for member: the copy
-				// names the session alone, with its path's trust.
-				cf.Entry, trust = "", from.pathTrust
-			}
+			cf, trust := from.entryFor(recorded)
 			e.CopiedFrom, e.Trust = &cf, trust
 		}
 		if err := recordProvenance(e, prov); err != nil {
