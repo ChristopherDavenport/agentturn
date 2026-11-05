@@ -31,9 +31,9 @@ func TestAHeldCallIsMarkedAndReadBack(t *testing.T) {
 	tools := []agenttool.Tool{agenttool.New("ask", "", run), agenttool.New("beside", "", run)}
 	decide := func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
 		if info.Call.Name == "ask" {
-			return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "rule r", By: agentsession.ByPolicy, Subject: "rm -rf build"}, nil
+			return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "rule r", By: agentsession.ByPolicy, Subject: "rm -rf build", DeclineText: "the build stays"}, nil
 		}
-		return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "held beside ask", By: agentsession.ByPolicy, Held: true, Subject: "git status"}, nil
+		return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "held beside ask", By: agentsession.ByPolicy, Held: true, Subject: "git status", DeclineText: "status waits on the clean"}, nil
 	}
 	a := agentturn.New(agentturn.Config{Model: twoCallModel{}, ModelName: "m", Tools: tools, BeforeToolCall: decide})
 	unsub := rec.Attach(a)
@@ -62,11 +62,11 @@ func TestAHeldCallIsMarkedAndReadBack(t *testing.T) {
 			names[c.Name] = c.CallID
 		}
 	}
-	if d := holds[names["beside"]]; d == nil || string(d.Unknown[HeldMember]) != "true" || string(d.Unknown[SubjectMember]) != `"git status"` {
-		t.Errorf("held call's hold = %+v, want it marked held with its subject", d)
+	if d := holds[names["beside"]]; d == nil || string(d.Unknown[HeldMember]) != "true" || string(d.Unknown[SubjectMember]) != `"git status"` || string(d.Unknown[DeclineTextMember]) != `"status waits on the clean"` {
+		t.Errorf("held call's hold = %+v, want it marked held with its subject and decline text", d)
 	}
-	if d := holds[names["ask"]]; d == nil || d.Unknown[HeldMember] != nil || string(d.Unknown[SubjectMember]) != `"rm -rf build"` {
-		t.Errorf("asked call's hold = %+v, want it unmarked with its subject", d)
+	if d := holds[names["ask"]]; d == nil || d.Unknown[HeldMember] != nil || string(d.Unknown[SubjectMember]) != `"rm -rf build"` || string(d.Unknown[DeclineTextMember]) != `"the build stays"` {
+		t.Errorf("asked call's hold = %+v, want it unmarked with its subject and decline text", d)
 	}
 
 	check := func(where string, pending []agentturn.PendingCall) {
@@ -78,10 +78,12 @@ func TestAHeldCallIsMarkedAndReadBack(t *testing.T) {
 			}
 			got[p.Call.Name] = p.Decision
 		}
-		if d := got["beside"]; d == nil || !d.Held || d.Subject != "git status" || d.Reason != "held beside ask" {
+		// The decline text survives, so a child reopened from its
+		// record still refuses in the host's words (#304).
+		if d := got["beside"]; d == nil || !d.Held || d.Subject != "git status" || d.Reason != "held beside ask" || d.DeclineText != "status waits on the clean" {
 			t.Errorf("%s: held call's decision = %+v", where, d)
 		}
-		if d := got["ask"]; d == nil || d.Held || d.Subject != "rm -rf build" || d.Reason != "rule r" {
+		if d := got["ask"]; d == nil || d.Held || d.Subject != "rm -rf build" || d.Reason != "rule r" || d.DeclineText != "the build stays" {
 			t.Errorf("%s: asked call's decision = %+v", where, d)
 		}
 	}

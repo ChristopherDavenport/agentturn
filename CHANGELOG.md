@@ -92,6 +92,11 @@ versions may break the API.
   `ChainBeforeToolCall` keeps it with the deferral that asks, and
   front/control's decision carries it as `decline_text`.
   RFC 0001 draft 0.7, Nested calls. (#304)
+- Added: `session.Recorder` writes a deferral's decline text on its
+  hold decision as `agentturn:decline_text` (`session.DeclineTextMember`),
+  and `Pending` and `AgentOptions` read it back, so a call reopened
+  from the record, a child's held call among them, is refused in the
+  host's words. RFC 0001 draft 0.7, The record. (#304)
 - Added: `tools/a2a.WithAskCaller`, which answers a remote task that
   waits only on calls front/a2a's `WithEscalation` put to its caller:
   each is asked of the elicitor of the call that started the task,

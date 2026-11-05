@@ -2150,7 +2150,12 @@ a call asked about. A reader that seeds pending calls from the record
 MUST read both back from those members onto the pending call's
 decision, however it reads the session, a sidecar one's blobs through
 its read options included, so a front over a restarted session asks
-about the asked call alone and says which part it is about (#299).
+about the asked call alone and says which part it is about (#299). A
+recorder SHOULD write a deferral's decline text as the hold
+`decision`'s `agentturn:decline_text` member, a string, and a reader
+that seeds pending calls SHOULD read it back onto the decision, so a
+call reopened from the record is refused in the host's words, a
+child's held call beside a declined sibling among them (#304).
 
 ## Bindings
 
@@ -2476,7 +2481,9 @@ it.
   recorder records them as a resume's (#305).
 - **Nested calls.** A deferral may carry a decline text, which the
   asking model reads in place of the loop's `declined when asked` when
-  the answer declines, followed by the answerer's note (#304).
+  the answer declines, followed by the answerer's note; a front that
+  escalates a call to its caller uses it for the caller's refusal, and
+  the record keeps it as the hold's `agentturn:decline_text` (#304).
 - **Composition, as a peer.** A tool consuming a remote agent puts the
   calls the remote escalated to its caller to the elicitor of the call
   that started the task, and answers them on the same task with an

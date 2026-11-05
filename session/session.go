@@ -772,6 +772,14 @@ const SubjectMember = "agentturn:subject"
 // reads it back onto the call's Decision.
 const HeldMember = "agentturn:held"
 
+// DeclineTextMember is the member of a hold decision that keeps the
+// host's text for a declined question about the call
+// ([agentturn.ToolDecision.DeclineText]), which the asking model reads
+// in place of the loop's own, and which a call held beside it reads
+// when its batch is refused. [Pending] reads it back onto the call's
+// Decision.
+const DeclineTextMember = "agentturn:decline_text"
+
 // VisibleMember, TrustMember and InstructionsPartMember are the
 // members of a queued entry in which agentturn v0.0.37 kept what the
 // host marked the input with, before agentsession RFC 0001's queued
@@ -2123,9 +2131,10 @@ func Resume(ctx context.Context, store agentsession.Store, sessionID string, opt
 // hold decision is [agentturn.PendingDeferred], Dispatched when the
 // hold follows its dispatch, with that hold as its Decision (the rule
 // that raised the question, who held it, the part of the call it is
-// about, whether the call is held only beside another, and the
-// decision's own note, from [SubjectMember], [HeldMember] and
-// [NoteMember]); one in flight when the record stopped
+// about, whether the call is held only beside another, the
+// decision's own note and the host's decline text, from
+// [SubjectMember], [HeldMember], [NoteMember] and
+// [DeclineTextMember]); one in flight when the record stopped
 // may have run and is [agentturn.PendingAborted], as is one with no
 // dispatch on the path that has one on a branch a rebase to before it
 // left, a held one of which is Dispatched; one whose every dispatch
@@ -3069,6 +3078,9 @@ func holdDecision(c *agentsession.Call) *agentturn.ToolDecision {
 			if raw, ok := d.Unknown[NoteMember]; ok {
 				_ = json.Unmarshal(raw, &out.Note)
 			}
+			if raw, ok := d.Unknown[DeclineTextMember]; ok {
+				_ = json.Unmarshal(raw, &out.DeclineText)
+			}
 			return out
 		}
 	}
@@ -3076,9 +3088,10 @@ func holdDecision(c *agentsession.Call) *agentturn.ToolDecision {
 }
 
 // holdMembers writes the deferral's [agentturn.ToolDecision.Subject],
-// [agentturn.ToolDecision.Held] and [agentturn.ToolDecision.Note] on its
-// hold decision, as [SubjectMember], [HeldMember] and [NoteMember], when
-// they are set.
+// [agentturn.ToolDecision.Held], [agentturn.ToolDecision.Note] and
+// [agentturn.ToolDecision.DeclineText] on its hold decision, as
+// [SubjectMember], [HeldMember], [NoteMember] and [DeclineTextMember],
+// when they are set.
 func holdMembers(hold *agentsession.DecisionEntry, d *agentturn.ToolDecision) {
 	if d.Subject != "" {
 		raw, _ := json.Marshal(d.Subject)
@@ -3090,6 +3103,10 @@ func holdMembers(hold *agentsession.DecisionEntry, d *agentturn.ToolDecision) {
 	if d.Note != "" {
 		raw, _ := json.Marshal(d.Note)
 		setMember(&hold.EntryBase, NoteMember, raw)
+	}
+	if d.DeclineText != "" {
+		raw, _ := json.Marshal(d.DeclineText)
+		setMember(&hold.EntryBase, DeclineTextMember, raw)
 	}
 }
 
