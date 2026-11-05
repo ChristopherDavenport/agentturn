@@ -1831,8 +1831,10 @@ An agent stands in four places inside another system:
   about. With nobody to ask, or with the task also waiting on other
   input, the call fails input-required and names those calls, as it
   does without the rule. A detached call's task, followed on the run
-  context, has no elicitor there, and keeps the host's own answer
-  (#296).
+  context, MUST NOT be answered by asking anyone, even where the run
+  context carries an elicitor the host prompted with, since the
+  question would reach a person after the run moved on; it keeps the
+  host's own answer (#296).
 - **As itself, under new settings.** The configuration replaced and the
   transcript kept, so the next run continues the same conversation
   under another agent's instructions, tools and model. This is what an

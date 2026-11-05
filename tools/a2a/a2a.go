@@ -216,8 +216,11 @@ func WithInputRequired(fn InputRequired) Option { return func(r *remote) { r.inp
 // ask, a cancel or an answer naming an unknown decider. Then
 // [WithInputRequired] answers it if it is set, and otherwise the call
 // fails input-required naming the calls, as it does without the
-// option. A detached call's task, followed on the run's context, has
-// no elicitor there, and keeps [WithInputRequired] (#296).
+// option. A detached call's task is followed on the run's context,
+// where the call's elicitor is not, and asks nobody, even when the
+// host put an elicitor on the context it prompted with: the question
+// would reach a person after the run moved on. It keeps
+// [WithInputRequired] (#296).
 func WithAskCaller() Option { return func(r *remote) { r.askCaller = true } }
 
 // WithSendBy sends, on each approval [WithAskCaller] gives, who decided
@@ -446,7 +449,11 @@ func (r *remote) follow(ctx context.Context, call agenttool.Call, msg *a2a.Messa
 		if out.state != a2a.TaskStateInputRequired || out.taskID == "" || rounds >= r.inputRounds {
 			break
 		}
-		if r.askCaller {
+		// A detached call's task is followed on the run's context, where
+		// the call's elicitor is not; one the host put on the prompt's
+		// context is, and is not the call's to ask from the background,
+		// after the run has moved on.
+		if r.askCaller && !c.detached {
 			if answer, ok := r.askEscalated(ctx, out.status); ok {
 				msg = a2a.NewMessageForTask(a2a.MessageRoleUser, a2a.TaskInfo{TaskID: out.taskID, ContextID: out.contextID}, answer...)
 				out.answered()

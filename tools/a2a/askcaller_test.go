@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
@@ -20,39 +21,129 @@ import (
 	"github.com/a2aproject/a2a-go/a2asrv"
 )
 
-// refundsThenSays calls issue_refund, and once a call's output is in
-// its input says the output, so the caller reads what the remote's
-// model read.
-type refundsThenSays struct{}
+// callsThenSays calls each tool it names, with {"amount":5}, and once
+// the calls' outputs are in its input says them, so the caller reads
+// what the remote's model read.
+type callsThenSays []string
 
-func (refundsThenSays) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+func (c callsThenSays) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
 	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	var read []string
 	for _, item := range req.Input {
 		if out, ok := item.(*openresponses.FunctionCallOutput); ok {
-			w, err := em.Message(openresponses.PhaseFinalAnswer)
-			if err != nil {
-				return err
-			}
-			if err := w.Text("remote read: " + out.Output.Text); err != nil {
-				return err
-			}
-			if err := w.Close(); err != nil {
-				return err
-			}
-			return em.Complete()
+			read = append(read, out.Output.Text)
 		}
 	}
-	w, err := em.FunctionCall("", "issue_refund")
-	if err != nil {
-		return err
+	if len(read) > 0 {
+		w, err := em.Message(openresponses.PhaseFinalAnswer)
+		if err != nil {
+			return err
+		}
+		if err := w.Text("remote read: " + strings.Join(read, " | ")); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+		return em.Complete()
 	}
-	if err := w.Arguments(`{"amount":5}`); err != nil {
-		return err
-	}
-	if err := w.Close(); err != nil {
-		return err
+	for _, name := range c {
+		w, err := em.FunctionCall("", name)
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(`{"amount":5}`); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
 	}
 	return em.Complete()
+}
+
+// escalated is a remote agent served through front/a2a under
+// WithEscalation to the bearer token "a-token" as alice: the counts of
+// its tools' runs and the decisions its runs started calls with.
+type escalated struct {
+	mu        sync.Mutex
+	ran       map[string]int
+	decisions []*agentturn.ToolDecision
+}
+
+// tool is a remote tool that counts its runs and says "<name> ran".
+func (e *escalated) tool(name string) agenttool.Tool {
+	return agenttool.NewFunc(name, "", json.RawMessage(`{"type":"object"}`),
+		func(context.Context, agenttool.Call) (agenttool.Result, error) {
+			e.mu.Lock()
+			e.ran[name]++
+			e.mu.Unlock()
+			if name == "issue_refund" {
+				return agenttool.Text("refunded 5"), nil
+			}
+			return agenttool.Text(name + " ran"), nil
+		})
+}
+
+func (e *escalated) runs(name string) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.ran[name]
+}
+
+// serveEscalating serves a remote agent whose model calls each of
+// names, with tools that count their runs, under hook, through
+// front/a2a's WithEscalation; chosen lets alice name who decided. It
+// returns a client for it and its card, named Refunds.
+func serveEscalating(t *testing.T, names []string, hook func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error), chosen bool) (*escalated, *a2aclient.Client, *a2a.AgentCard) {
+	t.Helper()
+	e := &escalated{ran: map[string]int{}}
+	var tools []agenttool.Tool
+	for _, n := range names {
+		tools = append(tools, e.tool(n))
+	}
+	remoteCfg := agentturn.Config{Name: "Refunds", Model: callsThenSays(names), Tools: tools, BeforeToolCall: hook}
+	auth := fronta2a.Authenticator{Name: "bearer", Scheme: a2a.HTTPAuthSecurityScheme{Scheme: "Bearer"},
+		Principal: func(r *http.Request) (string, error) {
+			if r.Header.Get("Authorization") != "Bearer a-token" {
+				return "", errors.New("no token")
+			}
+			return "alice", nil
+		}}
+	record := func(ctx context.Context, _ string, a *agentturn.Agent) (context.Context, func(), error) {
+		return ctx, a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+			if s, ok := ev.(*agentturn.ToolStart); ok {
+				e.mu.Lock()
+				e.decisions = append(e.decisions, s.Decision)
+				e.mu.Unlock()
+			}
+			return nil
+		}), nil
+	}
+	fopts := []fronta2a.Option{fronta2a.WithAuthenticator(auth), fronta2a.WithEscalation(), fronta2a.WithRecorderFor(record)}
+	if chosen {
+		fopts = append(fopts, fronta2a.WithChosenBy(func(context.Context, string) bool { return true }))
+	}
+	exec := fronta2a.New(remoteCfg, fopts...)
+	srv := httptest.NewServer(a2asrv.NewJSONRPCHandler(exec.RequestHandler()))
+	t.Cleanup(srv.Close)
+	card := &a2a.AgentCard{Name: "Refunds", URL: srv.URL, PreferredTransport: a2a.TransportProtocolJSONRPC, Capabilities: a2a.AgentCapabilities{Streaming: true}}
+	client, err := a2aclient.NewFromCard(context.Background(), card, a2aclient.WithInterceptors(ObserveEndpoint(), bearer{token: "a-token"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Destroy() })
+	return e, client, card
+}
+
+// asks defers every call to name with reason.
+func asks(name, reason string) func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+	return func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+		if info.Call.Name == name {
+			return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: reason}, nil
+		}
+		return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "held beside " + name, Held: true}, nil
+	}
 }
 
 // bearer is a client interceptor that sends a bearer token.
@@ -77,8 +168,11 @@ func (b bearer) Before(ctx context.Context, req *a2aclient.Request) (context.Con
 // same task with one approval per call. An accept runs the remote's
 // call once; a refusal reaches the remote's model with the answerer's
 // note. Who decided is sent only under WithSendBy, to a remote that
-// accepts it. With nobody to ask, the call fails input-required and
-// names the escalated call, as it does without the option.
+// accepts it. A call the remote held beside the asked one is not asked
+// about and follows the answer. With nobody to ask, WithInputRequired
+// answers the task when it is set, and otherwise the call fails
+// input-required and names the escalated call, as it does without the
+// option.
 func TestAskCallerAnswersARemotesEscalation(t *testing.T) {
 	const reason = "a person approves refunds"
 	for _, tc := range []struct {
@@ -93,60 +187,44 @@ func TestAskCallerAnswersARemotesEscalation(t *testing.T) {
 		// by is the decider the remote records the approval with.
 		by    string
 		input bool
+		// sibling adds a call the remote holds beside issue_refund;
+		// siblingRan is how often it runs.
+		sibling    bool
+		siblingRan int
+		// hooked is whether WithInputRequired answers the task.
+		hooked bool
 	}{
 		{name: "allowed", answer: &agenttool.Answer{Action: agenttool.ActionAccept}, ran: 1, want: "remote read: refunded 5"},
 		{name: "refused with a note", answer: &agenttool.Answer{Action: agenttool.ActionDecline, Note: "not this month"}, want: "remote read: the caller alice refused this call; the caller said: not this month"},
 		{name: "allowed with a note", answer: &agenttool.Answer{Action: agenttool.ActionAccept, Note: "only this once"}, ran: 1, want: "remote read: refunded 5"},
 		{name: "allowed, who decided sent", answer: &agenttool.Answer{Action: agenttool.ActionAccept}, opts: []Option{WithSendBy()}, chosen: true, ran: 1, want: "remote read: refunded 5", by: agenttool.ByHuman},
 		{name: "nobody to ask", input: true},
+		{name: "a held sibling runs with the accept", answer: &agenttool.Answer{Action: agenttool.ActionAccept}, sibling: true, ran: 1, siblingRan: 1, want: "remote read: refunded 5 | read_ledger ran"},
+		{name: "a held sibling is refused with the decline", answer: &agenttool.Answer{Action: agenttool.ActionDecline}, sibling: true, want: "remote read: the caller alice refused this call | not run: the caller alice refused the call this one was held beside"},
+		{name: "nobody to ask, the hook answers", hooked: true, want: "remote read: the caller alice refused this call; the caller said: the hook says no"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var mu sync.Mutex
-			ran := 0
-			refund := agenttool.NewFunc("issue_refund", "refunds a charge", json.RawMessage(`{"type":"object"}`),
-				func(context.Context, agenttool.Call) (agenttool.Result, error) {
-					mu.Lock()
-					ran++
-					mu.Unlock()
-					return agenttool.Text("refunded 5"), nil
-				})
-			remoteCfg := agentturn.Config{Name: "Refunds", Model: refundsThenSays{}, Tools: []agenttool.Tool{refund},
-				BeforeToolCall: func(_ context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
-					return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: reason}, nil
-				}}
-			auth := fronta2a.Authenticator{Name: "bearer", Scheme: a2a.HTTPAuthSecurityScheme{Scheme: "Bearer"},
-				Principal: func(r *http.Request) (string, error) {
-					if r.Header.Get("Authorization") != "Bearer a-token" {
-						return "", errors.New("no token")
-					}
-					return "alice", nil
-				}}
-			var decisions []*agentturn.ToolDecision
-			record := func(ctx context.Context, _ string, a *agentturn.Agent) (context.Context, func(), error) {
-				return ctx, a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
-					if e, ok := ev.(*agentturn.ToolStart); ok {
-						mu.Lock()
-						decisions = append(decisions, e.Decision)
-						mu.Unlock()
-					}
-					return nil
-				}), nil
+			names := []string{"issue_refund"}
+			if tc.sibling {
+				names = append(names, "read_ledger")
 			}
-			fopts := []fronta2a.Option{fronta2a.WithAuthenticator(auth), fronta2a.WithEscalation(), fronta2a.WithRecorderFor(record)}
-			if tc.chosen {
-				fopts = append(fopts, fronta2a.WithChosenBy(func(context.Context, string) bool { return true }))
-			}
-			exec := fronta2a.New(remoteCfg, fopts...)
-			srv := httptest.NewServer(a2asrv.NewJSONRPCHandler(exec.RequestHandler()))
-			t.Cleanup(srv.Close)
-			card := &a2a.AgentCard{Name: "Refunds", URL: srv.URL, PreferredTransport: a2a.TransportProtocolJSONRPC, Capabilities: a2a.AgentCapabilities{Streaming: true}}
-			client, err := a2aclient.NewFromCard(context.Background(), card, a2aclient.WithInterceptors(ObserveEndpoint(), bearer{token: "a-token"}))
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = client.Destroy() })
+			remote, client, card := serveEscalating(t, names, asks("issue_refund", reason), tc.chosen)
 
-			tool := New(client, card, append([]Option{WithAskCaller()}, tc.opts...)...)
+			opts := append([]Option{WithAskCaller()}, tc.opts...)
+			hooked := 0
+			if tc.hooked {
+				opts = append(opts, WithInputRequired(func(_ context.Context, _ TaskInfo, q *a2a.Message) ([]a2a.Part, error) {
+					hooked++
+					var parts []a2a.Part
+					escalated, _ := q.Metadata[fronta2a.MetaEscalatedCalls].([]any)
+					for _, e := range escalated {
+						id, _ := e.(map[string]any)["call_id"].(string)
+						parts = append(parts, fronta2a.ApprovalPart(fronta2a.Approval{CallID: id, Note: "the hook says no"}))
+					}
+					return parts, nil
+				}))
+			}
+			tool := New(client, card, opts...)
 			var asked []agentturn.AskedCall
 			var questions []string
 			var under []string
@@ -186,10 +264,11 @@ func TestAskCallerAnswersARemotesEscalation(t *testing.T) {
 					t.Errorf("the caller's run says the note itself: %q", text)
 				}
 			}
-			mu.Lock()
-			defer mu.Unlock()
-			if ran != tc.ran {
+			if ran := remote.runs("issue_refund"); ran != tc.ran {
 				t.Errorf("the remote's call ran %d times, want %d", ran, tc.ran)
+			}
+			if ran := remote.runs("read_ledger"); ran != tc.siblingRan {
+				t.Errorf("the held call ran %d times, want %d", ran, tc.siblingRan)
 			}
 			if tc.input {
 				var waiting agentturn.InputRequired
@@ -204,8 +283,14 @@ func TestAskCallerAnswersARemotesEscalation(t *testing.T) {
 			if end.Err != nil || end.Result.Output.Text != tc.want {
 				t.Errorf("the a2a call = %q, %v; want %q", end.Result.Output.Text, end.Err, tc.want)
 			}
+			if tc.hooked {
+				if hooked != 1 || len(asked) != 0 {
+					t.Errorf("the hook answered %d times and the elicitor %d; want the hook once", hooked, len(asked))
+				}
+				return
+			}
 			if len(asked) != 1 {
-				t.Fatalf("asked %d times, want once", len(asked))
+				t.Fatalf("asked %d times, want once, about the asked call alone", len(asked))
 			}
 			if a := asked[0]; a.Name != "issue_refund" || string(a.Args) != `{"amount":5}` || a.Callee != "Refunds" || a.Decision == nil || a.Decision.Reason != reason || a.CallID == "" {
 				t.Errorf("asked about %+v, want the remote's issue_refund, its reason and the remote agent", a)
@@ -217,8 +302,10 @@ func TestAskCallerAnswersARemotesEscalation(t *testing.T) {
 				t.Errorf("question %q does not name the remote agent and its reason", questions[0])
 			}
 			var approval *agentturn.ToolDecision
-			for _, d := range decisions {
-				if d != nil {
+			remote.mu.Lock()
+			defer remote.mu.Unlock()
+			for _, d := range remote.decisions {
+				if d != nil && strings.HasPrefix(d.Reason, "approved by the caller") {
 					approval = d
 				}
 			}
@@ -226,5 +313,73 @@ func TestAskCallerAnswersARemotesEscalation(t *testing.T) {
 				t.Errorf("the remote recorded the approval as %+v, want by %q", approval, tc.by)
 			}
 		})
+	}
+}
+
+// TestADetachedCallAsksNobody pins WithAskCaller under WithDetach: the
+// task is followed on the run's context once the call has returned,
+// where the call's elicitor is not, so an elicitor the host put on the
+// prompt's context is not asked from the background either; the task
+// keeps WithInputRequired.
+func TestADetachedCallAsksNobody(t *testing.T) {
+	remote, client, card := serveEscalating(t, []string{"issue_refund"}, asks("issue_refund", "a person approves refunds"), false)
+	var mu sync.Mutex
+	asked, hooked := 0, 0
+	hook := func(context.Context, TaskInfo, *a2a.Message) ([]a2a.Part, error) {
+		mu.Lock()
+		hooked++
+		mu.Unlock()
+		return nil, agentturn.ErrInputRequired
+	}
+	ended := make(chan error, 1)
+	detach := func(_ string, _ TaskInfo, _ *a2a.Task, err error) { ended <- err }
+	tool := New(client, card, WithAskCaller(), WithInputRequired(hook), WithDetach(detach))
+	elicit := func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+		mu.Lock()
+		asked++
+		mu.Unlock()
+		return agenttool.Answer{Action: agenttool.ActionAccept}, nil
+	}
+	parent := agentturn.New(agentturn.Config{Model: callsAll{}, Tools: []agenttool.Tool{tool}})
+	ctx := agenttool.ContextWithElicitor(context.Background(), elicit)
+	if _, err := parent.Prompt(ctx, openresponses.UserText("refund the charge")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-ended:
+		var waiting agentturn.InputRequired
+		if !errors.As(err, &waiting) {
+			t.Errorf("the detached task ended with %v, want input required", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the detached task never ended")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if asked != 0 || hooked != 1 {
+		t.Errorf("asked the prompt's elicitor %d times and the hook %d; want the hook once and nobody asked", asked, hooked)
+	}
+	if ran := remote.runs("issue_refund"); ran != 0 {
+		t.Errorf("the remote's call ran %d times, want none", ran)
+	}
+}
+
+// TestAskCallerLeavesATaskWaitingOnOtherInput pins that a task whose
+// status also lists calls to the caller's own tools is not answered by
+// asking about the escalated ones: one message answers both, so it is
+// left to WithInputRequired.
+func TestAskCallerLeavesATaskWaitingOnOtherInput(t *testing.T) {
+	asked := 0
+	ctx := agenttool.ContextWithElicitor(context.Background(), func(context.Context, agenttool.Elicitation) (agenttool.Answer, error) {
+		asked++
+		return agenttool.Answer{Action: agenttool.ActionAccept}, nil
+	})
+	status := &a2a.Message{Metadata: map[string]any{
+		fronta2a.MetaEscalatedCalls: []any{map[string]any{"call_id": "c1", "name": "issue_refund", "arguments": `{"amount":5}`, "reason": "a person approves refunds"}},
+		fronta2a.MetaPendingCalls:   []any{"c2"},
+	}}
+	r := &remote{name: "Refunds", askCaller: true}
+	if parts, ok := r.askEscalated(ctx, status); ok || asked != 0 {
+		t.Errorf("answered %v (%v) after asking %d times; want it left to WithInputRequired", parts, ok, asked)
 	}
 }
