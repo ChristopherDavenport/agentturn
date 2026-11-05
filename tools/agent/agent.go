@@ -527,6 +527,15 @@ type Record struct {
 	End *agentturn.RunEnd
 }
 
+// ErrNoRecord is what a [WithRecord] loader returns, wrapped, for a
+// call run again under the key of a hand-off that may have started
+// its child when the record holds no child of that hand-off: the
+// recorder keeps no child sessions, or the process stopped after the
+// child started and before the record linked it. The call fails with
+// it, and runs nothing: a child started afresh could repeat work the
+// first one did. Its text tells the model the outcome is unknown.
+var ErrNoRecord = errors.New("outcome unknown: the call was run again after it was cut off, and the record holds no child agent it started, which may or may not have done its work; check before calling it again")
+
 // WithRecord has a call run again under the key of the dispatch that
 // started its child continue that child from the host's record, rather
 // than start it afresh, and makes the tool report itself keyed
@@ -534,9 +543,12 @@ type Record struct {
 // was in flight when the process stopped again under that key (RFC
 // 0001, Composition, As a tool). load is called on each call that
 // carries a key, with the call and the configuration it runs under,
-// and returns nil when the record holds no child of that call started
-// under that key: a first call, or one run again under a new key,
-// which is another operation, starts afresh. agentturn/session's
+// and returns nil for a call that is the first hand-off under its key:
+// a first call, or one run again under a new key, which is another
+// operation, starts afresh. For a call that repeats a hand-off whose
+// child the record does not hold it returns [ErrNoRecord], and the
+// call fails with the outcome unknown (RFC 0001, Composition, As a
+// tool). agentturn/session's
 // Recorder.ChildRecord is the loader for a child recorded with
 // Recorder.Observe:
 //
@@ -710,6 +722,9 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		// The call runs again under its dispatch's key: the child that
 		// dispatch started continues from the record (#297).
 		if restored, err = a.opts.load(ctx, call, cfg); err != nil {
+			if errors.Is(err, ErrNoRecord) {
+				return agenttool.Result{}, fmt.Errorf("agent %q: %w", a.cfg.Name, err)
+			}
 			return agenttool.Result{}, fmt.Errorf("agent %q: read the child's record: %w", a.cfg.Name, err)
 		}
 	}

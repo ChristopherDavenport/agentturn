@@ -4554,11 +4554,16 @@ const cutOffRef = "cut off: closed on resume"
 //		agent.WithRecord(rec.ChildRecord))
 //
 // The parent is the session of the run on ctx, as for
-// [Recorder.ChildContext]. The child is the session the last
-// subsession link for the call on the parent's path names, when the
-// dispatch of the call before that link carried call's key: a call run
-// again under another key is another operation, and gets nil, so the
-// tool starts it afresh, as it does a call no link names yet. A run of
+// [Recorder.ChildContext]. A call whose dispatch on the parent's path
+// is the first hand-off under call's key since the call's last output
+// or result gets nil, and the tool starts it afresh: a first call, or
+// one run again under another key, which is another operation. A call
+// that repeats such a hand-off continues the child the last subsession
+// link for the call after it names. When there is no such link, the
+// process having stopped after the child started and before its link
+// was written, or the recorder being made with [WithoutChildSessions],
+// which holds no child, the call gets agent.ErrNoRecord and fails with
+// the outcome unknown rather than repeat the child's work. A run of
 // the child the process left open is closed, as [Resume] closes the
 // root's, and the record returned seeds a new agent with the child's
 // state at its leaf, as [AgentOptions] does, lists its pending calls,
@@ -4570,17 +4575,13 @@ const cutOffRef = "cut off: closed on resume"
 // answer, is returned as that end, which the tool returns without
 // running: Reason, Cause and the transcript as the record has them,
 // and Err naming the end for one without an answer. The child's run
-// is observed as any is, and goes on at the session's leaf. A recorder
-// made with [WithoutChildSessions] holds no child and returns nil.
+// is observed as any is, and goes on at the session's leaf.
 func (r *Recorder) ChildRecord(ctx context.Context, call agenttool.Call, cfg agentturn.Config) (*agent.Record, error) {
 	if call.ID == "" || call.IdempotencyKey == "" {
 		return nil, nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.children {
-		return nil, nil
-	}
 	parent := r.root
 	if p, ok := r.runs[agentturn.RunIDFromContext(ctx)]; ok {
 		parent = p
@@ -4592,9 +4593,14 @@ func (r *Recorder) ChildRecord(ctx context.Context, call agenttool.Call, cfg age
 	if err != nil {
 		return nil, fmt.Errorf("session: open %s for the call's child: %w", parent.id, err)
 	}
-	childID := linkedUnder(ps.Path(ps.Leaf()), call.ID, call.IdempotencyKey)
-	if childID == "" {
+	childID, repeat := linkedUnder(ps.Path(ps.Leaf()), call.ID, call.IdempotencyKey)
+	switch {
+	case !repeat:
 		return nil, nil
+	case !r.children:
+		return nil, fmt.Errorf("%w (the recorder keeps no child sessions)", agent.ErrNoRecord)
+	case childID == "":
+		return nil, fmt.Errorf("%w (session %s links no child to call %s after its hand-off)", agent.ErrNoRecord, parent.id, call.ID)
 	}
 	cs, err := r.store.Open(bg, childID)
 	if err != nil {
@@ -4649,28 +4655,49 @@ func (r *Recorder) ChildRecord(ctx context.Context, call agenttool.Call, cfg age
 	return out, nil
 }
 
-// linkedUnder returns the child session the last subsession link for
-// callID on path names, when the last dispatch of the call before that
-// link carried key, and "" otherwise.
-func linkedUnder(path []agentsession.Entry, callID, key string) string {
-	dispatched, child := "", ""
+// linkedUnder reads path for the call callID running under key, whose
+// dispatch is the last hand-off of the call on path. repeat says that
+// dispatch repeats an earlier hand-off under key that no output or
+// result for the call followed, so the call may have started a child
+// that ran; a hand-off under another key is another operation, a
+// withdrawn one never happened, and an output or a result ends the
+// operation. child is the session the last subsession link for the
+// call after such an earlier hand-off names, "" when none does.
+func linkedUnder(path []agentsession.Entry, callID, key string) (child string, repeat bool) {
+	handOffs := 0
 	for _, e := range path {
 		switch v := e.(type) {
 		case *agentsession.DispatchEntry:
+			if v.CallID != callID {
+				continue
+			}
+			if v.IdempotencyKey != key {
+				handOffs, child = 0, ""
+				continue
+			}
+			handOffs++
+		case *agentsession.DecisionEntry:
+			if v.CallID == callID && v.Withdrawn && handOffs > 0 {
+				handOffs--
+			}
+		case *agentsession.ResultEntry:
 			if v.CallID == callID {
-				dispatched = v.IdempotencyKey
+				handOffs, child = 0, ""
+			}
+		case *agentsession.ItemEntry:
+			if out, ok := v.Item.(*openresponses.FunctionCallOutput); ok && out.CallID == callID {
+				handOffs, child = 0, ""
 			}
 		case *agentsession.LinkEntry:
 			if v.Rel != agentsession.RelSubsession || v.CallID != callID || v.URL != "" || v.Cancel != "" || v.SpawnID != "" {
 				continue
 			}
-			child = ""
-			if dispatched == key {
+			if handOffs > 0 {
 				child = v.Session
 			}
 		}
 	}
-	return child
+	return child, handOffs > 1
 }
 
 // recordedEnd is the end of run, the child's last, with nothing

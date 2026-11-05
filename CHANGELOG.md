@@ -19,7 +19,11 @@ versions may break the API.
   `WithAskParent` the question open when the process stopped is asked
   again under the parent's call. A child that had ended with nothing
   pending returns that end and runs nothing; a call under a new key,
-  and a detached one, start afresh as before. `session.Recorder.ChildRecord`
+  and a detached one, start afresh as before. A call that repeats a
+  hand-off whose child the record does not hold, a recorder made with
+  `WithoutChildSessions` or a process that stopped before the parent's
+  link, fails with `agent.ErrNoRecord`, the outcome unknown, rather
+  than start the child afresh and repeat its work. `session.Recorder.ChildRecord`
   is the loader for a child recorded with `Observe`: it closes the
   child's run the process cut and reads the child's state as
   `AgentOptions`, `Pending` and `ReplayAnswers` do. A recorded end the

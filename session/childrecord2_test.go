@@ -2,6 +2,10 @@ package session
 
 import (
 	"context"
+	"errors"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/ChristopherDavenport/agentsession"
@@ -114,3 +118,126 @@ func TestACallIDTheModelReusesStartsAFreshChild(t *testing.T) {
 		}
 	}
 }
+
+// linkCutStore is a process that dies as it writes its first
+// subsession link: that append and every one after it fail.
+type linkCutStore struct {
+	agentsession.Store
+	cut, died atomic.Bool
+}
+
+func (s *linkCutStore) Append(ctx context.Context, id string, e agentsession.Entry) (string, error) {
+	if l, ok := e.(*agentsession.LinkEntry); ok && l.Rel == agentsession.RelSubsession && !s.died.Swap(true) {
+		s.cut.Store(true)
+	}
+	if s.cut.Load() {
+		return "", errors.New("the process died")
+	}
+	return s.Store.Append(ctx, id, e)
+}
+
+// TestACallRunAgainWithNoChildOnTheRecordIsNotRunAfresh is l6-3e's
+// M2: a call run again under the key of a hand-off that may have
+// started its child, when the record holds no child for it, fails with
+// the outcome unknown rather than start the child afresh, which would
+// run the child's tools a second time. The record holds none when the
+// recorder keeps no child sessions, and when the process stopped after
+// the child started and before the parent's link was written.
+func TestACallRunAgainWithNoChildOnTheRecordIsNotRunAfresh(t *testing.T) {
+	cases := []struct {
+		name  string
+		store interface {
+			agentsession.Store
+			Die()
+			Live()
+		}
+		opts []Option
+	}{
+		{name: "without child sessions", store: &dyingStore{cutStore: &cutStore{Store: agentsession.NewMemoryStore()}}, opts: []Option{WithoutChildSessions()}},
+		{name: "cut before the link", store: &dyingLinkStore{linkCutStore: &linkCutStore{Store: agentsession.NewMemoryStore()}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := tc.store
+			rec, s, err := Start(ctx, store, agentsession.Header{}, tc.opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var mu sync.Mutex
+			lookups := 0
+			lookup := agenttool.New("lookup", "", func(context.Context, echoArgs) (string, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				lookups++
+				return "FOUND", nil
+			})
+			childCfg := agentturn.Config{Name: "child", Description: "looks up", Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{lookup}}
+			child := func(rec *Recorder) agenttool.Tool {
+				return agent.New(childCfg, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext), agent.WithRecord(rec.ChildRecord))
+			}
+			parentCfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{child(rec)},
+				AfterToolCall: func(context.Context, agentturn.ToolResultInfo) (*agentturn.ToolOverride, error) {
+					// The process dies once the child has answered, if
+					// it has not already.
+					store.Die()
+					return nil, nil
+				}}
+			a := agentturn.New(parentCfg)
+			unsub := rec.Attach(a)
+			_, _ = a.Prompt(ctx, openresponses.UserText("find"))
+			unsub()
+			store.Live()
+			if lookups != 1 {
+				t.Fatalf("lookup ran %d times before the crash, want once", lookups)
+			}
+
+			rec, s, err = Resume(ctx, store, s.ID(), tc.opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parentCfg.Tools, parentCfg.AfterToolCall = []agenttool.Tool{child(rec)}, nil
+			answers, err := ReplayAnswers(ctx, s, parentCfg.Tools)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(answers) != 1 || answers[0].Reason != agentturn.RunAgainKeyedReason {
+				t.Fatalf("answers = %+v, want the call run again under its key", answers)
+			}
+			opts, err := AgentOptions(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := agentturn.New(parentCfg, opts...)
+			defer rec.Attach(b)()
+			end, err := b.Resume(ctx, answers...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lookups != 1 {
+				t.Errorf("lookup ran %d times, want once: the child was started afresh", lookups)
+			}
+			var out string
+			for _, item := range end.Items {
+				if o, ok := item.(*openresponses.FunctionCallOutput); ok && o.CallID == answers[0].CallID {
+					out = o.Output.String()
+				}
+			}
+			if !strings.Contains(out, "outcome unknown") {
+				t.Errorf("the call's output = %q, want the outcome unknown", out)
+			}
+		})
+	}
+}
+
+// dyingStore and dyingLinkStore give the two stores one way to die
+// and come back.
+type dyingStore struct{ *cutStore }
+
+func (s *dyingStore) Die()  { s.cut.Store(true) }
+func (s *dyingStore) Live() { s.cut.Store(false) }
+
+type dyingLinkStore struct{ *linkCutStore }
+
+func (s *dyingLinkStore) Die()  { s.cut.Store(true) }
+func (s *dyingLinkStore) Live() { s.cut.Store(false) }

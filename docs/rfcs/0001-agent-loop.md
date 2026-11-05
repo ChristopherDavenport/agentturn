@@ -1818,7 +1818,15 @@ An agent stands in four places inside another system:
   the tool puts the child's deferrals to the caller's elicitor; a
   child whose run had ended with nothing pending returns that end and
   runs nothing. A call run again under another key is another
-  operation, and starts its callee afresh (#297).
+  operation, and starts its callee afresh (#297). A call that repeats
+  a hand-off under its key whose callee the record does not hold, the
+  host keeping no record of callees, or the process having stopped
+  after the callee started and before the record named it, MUST NOT
+  start the callee afresh, which could repeat its work: it fails with
+  the outcome unknown, as a call that may have run and must not run
+  again does. A hand-off its call's output or result followed ended
+  that operation, and a link written before it names no callee of a
+  later one.
   A **detached** child is the background task: the call returns once
   the child's run has started, the child runs on the run context, so
   the parent's cancellation still cuts it and the parent's run ending
@@ -2592,7 +2600,9 @@ it.
 - **Composition, as a tool.** A composition tool that can continue its
   callee from the record SHOULD report itself keyed, and a call run
   again under its key SHOULD continue that callee, so a deferral open
-  when the process stopped is asked again under the same call (#297).
+  when the process stopped is asked again under the same call; one
+  whose callee the record does not hold fails with the outcome
+  unknown rather than start it afresh (#297).
 
 ## Changes in draft 0.6
 
