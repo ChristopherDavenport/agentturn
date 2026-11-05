@@ -5,6 +5,14 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Changed: requires openresponses v0.0.19 and agenttool v0.0.30 in every
+  module, and `session` requires agentsession v0.0.38, so a session the
+  recorder writes is format 0.21. Nothing here broke: the recorder
+  exports no sidecar session to ATIF, and the root does not use
+  agenttool's `mcpclient`.
+
 ## v0.0.37 - 2026-11-04
 
 - Added: `WithProvenance(item, Provenance{Layers, Source, Trust})` lets
