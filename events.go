@@ -149,7 +149,7 @@ func (t Trigger) IsZero() bool {
 // message it composed, which carries a kind of the host's own. The loop
 // reads nothing from it; a session recorder does not write it on the
 // source of an item the host marked as composed from instruction
-// layers, or copied, which keeps the trigger's other members, and
+// layers, copied or hidden, which keeps the trigger's other members, and
 // [WithProvenance] refuses it as the source of a message composed from
 // layers (#303).
 const TriggerHuman = "human"

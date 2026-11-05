@@ -41,7 +41,8 @@ versions may break the API.
   person typed was recorded under kind `human` beside its
   `instructions_part`, a pair format 0.21 forbids a writer to compose.
   The kind `human` is no longer written for an item that names
-  instruction layers or is copied; such an item keeps the rest of the
+  instruction layers, is copied or is hidden, since a message kept out
+  of the person's view is not what they typed; such an item keeps the rest of the
   trigger, its `ref` and `source`, without a kind, so a composed
   steer's `queued` entry still says where it arrived from. An owed
   input recorded so by v0.0.37 is queued again as recorded. RFC 0001

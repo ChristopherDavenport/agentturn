@@ -39,7 +39,9 @@ func (h markedItem) MarshalJSON() ([]byte, error) { return json.Marshal(h.item) 
 // a keyword added, a subagent's result. The model still sees it, the
 // transcript holds it and a request carries it; only its item events
 // say it is hidden, and a session recorder writes its entry with
-// visible false, which is the format's word for exactly this.
+// visible false, which is the format's word for exactly this. A hidden
+// message is not what the person typed, which they see: a session
+// recorder writes it without the trigger kind [TriggerHuman] (#303).
 //
 // Use it wherever the loop appends an item the caller supplied:
 // [Agent.Prompt], [Agent.Steer], [Agent.FollowUp], the prompts of [Run]

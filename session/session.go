@@ -5225,7 +5225,7 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 		if err != nil {
 			return err
 		}
-		source = inputTrigger(source, e.Provenance, e.Copied)
+		source = inputTrigger(source, e.Provenance, e.Copied, e.Hidden)
 		if w.inFlight && e.ResponseID == "" && !e.Hidden && !e.Copied && e.Provenance == nil && source == nil {
 			// The loop appends nothing of its own while a model call
 			// is in flight, so this is the model's, from a stream that
@@ -6184,7 +6184,7 @@ func recordProvenance(e *agentsession.ItemEntry, prov *agentturn.Provenance) err
 // itemTrigger is the trigger item is queued under: the source of its
 // provenance when that names one, which stands over the call's, and
 // trigger otherwise, though never with the kind human for a message
-// composed from layers or an item copied ([inputTrigger]).
+// composed from layers, or an item copied or hidden ([inputTrigger]).
 func itemTrigger(item openresponses.Item, trigger *agentsession.Trigger) (*agentsession.Trigger, error) {
 	p, ok := agentturn.ProvenanceOf(item)
 	var prov *agentturn.Provenance
@@ -6198,25 +6198,29 @@ func itemTrigger(item openresponses.Item, trigger *agentsession.Trigger) (*agent
 			return nil, err
 		}
 	}
-	return inputTrigger(t, prov, agentturn.IsCopied(item)), nil
+	_, hidden := agentturn.Unhide(item)
+	return inputTrigger(t, prov, agentturn.IsCopied(item), hidden), nil
 }
 
 // inputTrigger is t as the source of an input item, or the trigger of
 // its queued entry: t, except that the kind human is not written for an
-// item the host composed from instruction layers, or copied from
-// another conversation, which agentsession RFC 0001 0.21 says a writer
-// never marks human (#303). Such an item handed in under the person's
+// item the host composed from instruction layers, copied from another
+// conversation or hid from the person, which agentsession RFC 0001 0.21
+// says a writer never marks human (#303): a hidden message, kept out of
+// the person's view, is not what they typed but something the host
+// prompts with, a reminder its RFC counts as composed. Such an item
+// handed in under the person's
 // trigger, a template a slash command expands or a reminder the host
 // prompts beside what was typed, keeps the rest of the trigger, its ref,
 // its source and its other members, since for a steer the queued entry
 // is the only place its arrival is written; only the kind is cleared,
 // which reads as composed. One left with nothing is no trigger. A host
 // names its own kind for such an item with the provenance's Source.
-func inputTrigger(t *agentsession.Trigger, prov *agentturn.Provenance, copied bool) *agentsession.Trigger {
+func inputTrigger(t *agentsession.Trigger, prov *agentturn.Provenance, copied, hidden bool) *agentsession.Trigger {
 	if t == nil || t.Kind != agentsession.TriggerHuman {
 		return t
 	}
-	if !copied && (prov == nil || len(prov.Layers) == 0) {
+	if !copied && !hidden && (prov == nil || len(prov.Layers) == 0) {
 		return t
 	}
 	out := t.Clone()
@@ -6235,7 +6239,7 @@ func queuedTrigger(q *agentturn.Queued) (*agentsession.Trigger, error) {
 	if err != nil {
 		return nil, err
 	}
-	return inputTrigger(t, q.Provenance, q.Copied), nil
+	return inputTrigger(t, q.Provenance, q.Copied, q.Hidden), nil
 }
 
 // copySource is where a copied item was taken from: the entry's
