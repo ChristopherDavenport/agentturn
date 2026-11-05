@@ -756,7 +756,12 @@ could not fold, is not sent, and the run ends with the refusal (#277).
 Retry is off unless the policy names more than one attempt. The
 default predicate retries the transient statuses (408, 409, 429 and
 5xx), a stream that ended before its terminal event and transport
-failures, and calls everything else, a 4xx in particular, final. The
+failures, and calls everything else, a 4xx in particular, final. A
+loop MUST decide whether to retry by the error's code before its HTTP
+status: an error whose code says the account cannot pay for the
+request, Open Responses' registered `insufficient_quota`, MUST NOT be
+retried, whatever its status, since OpenAI sends it as a 429 and no
+retry can fix it (#308). The
 default backoff honours a Retry-After header, uncapped, and otherwise
 doubles from 500ms to a 30s cap. Cancellation cuts a delay short and
 ends the run with reason `aborted`.
@@ -2381,6 +2386,10 @@ it.
 - **The record.** A fold a host or a person asked for is recorded with
   agentsession RFC 0001 0.21's `requested` and its `instructions`, and
   one the budget or an overflow's retry forced with neither (#306).
+- **Retry.** A loop decides whether to retry by the error's code
+  before its status, and never retries `insufficient_quota`, whatever
+  its status (#308); breaking for a predicate that retried a 429 by its
+  status alone.
 
 ## Changes in draft 0.6
 

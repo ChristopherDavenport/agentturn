@@ -931,11 +931,20 @@ func TestDefaultRetryPolicy(t *testing.T) {
 			t.Errorf("%v should be retryable", err)
 		}
 	}
+	quota429 := openresponses.InsufficientQuota("You exceeded your current quota")
+	quota429.StatusCode = 429
+	quota503 := openresponses.InsufficientQuota("out of credit")
+	quota503.StatusCode = 503
 	final := []error{
 		openresponses.InvalidRequest("c", "m", ""),
 		openresponses.NewError(openresponses.ErrorTypeNotFound, "c", "m"),
 		errors.New("something else"),
 		context.Canceled,
+		// The code decides before the status: an account that cannot
+		// pay is never retried, whatever status it came with (#308).
+		quota429,
+		fmt.Errorf("wrapped: %w", quota503),
+		openresponses.InsufficientQuota("no status"),
 	}
 	for _, err := range final {
 		if DefaultRetryable(err) {
@@ -1991,5 +2000,41 @@ func TestToolEndSaysWhichCallsWereCut(t *testing.T) {
 	}
 	if e := ends["b"]; e == nil || !e.Cut {
 		t.Errorf("b = %+v, want it cut", e)
+	}
+}
+
+// quotaRefusing fails every call as OpenAI refuses an account that
+// cannot pay: insufficient_quota with HTTP status 429.
+type quotaRefusing struct{ calls int }
+
+func (m *quotaRefusing) CreateStream(context.Context, openresponses.Request, openresponses.EventSink) error {
+	m.calls++
+	err := openresponses.InsufficientQuota("You exceeded your current quota")
+	err.StatusCode = 429
+	return err
+}
+
+// TestAQuotaRefusalIsNotRetried pins #308: a 429 carrying
+// insufficient_quota ends the run after one attempt with the error,
+// under a policy that would retry a rate limit, rather than waiting out
+// the backoff for a refusal no retry can fix.
+func TestAQuotaRefusalIsNotRetried(t *testing.T) {
+	model := &quotaRefusing{}
+	cfg := Config{Model: model, Retry: Retry{MaxAttempts: 3, Backoff: func(int, error) time.Duration { return time.Millisecond }}}
+	var end *RunEnd
+	retries := 0
+	for ev := range Run(context.Background(), nil, openresponses.Items{openresponses.UserText("hi")}, cfg) {
+		switch e := ev.(type) {
+		case *ModelRetry:
+			retries++
+		case *RunEnd:
+			end = e
+		}
+	}
+	if model.calls != 1 || retries != 0 {
+		t.Errorf("calls = %d, retries = %d, want one attempt", model.calls, retries)
+	}
+	if end == nil || end.Reason != ReasonError || !openresponses.IsInsufficientQuota(end.Err) {
+		t.Errorf("end = %+v, want the quota error", end)
 	}
 }

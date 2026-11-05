@@ -384,10 +384,17 @@ func (r Retry) backoff(attempt int, err error) time.Duration {
 // openresponses error with status 408, 409, 429 or 5xx, a stream that
 // ended before its terminal event, and transport failures (net.Error,
 // an unexpected EOF, a reset or refused connection). Everything else,
-// a 4xx in particular, is final.
+// a 4xx in particular, is final. An openresponses error is judged by
+// its code before its status: one whose code is insufficient_quota, an
+// account or key that cannot pay for the request, is final whatever
+// status it came with, OpenAI's 429 included, since no retry can fix
+// it (RFC 0001, Retry; #308).
 func DefaultRetryable(err error) bool {
 	var oe *openresponses.Error
 	if errors.As(err, &oe) {
+		if openresponses.IsInsufficientQuota(err) {
+			return false
+		}
 		switch status := oe.HTTPStatus(); {
 		case status == 408, status == 409, status == 429, status >= 500:
 			return true

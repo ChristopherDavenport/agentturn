@@ -52,6 +52,11 @@ versions may break the API.
   agentsession RFC 0001 0.21's `requested` and `instructions`; a fold
   the budget or an overflow's retry forced carries neither. RFC 0001
   draft 0.7. (#306)
+- Fixed: `DefaultRetryable` judges an openresponses error by its code
+  before its status, and an `insufficient_quota` error is final
+  whatever its status: OpenAI sends it as a 429, which was retried
+  through the whole backoff before the user saw it. RFC 0001 draft
+  0.7, Retry. (#308)
 
 ## v0.0.37 - 2026-11-04
 
