@@ -1179,6 +1179,41 @@ func TestTheCallersClaimIsTheHostsToTrust(t *testing.T) {
 			}
 		})
 	}
+	// A reply carries the answerer's claim the same way: a person
+	// answering at a terminal claims human.
+	for _, tc := range []struct {
+		name  string
+		token string
+		claim agentturn.Trigger
+		want  agentturn.Trigger
+	}{
+		{"a person's answer, trusted", "person", agentturn.Trigger{Kind: agentturn.TriggerHuman}, agentturn.Trigger{Kind: agentturn.TriggerHuman, Ref: "chris"}},
+		{"an answer with no claim", "person", agentturn.Trigger{}, agentturn.Trigger{Kind: "control", Ref: "chris"}},
+		{"an untrusted answer's claim", "driver", agentturn.Trigger{Kind: agentturn.TriggerHuman}, agentturn.Trigger{Kind: "control", Ref: "driver"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &recorder{}
+			srv := httptest.NewServer(Handler(r, WithAuthenticator(tokenAuth(tokens)), WithTriggerClaims(claim)))
+			defer srv.Close()
+			c, err := Dial(t.Context(), srv.URL, withToken(tc.token))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := t.Context()
+			if !tc.claim.IsZero() {
+				ctx = agentturn.ContextWithAnswerer(ctx, tc.claim)
+			}
+			if err := c.Reply(ctx, "q", agenttool.Answer{Action: agenttool.ActionAccept}); err != nil {
+				t.Fatal(err)
+			}
+			r.mu.Lock()
+			got, ok := agentturn.AnswererFrom(r.ctx)
+			r.mu.Unlock()
+			if !ok || got.Kind != tc.want.Kind || got.Ref != tc.want.Ref {
+				t.Errorf("answered by %+v, want %+v", got, tc.want)
+			}
+		})
+	}
 	t.Run("a trusted claim the format cannot write", func(t *testing.T) {
 		r := &recorder{}
 		srv := httptest.NewServer(Handler(r, WithAuthenticator(tokenAuth(tokens)), WithTriggerClaims(claim)))

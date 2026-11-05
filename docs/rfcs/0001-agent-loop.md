@@ -2147,11 +2147,12 @@ it is the person's words. A host MUST start a run, or queue an input,
 under a trigger of kind `human` only for what the person typed, and
 MUST name its own kind, as the provenance's source, for a message it
 composed. A front that takes input from a remote party, to prompt,
-queue, deliver or resume, carries the trigger that party claims for
-it, so a person at a client claims `human` for what they typed, and
-MUST run the input under the claim only when the host has authorised
-that principal to claim one, as for a decider (Pending calls);
-otherwise it runs the input under the front's own kind naming the
+queue, deliver or resume, SHOULD carry the trigger that party claims
+for it, so a person at a client claims `human` for what they typed,
+and likewise the answerer it claims for a reply to a question. It MUST
+run the input, or record the answer, under the claim only when the
+host has authorised that principal to claim one, as for a decider
+(Pending calls); otherwise it uses the front's own kind naming the
 principal, `control` for a control front, and an unchecked claim is
 never recorded. The front authenticates nobody and trusts no claim of
 its own accord: whom to trust is the host's to decide. A recorder MUST NOT write the kind `human` on the `source`
@@ -2252,7 +2253,7 @@ maps onto it as follows:
 | retry policy | `Config.Retry{MaxAttempts, Backoff, Retryable, Revise}`; `DefaultBackoff`, `DefaultRetryable` |
 | low-level loop | `Run(ctx, t, prompts, cfg)`, `Continue(ctx, t, cfg)` → `iter.Seq[Event]`; `EventBuffer`; `CanContinue` |
 | delivery a control offers | `Deliverer`, which `*Agent` and `front/control`'s `Client` implement; `front/control` serves it as `POST /deliver`, `ErrNoDelivery` when the control offers none; in two steps, `Accepter` (`Accept` → `*Delivery`, whose `Wait` and `Done` give the outcome; `NewDelivery` for another implementation), which `*Agent`, `front/control`'s `Client` and `session`'s `RecordedControl` implement, served as `POST /accept`: the accept, then the outcome, on one response |
-| a remote caller's trigger | `front/control`'s `Client` sends the trigger on its caller's context (`ContextWithTrigger`) as a `trigger` member of `POST /prompt`, `/queue`, `/deliver`, `/accept` and `/resume`; the `Handler` runs the input under it for a principal holding the scope `WithTriggerClaims` names, its kind and ref defaulting to `control` and the principal's name, and otherwise under `control` naming the principal |
+| a remote caller's trigger | `front/control`'s `Client` sends the trigger on its caller's context (`ContextWithTrigger`) as a `trigger` member of `POST /prompt`, `/queue`, `/deliver`, `/accept` and `/resume`, and the answerer on `Reply`'s context (`ContextWithAnswerer`) as an `answerer` member of `POST /reply`; the `Handler` runs the input, or names the answerer, under it for a principal holding the scope `WithTriggerClaims` names, its kind and ref defaulting to `control` and the principal's name, and otherwise under `control` naming the principal |
 | agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`, `WithPending`, `SetPending`, `WithReservedCallIDs`, `ReserveCallIDs`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Deliver`, `Accept`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `WhileIdle`, `State`, `SetConfig`, `SetTranscript`, `SetReasoningModels`, `Config` |
 | refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning` (`ErrHeld` for a delivery during a hold, `State.Held`), `ErrTerminated` (a delivery after a terminating stop), `ErrAmbiguousCall`, `ErrCallAnswered`, `ErrTriggerExtra` (`Trigger.Validate`) |
 | run ID, turn, trigger, transcript on the context | `ContextWithRunID`/`RunIDFromContext`, `ContextWithTurn`/`TurnFromContext`, `ContextWithTrigger`/`TriggerFromContext`, `ContextWithTranscript`/`TranscriptFromContext`, `ContextWithReservedCallIDs` |
@@ -2571,14 +2572,16 @@ it.
   less than the request's budget, and records them as pinned (#298).
 - **Queues.** A delivery accepts its items before it waits, and a
   caller can take the acceptance without waiting for the outcome,
-  which the agent settles; a front SHOULD carry both steps, and a
+  which the agent settles, and starts no run once the run in flight
+  was aborted before taking it; a front SHOULD carry both steps, and a
   recorder writes the entry before the accept. A run in flight SHOULD
   report an accepted item without waiting for its next phase, and a
   subscriber's error on such a report ends the run at its next event
   (#302).
-- **The record.** A front that takes remote input carries the trigger
-  the party claims, `human` for what a person at a client typed, and
-  runs the input under it only for a principal the host has authorised
+- **The record.** A front that takes remote input SHOULD carry the
+  trigger the party claims, `human` for what a person at a client
+  typed, and the answerer it claims for a reply, and runs the input or
+  records the answer under it only for a principal the host has authorised
   to claim one, otherwise under its own kind; the control front's
   `control` stays the default (#303).
 - **Composition, as a tool.** A composition tool that can continue its

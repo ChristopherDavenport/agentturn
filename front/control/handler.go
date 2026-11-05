@@ -163,7 +163,9 @@ func WithChosenBy(scope Scope) Option {
 // WithTriggerClaims lets a principal that holds scope claim the trigger
 // its input runs under: the trigger a [Client]'s caller put on the
 // context of Prompt, Queue, Deliver, Accept or Resume
-// (agentturn.ContextWithTrigger), which the client sends. A person at a
+// (agentturn.ContextWithTrigger), which the client sends, and the
+// answerer it put on the context of Reply
+// (agentturn.ContextWithAnswerer), which names who answered a question. A person at a
 // terminal claims kind agentturn.TriggerHuman for what they typed, so a
 // recorder writes it as their words. The claim's members stand; a kind
 // or a ref it leaves out are "control" and the principal's name, as
@@ -381,11 +383,26 @@ func (h *handler) resume(w http.ResponseWriter, r *http.Request, p Principal) {
 // out. Anyone else's claim is not recorded. A claim the format cannot
 // write is refused, and claim has answered and returns false.
 func (h *handler) claim(w http.ResponseWriter, r *http.Request, p Principal, claimed *wireTrigger) (*http.Request, bool) {
-	t := triggerIn(claimed)
-	if t.IsZero() || h.claims == "" || !p.Has(h.claims) {
+	t, ok, err := h.claimed(p, claimed, agentturn.TriggerFromContext(r.Context()))
+	if err != nil {
+		h.writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: trigger: %w", err))
+		return nil, false
+	}
+	if !ok {
 		return r, true
 	}
-	base := agentturn.TriggerFromContext(r.Context())
+	return r.WithContext(agentturn.ContextWithTrigger(r.Context(), t)), true
+}
+
+// claimed is the trigger a client claims, filled from base where it
+// leaves the kind or the ref out, and true when the host lets p claim
+// one ([WithTriggerClaims]); false for no claim or one not recorded.
+// A claim the format cannot write is an error.
+func (h *handler) claimed(p Principal, claimed *wireTrigger, base agentturn.Trigger) (agentturn.Trigger, bool, error) {
+	t := triggerIn(claimed)
+	if t.IsZero() || h.claims == "" || !p.Has(h.claims) {
+		return agentturn.Trigger{}, false, nil
+	}
 	if t.Kind == "" {
 		t.Kind = base.Kind
 	}
@@ -393,10 +410,9 @@ func (h *handler) claim(w http.ResponseWriter, r *http.Request, p Principal, cla
 		t.Ref = base.Ref
 	}
 	if err := t.Validate(); err != nil {
-		h.writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: trigger: %w", err))
-		return nil, false
+		return agentturn.Trigger{}, false, err
 	}
-	return r.WithContext(agentturn.ContextWithTrigger(r.Context(), t)), true
+	return t, true, nil
 }
 
 // mayChoose reports whether p may say who decided its answers
@@ -590,8 +606,9 @@ func (h *handler) abort(w http.ResponseWriter, _ *http.Request, _ Principal) {
 
 func (h *handler) reply(w http.ResponseWriter, r *http.Request, p Principal) {
 	var req struct {
-		ID     string           `json:"id"`
-		Answer wireElicitAnswer `json:"answer"`
+		ID       string           `json:"id"`
+		Answer   wireElicitAnswer `json:"answer"`
+		Answerer *wireTrigger     `json:"answerer"`
 	}
 	if !h.decode(w, r, &req) {
 		return
@@ -612,10 +629,24 @@ func (h *handler) reply(w http.ResponseWriter, r *http.Request, p Principal) {
 		h.writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: reply: %w", err))
 		return
 	}
-	// The principal is who answered, as a run it starts names it.
+	// The principal is who answered, as a run it starts names it, or
+	// who it claims answered when the host lets it claim
+	// ([WithTriggerClaims]): a person at a terminal claims human.
 	ctx := r.Context()
+	var by agentturn.Trigger
 	if p.Name != "" {
-		ctx = agentturn.ContextWithAnswerer(ctx, agentturn.Trigger{Kind: "control", Ref: p.Name})
+		by = agentturn.Trigger{Kind: "control", Ref: p.Name}
+	}
+	claim, ok, err := h.claimed(p, req.Answerer, by)
+	if err != nil {
+		h.writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: reply: answerer: %w", err))
+		return
+	}
+	if ok {
+		by = claim
+	}
+	if !by.IsZero() {
+		ctx = agentturn.ContextWithAnswerer(ctx, by)
 	}
 	writeJSON(w, http.StatusOK, errReply{errorOut(h.c.Reply(ctx, req.ID, *a))})
 }

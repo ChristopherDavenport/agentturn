@@ -425,8 +425,12 @@ func (c *Client) FetchState(ctx context.Context) (agentturn.State, error) {
 }
 
 // Reply implements agentturn.Control. Who answered is the principal
-// the handler authenticates, not anything on ctx, which bounds the
-// request. answer.By, who decided, is recorded only when the handler
+// the handler authenticates, unless ctx carries an answerer
+// (agentturn.ContextWithAnswerer), which is sent as the caller's claim:
+// a person at a terminal claims kind agentturn.TriggerHuman. The server
+// records it only when its host lets the principal claim one
+// ([WithTriggerClaims]), and otherwise names the principal under kind
+// "control". answer.By, who decided, is recorded only when the handler
 // lets the principal say ([WithChosenBy]); otherwise the answer is a
 // person's. A question that is not waiting is an error that matches
 // agentturn.ErrNoQuestion.
@@ -434,10 +438,15 @@ func (c *Client) Reply(ctx context.Context, id string, answer agenttool.Answer) 
 	ctx, cancel := context.WithTimeout(ctx, c.wait)
 	defer cancel()
 	var out errReply
+	var answerer *wireTrigger
+	if by, ok := agentturn.AnswererFrom(ctx); ok {
+		answerer = triggerOut(by)
+	}
 	if err := c.call(ctx, http.MethodPost, "reply", struct {
-		ID     string            `json:"id"`
-		Answer *wireElicitAnswer `json:"answer"`
-	}{id, elicitAnswerOut(&answer)}, &out); err != nil {
+		ID       string            `json:"id"`
+		Answer   *wireElicitAnswer `json:"answer"`
+		Answerer *wireTrigger      `json:"answerer,omitempty"`
+	}{id, elicitAnswerOut(&answer), answerer}, &out); err != nil {
 		return err
 	}
 	return errorIn(out.Err)

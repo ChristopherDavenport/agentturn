@@ -212,6 +212,11 @@ versions may break the API.
   composed under format 0.21. Both directions are additive on the
   wire: an older server ignores the member, and an older client sends
   none. RFC 0001 draft 0.7, The record. (#303)
+- Added: `front/control`'s `Client.Reply` sends the answerer on its
+  caller's context (`ContextWithAnswerer`) as an `answerer` member of
+  `POST /reply`, which the handler records as who answered under the
+  same `WithTriggerClaims` scope, so a person answering a question at
+  a terminal reads as `human` rather than `control`. (#303)
 
 ## v0.0.37 - 2026-11-04
 
