@@ -1713,16 +1713,19 @@ func (a *Agent) outside(ctx context.Context) bool {
 // the agent's first run, as agentturn/session's Requeue does. The host
 // then starts the run that takes it when nothing else will, with
 // [Agent.Continue], or leaves it for the resume while calls are
-// pending. A trigger whose Extra cannot be written is refused with
-// [ErrTriggerExtra], and nothing is queued.
+// pending. A run in flight reports them as [Queued] as [Agent.Steer]
+// says, without waiting for its next event. A trigger whose Extra
+// cannot be written is refused with [ErrTriggerExtra], and nothing is
+// queued.
 func (a *Agent) Redeliver(ctx context.Context, items ...openresponses.Item) error {
 	trigger := TriggerFromContext(ctx)
 	if err := trigger.Validate(); err != nil {
 		return err
 	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.queue(trigger, QueueSteer, InputDeliver, a.outside(ctx), items)
+	a.mu.Unlock()
+	a.reportQueued()
 	return nil
 }
 

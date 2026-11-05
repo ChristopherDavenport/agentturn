@@ -883,3 +883,87 @@ func TestAnAbortSettlesAnAcceptedDelivery(t *testing.T) {
 		t.Errorf("steering = %d, want the delivery left queued", st.Steering)
 	}
 }
+
+// TestARedeliveryIsReportedWhileAQuietToolRuns: a delivery a host hands
+// back with Redeliver while a run is in flight, a front/a2a steer of a
+// recorded working task, is reported as any accept is, without waiting
+// for the run's next event (#302).
+func TestARedeliveryIsReportedWhileAQuietToolRuns(t *testing.T) {
+	running, release := make(chan struct{}, 1), make(chan struct{})
+	a := New(Config{Model: &echo.Adapter{}, MaxTurns: 3, Tools: []agenttool.Tool{heldTool(running, release)}})
+	reported := make(chan *Queued, 4)
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if e, ok := ev.(*Queued); ok {
+			reported <- e
+		}
+		return nil
+	})
+	done := make(chan *RunEnd, 1)
+	go func() {
+		end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+		done <- end
+	}()
+	<-running
+	var released sync.Once
+	defer released.Do(func() { close(release) })
+	if err := a.Redeliver(context.Background(), openresponses.UserText("owed")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case e := <-reported:
+		if e.Input != InputDeliver {
+			t.Errorf("queued = %+v, want a delivery", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the redelivery's report waited for the tool to end")
+	}
+	released.Do(func() { close(release) })
+	if end := <-done; end == nil || end.Reason != ReasonDone {
+		t.Fatalf("end = %+v", end)
+	}
+}
+
+// TestAnUnwaitedAcceptStartsTheFollowOnRun: a delivery accepted while a
+// run is past its last drain, which nobody waits on, is still settled by
+// the agent: it starts the run that takes it once the run in flight
+// ends (RFC 0001, Queues).
+func TestAnUnwaitedAcceptStartsTheFollowOnRun(t *testing.T) {
+	ending, release := make(chan struct{}), make(chan struct{})
+	a := New(Config{Model: &echo.Adapter{}})
+	var ended atomic.Int32
+	runs := make(chan *RunEnd, 4)
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if e, ok := ev.(*RunEnd); ok {
+			if ended.Add(1) == 1 {
+				// Past the last drain: what is accepted now waits for
+				// the next run.
+				close(ending)
+				<-release
+			}
+			runs <- e
+		}
+		return nil
+	})
+	go func() { _, _ = a.Prompt(context.Background(), openresponses.UserText("go")) }()
+	<-ending
+	if _, err := a.Accept(context.Background(), openresponses.UserText("later")); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	for i := range 2 {
+		select {
+		case <-runs:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%d runs ended; the unwaited delivery started no run", i)
+		}
+	}
+	var texts []string
+	for _, item := range a.State().Transcript {
+		if m, ok := item.(*openresponses.Message); ok && m.Role == openresponses.RoleUser {
+			texts = append(texts, m.Text())
+		}
+	}
+	if want := []string{"go", "later"}; !slices.Equal(texts, want) {
+		t.Errorf("user messages = %q, want %q", texts, want)
+	}
+}

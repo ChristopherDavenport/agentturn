@@ -184,8 +184,8 @@ versions may break the API.
   `Accept`. RFC 0001 draft 0.7, Queues. (#302)
 - Changed: a run in flight reports a `Queued` event without waiting
   for its next event: at once, on a goroutine of its own, when no
-  event is being delivered as `Queue`, `Steer`, `FollowUp`, `Deliver`
-  or `Accept` accepts, and otherwise right after the event that is, so a steer accepted while a quiet tool
+  event is being delivered as `Queue`, `Steer`, `FollowUp`, `Deliver`,
+  `Accept` or `Redeliver` accepts, and otherwise right after the event that is, so a steer accepted while a quiet tool
   runs is reported while it runs. Only a subscriber's own accept made
   while such a report is delivered, with the context it was handed or
   by `Steer` or `FollowUp`, which carry none, waits for the next event;
