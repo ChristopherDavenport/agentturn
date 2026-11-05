@@ -1460,7 +1460,7 @@ flight SHOULD report an accepted item without waiting for its next
 phase (#302): a quiet tool raises no event, and a host showing what it
 accepted would otherwise show a steer typed during the tool only once
 the tool ends. The reference reports it at once when no event is being
-delivered, from a goroutine of its own so the accept still returns
+delivered, on its own thread of control so the accept still returns
 without running a subscriber, and otherwise right after the event that
 is. An item a subscriber accepts while such a report is being
 delivered waits for the run's next event, so a subscriber that queues
@@ -1474,7 +1474,8 @@ of the next run. A host that must not lose an input therefore writes
 it before queueing it rather than from the event, and a subscriber's
 error cannot refuse the item; an error on a report delivered between
 the run's events ends the run at its next event, as one on a report
-delivered ahead of that event does.
+delivered ahead of that event does, unless that event is the run's
+end, when nothing is left to end and the error is dropped.
 
 A run that stops after a turn, on its turn limit, a stop hook, a
 terminating result or a call that needs input, decides so before it
@@ -1506,7 +1507,11 @@ caller has gone away, until an abort. A delivery MUST NOT start a run
 once the run in flight when it was accepted was aborted before taking
 it: the abort stopped the agent, a person's interrupt among them, and
 a run the delivery started would undo it. The item stays queued for
-the host's next run, and the delivery reports the aborted run's end. A delivery refused before its
+the host's next run, and the delivery reports the aborted run's end.
+A delivery taken in one step, whose caller waits for the outcome, is
+settled by that wait instead: a caller that stops waiting starts
+nothing and leaves the item queued, for the run in flight to take or
+the host's next run. A delivery refused before its
 items are queued, while the agent is held idle, accepts nothing. A run in flight
 that drains it and then sends a request has taken it. A run that stops
 after its turn or ends without draining it leaves it queued, and,

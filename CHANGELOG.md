@@ -197,6 +197,10 @@ versions may break the API.
   `session`'s `RecordedControl` does, now also has the embedded
   `Accept`, which skips its write; such a wrapper overrides `Accept`
   too. (#302)
+- Fixed: `front/control`'s `POST /accept` and `GET /events` stream
+  behind a middleware whose response writer does not implement
+  `http.Flusher` but unwraps to one, as `http.ResponseController`
+  finds it, rather than answering 500. (#302)
 - Added: `front/control` carries `ErrHeld` across the wire as the code
   `held`. (#302)
 - Added: `front/control` carries the caller's trigger claim. `Client`

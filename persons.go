@@ -8,8 +8,10 @@ import (
 )
 
 // PersonMessages names the messages of a transcript a person wrote:
-// the user messages the loop appended from a prompt, a steer or a
-// follow-up that came in under a trigger of kind [TriggerHuman] and
+// the user messages the loop appended from a prompt, a steer, a
+// follow-up or a delivery ([Agent.Deliver], [Agent.Accept]), a person's
+// steer a view forwarded among them, that came in under a trigger of
+// kind [TriggerHuman] and
 // that the host did not compose, copy or hide. A message composed from
 // instruction layers, one marked [Copied] or [Hidden], and one whose
 // [Provenance] names a source of another kind are not the person's,
