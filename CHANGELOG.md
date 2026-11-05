@@ -170,6 +170,19 @@ versions may break the API.
   too. (#302)
 - Added: `front/control` carries `ErrHeld` across the wire as the code
   `held`. (#302)
+- Added: `front/control` carries the caller's trigger claim. `Client`
+  sends the trigger on its caller's context as a `trigger` member of
+  `POST /prompt`, `/queue`, `/deliver`, `/accept` and `/resume`, and
+  `WithTriggerClaims(scope)` lets a principal holding scope run its
+  input under the claim, its kind and ref defaulting to `control` and
+  the principal's name; a claim whose Extra cannot be written is
+  refused with `ErrTriggerExtra`. Without the option, or for any other
+  principal, input still runs under kind `control`, so a person at a
+  terminal whose host trusts their principal now records `human` for
+  what they type, where everything through the control front read as
+  composed under format 0.21. Both directions are additive on the
+  wire: an older server ignores the member, and an older client sends
+  none. RFC 0001 draft 0.7, The record. (#303)
 
 ## v0.0.37 - 2026-11-04
 

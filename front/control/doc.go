@@ -25,6 +25,13 @@
 // could label its own text an instruction layer or trusted would take
 // it out of the run's inputs or clear a label the host gave it.
 //
+// What a client may claim is who sent the input: the trigger on its
+// caller's context, kind "human" for what a person at a terminal typed.
+// The handler records the claim only for a principal its host lets
+// claim one ([WithTriggerClaims]); anyone else's input runs under kind
+// "control" naming the principal. The package authenticates nobody and
+// trusts no claim of its own accord: whom to trust is the host's.
+//
 // A run belongs to the agent, not to the request that started it: a
 // connection that drops does not abort it, since over a wire that is
 // not the person's intent, and only an abort does. A [Client] keeps the

@@ -554,6 +554,13 @@ func (r *recorder) Deliver(ctx context.Context, _ ...openresponses.Item) (bool, 
 	return true, nil, nil
 }
 
+func (r *recorder) Accept(ctx context.Context, _ ...openresponses.Item) (*agentturn.Delivery, error) {
+	r.noteCtx(ctx, "Accept")
+	d, settle := agentturn.NewDelivery()
+	settle(true, nil, nil)
+	return d, nil
+}
+
 func (r *recorder) Abort() { r.note("Abort") }
 
 func (r *recorder) State() agentturn.State {
@@ -1093,4 +1100,99 @@ func TestChallenge(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTheCallersClaimIsTheHostsToTrust pins the control front's caller
+// claim (the part A review's M3 of #303): a client sends the trigger
+// its caller's context holds, so a person at a terminal sends kind
+// "human", and the handler runs the input under it only for a
+// principal the host lets claim one (WithTriggerClaims); anyone else's
+// input runs under kind "control" naming the principal, the claim
+// unrecorded. A claim that names no ref names the principal.
+func TestTheCallersClaimIsTheHostsToTrust(t *testing.T) {
+	const claim Scope = "claim"
+	tokens := map[string]Principal{
+		"person": {Name: "chris", Scopes: append(slices.Clone(AllScopes), claim)},
+		"driver": {Name: "driver", Scopes: AllScopes},
+	}
+	calls := []struct {
+		name string
+		do   func(context.Context, *Client) error
+	}{
+		{"Prompt", func(ctx context.Context, c *Client) error {
+			_, err := c.Prompt(ctx, openresponses.UserText("hi"))
+			return err
+		}},
+		{"Queue", func(ctx context.Context, c *Client) error {
+			return c.Queue(ctx, agentturn.QueueSteer, openresponses.UserText("hi"))
+		}},
+		{"Deliver", func(ctx context.Context, c *Client) error {
+			_, _, err := c.Deliver(ctx, openresponses.UserText("hi"))
+			return err
+		}},
+		{"Accept", func(ctx context.Context, c *Client) error {
+			d, err := c.Accept(ctx, openresponses.UserText("hi"))
+			if err != nil {
+				return err
+			}
+			_, _, err = d.Wait(ctx)
+			return err
+		}},
+		{"Resume", func(ctx context.Context, c *Client) error {
+			_, err := c.Resume(ctx, agentturn.Approve("c"))
+			return err
+		}},
+	}
+	for _, tc := range []struct {
+		name  string
+		token string
+		claim agentturn.Trigger
+		want  agentturn.Trigger
+	}{
+		{"a person's claim, trusted", "person", agentturn.Trigger{Kind: agentturn.TriggerHuman}, agentturn.Trigger{Kind: agentturn.TriggerHuman, Ref: "chris"}},
+		{"a claim with its own ref, trusted", "person", agentturn.Trigger{Kind: agentturn.TriggerHuman, Ref: "chris@tty1", Source: "console"}, agentturn.Trigger{Kind: agentturn.TriggerHuman, Ref: "chris@tty1", Source: "console"}},
+		{"no claim", "person", agentturn.Trigger{}, agentturn.Trigger{Kind: "control", Ref: "chris"}},
+		{"an untrusted claim", "driver", agentturn.Trigger{Kind: agentturn.TriggerHuman}, agentturn.Trigger{Kind: "control", Ref: "driver"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &recorder{}
+			srv := httptest.NewServer(Handler(r, WithAuthenticator(tokenAuth(tokens)), WithTriggerClaims(claim)))
+			defer srv.Close()
+			c, err := Dial(t.Context(), srv.URL, withToken(tc.token))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := t.Context()
+			if !tc.claim.IsZero() {
+				ctx = agentturn.ContextWithTrigger(ctx, tc.claim)
+			}
+			for _, call := range calls {
+				if err := call.do(ctx, c); err != nil {
+					t.Fatalf("%s: %v", call.name, err)
+				}
+				r.mu.Lock()
+				got := agentturn.TriggerFromContext(r.ctx)
+				r.mu.Unlock()
+				if got.Kind != tc.want.Kind || got.Ref != tc.want.Ref || got.Source != tc.want.Source {
+					t.Errorf("%s ran under %+v, want %+v", call.name, got, tc.want)
+				}
+			}
+		})
+	}
+	t.Run("a trusted claim the format cannot write", func(t *testing.T) {
+		r := &recorder{}
+		srv := httptest.NewServer(Handler(r, WithAuthenticator(tokenAuth(tokens)), WithTriggerClaims(claim)))
+		defer srv.Close()
+		c, err := Dial(t.Context(), srv.URL, withToken("person"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := agentturn.ContextWithTrigger(t.Context(), agentturn.Trigger{Kind: agentturn.TriggerHuman, Extra: map[string]any{"kind": "x"}})
+		if _, err := c.Prompt(ctx, openresponses.UserText("hi")); !errors.Is(err, agentturn.ErrTriggerExtra) {
+			t.Errorf("err = %v, want ErrTriggerExtra", err)
+		}
+		if seen := r.seen(); slices.Contains(seen, "Prompt") {
+			t.Errorf("the agent was prompted: %v", seen)
+		}
+	})
 }

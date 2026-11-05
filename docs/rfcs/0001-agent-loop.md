@@ -2120,7 +2120,15 @@ entry held. agentsession RFC 0001 0.21 defines one trigger kind,
 it is the person's words. A host MUST start a run, or queue an input,
 under a trigger of kind `human` only for what the person typed, and
 MUST name its own kind, as the provenance's source, for a message it
-composed. A recorder MUST NOT write the kind `human` on the `source`
+composed. A front that takes input from a remote party, to prompt,
+queue, deliver or resume, carries the trigger that party claims for
+it, so a person at a client claims `human` for what they typed, and
+MUST run the input under the claim only when the host has authorised
+that principal to claim one, as for a decider (Pending calls);
+otherwise it runs the input under the front's own kind naming the
+principal, `control` for a control front, and an unchecked claim is
+never recorded. The front authenticates nobody and trusts no claim of
+its own accord: whom to trust is the host's to decide. A recorder MUST NOT write the kind `human` on the `source`
 of an item, or the `trigger` of its `queued` entry, when the item names
 instruction layers, is copied or is hidden. The last is agentturn's
 own rule, not the format's: agentsession RFC 0001 0.21's `visible:
@@ -2218,6 +2226,7 @@ maps onto it as follows:
 | retry policy | `Config.Retry{MaxAttempts, Backoff, Retryable, Revise}`; `DefaultBackoff`, `DefaultRetryable` |
 | low-level loop | `Run(ctx, t, prompts, cfg)`, `Continue(ctx, t, cfg)` → `iter.Seq[Event]`; `EventBuffer`; `CanContinue` |
 | delivery a control offers | `Deliverer`, which `*Agent` and `front/control`'s `Client` implement; `front/control` serves it as `POST /deliver`, `ErrNoDelivery` when the control offers none; in two steps, `Accepter` (`Accept` → `*Delivery`, whose `Wait` and `Done` give the outcome; `NewDelivery` for another implementation), which `*Agent`, `front/control`'s `Client` and `session`'s `RecordedControl` implement, served as `POST /accept`: the accept, then the outcome, on one response |
+| a remote caller's trigger | `front/control`'s `Client` sends the trigger on its caller's context (`ContextWithTrigger`) as a `trigger` member of `POST /prompt`, `/queue`, `/deliver`, `/accept` and `/resume`; the `Handler` runs the input under it for a principal holding the scope `WithTriggerClaims` names, its kind and ref defaulting to `control` and the principal's name, and otherwise under `control` naming the principal |
 | agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`, `WithPending`, `SetPending`, `WithReservedCallIDs`, `ReserveCallIDs`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Deliver`, `Accept`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `WhileIdle`, `State`, `SetConfig`, `SetTranscript`, `SetReasoningModels`, `Config` |
 | refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning` (`ErrHeld` for a delivery during a hold, `State.Held`), `ErrTerminated` (a delivery after a terminating stop), `ErrAmbiguousCall`, `ErrCallAnswered`, `ErrTriggerExtra` (`Trigger.Validate`) |
 | run ID, turn, trigger, transcript on the context | `ContextWithRunID`/`RunIDFromContext`, `ContextWithTurn`/`TurnFromContext`, `ContextWithTrigger`/`TriggerFromContext`, `ContextWithTranscript`/`TranscriptFromContext`, `ContextWithReservedCallIDs` |
@@ -2541,6 +2550,11 @@ it.
   report an accepted item without waiting for its next phase, and a
   subscriber's error on such a report ends the run at its next event
   (#302).
+- **The record.** A front that takes remote input carries the trigger
+  the party claims, `human` for what a person at a client typed, and
+  runs the input under it only for a principal the host has authorised
+  to claim one, otherwise under its own kind; the control front's
+  `control` stays the default (#303).
 
 ## Changes in draft 0.6
 
