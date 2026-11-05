@@ -63,8 +63,10 @@ versions may break the API.
   also sets. `Instructions` is set only beside it. (#306)
 - Added: `session.Recorder` writes a requested fold's `compaction` with
   agentsession RFC 0001 0.21's `requested` and `instructions`; a fold
-  the budget or an overflow's retry forced carries neither. RFC 0001
-  draft 0.7. (#306)
+  the budget or an overflow's retry forced carries neither. A requested
+  fold that fails says so too: `session.FailedFold` gains `Requested`
+  and `Instructions`, written in the same members. RFC 0001 draft 0.7.
+  (#306)
 - Fixed: `DefaultRetryable` judges an openresponses error by its code
   before its status, and an `insufficient_quota` error is final
   whatever its status: OpenAI sends it as a 429, which was retried

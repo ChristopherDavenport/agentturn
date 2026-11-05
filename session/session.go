@@ -498,6 +498,12 @@ type FailedFold struct {
 	// items, as the transform was given them.
 	Split      int    `json:"split,omitempty"`
 	PrefixHash string `json:"prefix_hash,omitempty"`
+	// Requested and Instructions are the fold's compact.Fold.Requested
+	// and Instructions, in the members a compaction entry has them
+	// (format 0.21): a fold a host or a person asked for that failed
+	// still says it was asked for, and with what instructions (#306).
+	Requested    bool   `json:"requested,omitempty"`
+	Instructions string `json:"instructions,omitempty"`
 	FoldCall
 	Usage       *openresponses.Usage `json:"usage,omitempty"`
 	OutputTypes []string             `json:"output_types,omitempty"`
@@ -7160,6 +7166,9 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 		// hash rather than not at all.
 		call, _ := foldCall(f)
 		data := FailedFold{Error: f.Err.Error(), TokensBefore: f.TokensBefore, Attempts: f.Attempts, FoldCall: call, Usage: f.Usage, OutputTypes: f.OutputTypes}
+		if f.Requested {
+			data.Requested, data.Instructions = true, f.Instructions
+		}
 		if f.PrefixHash != "" {
 			data.Split, data.PrefixHash = f.Split, f.PrefixHash
 		}

@@ -706,3 +706,48 @@ func TestAFoldIsRecordedRequestedOnlyWhenAskedFor(t *testing.T) {
 	}
 	verifyAll(t, s)
 }
+
+// TestAFailedRequestedFoldSaysItWasAskedFor pins that a fold someone
+// asked for with Transform.FoldNext that then fails is recorded as
+// asked for: its failed-fold entry carries requested and the
+// instructions given for it, as the compaction would have (#306); a
+// forced fold that fails carries neither (TestFoldWithNoTextBacksOff).
+func TestAFailedRequestedFoldSaysItWasAskedFor(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := compact.NewLocal(&reasoningFold{}, compact.WithBudget(100), compact.WithKeepLast(1), compact.WithMinFold(0), compact.WithEstimator(countItems), compact.WithOnFold(rec.Fold))
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform})
+	defer rec.Attach(a)()
+	for _, text := range []string{"one", "two"} {
+		if _, err := a.Prompt(ctx, openresponses.UserText(text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tr.FoldNext("Keep every file name.")
+	if _, err := a.Prompt(ctx, openresponses.UserText("three")); err != nil {
+		t.Fatal(err)
+	}
+	// Read as the record holds it, in the members the format's
+	// compaction names.
+	type asked struct {
+		Requested    bool   `json:"requested"`
+		Instructions string `json:"instructions"`
+	}
+	var failed []asked
+	for _, e := range s.Entries() {
+		if c, ok := e.(*agentsession.CustomEntry); ok && c.NS == FailedFoldNS {
+			var data asked
+			if err := json.Unmarshal(c.Data, &data); err != nil {
+				t.Fatal(err)
+			}
+			failed = append(failed, data)
+		}
+	}
+	if len(failed) != 1 || !failed[0].Requested || failed[0].Instructions != "Keep every file name." {
+		t.Errorf("failed folds = %+v, want one requested with its instructions", failed)
+	}
+}
