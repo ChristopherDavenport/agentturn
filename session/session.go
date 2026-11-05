@@ -2665,9 +2665,13 @@ func TranscriptModels(s *agentsession.Session, opts ...ReadOption) (openresponse
 // has the kind human, composed from no instruction layers and
 // forwarded from no link. One a fold pinned, which the context holds
 // from its compaction entry, is the person's when the path before it
-// holds that message, as written, as the person's. A record whose
-// writer stamped human on what it composed, as one before format 0.21
-// may have, is read as written.
+// holds that message, as written, as the person's. The compaction entry
+// holds its pinned items by value and names no entry for them, so that
+// match is by content: a pinned item byte-identical to a message the
+// person wrote earlier on the path, an item [compact.WithPin] kept or
+// a short "yes" a host composed the same as the person's, reads as
+// the person's too. A record whose writer stamped human on what it
+// composed, as one before format 0.21 may have, is read as written.
 func TranscriptMarks(s *agentsession.Session, opts ...ReadOption) (openresponses.Items, agentturn.ReasoningModels, agentturn.PersonMessages, error) {
 	cx, err := s.Context()
 	if err != nil {

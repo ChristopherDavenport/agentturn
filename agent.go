@@ -1541,6 +1541,12 @@ func (a *Agent) flushReplay(id int, fn func(context.Context, Event) error) {
 // monitor or another goroutine, or from a subscriber only on events it
 // can tell apart from its own items, such as a tool_end or a specific
 // item type it never steers.
+//
+// Steer queues under no trigger, so its items name none, a recorder
+// writes none for them, and none of them is the person's own message
+// ([PersonMessages]) that a fold keeps, whatever the run's trigger. A
+// steer a person typed goes through [Agent.Queue] under a context with
+// a trigger of kind [TriggerHuman].
 func (a *Agent) Steer(items ...openresponses.Item) {
 	// No trigger, so nothing to refuse.
 	_ = a.Queue(context.Background(), QueueSteer, items...)
@@ -1549,7 +1555,9 @@ func (a *Agent) Steer(items ...openresponses.Item) {
 // FollowUp queues items to be injected when the run would otherwise
 // end, so the agent keeps going instead of going idle. The queue has
 // the same life, the same [Queued] event and the same caveat about
-// subscribers as [Agent.Steer].
+// subscribers as [Agent.Steer], and like it queues under no trigger: a
+// follow-up a person typed goes through [Agent.Queue] under a trigger
+// of kind [TriggerHuman] to count as theirs.
 func (a *Agent) FollowUp(items ...openresponses.Item) {
 	_ = a.Queue(context.Background(), QueueFollowUp, items...)
 }
