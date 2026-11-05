@@ -142,6 +142,17 @@ func (t Trigger) IsZero() bool {
 	return t.Kind == "" && t.Ref == "" && t.Source == "" && len(t.Extra) == 0
 }
 
+// TriggerHuman is the kind of a [Trigger] saying a person sent the
+// input: agentsession RFC 0001 0.21's one defined kind, under which a
+// user message is read as the person's words. A host starts a run or
+// queues an input under it for what the person typed, and never for a
+// message it composed, which carries a kind of the host's own. The loop
+// reads nothing from it; a session recorder does not write it as the
+// source of an item the host marked as composed from instruction
+// layers, or copied, and [WithProvenance] refuses it as the source of a
+// message composed from layers (#303).
+const TriggerHuman = "human"
+
 // TriggerCallee is the kind of a [Trigger] naming the call whose
 // callee's late result an input carries: a detached call's, whose
 // output said the callee was working, its answer delivered turns

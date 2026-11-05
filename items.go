@@ -119,7 +119,11 @@ type Provenance struct {
 	// trigger the item is handed in under, for this item alone: the
 	// item's queued report carries it as its trigger, and a recorder
 	// writes it as the item's source, where the run's trigger would be.
-	// Zero leaves the item the trigger it is handed in under.
+	// Zero leaves the item the trigger it is handed in under, though a
+	// session recorder does not write one of kind [TriggerHuman] as the
+	// source of a message composed from Layers: what the host composed
+	// is not the person's words (#303). A host that composed the
+	// message names its own kind here.
 	Source Trigger
 	// Trust is what the host knows of the content's trust; nil says
 	// nothing. On an item also marked [Copied] a session recorder
@@ -166,8 +170,10 @@ var ErrProvenance = errors.New("agentturn: provenance cannot be recorded")
 //
 // It refuses, with [ErrProvenance], layers on an item that is not a
 // message, a layer with no source, an instruction file's with no ID, a
-// layer named twice, an empty or repeated trust label, and a source
-// [Trigger.Validate] refuses. A provenance that says nothing returns
+// layer named twice, an empty or repeated trust label, a source
+// [Trigger.Validate] refuses, and a source of kind [TriggerHuman]
+// beside layers, since a message composed from layers is not the
+// person's words. A provenance that says nothing returns
 // item as it is, and a nil item nil.
 func WithProvenance(item openresponses.Item, p Provenance) (openresponses.Item, error) {
 	if item == nil {
@@ -203,6 +209,9 @@ func (p Provenance) validate(item openresponses.Item) error {
 		if _, ok := item.(*openresponses.Message); !ok {
 			return fmt.Errorf("%w: a %s item names instruction layers; only a message may", ErrProvenance, item.ItemType())
 		}
+	}
+	if len(p.Layers) > 0 && p.Source.Kind == TriggerHuman {
+		return fmt.Errorf("%w: a message composed from instruction layers names a source of kind %q, which says a person wrote it", ErrProvenance, TriggerHuman)
 	}
 	for i, l := range p.Layers {
 		switch {

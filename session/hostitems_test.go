@@ -324,3 +324,90 @@ func TestQueuedMarksReadBothForms(t *testing.T) {
 		}
 	}
 }
+
+// TestComposedInputIsNeverRecordedAsThePersons pins #303 under
+// agentsession RFC 0001 0.21's rule for the trigger kind human: a
+// message the host composed from instruction layers, prompted or
+// queued under a run's or a context's trigger of kind human, is not
+// recorded with that trigger as its source or its queued entry's
+// trigger, so the record reads it as composed and never carries human
+// beside instructions_part. What the person typed keeps the kind, a
+// pasted message the host labels untrusted included, and the drained
+// item still carries its queued entry's trigger.
+func TestComposedInputIsNeverRecordedAsThePersons(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{Records: agentsession.AllRecords})
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := func(text string) openresponses.Item {
+		item, err := agentturn.WithProvenance(openresponses.UserText(text), agentturn.Provenance{
+			Layers: []agentturn.Layer{{ID: "review.md", Source: "dax.prompts"}},
+			Trust:  &agentturn.Trust{},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return item
+	}
+	pasted, err := agentturn.WithProvenance(openresponses.UserText("pasted"), agentturn.Provenance{Trust: &agentturn.Trust{Reads: []agenttool.Label{agenttool.LabelUntrusted}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"})
+	defer rec.Attach(a)()
+	human := agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: agentturn.TriggerHuman, Source: "terminal"})
+	if _, err := a.Prompt(human, openresponses.UserText("typed"), pasted, template("prompted template")); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Queue(human, a, agentturn.QueueSteer, template("queued template")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Queue(human, agentturn.QueueSteer, template("event template")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Continue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	read, err := store.Open(ctx, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyAll(t, read)
+	if err := read.VerifyRecords(read.Leaf()); err != nil {
+		t.Errorf("verify records: %v", err)
+	}
+	items := itemEntries(read)
+	for text, want := range map[string]agentsession.Words{
+		"typed":             agentsession.WordsPerson,
+		"pasted":            agentsession.WordsPerson,
+		"prompted template": agentsession.WordsComposed,
+		"queued template":   agentsession.WordsComposed,
+		"event template":    agentsession.WordsComposed,
+	} {
+		it := items[text]
+		if it == nil {
+			t.Errorf("%q not recorded", text)
+			continue
+		}
+		if got := agentsession.WordsOf(it); got != want {
+			t.Errorf("%q reads as %v, want %v", text, got, want)
+		}
+	}
+	for _, e := range read.Entries() {
+		var trigger *agentsession.Trigger
+		var layers []agentsession.LayerRef
+		switch v := e.(type) {
+		case *agentsession.ItemEntry:
+			trigger, layers = v.Source, v.Layers()
+		case *agentsession.QueuedEntry:
+			trigger, layers = v.Trigger, v.Layers()
+		default:
+			continue
+		}
+		if layers != nil && trigger != nil && trigger.Kind == agentsession.TriggerHuman {
+			t.Errorf("%s %s carries human beside instructions_part", e.EntryType(), e.Base().ID)
+		}
+	}
+}

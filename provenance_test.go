@@ -113,8 +113,9 @@ func TestProvenanceRidesOnTheItemEvents(t *testing.T) {
 // TestWithProvenanceRefusesWhatTheFormatCannotHold pins the checks
 // made where the provenance is attached: a layer only on a message,
 // each with a source, an instruction file's with its id, none named
-// twice; trust labels without repeats; and a source the trigger rules
-// allow.
+// twice; trust labels without repeats; a source the trigger rules
+// allow; and no source of kind human beside layers, since a message
+// composed from layers is not the person's words (#303).
 func TestWithProvenanceRefusesWhatTheFormatCannotHold(t *testing.T) {
 	msg := openresponses.UserText("x")
 	for _, tc := range []struct {
@@ -133,6 +134,8 @@ func TestWithProvenanceRefusesWhatTheFormatCannotHold(t *testing.T) {
 		{name: "a repeated label", item: msg, p: Provenance{Trust: &Trust{Reads: []agenttool.Label{"private", "private"}}}},
 		{name: "an empty label", item: msg, p: Provenance{Trust: &Trust{Reads: []agenttool.Label{""}}}},
 		{name: "a bad source", item: msg, p: Provenance{Source: Trigger{Kind: "k", Extra: map[string]any{"kind": "x"}}}},
+		{name: "a person's source alone", item: msg, p: Provenance{Source: Trigger{Kind: TriggerHuman, Ref: "slack:U1"}, Trust: &Trust{Reads: []agenttool.Label{agenttool.LabelUntrusted}}}, ok: true},
+		{name: "a person's source beside layers", item: msg, p: Provenance{Source: Trigger{Kind: TriggerHuman}, Layers: []Layer{{Source: "dax.prompts", ID: "review.md"}}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := WithProvenance(tc.item, tc.p)

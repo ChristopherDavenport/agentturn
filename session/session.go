@@ -1467,7 +1467,7 @@ func (h *heldReport) inbox() *inboxItem {
 	if h.q.Mode == agentturn.QueueSteer {
 		mode = agentsession.ModeSteer
 	}
-	trigger, _ := sessionTrigger(h.q.Trigger)
+	trigger, _ := queuedTrigger(h.q)
 	return &inboxItem{item: h.q.Item, mode: mode, trigger: trigger, deliver: h.q.Input == agentturn.InputDeliver, entry: h.entry, held: true, hidden: h.q.Hidden, prov: h.q.Provenance}
 }
 
@@ -5166,6 +5166,7 @@ func (w *writer) handle(ctx context.Context, ev agentturn.Event) error {
 		if err != nil {
 			return err
 		}
+		source = inputTrigger(source, e.Provenance, e.Copied)
 		if w.inFlight && e.ResponseID == "" && !e.Hidden && !e.Copied && e.Provenance == nil && source == nil {
 			// The loop appends nothing of its own while a model call
 			// is in flight, so this is the model's, from a stream that
@@ -5218,7 +5219,7 @@ func (w *writer) queued(ctx context.Context, e *agentturn.Queued) error {
 	if e.Mode == agentturn.QueueSteer {
 		mode = agentsession.ModeSteer
 	}
-	trigger, err := sessionTrigger(e.Trigger)
+	trigger, err := queuedTrigger(e)
 	if err != nil {
 		return err
 	}
@@ -6116,12 +6117,48 @@ func recordProvenance(e *agentsession.ItemEntry, prov *agentturn.Provenance) err
 
 // itemTrigger is the trigger item is queued under: the source of its
 // provenance when that names one, which stands over the call's, and
-// trigger otherwise.
+// trigger otherwise, though never one of kind human for a message
+// composed from layers ([inputTrigger]).
 func itemTrigger(item openresponses.Item, trigger *agentsession.Trigger) (*agentsession.Trigger, error) {
-	if p, ok := agentturn.ProvenanceOf(item); ok && !p.Source.IsZero() {
+	p, ok := agentturn.ProvenanceOf(item)
+	if ok && !p.Source.IsZero() {
 		return sessionTrigger(p.Source)
 	}
-	return trigger.Clone(), nil
+	var prov *agentturn.Provenance
+	if ok {
+		prov = &p
+	}
+	return inputTrigger(trigger.Clone(), prov, false), nil
+}
+
+// inputTrigger is t as the source of an input item, or the trigger of
+// its queued entry: t, except that one of kind human is not written for
+// an item the host composed from instruction layers, or copied from
+// another conversation, which agentsession RFC 0001 0.21 reads as
+// composed and a writer never marks human (#303). Such an item handed
+// in under the person's trigger, a template a slash command expands or
+// a reminder the host prompts beside what was typed, gets no trigger:
+// its instructions_part or copied_from says it is not the person's
+// words. A host names its own kind for it with the provenance's Source.
+func inputTrigger(t *agentsession.Trigger, prov *agentturn.Provenance, copied bool) *agentsession.Trigger {
+	if t == nil || t.Kind != agentsession.TriggerHuman {
+		return t
+	}
+	if copied || (prov != nil && len(prov.Layers) > 0) {
+		return nil
+	}
+	return t
+}
+
+// queuedTrigger is the trigger the queued entry of the input a queued
+// report names is written with: the report's, which is the item's
+// provenance source when it names one, as [inputTrigger] takes it.
+func queuedTrigger(q *agentturn.Queued) (*agentsession.Trigger, error) {
+	t, err := sessionTrigger(q.Trigger)
+	if err != nil {
+		return nil, err
+	}
+	return inputTrigger(t, q.Provenance, false), nil
 }
 
 // copySource is where a copied item was taken from: the entry's

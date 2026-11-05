@@ -28,6 +28,22 @@ versions may break the API.
   more labels than its source, where v0.0.37 refused the item and
   ended the run with its error. An empty provenance trust adds none.
   RFC 0001 draft 0.7. (agentsession#279)
+- Added: `TriggerHuman`, agentsession RFC 0001 0.21's trigger kind for
+  input a person sent. A host starts a run or queues an input under it
+  only for what the person typed. (#303)
+- Changed (breaking): `WithProvenance` refuses, with `ErrProvenance`, a
+  source of kind `human` beside instruction layers: a message composed
+  from layers is not the person's words. (#303)
+- Fixed: `session.Recorder` wrote the run's trigger as the `source` of
+  every item a run was prompted with, and a queue's context trigger as
+  the `trigger` of every queued entry, so a template or a reminder the
+  host composed from instruction layers and prompted beside what the
+  person typed was recorded under kind `human` beside its
+  `instructions_part`, a pair format 0.21 forbids a writer to compose.
+  A trigger of kind `human` is no longer written for an item that names
+  instruction layers or is copied; such an item carries no source. An
+  owed input recorded so by v0.0.37 is queued again as recorded. RFC
+  0001 draft 0.7. (#303)
 
 ## v0.0.37 - 2026-11-04
 
