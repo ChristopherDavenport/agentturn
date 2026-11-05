@@ -2032,11 +2032,13 @@ under a trigger of kind `human` only for what the person typed, and
 MUST name its own kind, as the provenance's source, for a message it
 composed. A recorder MUST NOT write the kind `human` on the `source`
 of an item, or the `trigger` of its `queued` entry, when the item names
-instruction layers, is copied or is hidden, since a message kept out of
-the person's view is not what they typed but one the host prompts
-with, as agentsession RFC 0001 counts a hidden reminder composed: the
-run's or the context's trigger is written for that item without its
-`kind`, and keeps its `ref`, its `source` and its other members, since
+instruction layers, is copied or is hidden. The last is agentturn's
+own rule, not the format's: agentsession RFC 0001 0.21's `visible:
+false` only tells a renderer to hide an item, and its composed markers
+are `instructions_part` and `from_link` alone, but agentturn treats a
+hidden message as one the host prompts with, since a message kept out
+of the person's view is not what they typed. For such an item the
+run's or the context's trigger is written without its `kind`, and keeps its `ref`, its `source` and its other members, since
 a steer's `queued` entry is the only place its arrival is written; a
 trigger left with no member is not written (#303). agentsession RFC
 0001 reads a user message's words from its own trigger and two

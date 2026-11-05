@@ -40,8 +40,10 @@ func (h markedItem) MarshalJSON() ([]byte, error) { return json.Marshal(h.item) 
 // transcript holds it and a request carries it; only its item events
 // say it is hidden, and a session recorder writes its entry with
 // visible false, which is the format's word for exactly this. A hidden
-// message is not what the person typed, which they see: a session
-// recorder writes it without the trigger kind [TriggerHuman] (#303).
+// message is not what the person typed, which they see, so agentturn
+// treats it as one the host prompts with: a session recorder writes it
+// without the trigger kind [TriggerHuman] (#303). That is agentturn's
+// rule; the format's visible false only says to hide the item.
 //
 // Use it wherever the loop appends an item the caller supplied:
 // [Agent.Prompt], [Agent.Steer], [Agent.FollowUp], the prompts of [Run]
