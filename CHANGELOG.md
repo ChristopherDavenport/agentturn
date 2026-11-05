@@ -44,6 +44,14 @@ versions may break the API.
   instruction layers or is copied; such an item carries no source. An
   owed input recorded so by v0.0.37 is queued again as recorded. RFC
   0001 draft 0.7. (#303)
+- Added: `compact.Fold.Requested`, set only for a fold
+  `Transform.FoldNext` asked for, apart from `Forced`, which a fold the
+  loop asks for to retry a request the provider refused as too long
+  also sets. `Instructions` is set only beside it. (#306)
+- Added: `session.Recorder` writes a requested fold's `compaction` with
+  agentsession RFC 0001 0.21's `requested` and `instructions`; a fold
+  the budget or an overflow's retry forced carries neither. RFC 0001
+  draft 0.7. (#306)
 
 ## v0.0.37 - 2026-11-04
 

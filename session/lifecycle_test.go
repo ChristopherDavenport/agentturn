@@ -629,3 +629,80 @@ func TestUnhashedSaysWhyOnce(t *testing.T) {
 		})
 	}
 }
+
+// overflowModel refuses, as a provider does, every request whose input
+// holds more than limit items as longer than the context window, and
+// echoes the rest.
+type overflowModel struct{ limit int }
+
+func (m *overflowModel) CreateStream(ctx context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	if len(req.Input) > m.limit {
+		return openresponses.ContextLengthExceeded("prompt is too long")
+	}
+	return (&echo.Adapter{}).CreateStream(ctx, req, sink)
+}
+
+// TestAFoldIsRecordedRequestedOnlyWhenAskedFor pins #306 with
+// agentsession#277: the fold FoldNext asked for is recorded with
+// requested and its instructions; the fold the loop forces to retry a
+// request the provider refused as too long carries neither, so it does
+// not read as one the person asked for.
+func TestAFoldIsRecordedRequestedOnlyWhenAskedFor(t *testing.T) {
+	compactions := func(s *agentsession.Session) []*agentsession.CompactionEntry {
+		var out []*agentsession.CompactionEntry
+		for _, e := range s.Entries() {
+			if c, ok := e.(*agentsession.CompactionEntry); ok {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+	ctx := context.Background()
+
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := compact.NewLocal(&echo.Adapter{}, compact.WithBudget(100), compact.WithKeepLast(1), compact.WithMinFold(0), compact.WithEstimator(countItems), compact.WithOnFold(rec.Fold))
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform})
+	unsub := rec.Attach(a)
+	for _, text := range []string{"one", "two"} {
+		if _, err := a.Prompt(ctx, openresponses.UserText(text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tr.FoldNext("Keep every file name.")
+	if _, err := a.Prompt(ctx, openresponses.UserText("three")); err != nil {
+		t.Fatal(err)
+	}
+	unsub()
+	asked := compactions(s)
+	if len(asked) != 1 || !asked[0].Requested || asked[0].Instructions != "Keep every file name." {
+		t.Errorf("asked-for fold = %+v, want requested with its instructions", asked)
+	}
+
+	store = agentsession.NewMemoryStore()
+	rec, s, err = Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr = compact.NewLocal(&echo.Adapter{}, compact.WithBudget(100), compact.WithKeepLast(1), compact.WithMinFold(0), compact.WithEstimator(countItems), compact.WithOnFold(rec.Fold))
+	a = agentturn.New(agentturn.Config{Model: &overflowModel{limit: 4}, ModelName: "m", Transform: tr.Transform})
+	defer rec.Attach(a)()
+	for _, text := range []string{"one", "two", "three"} {
+		if _, err := a.Prompt(ctx, openresponses.UserText(text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	forced := compactions(s)
+	if len(forced) == 0 {
+		t.Fatal("the overflow folded nothing")
+	}
+	for _, c := range forced {
+		if c.Requested || c.Instructions != "" {
+			t.Errorf("overflow fold = requested %v instructions %q, want neither", c.Requested, c.Instructions)
+		}
+	}
+	verifyAll(t, s)
+}

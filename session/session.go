@@ -7126,6 +7126,13 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 		Config:       w.settings,
 		TokensBefore: f.TokensBefore,
 		Usage:        f.Usage,
+		// A fold a host or a person asked for, with what it asked
+		// the summariser to follow; never one the budget or an
+		// overflow's retry forced (#306, agentsession#277).
+		Requested: f.Requested,
+	}
+	if f.Requested {
+		entry.Instructions = f.Instructions
 	}
 	if f.Request != nil || f.ResponseID != "" {
 		call, err := foldCall(f)

@@ -290,9 +290,16 @@ type Fold struct {
 	Request *openresponses.Request
 	// Forced says the fold was asked for, by [Transform.FoldNext] or by
 	// the loop after the server refused a request as too long, rather
-	// than made because the estimate passed the budget. Instructions are
-	// the ones FoldNext gave for it, "" for none.
-	Forced       bool
+	// than made because the estimate passed the budget.
+	Forced bool
+	// Requested says a host or a person asked for the fold, through
+	// [Transform.FoldNext]: it is false for a fold the budget or the
+	// loop's retry after a context-length refusal forced. A recorder
+	// writes agentsession RFC 0001's requested from it, never from
+	// Forced, so an overflow's fold does not read as one the person
+	// asked for. Instructions are the ones FoldNext gave for it, "" for
+	// none, and only ever set beside Requested.
+	Requested    bool
 	Instructions string
 	// PrefixHash is the [PrefixHash] of the transcript's first Split
 	// items when the fold failed and the transform backs off from that
@@ -822,7 +829,10 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	}
 	quarantined := agentturn.QuarantineFromContext(ctx)
 	t.mu.Lock()
-	forced, instructions := t.next || agentturn.FoldRequested(ctx), t.nextInstructions
+	// A fold FoldNext asked for is requested; one only the loop's
+	// retry after an overflow asked for is forced and not requested.
+	requested, instructions := t.next, t.nextInstructions
+	forced := requested || agentturn.FoldRequested(ctx)
 	t.next, t.nextInstructions = false, ""
 	view, base := t.view(items, quarantined)
 	tokens := t.estimate(view) + settings
@@ -853,7 +863,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	// serialise on the network.
 	f, err := t.fold(ctx, input, instructions)
 	if err != nil {
-		failed := Fold{Split: split, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Forced: forced, Instructions: instructions, Err: err}
+		failed := Fold{Split: split, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Forced: forced, Requested: requested, Instructions: instructions, Err: err}
 		if unfolded(err) {
 			failed.PrefixHash = PrefixHash(items[:split])
 		}
@@ -898,7 +908,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	t.mu.Unlock()
 	// The fold's own output and the pinned items, as locals: the memory
 	// they were written to belongs to the lock that was just released.
-	if err := t.report(ctx, Fold{Split: split, First: first, Output: f.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Forced: forced, Instructions: instructions}); err != nil {
+	if err := t.report(ctx, Fold{Split: split, First: first, Output: f.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Forced: forced, Requested: requested, Instructions: instructions}); err != nil {
 		return nil, err
 	}
 	return out, nil
