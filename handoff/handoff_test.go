@@ -536,3 +536,58 @@ func TestADeliveryAfterATerminatingEndIsTaken(t *testing.T) {
 		}
 	})
 }
+
+// TestTheHostsOfferCoversTheTransfers is #307: a team's Offer sees each
+// agent's whole list, its own tools and the transfers, on every
+// request, so a filter that removes transfer_to_refund_agent leaves it
+// out of the request, a wrapper wraps it, and the receiver's own tools
+// pass through the same offer.
+func TestTheHostsOfferCoversTheTransfers(t *testing.T) {
+	for _, deny := range []bool{true, false} {
+		var triage, refund requests
+		team, err := New(
+			Agent{Config: agentturn.Config{Name: "Triage agent", Model: transfers{name: "triage", to: "Refund agent"}, Tools: []agenttool.Tool{issueRefund}, BeforeModelCall: triage.hook},
+				Handoffs: []To{{Agent: "Refund agent"}}},
+			Agent{Config: agentturn.Config{Name: "Refund agent", Model: transfers{name: "refunds"}, Tools: []agenttool.Tool{issueRefund}, BeforeModelCall: refund.hook}},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		offered := map[string][]string{}
+		team.Offer = func(_ context.Context, agent string, tools []agenttool.Tool) []agenttool.Tool {
+			var out []agenttool.Tool
+			for _, tool := range tools {
+				offered[agent] = append(offered[agent], tool.Name())
+				if deny && tool.Name() == ToolName("Refund agent") {
+					continue
+				}
+				out = append(out, tool)
+			}
+			return out
+		}
+		end, path, err := team.Run(context.Background(), agentturn.New(team.Config("Triage agent")), openresponses.UserText("I was double charged"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := strings.Join(toolNames(triage.seen[0]), ","), "issue_refund"; deny && got != want {
+			t.Errorf("denied: the triage request offers %s, want %s", got, want)
+		}
+		if want := "issue_refund," + ToolName("Refund agent"); !strings.HasPrefix(strings.Join(offered["Triage agent"], ","), want) {
+			t.Errorf("deny %v: the offer saw %v for the triage agent, want %s", deny, offered["Triage agent"], want)
+		}
+		if deny {
+			// The model called a transfer it was not offered: the loop
+			// answers it as unknown, and nothing hands off.
+			if strings.Join(path, ",") != "Triage agent" || len(refund.seen) != 0 {
+				t.Errorf("denied: path %v, refund requests %d; end %+v", path, len(refund.seen), end)
+			}
+			continue
+		}
+		if strings.Join(path, ",") != "Triage agent,Refund agent" {
+			t.Fatalf("allowed: path = %v", path)
+		}
+		if got := offered["Refund agent"]; len(got) == 0 || got[0] != "issue_refund" {
+			t.Errorf("allowed: the offer saw %v for the receiver", got)
+		}
+	}
+}

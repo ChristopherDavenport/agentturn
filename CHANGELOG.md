@@ -115,6 +115,14 @@ versions may break the API.
   summarising every message the person typed under `human` passes
   `compact.WithPersonBound(0)`. RFC 0001 draft 0.7, The request.
   (#298)
+- Added: `handoff.Team.Offer`, applied on every request to each
+  agent's whole tool list, its own tools of the moment and its
+  transfers, so a host's filter that removes a tool, a policy's, and
+  its tool wrappers reach the transfer tools too, and its name check
+  sees a tool of the moment that takes a transfer's name. The
+  configurations `Team.Config`, `Team.Route` and the switch hand out
+  carry it; unset, nothing changes. RFC 0001 draft 0.7, Composition.
+  (#307)
 
 ## v0.0.37 - 2026-11-04
 

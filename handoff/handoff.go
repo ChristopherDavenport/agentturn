@@ -13,6 +13,9 @@
 //	a := agentturn.New(team.Config("Triage agent"))
 //	end, path, err := team.Run(ctx, a, openresponses.UserText("I was double charged"))
 //
+// A host whose tools pass through a filter or a wrapper, a policy's,
+// sets [Team.Offer], so the transfers pass through it too.
+//
 // [Team.Run] carries the rules a handoff must meet: the receiver
 // continues under a trigger of kind "handoff" whose ref names the
 // sender; the handoffs one input causes are bounded
@@ -95,6 +98,18 @@ type Team struct {
 	// MaxHandoffs bounds the handoffs one [Team.Run] follows; 0 means
 	// [responses.DefaultMaxHandoffs], the fronts' default too.
 	MaxHandoffs int
+	// Offer, when set, is how the host offers the team's tools: it is
+	// applied on every request to each agent's whole list, its own
+	// tools of the moment and the transfers it offers, and returns the
+	// list the request carries, so a filter that removes a tool from
+	// the offer, a policy's, and a wrapper around the agent's tools
+	// apply to the transfers too (RFC 0001 Composition, as itself, under
+	// new settings; #307). agent is the agent's Config.Name. A host
+	// checks there, too, that no tool of the moment takes a transfer's
+	// name, which [New] checks only against the static Config.Tools.
+	// Set it before the team's configurations are used: [Team.Config],
+	// [Team.Route] and the switch read it when they hand one out.
+	Offer func(ctx context.Context, agent string, tools []agenttool.Tool) []agenttool.Tool
 
 	configs map[string]agentturn.Config
 	// tools maps a transfer tool's name to its receiver's name.
@@ -235,7 +250,22 @@ func transfer(to agentturn.Config) agenttool.Tool {
 
 // Config returns the configuration of the agent named name, its
 // transfer tools included; the zero Config when the team holds none.
-func (t *Team) Config(name string) agentturn.Config { return t.configs[name] }
+func (t *Team) Config(name string) agentturn.Config { return t.config(name) }
+
+// config is the configuration of the agent named name as the team
+// hands it out: with its tools offered through [Team.Offer] when that
+// is set.
+func (t *Team) config(name string) agentturn.Config {
+	cfg, ok := t.configs[name]
+	if !ok || t.Offer == nil {
+		return cfg
+	}
+	offer, whole := t.Offer, cfg
+	cfg.ToolProvider = func(ctx context.Context) []agenttool.Tool {
+		return offer(ctx, name, whole.ResolveTools(ctx))
+	}
+	return cfg
+}
 
 // Route says where a transfer call of the team hands the conversation:
 // the receiver's configuration, transfer tools included, and the text
@@ -249,7 +279,7 @@ func (t *Team) Route() responses.Route {
 		if !ok {
 			return agentturn.Config{}, "", false
 		}
-		return t.configs[name], output(name), true
+		return t.config(name), output(name), true
 	}
 }
 
