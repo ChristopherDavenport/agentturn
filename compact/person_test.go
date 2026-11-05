@@ -19,7 +19,7 @@ import (
 // are folded like any other item.
 func TestAFoldKeepsThePersonsOwnMessages(t *testing.T) {
 	s := &summarizer{reply: "They talked about things."}
-	tr := NewLocal(s, WithBudget(3), WithKeepLast(1), WithEstimator(count), WithPersonBound(200), WithPersonTotal(3))
+	tr := NewLocal(s, WithBudget(4), WithKeepLast(1), WithEstimator(count), WithPersonBound(200), WithPersonTotal(2))
 	var folds []Fold
 	WithOnFold(func(_ context.Context, f Fold) error {
 		folds = append(folds, f)
@@ -88,10 +88,28 @@ func texts(items openresponses.Items) []string {
 // a total, a quarter of the budget by default, the newest of them,
 // while the older ones fold into the summary. Without the total the
 // kept messages grow with every fold until the request no longer fits:
-// the overflow retry folds with the same pins and fails again.
+// the overflow retry folds with the same pins and fails again. A total
+// a host sets at the budget or over it counts as half the budget (l6-3c
+// round 2): kept messages that fill the request alone bring the refold
+// loop back.
 func TestThePersonsKeptMessagesHaveATotal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []Option
+		most int
+	}{
+		{"default, a quarter of the budget", nil, 2},
+		{"a total of the budget", []Option{WithPersonTotal(8)}, 4},
+		{"a total over the budget", []Option{WithPersonTotal(100)}, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) { personTotalRun(t, tc.opts, tc.most) })
+	}
+}
+
+func personTotalRun(t *testing.T, opts []Option, most int) {
+	t.Helper()
 	s := &summarizer{reply: "They talked about things."}
-	tr := NewLocal(s, WithBudget(8), WithKeepLast(1), WithEstimator(count))
+	tr := NewLocal(s, append([]Option{WithBudget(8), WithKeepLast(1), WithEstimator(count)}, opts...)...)
 	var folds []Fold
 	WithOnFold(func(_ context.Context, f Fold) error {
 		folds = append(folds, f)
@@ -123,8 +141,8 @@ func TestThePersonsKeptMessagesHaveATotal(t *testing.T) {
 		t.Fatalf("folds = %d, want several", len(folds))
 	}
 	for i, f := range folds {
-		if len(f.Pinned) > 2 {
-			t.Errorf("fold %d pinned %d messages, want at most a quarter of the budget, 2: %v", i+1, len(f.Pinned), texts(f.Pinned))
+		if len(f.Pinned) > most {
+			t.Errorf("fold %d pinned %d messages, want at most %d: %v", i+1, len(f.Pinned), most, texts(f.Pinned))
 		}
 		if len(f.Pinned) == 0 {
 			t.Errorf("fold %d pinned nothing", i+1)

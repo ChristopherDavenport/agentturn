@@ -462,7 +462,10 @@ that a recorder holding the transcript and the settings rebuilds it:
    A message over the bound, or one the host composed, is folded like
    any other item. The kept messages MUST also stay within a total,
    less than the request's budget, so that they never grow from fold
-   to fold until they alone pass it: the newest are kept, and once
+   to fold until they alone pass it, and SHOULD leave room under it
+   for the summary and the kept tail: a total that lets them fill the
+   request alone makes every call fold again (the reference holds a
+   host's total to half the budget). The newest are kept, and once
    the next would pass the total, it and every older one are folded
    into the summary, which had summarised them already. Only the transform's context carries them: a run a
    hook or a tool starts is prompted with copies, which are not the
@@ -2218,7 +2221,7 @@ maps onto it as follows:
 | copied item | `Copied(item)`, which `tools/agent`'s `WithCallConfig` sets on the items it takes from the parent; `Copied` on the item events |
 | filter | `Config.Filter`; `DefaultFilter`, `VisibleFilter(types…)` |
 | reasoning another model produced | `ReasoningModels` (`Attribute`, `For`); `WithReasoningModels` for an agent, `ContextWithReasoningModels` for `Run` and `Continue`, and on every hook's and tool's context |
-| transform | `Config.Transform`; `compact.New`, `compact.NewLocal` as the reference; `compact.MarkFold`/`compact.IsFold` for a fold's own model call; the person's own messages, `PersonMessages` (`Has`), `PersonMessagesFromContext` for a transform, `WithPersonMessages`/`Agent.SetPersonMessages` for an agent and `ContextWithPersonMessages` for `Run` and `Continue`, kept by `compact` under `compact.WithPersonBound` (`compact.DefaultPersonBound`) and the newest within `compact.WithPersonTotal` (a quarter of the budget by default) beside `compact.WithPin`, and read from a record by `session.TranscriptMarks`, which `session.AgentOptions` and `MoveTo` use; `(*compact.Transform).FoldNext(instructions)` for a fold on request, `ContextWithFoldRequest`/`FoldRequested` for the loop's after an overflow, `compact.Fold.Forced`, and `Requested`/`Instructions` for a fold asked for through `FoldNext` alone; the settings a transform reads, `ContextWithRequest`/`RequestFromContext`, weighed by `compact.EstimateSettings`, and images by `compact.ImageTokens` in `compact.Estimate` |
+| transform | `Config.Transform`; `compact.New`, `compact.NewLocal` as the reference; `compact.MarkFold`/`compact.IsFold` for a fold's own model call; the person's own messages, `PersonMessages` (`Has`), `PersonMessagesFromContext` for a transform, `WithPersonMessages`/`Agent.SetPersonMessages` for an agent and `ContextWithPersonMessages` for `Run` and `Continue`, kept by `compact` under `compact.WithPersonBound` (`compact.DefaultPersonBound`) and the newest within `compact.WithPersonTotal` (a quarter of the budget by default, at most half) beside `compact.WithPin`, and read from a record by `session.TranscriptMarks`, which `session.AgentOptions` and `MoveTo` use; `(*compact.Transform).FoldNext(instructions)` for a fold on request, `ContextWithFoldRequest`/`FoldRequested` for the loop's after an overflow, `compact.Fold.Forced`, and `Requested`/`Instructions` for a fold asked for through `FoldNext` alone; the settings a transform reads, `ContextWithRequest`/`RequestFromContext`, weighed by `compact.EstimateSettings`, and images by `compact.ImageTokens` in `compact.Estimate` |
 | configuration | `Config`; `Config.BaseRequest`, `Config.ResolveTools` |
 | tools of the moment | `Config.Tools`, `Config.ToolProvider` |
 | execution mode, bound | `Config.ToolExecution` (`ExecParallel`, `ExecSequential`), `Config.MaxParallelTools` |

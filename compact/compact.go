@@ -234,9 +234,10 @@ func WithPersonBound(bytes int) Option { return func(t *Transform) { t.personBou
 // call folded again and the loop's retry after an overflow, which
 // folds with the same kept messages, failed too. The default is a
 // quarter of [WithBudget], so the summary, the kept tail and the
-// request's settings keep the rest; a total over the budget counts as
-// the budget, so the kept messages never pass it alone. Zero or less
-// keeps none of them. [WithPin]'s items are the host's choice and do
+// request's settings keep the rest. A total over half the budget
+// counts as half of it: kept messages that filled the request alone
+// would leave no room for the summary and the kept tail, and every
+// call would fold again. Zero or less keeps none of them. [WithPin]'s items are the host's choice and do
 // not count against it.
 func WithPersonTotal(tokens int) Option {
 	return func(t *Transform) { t.personTotal, t.personTotalSet = tokens, true }
@@ -1026,13 +1027,14 @@ func (t *Transform) pinned(prefix agentturn.Transcript, persons agentturn.Person
 }
 
 // personTotalOf is the total [WithPersonTotal] sets, a quarter of the
-// budget by default, and never more than the budget.
+// budget by default, and never more than half the budget, so it stays
+// below the budget as RFC 0001 The request, step 2, requires.
 func (t *Transform) personTotalOf() int {
 	total := t.budget / 4
 	if t.personTotalSet {
 		total = t.personTotal
 	}
-	return min(total, t.budget)
+	return min(total, t.budget/2)
 }
 
 // keepsPerson reports whether item is one of the person's own messages
