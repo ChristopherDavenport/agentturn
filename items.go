@@ -13,7 +13,8 @@ import (
 // markedItem marks an item the caller hands the loop: one the model
 // reads and a renderer should not show ([Hidden]), one taken from
 // another conversation ([Copied]), one the host composed from text the
-// person did not write ([WithProvenance]), or any of them together. It
+// person did not write ([WithProvenance]), an output carrying what its
+// answer says of it ([Answer.Item]), or any of them together. It
 // is a wrapper the loop strips when it appends the item, so nothing
 // downstream sees it: the transcript, the request and every type
 // switch on an item work on the item itself, and only the item events
@@ -26,6 +27,16 @@ type markedItem struct {
 	copied bool
 	// prov is held by pointer so the wrapper stays comparable.
 	prov *Provenance
+	// answer is what an [Answer] says of the output it marks
+	// ([Answer.Item]), held by pointer for the same reason.
+	answer *answerMarks
+}
+
+// answerMarks is what [Answer.Item] carries of an answer onto the
+// output it marks, for [Agent.Prompt] to put on the run's context.
+type answerMarks struct {
+	by, reason, origin string
+	failed             bool
 }
 
 // ItemType returns the wrapped item's type.

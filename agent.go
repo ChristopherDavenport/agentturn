@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"slices"
 	"sync"
@@ -27,7 +28,8 @@ var (
 	// ErrInputRequired is returned when the last run left calls
 	// unanswered, deferred to the caller or cut off by an abort or a
 	// failure; answer them through [Agent.Resume], or open the next
-	// [Agent.Prompt] with their outputs. The typed errors of tools/agent
+	// [Agent.Prompt] with their outputs, each built with [Answer.Item]
+	// to carry what a Resume's answer says of it. The typed errors of tools/agent
 	// and tools/a2a match it with errors.Is, so a host can ask "does any
 	// sub-agent need input" once, and implement [InputRequired], which
 	// names what each waits on.
@@ -630,12 +632,80 @@ func (a *Agent) SetNotes(notes []Note) error {
 // a front wants after an abort when the user's next line is the next
 // prompt. A leading output for a call that is not pending returns
 // [ErrNotPending]; a prompt that leaves a pending call unanswered
-// returns [ErrInputRequired].
+// returns [ErrInputRequired]. Such a prompt carries, per output,
+// everything a Resume's [Answer] can: an output built with
+// [Answer.Item] puts who decided, why, where it was taken from and
+// whether it reports a failure on the run's context, as Resume puts
+// its answers' with [ContextWithDeciders], [ContextWithReasons],
+// [ContextWithOrigins] and [ContextWithFailures], so a session
+// recorder records it as it records a resume's, its output marked
+// failed only when the answer says so (#305). A host may attach those
+// itself to ctx instead; an output's own mark stands over the
+// context's for its call. A plain output says none of it.
 func (a *Agent) Prompt(ctx context.Context, items ...openresponses.Item) (*RunEnd, error) {
 	if len(items) == 0 {
 		return nil, ErrNoPrompt
 	}
-	return a.run(ctx, items, nil, nil, false, false)
+	return a.run(withAnswerMarks(ctx, items), items, nil, nil, false, false)
+}
+
+// withAnswerMarks puts what the leading outputs of a prompt built with
+// [Answer.Item] say of themselves on the run's context, as
+// [Agent.Resume] puts its answers', added to what ctx already holds:
+// an output's own mark stands over the context's for its call.
+func withAnswerMarks(ctx context.Context, items openresponses.Items) context.Context {
+	var deciders, reasons, origins map[string]string
+	var failures map[string]bool
+	for _, item := range items {
+		m, _ := item.(markedItem)
+		base, _ := Unhide(item)
+		out, ok := base.(*openresponses.FunctionCallOutput)
+		if !ok {
+			break
+		}
+		if m.answer == nil {
+			continue
+		}
+		if deciders == nil {
+			deciders, reasons, origins = contextMap(ctx, decidersKey{}), contextMap(ctx, reasonsKey{}), contextMap(ctx, originsKey{})
+			failures, _ = ctx.Value(failuresKey{}).(map[string]bool)
+			failures = maps.Clone(failures)
+			if failures == nil {
+				failures = map[string]bool{}
+			}
+		}
+		setOrClear(deciders, out.CallID, m.answer.by)
+		setOrClear(reasons, out.CallID, m.answer.reason)
+		setOrClear(origins, out.CallID, m.answer.origin)
+		if m.answer.failed {
+			failures[out.CallID] = true
+		} else {
+			delete(failures, out.CallID)
+		}
+	}
+	if deciders == nil {
+		return ctx
+	}
+	ctx = ContextWithOrigins(ContextWithReasons(ContextWithDeciders(ctx, deciders), reasons), origins)
+	return ContextWithFailures(ctx, failures)
+}
+
+// contextMap returns a copy of the map ctx holds under key, never nil.
+func contextMap(ctx context.Context, key any) map[string]string {
+	m, _ := ctx.Value(key).(map[string]string)
+	if m = maps.Clone(m); m == nil {
+		m = map[string]string{}
+	}
+	return m
+}
+
+// setOrClear sets m[k] to v, or deletes it when v is empty.
+func setOrClear(m map[string]string, k, v string) {
+	if v == "" {
+		delete(m, k)
+		return
+	}
+	m[k] = v
 }
 
 // Continue runs from the transcript as it stands with the steered
@@ -858,6 +928,27 @@ func (a Answer) WithIdempotencyKey(key string) Answer {
 func (a Answer) WithRunAgain() Answer {
 	a.RunAgain = true
 	return a
+}
+
+// Item returns the output answer as an item for [Agent.Prompt], marked
+// with what the answer says of it: who decided ([Answer.By]), why
+// ([Answer.Reason]), where it was taken from ([Answer.Origin]) and
+// whether it reports a failure ([Answer.Failed]). A prompt that opens
+// with outputs for the pending calls is a resume, and one opening with
+// such items carries what a Resume of the same answers would, so a
+// session recorder records them as it records a resume's (#305). The
+// loop strips the mark as it appends the output, as it strips
+// [Hidden]'s; [Unhide] strips it too. The answer's Note and Terminate
+// are not carried: a prompt says what follows the outputs itself. An
+// approval has no output and returns nil.
+func (a Answer) Item() openresponses.Item {
+	if a.Output == nil {
+		return nil
+	}
+	if a.By == "" && a.Reason == "" && a.Origin == "" && !a.Failed {
+		return a.Output
+	}
+	return markedItem{item: a.Output, answer: &answerMarks{by: a.By, reason: a.Reason, origin: a.Origin, failed: a.Failed}}
 }
 
 // Resume answers the calls the last run left pending and continues,

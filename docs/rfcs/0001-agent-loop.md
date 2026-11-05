@@ -1083,6 +1083,12 @@ is accepted as a resume that also carries a message: the outputs are
 appended ahead of the message, so the next model call sees the answers
 and the message together. A leading output for a call that is not
 pending, or a prompt that leaves a pending call unanswered, is refused.
+Such a prompt MUST be able to carry, per output, everything a resume's
+answer can: who decided, why, where the output was taken from, and
+whether it reports a failure; a recorder MUST record them as it
+records a resume's, and an output that says none of them is recorded
+as an answer that names nobody and does not report a failure, never
+one inferred failed from its text (#305).
 
 An agent given a transcript to start from — a stored session being
 resumed — derives its pending calls from that transcript: every
@@ -2135,7 +2141,7 @@ maps onto it as follows:
 | idempotency key | `ToolDispatch.IdempotencyKey`, on `agenttool.Call` for the tool |
 | pending call | `PendingCall{Call, Reason, Tool, Dispatched, IdempotencyKey, Args, Nested}`, `PendingCall.MayHaveRun`; `PendingReason` (`PendingDeferred`, `PendingAborted`, `PendingUndispatched`, `PendingUnknown`, `PendingAnswered`, `PendingRejected`, `PendingReturned`); `PendingCalls` |
 | decision | `ToolDecision{Action, Reason, Terminate, Args, By, Note, Held, Subject}`; `ToolAction` (`Allow`, `Block`, `Defer`) |
-| answer | `Answer{CallID, Output, Args, Note, Terminate, By, Reason, Origin, Failed, IdempotencyKey, RunAgain}`; `Output`, `Approve`, `ApproveWith`, `Refuse`, `OutcomeUnknown`, `WithNote`, `WithBy`, `WithReason`, `WithOrigin`, `WithFailed`, `WithIdempotencyKey`, `WithRunAgain`, `RunAgainReason`, `OutcomeUnknownReason`; `ContextWithDeciders`/`DeciderFromContext`, `ContextWithReasons`/`ReasonFromContext`, `ContextWithOrigins`/`OriginFromContext` and `ContextWithFailures`/`FailedFromContext` for a host driving `Run` |
+| answer | `Answer{CallID, Output, Args, Note, Terminate, By, Reason, Origin, Failed, IdempotencyKey, RunAgain}`; `Output`, `Approve`, `ApproveWith`, `Refuse`, `OutcomeUnknown`, `WithNote`, `WithBy`, `WithReason`, `WithOrigin`, `WithFailed`, `WithIdempotencyKey`, `WithRunAgain`, `RunAgainReason`, `OutcomeUnknownReason`; `Answer.Item` for an output opening a `Prompt`, carrying the answer's decider, reason, origin and failure; `ContextWithDeciders`/`DeciderFromContext`, `ContextWithReasons`/`ReasonFromContext`, `ContextWithOrigins`/`OriginFromContext` and `ContextWithFailures`/`FailedFromContext` for a host driving `Run` |
 | hooks | `Config.BeforeTurn`, `BeforeModelCall`, `OutputGuard`, `BeforeToolCall`, `AfterToolCall`, `ShouldStopAfterTurn` |
 | guard stop | an error wrapping `ErrGuard` from `ShouldStopAfterTurn`, `BeforeTurn`, `BeforeModelCall`, `OutputGuard` or the model; the output of a call a withheld response made is `WithheldCallOutput` |
 | chains | `ChainBeforeTurn`, `ChainBeforeModelCall`, `ChainOutputGuard`, `ChainBeforeToolCall`, `ChainShouldStopAfterTurn`, `ChainTransform` |
@@ -2418,6 +2424,10 @@ it.
   before its status, and never retries `insufficient_quota`, whatever
   its status (#308); breaking for a predicate that retried a 429 by its
   status alone.
+- **Pending calls.** A prompt that opens with outputs for pending
+  calls carries, per output, who decided, why, where it was taken from
+  and whether it reports a failure, as a resume's answer does, and a
+  recorder records them as a resume's (#305).
 
 ## Changes in draft 0.6
 

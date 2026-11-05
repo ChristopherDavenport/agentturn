@@ -72,6 +72,13 @@ versions may break the API.
   whatever its status: OpenAI sends it as a 429, which was retried
   through the whole backoff before the user saw it. RFC 0001 draft
   0.7, Retry. (#308)
+- Added: `Answer.Item`, an output answer as an item for `Prompt`,
+  marked with its decider, reason, origin and failure. A prompt that
+  opens with such outputs for the pending calls puts them on the run's
+  context as `Resume` does, so `session.Recorder` records the answer's
+  decision with its decider and reason and marks an `OutcomeUnknown`
+  output failed, where a prompt's output could say none of it. RFC
+  0001 draft 0.7. (#305)
 
 ## v0.0.37 - 2026-11-04
 
