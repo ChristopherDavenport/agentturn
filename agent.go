@@ -1532,6 +1532,16 @@ func (a *Agent) takeReplays(subs []subscription) map[int][]*Question {
 // comes, from a goroutine of the agent's, through the delivery barrier,
 // with an error fn returns for them dropped. No other past event is
 // sent.
+//
+// fn queues ([Agent.Queue], [Agent.Accept]) with the context it was
+// handed, which marks the accept as a subscriber's own:
+// it is reported once more as the event's delivery ends and otherwise
+// at the run's next event. An accept made under another context counts
+// as an outside caller's, which the delivery keeps reporting, up to a
+// few passes, before the run goes on. A subscriber that keeps the
+// context it was handed and queues with it later, after its event, is
+// still taken for a subscriber: its item is reported at the run's next
+// event, not at once.
 func (a *Agent) Subscribe(fn func(context.Context, Event) error) (unsubscribe func()) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

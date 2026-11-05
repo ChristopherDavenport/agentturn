@@ -1471,7 +1471,13 @@ it is delivered, a second person's steer, is reported right after it,
 since only the subscriber's own accepts can chase the reports. The
 reference tells a subscriber's accept by the context it hands the
 subscriber, and counts a steer or follow-up queued with no context as
-the subscriber's. An idle agent reports it at the start
+the subscriber's; a subscriber that queues later with a context it
+kept is still counted as one, and its item waits for the run's next
+event. Reports made right after an event MUST stop after a bounded
+number of passes, whoever's accepts are owed, so that a subscriber
+whose accepts read as from elsewhere, queued on every report under a
+context of its own, cannot stall the run; what is left is reported at
+the run's next event. An idle agent reports it at the start
 of the next run. A host that must not lose an input therefore writes
 it before queueing it rather than from the event, and a subscriber's
 error cannot refuse the item; an error on a report delivered between
@@ -2592,9 +2598,9 @@ it.
   which the agent settles, and starts no run once the run in flight
   was aborted before taking it; a front SHOULD carry both steps, and a
   recorder writes the entry before the accept. A run in flight SHOULD
-  report an accepted item without waiting for its next phase, and a
-  subscriber's error on such a report ends the run at its next event
-  (#302).
+  report an accepted item without waiting for its next phase, in a
+  bounded number of passes after an event, and a subscriber's error on
+  such a report ends the run at its next event (#302).
 - **The record.** A front that takes remote input SHOULD carry the
   trigger the party claims, `human` for what a person at a client
   typed, and the answerer it claims for a reply, and runs the input or

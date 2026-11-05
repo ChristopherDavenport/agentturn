@@ -759,6 +759,56 @@ func TestAQueuedReportDoesNotSpinASubscriber(t *testing.T) {
 	}
 }
 
+// TestASubscriberQueueingFromOutsideDoesNotStallTheRun pins the cap
+// on #302's report passes: a subscriber that queues on every queued
+// report under a context of its own, not the one it was handed, counts
+// as an outside caller each time, and the passes a delivery makes as it
+// lets the barrier go stop at a cap, so the run goes on to its next
+// event rather than reports and accepts chasing each other under the
+// barrier for as long as the subscriber keeps queueing.
+func TestASubscriberQueueingFromOutsideDoesNotStallTheRun(t *testing.T) {
+	a := New(Config{Model: &echo.Adapter{}, MaxTurns: 3})
+	// The subscriber stops after this many accepts, so that without the
+	// cap the test ends with a failure rather than never.
+	const accepts = 40
+	var queuedN, inARow, most int
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		_, queued := ev.(*Queued)
+		_, turn := ev.(*TurnStart)
+		if queued {
+			inARow++
+			most = max(most, inARow)
+		} else {
+			inARow = 0
+		}
+		if queuedN < accepts && (queued || turn && queuedN == 0) {
+			queuedN++
+			// A follow-up, which no turn takes before the run would
+			// end, so only the reports chase it.
+			_ = a.Queue(context.Background(), QueueFollowUp, openresponses.UserText("again"))
+		}
+		return nil
+	})
+	done := make(chan *RunEnd, 1)
+	go func() {
+		end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+		done <- end
+	}()
+	select {
+	case end := <-done:
+		if end == nil || end.Reason == ReasonError {
+			t.Fatalf("end = %+v", end)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run did not end")
+	}
+	// One report drained ahead of an event and the passes after the
+	// one before it.
+	if most > 1+maxQueuedPasses {
+		t.Errorf("%d queued reports in a row with no other event, want at most %d: the run was held while they chased each other", most, 1+maxQueuedPasses)
+	}
+}
+
 // TestOutsideAcceptsDuringAReportAreReported pins the bound on #302's
 // reports to what a subscriber itself queues: an outside caller's
 // accept that arrives while a queued report is being delivered, a

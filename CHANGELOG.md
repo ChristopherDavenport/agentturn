@@ -196,7 +196,9 @@ versions may break the API.
   runs is reported while it runs. Only a subscriber's own accept made
   while such a report is delivered, with the context it was handed or
   by `Steer` or `FollowUp`, which carry none, waits for the next event;
-  a second caller's accept arriving then is reported right after it.
+  a second caller's accept arriving then is reported right after it,
+  up to four passes per event, so a subscriber that queues on every
+  report under a context of its own cannot stall the run.
   A subscriber's error on such a report ends the run at its next
   event. RFC 0001 draft 0.7, Queues. (#302)
 - Changed (breaking for a wrapper that embeds `*Agent`): a type that
