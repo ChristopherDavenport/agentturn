@@ -16,7 +16,9 @@ const (
 	// MetaEscalatedCalls, on an input-required status message, lists the
 	// calls of the agent's own tools its policy asked about and
 	// [WithEscalation] put to the caller: a JSON array of objects with
-	// "call_id", "name" and "reason", the policy's reason for asking.
+	// "call_id", "name", "arguments", the arguments the call runs with
+	// if approved (the policy's rewrite, else the model's), and
+	// "reason", the policy's reason for asking.
 	// The calls are among the status message's function_call data
 	// parts, and the caller answers each with an [Approval].
 	MetaEscalatedCalls = "agentturn.escalated_calls"
