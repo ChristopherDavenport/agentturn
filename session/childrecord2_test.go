@@ -380,3 +380,90 @@ func TestAChildsOwedInputIsHandedBackToIt(t *testing.T) {
 	}
 	verifyAll(t, cs)
 }
+
+// TestARecordedEndIsTheLastRunsOwn is l6-3e's L1 and L5: the end
+// ChildRecord returns for a child that runs nothing again is its last
+// run's own. A run the process cut before it wrote an item has no
+// answer, even when an earlier run's answer is at the leaf, and goes
+// on (L1); an end's items are the items its run appended, as a run's
+// end gives them, not the child's whole transcript (L5).
+func TestARecordedEndIsTheLastRunsOwn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cut  bool
+	}{{name: "cut before its first item", cut: true}, {name: "ended"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := &cutStore{Store: agentsession.NewMemoryStore()}
+			rec, s, err := Start(ctx, store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The parent's call, handed off under K, its child linked,
+			// and handed off again under K: the call run again.
+			callID := "call_c"
+			target, err := store.Append(ctx, s.ID(), &agentsession.ItemEntry{Item: &openresponses.FunctionCall{CallID: callID, Name: "child", Arguments: `{"input":"one"}`}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Append(ctx, s.ID(), agentsession.NewDispatch(callID, target).WithIdempotencyKey("K")); err != nil {
+				t.Fatal(err)
+			}
+			childID := agentsession.SubsessionID(s.ID(), callID)
+			crec, _, err := Start(ctx, store, agentsession.Header{ID: childID, ParentSession: s.ID(), SpawnedBy: callID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			child := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"})
+			unsub := crec.Attach(child)
+			if _, err := child.Prompt(ctx, openresponses.UserText("one")); err != nil {
+				t.Fatal(err)
+			}
+			if tc.cut {
+				// The process dies once the second run's start is
+				// written.
+				child.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+					if _, ok := ev.(*agentturn.RunStart); ok {
+						store.cut.Store(true)
+					}
+					return nil
+				})
+			}
+			_, _ = child.Prompt(ctx, openresponses.UserText("two"))
+			unsub()
+			store.cut.Store(false)
+			for _, e := range []agentsession.Entry{agentsession.NewSubsessionLink(childID, callID), agentsession.NewDispatch(callID, target).WithIdempotencyKey("K")} {
+				if _, err := store.Append(ctx, s.ID(), e); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			got, err := rec.ChildRecord(ctx, agenttool.Call{ID: callID, IdempotencyKey: "K"}, agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == nil {
+				t.Fatal("no record of the child")
+			}
+			if tc.cut {
+				if got.End != nil {
+					text, _ := got.End.Answer()
+					t.Errorf("the cut run returned an end answering %q, want it to go on: the answer is an earlier run's", text)
+				}
+				return
+			}
+			if got.End == nil {
+				t.Fatal("no end for a child whose last run ended")
+			}
+			var texts []string
+			for _, item := range got.End.Items {
+				if m, ok := item.(*openresponses.Message); ok {
+					texts = append(texts, m.Text())
+				}
+			}
+			if strings.Join(texts, "|") != "two|two" {
+				t.Errorf("the end's items read %q, want the last run's own: its prompt and its answer", texts)
+			}
+		})
+	}
+}

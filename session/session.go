@@ -4577,10 +4577,11 @@ const cutOffRef = "cut off: closed on resume"
 // [ReplayAnswers] does with the tools cfg resolves; a call that never
 // started, one the child's policy was deciding when the process
 // stopped, is approved, which puts it to the policy again. A child
-// whose last run had ended with nothing pending, or was cut after its
-// answer, is returned as that end, which the tool returns without
-// running: Reason, Cause and the transcript as the record has them,
-// and Err naming the end for one without an answer. The child's run
+// whose last run had ended with nothing pending and nothing owed, or
+// was cut after its own answer, is returned as that end, which the
+// tool returns without running: Reason, Cause and the items that run
+// appended as the record has them, and Err naming the end for one
+// without an answer. The child's run
 // is observed as any is, and goes on at the session's leaf.
 func (r *Recorder) ChildRecord(ctx context.Context, call agenttool.Call, cfg agentturn.Config) (*agent.Record, error) {
 	if call.ID == "" || call.IdempotencyKey == "" {
@@ -4645,7 +4646,7 @@ func (r *Recorder) ChildRecord(ctx context.Context, call agenttool.Call, cfg age
 		return nil, err
 	}
 	if len(pending) == 0 && len(out.Queued) == 0 {
-		items, err := Transcript(cs, opts...)
+		items, err := runItems(cs, last, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -4767,11 +4768,29 @@ func linkedUnder(path []agentsession.Entry, callID, key string) (child string, r
 	return child, handOffs > 1
 }
 
+// runItems returns the items run appended, as its run end gives them,
+// read from its segment and resolved as [Transcript] resolves them:
+// another run's items are not its own, and its answer is the last of
+// these or none.
+func runItems(s *agentsession.Session, run *agentsession.Run, opts []ReadOption) (openresponses.Items, error) {
+	var items openresponses.Items
+	for _, e := range run.Segment {
+		if ie, ok := e.(*agentsession.ItemEntry); ok {
+			items = append(items, ie.Item)
+		}
+	}
+	if err := resolverFor(s, opts).items(s.ID(), items); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 // recordedEnd is the end of run, the child's last, with nothing
-// pending, as a call that runs again returns it, items being the
-// child's transcript: nil for a run the process cut before its answer,
-// which goes on. A run that ended without an answer carries an error
-// naming its end.
+// pending, as a call that runs again returns it, items being the items
+// the run appended ([runItems]): nil for a run the process cut before
+// its answer, an earlier run's answer at the leaf being no answer of
+// its, which goes on. A run that ended without an answer carries an
+// error naming its end.
 func recordedEnd(run *agentsession.Run, items openresponses.Items) *agentturn.RunEnd {
 	end := &agentturn.RunEnd{RunID: run.RunID(), Items: agentturn.Transcript(items)}
 	if run.End == nil || run.End.Ref == cutOffRef {
