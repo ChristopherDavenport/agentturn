@@ -293,6 +293,60 @@ func (steeredChild) CreateStream(_ context.Context, req openresponses.Request, s
 // under the entry the record already holds, rather than leave it owed
 // and drop it at the run's end.
 func TestAChildsOwedInputIsHandedBackToIt(t *testing.T) {
+	marked := func(t *testing.T, p agentturn.Provenance) openresponses.Item {
+		item, err := agentturn.WithProvenance(openresponses.UserText("also X"), p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return item
+	}
+	cases := []struct {
+		name string
+		// steer is the input the person steers the child with.
+		steer func(t *testing.T) openresponses.Item
+		// check is what the item that drains it must carry.
+		check func(t *testing.T, e *agentsession.ItemEntry)
+	}{
+		{name: "plain", steer: func(*testing.T) openresponses.Item { return openresponses.UserText("also X") },
+			check: func(t *testing.T, e *agentsession.ItemEntry) {
+				if e.Visible != nil || e.Trust != nil || e.Layers() != nil {
+					t.Errorf("the drained steer is marked: visible %v, trust %+v, layers %+v", e.Visible, e.Trust, e.Layers())
+				}
+			}},
+		{name: "hidden", steer: func(*testing.T) openresponses.Item { return agentturn.Hidden(openresponses.UserText("also X")) },
+			check: func(t *testing.T, e *agentsession.ItemEntry) {
+				if e.Visible == nil || *e.Visible {
+					t.Errorf("the drained steer's visible = %v, want false", e.Visible)
+				}
+			}},
+		{name: "trusted", steer: func(t *testing.T) openresponses.Item {
+			return marked(t, agentturn.Provenance{Trust: &agentturn.Trust{Reads: []agenttool.Label{agenttool.LabelUntrusted}}})
+		}, check: func(t *testing.T, e *agentsession.ItemEntry) {
+			if e.Trust == nil || len(e.Trust.Reads) != 1 || e.Trust.Reads[0] != string(agenttool.LabelUntrusted) {
+				t.Errorf("the drained steer's trust = %+v, want untrusted", e.Trust)
+			}
+		}},
+		{name: "an instructions part", steer: func(t *testing.T) openresponses.Item {
+			return agentturn.Hidden(marked(t, agentturn.Provenance{Layers: []agentturn.Layer{{ID: "AGENTS.md", Source: "file"}}}))
+		}, check: func(t *testing.T, e *agentsession.ItemEntry) {
+			if l := e.Layers(); len(l) != 1 || l[0].ID != "AGENTS.md" || e.Visible == nil || *e.Visible {
+				t.Errorf("the drained steer's layers = %+v, visible %v, want AGENTS.md hidden", l, e.Visible)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			testOwedInputHandedBack(t, tc.steer(t), tc.check)
+		})
+	}
+}
+
+// testOwedInputHandedBack is TestAChildsOwedInputIsHandedBackToIt with
+// the input steered: the child is steered with it while its tool runs,
+// the process dies once the steer's queued entry is written, and after
+// the restart the continued child takes it under that entry, the item
+// that drains it carrying what check wants.
+func testOwedInputHandedBack(t *testing.T, steerWith openresponses.Item, check func(*testing.T, *agentsession.ItemEntry)) {
 	ctx := context.Background()
 	store := &cutStore{Store: agentsession.NewMemoryStore()}
 	rec, s, err := Start(ctx, store, agentsession.Header{})
@@ -305,7 +359,7 @@ func TestAChildsOwedInputIsHandedBackToIt(t *testing.T) {
 	lookup := agenttool.New("lookup", "", func(context.Context, echoArgs) (string, error) {
 		if steer.Swap(false) {
 			// A person steers the child while its tool runs.
-			spawned.Steer(openresponses.UserText("also X"))
+			spawned.Steer(steerWith)
 		}
 		return "FOUND", nil
 	})
@@ -362,20 +416,24 @@ func TestAChildsOwedInputIsHandedBackToIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	var queued []string
-	drained := ""
+	var drained *agentsession.ItemEntry
 	for _, e := range cs.Entries() {
 		switch v := e.(type) {
 		case *agentsession.QueuedEntry:
 			queued = append(queued, v.ID)
 		case *agentsession.ItemEntry:
 			if m, ok := v.Item.(*openresponses.Message); ok && m.Text() == "also X" {
-				drained = v.QueuedFrom
+				drained = v
 			}
 		}
 	}
-	if len(queued) != 2 || drained != queued[1] {
-		t.Errorf("queued entries %v, the steer drained from %q: want it accepted, queued again at the cut, and taken from that entry", queued, drained)
+	if drained == nil {
+		t.Fatal("the steer was never drained into the child's session")
 	}
+	if len(queued) != 2 || drained.QueuedFrom != queued[1] {
+		t.Errorf("queued entries %v, the steer drained from %q: want it accepted, queued again at the cut, and taken from that entry", queued, drained.QueuedFrom)
+	}
+	check(t, drained)
 	if owed, err := cs.PendingQueued(cs.Leaf()); err != nil || len(owed) != 0 {
 		t.Errorf("the child still owes %d inputs (%v), want none", len(owed), err)
 	}

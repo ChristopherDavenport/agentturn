@@ -4750,7 +4750,11 @@ func handBack(cs *agentsession.Session, opts []ReadOption) ([]agent.QueuedInput,
 
 // takeHandedBack returns the input handed back to the child session id
 // that item is, once, and nil when there is none. The caller holds
-// r.mu.
+// r.mu. It matches by identity: an input is handed back marked
+// ([inboxItem.marked]), and the marks wrap the item the recorder holds,
+// which the child's queued report carries without them, so a hidden
+// input or one with trust or an instructions part is found as a plain
+// one is.
 func (r *Recorder) takeHandedBack(id string, item openresponses.Item) *inboxItem {
 	for i, in := range r.handedBack[id] {
 		if in.awaiting && in.item == item {
