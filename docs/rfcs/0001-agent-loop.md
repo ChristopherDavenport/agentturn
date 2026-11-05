@@ -1632,7 +1632,10 @@ as if the model had asked for it under the call in flight:
   the answerer's note still ends, named for whoever gave it, so the
   host's words are never attributed to the person (#304). The same
   holds wherever a call is asked about through the loop's question: a
-  child run's call, a front's own held call. Without an elicitor, or on a cancel or a
+  child run's call, a front's own held call. A front that escalates a
+  call to its caller instead MUST use the decline text when the caller
+  refuses it, the caller's note after it named for the caller, and a
+  call held beside it reads its own hold's decline text. Without an elicitor, or on a cancel or a
   failure to ask, the hook's deferral refuses the call, and the error
   reads `a nested call cannot be deferred to the caller: ` and the
   reason. The decision's note and terminate hint are ignored;

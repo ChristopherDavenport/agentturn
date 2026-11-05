@@ -86,8 +86,11 @@ versions may break the API.
   `tools/agent`'s `WithAskParent` and `front/a2a`'s own held call read
   the host's wording without it being put in the person's mouth. A
   call `WithAskParent` refuses beside a declined one uses its own
-  hold's text. `ChainBeforeToolCall` keeps it with the deferral that
-  asks, and front/control's decision carries it as `decline_text`.
+  hold's text, and so do `front/a2a`'s refusals under `WithEscalation`:
+  a call the caller refuses reads the deferral's text, the caller's
+  note after it, and a call held beside it its own hold's.
+  `ChainBeforeToolCall` keeps it with the deferral that asks, and
+  front/control's decision carries it as `decline_text`.
   RFC 0001 draft 0.7, Nested calls. (#304)
 - Added: `tools/a2a.WithAskCaller`, which answers a remote task that
   waits only on calls front/a2a's `WithEscalation` put to its caller:
