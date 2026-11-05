@@ -1901,7 +1901,7 @@ of the events.
 | `run_end` | first, when a `turn_start` had neither a `response_end` nor a `model_blocked`, a failed `response` carrying the run's error; then `run` end, its `pending` list naming the run's calls left without an output, an earlier run's call the run wrote a decision or a `dispatch` for among them, with the reason mapped onto the format's cascade: `done`, `input_required` and `error` as themselves, the error's text as `ref`; `aborted` as `interrupted` with the error's text, since the host asked; `stopped` as `aborted` when the last `response_end` was marked withheld, since the format reads a run whose last response is incomplete so, as `stopped` when the last response made calls, as `done` when it made none, and for a run with no response of its own as `stopped` when it answered a pending call and left none, `aborted` otherwise, with the cause as `ref`, and for a guard's stop the cause followed by the guard's error |
 | a record a tool writes while it runs, a question it asks the user | a record entry at the leaf, its `call_id` naming the call on the tool's context when the session holds it, or the nearest call up a nested call's chain that it holds. A question is two record entries: the question, written before it is put to the user, and the answer, written after it is given and naming the question's entry and carrying the decider the answer names, `human` when it names none, as Nested calls has it, so a run cut while the user was deciding shows the open question under the call that was waiting on it; both name the call the question is about, its tool and its parent, when the asker put that call on the context as the Nested calls section has it, and the question's entry takes that call's `call_id` when the context carries none the session holds |
 | a fold the transform reports | a `compaction` naming what was kept and what was pinned, with agentsession RFC 0001 0.21's `requested` for a fold a host or a person asked for, and its `instructions` when they gave the summariser any; a recorder MUST NOT write `requested` for a fold the budget or the loop's retry after a context-length refusal forced, nor `instructions` without `requested` (#306); or a record entry for a fold that failed, carrying, for one the transform backs off from, the split and the hash of the prefix it would have folded, so a transform seeded from the record in another process backs off from the same prefix |
-| `queued` | a `queued` entry with the item, the mode and the trigger, its richer facts included, and agentsession RFC 0001's `deliver: true` for an input that arrived as a delivery, before anything appends the item; the item entry that drains it names it in `queued_from` with the trigger as `source`. A run end closes the entries of the inputs it did not append, and the recorder writes them again after it, since the agent still holds them, a delivery again as one; so does a rewind. The loop's follow-up mode is spelled `follow_up` and the format's `followup`; a writer maps the one onto the other |
+| `queued` | a `queued` entry with the item, the mode and the trigger, its richer facts included, without the kind `human` for an input that names instruction layers, is copied or is hidden, as the item that drains it has its `source` (#303), and agentsession RFC 0001's `deliver: true` for an input that arrived as a delivery, before anything appends the item; the item entry that drains it names it in `queued_from` with the trigger as `source`. A run end closes the entries of the inputs it did not append, and the recorder writes them again after it, since the agent still holds them, a delivery again as one; so does a rewind. The loop's follow-up mode is spelled `follow_up` and the format's `followup`; a writer maps the one onto the other |
 
 Three rules follow from the writing discipline of that format and are
 met by the delivery rules here. An item is durable before the tool that
@@ -2035,15 +2035,22 @@ of an item, or the `trigger` of its `queued` entry, when the item names
 instruction layers, is copied or is hidden, since a message kept out of
 the person's view is not what they typed but one the host prompts
 with, as agentsession RFC 0001 counts a hidden reminder composed: the
-run's or the context's trigger is
-written for that item without its `kind`, and keeps its `ref`, its
-`source` and its other members, since a steer's `queued` entry is the
-only place its arrival is written; a trigger left with no member is
-not written (#303). A trigger without a kind reads as composed, and
-`instructions_part` says so of its own. An entry recorded before 0.21 that carries `human` beside
-either is read as composed, as agentsession RFC 0001 reads it, and a
-recorder queuing such an owed input again keeps its trigger as
-recorded. A layer named here carries no trust of its own, so the
+run's or the context's trigger is written for that item without its
+`kind`, and keeps its `ref`, its `source` and its other members, since
+a steer's `queued` entry is the only place its arrival is written; a
+trigger left with no member is not written (#303). agentsession RFC
+0001 reads a user message's words from its own trigger and two
+members alone: one naming `instructions_part` or `from_link` is
+composed whatever its trigger; otherwise a trigger of kind `human` is
+the person's words, one of another kind, an empty kind included, is
+not, and no trigger makes no claim, which a reader never presents as
+the person's either. `copied_from` and `visible` are not among those
+members: a copy or a hidden message is told from the person's words
+by its trigger alone, which is why a recorder clears the kind on them.
+An entry recorded before 0.21 that carries `human` beside
+`instructions_part` is read as composed, as agentsession RFC 0001
+reads it, and a recorder queuing such an owed input again keeps its
+trigger as recorded. A layer named here carries no trust of its own, so the
 item's trust MUST hold every label the host knows of each layer it
 names, beside any the content has for another reason, as agentsession
 RFC 0001's `instructions_part` has a writer carry them: the host, which
