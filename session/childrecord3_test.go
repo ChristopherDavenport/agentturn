@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/ChristopherDavenport/agentsession"
@@ -259,4 +260,125 @@ func TestANestedCallRunAgainWithNoChildOnTheRecordIsNotRunAfresh(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAHeldChildKeepsTheInputsItOwes is l6-3e round 3's held child: a
+// child whose policy held its call, nobody to ask, ended input-required
+// with a steer it had accepted and not taken, and the process stopped
+// before the parent wrote the call's output. The call run again under
+// its key fails input-required as the child left it, without running
+// it, and the steer the record owes stays queued in the child the host
+// is handed (agent.WithSpawn): once the host answers the held call, the
+// child's run takes the steer under the entry the record holds.
+func TestAHeldChildKeepsTheInputsItOwes(t *testing.T) {
+	ctx := context.Background()
+	store := &cutStore{Store: agentsession.NewMemoryStore()}
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spawned *agentturn.Agent
+	lookups := 0
+	lookup := agenttool.New("lookup", "", func(context.Context, echoArgs) (string, error) {
+		lookups++
+		return "FOUND", nil
+	})
+	steered := false
+	childCfg := agentturn.Config{Name: "child", Description: "looks up", Model: steeredChild{}, ModelName: "m", Tools: []agenttool.Tool{lookup},
+		BeforeToolCall: func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+			if !steered {
+				// A person steers the child while its policy holds
+				// the call.
+				steered = true
+				spawned.Steer(openresponses.UserText("also X"))
+			}
+			return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "a person approves lookups", By: agentsession.ByPolicy}, nil
+		}}
+	var armed atomic.Bool
+	child := func(rec *Recorder) agenttool.Tool {
+		return agent.New(childCfg, agent.WithRunContext(rec.ChildContext), agent.WithRecord(rec.ChildRecord),
+			agent.WithSpawn(func(_ string, a *agentturn.Agent) { spawned = a }),
+			agent.WithObserver(func(ctx context.Context, ev agentturn.Event) {
+				rec.Observe(ctx, ev)
+				if _, ok := ev.(*agentturn.RunEnd); ok && armed.Swap(false) {
+					// The process dies once the child's end is written
+					// and before the parent writes the call's output.
+					store.cut.Store(true)
+				}
+			}))
+	}
+	armed.Store(true)
+	parentCfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{child(rec)}}
+	a := agentturn.New(parentCfg)
+	unsub := rec.Attach(a)
+	_, _ = a.Prompt(ctx, openresponses.UserText("find"))
+	unsub()
+	store.cut.Store(false)
+	if !steered || lookups != 0 {
+		t.Fatalf("before the crash: steered %v, lookup ran %d times; want a steer and no run", steered, lookups)
+	}
+
+	rec, s, err = Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentCfg.Tools = []agenttool.Tool{child(rec)}
+	answers, err := ReplayAnswers(ctx, s, parentCfg.Tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(answers) != 1 || answers[0].Reason != agentturn.RunAgainKeyedReason {
+		t.Fatalf("answers = %+v, want the call run again under its key", answers)
+	}
+	opts, err := AgentOptions(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spawned = nil
+	b := agentturn.New(parentCfg, opts...)
+	defer rec.Attach(b)()
+	if _, err := b.Resume(ctx, answers...); err != nil {
+		t.Fatal(err)
+	}
+	if lookups != 0 {
+		t.Fatalf("lookup ran %d times on the call run again, want none: the child is held", lookups)
+	}
+	if spawned == nil {
+		t.Fatal("the host was handed no child holding the steer it owes")
+	}
+	pending := spawned.State().Pending
+	if len(pending) != 1 || pending[0].Call == nil {
+		t.Fatalf("the held child's pending = %+v, want its lookup", pending)
+	}
+	end, err := spawned.Resume(ctx, agentturn.Approve(pending[0].Call.CallID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text, _ := end.Answer(); text != "took X" {
+		t.Errorf("the child answered %q once its call was approved, want it to have taken its owed steer", text)
+	}
+
+	cs, err := store.Open(ctx, agentsession.SubsessionID(s.ID(), answers[0].CallID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var queued []string
+	drained := ""
+	for _, e := range cs.Entries() {
+		switch v := e.(type) {
+		case *agentsession.QueuedEntry:
+			queued = append(queued, v.ID)
+		case *agentsession.ItemEntry:
+			if m, ok := v.Item.(*openresponses.Message); ok && m.Text() == "also X" {
+				drained = v.QueuedFrom
+			}
+		}
+	}
+	if len(queued) == 0 || drained != queued[len(queued)-1] {
+		t.Errorf("queued entries %v, the steer drained from %q: want it taken from the entry the record owes", queued, drained)
+	}
+	if owed, err := cs.PendingQueued(cs.Leaf()); err != nil || len(owed) != 0 {
+		t.Errorf("the child still owes %d inputs (%v), want none", len(owed), err)
+	}
+	verifyAll(t, cs)
 }

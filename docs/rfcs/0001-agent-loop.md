@@ -1826,6 +1826,8 @@ An agent stands in four places inside another system:
   policy was deciding, which never started, put to the policy again,
   and one it held with nobody answering put to the policy again when
   the tool puts the child's deferrals to the caller's elicitor; a
+  child left held, its call failing input-required as the child left
+  it, keeps the inputs it owes queued until a run of it takes them; a
   child whose run had ended with nothing pending returns that end and
   runs nothing. A call run again under another key is another
   operation, and starts its callee afresh (#297). A call that repeats
@@ -2613,7 +2615,8 @@ it.
   callee from the record SHOULD report itself keyed, and a call run
   again under its key SHOULD continue that callee, so a deferral open
   when the process stopped is asked again under the same call, and the
-  inputs the callee owed are handed back to it; one
+  inputs the callee owed are handed back to it, and kept by a callee
+  still held until a run of it takes them; one
   whose callee the record does not hold fails with the outcome
   unknown rather than start it afresh, a nested call as much as one
   the model made (#297).

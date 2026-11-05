@@ -583,7 +583,9 @@ var ErrNoRecord = errors.New("outcome unknown: the call was run again after it w
 // goes back to its BeforeToolCall under [WithAskParent], which asks the
 // elicitor of the call that started the child again, under that call,
 // and otherwise the call fails input-required naming it, as the child
-// left it. A child that ended with nothing pending returns its recorded
+// left it, without running it: the inputs it owes stay queued in the
+// child, which [WithSpawn] hands the host as for any call, so the run
+// that answers the held call takes them. A child that ended with nothing pending returns its recorded
 // end ([Record.End]) without running, and one cut with nothing pending
 // continues its run. A loader's error fails the call before anything
 // runs, since running the child afresh could repeat its work. A
@@ -774,16 +776,12 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		runCfg.BeforeToolCall = asks.wrap(cfg.BeforeToolCall, elicit)
 	}
 	var answers []agentturn.Answer
+	// held says the restored child still waits on a call nobody may be
+	// asked about.
+	var held bool
 	if restored != nil {
 		var pending []agentturn.PendingCall
-		var held bool
 		answers, pending, held = restoredAnswers(restored, asks != nil)
-		if held {
-			// The child still waits on a call nobody may be asked
-			// about: the call fails as the child left it.
-			info := ChildInfo{Agent: a.cfg.Name, RunID: restored.RunID, Reason: agentturn.ReasonInputRequired, Pending: restored.Pending}
-			return agenttool.Result{Details: info}, &InputRequiredError{Agent: a.cfg.Name, RunID: restored.RunID, Pending: restored.Pending}
-		}
 		opts = append(append(opts, restored.Options...), agentturn.WithPending(pending))
 	}
 	child := agentturn.New(runCfg, opts...)
@@ -897,6 +895,18 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 				return agenttool.Result{}, fmt.Errorf("agent %q: hand back the child's owed input: %w", a.cfg.Name, err)
 			}
 		}
+	}
+	if held {
+		// The child still waits on a call nobody may be asked about:
+		// the call fails as the child left it, without running it. The
+		// inputs it owes stay queued in it, the child a host holds
+		// through WithSpawn, so the run that answers its call takes
+		// them, and owed on the record meanwhile.
+		mu.Lock()
+		done = true
+		mu.Unlock()
+		info := ChildInfo{Agent: a.cfg.Name, RunID: restored.RunID, Reason: agentturn.ReasonInputRequired, Pending: restored.Pending}
+		return agenttool.Result{Details: info}, &InputRequiredError{Agent: a.cfg.Name, RunID: restored.RunID, Pending: restored.Pending}
 	}
 	var end *agentturn.RunEnd
 	switch {
