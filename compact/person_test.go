@@ -94,28 +94,39 @@ func texts(items openresponses.Items) []string {
 // loop back.
 func TestThePersonsKeptMessagesHaveATotal(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		opts []Option
-		most int
+		name     string
+		opts     []Option
+		most     int
+		settings int
 	}{
-		{"default, a quarter of the budget", nil, 2},
-		{"a total of the budget", []Option{WithPersonTotal(8)}, 4},
-		{"a total over the budget", []Option{WithPersonTotal(100)}, 4},
+		{"default, a quarter of the budget", nil, 2, 0},
+		{"a total of the budget", []Option{WithPersonTotal(8)}, 4, 0},
+		{"a total over the budget", []Option{WithPersonTotal(100)}, 4, 0},
+		// The settings take half the budget: the total is held to half
+		// of what they leave (l6-3e L6).
+		{"a total over what the settings leave", []Option{WithPersonTotal(100)}, 2, 4},
 	} {
-		t.Run(tc.name, func(t *testing.T) { personTotalRun(t, tc.opts, tc.most) })
+		t.Run(tc.name, func(t *testing.T) { personTotalRun(t, tc.opts, tc.most, tc.settings) })
 	}
 }
 
-func personTotalRun(t *testing.T, opts []Option, most int) {
+// personTotalRun prompts twelve times under a budget of 8, settings
+// weighing settings of it, and checks no fold kept more than most of
+// the person's messages and no request outgrew the model, whose limit
+// is what the settings leave of the budget.
+func personTotalRun(t *testing.T, opts []Option, most, settings int) {
 	t.Helper()
 	s := &summarizer{reply: "They talked about things."}
+	if settings > 0 {
+		opts = append(opts, WithSettingsEstimator(func(openresponses.Request) int { return settings }))
+	}
 	tr := NewLocal(s, append([]Option{WithBudget(8), WithKeepLast(1), WithEstimator(count)}, opts...)...)
 	var folds []Fold
 	WithOnFold(func(_ context.Context, f Fold) error {
 		folds = append(folds, f)
 		return nil
 	})(tr)
-	m := &overflowing{limit: 8}
+	m := &overflowing{limit: 8 - settings}
 	var reqs []openresponses.Request
 	a := agentturn.New(agentturn.Config{Model: m, ModelName: "m", Transform: tr.Transform})
 	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {

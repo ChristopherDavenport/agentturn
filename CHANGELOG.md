@@ -150,7 +150,8 @@ versions may break the API.
   8 KiB), so after two folds the request still holds what the person
   asked. Only the newest are kept, up to `WithPersonTotal` tokens in
   all (a quarter of `WithBudget` by default, never more than half of
-  it, which leaves the summary and the kept tail room), so
+  what the request's settings leave of it, which leaves the summary
+  and the kept tail room), so
   the kept messages cannot grow from fold to fold until the request no
   longer fits; the older ones fold into the summary. `WithPin` adds to
   them. `session.TranscriptMarks` reads them from a
