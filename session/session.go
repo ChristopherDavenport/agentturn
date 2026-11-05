@@ -4583,6 +4583,17 @@ const cutOffRef = "cut off: closed on resume"
 // appended as the record has them, and Err naming the end for one
 // without an answer. The child's run
 // is observed as any is, and goes on at the session's leaf.
+//
+// A call whose dispatch the parent's writer has just written as its
+// first hand-off gets nil without a read of the record. Otherwise the
+// parent's session is opened, which the recorder holds already, and the
+// child's is read without a hold when the store is an
+// agentsession.Reader, and opened, taking the hold, only to close a run
+// the process cut. A store that guards sessions against a second
+// writing process, as agentsession's jsonl, cas and remote stores do,
+// refuses that open with agentsession.ErrSessionLocked while another
+// process holds the child, and the call fails with the error rather
+// than run again.
 func (r *Recorder) ChildRecord(ctx context.Context, call agenttool.Call, cfg agentturn.Config) (*agent.Record, error) {
 	if call.ID == "" || call.IdempotencyKey == "" {
 		return nil, nil
@@ -4598,6 +4609,13 @@ func (r *Recorder) ChildRecord(ctx context.Context, call agenttool.Call, cfg age
 		parent = p
 	}
 	parentID, children := parent.id, r.children
+	if c := parent.calls[call.ID]; c != nil && c.before != nil && c.before.handedOff == 0 {
+		// The parent's writer has just written the call's first
+		// hand-off: there is nothing on the record to continue, and no
+		// need to read the parent's path to know it.
+		r.mu.Unlock()
+		return nil, nil
+	}
 	r.mu.Unlock()
 	// What is read and written here is the record of work that may
 	// have happened, so a cancel does not cut it short.
@@ -4615,9 +4633,11 @@ func (r *Recorder) ChildRecord(ctx context.Context, call agenttool.Call, cfg age
 	case childID == "":
 		return nil, fmt.Errorf("%w (session %s links no child to call %s after its hand-off)", agent.ErrNoRecord, parentID, call.ID)
 	}
-	cs, err := r.store.Open(bg, childID)
+	// Read without a hold: a child returned as its end is not written,
+	// and one that goes on is opened by the run that writes it.
+	cs, err := r.peek(bg, childID)
 	if err != nil {
-		return nil, fmt.Errorf("session: open the child session %s: %w", childID, err)
+		return nil, fmt.Errorf("session: read the child session %s: %w", childID, err)
 	}
 	r.mu.Lock()
 	r.addChild(cs.ID())
@@ -4636,6 +4656,9 @@ func (r *Recorder) ChildRecord(ctx context.Context, call agenttool.Call, cfg age
 	if last.End == nil {
 		// The process stopped inside the run: the writer that goes on
 		// closes it, as Resume closes the root's.
+		if cs, err = r.store.Open(bg, childID); err != nil {
+			return nil, fmt.Errorf("session: open the child session %s: %w", childID, err)
+		}
 		w := newWriter(r, childID)
 		if err := w.closeOpenRun(bg, cs, agentsession.ReasonError, cutOffRef, true); err != nil {
 			return nil, err
@@ -7802,14 +7825,28 @@ func (w *writer) child(ctx context.Context, callID string, info agent.ChildInfo)
 	return w.link(ctx, cw.id, callID)
 }
 
+// peek reads the session id without taking the store's hold of it,
+// through agentsession.Reader when the store is one, as every store
+// agentsession offers is, and through Open otherwise: for a session
+// the recorder reads and may not write, whose hold would otherwise stay
+// with this process until the store lets it go.
+func (r *Recorder) peek(ctx context.Context, id string) (*agentsession.Session, error) {
+	if rd, ok := r.store.(agentsession.Reader); ok {
+		return rd.Read(ctx, id)
+	}
+	return r.store.Open(ctx, id)
+}
+
 // holdsRun returns the ID of the call's child session of w when it
-// holds the run runID, and "" otherwise.
+// holds the run runID, and "" otherwise. It reads the session without
+// a hold ([Recorder.peek]): one that does not hold the run is about to
+// be written, and the writer that does opens it.
 func (r *Recorder) holdsRun(ctx context.Context, w *writer, callID, runID string) string {
 	if runID == "" {
 		return ""
 	}
 	id := agentsession.SubsessionID(w.id, callID)
-	s, err := r.store.Open(context.WithoutCancel(ctx), id)
+	s, err := r.peek(context.WithoutCancel(ctx), id)
 	if err != nil || s.Leaf() == "" {
 		return ""
 	}

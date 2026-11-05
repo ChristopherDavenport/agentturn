@@ -501,3 +501,105 @@ func TestChildRecordCallsTheHostOutsideTheRecordersLock(t *testing.T) {
 		t.Fatal("ChildRecord deadlocked: the child's ToolProvider waits on the recorder's lock")
 	}
 }
+
+// openCounter counts the store's opens of each session, which take the
+// hold of a store that guards its sessions, and fails every append
+// while cut is set. It reads without a hold, as agentsession's stores
+// do.
+type openCounter struct {
+	*agentsession.MemoryStore
+	cut   atomic.Bool
+	mu    sync.Mutex
+	opens map[string]int
+}
+
+func (s *openCounter) Open(ctx context.Context, id string) (*agentsession.Session, error) {
+	s.mu.Lock()
+	if s.opens == nil {
+		s.opens = map[string]int{}
+	}
+	s.opens[id]++
+	s.mu.Unlock()
+	return s.MemoryStore.Open(ctx, id)
+}
+
+func (s *openCounter) Append(ctx context.Context, id string, e agentsession.Entry) (string, error) {
+	if s.cut.Load() {
+		return "", errors.New("the process died")
+	}
+	return s.MemoryStore.Append(ctx, id, e)
+}
+
+func (s *openCounter) count(id string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.opens[id]
+}
+
+func (s *openCounter) reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.opens = nil
+}
+
+// TestChildRecordReadsOnlyWhatItNeeds is l6-3e's L3: a keyed call's
+// first hand-off, which the parent's writer has just written as the
+// call's first, is not looked up on the record, so it does not read
+// the parent's session; and a child the record returns as its end,
+// which nothing writes, is read without taking the store's hold of it.
+func TestChildRecordReadsOnlyWhatItNeeds(t *testing.T) {
+	ctx := context.Background()
+	store := &openCounter{MemoryStore: agentsession.NewMemoryStore()}
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	childCfg := agentturn.Config{Name: "child", Description: "echoes", Model: &echo.Adapter{}, ModelName: "m"}
+	child := func(rec *Recorder) agenttool.Tool {
+		return agent.New(childCfg, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext), agent.WithRecord(rec.ChildRecord))
+	}
+	callID := ""
+	parentCfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{child(rec)},
+		AfterToolCall: func(_ context.Context, info agentturn.ToolResultInfo) (*agentturn.ToolOverride, error) {
+			// The process dies once the child has answered.
+			callID = info.Call.CallID
+			store.cut.Store(true)
+			return nil, nil
+		}}
+	store.reset()
+	a := agentturn.New(parentCfg)
+	unsub := rec.Attach(a)
+	_, _ = a.Prompt(ctx, openresponses.UserText("find"))
+	unsub()
+	store.cut.Store(false)
+	if n := store.count(s.ID()); n != 0 {
+		t.Errorf("the first call opened the parent's session %d times, want none", n)
+	}
+
+	rec, s, err = Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentCfg.Tools, parentCfg.AfterToolCall = []agenttool.Tool{child(rec)}, nil
+	answers, err := ReplayAnswers(ctx, s, parentCfg.Tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts, err := AgentOptions(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := agentturn.New(parentCfg, opts...)
+	defer rec.Attach(b)()
+	store.reset()
+	end, err := b.Resume(ctx, answers...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if end.Reason != agentturn.ReasonDone {
+		t.Fatalf("resume ended %s: %v", end.Reason, end.Err)
+	}
+	if n := store.count(agentsession.SubsessionID(s.ID(), callID)); n != 0 {
+		t.Errorf("the recorded end opened the child's session %d times, want it read without a hold", n)
+	}
+}
