@@ -413,7 +413,13 @@ type ItemEnd struct {
 	// [Trigger], so a recorder can write how the input arrived; it is
 	// zero for every other item, a queued input included, whose own
 	// trigger rode on its [Queued] report, and an output [Agent.Resume]
-	// appends for a pending call, whose decision says who gave it.
+	// appends for a pending call, whose decision says who gave it. It
+	// says how the input arrived, not who wrote the item: the loop
+	// carries it unread, so an item composed from layers, copied or
+	// hidden that a run a person started was prompted with carries the
+	// kind [TriggerHuman] here, which a session recorder clears in the
+	// record (#303). The record is the truth; a live view tells such an
+	// item by its Provenance, Copied and Hidden, never by this kind.
 	Trigger Trigger
 	// ModelCallID is the call ID the model gave a function call the
 	// loop gave an ID of its own, because the model's named a call in
@@ -1092,7 +1098,11 @@ type Queued struct {
 	// [Agent.Queue], zero for [Agent.Steer] and [Agent.FollowUp]: the
 	// run start names what started the run, and an input that joins it
 	// has a provenance of its own. It is the Source of the item's
-	// [Provenance] when that names one.
+	// [Provenance] when that names one. Like [ItemEnd.Trigger] it says
+	// how the input arrived, not who wrote it: a composed, copied or
+	// hidden item queued under the kind [TriggerHuman] carries that kind
+	// here, and a session recorder writes its queued entry without it
+	// (#303).
 	Trigger Trigger
 	// Provenance is what the caller marked the item with through
 	// [WithProvenance], nil for none. The item's own events carry it
