@@ -23,6 +23,11 @@ versions may break the API.
   `VisibleMember`, `TrustMember` and `InstructionsPartMember` are
   deprecated, kept for a reader of such a session. RFC 0001 draft 0.7.
   (agentsession#278)
+- Changed: `session.Recorder` merges a provenance's trust labels into
+  a copied item's trust, which agentsession RFC 0001 0.21 lets hold
+  more labels than its source, where v0.0.37 refused the item and
+  ended the run with its error. An empty provenance trust adds none.
+  RFC 0001 draft 0.7. (agentsession#279)
 
 ## v0.0.37 - 2026-11-04
 

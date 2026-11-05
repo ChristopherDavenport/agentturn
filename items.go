@@ -82,10 +82,8 @@ func Unhide(item openresponses.Item) (openresponses.Item, bool) {
 // and writes no decision for a call so marked or its output, since the
 // call is not this session's. Use it where [Hidden] may be used; the
 // marks compose, and [Unhide] strips them all. A copy's trust is the
-// trust of what it copies, so a [Provenance] trust on a copied item is
-// not written, and one naming a label the copy's source lacks is
-// refused by a session recorder, ending the run with its error; see
-// [Provenance.Trust].
+// trust of what it copies, and a [Provenance] trust on a copied item
+// adds its labels to it; see [Provenance.Trust].
 func Copied(item openresponses.Item) openresponses.Item {
 	if item == nil {
 		return nil
@@ -124,14 +122,11 @@ type Provenance struct {
 	// Zero leaves the item the trigger it is handed in under.
 	Source Trigger
 	// Trust is what the host knows of the content's trust; nil says
-	// nothing. On an item also marked [Copied] it adds nothing: a copy
-	// carries the trust of what it copies, as written, and a session
-	// recorder refuses one whose Trust names a label that trust does
-	// not hold rather than drop it. The refusal is the recorder's
-	// error on the item's item_end, so the run ends with it and the
-	// item is in the agent's transcript but not in the record. That
-	// holds until agentsession lets a copy's trust be wider than its
-	// source's (agentsession#279).
+	// nothing. On an item also marked [Copied] a session recorder
+	// merges its labels into the trust the copy carries from what it
+	// copies, since agentsession's format 0.21 lets a copy's trust hold
+	// more labels than its source's, never fewer (agentsession#279); an
+	// empty list adds nothing there.
 	Trust *Trust
 }
 

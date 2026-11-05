@@ -239,12 +239,12 @@ func TestAnOwedQueuedInputKeepsItsMarksAcrossARestart(t *testing.T) {
 	}
 }
 
-// TestACopysTrustIsNotSilentlyNarrowed pins the choice made for a
-// copied item that also carries a provenance trust: the format has a
-// copy carry the trust of what it copies as written, so the host's
-// labels cannot be added; a recorder that would drop one refuses
-// instead, and one the copy's trust already holds loses nothing.
-func TestACopysTrustIsNotSilentlyNarrowed(t *testing.T) {
+// TestACopysTrustTakesTheHostsLabels pins agentsession#279's
+// follow-up: a copied item carries the trust it was copied with, and a
+// host's provenance labels are merged into it, since format 0.21 lets a
+// copy's trust hold more labels than its source's, never fewer. An
+// empty provenance trust adds nothing.
+func TestACopysTrustTakesTheHostsLabels(t *testing.T) {
 	copyOf := func(reads ...string) *agentsession.ItemEntry {
 		return &agentsession.ItemEntry{Item: openresponses.UserText("copied"), CopiedFrom: &agentsession.CopiedFrom{Session: "s"}, Trust: &agentsession.Trust{Reads: reads}}
 	}
@@ -255,17 +255,17 @@ func TestACopysTrustIsNotSilentlyNarrowed(t *testing.T) {
 	if err := recordProvenance(e, prov(agenttool.LabelUntrusted)); err != nil || !slices.Equal(e.Trust.Reads, []string{"untrusted"}) {
 		t.Errorf("held labels: err=%v trust=%+v", err, e.Trust)
 	}
-	e = copyOf()
-	if err := recordProvenance(e, prov()); err != nil {
-		t.Errorf("an empty trust: %v", err)
+	e = &agentsession.ItemEntry{Item: openresponses.UserText("copied"), CopiedFrom: &agentsession.CopiedFrom{Session: "s"}}
+	if err := recordProvenance(e, prov()); err != nil || e.Trust != nil {
+		t.Errorf("an empty trust: err=%v trust=%+v, want nothing added", err, e.Trust)
 	}
 	e = copyOf("untrusted")
-	if err := recordProvenance(e, prov(agenttool.LabelPrivate)); err == nil {
-		t.Errorf("a label the copy cannot hold was dropped: trust %+v", e.Trust)
+	if err := recordProvenance(e, prov(agenttool.LabelPrivate)); err != nil || !slices.Equal(e.Trust.Reads, []string{"untrusted", "private"}) {
+		t.Errorf("a label the source lacks: err=%v trust=%+v, want it merged", err, e.Trust)
 	}
 	e = &agentsession.ItemEntry{Item: openresponses.UserText("copied"), CopiedFrom: &agentsession.CopiedFrom{Session: "s"}}
-	if err := recordProvenance(e, prov(agenttool.LabelUntrusted)); err == nil {
-		t.Errorf("a label dropped from a copy with no trust: trust %+v", e.Trust)
+	if err := recordProvenance(e, prov(agenttool.LabelUntrusted)); err != nil || e.Trust == nil || !slices.Equal(e.Trust.Reads, []string{"untrusted"}) {
+		t.Errorf("a copy with no trust: err=%v trust=%+v, want the label", err, e.Trust)
 	}
 }
 

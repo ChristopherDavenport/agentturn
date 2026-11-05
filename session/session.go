@@ -6064,9 +6064,9 @@ func (w *writer) item(ctx context.Context, item openresponses.Item, responseID s
 // recordProvenance writes on e what the host said of the item it
 // composed: the layers a message was composed from as
 // instructions_part, a single object for one and a list for several,
-// and its trust, unless the item is a copy, whose trust is the one it
-// was copied with: it refuses a copy whose provenance carries a label
-// that trust does not hold, rather than drop it.
+// and its trust, which on a copy is merged into the trust it was copied
+// with (format 0.21, agentsession#279). It refuses nothing today; the
+// error is kept for a provenance the record cannot hold.
 func recordProvenance(e *agentsession.ItemEntry, prov *agentturn.Provenance) error {
 	if prov == nil {
 		return nil
@@ -6093,17 +6093,23 @@ func recordProvenance(e *agentsession.ItemEntry, prov *agentturn.Provenance) err
 		e.Trust = &agentsession.Trust{Reads: reads}
 		return nil
 	}
-	// A copy carries the trust of what it copies, as written: the
-	// host's labels cannot be added to it, and one it does not hold
-	// would be dropped without a word, so the item is refused.
-	var held []string
+	// A copy carries the trust of what it copies, and format 0.21 lets
+	// it hold more labels, never fewer (agentsession#279): the host's
+	// labels are merged into it. An empty trust adds none, and leaves a
+	// copy that carries none with none.
+	var merged []string
 	if e.Trust != nil {
-		held = e.Trust.Reads
+		merged = slices.Clone(e.Trust.Reads)
 	}
+	added := false
 	for _, l := range reads {
-		if !slices.Contains(held, l) {
-			return fmt.Errorf("session: copied %s item: its provenance labels it %q, which the trust it was copied with does not hold and a copy cannot add", e.Item.ItemType(), l)
+		if !slices.Contains(merged, l) {
+			merged = append(merged, l)
+			added = true
 		}
+	}
+	if added {
+		e.Trust = &agentsession.Trust{Reads: merged}
 	}
 	return nil
 }

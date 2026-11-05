@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"github.com/ChristopherDavenport/agentsession"
@@ -181,6 +182,70 @@ func TestACopyThatNamesNoEntryCarriesItsPathsTrust(t *testing.T) {
 		if !ie.Trust.Untrusted() {
 			t.Errorf("%s copied with no entry carries trust %+v, want the parent path's untrusted", ie.Item.ItemType(), ie.Trust)
 		}
+	}
+	if err := child.VerifyCopies(func(id string) (*agentsession.Session, error) { return store.Open(ctx, id) }); err != nil {
+		t.Errorf("verify copies: %v", err)
+	}
+	verifyAll(t, child)
+}
+
+// TestAHostMarksACopyMoreCautiously pins agentsession#279's follow-up
+// end to end: a parent's item a child is prompted with, which the host
+// labels untrusted, is recorded in the child copied, with the label
+// merged into the trust it was copied with, and the copy verifies; the
+// run no longer ends with the recorder's refusal.
+func TestAHostMarksACopyMoreCautiously(t *testing.T) {
+	type taskArgs struct {
+		Input string `json:"input"`
+	}
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := agent.New(agentturn.Config{Name: "helper", Description: "helps", Model: &echo.Adapter{}, ModelName: "child"},
+		agent.WithCallConfig(func(_ context.Context, a taskArgs, parent agentturn.Transcript, cfg agentturn.Config) (agentturn.Config, openresponses.Items, error) {
+			var items openresponses.Items
+			for _, item := range parent {
+				if m, ok := item.(*openresponses.Message); ok && m.Text() == "delegate" {
+					marked, err := agentturn.WithProvenance(item, agentturn.Provenance{Trust: &agentturn.Trust{Reads: []agenttool.Label{agenttool.LabelUntrusted}}})
+					if err != nil {
+						return cfg, nil, err
+					}
+					item = marked
+				}
+				items = append(items, item)
+			}
+			return cfg, append(items, openresponses.UserText(a.Input)), nil
+		}),
+		agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext))
+	a := agentturn.New(agentturn.Config{Model: scriptedCalls{{"helper", `{"input":"summarise"}`}}, ModelName: "parent", Tools: []agenttool.Tool{helper}})
+	defer rec.Attach(a)()
+	if end, err := a.Prompt(ctx, openresponses.UserText("delegate")); err != nil || end.Reason != agentturn.ReasonDone {
+		t.Fatalf("prompt: err=%v end=%+v", err, end)
+	}
+	l := links(s)
+	if len(l) != 1 {
+		t.Fatalf("links = %+v", l)
+	}
+	child, err := store.Open(ctx, l[0].Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, e := range child.Path(child.Leaf()) {
+		if ie, ok := e.(*agentsession.ItemEntry); ok {
+			if m, ok := ie.Item.(*openresponses.Message); ok && m.Text() == "delegate" {
+				found = true
+				if ie.CopiedFrom == nil || ie.CopiedFrom.Session != s.ID() || ie.Trust == nil || !slices.Equal(ie.Trust.Reads, []string{"untrusted"}) {
+					t.Errorf("copied message: copied_from %+v trust %+v, want the parent's entry with the host's label", ie.CopiedFrom, ie.Trust)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("the child holds no copy of the parent's message")
 	}
 	if err := child.VerifyCopies(func(id string) (*agentsession.Session, error) { return store.Open(ctx, id) }); err != nil {
 		t.Errorf("verify copies: %v", err)
