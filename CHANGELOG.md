@@ -121,9 +121,13 @@ versions may break the API.
   `WithPersonMessages`, `Agent.SetPersonMessages` and
   `ContextWithPersonMessages` give them for a rebuilt transcript.
   `compact`'s folds keep them verbatim after the summary, as pinned
-  items, up to `WithPersonBound` bytes (`DefaultPersonBound`, 8 KiB),
-  so after two folds the request still holds what the person asked;
-  `WithPin` adds to them. `session.TranscriptMarks` reads them from a
+  items, each up to `WithPersonBound` bytes (`DefaultPersonBound`,
+  8 KiB), so after two folds the request still holds what the person
+  asked. Only the newest are kept, up to `WithPersonTotal` tokens in
+  all (a quarter of `WithBudget` by default, never more than it), so
+  the kept messages cannot grow from fold to fold until the request no
+  longer fits; the older ones fold into the summary. `WithPin` adds to
+  them. `session.TranscriptMarks` reads them from a
   record, a message a fold pinned included, and `session.AgentOptions`
   and `MoveTo` seed the agent with them. A host that relied on a fold
   summarising every message the person typed under `human` passes

@@ -26,9 +26,10 @@
 // transcript was split; [Transform.Last] returns the latest summary.
 // A fold keeps the person's own messages of the folded prefix verbatim
 // after the summary, those the loop names on the transform's context
-// (agentturn.PersonMessagesFromContext) up to [WithPersonBound], so
-// after two folds the request still holds what the person asked for
-// and not a summary's paraphrase of it. [WithPin] keeps more chosen
+// (agentturn.PersonMessagesFromContext) up to [WithPersonBound] each
+// and the newest of them up to [WithPersonTotal] in all, so after two
+// folds the request still holds what the person asked for and not a
+// summary's paraphrase of it. [WithPin] keeps more chosen
 // items so, for context a harness injected that must not become
 // whatever the summary made of it. [WithRequest] edits the summary
 // request [NewLocal] sends, so it can carry the reasoning setting the
@@ -223,6 +224,24 @@ const DefaultPersonBound = 8 << 10
 // and [WithPin] still keeps what it names.
 func WithPersonBound(bytes int) Option { return func(t *Transform) { t.personBound = bytes } }
 
+// WithPersonTotal sets the total, in the estimator's tokens, up to
+// which a fold keeps the person's own messages [WithPersonBound]
+// admits: the newest of them, counted back from the end of the part it
+// folds, until the next would pass the total; that one and every older
+// one are folded into the summary, which an earlier fold that kept
+// them had summarised too. Without a total the kept messages would
+// grow with every fold, until they alone passed the budget, every
+// call folded again and the loop's retry after an overflow, which
+// folds with the same kept messages, failed too. The default is a
+// quarter of [WithBudget], so the summary, the kept tail and the
+// request's settings keep the rest; a total over the budget counts as
+// the budget, so the kept messages never pass it alone. Zero or less
+// keeps none of them. [WithPin]'s items are the host's choice and do
+// not count against it.
+func WithPersonTotal(tokens int) Option {
+	return func(t *Transform) { t.personTotal, t.personTotalSet = tokens, true }
+}
+
 // WithFilter sets the filter applied to the items sent to be folded,
 // so app-only items never reach the server. The default is
 // agentturn.DefaultFilter; pass the same function as Config.Filter.
@@ -302,8 +321,9 @@ type Fold struct {
 	// for a [NewLocal] fold that asked again.
 	Attempts int
 	// Pinned are the items of the folded prefix the fold kept, in their
-	// order: the person's own messages within [WithPersonBound] and the
-	// items [WithPin] names. They follow Output on the request and are not part
+	// order: the newest of the person's own messages within
+	// [WithPersonBound] and [WithPersonTotal], and the items [WithPin]
+	// names. They follow Output on the request and are not part
 	// of it.
 	Pinned openresponses.Items
 	// Request is the request [NewLocal] sent for the fold's last
@@ -394,7 +414,11 @@ type Transform struct {
 	summaryItem func(string) openresponses.Item
 	pin         func(openresponses.Item) bool
 	personBound int
-	request     func(*openresponses.Request)
+	// personTotal is WithPersonTotal's, when personTotalSet; the
+	// default is a quarter of the budget.
+	personTotal    int
+	personTotalSet bool
+	request        func(*openresponses.Request)
 
 	mu sync.Mutex
 	// next says FoldNext asked the next call to fold whatever its
@@ -968,20 +992,47 @@ func (t *Transform) backOff(items agentturn.Transcript, split, tokens int) bool 
 }
 
 // pinned returns the items of the folded prefix that the pin keeps and
-// the person's own messages among them within the bound, in their
-// order, filtered as the request is so an app-only item never reaches
-// the server.
+// the person's own messages among them within the bound and the
+// newest of those within the total, in their order, filtered as the
+// request is so an app-only item never reaches the server.
 func (t *Transform) pinned(prefix agentturn.Transcript, persons agentturn.PersonMessages) openresponses.Items {
-	if t.pin == nil && (len(persons) == 0 || t.personBound <= 0) {
+	total := t.personTotalOf()
+	if t.pin == nil && (len(persons) == 0 || t.personBound <= 0 || total <= 0) {
 		return nil
 	}
+	filtered := t.filter(prefix)
+	// The person's messages kept, chosen newest first until the next
+	// would pass the total (#298, l6-3c M1).
+	kept := make([]bool, len(filtered))
+	used := 0
+	for i := len(filtered) - 1; i >= 0 && total > 0; i-- {
+		item := filtered[i]
+		if !t.keepsPerson(persons, item) {
+			continue
+		}
+		used += t.estimate(openresponses.Items{item})
+		if used > total {
+			break
+		}
+		kept[i] = true
+	}
 	var out openresponses.Items
-	for _, item := range t.filter(prefix) {
-		if (t.pin != nil && t.pin(item)) || t.keepsPerson(persons, item) {
+	for i, item := range filtered {
+		if (t.pin != nil && t.pin(item)) || kept[i] {
 			out = append(out, item)
 		}
 	}
 	return out
+}
+
+// personTotalOf is the total [WithPersonTotal] sets, a quarter of the
+// budget by default, and never more than the budget.
+func (t *Transform) personTotalOf() int {
+	total := t.budget / 4
+	if t.personTotalSet {
+		total = t.personTotal
+	}
+	return min(total, t.budget)
 }
 
 // keepsPerson reports whether item is one of the person's own messages

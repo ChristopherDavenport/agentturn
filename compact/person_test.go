@@ -2,6 +2,7 @@ package compact
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -18,7 +19,7 @@ import (
 // are folded like any other item.
 func TestAFoldKeepsThePersonsOwnMessages(t *testing.T) {
 	s := &summarizer{reply: "They talked about things."}
-	tr := NewLocal(s, WithBudget(3), WithKeepLast(1), WithEstimator(count), WithPersonBound(200))
+	tr := NewLocal(s, WithBudget(3), WithKeepLast(1), WithEstimator(count), WithPersonBound(200), WithPersonTotal(3))
 	var folds []Fold
 	WithOnFold(func(_ context.Context, f Fold) error {
 		folds = append(folds, f)
@@ -80,4 +81,72 @@ func texts(items openresponses.Items) []string {
 		}
 	}
 	return out
+}
+
+// TestThePersonsKeptMessagesHaveATotal is the l6-3c review's M1: many
+// small messages a person typed, across several folds, are kept up to
+// a total, a quarter of the budget by default, the newest of them,
+// while the older ones fold into the summary. Without the total the
+// kept messages grow with every fold until the request no longer fits:
+// the overflow retry folds with the same pins and fails again.
+func TestThePersonsKeptMessagesHaveATotal(t *testing.T) {
+	s := &summarizer{reply: "They talked about things."}
+	tr := NewLocal(s, WithBudget(8), WithKeepLast(1), WithEstimator(count))
+	var folds []Fold
+	WithOnFold(func(_ context.Context, f Fold) error {
+		folds = append(folds, f)
+		return nil
+	})(tr)
+	m := &overflowing{limit: 8}
+	var reqs []openresponses.Request
+	a := agentturn.New(agentturn.Config{Model: m, ModelName: "m", Transform: tr.Transform})
+	a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+		if ts, ok := ev.(*agentturn.TurnStart); ok {
+			reqs = append(reqs, ts.Request)
+		}
+		return nil
+	})
+	person := agentturn.ContextWithTrigger(context.Background(), agentturn.Trigger{Kind: agentturn.TriggerHuman})
+	var asked openresponses.Items
+	for i := range 12 {
+		ask := openresponses.UserText(fmt.Sprintf("Step %d, please.", i))
+		asked = append(asked, ask)
+		end, err := a.Prompt(person, ask)
+		if err != nil {
+			t.Fatalf("prompt %d: %v", i, err)
+		}
+		if end.Reason != agentturn.ReasonDone {
+			t.Fatalf("prompt %d ended %s (%v): the kept messages outgrew the request", i, end.Reason, end.Err)
+		}
+	}
+	if len(folds) < 3 {
+		t.Fatalf("folds = %d, want several", len(folds))
+	}
+	for i, f := range folds {
+		if len(f.Pinned) > 2 {
+			t.Errorf("fold %d pinned %d messages, want at most a quarter of the budget, 2: %v", i+1, len(f.Pinned), texts(f.Pinned))
+		}
+		if len(f.Pinned) == 0 {
+			t.Errorf("fold %d pinned nothing", i+1)
+			continue
+		}
+		// The newest of them: a run of the person's messages with no
+		// gap, so an older one folded and a newer one did not.
+		first := slices.Index(asked, f.Pinned[0])
+		if first < 0 || first+len(f.Pinned) > len(asked) || !slices.Equal(f.Pinned, asked[first:first+len(f.Pinned)]) {
+			t.Errorf("fold %d pinned %v, want a run of the newest", i+1, texts(f.Pinned))
+		}
+		// Each prompt is one request, whose kept tail is the prompt
+		// itself, so the folded part's newest message is the one before.
+		if k := slices.Index(asked, f.First); k < 1 || f.Pinned[len(f.Pinned)-1] != asked[k-1] {
+			t.Errorf("fold %d kept %v before %v, want the newest of the folded part", i+1, texts(f.Pinned), texts(openresponses.Items{f.First}))
+		}
+	}
+	last := reqs[len(reqs)-1].Input
+	if len(last) > m.limit {
+		t.Errorf("the last request holds %d items, over the model's %d", len(last), m.limit)
+	}
+	if slices.Contains(last, asked[0]) {
+		t.Errorf("the last request still kept the first message, which the total folds: %v", texts(last))
+	}
 }

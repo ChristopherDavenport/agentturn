@@ -25,7 +25,7 @@ func TestAResumeKnowsThePersonsMessages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr := compact.NewLocal(&echo.Adapter{}, compact.WithBudget(4), compact.WithKeepLast(2),
+	tr := compact.NewLocal(&echo.Adapter{}, compact.WithBudget(4), compact.WithKeepLast(2), compact.WithPersonTotal(4),
 		compact.WithEstimator(countItems), compact.WithOnFold(rec.Fold))
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Transform: tr.Transform})
 	detach := rec.Attach(a)
@@ -59,7 +59,7 @@ func TestAResumeKnowsThePersonsMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 	var seen []string
-	tr2 := compact.NewLocal(&echo.Adapter{}, compact.WithBudget(4), compact.WithKeepLast(2),
+	tr2 := compact.NewLocal(&echo.Adapter{}, compact.WithBudget(4), compact.WithKeepLast(2), compact.WithPersonTotal(4),
 		compact.WithEstimator(countItems), compact.WithOnFold(rec2.Fold))
 	transform := func(ctx context.Context, t agentturn.Transcript) (agentturn.Transcript, error) {
 		if seen == nil {
