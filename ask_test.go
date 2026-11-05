@@ -84,6 +84,7 @@ func TestAsk(t *testing.T) {
 		// elicit is installed on the context; nil installs none.
 		elicit     agenttool.Elicitor
 		reason     string
+		decline    string
 		wantOK     bool
 		wantAction ToolAction
 		wantReason string
@@ -97,6 +98,9 @@ func TestAsk(t *testing.T) {
 		{name: "decline", elicit: answers(agenttool.Answer{Action: agenttool.ActionDecline}), reason: "rule r", wantOK: true, wantAction: Block, wantReason: "declined when asked: rule r"},
 		{name: "decline, no reason", elicit: answers(agenttool.Answer{Action: agenttool.ActionDecline}), wantOK: true, wantAction: Block, wantReason: "declined when asked"},
 		{name: "decline, with a note", elicit: answers(agenttool.Answer{Action: agenttool.ActionDecline, Note: "use the fixture"}), reason: "rule r", wantOK: true, wantAction: Block, wantReason: "declined when asked: rule r; the user said: use the fixture"},
+		{name: "decline with the host's text", elicit: answers(agenttool.Answer{Action: agenttool.ActionDecline}), reason: "rule r", decline: "the host keeps reads for itself", wantOK: true, wantAction: Block, wantReason: "the host keeps reads for itself"},
+		{name: "decline with the host's text and a note", elicit: answers(agenttool.Answer{Action: agenttool.ActionDecline, Note: "use the fixture", By: agenttool.ByAgent}), reason: "rule r", decline: "the host keeps reads for itself", wantOK: true, wantAction: Block, wantReason: "the host keeps reads for itself; another agent said: use the fixture", wantBy: "agent"},
+		{name: "accept with a decline text", elicit: answers(agenttool.Answer{Action: agenttool.ActionAccept}), reason: "rule r", decline: "the host keeps reads for itself", wantOK: true, wantAction: Allow, wantReason: "rule r"},
 		{name: "accept, with a note", elicit: answers(agenttool.Answer{Action: agenttool.ActionAccept, Note: "only this once"}), reason: "rule r", wantOK: true, wantAction: Allow, wantReason: "rule r", wantNote: "The user said: only this once"},
 		{name: "accept by a rule, with a note", elicit: answers(agenttool.Answer{Action: agenttool.ActionAccept, Note: "only this once", By: agenttool.ByPolicy}), reason: "rule r", wantOK: true, wantAction: Allow, wantReason: "rule r", wantNote: "The policy said: only this once", wantBy: "policy"},
 		{name: "decline by another model, with a note", elicit: answers(agenttool.Answer{Action: agenttool.ActionDecline, Note: "use the fixture", By: agenttool.ByAgent}), reason: "rule r", wantOK: true, wantAction: Block, wantReason: "declined when asked: rule r; another agent said: use the fixture", wantBy: "agent"},
@@ -120,7 +124,7 @@ func TestAsk(t *testing.T) {
 					return tc.elicit(ctx, q)
 				})
 			}
-			deferral := &ToolDecision{Action: Defer, Reason: tc.reason, By: "policy"}
+			deferral := &ToolDecision{Action: Defer, Reason: tc.reason, By: "policy", DeclineText: tc.decline}
 			call := AskedCall{Parent: "call_p", CallID: "call_n", Name: "read", Args: json.RawMessage(`{"text":"go.mod"}`), Decision: deferral}
 			d, ok := Ask(ctx, call)
 			if ok != tc.wantOK {
@@ -128,7 +132,7 @@ func TestAsk(t *testing.T) {
 			}
 			// The deferral is the caller's to keep: Ask never writes
 			// to it.
-			if deferral.Action != Defer || deferral.Reason != tc.reason || deferral.By != "policy" {
+			if deferral.Action != Defer || deferral.Reason != tc.reason || deferral.By != "policy" || deferral.DeclineText != tc.decline {
 				t.Errorf("the deferral was changed: %+v", deferral)
 			}
 			if tc.elicit != nil {

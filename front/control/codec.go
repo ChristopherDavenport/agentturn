@@ -775,6 +775,9 @@ type wireDecision struct {
 	Note      string          `json:"note,omitempty"`
 	Held      bool            `json:"held,omitempty"`
 	Subject   string          `json:"subject,omitempty"`
+	// DeclineText is the host's text for a decline of the deferred
+	// call (#304).
+	DeclineText string `json:"decline_text,omitempty"`
 }
 
 var actionNames = map[agentturn.ToolAction]string{agentturn.Allow: "allow", agentturn.Block: "block", agentturn.Defer: "defer"}
@@ -787,14 +790,14 @@ func decisionOut(d *agentturn.ToolDecision) *wireDecision {
 	if !ok {
 		action = fmt.Sprintf("action(%d)", d.Action)
 	}
-	return &wireDecision{Action: action, Reason: d.Reason, Terminate: d.Terminate, Args: d.Args, By: d.By, Note: d.Note, Held: d.Held, Subject: d.Subject}
+	return &wireDecision{Action: action, Reason: d.Reason, Terminate: d.Terminate, Args: d.Args, By: d.By, Note: d.Note, Held: d.Held, Subject: d.Subject, DeclineText: d.DeclineText}
 }
 
 func decisionIn(w *wireDecision) (*agentturn.ToolDecision, error) {
 	if w == nil {
 		return nil, nil
 	}
-	d := &agentturn.ToolDecision{Reason: w.Reason, Terminate: w.Terminate, Args: w.Args, By: w.By, Note: w.Note, Held: w.Held, Subject: w.Subject}
+	d := &agentturn.ToolDecision{Reason: w.Reason, Terminate: w.Terminate, Args: w.Args, By: w.By, Note: w.Note, Held: w.Held, Subject: w.Subject, DeclineText: w.DeclineText}
 	found := false
 	for a, name := range actionNames {
 		if name == w.Action {

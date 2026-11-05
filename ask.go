@@ -57,9 +57,12 @@ func ContextWithAskedCall(ctx context.Context, call AskedCall) context.Context {
 // ([agenttool.Answer.By]), or "human" when it names none, since an
 // answer that names nobody is the user's: Allow with the deferral's
 // reason, or "allowed when asked" when it has none, on an accept, and
-// Block with "declined when asked" and the reason on a decline. What
+// Block with "declined when asked" and the reason on a decline, or the
+// deferral's [ToolDecision.DeclineText] in their place when the host
+// gave one. What
 // the answerer said with the answer ([agenttool.Answer.Note]) reaches
-// the model: on a decline it ends the reason the model is told, and on
+// the model: on a decline it ends the reason the model is told, named
+// for whoever said it, whichever text it follows, and on
 // an accept, under a run's hook or tool, it is a message of its own,
 // held with the call and appended after the outputs of the batch it
 // belongs to, for a nested call the batch of the call that made it: a
@@ -132,9 +135,14 @@ func Ask(ctx context.Context, call AskedCall) (*ToolDecision, bool) {
 		}
 	case agenttool.ActionDecline:
 		decided.Action = Block
-		decided.Reason = "declined when asked"
-		if call.Decision.Reason != "" {
-			decided.Reason += ": " + call.Decision.Reason
+		switch {
+		case call.Decision.DeclineText != "":
+			// The host worded the refusal, as it words the question.
+			decided.Reason = call.Decision.DeclineText
+		case call.Decision.Reason != "":
+			decided.Reason = "declined when asked: " + call.Decision.Reason
+		default:
+			decided.Reason = "declined when asked"
 		}
 		if ans.Note != "" {
 			decided.Reason += "; " + lowerFirst(saidBy(by, ans.Note))

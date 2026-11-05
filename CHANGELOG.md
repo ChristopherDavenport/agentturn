@@ -79,6 +79,16 @@ versions may break the API.
   decision with its decider and reason and marks an `OutcomeUnknown`
   output failed, where a prompt's output could say none of it. RFC
   0001 draft 0.7. (#305)
+- Added: `ToolDecision.DeclineText`, the host's text for a declined
+  question about a deferred call. `Ask` uses it in place of "declined
+  when asked: <reason>", and still ends it with the answerer's note
+  named for whoever gave it, so a nested call, a child's call under
+  `tools/agent`'s `WithAskParent` and `front/a2a`'s own held call read
+  the host's wording without it being put in the person's mouth. A
+  call `WithAskParent` refuses beside a declined one uses its own
+  hold's text. `ChainBeforeToolCall` keeps it with the deferral that
+  asks, and front/control's decision carries it as `decline_text`.
+  RFC 0001 draft 0.7, Nested calls. (#304)
 
 ## v0.0.37 - 2026-11-04
 

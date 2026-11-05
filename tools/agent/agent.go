@@ -235,7 +235,12 @@ func (l *askLog) releases(pending []agentturn.PendingCall) ([]agentturn.Answer, 
 			return nil, false
 		}
 		if b.declined > 0 {
-			text := "not run: the call this one was held beside was declined when asked"
+			// The host's own words for a decline, where its hold gave
+			// them, stand for the loop's here too.
+			text := p.Decision.DeclineText
+			if text == "" {
+				text = "not run: the call this one was held beside was declined when asked"
+			}
 			answers = append(answers, agentturn.Output(&openresponses.FunctionCallOutput{CallID: p.Call.CallID, Output: openresponses.FunctionCallOutputData{Text: text}}).WithBy(agenttool.ByPolicy).WithReason(text))
 			continue
 		}

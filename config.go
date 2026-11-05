@@ -526,6 +526,15 @@ type ToolDecision struct {
 	// so the person asked knows which part the question is about. Empty
 	// for a decision about the whole call. The loop does not use it.
 	Subject string
+	// DeclineText, on a Defer, is the text the asking model reads when
+	// the person or rule asked about the call declines it, in place of
+	// the loop's own "declined when asked: <reason>": the host's words
+	// for the refusal, as it words the question. [Ask] uses it for a
+	// nested call, a child's call under tools/agent's WithAskParent and
+	// any other call it is handed, and still ends it with what the
+	// answerer said, named for whoever said it. Empty keeps the loop's
+	// text (#304).
+	DeclineText string
 }
 
 // ToolResultInfo describes a completed call.

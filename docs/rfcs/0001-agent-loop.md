@@ -1610,7 +1610,14 @@ as if the model had asked for it under the call in flight:
   message only for `human`; a rule's or another model's is a
   developer message, since its words are not the user's, and on a
   decline the note ends the refusal's reason, named for whoever gave
-  it. Without an elicitor, or on a cancel or a
+  it. A host that raises a question about a call MUST be able to
+  supply the text the asking model reads when the answer declines: a
+  deferral MAY carry a **decline text**, which the loop MUST use in
+  place of its own `declined when asked` and the reason, and which
+  the answerer's note still ends, named for whoever gave it, so the
+  host's words are never attributed to the person (#304). The same
+  holds wherever a call is asked about through the loop's question: a
+  child run's call, a front's own held call. Without an elicitor, or on a cancel or a
   failure to ask, the hook's deferral refuses the call, and the error
   reads `a nested call cannot be deferred to the caller: ` and the
   reason. The decision's note and terminate hint are ignored;
@@ -1714,7 +1721,8 @@ An agent stands in four places inside another system:
   is not asked about, and its fate is its batch's answers: it is
   released, as the policy decided it, once every call asked about in
   its batch was accepted, and refused unrun, by the policy, once one
-  was declined; a front that escalates held calls to its caller
+  was declined, with its own hold's decline text when it has one; a
+  front that escalates held calls to its caller
   settles them the same way. The call
   fails with input-required only when there is nobody to ask, no
   elicitor, a failure to ask or a cancel: an error that says so and
@@ -2140,7 +2148,7 @@ maps onto it as follows:
 | reason, cause | `Reason` (`ReasonDone`, `ReasonStopped`, `ReasonInputRequired`, `ReasonAborted`, `ReasonError`); `StopCause` (`StopMaxTurns`, `StopHook`, `StopGuard`, `StopTerminate`, `StopPartialTerminate`, `StopRefused`) |
 | idempotency key | `ToolDispatch.IdempotencyKey`, on `agenttool.Call` for the tool |
 | pending call | `PendingCall{Call, Reason, Tool, Dispatched, IdempotencyKey, Args, Nested}`, `PendingCall.MayHaveRun`; `PendingReason` (`PendingDeferred`, `PendingAborted`, `PendingUndispatched`, `PendingUnknown`, `PendingAnswered`, `PendingRejected`, `PendingReturned`); `PendingCalls` |
-| decision | `ToolDecision{Action, Reason, Terminate, Args, By, Note, Held, Subject}`; `ToolAction` (`Allow`, `Block`, `Defer`) |
+| decision | `ToolDecision{Action, Reason, Terminate, Args, By, Note, Held, Subject, DeclineText}`; `ToolAction` (`Allow`, `Block`, `Defer`) |
 | answer | `Answer{CallID, Output, Args, Note, Terminate, By, Reason, Origin, Failed, IdempotencyKey, RunAgain}`; `Output`, `Approve`, `ApproveWith`, `Refuse`, `OutcomeUnknown`, `WithNote`, `WithBy`, `WithReason`, `WithOrigin`, `WithFailed`, `WithIdempotencyKey`, `WithRunAgain`, `RunAgainReason`, `OutcomeUnknownReason`; `Answer.Item` for an output opening a `Prompt`, carrying the answer's decider, reason, origin and failure; `ContextWithDeciders`/`DeciderFromContext`, `ContextWithReasons`/`ReasonFromContext`, `ContextWithOrigins`/`OriginFromContext` and `ContextWithFailures`/`FailedFromContext` for a host driving `Run` |
 | hooks | `Config.BeforeTurn`, `BeforeModelCall`, `OutputGuard`, `BeforeToolCall`, `AfterToolCall`, `ShouldStopAfterTurn` |
 | guard stop | an error wrapping `ErrGuard` from `ShouldStopAfterTurn`, `BeforeTurn`, `BeforeModelCall`, `OutputGuard` or the model; the output of a call a withheld response made is `WithheldCallOutput` |
@@ -2428,6 +2436,9 @@ it.
   calls carries, per output, who decided, why, where it was taken from
   and whether it reports a failure, as a resume's answer does, and a
   recorder records them as a resume's (#305).
+- **Nested calls.** A deferral may carry a decline text, which the
+  asking model reads in place of the loop's `declined when asked` when
+  the answer declines, followed by the answerer's note (#304).
 
 ## Changes in draft 0.6
 

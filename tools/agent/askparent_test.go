@@ -32,6 +32,8 @@ func TestAChildsDeferralAsksTheParentsElicitor(t *testing.T) {
 		ask    bool
 		answer *agenttool.Answer
 		held   bool
+		// decline is the deferral's DeclineText.
+		decline string
 		// want is the parent's call output; input says it failed
 		// with input-required.
 		want  string
@@ -40,6 +42,7 @@ func TestAChildsDeferralAsksTheParentsElicitor(t *testing.T) {
 	}{
 		{name: "accepted", ask: true, answer: &agenttool.Answer{Action: agenttool.ActionAccept}, want: "Tool result: FOUND", asked: true},
 		{name: "declined", ask: true, answer: &agenttool.Answer{Action: agenttool.ActionDecline}, want: "Tool result: Error: declined when asked: a person approves lookups", asked: true},
+		{name: "declined with the host's text", ask: true, decline: "lookups stay with the host", answer: &agenttool.Answer{Action: agenttool.ActionDecline, Note: "use the cache"}, want: "Tool result: Error: lookups stay with the host; the user said: use the cache", asked: true},
 		{name: "nobody to ask", ask: true, input: true},
 		{name: "a cancel", ask: true, answer: &agenttool.Answer{Action: agenttool.ActionCancel}, input: true, asked: true},
 		{name: "a held call beside no asked one stays held", ask: true, held: true, answer: &agenttool.Answer{Action: agenttool.ActionAccept}, input: true},
@@ -48,7 +51,7 @@ func TestAChildsDeferralAsksTheParentsElicitor(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			childCfg := agentturn.Config{Name: "child", Description: "looks up", Model: &echo.Adapter{}, Tools: []agenttool.Tool{lookup},
 				BeforeToolCall: func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
-					return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "a person approves lookups", By: "policy", Held: tc.held}, nil
+					return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "a person approves lookups", By: "policy", Held: tc.held, DeclineText: tc.decline}, nil
 				}}
 			var opts []Option
 			if tc.ask {

@@ -27,7 +27,7 @@ func sampleEvents(t *testing.T) map[string]agentturn.Event {
 	call := &openresponses.FunctionCall{CallID: "call_1", Name: "upper", Arguments: `{"text":"a"}`}
 	out := openresponses.NewFunctionCallOutput("call_1", "A")
 	trigger := agentturn.Trigger{Kind: "control", Ref: "alice", Extra: map[string]any{"n": 1.0}}
-	decision := &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "rule r", By: "policy", Held: true, Args: json.RawMessage(`{"text":"b"}`), Note: "n", Terminate: true, Subject: "rm -rf build"}
+	decision := &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "rule r", By: "policy", Held: true, Args: json.RawMessage(`{"text":"b"}`), Note: "n", Terminate: true, Subject: "rm -rf build", DeclineText: "not this build"}
 	resp := openresponses.NewResponse(openresponses.Request{Model: "m"})
 	resp.Output = openresponses.Items{call}
 	req := openresponses.Request{Model: "m", Input: openresponses.Items{openresponses.UserText("hi")}}
@@ -184,7 +184,7 @@ func TestWhatTravelsAsADescription(t *testing.T) {
 	if _, err := tool.Execute(t.Context(), agenttool.Call{}); !errors.Is(err, ErrRemoteTool) {
 		t.Errorf("a remote tool ran: %v", err)
 	}
-	if p.Decision == nil || !p.Decision.Held || p.Decision.Action != agentturn.Defer || p.Decision.Reason != "rule r" || p.Decision.Subject != "rm -rf build" {
+	if p.Decision == nil || !p.Decision.Held || p.Decision.Action != agentturn.Defer || p.Decision.Reason != "rule r" || p.Decision.Subject != "rm -rf build" || p.Decision.DeclineText != "not this build" {
 		t.Errorf("decision = %+v", p.Decision)
 	}
 	if len(end.Notes) != 1 || end.Notes[0].Mode != agentturn.InputTool {
