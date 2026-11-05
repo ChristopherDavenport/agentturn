@@ -336,9 +336,11 @@ func TestQueuedMarksReadBothForms(t *testing.T) {
 // source, is kept: a steer's queued entry is the only place its arrival
 // is written. A hidden message, which the person never sees and so did
 // not type, a reminder the host prompts with no provenance, is composed
-// too. What the person typed keeps the kind, a pasted message the host
-// labels untrusted included, and the drained item still carries its
-// queued entry's trigger.
+// too, and so is an item copied from another conversation. A reminder
+// the host names its own kind for, #303's first case, carries that kind
+// whatever the run's. What the person typed keeps the kind, a pasted
+// message the host labels untrusted included, and the drained item
+// still carries its queued entry's trigger.
 func TestComposedInputIsNeverRecordedAsThePersons(t *testing.T) {
 	ctx := context.Background()
 	store := agentsession.NewMemoryStore()
@@ -360,10 +362,16 @@ func TestComposedInputIsNeverRecordedAsThePersons(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	reminderKind := agentturn.Trigger{Kind: "reminder", Ref: "todo", Source: "dax"}
+	reminder, err := agentturn.WithProvenance(openresponses.UserText("reminder"), agentturn.Provenance{Source: reminderKind})
+	if err != nil {
+		t.Fatal(err)
+	}
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"})
 	defer rec.Attach(a)()
 	human := agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: agentturn.TriggerHuman, Ref: "slack:1758412800.0002", Source: "gateway"})
-	if _, err := a.Prompt(human, openresponses.UserText("typed"), pasted, template("prompted template"), agentturn.Hidden(openresponses.UserText("hidden reminder"))); err != nil {
+	if _, err := a.Prompt(human, openresponses.UserText("typed"), pasted, template("prompted template"), agentturn.Hidden(openresponses.UserText("hidden reminder")),
+		reminder, agentturn.Copied(openresponses.UserText("copied"))); err != nil {
 		t.Fatal(err)
 	}
 	if err := rec.Queue(human, a, agentturn.QueueSteer, template("queued template")); err != nil {
@@ -392,6 +400,8 @@ func TestComposedInputIsNeverRecordedAsThePersons(t *testing.T) {
 		"event template":    agentsession.WordsComposed,
 		"hidden reminder":   agentsession.WordsComposed,
 		"hidden steer":      agentsession.WordsComposed,
+		"reminder":          agentsession.WordsComposed,
+		"copied":            agentsession.WordsComposed,
 	} {
 		it := items[text]
 		if it == nil {
@@ -404,10 +414,13 @@ func TestComposedInputIsNeverRecordedAsThePersons(t *testing.T) {
 	}
 	// A composed input keeps where it arrived from, without the kind.
 	arrival := &agentsession.Trigger{Ref: "slack:1758412800.0002", Source: "gateway"}
-	for _, text := range []string{"prompted template", "queued template", "event template", "hidden reminder", "hidden steer"} {
+	for _, text := range []string{"prompted template", "queued template", "event template", "hidden reminder", "hidden steer", "copied"} {
 		if it := items[text]; it != nil && !it.Source.Equal(arrival) {
 			t.Errorf("%q source = %+v, want %+v", text, it.Source, arrival)
 		}
+	}
+	if it := items["reminder"]; it != nil && !it.Source.Equal(&agentsession.Trigger{Kind: "reminder", Ref: "todo", Source: "dax"}) {
+		t.Errorf("reminder source = %+v, want the host's own kind", it.Source)
 	}
 	for _, e := range read.Entries() {
 		if q, ok := e.(*agentsession.QueuedEntry); ok && (q.Layers() != nil || q.Visible != nil) && !q.Trigger.Equal(arrival) {
