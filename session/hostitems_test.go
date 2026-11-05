@@ -329,11 +329,13 @@ func TestQueuedMarksReadBothForms(t *testing.T) {
 // agentsession RFC 0001 0.21's rule for the trigger kind human: a
 // message the host composed from instruction layers, prompted or
 // queued under a run's or a context's trigger of kind human, is not
-// recorded with that trigger as its source or its queued entry's
+// recorded with that kind on its source or its queued entry's
 // trigger, so the record reads it as composed and never carries human
-// beside instructions_part. What the person typed keeps the kind, a
-// pasted message the host labels untrusted included, and the drained
-// item still carries its queued entry's trigger.
+// beside instructions_part. The rest of the trigger, its ref and its
+// source, is kept: a steer's queued entry is the only place its arrival
+// is written. What the person typed keeps the kind, a pasted message
+// the host labels untrusted included, and the drained item still
+// carries its queued entry's trigger.
 func TestComposedInputIsNeverRecordedAsThePersons(t *testing.T) {
 	ctx := context.Background()
 	store := agentsession.NewMemoryStore()
@@ -357,7 +359,7 @@ func TestComposedInputIsNeverRecordedAsThePersons(t *testing.T) {
 	}
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"})
 	defer rec.Attach(a)()
-	human := agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: agentturn.TriggerHuman, Source: "terminal"})
+	human := agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: agentturn.TriggerHuman, Ref: "slack:1758412800.0002", Source: "gateway"})
 	if _, err := a.Prompt(human, openresponses.UserText("typed"), pasted, template("prompted template")); err != nil {
 		t.Fatal(err)
 	}
@@ -393,6 +395,18 @@ func TestComposedInputIsNeverRecordedAsThePersons(t *testing.T) {
 		}
 		if got := agentsession.WordsOf(it); got != want {
 			t.Errorf("%q reads as %v, want %v", text, got, want)
+		}
+	}
+	// A composed input keeps where it arrived from, without the kind.
+	arrival := &agentsession.Trigger{Ref: "slack:1758412800.0002", Source: "gateway"}
+	for _, text := range []string{"prompted template", "queued template", "event template"} {
+		if it := items[text]; it != nil && !it.Source.Equal(arrival) {
+			t.Errorf("%q source = %+v, want %+v", text, it.Source, arrival)
+		}
+	}
+	for _, e := range read.Entries() {
+		if q, ok := e.(*agentsession.QueuedEntry); ok && q.Layers() != nil && !q.Trigger.Equal(arrival) {
+			t.Errorf("queued %s trigger = %+v, want %+v", q.ID, q.Trigger, arrival)
 		}
 	}
 	for _, e := range read.Entries() {

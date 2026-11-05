@@ -120,10 +120,10 @@ type Provenance struct {
 	// item's queued report carries it as its trigger, and a recorder
 	// writes it as the item's source, where the run's trigger would be.
 	// Zero leaves the item the trigger it is handed in under, though a
-	// session recorder does not write one of kind [TriggerHuman] as the
-	// source of a message composed from Layers: what the host composed
-	// is not the person's words (#303). A host that composed the
-	// message names its own kind here.
+	// session recorder writes one of kind [TriggerHuman] without its
+	// kind as the source of a message composed from Layers: what the
+	// host composed is not the person's words (#303). A host that
+	// composed the message names its own kind here.
 	Source Trigger
 	// Trust is what the host knows of the content's trust; nil says
 	// nothing. On an item also marked [Copied] a session recorder

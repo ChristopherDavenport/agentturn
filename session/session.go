@@ -6132,22 +6132,29 @@ func itemTrigger(item openresponses.Item, trigger *agentsession.Trigger) (*agent
 }
 
 // inputTrigger is t as the source of an input item, or the trigger of
-// its queued entry: t, except that one of kind human is not written for
-// an item the host composed from instruction layers, or copied from
-// another conversation, which agentsession RFC 0001 0.21 reads as
-// composed and a writer never marks human (#303). Such an item handed
-// in under the person's trigger, a template a slash command expands or
-// a reminder the host prompts beside what was typed, gets no trigger:
-// its instructions_part or copied_from says it is not the person's
-// words. A host names its own kind for it with the provenance's Source.
+// its queued entry: t, except that the kind human is not written for an
+// item the host composed from instruction layers, or copied from
+// another conversation, which agentsession RFC 0001 0.21 says a writer
+// never marks human (#303). Such an item handed in under the person's
+// trigger, a template a slash command expands or a reminder the host
+// prompts beside what was typed, keeps the rest of the trigger, its ref,
+// its source and its other members, since for a steer the queued entry
+// is the only place its arrival is written; only the kind is cleared,
+// which reads as composed. One left with nothing is no trigger. A host
+// names its own kind for such an item with the provenance's Source.
 func inputTrigger(t *agentsession.Trigger, prov *agentturn.Provenance, copied bool) *agentsession.Trigger {
 	if t == nil || t.Kind != agentsession.TriggerHuman {
 		return t
 	}
-	if copied || (prov != nil && len(prov.Layers) > 0) {
+	if !copied && (prov == nil || len(prov.Layers) == 0) {
+		return t
+	}
+	out := t.Clone()
+	out.Kind = ""
+	if out.Ref == "" && out.Source == "" && len(out.Unknown) == 0 {
 		return nil
 	}
-	return t
+	return out
 }
 
 // queuedTrigger is the trigger the queued entry of the input a queued
