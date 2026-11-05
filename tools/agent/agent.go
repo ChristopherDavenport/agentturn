@@ -585,7 +585,12 @@ var ErrNoRecord = errors.New("outcome unknown: the call was run again after it w
 // and otherwise the call fails input-required naming it, as the child
 // left it, without running it: the inputs it owes stay queued in the
 // child, which [WithSpawn] hands the host as for any call, so the run
-// that answers the held call takes them. A child that ended with nothing pending returns its recorded
+// that answers the held call takes them. Such a host resumes the held
+// child itself, and [Agent.Resume] needs an answer for every pending
+// call: when the held call is not the child's only pending call, the
+// host answers the others as the replay rule does (agentturn/session's
+// ReplayAnswers over the child's session), since the tool returns
+// before it would apply [Record.Answers]. A child that ended with nothing pending returns its recorded
 // end ([Record.End]) without running, and one cut with nothing pending
 // continues its run. A loader's error fails the call before anything
 // runs, since running the child afresh could repeat its work. A
