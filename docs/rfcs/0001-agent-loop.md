@@ -1,6 +1,6 @@
 # RFC 0001: Agent Loop
 
-Status: draft 0.7
+Status: draft 0.8
 Author: Christopher Davenport
 Discussion: to be opened against this repository, then proposed to the
 Open Responses community as a companion specification. The Go module at
@@ -62,7 +62,7 @@ executor, the session format begins where an entry is appended, and
 the loop is everything in between.
 
 Each draft describes the Go module as released with it; [Changes in
-draft 0.7](#changes-in-draft-07) lists what this draft added. Where the
+draft 0.8](#changes-in-draft-08) lists what this draft added. Where the
 module falls short of what is written here, or where a rule is
 contested, the shortfall is under open questions with the issue that
 tracks it.
@@ -1516,6 +1516,18 @@ once the run in flight when it was accepted was aborted before taking
 it: the abort stopped the agent, a person's interrupt among them, and
 a run the delivery started would undo it. The item stays queued for
 the host's next run, and the delivery reports the aborted run's end.
+An abort the agent receives after a delivery is accepted and before
+its follow-on run starts MUST settle that delivery as aborted and
+start no run; the accepted items stay queued (#312). This holds when
+the abort finds no run to stop, the run in flight being past its last
+drain or having ended, and the delivery about to start the run that
+takes the item: a person's interrupt pressed as a run ends, or a
+host's abort as it shuts down, would otherwise be lost to a run it
+never saw. The agent records the abort's arrival against the
+deliveries it has accepted and not settled, and a delivery checks it
+in the same step as it starts a run, so an abort either stops the
+delivery or reaches the run it started. A delivery so settled reports
+the abort's cause, and no run's end, since no run ended on it.
 A delivery taken in one step, whose caller waits for the outcome, is
 settled by that wait instead: a caller that stops waiting starts
 nothing and leaves the item queued, for the run in flight to take or
@@ -1523,7 +1535,8 @@ the host's next run. A delivery refused before its
 items are queued, while the agent is held idle, accepts nothing. A run in flight
 that drains it and then sends a request has taken it. A run that stops
 after its turn or ends without draining it leaves it queued, and,
-unless it was aborted, the delivery starts a run that takes it once
+unless it was aborted or an abort has arrived since the accept,
+the delivery starts a run that takes it once
 that run has ended, as a
 continue after a steer would, unless calls are pending, when it is
 left for the resume and the delivery says input is required. A
@@ -2539,6 +2552,17 @@ The scenario corpus is versioned with this document. A scenario is
 added when a rule is, and changes only when the rule it pins does, in
 the same draft; a scenario that a conforming loop fails is a defect in
 the scenario, fixed without a change of rule.
+
+## Changes in draft 0.8
+
+Draft 0.8 adds the rules below to draft 0.7, marked as Versioning has
+it.
+
+- **Queues.** An abort the agent receives after a delivery is accepted
+  and before its follow-on run starts settles that delivery as aborted
+  and starts no run, the items left queued, when the abort finds no
+  run to stop as much as when it reaches the run in flight; the
+  delivery reports the abort's cause (#312).
 
 ## Changes in draft 0.7
 

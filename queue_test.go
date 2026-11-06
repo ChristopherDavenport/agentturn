@@ -934,6 +934,125 @@ func TestAnAbortSettlesAnAcceptedDelivery(t *testing.T) {
 	}
 }
 
+// TestAnAbortBeforeTheDeliveryRunStartsStartsNone pins #312's rule in
+// RFC 0001's Queues: a steer accepted after the run's last drain waits
+// for that run to end and then starts a run of its own, and an abort
+// that lands before that run starts, while the run in flight delivers
+// its end or once it has ended and before the delivery starts its run,
+// finds no run to stop. The delivery is settled as aborted all the
+// same: it starts no run and the items stay queued, so an Esc pressed
+// as a run ends is not ignored and a view's abort at exit does not
+// leave a run going under a closed store. Deliver goes the same way.
+func TestAnAbortBeforeTheDeliveryRunStartsStartsNone(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// gap aborts once the run in flight has ended and before the
+		// delivery starts its run; otherwise the abort lands while
+		// the run in flight delivers its end, past its last drain.
+		gap     bool
+		deliver bool
+	}{
+		{name: "accept, abort during run_end"},
+		{name: "accept, abort after the run ends", gap: true},
+		{name: "deliver, abort during run_end", deliver: true},
+		{name: "deliver, abort after the run ends", gap: true, deliver: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New(Config{Model: &echo.Adapter{}, MaxTurns: 3})
+			ending, release := make(chan struct{}), make(chan struct{})
+			var starts atomic.Int32
+			a.Subscribe(func(_ context.Context, ev Event) error {
+				switch ev.(type) {
+				case *RunStart:
+					starts.Add(1)
+				case *RunEnd:
+					if starts.Load() == 1 {
+						// The first run is past its last drain: hold
+						// its end until the delivery waits on it.
+						close(ending)
+						<-release
+					}
+				}
+				return nil
+			})
+			waiting := make(chan struct{}, 1)
+			var aborted atomic.Bool
+			a.settleHook = func(woke bool) {
+				if !woke {
+					select {
+					case waiting <- struct{}{}:
+					default:
+					}
+					return
+				}
+				a.mu.Lock()
+				running := a.running
+				a.mu.Unlock()
+				if tc.gap && !running && aborted.CompareAndSwap(false, true) {
+					// The run has ended and the delivery has not yet
+					// looked: the abort finds nothing to stop.
+					a.Abort()
+				}
+			}
+			done := make(chan *RunEnd, 1)
+			go func() {
+				end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+				done <- end
+			}()
+			<-ending
+			type outcome struct {
+				joined bool
+				end    *RunEnd
+				err    error
+			}
+			settled := make(chan outcome, 1)
+			steer := openresponses.UserText("steer")
+			if tc.deliver {
+				go func() {
+					joined, end, err := a.Deliver(context.Background(), steer)
+					settled <- outcome{joined, end, err}
+				}()
+			} else {
+				d, err := a.Accept(context.Background(), steer)
+				if err != nil {
+					t.Fatal(err)
+				}
+				go func() {
+					joined, end, err := d.Wait(context.Background())
+					settled <- outcome{joined, end, err}
+				}()
+			}
+			<-waiting
+			if !tc.gap {
+				a.Abort()
+			}
+			close(release)
+			if end := <-done; end == nil || end.Reason != ReasonDone {
+				t.Fatalf("prompt end = %+v, want done", end)
+			}
+			var o outcome
+			select {
+			case o = <-settled:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the delivery was not settled")
+			}
+			if o.joined || o.end != nil || !errors.Is(o.err, context.Canceled) {
+				t.Errorf("delivery: joined %v, end %+v, err %v; want settled as aborted", o.joined, o.end, o.err)
+			}
+			if tc.gap && !aborted.Load() {
+				t.Error("the abort did not land between the run's end and the delivery's look")
+			}
+			st := a.State()
+			if n := starts.Load(); n != 1 || st.Running {
+				t.Errorf("%d runs started, running %v: the delivery started a run after the abort", n, st.Running)
+			}
+			if st.Steering != 1 {
+				t.Errorf("steering = %d, want the delivery left queued", st.Steering)
+			}
+		})
+	}
+}
+
 // TestARedeliveryIsReportedWhileAQuietToolRuns: a delivery a host hands
 // back with Redeliver while a run is in flight, a front/a2a steer of a
 // recorded working task, is reported as any accept is, without waiting

@@ -166,6 +166,12 @@ type Agent struct {
 	// lastEnd is the end of the last run, for a Deliver whose items that
 	// run took and ended without a model call seeing them.
 	lastEnd *RunEnd
+	// aborts counts the aborts the agent has received, run or no run,
+	// and abortCause is the last one's cause, so a delivery accepted
+	// before an abort that found no run to stop, the run in flight
+	// having ended or being past its last drain, starts none (#312).
+	aborts     int
+	abortCause error
 	// queued holds the accepts not yet reported: Steer and FollowUp
 	// append, and the goroutine that owns delivery reports them at its
 	// next event, or, while a run is in flight, the accept itself when
@@ -226,6 +232,10 @@ type Agent struct {
 	// none comes first.
 	waiting []*Question
 	replays map[int][]*Question
+	// settleHook, set by tests alone, is called by a delivery waiting
+	// for the run in flight, with a.mu released: woke false as it
+	// starts to wait, true once the run has moved and before it looks.
+	settleHook func(woke bool)
 }
 
 type subscription struct {
@@ -1779,6 +1789,12 @@ func (a *Agent) Redeliver(ctx context.Context, items ...openresponses.Item) erro
 // them queued, and Deliver returns joined false with that run's end and
 // starts nothing: the abort stopped the agent, whoever asked, and a run
 // started for the items would undo it. The host's next run takes them.
+// An abort that arrives once the items are accepted and before the run
+// that takes them starts, which finds no run to stop since the run in
+// flight is past its last drain or has ended, stops the agent the same
+// way: Deliver starts nothing, leaves the items queued and returns
+// joined false, no end, since no run ended on the abort, and the
+// abort's cause, context.Canceled for [Agent.Abort].
 //
 // A run that drained the items and then ended before a model call, on
 // a guard before the call, an abort or a failure, has them in its
@@ -1821,9 +1837,10 @@ func (a *Agent) Deliver(ctx context.Context, items ...openresponses.Item) (joine
 // the run that takes them once that run has ended, on ctx's values
 // without its cancellation, so the caller going away neither stops
 // that run nor leaves the items for an input that may never come. Only
-// [Agent.Abort] stops a run so started, and an abort of the run in
-// flight before it takes the items settles the delivery on that run's
-// end, starting none, as Deliver says. A run in flight reports the
+// [Agent.Abort] stops a run so started, and an abort before that run
+// starts settles the delivery starting none, as Deliver says: on the
+// end of the run in flight when the abort reached it before it took
+// the items, and with the abort's cause when it found no run to stop. A run in flight reports the
 // items as [Queued] as [Agent.Steer] says, without waiting for its
 // next event.
 //
@@ -1858,11 +1875,13 @@ type deliveryOutcome struct {
 }
 
 // deliveryMark is where a delivery was accepted, which its outcome is
-// measured from: the count of steer drains, and the end of the last
-// run then, so an end since is told from it.
+// measured from: the count of steer drains, the end of the last run
+// then, so an end since is told from it, and the count of aborts, so
+// an abort since is.
 type deliveryMark struct {
 	drains int
 	end    *RunEnd
+	aborts int
 }
 
 // acceptDelivery queues items as a delivery and returns the mark its
@@ -1883,7 +1902,7 @@ func (a *Agent) acceptDelivery(ctx context.Context, items openresponses.Items) (
 		// is queued.
 		return none, nil, ErrHeld
 	}
-	mark, before := deliveryMark{drains: a.drains, end: a.lastEnd}, len(a.steer)
+	mark, before := deliveryMark{drains: a.drains, end: a.lastEnd, aborts: a.aborts}, len(a.steer)
 	a.queue(TriggerFromContext(ctx), QueueSteer, InputDeliver, a.outside(ctx), items)
 	if len(a.steer) == before {
 		return none, nil, ErrNoPrompt
@@ -1922,10 +1941,16 @@ func (a *Agent) settleDelivery(ctx context.Context, mark deliveryMark) (joined b
 		}
 		progress := a.progress
 		a.mu.Unlock()
+		if a.settleHook != nil {
+			a.settleHook(false)
+		}
 		select {
 		case <-progress:
 		case <-ctx.Done():
 			return false, nil, ctx.Err()
+		}
+		if a.settleHook != nil {
+			a.settleHook(true)
 		}
 		a.mu.Lock()
 	}
@@ -1945,6 +1970,17 @@ func (a *Agent) settleDelivery(ctx context.Context, mark deliveryMark) (joined b
 		// the host's next run.
 		a.mu.Unlock()
 		return false, end, nil
+	}
+	if a.aborts != mark.aborts {
+		// An abort arrived after the accept and found no run to stop:
+		// the run in flight was past its last drain or had ended, and
+		// the run that takes the items had not started. It stopped the
+		// agent all the same, so none starts here; checked under the
+		// lock start takes, an abort either lands before this or
+		// reaches the run started below (#312).
+		cause := a.abortCause
+		a.mu.Unlock()
+		return false, nil, cause
 	}
 	if len(a.pending) > 0 {
 		a.mu.Unlock()
@@ -2122,7 +2158,9 @@ func (a *Agent) drainFollowUp() []TurnInput {
 // tools see the cancellation through their context and the run ends
 // with ReasonAborted and context.Canceled on RunEnd.Err. The queues are
 // untouched: anything steered or queued and not yet appended goes to
-// the next run.
+// the next run. An abort with no run to stop, the run in flight past
+// its last drain or ended, still stops a delivery accepted before it
+// from starting the run that takes its items, as [Agent.Deliver] says.
 func (a *Agent) Abort() { a.AbortCause(nil) }
 
 // AbortCause is [Agent.Abort] with a reason: cause is what
@@ -2141,6 +2179,13 @@ func (a *Agent) Abort() { a.AbortCause(nil) }
 func (a *Agent) AbortCause(cause error) {
 	a.mu.Lock()
 	cancel, runCancel := a.cancel, a.runCancel
+	// Recorded with no run going too: a delivery accepted before it
+	// starts no run (#312).
+	a.aborts++
+	a.abortCause = cause
+	if a.abortCause == nil {
+		a.abortCause = context.Canceled
+	}
 	a.mu.Unlock()
 	if cancel != nil {
 		cancel(cause)

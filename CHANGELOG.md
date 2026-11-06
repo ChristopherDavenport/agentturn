@@ -5,6 +5,19 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Changed: an abort that arrives after a delivery, `Deliver` or
+  `Accept`, is accepted and before the run that takes its items starts
+  settles that delivery as aborted and starts no run, though it finds
+  no run to stop: the run in flight was past its last drain, delivering
+  its end, or had ended. The items stay queued for the host's next run,
+  and the delivery returns joined false, no end and the abort's cause,
+  `context.Canceled` for `Abort`. An Esc pressed as a run ends is no
+  longer ignored when a forwarded steer's run is about to start, and a
+  view that aborts at exit no longer leaves that run going under a
+  closed store. RFC 0001 draft 0.8, Queues. (#312)
+
 ## v0.0.38 - 2026-11-06
 
 - Added: `tools/agent.WithRecord` (`Record`) continues the child a call
