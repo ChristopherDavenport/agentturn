@@ -5,6 +5,35 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Changed: an abort that arrives after a delivery, `Deliver` or
+  `Accept`, is accepted and before the run that takes its items starts
+  settles that delivery as aborted and starts no run, though it finds
+  no run to stop: the run in flight was past its last drain, delivering
+  its end, or had ended. The items stay queued for the host's next run,
+  and the delivery returns joined false, no end and `ErrAborted`,
+  below, wrapping the abort's cause. An Esc pressed as a run ends is no
+  longer ignored when a forwarded steer's run is about to start, and a
+  view that aborts at exit no longer leaves that run going under a
+  closed store. RFC 0001 draft 0.8, Queues. (#312)
+- Added: `agentturn.ErrAborted`, the error of a delivery an abort
+  stopped before a run took its items. It wraps the abort's cause, so
+  `errors.Is(err, context.Canceled)` still holds for `Abort`, and comes
+  with the aborted run's end when the abort reached the run in flight,
+  and no end when it found no run to stop. `front/control` carries it
+  as the `aborted` error code, so a remote `Delivery.Wait` tells an
+  abort from the end of its own wait; an older client still matches
+  `context.Canceled` by the cause's code. (#312)
+- Changed (breaking for a caller of `Deliver` or `Accept` that read an
+  abort as an aborted end with no error): a delivery whose run in
+  flight is aborted before taking its items returns the aborted end
+  with `ErrAborted`, where v0.0.38 returned it with a nil error. A run
+  that took the items and was then aborted still returns its end with
+  no error. No released caller reads the outcome: agentconsole's
+  `client.Direct` discards the `Delivery`, and dax uses neither yet.
+  RFC 0001 draft 0.8, Queues. (#312)
+
 ## v0.0.38 - 2026-11-06
 
 - Added: `tools/agent.WithRecord` (`Record`) continues the child a call

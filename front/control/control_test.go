@@ -289,6 +289,130 @@ func TestDeliverOverTheWire(t *testing.T) {
 	})
 }
 
+// TestAnAbortedDeliveryOverTheWire pins ErrAborted across the wire: a
+// delivery an abort stopped before a run took it, the run in flight
+// cut before its drain (#302) or the abort landing after the run's
+// last drain with no run left to stop (#312), reports ErrAborted, so
+// a remote caller tells it from the end of its own wait, and the
+// cause, context.Canceled, still matches.
+func TestAnAbortedDeliveryOverTheWire(t *testing.T) {
+	type outcome struct {
+		joined bool
+		end    *agentturn.RunEnd
+		err    error
+	}
+	settle := func(t *testing.T, c *Client, deliver bool) <-chan outcome {
+		t.Helper()
+		got := make(chan outcome, 1)
+		steer := openresponses.UserText("steer")
+		if deliver {
+			go func() {
+				joined, end, err := c.Deliver(context.Background(), steer)
+				got <- outcome{joined, end, err}
+			}()
+			return got
+		}
+		d, err := c.Accept(context.Background(), steer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			joined, end, err := d.Wait(ctx)
+			got <- outcome{joined, end, err}
+		}()
+		return got
+	}
+	queued := func(t *testing.T, a *agentturn.Agent) {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); a.State().Steering == 0; {
+			if time.Now().After(deadline) {
+				t.Fatal("the server's agent never held the delivery")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	for _, deliver := range []bool{false, true} {
+		name := "accept"
+		if deliver {
+			name = "deliver"
+		}
+		t.Run(name+", the run in flight is aborted before it takes it", func(t *testing.T) {
+			running, release := make(chan struct{}, 1), make(chan struct{})
+			defer close(release)
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, MaxTurns: 3, Tools: []agenttool.Tool{blocker(running, release)}})
+			c := serve(t, a)
+			done := make(chan *agentturn.RunEnd, 1)
+			go func() {
+				end, _ := c.Prompt(context.Background(), openresponses.UserText("go"))
+				done <- end
+			}()
+			<-running
+			got := settle(t, c, deliver)
+			queued(t, a)
+			c.Abort()
+			o := <-got
+			if !errors.Is(o.err, agentturn.ErrAborted) || !errors.Is(o.err, context.Canceled) || o.joined || o.end == nil || o.end.Reason != agentturn.ReasonAborted {
+				t.Errorf("joined %v, end %+v, err %v; want ErrAborted with the aborted end", o.joined, o.end, o.err)
+			}
+			<-done
+		})
+		t.Run(name+", the abort finds no run to stop", func(t *testing.T) {
+			a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, MaxTurns: 3})
+			ending, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+				if _, ok := ev.(*agentturn.RunEnd); ok {
+					// The first run is past its last drain: hold its
+					// end while the delivery arrives and the abort.
+					once.Do(func() {
+						close(ending)
+						<-release
+					})
+				}
+				return nil
+			})
+			c := serve(t, a)
+			done := make(chan *agentturn.RunEnd, 1)
+			go func() {
+				end, _ := c.Prompt(context.Background(), openresponses.UserText("go"))
+				done <- end
+			}()
+			<-ending
+			got := settle(t, c, deliver)
+			queued(t, a)
+			c.Abort()
+			close(release)
+			o := <-got
+			if !errors.Is(o.err, agentturn.ErrAborted) || !errors.Is(o.err, context.Canceled) || o.joined || o.end != nil {
+				t.Errorf("joined %v, end %+v, err %v; want ErrAborted and no end", o.joined, o.end, o.err)
+			}
+			<-done
+			if st := a.State(); st.Steering != 1 || st.Running {
+				t.Errorf("steering %d, running %v: want the delivery left queued and no run", st.Steering, st.Running)
+			}
+		})
+	}
+	t.Run("the caller's own wait ending is not an abort", func(t *testing.T) {
+		running, release := make(chan struct{}, 1), make(chan struct{})
+		defer close(release)
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, MaxTurns: 3, Tools: []agenttool.Tool{blocker(running, release)}})
+		c := serve(t, a)
+		go func() { _, _ = c.Prompt(context.Background(), openresponses.UserText("go")) }()
+		<-running
+		d, err := c.Accept(context.Background(), openresponses.UserText("steer"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, _, err := d.Wait(ctx); !errors.Is(err, context.Canceled) || errors.Is(err, agentturn.ErrAborted) {
+			t.Errorf("err = %v, want the wait's own cancellation, not ErrAborted", err)
+		}
+	})
+}
+
 // TestAcceptOverTheWire pins #302 across the wire: the control front
 // carries a delivery's two steps, so a view forwarding a person's
 // steers answers each once the server's agent has it, while a quiet

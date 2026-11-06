@@ -48,6 +48,7 @@ var sentinels = []struct {
 	{"no_model", agentturn.ErrNoModel},
 	{"cannot_continue", agentturn.ErrCannotContinue},
 	{"terminated", agentturn.ErrTerminated},
+	{"aborted", agentturn.ErrAborted},
 	{"no_prompt", agentturn.ErrNoPrompt},
 	{"guard", agentturn.ErrGuard},
 	{"trigger_extra", agentturn.ErrTriggerExtra},
