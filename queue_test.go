@@ -921,8 +921,8 @@ func TestAnAbortSettlesAnAcceptedDelivery(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	joined, end, err := d.Wait(ctx)
-	if err != nil || joined || end == nil || end.Reason != ReasonAborted {
-		t.Fatalf("delivery: joined %v, end %+v, err %v; want the aborted end", joined, end, err)
+	if !errors.Is(err, ErrAborted) || !errors.Is(err, context.Canceled) || joined || end == nil || end.Reason != ReasonAborted {
+		t.Fatalf("delivery: joined %v, end %+v, err %v; want ErrAborted with the aborted end", joined, end, err)
 	}
 	time.Sleep(50 * time.Millisecond)
 	st := a.State()
@@ -1036,8 +1036,8 @@ func TestAnAbortBeforeTheDeliveryRunStartsStartsNone(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("the delivery was not settled")
 			}
-			if o.joined || o.end != nil || !errors.Is(o.err, context.Canceled) {
-				t.Errorf("delivery: joined %v, end %+v, err %v; want settled as aborted", o.joined, o.end, o.err)
+			if o.joined || o.end != nil || !errors.Is(o.err, ErrAborted) || !errors.Is(o.err, context.Canceled) {
+				t.Errorf("delivery: joined %v, end %+v, err %v; want ErrAborted and no end", o.joined, o.end, o.err)
 			}
 			if tc.gap && !aborted.Load() {
 				t.Error("the abort did not land between the run's end and the delivery's look")
@@ -1051,6 +1051,62 @@ func TestAnAbortBeforeTheDeliveryRunStartsStartsNone(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAnAbortOutsideADeliverysWindowLeavesItsRun pins the edges of
+// #312's window: an abort the agent received before the accept, of an
+// earlier run or of none, does not count against the delivery, which
+// starts its run; and an abort once the delivery's run has started
+// reaches that run, which took the items before it was cut, so the
+// delivery reports its end and no refusal.
+func TestAnAbortOutsideADeliverysWindowLeavesItsRun(t *testing.T) {
+	t.Run("before the accept", func(t *testing.T) {
+		a := New(Config{Model: &echo.Adapter{}, MaxTurns: 1})
+		a.Abort()
+		d, err := a.Accept(context.Background(), openresponses.UserText("steer"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		joined, end, err := d.Wait(ctx)
+		if err != nil || joined || end == nil || end.Reason != ReasonDone {
+			t.Fatalf("delivery: joined %v, end %+v, err %v; want its run started and done", joined, end, err)
+		}
+		if st := a.State(); st.Steering != 0 {
+			t.Errorf("steering = %d, want the run to have taken the delivery", st.Steering)
+		}
+	})
+	t.Run("after its run starts", func(t *testing.T) {
+		a := New(Config{Model: &echo.Adapter{}, MaxTurns: 1, BeforeModelCall: func(ctx context.Context, _ *openresponses.Request) error {
+			// The delivery's run has taken the items; hold its model
+			// call for the abort.
+			<-ctx.Done()
+			return ctx.Err()
+		}})
+		started := make(chan struct{})
+		a.Subscribe(func(_ context.Context, ev Event) error {
+			if _, ok := ev.(*RunStart); ok {
+				close(started)
+			}
+			return nil
+		})
+		d, err := a.Accept(context.Background(), openresponses.UserText("steer"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		<-started
+		a.Abort()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		joined, end, err := d.Wait(ctx)
+		if err != nil || joined || end == nil || end.Reason != ReasonAborted {
+			t.Fatalf("delivery: joined %v, end %+v, err %v; want the end of its aborted run", joined, end, err)
+		}
+		if st := a.State(); st.Steering != 0 {
+			t.Errorf("steering = %d, want the run to have taken the delivery", st.Steering)
+		}
+	})
 }
 
 // TestARedeliveryIsReportedWhileAQuietToolRuns: a delivery a host hands

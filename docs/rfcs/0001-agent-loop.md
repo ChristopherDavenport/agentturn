@@ -1515,7 +1515,8 @@ caller has gone away, until an abort. A delivery MUST NOT start a run
 once the run in flight when it was accepted was aborted before taking
 it: the abort stopped the agent, a person's interrupt among them, and
 a run the delivery started would undo it. The item stays queued for
-the host's next run, and the delivery reports the aborted run's end.
+the host's next run, and the delivery reports that it was aborted,
+with the aborted run's end.
 An abort the agent receives after a delivery is accepted and before
 its follow-on run starts MUST settle that delivery as aborted and
 start no run; the accepted items stay queued (#312). This holds when
@@ -1527,7 +1528,11 @@ never saw. The agent records the abort's arrival against the
 deliveries it has accepted and not settled, and a delivery checks it
 in the same step as it starts a run, so an abort either stops the
 delivery or reaches the run it started. A delivery so settled reports
-the abort's cause, and no run's end, since no run ended on it.
+that it was aborted, with the abort's cause and no run's end, since
+no run ended on it. Either way the report tells the abort from the
+end of the caller's own wait, across a wire too. A run that took the
+item and was then aborted did not refuse it: the delivery reports
+that run's end and no refusal.
 A delivery taken in one step, whose caller waits for the outcome, is
 settled by that wait instead: a caller that stops waiting starts
 nothing and leaves the item queued, for the run in flight to take or
@@ -2292,10 +2297,10 @@ maps onto it as follows:
 | turn limit | `Config.MaxTurns` |
 | retry policy | `Config.Retry{MaxAttempts, Backoff, Retryable, Revise}`; `DefaultBackoff`, `DefaultRetryable` |
 | low-level loop | `Run(ctx, t, prompts, cfg)`, `Continue(ctx, t, cfg)` → `iter.Seq[Event]`; `EventBuffer`; `CanContinue` |
-| delivery a control offers | `Deliverer`, which `*Agent` and `front/control`'s `Client` implement; `front/control` serves it as `POST /deliver`, `ErrNoDelivery` when the control offers none; in two steps, `Accepter` (`Accept` → `*Delivery`, whose `Wait` and `Done` give the outcome; `NewDelivery` for another implementation), which `*Agent`, `front/control`'s `Client` and `session`'s `RecordedControl` implement, served as `POST /accept`: the accept, then the outcome, on one response |
+| delivery a control offers | `Deliverer`, which `*Agent` and `front/control`'s `Client` implement; `front/control` serves it as `POST /deliver`, `ErrNoDelivery` when the control offers none; in two steps, `Accepter` (`Accept` → `*Delivery`, whose `Wait` and `Done` give the outcome; `NewDelivery` for another implementation), which `*Agent`, `front/control`'s `Client` and `session`'s `RecordedControl` implement, served as `POST /accept`: the accept, then the outcome, on one response; an outcome's `ErrAborted` crosses as the `aborted` code beside the cause's, so a remote caller's `errors.Is` tells it from the end of its own wait |
 | a remote caller's trigger | `front/control`'s `Client` sends the trigger on its caller's context (`ContextWithTrigger`) as a `trigger` member of `POST /prompt`, `/queue`, `/deliver`, `/accept` and `/resume`, and the answerer on `Reply`'s context (`ContextWithAnswerer`) as an `answerer` member of `POST /reply`; the `Handler` runs the input, or names the answerer, under it for a principal holding the scope `WithTriggerClaims` names, its kind and ref defaulting to `control` and the principal's name, and otherwise under `control` naming the principal |
 | agent | `Agent`; `New(cfg, opts…)`, `WithTranscript`, `WithPending`, `SetPending`, `WithReservedCallIDs`, `ReserveCallIDs`; `Prompt`, `Continue`, `Resume`, `Steer`, `FollowUp`, `Queue`, `Deliver`, `Accept`, `Subscribe`, `Abort`, `AbortCause`, `WaitForIdle`, `WhileIdle`, `State`, `SetConfig`, `SetTranscript`, `SetReasoningModels`, `Config` |
-| refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning` (`ErrHeld` for a delivery during a hold, `State.Held`), `ErrTerminated` (a delivery after a terminating stop), `ErrAmbiguousCall`, `ErrCallAnswered`, `ErrTriggerExtra` (`Trigger.Validate`) |
+| refusals before a run | `ErrNoPrompt`, `ErrCannotContinue`, `ErrNoModel`, `ErrInputRequired`, `ErrNotPending`, `ErrRunning` (`ErrHeld` for a delivery during a hold, `State.Held`), `ErrTerminated` (a delivery after a terminating stop), `ErrAborted` (a delivery an abort stopped before a run took it, wrapping the cause), `ErrAmbiguousCall`, `ErrCallAnswered`, `ErrTriggerExtra` (`Trigger.Validate`) |
 | run ID, turn, trigger, transcript on the context | `ContextWithRunID`/`RunIDFromContext`, `ContextWithTurn`/`TurnFromContext`, `ContextWithTrigger`/`TriggerFromContext`, `ContextWithTranscript`/`TranscriptFromContext`, `ContextWithReservedCallIDs` |
 | run context, steer signal | `RunContext(ctx)`, `Steered(ctx)` |
 | source | `Source`: `SourceInput`, `SourceResume` |
@@ -2561,8 +2566,11 @@ it.
 - **Queues.** An abort the agent receives after a delivery is accepted
   and before its follow-on run starts settles that delivery as aborted
   and starts no run, the items left queued, when the abort finds no
-  run to stop as much as when it reaches the run in flight; the
-  delivery reports the abort's cause (#312).
+  run to stop as much as when it reaches the run in flight. Both
+  report that the delivery was aborted, with the aborted run's end
+  when one ended on the abort, told from the end of the caller's own
+  wait; breaking for a caller that read draft 0.7's aborted end with
+  no refusal (#312).
 
 ## Changes in draft 0.7
 

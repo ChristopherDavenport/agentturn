@@ -120,8 +120,11 @@ func (d *Delivery) Done() <-chan struct{} { return d.done }
 // the items and a model call has seen them; otherwise the end of the
 // run the agent started for them, or of the run that took them and
 // ended before a model call saw them, and the error that says why
-// none could start. A ctx that ends first returns its error and
-// changes nothing: the agent settles the delivery all the same.
+// none could start, [ErrAborted] when an abort stopped the agent before
+// a run took them. A ctx that ends first returns its error and
+// changes nothing: the agent settles the delivery all the same. Its
+// error is ctx's alone, never [ErrAborted], which an abort's carries
+// along with the abort's cause, so a caller tells the two apart.
 func (d *Delivery) Wait(ctx context.Context) (joined bool, end *RunEnd, err error) {
 	select {
 	case <-d.done:
