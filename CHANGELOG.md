@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.39 - 2026-11-06
 
 - Changed: an abort that arrives after a delivery, `Deliver` or
   `Accept`, is accepted and before the run that takes its items starts
