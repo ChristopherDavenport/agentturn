@@ -1200,7 +1200,9 @@ func TestAFoldsOwnCallIsMarked(t *testing.T) {
 // TestFoldNextFoldsWithItsInstructions pins #277's fold on request: the
 // call after FoldNext folds a transcript within its budget, sends the
 // instructions after the summary prompt, and reports the fold as asked
-// for; the call after it is back to the budget, and reuses the fold.
+// for, Requested as well as Forced; the call after it is back to the
+// budget, and reuses the fold. A fold the loop asks for is Forced and
+// not Requested (#306).
 func TestFoldNextFoldsWithItsInstructions(t *testing.T) {
 	s := &summarizer{reply: "They talked about things."}
 	var folds []Fold
@@ -1218,7 +1220,7 @@ func TestFoldNextFoldsWithItsInstructions(t *testing.T) {
 	if got, want := in[len(in)-1].(*openresponses.Message).Text(), DefaultSummaryPrompt+"\n\nKeep every file name."; got != want {
 		t.Errorf("summary prompt = %q, want %q", got, want)
 	}
-	if len(folds) != 1 || !folds[0].Forced || folds[0].Instructions != "Keep every file name." || folds[0].Summary == nil {
+	if len(folds) != 1 || !folds[0].Forced || !folds[0].Requested || folds[0].Instructions != "Keep every file name." || folds[0].Summary == nil {
 		t.Errorf("folds = %+v", folds)
 	}
 	// The request is taken: the next call is within budget again and
@@ -1226,9 +1228,14 @@ func TestFoldNextFoldsWithItsInstructions(t *testing.T) {
 	if out, err := tr.Transform(context.Background(), items(7)); err != nil || len(out) != 3 || len(s.reqs) != 1 {
 		t.Errorf("after: out = %d items, err = %v, summaries = %d", len(out), err, len(s.reqs))
 	}
-	// A request the loop marks folds as one FoldNext asked for does.
+	// A request the loop marks folds as one FoldNext asked for does,
+	// but nobody requested it (#306): it is forced, not requested, and
+	// carries no instructions.
 	if out, err := tr.Transform(agentturn.ContextWithFoldRequest(context.Background()), items(9)); err != nil || len(out) != 2 || len(s.reqs) != 2 {
 		t.Errorf("marked: out = %d items, err = %v, summaries = %d", len(out), err, len(s.reqs))
+	}
+	if len(folds) != 2 || !folds[1].Forced || folds[1].Requested || folds[1].Instructions != "" {
+		t.Errorf("the loop's fold = %+v, want forced and not requested", folds[len(folds)-1])
 	}
 }
 

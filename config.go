@@ -262,6 +262,10 @@ type Config struct {
 	// takes over the conversation and should see less of it, belongs in
 	// [Agent.SetTranscript] between runs: a transform that drops items
 	// does so on every call, the receiver's own tool outputs included.
+	// Its context carries the settings the request will carry
+	// ([RequestFromContext]) and the person's own messages among the
+	// transcript ([PersonMessagesFromContext]), which a transform that
+	// folds keeps verbatim (#298).
 	Transform func(context.Context, Transcript) (Transcript, error)
 
 	// BeforeToolCall runs once per call, in the model's order, before any
@@ -384,10 +388,17 @@ func (r Retry) backoff(attempt int, err error) time.Duration {
 // openresponses error with status 408, 409, 429 or 5xx, a stream that
 // ended before its terminal event, and transport failures (net.Error,
 // an unexpected EOF, a reset or refused connection). Everything else,
-// a 4xx in particular, is final.
+// a 4xx in particular, is final. An openresponses error is judged by
+// its code before its status: one whose code is insufficient_quota, an
+// account or key that cannot pay for the request, is final whatever
+// status it came with, OpenAI's 429 included, since no retry can fix
+// it (RFC 0001, Retry; #308).
 func DefaultRetryable(err error) bool {
 	var oe *openresponses.Error
 	if errors.As(err, &oe) {
+		if openresponses.IsInsufficientQuota(err) {
+			return false
+		}
 		switch status := oe.HTTPStatus(); {
 		case status == 408, status == 409, status == 429, status >= 500:
 			return true
@@ -519,6 +530,15 @@ type ToolDecision struct {
 	// so the person asked knows which part the question is about. Empty
 	// for a decision about the whole call. The loop does not use it.
 	Subject string
+	// DeclineText, on a Defer, is the text the asking model reads when
+	// the person or rule asked about the call declines it, in place of
+	// the loop's own "declined when asked: <reason>": the host's words
+	// for the refusal, as it words the question. [Ask] uses it for a
+	// nested call, a child's call under tools/agent's WithAskParent and
+	// any other call it is handed, and still ends it with what the
+	// answerer said, named for whoever said it. Empty keeps the loop's
+	// text (#304).
+	DeclineText string
 }
 
 // ToolResultInfo describes a completed call.

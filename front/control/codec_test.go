@@ -27,7 +27,7 @@ func sampleEvents(t *testing.T) map[string]agentturn.Event {
 	call := &openresponses.FunctionCall{CallID: "call_1", Name: "upper", Arguments: `{"text":"a"}`}
 	out := openresponses.NewFunctionCallOutput("call_1", "A")
 	trigger := agentturn.Trigger{Kind: "control", Ref: "alice", Extra: map[string]any{"n": 1.0}}
-	decision := &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "rule r", By: "policy", Held: true, Args: json.RawMessage(`{"text":"b"}`), Note: "n", Terminate: true, Subject: "rm -rf build"}
+	decision := &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "rule r", By: "policy", Held: true, Args: json.RawMessage(`{"text":"b"}`), Note: "n", Terminate: true, Subject: "rm -rf build", DeclineText: "not this build"}
 	resp := openresponses.NewResponse(openresponses.Request{Model: "m"})
 	resp.Output = openresponses.Items{call}
 	req := openresponses.Request{Model: "m", Input: openresponses.Items{openresponses.UserText("hi")}}
@@ -60,7 +60,7 @@ func sampleEvents(t *testing.T) map[string]agentturn.Event {
 				Notes:    []agentturn.Note{{Item: openresponses.UserText("only the unit tests"), Mode: agentturn.InputResume, Trigger: trigger, CallID: "call_1"}},
 				Question: &agentturn.OpenQuestion{ID: "entry_1", Message: "Allow notify?", Call: &agentturn.AskedCall{Parent: "call_1", CallID: "call_2", Name: "notify"}},
 			}}, Notes: []agentturn.Note{{Item: openresponses.DeveloperText("owed"), Mode: agentturn.InputTool}}},
-		"Queued":          &agentturn.Queued{RunID: "run_1", Item: openresponses.UserText("more"), Mode: agentturn.QueueSteer, Input: agentturn.InputDeliver, Hidden: true, Trigger: trigger, Provenance: prov},
+		"Queued":          &agentturn.Queued{RunID: "run_1", Item: openresponses.UserText("more"), Mode: agentturn.QueueSteer, Input: agentturn.InputDeliver, Hidden: true, Copied: true, Trigger: trigger, Provenance: prov},
 		"Question":        &agentturn.Question{ID: "question_1", RunID: "run_1", CallID: "call_0", Call: &agentturn.AskedCall{Parent: "call_0", CallID: "call_1", Name: "upper", Args: json.RawMessage(`{}`), Decision: decision}, Elicitation: agenttool.Elicitation{Message: "ok?", Schema: json.RawMessage(`{"type":"object"}`), URL: "https://example.test"}},
 		"QuarantineAdded": &agentturn.QuarantineAdded{},
 		"NotesHeld":       &agentturn.NotesHeld{RunID: "run_1", Notes: []agentturn.Note{{Item: openresponses.DeveloperText("a ran in the sandbox"), Mode: agentturn.InputTool}}},
@@ -184,7 +184,7 @@ func TestWhatTravelsAsADescription(t *testing.T) {
 	if _, err := tool.Execute(t.Context(), agenttool.Call{}); !errors.Is(err, ErrRemoteTool) {
 		t.Errorf("a remote tool ran: %v", err)
 	}
-	if p.Decision == nil || !p.Decision.Held || p.Decision.Action != agentturn.Defer || p.Decision.Reason != "rule r" || p.Decision.Subject != "rm -rf build" {
+	if p.Decision == nil || !p.Decision.Held || p.Decision.Action != agentturn.Defer || p.Decision.Reason != "rule r" || p.Decision.Subject != "rm -rf build" || p.Decision.DeclineText != "not this build" {
 		t.Errorf("decision = %+v", p.Decision)
 	}
 	if len(end.Notes) != 1 || end.Notes[0].Mode != agentturn.InputTool {

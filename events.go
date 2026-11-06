@@ -142,6 +142,18 @@ func (t Trigger) IsZero() bool {
 	return t.Kind == "" && t.Ref == "" && t.Source == "" && len(t.Extra) == 0
 }
 
+// TriggerHuman is the kind of a [Trigger] saying a person sent the
+// input: agentsession RFC 0001 0.21's one defined kind, under which a
+// user message is read as the person's words. A host starts a run or
+// queues an input under it for what the person typed, and never for a
+// message it composed, which carries a kind of the host's own. The loop
+// reads nothing from it; a session recorder does not write it on the
+// source of an item the host marked as composed from instruction
+// layers, copied or hidden, which keeps the trigger's other members, and
+// [WithProvenance] refuses it as the source of a message composed from
+// layers (#303).
+const TriggerHuman = "human"
+
 // TriggerCallee is the kind of a [Trigger] naming the call whose
 // callee's late result an input carries: a detached call's, whose
 // output said the callee was working, its answer delivered turns
@@ -401,7 +413,13 @@ type ItemEnd struct {
 	// [Trigger], so a recorder can write how the input arrived; it is
 	// zero for every other item, a queued input included, whose own
 	// trigger rode on its [Queued] report, and an output [Agent.Resume]
-	// appends for a pending call, whose decision says who gave it.
+	// appends for a pending call, whose decision says who gave it. It
+	// says how the input arrived, not who wrote the item: the loop
+	// carries it unread, so an item composed from layers, copied or
+	// hidden that a run a person started was prompted with carries the
+	// kind [TriggerHuman] here, which a session recorder clears in the
+	// record (#303). The record is the truth; a live view tells such an
+	// item by its Provenance, Copied and Hidden, never by this kind.
 	Trigger Trigger
 	// ModelCallID is the call ID the model gave a function call the
 	// loop gave an ID of its own, because the model's named a call in
@@ -1043,9 +1061,12 @@ const (
 // Queued reports an item [Agent.Steer] or [Agent.FollowUp] accepted
 // into a queue, before any run appends it, so a host writing what it
 // accepted can tell an item it was given from one a run produced. It
-// belongs to no run: the goroutine that owns delivery reports it at its
-// next event, which is why it is not the accept itself and a
-// subscriber's error cannot refuse the item.
+// belongs to no run: it is delivered under the delivery barrier after
+// the accept, by a run in flight without waiting for its next event
+// (#302) and by an idle agent at the next run's start, which is why it
+// is not the accept itself and a subscriber's error cannot refuse the
+// item. A subscriber's error on a report made between the run's events
+// ends the run at its next event.
 //
 // RunID names the run that was in flight when the item was accepted,
 // from the moment it was started, and is empty when the agent was idle
@@ -1071,11 +1092,20 @@ type Queued struct {
 	Input InputMode
 	// Hidden is set for an item the caller marked with [Hidden].
 	Hidden bool
+	// Copied is set for an item the caller marked with [Copied], taken
+	// from another conversation: a session recorder writes its queued
+	// entry with the trust the copy carries and without the kind
+	// [TriggerHuman], as it writes the item that drains it.
+	Copied bool
 	// Trigger is what brought the item in, from the context given to
 	// [Agent.Queue], zero for [Agent.Steer] and [Agent.FollowUp]: the
 	// run start names what started the run, and an input that joins it
 	// has a provenance of its own. It is the Source of the item's
-	// [Provenance] when that names one.
+	// [Provenance] when that names one. Like [ItemEnd.Trigger] it says
+	// how the input arrived, not who wrote it: a composed, copied or
+	// hidden item queued under the kind [TriggerHuman] carries that kind
+	// here, and a session recorder writes its queued entry without it
+	// (#303).
 	Trigger Trigger
 	// Provenance is what the caller marked the item with through
 	// [WithProvenance], nil for none. The item's own events carry it

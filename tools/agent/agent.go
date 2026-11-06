@@ -235,7 +235,12 @@ func (l *askLog) releases(pending []agentturn.PendingCall) ([]agentturn.Answer, 
 			return nil, false
 		}
 		if b.declined > 0 {
-			text := "not run: the call this one was held beside was declined when asked"
+			// The host's own words for a decline, where its hold gave
+			// them, stand for the loop's here too.
+			text := p.Decision.DeclineText
+			if text == "" {
+				text = "not run: the call this one was held beside was declined when asked"
+			}
 			answers = append(answers, agentturn.Output(&openresponses.FunctionCallOutput{CallID: p.Call.CallID, Output: openresponses.FunctionCallOutputData{Text: text}}).WithBy(agenttool.ByPolicy).WithReason(text))
 			continue
 		}
@@ -269,6 +274,8 @@ type options struct {
 	detach   func(callID string, end *agentturn.RunEnd)
 	// askParent is [WithAskParent].
 	askParent bool
+	// load is [WithRecord].
+	load func(ctx context.Context, call agenttool.Call, cfg agentturn.Config) (*Record, error)
 }
 
 // toolName is the form a provider accepts for a function tool's name.
@@ -494,6 +501,105 @@ func WithDetach(fn func(callID string, end *agentturn.RunEnd)) Option {
 	return func(o *options) { o.detach = fn }
 }
 
+// Record is what a host's record holds of the child a call started,
+// which [WithRecord]'s loader reads for a call run again under the key
+// of the dispatch that started it.
+type Record struct {
+	// Options seed the child's agent from the record: its transcript,
+	// its pending calls with what the record says of them, and whatever
+	// else a stored session gives an agent, as agentturn/session's
+	// AgentOptions does.
+	Options []agentturn.Option
+	// Pending are the calls Options seeds as pending, as
+	// agentturn/session's Pending reads them.
+	Pending []agentturn.PendingCall
+	// Answers answer the pending calls that are not held, by the
+	// replay rule, as agentturn/session's ReplayAnswers gives them: a
+	// call that never started is approved, which puts it to the
+	// child's BeforeToolCall again.
+	Answers []agentturn.Answer
+	// RunID is the child's last run on the record, the callee a held
+	// call it still waits on is named under.
+	RunID string
+	// End, when set, is the end of the child's last run, which ended
+	// with nothing pending: the call returns what that end says and
+	// runs nothing. Err says why for an end without an answer.
+	End *agentturn.RunEnd
+	// Queued are the inputs the child accepted and had not taken when
+	// the process stopped, which the record still owes it, in the order
+	// they were accepted: the call hands them back to the continued
+	// child before its run, as a recorder hands the root its owed inputs
+	// (RFC 0001, Queues), so the run takes them under the entries the
+	// record holds.
+	Queued []QueuedInput
+}
+
+// QueuedInput is an input a child's record owes it, handed back the
+// way it arrived: Item with the marks it was accepted with, the queue
+// it joined, whether it came as a delivery, which goes back through
+// agentturn.Agent.Redeliver, and the trigger that brought it in.
+type QueuedInput struct {
+	Item    openresponses.Item
+	Mode    agentturn.QueueMode
+	Deliver bool
+	Trigger agentturn.Trigger
+}
+
+// ErrNoRecord is what a [WithRecord] loader returns, wrapped, for a
+// call run again under the key of a hand-off that may have started
+// its child when the record holds no child of that hand-off: the
+// recorder keeps no child sessions, or the process stopped after the
+// child started and before the record linked it. The call fails with
+// it, and runs nothing: a child started afresh could repeat work the
+// first one did. Its text tells the model the outcome is unknown.
+var ErrNoRecord = errors.New("outcome unknown: the call was run again after it was cut off, and the record holds no child agent it started, which may or may not have done its work; check before calling it again")
+
+// WithRecord has a call run again under the key of the dispatch that
+// started its child continue that child from the host's record, rather
+// than start it afresh, and makes the tool report itself keyed
+// (agenttool.ReplayKeyed), so the loop's replay rule runs a call that
+// was in flight when the process stopped again under that key (RFC
+// 0001, Composition, As a tool). load is called on each call that
+// carries a key, with the call and the configuration it runs under,
+// and returns nil for a call that is the first hand-off under its key:
+// a first call, or one run again under a new key, which is another
+// operation, starts afresh. For a call that repeats a hand-off whose
+// child the record does not hold it returns [ErrNoRecord], and the
+// call fails with the outcome unknown (RFC 0001, Composition, As a
+// tool). agentturn/session's
+// Recorder.ChildRecord is the loader for a child recorded with
+// Recorder.Observe:
+//
+//	specialist := agent.New(childCfg,
+//		agent.WithObserver(rec.Observe),
+//		agent.WithRunContext(rec.ChildContext),
+//		agent.WithRecord(rec.ChildRecord))
+//
+// A child the record holds continues on a new agent seeded with
+// [Record.Options], its run not marked [ContextWithRetry], so its
+// session goes on at its leaf. Its pending calls are answered with
+// [Record.Answers], and the inputs it owes ([Record.Queued]) are
+// handed back to it first; one its policy held, a deferral nobody answered,
+// goes back to its BeforeToolCall under [WithAskParent], which asks the
+// elicitor of the call that started the child again, under that call,
+// and otherwise the call fails input-required naming it, as the child
+// left it, without running it: the inputs it owes stay queued in the
+// child, which [WithSpawn] hands the host as for any call, so the run
+// that answers the held call takes them. Such a host resumes the held
+// child itself, and [Agent.Resume] needs an answer for every pending
+// call: when the held call is not the child's only pending call, the
+// host answers the others as the replay rule does (agentturn/session's
+// ReplayAnswers over the child's session), since the tool returns
+// before it would apply [Record.Answers]. A child that ended with nothing pending returns its recorded
+// end ([Record.End]) without running, and one cut with nothing pending
+// continues its run. A loader's error fails the call before anything
+// runs, since running the child afresh could repeat its work. A
+// detached call ([WithDetach]) is not continued, and the tool reports
+// no replay for it.
+func WithRecord(load func(ctx context.Context, call agenttool.Call, cfg agentturn.Config) (*Record, error)) Option {
+	return func(o *options) { o.load = load }
+}
+
 type configKey struct{}
 type retryKey struct{}
 
@@ -525,7 +631,10 @@ func ContextWithConfig(ctx context.Context, cfg agentturn.Config) context.Contex
 // second Execute under one call ID, Agent.Resume running a cut-off
 // call again for one, never holds the path it would continue, and its
 // run belongs on a new root, where its responses rebuild and the
-// earlier attempt's open call is not at the leaf. For a first call the
+// earlier attempt's open call is not at the leaf. The exception is a
+// call run again under [WithRecord] whose child the record holds: its
+// agent is seeded with that path, so its run is not marked and goes on
+// at the leaf. For a first call the
 // session does not exist yet and the mark changes nothing. A host that
 // keeps the child through [WithSpawn] and prompts it again does so
 // with a context of its own, unmarked, and that run continues at the
@@ -582,6 +691,16 @@ func (a *agentTool) Description() string         { return a.cfg.Description }
 func (a *agentTool) Parameters() json.RawMessage { return a.opts.schema }
 func (a *agentTool) Strict() bool                { return a.opts.strict }
 
+// Replay reports the tool keyed under [WithRecord], which continues
+// the child a call started under its key rather than run it afresh,
+// and says nothing otherwise.
+func (a *agentTool) Replay(context.Context, json.RawMessage) agenttool.Replay {
+	if a.opts.load != nil && a.opts.detach == nil {
+		return agenttool.ReplayKeyed
+	}
+	return agenttool.ReplayUnknown
+}
+
 // Execute runs the child as an [agentturn.Agent], so every event is a
 // barrier and a host given the agent by [WithSpawn] can reach it while
 // it runs. The output is the text of the child's last assistant
@@ -589,7 +708,10 @@ func (a *agentTool) Strict() bool                { return a.opts.strict }
 // error, one that is aborted returns the context error, and one that
 // stopped on deferred calls, nobody having been asked ([WithAskParent]),
 // returns an [*InputRequiredError], because a pause inside the child
-// cannot become a pause of the parent after the fact. A child that ends without a final assistant message returns
+// cannot become a pause of the parent after the fact. Under
+// [WithRecord] a call run again under the key of the dispatch that
+// started its child continues that child from the record instead of
+// running it afresh. A child that ends without a final assistant message returns
 // what [WithNoAnswer] says, by default an error naming the cause. On
 // every error path the Result still carries the ChildInfo: the loop
 // keeps Details when it turns an error into the output the model sees,
@@ -621,8 +743,22 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	if a.opts.call != nil {
 		prompts = markCopied(prompts, parent)
 	}
+	var restored *Record
+	if a.opts.load != nil && a.opts.detach == nil && call.IdempotencyKey != "" {
+		// The call runs again under its dispatch's key: the child that
+		// dispatch started continues from the record (#297).
+		if restored, err = a.opts.load(ctx, call, cfg); err != nil {
+			if errors.Is(err, ErrNoRecord) {
+				return agenttool.Result{}, fmt.Errorf("agent %q: %w", a.cfg.Name, err)
+			}
+			return agenttool.Result{}, fmt.Errorf("agent %q: read the child's record: %w", a.cfg.Name, err)
+		}
+	}
+	if restored != nil && restored.End != nil {
+		return a.result(restored.End, restored.End.Items)
+	}
 	var seed agentturn.Transcript
-	if a.opts.seed != nil {
+	if a.opts.seed != nil && restored == nil {
 		seed = a.opts.seed(parent)
 	}
 
@@ -643,6 +779,15 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		elicit, _ := agenttool.ElicitorFrom(ctx)
 		asks = &askLog{}
 		runCfg.BeforeToolCall = asks.wrap(cfg.BeforeToolCall, elicit)
+	}
+	var answers []agentturn.Answer
+	// held says the restored child still waits on a call nobody may be
+	// asked about.
+	var held bool
+	if restored != nil {
+		var pending []agentturn.PendingCall
+		answers, pending, held = restoredAnswers(restored, asks != nil)
+		opts = append(append(opts, restored.Options...), agentturn.WithPending(pending))
 	}
 	child := agentturn.New(runCfg, opts...)
 	var mu sync.Mutex
@@ -725,8 +870,11 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 	// call, so its run starts afresh in the call's session: a second
 	// Execute under one call ID, a cut-off call run again, opens a new
 	// root rather than continue a path this agent never read. The
-	// subscriber above carries the mark to the observer's context.
-	ctx = ContextWithRetry(ctx)
+	// subscriber above carries the mark to the observer's context. A
+	// child seeded from its record holds that path, and continues it.
+	if restored == nil {
+		ctx = ContextWithRetry(ctx)
+	}
 	if a.opts.runCtx != nil {
 		ctx = a.opts.runCtx(ctx, call.ID)
 	}
@@ -737,7 +885,44 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 			mu.Unlock()
 		})
 	}
-	end, err := child.Prompt(ctx, prompts...)
+	if restored != nil {
+		// The inputs the child owes go back to it before its run, so
+		// the run takes them.
+		for _, q := range restored.Queued {
+			qctx := agentturn.ContextWithTrigger(ctx, q.Trigger)
+			var err error
+			if q.Deliver {
+				err = child.Redeliver(qctx, q.Item)
+			} else {
+				err = child.Queue(qctx, q.Mode, q.Item)
+			}
+			if err != nil {
+				return agenttool.Result{}, fmt.Errorf("agent %q: hand back the child's owed input: %w", a.cfg.Name, err)
+			}
+		}
+	}
+	if held {
+		// The child still waits on a call nobody may be asked about:
+		// the call fails as the child left it, without running it. The
+		// inputs it owes stay queued in it, the child a host holds
+		// through WithSpawn, so the run that answers its call takes
+		// them, and owed on the record meanwhile.
+		mu.Lock()
+		done = true
+		mu.Unlock()
+		info := ChildInfo{Agent: a.cfg.Name, RunID: restored.RunID, Reason: agentturn.ReasonInputRequired, Pending: restored.Pending}
+		return agenttool.Result{Details: info}, &InputRequiredError{Agent: a.cfg.Name, RunID: restored.RunID, Pending: restored.Pending}
+	}
+	var end *agentturn.RunEnd
+	switch {
+	case restored == nil:
+		end, err = child.Prompt(ctx, prompts...)
+	case len(answers) > 0:
+		end, err = child.Resume(ctx, answers...)
+	default:
+		// Cut with nothing pending: the run goes on from where it was.
+		end, err = child.Continue(ctx)
+	}
 	var items agentturn.Transcript
 	if end != nil {
 		items = end.Items
@@ -769,6 +954,41 @@ func (a *agentTool) Execute(ctx context.Context, call agenttool.Call) (agenttool
 		}
 		return agenttool.Result{}, fmt.Errorf("agent %s: %w", strconv.Quote(a.cfg.Name), err)
 	}
+	return a.result(end, items)
+}
+
+// restoredAnswers returns the answers that continue a child from rec,
+// the pending calls to seed it with, and whether it waits on a call
+// they cannot answer. The replay rule answers every call that is not
+// held. One the child's policy held, nobody having answered, goes back
+// to the policy when ask, under [WithAskParent], says the question can
+// be put again: it is seeded as a call that never started and approved,
+// which puts it to BeforeToolCall. Otherwise it stays held.
+func restoredAnswers(rec *Record, ask bool) ([]agentturn.Answer, []agentturn.PendingCall, bool) {
+	answers := append([]agentturn.Answer(nil), rec.Answers...)
+	answered := make(map[string]bool, len(answers))
+	for _, ans := range answers {
+		answered[ans.CallID] = true
+	}
+	pending := append([]agentturn.PendingCall(nil), rec.Pending...)
+	held := false
+	for i, p := range pending {
+		if p.Call == nil || answered[p.Call.CallID] {
+			continue
+		}
+		if !ask || p.Reason != agentturn.PendingDeferred || p.Dispatched {
+			held = true
+			continue
+		}
+		pending[i].Reason, pending[i].Decision = agentturn.PendingUndispatched, nil
+		answers = append(answers, agentturn.Approve(p.Call.CallID))
+	}
+	return answers, pending, held
+}
+
+// result is the call's result for the child's run end, items being
+// what the call's runs appended.
+func (a *agentTool) result(end *agentturn.RunEnd, items agentturn.Transcript) (agenttool.Result, error) {
 	info := ChildInfo{Agent: a.cfg.Name, RunID: end.RunID, Items: items, Reason: end.Reason, Cause: end.Cause, Pending: end.Pending}
 	switch end.Reason {
 	case agentturn.ReasonInputRequired:

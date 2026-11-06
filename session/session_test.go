@@ -1617,6 +1617,11 @@ func TestFoldWithNoTextBacksOff(t *testing.T) {
 	for _, e := range s.Entries() {
 		if c, ok := e.(*agentsession.CustomEntry); ok && c.NS == FailedFoldNS {
 			failed++
+			// The budget forced it: nobody asked for it (#306).
+			var data FailedFold
+			if err := json.Unmarshal(c.Data, &data); err != nil || data.Requested || data.Instructions != "" {
+				t.Errorf("forced failed fold = %+v err=%v, want neither requested nor instructions", data, err)
+			}
 		}
 	}
 	if failed != 1 {

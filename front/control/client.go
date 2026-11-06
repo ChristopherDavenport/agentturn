@@ -201,17 +201,32 @@ func (c *Client) run(ctx context.Context, path string, body any) (*agentturn.Run
 
 // Prompt implements agentturn.Control. Cancelling ctx aborts the run,
 // as it does in process; a lost connection does not (see [Client]).
+//
+// The trigger on ctx (agentturn.ContextWithTrigger) is sent as the
+// caller's claim, by Prompt, Resume, Queue, Deliver and Accept alike: a
+// person at a terminal claims kind agentturn.TriggerHuman for what they
+// typed. The server runs the input under it only when its host lets the
+// principal claim one ([WithTriggerClaims]), and otherwise under kind
+// "control" naming the principal.
 func (c *Client) Prompt(ctx context.Context, items ...openresponses.Item) (*agentturn.RunEnd, error) {
 	raw, err := itemsOut(items)
 	if err != nil {
 		return nil, err
 	}
 	return c.run(ctx, "prompt", struct {
-		Items json.RawMessage `json:"items"`
-	}{raw})
+		Items   json.RawMessage `json:"items"`
+		Trigger *wireTrigger    `json:"trigger,omitempty"`
+	}{raw, claimOut(ctx)})
 }
 
-// Resume implements agentturn.Control.
+// claimOut is the trigger on ctx, which a request sends as its
+// caller's claim; nil for none.
+func claimOut(ctx context.Context) *wireTrigger {
+	return triggerOut(agentturn.TriggerFromContext(ctx))
+}
+
+// Resume implements agentturn.Control, sending ctx's trigger as the
+// caller's claim, as [Client.Prompt] does.
 func (c *Client) Resume(ctx context.Context, answers ...agentturn.Answer) (*agentturn.RunEnd, error) {
 	w, err := answersOut(answers)
 	if err != nil {
@@ -219,10 +234,12 @@ func (c *Client) Resume(ctx context.Context, answers ...agentturn.Answer) (*agen
 	}
 	return c.run(ctx, "resume", struct {
 		Answers []wireAnswer `json:"answers"`
-	}{w})
+		Trigger *wireTrigger `json:"trigger,omitempty"`
+	}{w, claimOut(ctx)})
 }
 
-// Queue implements agentturn.Control.
+// Queue implements agentturn.Control, sending ctx's trigger as the
+// caller's claim, as [Client.Prompt] does.
 func (c *Client) Queue(ctx context.Context, mode agentturn.QueueMode, items ...openresponses.Item) error {
 	raw, err := itemsOut(items)
 	if err != nil {
@@ -230,9 +247,10 @@ func (c *Client) Queue(ctx context.Context, mode agentturn.QueueMode, items ...o
 	}
 	var out errReply
 	if err := c.call(ctx, http.MethodPost, "queue", struct {
-		Mode  string          `json:"mode"`
-		Items json.RawMessage `json:"items"`
-	}{string(mode), raw}, &out); err != nil {
+		Mode    string          `json:"mode"`
+		Items   json.RawMessage `json:"items"`
+		Trigger *wireTrigger    `json:"trigger,omitempty"`
+	}{string(mode), raw, claimOut(ctx)}, &out); err != nil {
 		return err
 	}
 	return errorIn(out.Err)
@@ -244,7 +262,8 @@ func (c *Client) Queue(ctx context.Context, mode agentturn.QueueMode, items ...o
 // delivery started, or the one that took them and ended before a model
 // call saw them. A server whose Control offers no delivery answers
 // [ErrNoDelivery]. Cancelling ctx stops waiting and aborts nothing: a
-// run the delivery started goes on, and Abort stops it.
+// run the delivery started goes on, and Abort stops it. ctx's trigger
+// is sent as the caller's claim, as [Client.Prompt] does.
 func (c *Client) Deliver(ctx context.Context, items ...openresponses.Item) (bool, *agentturn.RunEnd, error) {
 	raw, err := itemsOut(items)
 	if err != nil {
@@ -252,8 +271,9 @@ func (c *Client) Deliver(ctx context.Context, items ...openresponses.Item) (bool
 	}
 	var out deliverReply
 	if err := c.call(ctx, http.MethodPost, "deliver", struct {
-		Items json.RawMessage `json:"items"`
-	}{raw}, &out); err != nil {
+		Items   json.RawMessage `json:"items"`
+		Trigger *wireTrigger    `json:"trigger,omitempty"`
+	}{raw, claimOut(ctx)}, &out); err != nil {
 		var lost *lostError
 		if errors.As(err, &lost) && ctx.Err() == nil {
 			return false, nil, fmt.Errorf("%w: %w", ErrConnectionLost, lost.err)
@@ -270,6 +290,116 @@ func (c *Client) Deliver(ctx context.Context, items ...openresponses.Item) (bool
 }
 
 var _ agentturn.Deliverer = (*Client)(nil)
+
+// Accept implements agentturn.Accepter: it returns once the server's
+// agent has queued the items as a delivery, and the [agentturn.Delivery]
+// it returns is settled with what [Client.Deliver] would have returned
+// once the agent has settled the delivery, which it does whether or not
+// anyone waits. The outcome arrives on the same response, which stays
+// open until then, whether or not the handle is waited on: each accept
+// holds one connection of the HTTP client's until the server's agent
+// settles it, a view that steers often and never waits among them, so
+// a client with a per-host connection limit counts them against it. A
+// client whose WithHTTPClient sets a Timeout cuts the response off. A
+// proxy that buffers responses holds the accept back until the outcome
+// too, so Accept then returns no sooner than [Client.Deliver]. Cancelling ctx before the accept arrives returns ctx's error,
+// and the items may have been queued all the same; once Accept has
+// returned, ctx bounds nothing. A connection lost before the outcome
+// settles the delivery with an error wrapping [ErrConnectionLost], the
+// agent settling it all the same. A server whose Control offers no
+// two-step delivery, or that serves no POST /accept, answers
+// [ErrNoDelivery]. ctx's trigger is sent as the caller's claim, as
+// [Client.Prompt] does.
+func (c *Client) Accept(ctx context.Context, items ...openresponses.Item) (*agentturn.Delivery, error) {
+	raw, err := itemsOut(items)
+	if err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(struct {
+		Items   json.RawMessage `json:"items"`
+		Trigger *wireTrigger    `json:"trigger,omitempty"`
+	}{raw, claimOut(ctx)})
+	if err != nil {
+		return nil, err
+	}
+	// The response outlives ctx once the accept is in: the outcome
+	// follows on it.
+	reqCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stop := context.AfterFunc(ctx, cancel)
+	fail := func(resp *http.Response, err error) (*agentturn.Delivery, error) {
+		stop()
+		cancel()
+		if resp != nil {
+			resp.Body.Close()
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.base.JoinPath("accept").String(), bytes.NewReader(body))
+	if err != nil {
+		return fail(nil, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return fail(nil, err)
+	}
+	if resp.StatusCode/100 != 2 {
+		data, rerr := io.ReadAll(io.LimitReader(resp.Body, c.maxBody))
+		if rerr != nil {
+			return fail(resp, rerr)
+		}
+		var e errReply
+		switch {
+		case json.Unmarshal(data, &e) == nil && e.Err != nil:
+			return fail(resp, errorIn(e.Err))
+		case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed:
+			// A server that predates the two-step delivery.
+			return fail(resp, fmt.Errorf("%w: POST accept: %s", ErrNoDelivery, resp.Status))
+		}
+		return fail(resp, fmt.Errorf("control: POST accept: %s", resp.Status))
+	}
+	dec := json.NewDecoder(io.LimitReader(resp.Body, c.maxBody))
+	var first acceptReply
+	if err := dec.Decode(&first); err != nil {
+		return fail(resp, err)
+	}
+	if first.Err != nil || !first.Accepted {
+		err := errorIn(first.Err)
+		if err == nil {
+			err = errors.New("control: accept: the server did not accept the items")
+		}
+		return fail(resp, err)
+	}
+	// Accepted: from here ctx bounds nothing. Should it have ended in
+	// between, the outcome's read fails, and the delivery says the
+	// connection was lost.
+	stop()
+	d, settle := agentturn.NewDelivery()
+	go func() {
+		defer cancel()
+		defer resp.Body.Close()
+		var out deliverReply
+		if err := dec.Decode(&out); err != nil {
+			settle(false, nil, fmt.Errorf("%w: %w", ErrConnectionLost, err))
+			return
+		}
+		var end *agentturn.RunEnd
+		if out.End != nil {
+			var err error
+			if end, err = runEndIn(*out.End); err != nil {
+				settle(false, nil, err)
+				return
+			}
+		}
+		settle(out.Joined, end, errorIn(out.Err))
+	}()
+	return d, nil
+}
+
+var _ agentturn.Accepter = (*Client)(nil)
 
 // Abort implements agentturn.Control. A failure goes to the
 // [WithStreamErrors] function.
@@ -300,8 +430,12 @@ func (c *Client) FetchState(ctx context.Context) (agentturn.State, error) {
 }
 
 // Reply implements agentturn.Control. Who answered is the principal
-// the handler authenticates, not anything on ctx, which bounds the
-// request. answer.By, who decided, is recorded only when the handler
+// the handler authenticates, unless ctx carries an answerer
+// (agentturn.ContextWithAnswerer), which is sent as the caller's claim:
+// a person at a terminal claims kind agentturn.TriggerHuman. The server
+// records it only when its host lets the principal claim one
+// ([WithTriggerClaims]), and otherwise names the principal under kind
+// "control". answer.By, who decided, is recorded only when the handler
 // lets the principal say ([WithChosenBy]); otherwise the answer is a
 // person's. A question that is not waiting is an error that matches
 // agentturn.ErrNoQuestion.
@@ -309,10 +443,15 @@ func (c *Client) Reply(ctx context.Context, id string, answer agenttool.Answer) 
 	ctx, cancel := context.WithTimeout(ctx, c.wait)
 	defer cancel()
 	var out errReply
+	var answerer *wireTrigger
+	if by, ok := agentturn.AnswererFrom(ctx); ok {
+		answerer = triggerOut(by)
+	}
 	if err := c.call(ctx, http.MethodPost, "reply", struct {
-		ID     string            `json:"id"`
-		Answer *wireElicitAnswer `json:"answer"`
-	}{id, elicitAnswerOut(&answer)}, &out); err != nil {
+		ID       string            `json:"id"`
+		Answer   *wireElicitAnswer `json:"answer"`
+		Answerer *wireTrigger      `json:"answerer,omitempty"`
+	}{id, elicitAnswerOut(&answer), answerer}, &out); err != nil {
 		return err
 	}
 	return errorIn(out.Err)

@@ -330,32 +330,42 @@ func TestChainTransform(t *testing.T) {
 
 // TestChainedDeferralsAreHeldOnlyIfEveryHookHeld pins R10: a call one
 // hook only held beside another and a later hook asks about is asked
-// about, not held, so nothing releases it unasked.
+// about, not held, so nothing releases it unasked. The decline text
+// comes only from a deferral of the kind that stands (#304): an asked
+// call's from the deferrals that ask, since a hold's is worded for a
+// refusal beside a declined sibling, and a held call's from the holds.
 func TestChainedDeferralsAreHeldOnlyIfEveryHookHeld(t *testing.T) {
 	held := func(context.Context, ToolCallInfo) (*ToolDecision, error) {
-		return &ToolDecision{Action: Defer, Reason: "held beside another call", Held: true}, nil
+		return &ToolDecision{Action: Defer, Reason: "held beside another call", Held: true, DeclineText: "not run beside a refusal"}, nil
 	}
 	ask := func(context.Context, ToolCallInfo) (*ToolDecision, error) {
 		return &ToolDecision{Action: Defer, Reason: "ask bash(rm:*)", Subject: "rm -rf build"}, nil
 	}
+	worded := func(context.Context, ToolCallInfo) (*ToolDecision, error) {
+		return &ToolDecision{Action: Defer, Reason: "ask bash(git push:*)", DeclineText: "the push stays local"}, nil
+	}
+	type hook = func(context.Context, ToolCallInfo) (*ToolDecision, error)
 	for _, tc := range []struct {
 		name    string
-		fns     []func(context.Context, ToolCallInfo) (*ToolDecision, error)
+		fns     []hook
 		held    bool
 		reason  string
 		subject string
+		decline string
 	}{
-		{"held then asked", []func(context.Context, ToolCallInfo) (*ToolDecision, error){held, ask}, false, "ask bash(rm:*)", "rm -rf build"},
-		{"asked then held", []func(context.Context, ToolCallInfo) (*ToolDecision, error){ask, held}, false, "ask bash(rm:*)", "rm -rf build"},
-		{"held by both", []func(context.Context, ToolCallInfo) (*ToolDecision, error){held, held}, true, "held beside another call", ""},
+		{"held then asked", []hook{held, ask}, false, "ask bash(rm:*)", "rm -rf build", ""},
+		{"asked then held", []hook{ask, held}, false, "ask bash(rm:*)", "rm -rf build", ""},
+		{"held by both", []hook{held, held}, true, "held beside another call", "", "not run beside a refusal"},
+		{"held then asked in the host's words", []hook{held, worded}, false, "ask bash(git push:*)", "", "the push stays local"},
+		{"asked, then asked in the host's words", []hook{ask, worded}, false, "ask bash(rm:*)", "rm -rf build", "the push stays local"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d, err := ChainBeforeToolCall(tc.fns...)(context.Background(), ToolCallInfo{})
 			if err != nil {
 				t.Fatal(err)
 			}
-			if d.Action != Defer || d.Held != tc.held || d.Reason != tc.reason || d.Subject != tc.subject {
-				t.Errorf("decision = %+v, want held %v, reason %q, subject %q", d, tc.held, tc.reason, tc.subject)
+			if d.Action != Defer || d.Held != tc.held || d.Reason != tc.reason || d.Subject != tc.subject || d.DeclineText != tc.decline {
+				t.Errorf("decision = %+v, want held %v, reason %q, subject %q, decline text %q", d, tc.held, tc.reason, tc.subject, tc.decline)
 			}
 		})
 	}

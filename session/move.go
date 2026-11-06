@@ -58,7 +58,7 @@ func MoveTo(ctx context.Context, a *agentturn.Agent, r *Recorder, entryID string
 		if s, err = r.store.Open(ctx, r.SessionID()); err != nil {
 			return back(fmt.Errorf("session: move: %w", err))
 		}
-		items, models, pending, owed, ids, err := agentState(s, append(r.ReadOptions(), WithContext(ctx)))
+		items, models, persons, pending, owed, ids, err := agentState(s, append(r.ReadOptions(), WithContext(ctx)))
 		if err != nil {
 			return back(fmt.Errorf("session: move: %w", err))
 		}
@@ -67,6 +67,7 @@ func MoveTo(ctx context.Context, a *agentturn.Agent, r *Recorder, entryID string
 		for _, step := range []func() error{
 			func() error { return a.SetTranscript(items) },
 			func() error { return a.SetReasoningModels(models) },
+			func() error { return a.SetPersonMessages(persons) },
 			func() error { return a.SetPending(pending) },
 			func() error { return a.SetNotes(owed) },
 			func() error { return a.ReserveCallIDs(ids...) },
@@ -81,8 +82,8 @@ func MoveTo(ctx context.Context, a *agentturn.Agent, r *Recorder, entryID string
 
 // agentState reads what an agent continuing s at its leaf holds, as
 // [AgentOptions] does.
-func agentState(s *agentsession.Session, opts []ReadOption) (items openresponses.Items, models agentturn.ReasoningModels, pending []agentturn.PendingCall, owed []agentturn.Note, ids []string, err error) {
-	if items, models, err = TranscriptModels(s, opts...); err != nil {
+func agentState(s *agentsession.Session, opts []ReadOption) (items openresponses.Items, models agentturn.ReasoningModels, persons agentturn.PersonMessages, pending []agentturn.PendingCall, owed []agentturn.Note, ids []string, err error) {
+	if items, models, persons, err = TranscriptMarks(s, opts...); err != nil {
 		return
 	}
 	if pending, err = Pending(s, opts...); err != nil {

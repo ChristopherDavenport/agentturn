@@ -16,7 +16,9 @@ const (
 	// MetaEscalatedCalls, on an input-required status message, lists the
 	// calls of the agent's own tools its policy asked about and
 	// [WithEscalation] put to the caller: a JSON array of objects with
-	// "call_id", "name" and "reason", the policy's reason for asking.
+	// "call_id", "name", "arguments", the arguments the call runs with
+	// if approved (the policy's rewrite, else the model's), and
+	// "reason", the policy's reason for asking.
 	// The calls are among the status message's function_call data
 	// parts, and the caller answers each with an [Approval].
 	MetaEscalatedCalls = "agentturn.escalated_calls"
@@ -202,7 +204,10 @@ func (e *Executor) checkChosen(ctx context.Context, principal string, approvals 
 // answer is the agentturn answer an approval of call makes, said by
 // principal. An approval runs the call with the policy's rewrite of its
 // arguments; a refusal says the caller's note in its output, which the
-// model reads, so the note is not said a second time.
+// model reads, so the note is not said a second time. The refusal is
+// the deferral's decline text when the host gave one (#304), else the
+// front's own words, and the note follows either, named for the
+// caller.
 func (a Approval) answer(call Escalated, principal string) agentturn.Answer {
 	if a.Approve {
 		ans := agentturn.Approve(a.CallID)
@@ -220,8 +225,15 @@ func (a Approval) answer(call Escalated, principal string) agentturn.Answer {
 		return ans
 	}
 	text := "the caller " + principal + " refused this call"
+	said := "; the caller said: "
+	if call.Decision != nil && call.Decision.DeclineText != "" {
+		// The host worded the refusal; the caller is named with the
+		// note, since the host's text may not name them.
+		text = call.Decision.DeclineText
+		said = "; the caller " + principal + " said: "
+	}
 	if a.Note != "" {
-		text += "; the caller said: " + a.Note
+		text += said + a.Note
 	}
 	return agentturn.Output(&openresponses.FunctionCallOutput{CallID: a.CallID, Output: openresponses.FunctionCallOutputData{Text: text}}).WithBy(a.By)
 }
@@ -251,9 +263,13 @@ func (c Escalated) release() agentturn.Answer {
 
 // refuse answers a held call whose batch the caller refused: not run,
 // by the policy that held it, since it was held only beside the call
-// the caller said no to.
+// the caller said no to. The model reads the hold's own decline text
+// when the host gave one (#304).
 func (c Escalated) refuse(principal string) agentturn.Answer {
 	text := "not run: the caller " + principal + " refused the call this one was held beside"
+	if c.Decision.DeclineText != "" {
+		text = c.Decision.DeclineText
+	}
 	return agentturn.Output(&openresponses.FunctionCallOutput{CallID: c.Call.CallID, Output: openresponses.FunctionCallOutputData{Text: text}}).WithBy("policy").WithReason(text)
 }
 

@@ -481,21 +481,44 @@ func (a *Agent) eventContext() context.Context {
 // not take. It takes the barrier again only when it is free; when it is
 // not, the holder runs this as it lets go, so no owed event is left
 // behind. The caller holds a.emitMu.
+//
+// It reports, too, the items a run in flight accepted while the barrier
+// was held ([Agent.reportQueued]): every pass while an accept from
+// outside the agent's subscribers is owed, and otherwise one. An item a
+// subscriber accepts while those are reported, with the context it was
+// handed or by Steer or FollowUp, which carry none, waits for the run's
+// next event, so a subscriber that queues on every queued report does
+// not spin here, while a second caller's accept that arrives during a
+// report is not left behind it. The passes stop at maxQueuedPasses,
+// whoever's accepts are owed, so a subscriber that queues on every
+// report under a context of its own, which counts as from outside,
+// cannot hold the barrier and stall the run: what is left waits for the
+// run's next event.
 func (a *Agent) unlockEmit() error {
+	passes := 0
 	for {
 		a.emitMu.Unlock()
 		a.mu.Lock()
 		owed := len(a.quarantineOwed) > 0
+		queued := a.queuedOwed() && passes < maxQueuedPasses && (passes == 0 || a.queuedOutside > 0)
 		a.mu.Unlock()
-		if !owed || !a.emitMu.TryLock() {
+		if !owed && !queued || !a.emitMu.TryLock() {
 			return nil
 		}
 		if err := a.flushQuarantine(a.eventContext()); err != nil {
 			a.emitMu.Unlock()
 			return err
 		}
+		if queued {
+			passes++
+			a.flushQueued()
+		}
 	}
 }
+
+// maxQueuedPasses bounds the queued reports one release of the barrier
+// makes ([Agent.unlockEmit]).
+const maxQueuedPasses = 4
 
 // flushQuarantine delivers the [QuarantineAdded] events owed. The
 // caller holds a.emitMu.

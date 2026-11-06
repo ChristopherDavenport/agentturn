@@ -29,7 +29,7 @@ type Scope string
 const (
 	// ScopeRead follows the agent: Subscribe and State.
 	ScopeRead Scope = "read"
-	// ScopeControl drives it: Prompt, Queue, Deliver and Abort.
+	// ScopeControl drives it: Prompt, Queue, Deliver, Accept and Abort.
 	ScopeControl Scope = "control"
 	// ScopeAnswer answers it: Resume and Reply, which let a call run
 	// that the policy asked a person about. No other scope implies it.
@@ -42,8 +42,10 @@ const (
 // it, and what they may do.
 type Principal struct {
 	// Name says who, for the record: a run a principal starts or
-	// answers carries it as the Ref of an agentturn.Trigger of kind
-	// "control".
+	// answers, and an input it queues or delivers, carries it as the
+	// Ref of an agentturn.Trigger of kind "control", or of the trigger
+	// it claims when the host lets it ([WithTriggerClaims]) and the
+	// claim names no ref of its own.
 	Name   string
 	Scopes []Scope
 }
@@ -99,7 +101,8 @@ type Command struct {
 var ErrUnknownCommand = errors.New("control: no such command")
 
 // ErrNoDelivery is the answer to a delivery when the Control the
-// handler serves is no agentturn.Deliverer.
+// handler serves is no agentturn.Deliverer, and to an accept when it is
+// no agentturn.Accepter or the handler predates POST /accept.
 var ErrNoDelivery = errors.New("control: the agent offers no delivery")
 
 // Option configures a Handler.
@@ -157,6 +160,26 @@ func WithChosenBy(scope Scope) Option {
 	return func(h *handler) { h.chosenBy = scope }
 }
 
+// WithTriggerClaims lets a principal that holds scope claim the trigger
+// its input runs under: the trigger a [Client]'s caller put on the
+// context of Prompt, Queue, Deliver, Accept or Resume
+// (agentturn.ContextWithTrigger), which the client sends, and the
+// answerer it put on the context of Reply
+// (agentturn.ContextWithAnswerer), which names who answered a question. A person at a
+// terminal claims kind agentturn.TriggerHuman for what they typed, so a
+// recorder writes it as their words. The claim's members stand; a kind
+// or a ref it leaves out are "control" and the principal's name, as
+// without a claim. A claim whose Extra the format cannot write is
+// refused with agentturn.ErrTriggerExtra, before the agent sees the
+// input. Without the option, or for a principal without scope, the
+// claim is not recorded: the input runs under kind "control" naming the
+// principal, since the package cannot check who is at a client and
+// whom to trust is the host's to decide, through the scopes its
+// [Authenticator] grants (RFC 0001, The record, #303).
+func WithTriggerClaims(scope Scope) Option {
+	return func(h *handler) { h.claims = scope }
+}
+
 // WithMaxRequestBytes bounds a request body; a larger one is refused.
 // The default is 16 MiB, room for a prompt with images.
 func WithMaxRequestBytes(n int64) Option {
@@ -178,6 +201,7 @@ type handler struct {
 	challenge string
 	insecure  bool
 	chosenBy  Scope
+	claims    Scope
 	commands  map[string]Command
 	maxBody   int64
 	buffer    int
@@ -197,6 +221,8 @@ type handler struct {
 //	POST /prompt           Prompt; returns the run's end     control
 //	POST /queue            Queue: steer or follow_up         control
 //	POST /deliver          Deliver, when c offers it         control
+//	POST /accept           Accept, when c offers it; the     control
+//	                       accept, then the outcome
 //	POST /abort            Abort                             control
 //	POST /resume           Resume; returns the run's end     answer
 //	POST /reply            Reply                             answer
@@ -205,8 +231,9 @@ type handler struct {
 //
 // Every request is authenticated ([WithAuthenticator]); the principal
 // rides on the call's context ([PrincipalFrom]), and a run it starts or
-// answers carries an agentturn.Trigger of kind "control" naming it. So
-// does an answer to a question: Reply gets the request's context, so
+// answers carries an agentturn.Trigger of kind "control" naming it, or
+// the trigger its client claims when [WithTriggerClaims] lets it. So
+// does an answer to a question, always of kind "control": Reply gets the request's context, so
 // agentturn.QuestionClosed.By and a recorder name who answered. An
 // answer to Resume or Reply is recorded as decided by "human" unless
 // the principal holds the scope [WithChosenBy] names.
@@ -235,6 +262,7 @@ func Handler(c agentturn.Control, opts ...Option) http.Handler {
 	mux.HandleFunc("POST /prompt", h.guard(ScopeControl, h.prompt))
 	mux.HandleFunc("POST /queue", h.guard(ScopeControl, h.queue))
 	mux.HandleFunc("POST /deliver", h.guard(ScopeControl, h.deliver))
+	mux.HandleFunc("POST /accept", h.guard(ScopeControl, h.accept))
 	mux.HandleFunc("POST /abort", h.guard(ScopeControl, h.abort))
 	mux.HandleFunc("POST /resume", h.guard(ScopeAnswer, h.resume))
 	mux.HandleFunc("POST /reply", h.guard(ScopeAnswer, h.reply))
@@ -298,11 +326,16 @@ type runReply struct {
 	Err *wireError  `json:"error,omitempty"`
 }
 
-func (h *handler) prompt(w http.ResponseWriter, r *http.Request, _ Principal) {
+func (h *handler) prompt(w http.ResponseWriter, r *http.Request, p Principal) {
 	var req struct {
-		Items json.RawMessage `json:"items"`
+		Items   json.RawMessage `json:"items"`
+		Trigger *wireTrigger    `json:"trigger"`
 	}
 	if !h.decode(w, r, &req) {
+		return
+	}
+	r, ok := h.claim(w, r, p, req.Trigger)
+	if !ok {
 		return
 	}
 	items, err := itemsIn(req.Items)
@@ -316,8 +349,13 @@ func (h *handler) prompt(w http.ResponseWriter, r *http.Request, _ Principal) {
 func (h *handler) resume(w http.ResponseWriter, r *http.Request, p Principal) {
 	var req struct {
 		Answers []wireAnswer `json:"answers"`
+		Trigger *wireTrigger `json:"trigger"`
 	}
 	if !h.decode(w, r, &req) {
+		return
+	}
+	r, ok := h.claim(w, r, p, req.Trigger)
+	if !ok {
 		return
 	}
 	answers, err := answersIn(req.Answers)
@@ -337,6 +375,44 @@ func (h *handler) resume(w http.ResponseWriter, r *http.Request, p Principal) {
 		}
 	}
 	h.writeRun(w, func() (*agentturn.RunEnd, error) { return h.c.Resume(context.WithoutCancel(r.Context()), answers...) })
+}
+
+// claim puts on r's context the trigger the client claims, when the
+// host lets p claim one ([WithTriggerClaims]): its members stand over
+// the ones guard put there, which fill the kind and the ref it leaves
+// out. Anyone else's claim is not recorded. A claim the format cannot
+// write is refused, and claim has answered and returns false.
+func (h *handler) claim(w http.ResponseWriter, r *http.Request, p Principal, claimed *wireTrigger) (*http.Request, bool) {
+	t, ok, err := h.claimed(p, claimed, agentturn.TriggerFromContext(r.Context()))
+	if err != nil {
+		h.writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: trigger: %w", err))
+		return nil, false
+	}
+	if !ok {
+		return r, true
+	}
+	return r.WithContext(agentturn.ContextWithTrigger(r.Context(), t)), true
+}
+
+// claimed is the trigger a client claims, filled from base where it
+// leaves the kind or the ref out, and true when the host lets p claim
+// one ([WithTriggerClaims]); false for no claim or one not recorded.
+// A claim the format cannot write is an error.
+func (h *handler) claimed(p Principal, claimed *wireTrigger, base agentturn.Trigger) (agentturn.Trigger, bool, error) {
+	t := triggerIn(claimed)
+	if t.IsZero() || h.claims == "" || !p.Has(h.claims) {
+		return agentturn.Trigger{}, false, nil
+	}
+	if t.Kind == "" {
+		t.Kind = base.Kind
+	}
+	if t.Ref == "" {
+		t.Ref = base.Ref
+	}
+	if err := t.Validate(); err != nil {
+		return agentturn.Trigger{}, false, err
+	}
+	return t, true, nil
 }
 
 // mayChoose reports whether p may say who decided its answers
@@ -374,10 +450,11 @@ type errReply struct {
 	Err *wireError `json:"error,omitempty"`
 }
 
-func (h *handler) queue(w http.ResponseWriter, r *http.Request, _ Principal) {
+func (h *handler) queue(w http.ResponseWriter, r *http.Request, p Principal) {
 	var req struct {
-		Mode  string          `json:"mode"`
-		Items json.RawMessage `json:"items"`
+		Mode    string          `json:"mode"`
+		Items   json.RawMessage `json:"items"`
+		Trigger *wireTrigger    `json:"trigger"`
 	}
 	if !h.decode(w, r, &req) {
 		return
@@ -393,6 +470,10 @@ func (h *handler) queue(w http.ResponseWriter, r *http.Request, _ Principal) {
 	items, err := itemsIn(req.Items)
 	if err != nil {
 		h.writeFailure(w, http.StatusBadRequest, err)
+		return
+	}
+	r, ok := h.claim(w, r, p, req.Trigger)
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, errReply{errorOut(h.c.Queue(r.Context(), agentturn.QueueMode(req.Mode), items...))})
@@ -412,14 +493,15 @@ type deliverReply struct {
 // take a steer, and a delivery says. It runs on the request's context
 // with its cancellation lifted, as a prompt does, since a run it
 // starts goes on when the client goes away.
-func (h *handler) deliver(w http.ResponseWriter, r *http.Request, _ Principal) {
+func (h *handler) deliver(w http.ResponseWriter, r *http.Request, p Principal) {
 	d, ok := h.c.(agentturn.Deliverer)
 	if !ok {
 		h.writeFailure(w, http.StatusNotImplemented, ErrNoDelivery)
 		return
 	}
 	var req struct {
-		Items json.RawMessage `json:"items"`
+		Items   json.RawMessage `json:"items"`
+		Trigger *wireTrigger    `json:"trigger"`
 	}
 	if !h.decode(w, r, &req) {
 		return
@@ -427,6 +509,10 @@ func (h *handler) deliver(w http.ResponseWriter, r *http.Request, _ Principal) {
 	items, err := itemsIn(req.Items)
 	if err != nil {
 		h.writeFailure(w, http.StatusBadRequest, err)
+		return
+	}
+	r, ok = h.claim(w, r, p, req.Trigger)
+	if !ok {
 		return
 	}
 	joined, end, err := d.Deliver(context.WithoutCancel(r.Context()), items...)
@@ -442,6 +528,77 @@ func (h *handler) deliver(w http.ResponseWriter, r *http.Request, _ Principal) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// acceptReply is the first value POST /accept answers with: the items
+// are queued, or the error that says why none was. The outcome follows
+// as a [deliverReply] once the agent has settled the delivery.
+type acceptReply struct {
+	Accepted bool       `json:"accepted"`
+	Err      *wireError `json:"error,omitempty"`
+}
+
+// accept serves agentturn.Accepter, which c offers or not: the two
+// steps of a delivery in one response, two JSON values. The first says
+// the items are queued, or why not, and is written as soon as the agent
+// has them; the second is the delivery's outcome, once it is settled.
+// The agent settles it whether or not the response is still read: it
+// runs on the request's context with its cancellation lifted, and a
+// client that goes away stops only the wait.
+func (h *handler) accept(w http.ResponseWriter, r *http.Request, p Principal) {
+	acc, ok := h.c.(agentturn.Accepter)
+	if !ok {
+		h.writeFailure(w, http.StatusNotImplemented, ErrNoDelivery)
+		return
+	}
+	flush := flusherOf(w)
+	if flush == nil {
+		h.writeFailure(w, http.StatusInternalServerError, errors.New("control: the response cannot stream"))
+		return
+	}
+	var req struct {
+		Items   json.RawMessage `json:"items"`
+		Trigger *wireTrigger    `json:"trigger"`
+	}
+	if !h.decode(w, r, &req) {
+		return
+	}
+	items, err := itemsIn(req.Items)
+	if err != nil {
+		h.writeFailure(w, http.StatusBadRequest, err)
+		return
+	}
+	r, ok = h.claim(w, r, p, req.Trigger)
+	if !ok {
+		return
+	}
+	d, err := acc.Accept(context.WithoutCancel(r.Context()), items...)
+	if err != nil {
+		writeJSON(w, http.StatusOK, acceptReply{Err: errorOut(err)})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	enc := json.NewEncoder(w)
+	if enc.Encode(acceptReply{Accepted: true}) != nil {
+		return
+	}
+	flush()
+	joined, end, err := d.Wait(r.Context())
+	if r.Context().Err() != nil {
+		// The client went away; the agent settles the delivery anyway.
+		return
+	}
+	out := deliverReply{Joined: joined, Err: errorOut(err)}
+	if end != nil {
+		we, merr := runEndOut(end)
+		if merr != nil {
+			out.Err = errorOut(merr)
+		} else {
+			out.End = &we
+		}
+	}
+	_ = enc.Encode(out)
+}
+
 func (h *handler) abort(w http.ResponseWriter, _ *http.Request, _ Principal) {
 	h.c.Abort()
 	writeJSON(w, http.StatusOK, errReply{})
@@ -449,8 +606,9 @@ func (h *handler) abort(w http.ResponseWriter, _ *http.Request, _ Principal) {
 
 func (h *handler) reply(w http.ResponseWriter, r *http.Request, p Principal) {
 	var req struct {
-		ID     string           `json:"id"`
-		Answer wireElicitAnswer `json:"answer"`
+		ID       string           `json:"id"`
+		Answer   wireElicitAnswer `json:"answer"`
+		Answerer *wireTrigger     `json:"answerer"`
 	}
 	if !h.decode(w, r, &req) {
 		return
@@ -471,10 +629,24 @@ func (h *handler) reply(w http.ResponseWriter, r *http.Request, p Principal) {
 		h.writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: reply: %w", err))
 		return
 	}
-	// The principal is who answered, as a run it starts names it.
+	// The principal is who answered, as a run it starts names it, or
+	// who it claims answered when the host lets it claim
+	// ([WithTriggerClaims]): a person at a terminal claims human.
 	ctx := r.Context()
+	var by agentturn.Trigger
 	if p.Name != "" {
-		ctx = agentturn.ContextWithAnswerer(ctx, agentturn.Trigger{Kind: "control", Ref: p.Name})
+		by = agentturn.Trigger{Kind: "control", Ref: p.Name}
+	}
+	claim, ok, err := h.claimed(p, req.Answerer, by)
+	if err != nil {
+		h.writeFailure(w, http.StatusBadRequest, fmt.Errorf("control: reply: answerer: %w", err))
+		return
+	}
+	if ok {
+		by = claim
+	}
+	if !by.IsZero() {
+		ctx = agentturn.ContextWithAnswerer(ctx, by)
 	}
 	writeJSON(w, http.StatusOK, errReply{errorOut(h.c.Reply(ctx, req.ID, *a))})
 }
@@ -543,10 +715,30 @@ func (h *handler) decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	return true
 }
 
+// flusherOf returns what flushes w, found as http.ResponseController
+// finds it: w itself, or what a middleware's writer unwraps to, since
+// a logging or metrics wrapper rarely implements Flush. nil when
+// nothing along the chain can.
+func flusherOf(w http.ResponseWriter) func() {
+	for {
+		switch f := w.(type) {
+		case interface{ FlushError() error }:
+			return func() { _ = f.FlushError() }
+		case http.Flusher:
+			return f.Flush
+		}
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return nil
+		}
+		w = u.Unwrap()
+	}
+}
+
 // events serves Subscribe as a server-sent event stream.
 func (h *handler) events(w http.ResponseWriter, r *http.Request, _ Principal) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	flush := flusherOf(w)
+	if flush == nil {
 		h.writeFailure(w, http.StatusInternalServerError, errors.New("control: the response cannot stream"))
 		return
 	}
@@ -582,7 +774,7 @@ func (h *handler) events(w http.ResponseWriter, r *http.Request, _ Principal) {
 	if writeFrame(w, "ready", []byte("{}")) != nil {
 		return
 	}
-	flusher.Flush()
+	flush()
 
 	// drain writes what else is queued, without waiting for more.
 	drain := func() bool {
@@ -609,18 +801,18 @@ func (h *handler) events(w http.ResponseWriter, r *http.Request, _ Principal) {
 				return
 			}
 			_ = writeFrame(w, "overflow", []byte(`{"message":"the stream fell too far behind the agent; catch up from the record and subscribe again"}`))
-			flusher.Flush()
+			flush()
 			return
 		case data := <-frames:
 			if writeFrame(w, "", data) != nil || !drain() {
 				return
 			}
-			flusher.Flush()
+			flush()
 		case <-ping.C:
 			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
 				return
 			}
-			flusher.Flush()
+			flush()
 		}
 	}
 }

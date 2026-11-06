@@ -24,8 +24,13 @@
 // front that wants to persist the result registers [WithOnFold], which
 // reports every fold, successful or not, with the index at which the
 // transcript was split; [Transform.Last] returns the latest summary.
-// [WithPin] keeps chosen items of the folded prefix verbatim after the
-// summary, for context a harness injected that must not become
+// A fold keeps the person's own messages of the folded prefix verbatim
+// after the summary, those the loop names on the transform's context
+// (agentturn.PersonMessagesFromContext) up to [WithPersonBound] each
+// and the newest of them up to [WithPersonTotal] in all, so after two
+// folds the request still holds what the person asked for and not a
+// summary's paraphrase of it. [WithPin] keeps more chosen
+// items so, for context a harness injected that must not become
 // whatever the summary made of it. [WithRequest] edits the summary
 // request [NewLocal] sends, so it can carry the reasoning setting the
 // agent's own requests do.
@@ -186,9 +191,10 @@ func WithBackOff(enabled bool) Option { return func(t *Transform) { t.noBackOff 
 // request, in their order, and the fold that summarised them
 // summarised them too, so nothing is lost if the pin is later dropped.
 // It is for context a harness injected and must not lose to a summary:
-// a stream rule's reminder, a policy notice, an instruction the user
-// gave once. [WithKeepLast] keeps a window at the end; this keeps a
-// member of the part that is folded.
+// a stream rule's reminder, a policy notice. [WithKeepLast] keeps a
+// window at the end; this keeps a member of the part that is folded.
+// The person's own messages are kept so without it, as
+// [WithPersonBound] says; what fn reports is added to them.
 //
 // A pinned item is on the request and not in the transcript, so a
 // session recorder names it in the compaction entry, whose pinned
@@ -197,6 +203,45 @@ func WithBackOff(enabled bool) Option { return func(t *Transform) { t.noBackOff 
 // resumed from the record still carries the pinned items.
 func WithPin(fn func(openresponses.Item) bool) Option {
 	return func(t *Transform) { t.pin = fn }
+}
+
+// DefaultPersonBound is the size, in bytes of the message's JSON,
+// up to which a fold keeps the person's own messages verbatim when
+// [WithPersonBound] is not given.
+const DefaultPersonBound = 8 << 10
+
+// WithPersonBound sets the size, in bytes of a message's JSON, up to
+// which a fold keeps verbatim each of the person's own messages in the
+// part it folds: the messages the loop names on the transform's
+// context (agentturn.PersonMessagesFromContext), which a person typed
+// under a trigger of kind human and the host did not compose, copy or
+// hide (agentturn RFC 0001 The request, step 2; #298). They follow
+// the summary in the request, in their order, as [WithPin]'s items do,
+// and are reported in [Fold.Pinned], so a session recorder names them
+// in the compaction entry. A message over the bound, a long paste say,
+// is folded like any other item, and so is one the host composed. The
+// default is [DefaultPersonBound]; zero or less keeps none of them,
+// and [WithPin] still keeps what it names.
+func WithPersonBound(bytes int) Option { return func(t *Transform) { t.personBound = bytes } }
+
+// WithPersonTotal sets the total, in the estimator's tokens, up to
+// which a fold keeps the person's own messages [WithPersonBound]
+// admits: the newest of them, counted back from the end of the part it
+// folds, until the next would pass the total; that one and every older
+// one are folded into the summary, which an earlier fold that kept
+// them had summarised too. Without a total the kept messages would
+// grow with every fold, until they alone passed the budget, every
+// call folded again and the loop's retry after an overflow, which
+// folds with the same kept messages, failed too. The default is a
+// quarter of [WithBudget], so the summary, the kept tail and the
+// request's settings keep the rest. A total over half of what the
+// request's settings leave of the budget, as [WithSettingsEstimator]
+// weighs them, counts as that half: kept messages that filled the
+// request alone would leave no room for the summary and the kept tail,
+// and every call would fold again. Zero or less keeps none of them. [WithPin]'s items are the host's choice and do
+// not count against it.
+func WithPersonTotal(tokens int) Option {
+	return func(t *Transform) { t.personTotal, t.personTotalSet = tokens, true }
 }
 
 // WithFilter sets the filter applied to the items sent to be folded,
@@ -277,8 +322,10 @@ type Fold struct {
 	// Attempts is the number of model calls the fold made: one, or two
 	// for a [NewLocal] fold that asked again.
 	Attempts int
-	// Pinned are the items of the folded prefix that [WithPin] kept, in
-	// their order. They follow Output on the request and are not part
+	// Pinned are the items of the folded prefix the fold kept, in their
+	// order: the newest of the person's own messages within
+	// [WithPersonBound] and [WithPersonTotal], and the items [WithPin]
+	// names. They follow Output on the request and are not part
 	// of it.
 	Pinned openresponses.Items
 	// Request is the request [NewLocal] sent for the fold's last
@@ -290,9 +337,16 @@ type Fold struct {
 	Request *openresponses.Request
 	// Forced says the fold was asked for, by [Transform.FoldNext] or by
 	// the loop after the server refused a request as too long, rather
-	// than made because the estimate passed the budget. Instructions are
-	// the ones FoldNext gave for it, "" for none.
-	Forced       bool
+	// than made because the estimate passed the budget.
+	Forced bool
+	// Requested says a host or a person asked for the fold, through
+	// [Transform.FoldNext]: it is false for a fold the budget or the
+	// loop's retry after a context-length refusal forced. A recorder
+	// writes agentsession RFC 0001's requested from it, never from
+	// Forced, so an overflow's fold does not read as one the person
+	// asked for. Instructions are the ones FoldNext gave for it, "" for
+	// none, and only ever set beside Requested.
+	Requested    bool
 	Instructions string
 	// PrefixHash is the [PrefixHash] of the transcript's first Split
 	// items when the fold failed and the transform backs off from that
@@ -361,7 +415,12 @@ type Transform struct {
 	prompt      string
 	summaryItem func(string) openresponses.Item
 	pin         func(openresponses.Item) bool
-	request     func(*openresponses.Request)
+	personBound int
+	// personTotal is WithPersonTotal's, when personTotalSet; the
+	// default is a quarter of the budget.
+	personTotal    int
+	personTotalSet bool
+	request        func(*openresponses.Request)
 
 	mu sync.Mutex
 	// next says FoldNext asked the next call to fold whatever its
@@ -634,6 +693,7 @@ func newTransform(opts []Option) *Transform {
 		filter:      agentturn.DefaultFilter,
 		prompt:      DefaultSummaryPrompt,
 		summaryItem: SummaryMessage,
+		personBound: DefaultPersonBound,
 	}
 	for _, opt := range opts {
 		opt(t)
@@ -778,7 +838,7 @@ func (t *Transform) Last() openresponses.Item {
 // its budget, with instructions, when not empty, for that fold alone:
 // [NewLocal] sends them after the summary prompt, and [New], whose
 // compaction endpoint takes no prompt, ignores them. The fold is the
-// one a call over budget makes, kept tail and [WithPin] included, and
+// one a call over budget makes, kept tail and pinned items included, and
 // is reported to [WithOnFold] as any other, so a recorder writes it.
 // [WithMinFold] still guards it: a prefix too small to fold is left as
 // it is, and so is a transcript whose older part the remembered fold
@@ -821,8 +881,13 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 		settings = t.settings(req)
 	}
 	quarantined := agentturn.QuarantineFromContext(ctx)
+	// The person's own messages, which a fold keeps verbatim (#298).
+	persons := agentturn.PersonMessagesFromContext(ctx)
 	t.mu.Lock()
-	forced, instructions := t.next || agentturn.FoldRequested(ctx), t.nextInstructions
+	// A fold FoldNext asked for is requested; one only the loop's
+	// retry after an overflow asked for is forced and not requested.
+	requested, instructions := t.next, t.nextInstructions
+	forced := requested || agentturn.FoldRequested(ctx)
 	t.next, t.nextInstructions = false, ""
 	view, base := t.view(items, quarantined)
 	tokens := t.estimate(view) + settings
@@ -853,7 +918,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	// serialise on the network.
 	f, err := t.fold(ctx, input, instructions)
 	if err != nil {
-		failed := Fold{Split: split, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Forced: forced, Instructions: instructions, Err: err}
+		failed := Fold{Split: split, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Forced: forced, Requested: requested, Instructions: instructions, Err: err}
 		if unfolded(err) {
 			failed.PrefixHash = PrefixHash(items[:split])
 		}
@@ -882,7 +947,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 		t.mu.Unlock()
 		return view, nil
 	}
-	pinned := t.pinned(items[:split])
+	pinned := t.pinned(items[:split], persons, settings)
 	var first openresponses.Item
 	if split < len(items) {
 		first = items[split]
@@ -898,7 +963,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	t.mu.Unlock()
 	// The fold's own output and the pinned items, as locals: the memory
 	// they were written to belongs to the lock that was just released.
-	if err := t.report(ctx, Fold{Split: split, First: first, Output: f.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Forced: forced, Instructions: instructions}); err != nil {
+	if err := t.report(ctx, Fold{Split: split, First: first, Output: f.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Forced: forced, Requested: requested, Instructions: instructions}); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -928,20 +993,61 @@ func (t *Transform) backOff(items agentturn.Transcript, split, tokens int) bool 
 	return PrefixHash(items[:t.failLen]) == t.failHash
 }
 
-// pinned returns the items of the folded prefix that the pin keeps, in
-// their order, filtered as the request is so an app-only item never
-// reaches the server.
-func (t *Transform) pinned(prefix agentturn.Transcript) openresponses.Items {
-	if t.pin == nil {
+// pinned returns the items of the folded prefix that the pin keeps and
+// the person's own messages among them within the bound and the
+// newest of those within the total, in their order, filtered as the
+// request is so an app-only item never reaches the server.
+func (t *Transform) pinned(prefix agentturn.Transcript, persons agentturn.PersonMessages, settings int) openresponses.Items {
+	total := t.personTotalOf(settings)
+	if t.pin == nil && (len(persons) == 0 || t.personBound <= 0 || total <= 0) {
 		return nil
 	}
+	filtered := t.filter(prefix)
+	// The person's messages kept, chosen newest first until the next
+	// would pass the total (#298, l6-3c M1).
+	kept := make([]bool, len(filtered))
+	used := 0
+	for i := len(filtered) - 1; i >= 0 && total > 0; i-- {
+		item := filtered[i]
+		if !t.keepsPerson(persons, item) {
+			continue
+		}
+		used += t.estimate(openresponses.Items{item})
+		if used > total {
+			break
+		}
+		kept[i] = true
+	}
 	var out openresponses.Items
-	for _, item := range t.filter(prefix) {
-		if t.pin(item) {
+	for i, item := range filtered {
+		if (t.pin != nil && t.pin(item)) || kept[i] {
 			out = append(out, item)
 		}
 	}
 	return out
+}
+
+// personTotalOf is the total [WithPersonTotal] sets, a quarter of the
+// budget by default, and never more than half of what the request's
+// settings, weighing settings, leave of the budget, so the kept
+// messages stay below it with room for the summary and the kept tail,
+// as RFC 0001 The request, step 2, requires.
+func (t *Transform) personTotalOf(settings int) int {
+	total := t.budget / 4
+	if t.personTotalSet {
+		total = t.personTotal
+	}
+	return min(total, max(t.budget-settings, 0)/2)
+}
+
+// keepsPerson reports whether item is one of the person's own messages
+// and within the bound [WithPersonBound] sets.
+func (t *Transform) keepsPerson(persons agentturn.PersonMessages, item openresponses.Item) bool {
+	if t.personBound <= 0 || !persons.Has(item) {
+		return false
+	}
+	data, err := json.Marshal(item)
+	return err == nil && len(data) <= t.personBound
 }
 
 // view returns the transcript with the remembered fold applied, and how

@@ -289,6 +289,204 @@ func TestDeliverOverTheWire(t *testing.T) {
 	})
 }
 
+// TestAcceptOverTheWire pins #302 across the wire: the control front
+// carries a delivery's two steps, so a view forwarding a person's
+// steers answers each once the server's agent has it, while a quiet
+// tool still runs, and learns the outcome after.
+func TestAcceptOverTheWire(t *testing.T) {
+	t.Run("during a run, both are accepted before the tool ends", func(t *testing.T) {
+		running, release := make(chan struct{}, 1), make(chan struct{})
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, MaxTurns: 3, Tools: []agenttool.Tool{blocker(running, release)}})
+		c := serve(t, a)
+		done := make(chan *agentturn.RunEnd, 1)
+		go func() {
+			end, _ := c.Prompt(context.Background(), openresponses.UserText("go"))
+			done <- end
+		}()
+		<-running
+		var released sync.Once
+		defer released.Do(func() { close(release) })
+		accepted := make(chan *agentturn.Delivery, 2)
+		go func() {
+			for _, text := range []string{"one", "two"} {
+				d, err := c.Accept(context.Background(), openresponses.UserText(text))
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				accepted <- d
+			}
+		}()
+		var ds []*agentturn.Delivery
+		for len(ds) < 2 {
+			select {
+			case d := <-accepted:
+				ds = append(ds, d)
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%d of two accepted while the tool ran", len(ds))
+			}
+		}
+		if n := a.State().Steering; n != 2 {
+			t.Errorf("steering = %d, want both", n)
+		}
+		released.Do(func() { close(release) })
+		for i, d := range ds {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			joined, end, err := d.Wait(ctx)
+			cancel()
+			if err != nil || !joined || end != nil {
+				t.Errorf("delivery %d: joined %v, end %+v, err %v; want joined", i, joined, end, err)
+			}
+		}
+		<-done
+	})
+	t.Run("to an idle agent, the agent starts the run", func(t *testing.T) {
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, MaxTurns: 1})
+		c := serve(t, a)
+		ctx, cancel := context.WithCancel(context.Background())
+		d, err := c.Accept(ctx, openresponses.UserText("the build passed"))
+		// The caller goes away at once: the agent settles it anyway.
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		wctx, wcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer wcancel()
+		joined, end, err := d.Wait(wctx)
+		if err != nil || joined || end == nil || end.Reason != agentturn.ReasonDone {
+			t.Fatalf("joined %v, end %+v, err %v; want a run started and done", joined, end, err)
+		}
+	})
+	t.Run("a refusal queues nothing", func(t *testing.T) {
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, MaxTurns: 1})
+		c := serve(t, a)
+		var err error
+		if herr := a.WhileIdle(func() error {
+			_, err = c.Accept(t.Context(), openresponses.UserText("x"))
+			return nil
+		}); herr != nil {
+			t.Fatal(herr)
+		}
+		if !errors.Is(err, agentturn.ErrHeld) {
+			t.Errorf("err = %v, want ErrHeld", err)
+		}
+		if n := a.State().Steering; n != 0 {
+			t.Errorf("steering = %d, want nothing queued", n)
+		}
+	})
+	t.Run("a Control without one", func(t *testing.T) {
+		c := serve(t, struct{ agentturn.Control }{agentturn.New(agentturn.Config{Model: &echo.Adapter{}})})
+		if _, err := c.Accept(t.Context(), openresponses.UserText("x")); !errors.Is(err, ErrNoDelivery) {
+			t.Errorf("err = %v, want ErrNoDelivery", err)
+		}
+	})
+	t.Run("behind a wrapper that cannot flush itself", func(t *testing.T) {
+		// A logging middleware's writer that unwraps to the server's
+		// but implements no Flush.
+		h := Handler(agentturn.New(agentturn.Config{Model: &echo.Adapter{}, MaxTurns: 1}), WithInsecureNoAuth())
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h.ServeHTTP(unflushed{w}, r)
+		}))
+		t.Cleanup(srv.Close)
+		c, err := Dial(t.Context(), srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, err := c.Accept(t.Context(), openresponses.UserText("x"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, end, err := d.Wait(ctx); err != nil || end == nil {
+			t.Fatalf("end %+v, err %v; want a run", end, err)
+		}
+	})
+	t.Run("a client gone after the accept, the agent settles it", func(t *testing.T) {
+		running, release := make(chan struct{}, 2), make(chan struct{})
+		// One turn: the run stops after its batch without draining the
+		// delivery, which then needs a run of its own.
+		a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, MaxTurns: 1, Tools: []agenttool.Tool{blocker(running, release)}})
+		ends := make(chan *agentturn.RunEnd, 4)
+		a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+			if e, ok := ev.(*agentturn.RunEnd); ok {
+				ends <- e
+			}
+			return nil
+		})
+		srv := httptest.NewServer(Handler(a, WithInsecureNoAuth()))
+		t.Cleanup(srv.Close)
+		go func() { _, _ = a.Prompt(context.Background(), openresponses.UserText("go")) }()
+		<-running
+		var released sync.Once
+		defer released.Do(func() { close(release) })
+		raw, err := itemsOut(openresponses.Items{openresponses.UserText("later")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := json.Marshal(struct {
+			Items json.RawMessage `json:"items"`
+		}{raw})
+		ctx, cancel := context.WithCancel(t.Context())
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/accept", strings.NewReader(string(body)))
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var first acceptReply
+		if err := json.NewDecoder(resp.Body).Decode(&first); err != nil || !first.Accepted {
+			t.Fatalf("first = %+v, err %v", first, err)
+		}
+		// The client goes away before the outcome.
+		cancel()
+		resp.Body.Close()
+		released.Do(func() { close(release) })
+		for i := range 2 {
+			select {
+			case <-ends:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("%d runs ended; the delivery was not settled once its client went away", i)
+			}
+		}
+		var texts []string
+		for _, item := range a.State().Transcript {
+			if m, ok := item.(*openresponses.Message); ok && m.Role == openresponses.RoleUser {
+				texts = append(texts, m.Text())
+			}
+		}
+		if !slices.Contains(texts, "later") {
+			t.Errorf("user messages = %q, want the delivery taken", texts)
+		}
+	})
+	t.Run("a server without the route", func(t *testing.T) {
+		h := Handler(agentturn.New(agentturn.Config{Model: &echo.Adapter{}}), WithInsecureNoAuth())
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/accept" {
+				http.NotFound(w, r)
+				return
+			}
+			h.ServeHTTP(w, r)
+		}))
+		t.Cleanup(srv.Close)
+		c, err := Dial(t.Context(), srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Accept(t.Context(), openresponses.UserText("x")); !errors.Is(err, ErrNoDelivery) {
+			t.Errorf("err = %v, want ErrNoDelivery", err)
+		}
+	})
+}
+
+// unflushed is a middleware's response writer that unwraps to the one
+// it wraps but does not implement http.Flusher itself.
+type unflushed struct{ w http.ResponseWriter }
+
+func (u unflushed) Header() http.Header         { return u.w.Header() }
+func (u unflushed) Write(b []byte) (int, error) { return u.w.Write(b) }
+func (u unflushed) WriteHeader(code int)        { u.w.WriteHeader(code) }
+func (u unflushed) Unwrap() http.ResponseWriter { return u.w }
+
 func TestAbortMidBatch(t *testing.T) {
 	running := make(chan struct{}, 1)
 	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, Tools: []agenttool.Tool{blocker(running, nil)}})
@@ -441,6 +639,13 @@ func (r *recorder) Queue(ctx context.Context, _ agentturn.QueueMode, _ ...openre
 func (r *recorder) Deliver(ctx context.Context, _ ...openresponses.Item) (bool, *agentturn.RunEnd, error) {
 	r.noteCtx(ctx, "Deliver")
 	return true, nil, nil
+}
+
+func (r *recorder) Accept(ctx context.Context, _ ...openresponses.Item) (*agentturn.Delivery, error) {
+	r.noteCtx(ctx, "Accept")
+	d, settle := agentturn.NewDelivery()
+	settle(true, nil, nil)
+	return d, nil
 }
 
 func (r *recorder) Abort() { r.note("Abort") }
@@ -982,4 +1187,134 @@ func TestChallenge(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTheCallersClaimIsTheHostsToTrust pins the control front's caller
+// claim (the part A review's M3 of #303): a client sends the trigger
+// its caller's context holds, so a person at a terminal sends kind
+// "human", and the handler runs the input under it only for a
+// principal the host lets claim one (WithTriggerClaims); anyone else's
+// input runs under kind "control" naming the principal, the claim
+// unrecorded. A claim that names no ref names the principal.
+func TestTheCallersClaimIsTheHostsToTrust(t *testing.T) {
+	const claim Scope = "claim"
+	tokens := map[string]Principal{
+		"person": {Name: "chris", Scopes: append(slices.Clone(AllScopes), claim)},
+		"driver": {Name: "driver", Scopes: AllScopes},
+	}
+	calls := []struct {
+		name string
+		do   func(context.Context, *Client) error
+	}{
+		{"Prompt", func(ctx context.Context, c *Client) error {
+			_, err := c.Prompt(ctx, openresponses.UserText("hi"))
+			return err
+		}},
+		{"Queue", func(ctx context.Context, c *Client) error {
+			return c.Queue(ctx, agentturn.QueueSteer, openresponses.UserText("hi"))
+		}},
+		{"Deliver", func(ctx context.Context, c *Client) error {
+			_, _, err := c.Deliver(ctx, openresponses.UserText("hi"))
+			return err
+		}},
+		{"Accept", func(ctx context.Context, c *Client) error {
+			d, err := c.Accept(ctx, openresponses.UserText("hi"))
+			if err != nil {
+				return err
+			}
+			_, _, err = d.Wait(ctx)
+			return err
+		}},
+		{"Resume", func(ctx context.Context, c *Client) error {
+			_, err := c.Resume(ctx, agentturn.Approve("c"))
+			return err
+		}},
+	}
+	for _, tc := range []struct {
+		name  string
+		token string
+		claim agentturn.Trigger
+		want  agentturn.Trigger
+	}{
+		{"a person's claim, trusted", "person", agentturn.Trigger{Kind: agentturn.TriggerHuman}, agentturn.Trigger{Kind: agentturn.TriggerHuman, Ref: "chris"}},
+		{"a claim with its own ref, trusted", "person", agentturn.Trigger{Kind: agentturn.TriggerHuman, Ref: "chris@tty1", Source: "console"}, agentturn.Trigger{Kind: agentturn.TriggerHuman, Ref: "chris@tty1", Source: "console"}},
+		{"no claim", "person", agentturn.Trigger{}, agentturn.Trigger{Kind: "control", Ref: "chris"}},
+		{"an untrusted claim", "driver", agentturn.Trigger{Kind: agentturn.TriggerHuman}, agentturn.Trigger{Kind: "control", Ref: "driver"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &recorder{}
+			srv := httptest.NewServer(Handler(r, WithAuthenticator(tokenAuth(tokens)), WithTriggerClaims(claim)))
+			defer srv.Close()
+			c, err := Dial(t.Context(), srv.URL, withToken(tc.token))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := t.Context()
+			if !tc.claim.IsZero() {
+				ctx = agentturn.ContextWithTrigger(ctx, tc.claim)
+			}
+			for _, call := range calls {
+				if err := call.do(ctx, c); err != nil {
+					t.Fatalf("%s: %v", call.name, err)
+				}
+				r.mu.Lock()
+				got := agentturn.TriggerFromContext(r.ctx)
+				r.mu.Unlock()
+				if got.Kind != tc.want.Kind || got.Ref != tc.want.Ref || got.Source != tc.want.Source {
+					t.Errorf("%s ran under %+v, want %+v", call.name, got, tc.want)
+				}
+			}
+		})
+	}
+	// A reply carries the answerer's claim the same way: a person
+	// answering at a terminal claims human.
+	for _, tc := range []struct {
+		name  string
+		token string
+		claim agentturn.Trigger
+		want  agentturn.Trigger
+	}{
+		{"a person's answer, trusted", "person", agentturn.Trigger{Kind: agentturn.TriggerHuman}, agentturn.Trigger{Kind: agentturn.TriggerHuman, Ref: "chris"}},
+		{"an answer with no claim", "person", agentturn.Trigger{}, agentturn.Trigger{Kind: "control", Ref: "chris"}},
+		{"an untrusted answer's claim", "driver", agentturn.Trigger{Kind: agentturn.TriggerHuman}, agentturn.Trigger{Kind: "control", Ref: "driver"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &recorder{}
+			srv := httptest.NewServer(Handler(r, WithAuthenticator(tokenAuth(tokens)), WithTriggerClaims(claim)))
+			defer srv.Close()
+			c, err := Dial(t.Context(), srv.URL, withToken(tc.token))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := t.Context()
+			if !tc.claim.IsZero() {
+				ctx = agentturn.ContextWithAnswerer(ctx, tc.claim)
+			}
+			if err := c.Reply(ctx, "q", agenttool.Answer{Action: agenttool.ActionAccept}); err != nil {
+				t.Fatal(err)
+			}
+			r.mu.Lock()
+			got, ok := agentturn.AnswererFrom(r.ctx)
+			r.mu.Unlock()
+			if !ok || got.Kind != tc.want.Kind || got.Ref != tc.want.Ref {
+				t.Errorf("answered by %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+	t.Run("a trusted claim the format cannot write", func(t *testing.T) {
+		r := &recorder{}
+		srv := httptest.NewServer(Handler(r, WithAuthenticator(tokenAuth(tokens)), WithTriggerClaims(claim)))
+		defer srv.Close()
+		c, err := Dial(t.Context(), srv.URL, withToken("person"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := agentturn.ContextWithTrigger(t.Context(), agentturn.Trigger{Kind: agentturn.TriggerHuman, Extra: map[string]any{"kind": "x"}})
+		if _, err := c.Prompt(ctx, openresponses.UserText("hi")); !errors.Is(err, agentturn.ErrTriggerExtra) {
+			t.Errorf("err = %v, want ErrTriggerExtra", err)
+		}
+		if seen := r.seen(); slices.Contains(seen, "Prompt") {
+			t.Errorf("the agent was prompted: %v", seen)
+		}
+	})
 }

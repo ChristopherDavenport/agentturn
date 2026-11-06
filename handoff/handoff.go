@@ -13,6 +13,9 @@
 //	a := agentturn.New(team.Config("Triage agent"))
 //	end, path, err := team.Run(ctx, a, openresponses.UserText("I was double charged"))
 //
+// A host whose tools pass through a filter or a wrapper, a policy's,
+// sets [Team.Offer], so the transfers pass through it too.
+//
 // [Team.Run] carries the rules a handoff must meet: the receiver
 // continues under a trigger of kind "handoff" whose ref names the
 // sender; the handoffs one input causes are bounded
@@ -95,6 +98,36 @@ type Team struct {
 	// MaxHandoffs bounds the handoffs one [Team.Run] follows; 0 means
 	// [responses.DefaultMaxHandoffs], the fronts' default too.
 	MaxHandoffs int
+	// Offer, when set, is how the host offers the team's tools: it is
+	// applied on every request to each agent's whole list, its own
+	// tools of the moment and the transfers it offers, and returns the
+	// list the request carries, so a filter that removes a tool from
+	// the offer, a policy's, and a wrapper around the agent's tools
+	// apply to the transfers too (RFC 0001 Composition, as itself, under
+	// new settings; #307). agent is the agent's Config.Name.
+	//
+	// A wrapper keeps a transfer's name and its result as they are:
+	// the team knows a transfer by its name ([Team.Route]) and a
+	// handoff by the transfer's own output text after the call
+	// (front/responses.Handoffs). A wrapper that renames the tool, or
+	// changes the text, as an audit suffix would, makes the call run
+	// and not hand off, as a call a policy blocked or a tool that failed
+	// does not, and nothing tells the two apart afterwards. A wrapper
+	// that refuses the call is the way to stop a transfer.
+	//
+	// A tool of the moment that takes a transfer's name, a remote MCP
+	// server's, which [New] cannot see in the static Config.Tools, fails
+	// the turn by the loop's own check that a request's tools have
+	// distinct names; Offer need not check it.
+	//
+	// What Offer removes is gone from the request and from the tools a
+	// call resolves against, but Config.Tools of what [Team.Config]
+	// returns still lists every transfer: read the tools of a request
+	// through Config.ResolveTools.
+	//
+	// Set it before the team's configurations are used: [Team.Config],
+	// [Team.Route] and the switch read it when they hand one out.
+	Offer func(ctx context.Context, agent string, tools []agenttool.Tool) []agenttool.Tool
 
 	configs map[string]agentturn.Config
 	// tools maps a transfer tool's name to its receiver's name.
@@ -192,7 +225,8 @@ func New(agents ...Agent) (*Team, error) {
 // offer returns cfg with transfers among its tools. A transfer whose
 // Enabled is set, or a configuration whose tools come from a provider,
 // is offered through a ToolProvider that asks each request; Tools
-// lists every transfer either way, for whoever reads the tools whole.
+// lists every transfer either way, for whoever reads the tools whole,
+// [Team.Offer]'s removals not applied.
 func offer(cfg agentturn.Config, transfers []agenttool.Tool, enabled []func(context.Context) bool) agentturn.Config {
 	if len(transfers) == 0 {
 		return cfg
@@ -235,7 +269,22 @@ func transfer(to agentturn.Config) agenttool.Tool {
 
 // Config returns the configuration of the agent named name, its
 // transfer tools included; the zero Config when the team holds none.
-func (t *Team) Config(name string) agentturn.Config { return t.configs[name] }
+func (t *Team) Config(name string) agentturn.Config { return t.config(name) }
+
+// config is the configuration of the agent named name as the team
+// hands it out: with its tools offered through [Team.Offer] when that
+// is set.
+func (t *Team) config(name string) agentturn.Config {
+	cfg, ok := t.configs[name]
+	if !ok || t.Offer == nil {
+		return cfg
+	}
+	offer, whole := t.Offer, cfg
+	cfg.ToolProvider = func(ctx context.Context) []agenttool.Tool {
+		return offer(ctx, name, whole.ResolveTools(ctx))
+	}
+	return cfg
+}
 
 // Route says where a transfer call of the team hands the conversation:
 // the receiver's configuration, transfer tools included, and the text
@@ -249,7 +298,7 @@ func (t *Team) Route() responses.Route {
 		if !ok {
 			return agentturn.Config{}, "", false
 		}
-		return t.configs[name], output(name), true
+		return t.config(name), output(name), true
 	}
 }
 

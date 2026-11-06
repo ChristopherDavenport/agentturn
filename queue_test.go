@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -591,5 +593,427 @@ func TestADeliveryAfterATransferWaitsForTheReceiver(t *testing.T) {
 				t.Errorf("the receiver never saw the delivery: %q", receiver.seen)
 			}
 		})
+	}
+}
+
+// heldTool is a tool that says when it runs and returns once released,
+// a quiet call that raises no event while it waits.
+func heldTool(running chan<- struct{}, release <-chan struct{}) agenttool.Tool {
+	return agenttool.New("wait", "waits", func(ctx context.Context, _ echoArgs) (string, error) {
+		running <- struct{}{}
+		select {
+		case <-release:
+			return "released", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	})
+}
+
+// TestADeliveryIsAcceptedBeforeItsOutcome pins #302: accepting a
+// delivery returns once its items are queued, and its outcome follows
+// on the handle, so a view forwarding two steers typed while a quiet
+// tool runs answers both before the tool ends. The agent settles both:
+// they join the run in flight in the order given.
+func TestADeliveryIsAcceptedBeforeItsOutcome(t *testing.T) {
+	running, release := make(chan struct{}, 1), make(chan struct{})
+	a := New(Config{Model: &echo.Adapter{}, MaxTurns: 3, Tools: []agenttool.Tool{heldTool(running, release)}})
+	done := make(chan *RunEnd, 1)
+	go func() {
+		end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+		done <- end
+	}()
+	<-running
+	var released sync.Once
+	defer released.Do(func() { close(release) })
+	accepted := make(chan *Delivery, 2)
+	go func() {
+		for _, text := range []string{"one", "two"} {
+			d, err := a.Accept(context.Background(), openresponses.UserText(text))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			accepted <- d
+		}
+	}()
+	var ds []*Delivery
+	for len(ds) < 2 {
+		select {
+		case d := <-accepted:
+			ds = append(ds, d)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%d of two deliveries accepted while the tool ran; Accept waited for the outcome", len(ds))
+		}
+	}
+	if st := a.State(); st.Steering != 2 {
+		t.Errorf("steering = %d, want both queued", st.Steering)
+	}
+	released.Do(func() { close(release) })
+	for i, d := range ds {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		joined, end, err := d.Wait(ctx)
+		cancel()
+		if err != nil || !joined || end != nil {
+			t.Errorf("delivery %d: joined %v, end %+v, err %v; want joined", i, joined, end, err)
+		}
+	}
+	<-done
+	var texts []string
+	for _, item := range a.State().Transcript {
+		if m, ok := item.(*openresponses.Message); ok && m.Role == openresponses.RoleUser {
+			texts = append(texts, m.Text())
+		}
+	}
+	if want := []string{"go", "one", "two"}; !slices.Equal(texts, want) {
+		t.Errorf("user messages = %q, want %q", texts, want)
+	}
+}
+
+// TestAQueuedReportDoesNotWaitOutAQuietTool pins #302's second half: a
+// run in flight reports an accepted item without waiting for its next
+// event, so a host showing what it accepted shows a steer typed while a
+// tool runs before the tool ends.
+func TestAQueuedReportDoesNotWaitOutAQuietTool(t *testing.T) {
+	running, release := make(chan struct{}, 1), make(chan struct{})
+	a := New(Config{Model: &echo.Adapter{}, MaxTurns: 3, Tools: []agenttool.Tool{heldTool(running, release)}})
+	reported := make(chan *Queued, 4)
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if e, ok := ev.(*Queued); ok {
+			reported <- e
+		}
+		return nil
+	})
+	done := make(chan *RunEnd, 1)
+	go func() {
+		end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+		done <- end
+	}()
+	<-running
+	var released sync.Once
+	defer released.Do(func() { close(release) })
+	if err := a.Queue(ContextWithTrigger(context.Background(), Trigger{Kind: TriggerHuman}), QueueSteer, openresponses.UserText("and this")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case e := <-reported:
+		if e.RunID == "" || e.Trigger.Kind != TriggerHuman {
+			t.Errorf("queued = %+v, want the run in flight and the trigger", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the queued report waited for the tool to end")
+	}
+	released.Do(func() { close(release) })
+	end := <-done
+	if end == nil || end.Reason != ReasonDone {
+		t.Fatalf("end = %+v", end)
+	}
+	select {
+	case e := <-reported:
+		t.Errorf("a second report: %+v", e)
+	default:
+	}
+}
+
+// TestAQueuedReportDoesNotSpinASubscriber pins the bound on #302's
+// reports between events: a subscriber that queues on every queued
+// report gets one report more right after the one it reacted to, and
+// the next waits for the run's next event, rather than reports and
+// accepts chasing each other while the tool runs.
+func TestAQueuedReportDoesNotSpinASubscriber(t *testing.T) {
+	running, release := make(chan struct{}, 1), make(chan struct{})
+	a := New(Config{Model: &echo.Adapter{}, MaxTurns: 3, Tools: []agenttool.Tool{heldTool(running, release)}})
+	var holding atomic.Bool
+	holding.Store(true)
+	first := make(chan struct{})
+	var once sync.Once
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if _, ok := ev.(*Queued); ok && holding.Load() {
+			once.Do(func() { close(first) })
+			a.Steer(openresponses.UserText("again"))
+		}
+		return nil
+	})
+	done := make(chan *RunEnd, 1)
+	go func() {
+		end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+		done <- end
+	}()
+	<-running
+	var released sync.Once
+	defer released.Do(func() { close(release) })
+	a.Steer(openresponses.UserText("and this"))
+	select {
+	case <-first:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the queued report waited for the tool to end")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := a.State().Steering; n > 3 {
+		t.Errorf("steering = %d while the tool ran, want at most 3: the reports spun", n)
+	}
+	holding.Store(false)
+	released.Do(func() { close(release) })
+	if end := <-done; end == nil || end.Reason == ReasonError {
+		t.Fatalf("end = %+v", end)
+	}
+}
+
+// TestASubscriberQueueingFromOutsideDoesNotStallTheRun pins the cap
+// on #302's report passes: a subscriber that queues on every queued
+// report under a context of its own, not the one it was handed, counts
+// as an outside caller each time, and the passes a delivery makes as it
+// lets the barrier go stop at a cap, so the run goes on to its next
+// event rather than reports and accepts chasing each other under the
+// barrier for as long as the subscriber keeps queueing.
+func TestASubscriberQueueingFromOutsideDoesNotStallTheRun(t *testing.T) {
+	a := New(Config{Model: &echo.Adapter{}, MaxTurns: 3})
+	// The subscriber stops after this many accepts, so that without the
+	// cap the test ends with a failure rather than never.
+	const accepts = 40
+	var queuedN, inARow, most int
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		_, queued := ev.(*Queued)
+		_, turn := ev.(*TurnStart)
+		if queued {
+			inARow++
+			most = max(most, inARow)
+		} else {
+			inARow = 0
+		}
+		if queuedN < accepts && (queued || turn && queuedN == 0) {
+			queuedN++
+			// A follow-up, which no turn takes before the run would
+			// end, so only the reports chase it.
+			_ = a.Queue(context.Background(), QueueFollowUp, openresponses.UserText("again"))
+		}
+		return nil
+	})
+	done := make(chan *RunEnd, 1)
+	go func() {
+		end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+		done <- end
+	}()
+	select {
+	case end := <-done:
+		if end == nil || end.Reason == ReasonError {
+			t.Fatalf("end = %+v", end)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run did not end")
+	}
+	// One report drained ahead of an event and the passes after the
+	// one before it.
+	if most > 1+maxQueuedPasses {
+		t.Errorf("%d queued reports in a row with no other event, want at most %d: the run was held while they chased each other", most, 1+maxQueuedPasses)
+	}
+}
+
+// TestOutsideAcceptsDuringAReportAreReported pins the bound on #302's
+// reports to what a subscriber itself queues: an outside caller's
+// accept that arrives while a queued report is being delivered, a
+// second typed steer, is reported before a quiet tool ends, however
+// many arrive one after another during the reports before it.
+func TestOutsideAcceptsDuringAReportAreReported(t *testing.T) {
+	running, release := make(chan struct{}, 1), make(chan struct{})
+	a := New(Config{Model: &echo.Adapter{}, MaxTurns: 3, Tools: []agenttool.Tool{heldTool(running, release)}})
+	var holding atomic.Bool
+	holding.Store(true)
+	reported, proceed := make(chan string, 4), make(chan struct{})
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		e, ok := ev.(*Queued)
+		if !ok || !holding.Load() {
+			return nil
+		}
+		m, _ := e.Item.(*openresponses.Message)
+		reported <- m.Text()
+		// Held inside the report until the test has accepted the next
+		// item from outside.
+		<-proceed
+		return nil
+	})
+	done := make(chan *RunEnd, 1)
+	go func() {
+		end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+		done <- end
+	}()
+	<-running
+	var released sync.Once
+	defer released.Do(func() { close(release) })
+	person := ContextWithTrigger(context.Background(), Trigger{Kind: TriggerHuman})
+	steer := func(text string) {
+		t.Helper()
+		if err := a.Queue(person, QueueSteer, openresponses.UserText(text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	steer("one")
+	for _, next := range []string{"two", "three"} {
+		select {
+		case <-reported:
+		case <-time.After(2 * time.Second):
+			holding.Store(false)
+			close(proceed)
+			t.Fatalf("the report before %q waited for the tool to end", next)
+		}
+		// The report under way is inside the subscriber: this accept
+		// cannot take the barrier.
+		steer(next)
+		proceed <- struct{}{}
+	}
+	select {
+	case text := <-reported:
+		if text != "three" {
+			t.Errorf("reported %q, want three", text)
+		}
+	case <-time.After(2 * time.Second):
+		holding.Store(false)
+		close(proceed)
+		t.Fatal("the second outside accept during a report waited for the tool to end")
+	}
+	holding.Store(false)
+	close(proceed)
+	released.Do(func() { close(release) })
+	if end := <-done; end == nil || end.Reason != ReasonDone {
+		t.Fatalf("end = %+v", end)
+	}
+}
+
+// TestAnAbortSettlesAnAcceptedDelivery pins the abort in RFC 0001's
+// Queues: a delivery accepted while a run is in flight that the run is
+// aborted before taking is settled on the aborted end and starts no run,
+// its items left queued for the host's next run, so a person's Esc does
+// not restart the agent with a steer forwarded through Accept.
+func TestAnAbortSettlesAnAcceptedDelivery(t *testing.T) {
+	entered := make(chan struct{})
+	var calls atomic.Int32
+	a := New(Config{Model: &echo.Adapter{}, MaxTurns: 3, BeforeModelCall: func(ctx context.Context, _ *openresponses.Request) error {
+		if calls.Add(1) > 1 {
+			return nil
+		}
+		// The first request waits for the abort, past the drain that
+		// would have taken a steer.
+		close(entered)
+		<-ctx.Done()
+		return ctx.Err()
+	}})
+	var starts atomic.Int32
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if _, ok := ev.(*RunStart); ok {
+			starts.Add(1)
+		}
+		return nil
+	})
+	done := make(chan *RunEnd, 1)
+	go func() {
+		end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+		done <- end
+	}()
+	<-entered
+	d, err := a.Accept(context.Background(), openresponses.UserText("steer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Abort()
+	if end := <-done; end == nil || end.Reason != ReasonAborted {
+		t.Fatalf("prompt end = %+v, want aborted", end)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	joined, end, err := d.Wait(ctx)
+	if err != nil || joined || end == nil || end.Reason != ReasonAborted {
+		t.Fatalf("delivery: joined %v, end %+v, err %v; want the aborted end", joined, end, err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	st := a.State()
+	if n := starts.Load(); n != 1 || st.Running {
+		t.Errorf("%d runs started, running %v: the delivery started a run after the abort", n, st.Running)
+	}
+	if st.Steering != 1 {
+		t.Errorf("steering = %d, want the delivery left queued", st.Steering)
+	}
+}
+
+// TestARedeliveryIsReportedWhileAQuietToolRuns: a delivery a host hands
+// back with Redeliver while a run is in flight, a front/a2a steer of a
+// recorded working task, is reported as any accept is, without waiting
+// for the run's next event (#302).
+func TestARedeliveryIsReportedWhileAQuietToolRuns(t *testing.T) {
+	running, release := make(chan struct{}, 1), make(chan struct{})
+	a := New(Config{Model: &echo.Adapter{}, MaxTurns: 3, Tools: []agenttool.Tool{heldTool(running, release)}})
+	reported := make(chan *Queued, 4)
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if e, ok := ev.(*Queued); ok {
+			reported <- e
+		}
+		return nil
+	})
+	done := make(chan *RunEnd, 1)
+	go func() {
+		end, _ := a.Prompt(context.Background(), openresponses.UserText("go"))
+		done <- end
+	}()
+	<-running
+	var released sync.Once
+	defer released.Do(func() { close(release) })
+	if err := a.Redeliver(context.Background(), openresponses.UserText("owed")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case e := <-reported:
+		if e.Input != InputDeliver {
+			t.Errorf("queued = %+v, want a delivery", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the redelivery's report waited for the tool to end")
+	}
+	released.Do(func() { close(release) })
+	if end := <-done; end == nil || end.Reason != ReasonDone {
+		t.Fatalf("end = %+v", end)
+	}
+}
+
+// TestAnUnwaitedAcceptStartsTheFollowOnRun: a delivery accepted while a
+// run is past its last drain, which nobody waits on, is still settled by
+// the agent: it starts the run that takes it once the run in flight
+// ends (RFC 0001, Queues).
+func TestAnUnwaitedAcceptStartsTheFollowOnRun(t *testing.T) {
+	ending, release := make(chan struct{}), make(chan struct{})
+	a := New(Config{Model: &echo.Adapter{}})
+	var ended atomic.Int32
+	runs := make(chan *RunEnd, 4)
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if e, ok := ev.(*RunEnd); ok {
+			if ended.Add(1) == 1 {
+				// Past the last drain: what is accepted now waits for
+				// the next run.
+				close(ending)
+				<-release
+			}
+			runs <- e
+		}
+		return nil
+	})
+	go func() { _, _ = a.Prompt(context.Background(), openresponses.UserText("go")) }()
+	<-ending
+	if _, err := a.Accept(context.Background(), openresponses.UserText("later")); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	for i := range 2 {
+		select {
+		case <-runs:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%d runs ended; the unwaited delivery started no run", i)
+		}
+	}
+	var texts []string
+	for _, item := range a.State().Transcript {
+		if m, ok := item.(*openresponses.Message); ok && m.Role == openresponses.RoleUser {
+			texts = append(texts, m.Text())
+		}
+	}
+	if want := []string{"go", "later"}; !slices.Equal(texts, want) {
+		t.Errorf("user messages = %q, want %q", texts, want)
 	}
 }

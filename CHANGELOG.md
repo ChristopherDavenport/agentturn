@@ -5,6 +5,237 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Added: `tools/agent.WithRecord` (`Record`) continues the child a call
+  started from the host's record when the call runs again under the
+  key of the dispatch that started it, and the tool then reports
+  itself keyed (`agenttool.ReplayKeyed`), so the replay rule runs a
+  call that was in flight when the process stopped again under its
+  key. The child's agent is seeded from the record and its run is not
+  marked a retry, so its session goes on at its leaf rather than on a
+  new root; its pending calls are answered by the replay rule, and a
+  call its policy was deciding goes back to `BeforeToolCall`, so under
+  `WithAskParent` the question open when the process stopped is asked
+  again under the parent's call. The inputs it had accepted and not
+  taken (`Record.Queued`, `QueuedInput`) are handed back to it before
+  its run, which takes them under the entries its record holds; a child
+  still held, whose call fails input-required without running, keeps
+  them queued in the agent `WithSpawn` hands the host, so the run that
+  answers its held call takes them. A child that had ended with nothing
+  pending returns that end and runs nothing; a call under a new key,
+  and a detached one, start afresh as before. A call that repeats a
+  hand-off whose child the record does not hold, a recorder made with
+  `WithoutChildSessions` or a process that stopped before the parent's
+  link, fails with `agent.ErrNoRecord`, the outcome unknown, rather
+  than start the child afresh and repeat its work. A nested call to the
+  tool, made through `agentturn.Invoke`, is matched by the same rule
+  from its `agentturn:nested_call` entries. `session.Recorder.ChildRecord`
+  is the loader for a child recorded with `Observe`: it closes the
+  child's run the process cut and reads the child's state as
+  `AgentOptions`, `Pending` and `ReplayAnswers` do. A recorded end the
+  call returns is not written into the child's session again. RFC 0001
+  draft 0.7, Composition, As a tool. agentkit wires it in agentkit#124.
+  (#297)
+- Changed: requires openresponses v0.0.19 and agenttool v0.0.30 in every
+  module, and `session` requires agentsession v0.0.38, so a session the
+  recorder writes is format 0.21. Nothing here broke: the recorder
+  exports no sidecar session to ATIF, and the root does not use
+  agenttool's `mcpclient`.
+- Changed (breaking for a reader of the record): `session.Recorder`
+  writes an owed queued input's marks in agentsession RFC 0001 0.21's
+  `visible`, `trust` and `instructions_part` on its `queued` entry,
+  where v0.0.37 wrote `agentturn:visible`, `agentturn:trust` and
+  `agentturn:instructions_part`. It still reads those from a session
+  v0.0.37 recorded, so an input owed across the upgrade is handed back
+  marked, and a run end that queues such an input again writes the
+  marks in 0.21's members and drops the interim ones.
+  `VisibleMember`, `TrustMember` and `InstructionsPartMember` are
+  deprecated, kept for a reader of such a session. RFC 0001 draft 0.7.
+  (agentsession#278)
+- Changed: `session.Recorder` merges a provenance's trust labels into
+  a copied item's trust, which agentsession RFC 0001 0.21 lets hold
+  more labels than its source, where v0.0.37 refused the item and
+  ended the run with its error. An empty provenance trust adds none.
+  RFC 0001 draft 0.7. (agentsession#279)
+- Added: `TriggerHuman`, agentsession RFC 0001 0.21's trigger kind for
+  input a person sent. A host starts a run or queues an input under it
+  only for what the person typed. (#303)
+- Changed (breaking): `WithProvenance` refuses, with `ErrProvenance`, a
+  source of kind `human` beside instruction layers: a message composed
+  from layers is not the person's words. (#303)
+- Fixed: `session.Recorder` wrote the run's trigger as the `source` of
+  every item a run was prompted with, and a queue's context trigger as
+  the `trigger` of every queued entry, so a template or a reminder the
+  host composed from instruction layers and prompted beside what the
+  person typed was recorded under kind `human` beside its
+  `instructions_part`, a pair format 0.21 forbids a writer to compose.
+  The kind `human` is no longer written for an item that names
+  instruction layers, is copied or is hidden, since a message kept out
+  of the person's view is not what they typed; such an item keeps the rest of the
+  trigger, its `ref` and `source`, without a kind, so a composed
+  steer's `queued` entry still says where it arrived from. An owed
+  input recorded so by v0.0.37 is queued again as recorded. RFC 0001
+  draft 0.7. (#303)
+- Added: `Queued.Copied`, set for an item queued with the `Copied`
+  mark, carried by front/control's `queued` event as `copied`, and
+  `IsCopied`, which reports the mark. (#303)
+- Fixed: `session.Recorder` wrote a copied input's `queued` entry
+  under the person's trigger with the provenance's trust alone, so the
+  copy that drained it was recorded `human` beside `copied_from`, and a
+  copy whose source had trust did not match its entry, which
+  agentsession's record check reports. The entry now carries the
+  trigger without the kind `human` and the copy's merged trust. RFC
+  0001 draft 0.7. (#303)
+- Added: `compact.Fold.Requested`, set only for a fold
+  `Transform.FoldNext` asked for, apart from `Forced`, which a fold the
+  loop asks for to retry a request the provider refused as too long
+  also sets. `Instructions` is set only beside it. (#306)
+- Added: `session.Recorder` writes a requested fold's `compaction` with
+  agentsession RFC 0001 0.21's `requested` and `instructions`; a fold
+  the budget or an overflow's retry forced carries neither. A requested
+  fold that fails says so too: `session.FailedFold` gains `Requested`
+  and `Instructions`, written in the same members. RFC 0001 draft 0.7.
+  (#306)
+- Fixed: `DefaultRetryable` judges an openresponses error by its code
+  before its status, and an `insufficient_quota` error is final
+  whatever its status: OpenAI sends it as a 429, which was retried
+  through the whole backoff before the user saw it. RFC 0001 draft
+  0.7, Retry. (#308)
+- Added: `Answer.Item`, an output answer as an item for `Prompt`,
+  marked with its decider, reason, origin and failure. A prompt that
+  opens with such outputs for the pending calls puts them on the run's
+  context as `Resume` does, so `session.Recorder` records the answer's
+  decision with its decider and reason and marks an `OutcomeUnknown`
+  output failed, where a prompt's output could say none of it. RFC
+  0001 draft 0.7. (#305)
+- Added: `ToolDecision.DeclineText`, the host's text for a declined
+  question about a deferred call. `Ask` uses it in place of "declined
+  when asked: <reason>", and still ends it with the answerer's note
+  named for whoever gave it, so a nested call, a child's call under
+  `tools/agent`'s `WithAskParent` and `front/a2a`'s own held call read
+  the host's wording without it being put in the person's mouth. A
+  call `WithAskParent` refuses beside a declined one uses its own
+  hold's text, and so do `front/a2a`'s refusals under `WithEscalation`:
+  a call the caller refuses reads the deferral's text, the caller's
+  note after it, and a call held beside it its own hold's.
+  `ChainBeforeToolCall` takes it only from a deferral of the kind that
+  stands, so an asked call never reads a hold's text, and
+  front/control's decision carries it as `decline_text`.
+  RFC 0001 draft 0.7, Nested calls. (#304)
+- Added: `session.Recorder` writes a deferral's decline text on its
+  hold decision as `agentturn:decline_text` (`session.DeclineTextMember`),
+  and `Pending` and `AgentOptions` read it back, so a call reopened
+  from the record, a child's held call among them, is refused in the
+  host's words. RFC 0001 draft 0.7, The record. (#304)
+- Added: `tools/a2a.WithAskCaller`, which answers a remote task that
+  waits only on calls front/a2a's `WithEscalation` put to its caller:
+  each is asked of the elicitor of the call that started the task,
+  through `Ask`, naming the call, the remote's reason and the remote
+  agent, and answered on the same task with an `Approval` carrying the
+  answerer's note. `WithSendBy` adds who decided, for a remote whose
+  `WithChosenBy` accepts it. With nobody to ask, or other input
+  waited on, the call still fails input-required; a round is sent whole
+  or not at all, so one cancelled question leaves every escalated call
+  of the round to `WithInputRequired`. A detached call's
+  task asks nobody, even with an elicitor on the context the host
+  prompted with, and keeps `WithInputRequired`. `AskedCall.Callee`
+  names the agent that would run an asked call that is not this run's;
+  `Ask` names it in the question, quoted, with its reason said to be
+  its own (`Agent "<callee>" says: ...`), and leaves the answerer's
+  note for its caller to send on. RFC 0001 draft 0.7, Composition. (#296)
+- Added: the transform's context names the person's own messages,
+  `PersonMessagesFromContext` (`PersonMessages`): the user messages a
+  run appended under a trigger of kind `human` that the host did not
+  compose from layers, copy or hide. The agent keeps them across runs;
+  `WithPersonMessages`, `Agent.SetPersonMessages` and
+  `ContextWithPersonMessages` give them for a rebuilt transcript.
+  `compact`'s folds keep them verbatim after the summary, as pinned
+  items, each up to `WithPersonBound` bytes (`DefaultPersonBound`,
+  8 KiB), so after two folds the request still holds what the person
+  asked. Only the newest are kept, up to `WithPersonTotal` tokens in
+  all (a quarter of `WithBudget` by default, never more than half of
+  what the request's settings leave of it, which leaves the summary
+  and the kept tail room), so
+  the kept messages cannot grow from fold to fold until the request no
+  longer fits; the older ones fold into the summary. `WithPin` adds to
+  them. `session.TranscriptMarks` reads them from a
+  record, a message a fold pinned included, and `session.AgentOptions`
+  and `MoveTo` seed the agent with them. A host that relied on a fold
+  summarising every message the person typed under `human` passes
+  `compact.WithPersonBound(0)`. RFC 0001 draft 0.7, The request.
+  (#298)
+- Added: `handoff.Team.Offer`, applied on every request to each
+  agent's whole tool list, its own tools of the moment and its
+  transfers, so a host's filter that removes a tool, a policy's, and
+  its tool wrappers reach the transfer tools too. A wrapper must keep a
+  transfer's name and result as they are, or the call runs without
+  handing off. A tool of the moment that takes a transfer's name fails
+  the turn by the loop's distinct-name check, with or without Offer.
+  `Config.Tools` still lists every transfer; `ResolveTools` gives the
+  offer. The configurations `Team.Config`, `Team.Route` and the switch
+  hand out carry it; unset, nothing changes. RFC 0001 draft 0.7,
+  Composition. (#307)
+- Added: `Agent.Accept`, a delivery in two steps: it returns once the
+  items are queued, with a `*Delivery` whose `Wait` (and `Done`) gives
+  what `Deliver` returns once the agent has settled it, which it does
+  whether or not anyone waits, starting the run that takes the items
+  on the caller's values without its cancellation. `Accepter` names it
+  for a `Control`, and `NewDelivery` lets another implementation hand
+  one back. `front/control` serves it as `POST /accept`, the accept and
+  then the outcome on one response, `Client.Accept` takes it, and
+  `session.Recorder.Accept` and `RecordedControl` write the `queued`
+  entry before the agent accepts. A view forwarding a person's steer
+  answers once the agent has it, so a second steer typed while a quiet
+  tool runs is not held behind the first's outcome. RFC 0001 draft
+  0.7, Queues. (#302)
+- Changed: a delivery, `Deliver` or `Accept`, whose run in flight is
+  aborted before taking its items starts no run: it reports the aborted
+  end and leaves the items queued for the host's next run, so an
+  interrupt does not restart the agent with a steer forwarded through
+  `Accept`. RFC 0001 draft 0.7, Queues. (#302)
+- Changed: a run in flight reports a `Queued` event without waiting
+  for its next event: at once, on a goroutine of its own, when no
+  event is being delivered as `Queue`, `Steer`, `FollowUp`, `Deliver`,
+  `Accept` or `Redeliver` accepts, and otherwise right after the event that is, so a steer accepted while a quiet tool
+  runs is reported while it runs. Only a subscriber's own accept made
+  while such a report is delivered, with the context it was handed or
+  by `Steer` or `FollowUp`, which carry none, waits for the next event;
+  a second caller's accept arriving then is reported right after it,
+  up to four passes per event, so a subscriber that queues on every
+  report under a context of its own cannot stall the run.
+  A subscriber's error on such a report ends the run at its next
+  event. RFC 0001 draft 0.7, Queues. (#302)
+- Changed (breaking for a wrapper that embeds `*Agent`): a type that
+  embeds `*agentturn.Agent` and overrides `Deliver` to write first, as
+  `session`'s `RecordedControl` does, now also has the embedded
+  `Accept`, which skips its write; such a wrapper overrides `Accept`
+  too. (#302)
+- Fixed: `front/control`'s `POST /accept` and `GET /events` stream
+  behind a middleware whose response writer does not implement
+  `http.Flusher` but unwraps to one, as `http.ResponseController`
+  finds it, rather than answering 500. (#302)
+- Added: `front/control` carries `ErrHeld` across the wire as the code
+  `held`. (#302)
+- Added: `front/control` carries the caller's trigger claim. `Client`
+  sends the trigger on its caller's context as a `trigger` member of
+  `POST /prompt`, `/queue`, `/deliver`, `/accept` and `/resume`, and
+  `WithTriggerClaims(scope)` lets a principal holding scope run its
+  input under the claim, its kind and ref defaulting to `control` and
+  the principal's name; a claim whose Extra cannot be written is
+  refused with `ErrTriggerExtra`. Without the option, or for any other
+  principal, input still runs under kind `control`, so a person at a
+  terminal whose host trusts their principal now records `human` for
+  what they type, where everything through the control front read as
+  composed under format 0.21. Both directions are additive on the
+  wire: an older server ignores the member, and an older client sends
+  none. RFC 0001 draft 0.7, The record. (#303)
+- Added: `front/control`'s `Client.Reply` sends the answerer on its
+  caller's context (`ContextWithAnswerer`) as an `answerer` member of
+  `POST /reply`, which the handler records as who answered under the
+  same `WithTriggerClaims` scope, so a person answering a question at
+  a terminal reads as `human` rather than `control`. (#303)
+
 ## v0.0.37 - 2026-11-04
 
 - Added: `WithProvenance(item, Provenance{Layers, Source, Trust})` lets

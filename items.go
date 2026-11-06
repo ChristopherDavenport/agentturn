@@ -13,7 +13,8 @@ import (
 // markedItem marks an item the caller hands the loop: one the model
 // reads and a renderer should not show ([Hidden]), one taken from
 // another conversation ([Copied]), one the host composed from text the
-// person did not write ([WithProvenance]), or any of them together. It
+// person did not write ([WithProvenance]), an output carrying what its
+// answer says of it ([Answer.Item]), or any of them together. It
 // is a wrapper the loop strips when it appends the item, so nothing
 // downstream sees it: the transcript, the request and every type
 // switch on an item work on the item itself, and only the item events
@@ -26,6 +27,16 @@ type markedItem struct {
 	copied bool
 	// prov is held by pointer so the wrapper stays comparable.
 	prov *Provenance
+	// answer is what an [Answer] says of the output it marks
+	// ([Answer.Item]), held by pointer for the same reason.
+	answer *answerMarks
+}
+
+// answerMarks is what [Answer.Item] carries of an answer onto the
+// output it marks, for [Agent.Prompt] to put on the run's context.
+type answerMarks struct {
+	by, reason, origin string
+	failed             bool
 }
 
 // ItemType returns the wrapped item's type.
@@ -39,7 +50,11 @@ func (h markedItem) MarshalJSON() ([]byte, error) { return json.Marshal(h.item) 
 // a keyword added, a subagent's result. The model still sees it, the
 // transcript holds it and a request carries it; only its item events
 // say it is hidden, and a session recorder writes its entry with
-// visible false, which is the format's word for exactly this.
+// visible false, which is the format's word for exactly this. A hidden
+// message is not what the person typed, which they see, so agentturn
+// treats it as one the host prompts with: a session recorder writes it
+// without the trigger kind [TriggerHuman] (#303). That is agentturn's
+// rule; the format's visible false only says to hide the item.
 //
 // Use it wherever the loop appends an item the caller supplied:
 // [Agent.Prompt], [Agent.Steer], [Agent.FollowUp], the prompts of [Run]
@@ -82,10 +97,8 @@ func Unhide(item openresponses.Item) (openresponses.Item, bool) {
 // and writes no decision for a call so marked or its output, since the
 // call is not this session's. Use it where [Hidden] may be used; the
 // marks compose, and [Unhide] strips them all. A copy's trust is the
-// trust of what it copies, so a [Provenance] trust on a copied item is
-// not written, and one naming a label the copy's source lacks is
-// refused by a session recorder, ending the run with its error; see
-// [Provenance.Trust].
+// trust of what it copies, and a [Provenance] trust on a copied item
+// adds its labels to it; see [Provenance.Trust].
 func Copied(item openresponses.Item) openresponses.Item {
 	if item == nil {
 		return nil
@@ -96,6 +109,14 @@ func Copied(item openresponses.Item) openresponses.Item {
 	}
 	m.copied = true
 	return m
+}
+
+// IsCopied reports whether item carries the [Copied] mark, for a host
+// or a recorder that takes an input before the loop does, as
+// agentturn/session's Recorder.Queue does.
+func IsCopied(item openresponses.Item) bool {
+	_, _, copied := marks(item)
+	return copied
 }
 
 // Provenance says where an item the host or a hook composed came from
@@ -121,17 +142,18 @@ type Provenance struct {
 	// trigger the item is handed in under, for this item alone: the
 	// item's queued report carries it as its trigger, and a recorder
 	// writes it as the item's source, where the run's trigger would be.
-	// Zero leaves the item the trigger it is handed in under.
+	// Zero leaves the item the trigger it is handed in under, though a
+	// session recorder writes one of kind [TriggerHuman] without its
+	// kind as the source of a message composed from Layers: what the
+	// host composed is not the person's words (#303). A host that
+	// composed the message names its own kind here.
 	Source Trigger
 	// Trust is what the host knows of the content's trust; nil says
-	// nothing. On an item also marked [Copied] it adds nothing: a copy
-	// carries the trust of what it copies, as written, and a session
-	// recorder refuses one whose Trust names a label that trust does
-	// not hold rather than drop it. The refusal is the recorder's
-	// error on the item's item_end, so the run ends with it and the
-	// item is in the agent's transcript but not in the record. That
-	// holds until agentsession lets a copy's trust be wider than its
-	// source's (agentsession#279).
+	// nothing. On an item also marked [Copied] a session recorder
+	// merges its labels into the trust the copy carries from what it
+	// copies, since agentsession's format 0.21 lets a copy's trust hold
+	// more labels than its source's, never fewer (agentsession#279); an
+	// empty list adds nothing there.
 	Trust *Trust
 }
 
@@ -171,8 +193,10 @@ var ErrProvenance = errors.New("agentturn: provenance cannot be recorded")
 //
 // It refuses, with [ErrProvenance], layers on an item that is not a
 // message, a layer with no source, an instruction file's with no ID, a
-// layer named twice, an empty or repeated trust label, and a source
-// [Trigger.Validate] refuses. A provenance that says nothing returns
+// layer named twice, an empty or repeated trust label, a source
+// [Trigger.Validate] refuses, and a source of kind [TriggerHuman]
+// beside layers, since a message composed from layers is not the
+// person's words. A provenance that says nothing returns
 // item as it is, and a nil item nil.
 func WithProvenance(item openresponses.Item, p Provenance) (openresponses.Item, error) {
 	if item == nil {
@@ -208,6 +232,9 @@ func (p Provenance) validate(item openresponses.Item) error {
 		if _, ok := item.(*openresponses.Message); !ok {
 			return fmt.Errorf("%w: a %s item names instruction layers; only a message may", ErrProvenance, item.ItemType())
 		}
+	}
+	if len(p.Layers) > 0 && p.Source.Kind == TriggerHuman {
+		return fmt.Errorf("%w: a message composed from instruction layers names a source of kind %q, which says a person wrote it", ErrProvenance, TriggerHuman)
 	}
 	for i, l := range p.Layers {
 		switch {

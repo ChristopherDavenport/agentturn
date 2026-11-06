@@ -1,0 +1,663 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/ChristopherDavenport/agentsession"
+	"github.com/ChristopherDavenport/agenttool"
+	"github.com/ChristopherDavenport/agentturn"
+	"github.com/ChristopherDavenport/agentturn/tools/agent"
+	"github.com/ChristopherDavenport/openresponses"
+	"github.com/ChristopherDavenport/openresponses/echo"
+)
+
+// reusesCallID calls tool once a turn under the one call ID id, with
+// the input each of inputs gives in turn, and answers "done" once
+// every one has its output: a provider that numbers its calls afresh
+// in each response.
+type reusesCallID struct {
+	id, tool string
+	inputs   []string
+}
+
+func (m reusesCallID) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	outputs := 0
+	for _, item := range req.Input {
+		if _, ok := item.(*openresponses.FunctionCallOutput); ok {
+			outputs++
+		}
+	}
+	if outputs < len(m.inputs) {
+		w, err := em.FunctionCall(m.id, m.tool)
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(`{"input":"` + m.inputs[outputs] + `"}`); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("done"); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestACallIDTheModelReusesStartsAFreshChild is l6-3e's M1: a provider
+// that reuses call_0 for a second call in the same run must not have
+// the second call continue, or return the end of, the child the first
+// one started. The loop gives the second call an ID of its own, since
+// the run's transcript holds the first (a fold leaves the working
+// transcript whole), so its key differs and the loader finds no child
+// under it; and a session refuses a call ID twice
+// (agentsession.ErrCallIDRepeated), so the record cannot name two
+// calls with one key either.
+func TestACallIDTheModelReusesStartsAFreshChild(t *testing.T) {
+	ctx := context.Background()
+	rec, s, err := Start(ctx, agentsession.NewMemoryStore(), agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded := 0
+	load := func(ctx context.Context, call agenttool.Call, cfg agentturn.Config) (*agent.Record, error) {
+		r, err := rec.ChildRecord(ctx, call, cfg)
+		if r != nil {
+			loaded++
+		}
+		return r, err
+	}
+	childCfg := agentturn.Config{Name: "child", Description: "echoes", Model: &echo.Adapter{}, ModelName: "m"}
+	tool := agent.New(childCfg, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext), agent.WithRecord(load))
+	a := agentturn.New(agentturn.Config{Model: reusesCallID{id: "call_0", tool: "child", inputs: []string{"one", "two"}}, ModelName: "m", Tools: []agenttool.Tool{tool}})
+	defer rec.Attach(a)()
+	end, err := a.Prompt(ctx, openresponses.UserText("go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if end.Reason != agentturn.ReasonDone {
+		t.Fatalf("run ended %s: %v", end.Reason, end.Err)
+	}
+	var ids, outputs []string
+	for _, item := range end.Items {
+		switch v := item.(type) {
+		case *openresponses.FunctionCall:
+			ids = append(ids, v.CallID)
+		case *openresponses.FunctionCallOutput:
+			outputs = append(outputs, v.Output.String())
+		}
+	}
+	if len(ids) != 2 || ids[0] == ids[1] {
+		t.Fatalf("call IDs = %v, want two calls told apart", ids)
+	}
+	if len(outputs) != 2 || outputs[0] != "one" || outputs[1] != "two" {
+		t.Errorf("outputs = %q, want each call's own child's answer", outputs)
+	}
+	if loaded != 0 {
+		t.Errorf("the loader returned %d records, want none for first calls", loaded)
+	}
+	for _, id := range ids {
+		cs, err := rec.Store().Open(ctx, agentsession.SubsessionID(s.ID(), id))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if runs, err := cs.Runs(cs.Leaf()); err != nil || len(runs) != 1 {
+			t.Errorf("child of %s has %d runs (%v), want its own one", id, len(runs), err)
+		}
+	}
+}
+
+// linkCutStore is a process that dies as it writes its first
+// subsession link: that append and every one after it fail.
+type linkCutStore struct {
+	agentsession.Store
+	cut, died atomic.Bool
+}
+
+func (s *linkCutStore) Append(ctx context.Context, id string, e agentsession.Entry) (string, error) {
+	if l, ok := e.(*agentsession.LinkEntry); ok && l.Rel == agentsession.RelSubsession && !s.died.Swap(true) {
+		s.cut.Store(true)
+	}
+	if s.cut.Load() {
+		return "", errors.New("the process died")
+	}
+	return s.Store.Append(ctx, id, e)
+}
+
+// TestACallRunAgainWithNoChildOnTheRecordIsNotRunAfresh is l6-3e's
+// M2: a call run again under the key of a hand-off that may have
+// started its child, when the record holds no child for it, fails with
+// the outcome unknown rather than start the child afresh, which would
+// run the child's tools a second time. The record holds none when the
+// recorder keeps no child sessions, and when the process stopped after
+// the child started and before the parent's link was written.
+func TestACallRunAgainWithNoChildOnTheRecordIsNotRunAfresh(t *testing.T) {
+	cases := []struct {
+		name  string
+		store interface {
+			agentsession.Store
+			Die()
+			Live()
+		}
+		opts []Option
+	}{
+		{name: "without child sessions", store: &dyingStore{cutStore: &cutStore{Store: agentsession.NewMemoryStore()}}, opts: []Option{WithoutChildSessions()}},
+		{name: "cut before the link", store: &dyingLinkStore{linkCutStore: &linkCutStore{Store: agentsession.NewMemoryStore()}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := tc.store
+			rec, s, err := Start(ctx, store, agentsession.Header{}, tc.opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var mu sync.Mutex
+			lookups := 0
+			lookup := agenttool.New("lookup", "", func(context.Context, echoArgs) (string, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				lookups++
+				return "FOUND", nil
+			})
+			childCfg := agentturn.Config{Name: "child", Description: "looks up", Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{lookup}}
+			child := func(rec *Recorder) agenttool.Tool {
+				return agent.New(childCfg, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext), agent.WithRecord(rec.ChildRecord))
+			}
+			parentCfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{child(rec)},
+				AfterToolCall: func(context.Context, agentturn.ToolResultInfo) (*agentturn.ToolOverride, error) {
+					// The process dies once the child has answered, if
+					// it has not already.
+					store.Die()
+					return nil, nil
+				}}
+			a := agentturn.New(parentCfg)
+			unsub := rec.Attach(a)
+			_, _ = a.Prompt(ctx, openresponses.UserText("find"))
+			unsub()
+			store.Live()
+			if lookups != 1 {
+				t.Fatalf("lookup ran %d times before the crash, want once", lookups)
+			}
+
+			rec, s, err = Resume(ctx, store, s.ID(), tc.opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parentCfg.Tools, parentCfg.AfterToolCall = []agenttool.Tool{child(rec)}, nil
+			answers, err := ReplayAnswers(ctx, s, parentCfg.Tools)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(answers) != 1 || answers[0].Reason != agentturn.RunAgainKeyedReason {
+				t.Fatalf("answers = %+v, want the call run again under its key", answers)
+			}
+			opts, err := AgentOptions(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := agentturn.New(parentCfg, opts...)
+			defer rec.Attach(b)()
+			end, err := b.Resume(ctx, answers...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lookups != 1 {
+				t.Errorf("lookup ran %d times, want once: the child was started afresh", lookups)
+			}
+			var out string
+			for _, item := range end.Items {
+				if o, ok := item.(*openresponses.FunctionCallOutput); ok && o.CallID == answers[0].CallID {
+					out = o.Output.String()
+				}
+			}
+			if !strings.Contains(out, "outcome unknown") {
+				t.Errorf("the call's output = %q, want the outcome unknown", out)
+			}
+		})
+	}
+}
+
+// dyingStore and dyingLinkStore give the two stores one way to die
+// and come back.
+type dyingStore struct{ *cutStore }
+
+func (s *dyingStore) Die()  { s.cut.Store(true) }
+func (s *dyingStore) Live() { s.cut.Store(false) }
+
+type dyingLinkStore struct{ *linkCutStore }
+
+func (s *dyingLinkStore) Die()  { s.cut.Store(true) }
+func (s *dyingLinkStore) Live() { s.cut.Store(false) }
+
+// steeredChild calls lookup once, and answers "took X" once a user
+// message "also X" is in its input, "no X" otherwise.
+type steeredChild struct{}
+
+func (steeredChild) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	steered, answered := false, false
+	for _, item := range req.Input {
+		switch v := item.(type) {
+		case *openresponses.Message:
+			steered = steered || v.Role == openresponses.RoleUser && v.Text() == "also X"
+		case *openresponses.FunctionCallOutput:
+			answered = true
+		}
+	}
+	if !steered && !answered {
+		w, err := em.FunctionCall("", "lookup")
+		if err != nil {
+			return err
+		}
+		if err := w.Arguments(`{"text":"x"}`); err != nil {
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+		return em.Complete()
+	}
+	text := "no X"
+	if steered {
+		text = "took X"
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text(text); err != nil {
+		return err
+	}
+	return em.Complete()
+}
+
+// TestAChildsOwedInputIsHandedBackToIt is l6-3e's M3: an input the
+// child accepted and had not taken when the process stopped is owed on
+// the child's record, as RFC 0001 Queues says a recorder hands back the
+// inputs it owes. A call run again under its key that continues the
+// child hands the input back to it, so the continued run takes it,
+// under the entry the record already holds, rather than leave it owed
+// and drop it at the run's end.
+func TestAChildsOwedInputIsHandedBackToIt(t *testing.T) {
+	marked := func(t *testing.T, p agentturn.Provenance) openresponses.Item {
+		item, err := agentturn.WithProvenance(openresponses.UserText("also X"), p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return item
+	}
+	cases := []struct {
+		name string
+		// steer is the input the person steers the child with.
+		steer func(t *testing.T) openresponses.Item
+		// check is what the item that drains it must carry.
+		check func(t *testing.T, e *agentsession.ItemEntry)
+	}{
+		{name: "plain", steer: func(*testing.T) openresponses.Item { return openresponses.UserText("also X") },
+			check: func(t *testing.T, e *agentsession.ItemEntry) {
+				if e.Visible != nil || e.Trust != nil || e.Layers() != nil {
+					t.Errorf("the drained steer is marked: visible %v, trust %+v, layers %+v", e.Visible, e.Trust, e.Layers())
+				}
+			}},
+		{name: "hidden", steer: func(*testing.T) openresponses.Item { return agentturn.Hidden(openresponses.UserText("also X")) },
+			check: func(t *testing.T, e *agentsession.ItemEntry) {
+				if e.Visible == nil || *e.Visible {
+					t.Errorf("the drained steer's visible = %v, want false", e.Visible)
+				}
+			}},
+		{name: "trusted", steer: func(t *testing.T) openresponses.Item {
+			return marked(t, agentturn.Provenance{Trust: &agentturn.Trust{Reads: []agenttool.Label{agenttool.LabelUntrusted}}})
+		}, check: func(t *testing.T, e *agentsession.ItemEntry) {
+			if e.Trust == nil || len(e.Trust.Reads) != 1 || e.Trust.Reads[0] != string(agenttool.LabelUntrusted) {
+				t.Errorf("the drained steer's trust = %+v, want untrusted", e.Trust)
+			}
+		}},
+		{name: "an instructions part", steer: func(t *testing.T) openresponses.Item {
+			return agentturn.Hidden(marked(t, agentturn.Provenance{Layers: []agentturn.Layer{{ID: "AGENTS.md", Source: "file"}}}))
+		}, check: func(t *testing.T, e *agentsession.ItemEntry) {
+			if l := e.Layers(); len(l) != 1 || l[0].ID != "AGENTS.md" || e.Visible == nil || *e.Visible {
+				t.Errorf("the drained steer's layers = %+v, visible %v, want AGENTS.md hidden", l, e.Visible)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			testOwedInputHandedBack(t, tc.steer(t), tc.check)
+		})
+	}
+}
+
+// testOwedInputHandedBack is TestAChildsOwedInputIsHandedBackToIt with
+// the input steered: the child is steered with it while its tool runs,
+// the process dies once the steer's queued entry is written, and after
+// the restart the continued child takes it under that entry, the item
+// that drains it carrying what check wants.
+func testOwedInputHandedBack(t *testing.T, steerWith openresponses.Item, check func(*testing.T, *agentsession.ItemEntry)) {
+	ctx := context.Background()
+	store := &cutStore{Store: agentsession.NewMemoryStore()}
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spawned *agentturn.Agent
+	var steer atomic.Bool
+	steer.Store(true)
+	lookup := agenttool.New("lookup", "", func(context.Context, echoArgs) (string, error) {
+		if steer.Swap(false) {
+			// A person steers the child while its tool runs.
+			spawned.Steer(steerWith)
+		}
+		return "FOUND", nil
+	})
+	childCfg := agentturn.Config{Name: "child", Description: "looks up", Model: steeredChild{}, ModelName: "m", Tools: []agenttool.Tool{lookup}}
+	var armed atomic.Bool
+	child := func(rec *Recorder) agenttool.Tool {
+		return agent.New(childCfg, agent.WithRunContext(rec.ChildContext), agent.WithRecord(rec.ChildRecord),
+			agent.WithSpawn(func(_ string, a *agentturn.Agent) { spawned = a }),
+			agent.WithObserver(func(ctx context.Context, ev agentturn.Event) {
+				rec.Observe(ctx, ev)
+				if _, ok := ev.(*agentturn.ToolEnd); ok && armed.Swap(false) {
+					// The process dies once the steer's queued entry is
+					// written and before the turn that would take it.
+					store.cut.Store(true)
+				}
+			}))
+	}
+	armed.Store(true)
+	parentCfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{child(rec)}}
+	a := agentturn.New(parentCfg)
+	unsub := rec.Attach(a)
+	_, _ = a.Prompt(ctx, openresponses.UserText("find"))
+	unsub()
+	store.cut.Store(false)
+
+	rec, s, err = Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentCfg.Tools = []agenttool.Tool{child(rec)}
+	answers, err := ReplayAnswers(ctx, s, parentCfg.Tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(answers) != 1 || answers[0].Reason != agentturn.RunAgainKeyedReason {
+		t.Fatalf("answers = %+v, want the call run again under its key", answers)
+	}
+	opts, err := AgentOptions(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := agentturn.New(parentCfg, opts...)
+	defer rec.Attach(b)()
+	end, err := b.Resume(ctx, answers...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text, _ := end.Answer(); text != "Tool result: took X" {
+		t.Errorf("the parent read %q, want the child to have taken its owed steer", text)
+	}
+
+	cs, err := store.Open(ctx, agentsession.SubsessionID(s.ID(), answers[0].CallID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var queued []string
+	var drained *agentsession.ItemEntry
+	for _, e := range cs.Entries() {
+		switch v := e.(type) {
+		case *agentsession.QueuedEntry:
+			queued = append(queued, v.ID)
+		case *agentsession.ItemEntry:
+			if m, ok := v.Item.(*openresponses.Message); ok && m.Text() == "also X" {
+				drained = v
+			}
+		}
+	}
+	if drained == nil {
+		t.Fatal("the steer was never drained into the child's session")
+	}
+	if len(queued) != 2 || drained.QueuedFrom != queued[1] {
+		t.Errorf("queued entries %v, the steer drained from %q: want it accepted, queued again at the cut, and taken from that entry", queued, drained.QueuedFrom)
+	}
+	check(t, drained)
+	if owed, err := cs.PendingQueued(cs.Leaf()); err != nil || len(owed) != 0 {
+		t.Errorf("the child still owes %d inputs (%v), want none", len(owed), err)
+	}
+	verifyAll(t, cs)
+}
+
+// TestARecordedEndIsTheLastRunsOwn is l6-3e's L1 and L5: the end
+// ChildRecord returns for a child that runs nothing again is its last
+// run's own. A run the process cut before it wrote an item has no
+// answer, even when an earlier run's answer is at the leaf, and goes
+// on (L1); an end's items are the items its run appended, as a run's
+// end gives them, not the child's whole transcript (L5).
+func TestARecordedEndIsTheLastRunsOwn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cut  bool
+	}{{name: "cut before its first item", cut: true}, {name: "ended"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			rec, callID := recordedChild(t, tc.cut)
+			got, err := rec.ChildRecord(ctx, agenttool.Call{ID: callID, IdempotencyKey: "K"}, agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == nil {
+				t.Fatal("no record of the child")
+			}
+			if tc.cut {
+				if got.End != nil {
+					text, _ := got.End.Answer()
+					t.Errorf("the cut run returned an end answering %q, want it to go on: the answer is an earlier run's", text)
+				}
+				return
+			}
+			if got.End == nil {
+				t.Fatal("no end for a child whose last run ended")
+			}
+			var texts []string
+			for _, item := range got.End.Items {
+				if m, ok := item.(*openresponses.Message); ok {
+					texts = append(texts, m.Text())
+				}
+			}
+			if strings.Join(texts, "|") != "two|two" {
+				t.Errorf("the end's items read %q, want the last run's own: its prompt and its answer", texts)
+			}
+		})
+	}
+}
+
+// recordedChild records a parent's call call_c handed off under the
+// key K, its child linked, and handed off again under K, the call run
+// again; the child, an echo agent, prompted "one" and then "two", the
+// second run cut once its start is written when cut is set. It returns
+// the parent's recorder and the call's ID.
+func recordedChild(t *testing.T, cut bool) (*Recorder, string) {
+	t.Helper()
+	ctx := context.Background()
+	store := &cutStore{Store: agentsession.NewMemoryStore()}
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	callID := "call_c"
+	target, err := store.Append(ctx, s.ID(), &agentsession.ItemEntry{Item: &openresponses.FunctionCall{CallID: callID, Name: "child", Arguments: `{"input":"one"}`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append(ctx, s.ID(), agentsession.NewDispatch(callID, target).WithIdempotencyKey("K")); err != nil {
+		t.Fatal(err)
+	}
+	childID := agentsession.SubsessionID(s.ID(), callID)
+	crec, _, err := Start(ctx, store, agentsession.Header{ID: childID, ParentSession: s.ID(), SpawnedBy: callID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"})
+	unsub := crec.Attach(child)
+	if _, err := child.Prompt(ctx, openresponses.UserText("one")); err != nil {
+		t.Fatal(err)
+	}
+	if cut {
+		child.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+			if _, ok := ev.(*agentturn.RunStart); ok {
+				store.cut.Store(true)
+			}
+			return nil
+		})
+	}
+	_, _ = child.Prompt(ctx, openresponses.UserText("two"))
+	unsub()
+	store.cut.Store(false)
+	for _, e := range []agentsession.Entry{agentsession.NewSubsessionLink(childID, callID), agentsession.NewDispatch(callID, target).WithIdempotencyKey("K")} {
+		if _, err := store.Append(ctx, s.ID(), e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return rec, callID
+}
+
+// TestChildRecordCallsTheHostOutsideTheRecordersLock is l6-3e's L2:
+// ChildRecord reads the store and calls the host's code, the child's
+// ToolProvider among it, without holding the recorder's lock, so a
+// provider that asks the recorder something does not deadlock it.
+func TestChildRecordCallsTheHostOutsideTheRecordersLock(t *testing.T) {
+	ctx := context.Background()
+	rec, callID := recordedChild(t, true)
+	cfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", ToolProvider: func(ctx context.Context) []agenttool.Tool {
+		_ = rec.SessionOf(ctx)
+		return nil
+	}}
+	done := make(chan error, 1)
+	go func() {
+		_, err := rec.ChildRecord(ctx, agenttool.Call{ID: callID, IdempotencyKey: "K"}, cfg)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ChildRecord deadlocked: the child's ToolProvider waits on the recorder's lock")
+	}
+}
+
+// openCounter counts the store's opens of each session, which take the
+// hold of a store that guards its sessions, and fails every append
+// while cut is set. It reads without a hold, as agentsession's stores
+// do.
+type openCounter struct {
+	*agentsession.MemoryStore
+	cut   atomic.Bool
+	mu    sync.Mutex
+	opens map[string]int
+}
+
+func (s *openCounter) Open(ctx context.Context, id string) (*agentsession.Session, error) {
+	s.mu.Lock()
+	if s.opens == nil {
+		s.opens = map[string]int{}
+	}
+	s.opens[id]++
+	s.mu.Unlock()
+	return s.MemoryStore.Open(ctx, id)
+}
+
+func (s *openCounter) Append(ctx context.Context, id string, e agentsession.Entry) (string, error) {
+	if s.cut.Load() {
+		return "", errors.New("the process died")
+	}
+	return s.MemoryStore.Append(ctx, id, e)
+}
+
+func (s *openCounter) count(id string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.opens[id]
+}
+
+func (s *openCounter) reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.opens = nil
+}
+
+// TestChildRecordReadsOnlyWhatItNeeds is l6-3e's L3: a keyed call's
+// first hand-off, which the parent's writer has just written as the
+// call's first, is not looked up on the record, so it does not read
+// the parent's session; and a child the record returns as its end,
+// which nothing writes, is read without taking the store's hold of it.
+func TestChildRecordReadsOnlyWhatItNeeds(t *testing.T) {
+	ctx := context.Background()
+	store := &openCounter{MemoryStore: agentsession.NewMemoryStore()}
+	rec, s, err := Start(ctx, store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	childCfg := agentturn.Config{Name: "child", Description: "echoes", Model: &echo.Adapter{}, ModelName: "m"}
+	child := func(rec *Recorder) agenttool.Tool {
+		return agent.New(childCfg, agent.WithObserver(rec.Observe), agent.WithRunContext(rec.ChildContext), agent.WithRecord(rec.ChildRecord))
+	}
+	callID := ""
+	parentCfg := agentturn.Config{Model: &echo.Adapter{}, ModelName: "m", Tools: []agenttool.Tool{child(rec)},
+		AfterToolCall: func(_ context.Context, info agentturn.ToolResultInfo) (*agentturn.ToolOverride, error) {
+			// The process dies once the child has answered.
+			callID = info.Call.CallID
+			store.cut.Store(true)
+			return nil, nil
+		}}
+	store.reset()
+	a := agentturn.New(parentCfg)
+	unsub := rec.Attach(a)
+	_, _ = a.Prompt(ctx, openresponses.UserText("find"))
+	unsub()
+	store.cut.Store(false)
+	if n := store.count(s.ID()); n != 0 {
+		t.Errorf("the first call opened the parent's session %d times, want none", n)
+	}
+
+	rec, s, err = Resume(ctx, store, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentCfg.Tools, parentCfg.AfterToolCall = []agenttool.Tool{child(rec)}, nil
+	answers, err := ReplayAnswers(ctx, s, parentCfg.Tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts, err := AgentOptions(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := agentturn.New(parentCfg, opts...)
+	defer rec.Attach(b)()
+	store.reset()
+	end, err := b.Resume(ctx, answers...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if end.Reason != agentturn.ReasonDone {
+		t.Fatalf("resume ended %s: %v", end.Reason, end.Err)
+	}
+	if n := store.count(agentsession.SubsessionID(s.ID(), callID)); n != 0 {
+		t.Errorf("the recorded end opened the child's session %d times, want it read without a hold", n)
+	}
+}

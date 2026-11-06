@@ -157,7 +157,11 @@ func ChainShouldStopAfterTurn(fns ...func(context.Context, TurnInfo) (bool, erro
 // because the reason has to explain the decision that stands and a
 // block's reason is what the model reads. Two deferrals make a call
 // held ([ToolDecision.Held]) only if both held it: a deferral that asks
-// about it wins, with its reason and subject. The first note stands, and
+// about it wins, with its reason, subject and decline text. The decline
+// text comes only from a deferral of the kind that stands: for a call
+// asked about, the first among the deferrals that ask, never a hold's,
+// which is worded for a refusal beside a declined sibling; for a held
+// call, the first among the holds. The first note stands, and
 // Terminate is set when any decision sets it. Arguments a decision rewrites are passed to the
 // hooks after it, so each sees what the call will actually run with and
 // the last rewrite is what the tool receives. The first error stops the
@@ -223,18 +227,22 @@ func (d *ToolDecision) merge(next *ToolDecision) {
 		// stands with it: a block's reason is what the model reads as
 		// the error output.
 		d.Action, d.Reason, d.By = next.Action, next.Reason, next.By
-		d.Held, d.Subject = next.Held, next.Subject
+		d.Held, d.Subject, d.DeclineText = next.Held, next.Subject, next.DeclineText
 	case d.Action == Defer && next.Action == Defer && d.Held && !next.Held:
 		// A call one hook only held beside another and a later one asks
 		// about is asked about: held only if every deferring hook held
 		// it, and the ask's reason and part explain the question.
-		d.Held, d.Reason, d.By, d.Subject = false, next.Reason, next.By, next.Subject
+		d.Held, d.Reason, d.By, d.Subject, d.DeclineText = false, next.Reason, next.By, next.Subject, next.DeclineText
 	}
 	if d.Reason == "" {
 		d.Reason = next.Reason
 	}
 	if d.By == "" {
 		d.By = next.By
+	}
+	if d.DeclineText == "" && d.Action == Defer && next.Action == Defer && d.Held == next.Held {
+		// Only a deferral of the kind that stands words its refusal.
+		d.DeclineText = next.DeclineText
 	}
 	if d.Note == "" {
 		d.Note = next.Note

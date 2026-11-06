@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/ChristopherDavenport/agentsession"
 	"github.com/ChristopherDavenport/agenttool"
 	"github.com/ChristopherDavenport/agentturn"
+	"github.com/ChristopherDavenport/agentturn/tools/agent"
 	"github.com/ChristopherDavenport/openresponses"
 	"github.com/ChristopherDavenport/openresponses/echo"
 )
@@ -140,9 +142,10 @@ func TestHostComposedItemsAreRecordedWithTheirProvenance(t *testing.T) {
 // TestAnOwedQueuedInputKeepsItsMarksAcrossARestart pins that an input
 // the host composed and queued, hidden, with instruction layers and
 // trust, and owed when the process quits, is drained after a restart as
-// what it was: the queued entry keeps the marks the format's queued
-// entry has no member for, as agentturn:visible, agentturn:trust and
-// agentturn:instructions_part, Requeue hands the input back marked, and
+// what it was: the queued entry keeps the marks in format 0.21's
+// visible, trust and instructions_part (agentsession#278), and none of
+// the interim agentturn: members v0.0.37 wrote, Requeue hands the input
+// back marked, and
 // the item that drains it is recorded hidden, with its layers and its
 // trust, not as the person's visible words. A run end before the drain
 // writes the entry again with them.
@@ -219,9 +222,14 @@ func TestAnOwedQueuedInputKeepsItsMarksAcrossARestart(t *testing.T) {
 		t.Fatalf("queued entries = %d, want the reminder's and the one its run end wrote again", len(queued))
 	}
 	for _, q := range queued {
-		if string(q.Unknown[VisibleMember]) != "false" || string(q.Unknown[TrustMember]) != `{"reads":["untrusted"]}` ||
-			string(q.Unknown[InstructionsPartMember]) != `{"id":"/repo/sub/AGENTS.md","source":"agentsmd"}` {
-			t.Errorf("queued entry %s members = %s", q.ID, q.Unknown)
+		if q.Visible == nil || *q.Visible || q.Trust == nil || !slices.Equal(q.Trust.Reads, []string{"untrusted"}) ||
+			q.InstructionsPart == nil || *q.InstructionsPart != (agentsession.LayerRef{ID: "/repo/sub/AGENTS.md", Source: agentsession.LayerAgentsMD}) {
+			t.Errorf("queued entry %s: visible %v trust %+v instructions_part %+v, want format 0.21's members", q.ID, q.Visible, q.Trust, q.InstructionsPart)
+		}
+		for name := range q.Unknown {
+			if strings.HasPrefix(name, "agentturn:") {
+				t.Errorf("queued entry %s carries the interim member %s", q.ID, name)
+			}
 		}
 	}
 	it := itemEntries(read)["<reminder>sub/AGENTS.md</reminder>"]
@@ -232,12 +240,12 @@ func TestAnOwedQueuedInputKeepsItsMarksAcrossARestart(t *testing.T) {
 	}
 }
 
-// TestACopysTrustIsNotSilentlyNarrowed pins the choice made for a
-// copied item that also carries a provenance trust: the format has a
-// copy carry the trust of what it copies as written, so the host's
-// labels cannot be added; a recorder that would drop one refuses
-// instead, and one the copy's trust already holds loses nothing.
-func TestACopysTrustIsNotSilentlyNarrowed(t *testing.T) {
+// TestACopysTrustTakesTheHostsLabels pins agentsession#279's
+// follow-up: a copied item carries the trust it was copied with, and a
+// host's provenance labels are merged into it, since format 0.21 lets a
+// copy's trust hold more labels than its source's, never fewer. An
+// empty provenance trust adds nothing.
+func TestACopysTrustTakesTheHostsLabels(t *testing.T) {
 	copyOf := func(reads ...string) *agentsession.ItemEntry {
 		return &agentsession.ItemEntry{Item: openresponses.UserText("copied"), CopiedFrom: &agentsession.CopiedFrom{Session: "s"}, Trust: &agentsession.Trust{Reads: reads}}
 	}
@@ -248,17 +256,17 @@ func TestACopysTrustIsNotSilentlyNarrowed(t *testing.T) {
 	if err := recordProvenance(e, prov(agenttool.LabelUntrusted)); err != nil || !slices.Equal(e.Trust.Reads, []string{"untrusted"}) {
 		t.Errorf("held labels: err=%v trust=%+v", err, e.Trust)
 	}
-	e = copyOf()
-	if err := recordProvenance(e, prov()); err != nil {
-		t.Errorf("an empty trust: %v", err)
+	e = &agentsession.ItemEntry{Item: openresponses.UserText("copied"), CopiedFrom: &agentsession.CopiedFrom{Session: "s"}}
+	if err := recordProvenance(e, prov()); err != nil || e.Trust != nil {
+		t.Errorf("an empty trust: err=%v trust=%+v, want nothing added", err, e.Trust)
 	}
 	e = copyOf("untrusted")
-	if err := recordProvenance(e, prov(agenttool.LabelPrivate)); err == nil {
-		t.Errorf("a label the copy cannot hold was dropped: trust %+v", e.Trust)
+	if err := recordProvenance(e, prov(agenttool.LabelPrivate)); err != nil || !slices.Equal(e.Trust.Reads, []string{"untrusted", "private"}) {
+		t.Errorf("a label the source lacks: err=%v trust=%+v, want it merged", err, e.Trust)
 	}
 	e = &agentsession.ItemEntry{Item: openresponses.UserText("copied"), CopiedFrom: &agentsession.CopiedFrom{Session: "s"}}
-	if err := recordProvenance(e, prov(agenttool.LabelUntrusted)); err == nil {
-		t.Errorf("a label dropped from a copy with no trust: trust %+v", e.Trust)
+	if err := recordProvenance(e, prov(agenttool.LabelUntrusted)); err != nil || e.Trust == nil || !slices.Equal(e.Trust.Reads, []string{"untrusted"}) {
+		t.Errorf("a copy with no trust: err=%v trust=%+v, want the label", err, e.Trust)
 	}
 }
 
@@ -287,5 +295,234 @@ func TestAnUnreadableLayerDropsOnlyTheLayers(t *testing.T) {
 	}
 	if len(p.Layers) != 0 {
 		t.Errorf("layers = %+v, want the unreadable one dropped", p.Layers)
+	}
+}
+
+// TestQueuedMarksReadBothForms pins agentsession#278's follow-up: an
+// owed input's marks are read from format 0.21's visible, trust and
+// instructions_part on its queued entry, and, for a session agentturn
+// v0.0.37 recorded, from the interim agentturn: members it wrote there.
+func TestQueuedMarksReadBothForms(t *testing.T) {
+	visible := false
+	current := agentsession.NewQueued(openresponses.UserText("<reminder>x</reminder>"), agentsession.ModeFollowUp)
+	current.Visible = &visible
+	current.Trust = &agentsession.Trust{Reads: []string{"untrusted"}}
+	current.InstructionsLayers = []agentsession.LayerRef{{ID: "/repo/AGENTS.md", Source: agentsession.LayerAgentsMD}, {Source: agentsession.LayerAgentMemory}}
+	interim := agentsession.NewQueued(openresponses.UserText("<reminder>x</reminder>"), agentsession.ModeFollowUp)
+	interim.Unknown = map[string]json.RawMessage{
+		VisibleMember:          json.RawMessage(`false`),
+		TrustMember:            json.RawMessage(`{"reads":["untrusted"]}`),
+		InstructionsPartMember: json.RawMessage(`[{"id":"/repo/AGENTS.md","source":"agentsmd"},{"source":"agentmemory"}]`),
+	}
+	wantLayers := []agentturn.Layer{{ID: "/repo/AGENTS.md", Source: agentsession.LayerAgentsMD}, {Source: agentsession.LayerAgentMemory}}
+	for name, q := range map[string]*agentsession.QueuedEntry{"0.21": current, "v0.0.37": interim} {
+		hidden, prov := queuedMarks(q)
+		if !hidden {
+			t.Errorf("%s: not hidden", name)
+		}
+		if prov == nil || prov.Trust == nil || !slices.Equal(prov.Trust.Reads, []agenttool.Label{agenttool.LabelUntrusted}) || !slices.Equal(prov.Layers, wantLayers) {
+			t.Errorf("%s: provenance = %+v", name, prov)
+		}
+	}
+}
+
+// TestComposedInputIsNeverRecordedAsThePersons pins #303 under
+// agentsession RFC 0001 0.21's rule for the trigger kind human: a
+// message the host composed from instruction layers, prompted or
+// queued under a run's or a context's trigger of kind human, is not
+// recorded with that kind on its source or its queued entry's
+// trigger, so the record reads it as composed and never carries human
+// beside instructions_part. The rest of the trigger, its ref and its
+// source, is kept: a steer's queued entry is the only place its arrival
+// is written. A hidden message, which the person never sees and so did
+// not type, a reminder the host prompts with no provenance, is composed
+// too, and so is an item copied from another conversation. A reminder
+// the host names its own kind for, #303's first case, carries that kind
+// whatever the run's. What the person typed keeps the kind, a pasted
+// message the host labels untrusted included, and the drained item
+// still carries its queued entry's trigger.
+func TestComposedInputIsNeverRecordedAsThePersons(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{Records: agentsession.AllRecords})
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := func(text string) openresponses.Item {
+		item, err := agentturn.WithProvenance(openresponses.UserText(text), agentturn.Provenance{
+			Layers: []agentturn.Layer{{ID: "review.md", Source: "dax.prompts"}},
+			Trust:  &agentturn.Trust{},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return item
+	}
+	pasted, err := agentturn.WithProvenance(openresponses.UserText("pasted"), agentturn.Provenance{Trust: &agentturn.Trust{Reads: []agenttool.Label{agenttool.LabelUntrusted}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reminderKind := agentturn.Trigger{Kind: "reminder", Ref: "todo", Source: "dax"}
+	reminder, err := agentturn.WithProvenance(openresponses.UserText("reminder"), agentturn.Provenance{Source: reminderKind})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"})
+	defer rec.Attach(a)()
+	human := agentturn.ContextWithTrigger(ctx, agentturn.Trigger{Kind: agentturn.TriggerHuman, Ref: "slack:1758412800.0002", Source: "gateway"})
+	if _, err := a.Prompt(human, openresponses.UserText("typed"), pasted, template("prompted template"), agentturn.Hidden(openresponses.UserText("hidden reminder")),
+		reminder, agentturn.Copied(openresponses.UserText("copied"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Queue(human, a, agentturn.QueueSteer, template("queued template")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Queue(human, agentturn.QueueSteer, template("event template"), agentturn.Hidden(openresponses.UserText("hidden steer"))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Continue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	read, err := store.Open(ctx, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyAll(t, read)
+	if err := read.VerifyRecords(read.Leaf()); err != nil {
+		t.Errorf("verify records: %v", err)
+	}
+	items := itemEntries(read)
+	for text, want := range map[string]agentsession.Words{
+		"typed":             agentsession.WordsPerson,
+		"pasted":            agentsession.WordsPerson,
+		"prompted template": agentsession.WordsComposed,
+		"queued template":   agentsession.WordsComposed,
+		"event template":    agentsession.WordsComposed,
+		"hidden reminder":   agentsession.WordsComposed,
+		"hidden steer":      agentsession.WordsComposed,
+		"reminder":          agentsession.WordsComposed,
+		"copied":            agentsession.WordsComposed,
+	} {
+		it := items[text]
+		if it == nil {
+			t.Errorf("%q not recorded", text)
+			continue
+		}
+		if got := agentsession.WordsOf(it); got != want {
+			t.Errorf("%q reads as %v, want %v", text, got, want)
+		}
+	}
+	// A composed input keeps where it arrived from, without the kind.
+	arrival := &agentsession.Trigger{Ref: "slack:1758412800.0002", Source: "gateway"}
+	for _, text := range []string{"prompted template", "queued template", "event template", "hidden reminder", "hidden steer", "copied"} {
+		if it := items[text]; it != nil && !it.Source.Equal(arrival) {
+			t.Errorf("%q source = %+v, want %+v", text, it.Source, arrival)
+		}
+	}
+	if it := items["reminder"]; it != nil && !it.Source.Equal(&agentsession.Trigger{Kind: "reminder", Ref: "todo", Source: "dax"}) {
+		t.Errorf("reminder source = %+v, want the host's own kind", it.Source)
+	}
+	for _, e := range read.Entries() {
+		if q, ok := e.(*agentsession.QueuedEntry); ok && (q.Layers() != nil || q.Visible != nil) && !q.Trigger.Equal(arrival) {
+			t.Errorf("queued %s trigger = %+v, want %+v", q.ID, q.Trigger, arrival)
+		}
+	}
+	for _, e := range read.Entries() {
+		var trigger *agentsession.Trigger
+		var layers []agentsession.LayerRef
+		switch v := e.(type) {
+		case *agentsession.ItemEntry:
+			trigger, layers = v.Source, v.Layers()
+		case *agentsession.QueuedEntry:
+			trigger, layers = v.Trigger, v.Layers()
+		default:
+			continue
+		}
+		if layers != nil && trigger != nil && trigger.Kind == agentsession.TriggerHuman {
+			t.Errorf("%s %s carries human beside instructions_part", e.EntryType(), e.Base().ID)
+		}
+	}
+}
+
+// TestACopiedInputQueuedIsRecordedAsACopy pins that an input marked
+// copied and put on a queue is recorded as the copy it is, on its queued
+// entry as on the item that drains it: a child queued its parent's
+// message under the person's trigger, with a label the host adds, writes
+// the queued entry with the trigger's ref and source but not the kind
+// human, and with the trust the drained copy carries, its source's
+// labels merged with the host's, so the drain verifies and the copy is
+// never read as the person's words.
+func TestACopiedInputQueuedIsRecordedAsACopy(t *testing.T) {
+	ctx := context.Background()
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(ctx, store, agentsession.Header{Records: agentsession.AllRecords})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := agentturn.New(agentturn.Config{Model: &echo.Adapter{}, ModelName: "m"})
+	defer rec.Attach(parent)()
+	secret := openresponses.UserText("secret")
+	private, err := agentturn.WithProvenance(secret, agentturn.Provenance{Trust: &agentturn.Trust{Reads: []agenttool.Label{agenttool.LabelPrivate}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parent.Prompt(ctx, private); err != nil {
+		t.Fatal(err)
+	}
+	spawnID := agentsession.NewSpawnID()
+	cctx, err := rec.StartChild(ctx, spawnID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cctx = agentturn.ContextWithTrigger(cctx, agentturn.Trigger{Kind: agentturn.TriggerHuman, Ref: "slack:1758412800.0002", Source: "gateway"})
+	cfg := agentturn.Config{Name: "helper", Model: &echo.Adapter{}, ModelName: "child"}
+	child := agentturn.New(cfg)
+	child.Subscribe(func(ctx context.Context, ev agentturn.Event) error {
+		rec.Observe(ctx, ev)
+		return nil
+	})
+	copied, err := agentturn.WithProvenance(secret, agentturn.Provenance{Trust: &agentturn.Trust{Reads: []agenttool.Label{agenttool.LabelUntrusted}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Queue(cctx, agentturn.QueueFollowUp, agentturn.Copied(copied)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := child.Prompt(agent.ContextWithConfig(cctx, cfg), openresponses.UserText("go")); err != nil {
+		t.Fatal(err)
+	}
+	cs, err := store.Open(ctx, agentsession.SpawnedSessionID(s.ID(), spawnID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.VerifyRecords(cs.Leaf()); err != nil {
+		t.Errorf("verify records: %v", err)
+	}
+	if err := cs.VerifyCopies(func(id string) (*agentsession.Session, error) { return store.Open(ctx, id) }); err != nil {
+		t.Errorf("verify copies: %v", err)
+	}
+	arrival := &agentsession.Trigger{Ref: "slack:1758412800.0002", Source: "gateway"}
+	wantTrust := []string{"private", "untrusted"}
+	var queued *agentsession.QueuedEntry
+	for _, e := range cs.Entries() {
+		if q, ok := e.(*agentsession.QueuedEntry); ok {
+			queued = q
+		}
+	}
+	if queued == nil {
+		t.Fatal("no queued entry")
+	}
+	if !queued.Trigger.Equal(arrival) || queued.Trust == nil || !slices.Equal(queued.Trust.Reads, wantTrust) {
+		t.Errorf("queued trigger %+v trust %+v, want %+v and %v", queued.Trigger, queued.Trust, arrival, wantTrust)
+	}
+	it := itemEntries(cs)["secret"]
+	if it == nil {
+		t.Fatal("the copy was not drained")
+	}
+	if it.QueuedFrom != queued.ID || it.CopiedFrom == nil || !it.Source.Equal(arrival) || it.Trust == nil || !slices.Equal(it.Trust.Reads, wantTrust) {
+		t.Errorf("drained copy: queued_from %q copied_from %+v source %+v trust %+v", it.QueuedFrom, it.CopiedFrom, it.Source, it.Trust)
+	}
+	if got := agentsession.WordsOf(it); got == agentsession.WordsPerson {
+		t.Errorf("the copy reads as the person's words")
 	}
 }

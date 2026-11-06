@@ -128,6 +128,91 @@ func TestAnOutcomeUnknownIsMarkedFailed(t *testing.T) {
 	}
 }
 
+// TestAPromptCarriesAnAnswersMarks pins RFC 0001's Pending calls rule
+// that a prompt opening with outputs for pending calls carries, per
+// output, what a resume's answer can (#305): an output marked with its
+// answer, OutcomeUnknown's, is recorded failed and its decision names
+// who decided and why; a plain output for the same cut call is not
+// marked failed, since nothing says it reports a failure.
+func TestAPromptCarriesAnAnswersMarks(t *testing.T) {
+	for _, marked := range []bool{true, false} {
+		name := "marked"
+		if !marked {
+			name = "plain"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := agentsession.NewMemoryStore()
+			rec, s, err := Start(ctx, store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			started := make(chan struct{})
+			cut := true
+			bash := agenttool.New("bash", "", func(ctx context.Context, _ echoArgs) (string, error) {
+				if !cut {
+					return "ok", nil
+				}
+				cut = false
+				close(started)
+				<-ctx.Done()
+				return "", ctx.Err()
+			})
+			a := agentturn.New(agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: []agenttool.Tool{bash}})
+			defer rec.Attach(a)()
+			go func() {
+				<-started
+				a.Abort()
+			}()
+			end, err := a.Prompt(ctx, openresponses.UserText("go"))
+			if err != nil || end.Reason != agentturn.ReasonAborted || len(end.Pending) != 1 {
+				t.Fatalf("prompt: err=%v end=%+v", err, end)
+			}
+			ans := agentturn.OutcomeUnknown(end.Pending[0].Call.CallID).WithBy(agentsession.ByHuman)
+			out := openresponses.Item(ans.Output)
+			if marked {
+				out = ans.Item()
+			}
+			if _, err := a.Prompt(ctx, out, openresponses.UserText("what now?")); err != nil {
+				t.Fatal(err)
+			}
+			calls, err := s.Calls(s.Leaf())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var c *agentsession.Call
+			for _, cc := range calls {
+				if cc.Call.CallID == ans.CallID {
+					c = cc
+				}
+			}
+			if c == nil || c.Output == nil {
+				t.Fatalf("no output in %q", entryTypes(s))
+			}
+			if c.Failed() != marked {
+				t.Errorf("failed = %v, want %v", c.Failed(), marked)
+			}
+			var answer *agentsession.DecisionEntry
+			for _, d := range c.Decisions {
+				if d.Verdict == agentsession.VerdictAnswer {
+					answer = d
+				}
+			}
+			switch {
+			case answer == nil:
+				t.Errorf("no answer decision in %+v", c.Decisions)
+			case marked && (answer.By != agentsession.ByHuman || answer.Reason != agentturn.OutcomeUnknownReason):
+				t.Errorf("answer by %q reason %q, want %q and %q", answer.By, answer.Reason, agentsession.ByHuman, agentturn.OutcomeUnknownReason)
+			case !marked && (answer.By != "" || answer.Reason != ""):
+				t.Errorf("a plain output's answer by %q reason %q, want neither", answer.By, answer.Reason)
+			}
+			if err := s.VerifyRecords(s.Leaf()); err != nil {
+				t.Errorf("verify: %v", err)
+			}
+		})
+	}
+}
+
 // TestAWithdrawalAnEarlierVersionWroteStillReads pins the reading of
 // the agentturn:withdrawn entry agentturn v0.0.34 and earlier wrote in
 // place of the format's withdrawal (#278): the call whose only dispatch

@@ -216,12 +216,17 @@ func TestEscalationPutsTheAgentsQuestionToTheCaller(t *testing.T) {
 		opts     []Option
 		// by is the decider the approval's decision is recorded with.
 		by string
+		// declineText is the host's text for a refusal, on the deferral.
+		declineText string
 	}{
 		{name: "approved", approval: Approval{Approve: true, Note: "only this once"}, ran: 1, output: "refunded 10", note: "The caller alice said: only this once"},
 		{name: "refused", approval: Approval{Note: "not today"}, output: "the caller alice refused this call; the caller said: not today"},
 		{name: "approved by a rule the host lets alice name", approval: Approval{Approve: true, Note: "only this once", By: "policy"}, ran: 1, output: "refunded 10", note: "The caller alice said: only this once", opts: []Option{letsAlice}, by: "policy"},
 		{name: "approved by a person the host lets alice name", approval: Approval{Approve: true, Note: "only this once", By: "human"}, ran: 1, output: "refunded 10", note: "The caller alice said: only this once", opts: []Option{letsAlice}, by: "human"},
 		{name: "refused by a person the host lets alice name", approval: Approval{Note: "not today", By: "human"}, output: "the caller alice refused this call; the caller said: not today", opts: []Option{letsAlice}},
+		// #304: the host's decline text is what the model reads, the
+		// caller's note still after it, named for the caller.
+		{name: "refused in the host's words", approval: Approval{Note: "not today"}, declineText: "the refund desk turned this down", output: "the refund desk turned this down; the caller alice said: not today"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var ran int
@@ -232,8 +237,15 @@ func TestEscalationPutsTheAgentsQuestionToTheCaller(t *testing.T) {
 					gotArgs = string(c.Args)
 					return agenttool.Text("refunded 10"), nil
 				})
+			rewrite := rewrites("issue_refund", reason, "capped at 10", json.RawMessage(`{"amount":10}`))
 			cfg := agentturn.Config{Model: callsThenDone{"issue_refund"}, Tools: []agenttool.Tool{refund},
-				BeforeToolCall: rewrites("issue_refund", reason, "capped at 10", json.RawMessage(`{"amount":10}`))}
+				BeforeToolCall: func(ctx context.Context, info agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+					d, err := rewrite(ctx, info)
+					if d != nil {
+						d.DeclineText = tc.declineText
+					}
+					return d, err
+				}}
 			var triggers []agentturn.Trigger
 			var decisions []*agentturn.ToolDecision
 			record := func(ctx context.Context, _ string, a *agentturn.Agent) (context.Context, func(), error) {
@@ -552,7 +564,13 @@ func (m callsBoth) CreateStream(_ context.Context, req openresponses.Request, si
 // to the caller; the caller's answer to the asked call releases it, by
 // the policy, whether that answer approved or refused.
 func TestAHeldCallIsReleasedNotAsked(t *testing.T) {
-	for _, approve := range []bool{true, false} {
+	for _, tc := range []struct {
+		approve bool
+		// declineText is the held call's own text for its refusal
+		// (#304).
+		declineText string
+	}{{approve: true}, {approve: false}, {approve: false, declineText: "read is not run without the deploy"}} {
+		approve := tc.approve
 		// The batch runs its calls in parallel.
 		var mu sync.Mutex
 		ran := map[string]int{}
@@ -569,7 +587,7 @@ func TestAHeldCallIsReleasedNotAsked(t *testing.T) {
 			case "deploy":
 				return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "deploys are asked"}, nil
 			case "read":
-				return &agentturn.ToolDecision{Action: agentturn.Defer, Held: true, Reason: "allowed by read"}, nil
+				return &agentturn.ToolDecision{Action: agentturn.Defer, Held: true, Reason: "allowed by read", DeclineText: tc.declineText}, nil
 			}
 			return nil, nil
 		}
@@ -629,7 +647,12 @@ func TestAHeldCallIsReleasedNotAsked(t *testing.T) {
 				}
 			}
 		}
-		if !strings.Contains(readOut, "not run") || !strings.Contains(readOut, "refused") {
+		if tc.declineText != "" {
+			// The host worded the refusal of the call it held.
+			if readOut != tc.declineText {
+				t.Errorf("the held call's output = %q, want the hold's own text %q", readOut, tc.declineText)
+			}
+		} else if !strings.Contains(readOut, "not run") || !strings.Contains(readOut, "refused") {
 			t.Errorf("the held call's output = %q, want it refused unrun", readOut)
 		}
 	}

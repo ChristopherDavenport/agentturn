@@ -457,3 +457,70 @@ func TestARequeuedSteerIsSkippedOnlyForItsHolder(t *testing.T) {
 		t.Errorf("the agent Requeue handed it to holds %d steers, want 1", st.Steering)
 	}
 }
+
+// TestAnAcceptedDeliveryIsWrittenFirst pins #302 beside #244: the
+// recorder's two-step delivery writes each item's queued entry, with
+// deliver, before the agent accepts it, so the accept a caller takes
+// at once is on the record, at an approval prompt and over the wire
+// alike; and one the agent refuses leaves nothing owed.
+func TestAnAcceptedDeliveryIsWrittenFirst(t *testing.T) {
+	setup := func(t *testing.T) (*Recorder, *agentsession.Session, *agentturn.Agent) {
+		t.Helper()
+		ctx := context.Background()
+		rec, s, err := Start(ctx, agentsession.NewMemoryStore(), agentsession.Header{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		hold := func(context.Context, agentturn.ToolCallInfo) (*agentturn.ToolDecision, error) {
+			return &agentturn.ToolDecision{Action: agentturn.Defer, Reason: "ask"}, nil
+		}
+		tools := []agenttool.Tool{agenttool.New("deploy", "", func(context.Context, echoArgs) (string, error) { return "deployed", nil })}
+		a := agentturn.New(agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools, BeforeToolCall: hold})
+		t.Cleanup(rec.Attach(a))
+		if end, err := a.Prompt(ctx, openresponses.UserText("deploy")); err != nil || end.Reason != agentturn.ReasonInputRequired {
+			t.Fatalf("first run: %v, %+v", err, end)
+		}
+		return rec, s, a
+	}
+	for _, via := range []string{"recorder", "wire"} {
+		t.Run(via, func(t *testing.T) {
+			ctx := context.Background()
+			rec, s, a := setup(t)
+			var acc agentturn.Accepter = rec.Control(a)
+			if via == "wire" {
+				srv := httptest.NewServer(control.Handler(rec.Control(a), control.WithInsecureNoAuth()))
+				defer srv.Close()
+				c, err := control.Dial(ctx, srv.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				acc = c
+			}
+			d, err := acc.Accept(ctx, openresponses.UserText("the build passed"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if q := deliveries(s)["the build passed"]; q == nil || !q.Deliver {
+				t.Errorf("the delivery's entry = %+v, want it written with deliver when the accept returns", q)
+			}
+			if _, _, err := d.Wait(ctx); !errors.Is(err, agentturn.ErrInputRequired) {
+				t.Errorf("the outcome: err = %v, want ErrInputRequired", err)
+			}
+		})
+	}
+	t.Run("refused while held", func(t *testing.T) {
+		ctx := context.Background()
+		rec, s, a := setup(t)
+		if err := a.WhileIdle(func() error {
+			if _, err := rec.Accept(ctx, a, openresponses.UserText("the build passed")); !errors.Is(err, agentturn.ErrHeld) {
+				t.Errorf("an accept during the hold: err = %v, want ErrHeld", err)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if n := queuedCount(s, "the build passed"); n != 0 {
+			t.Errorf("%d queued entries for a refused accept, want none", n)
+		}
+	})
+}
