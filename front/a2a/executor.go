@@ -946,6 +946,14 @@ func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, 
 		var msg *a2a.Message
 		if text != "" {
 			msg = a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: text})
+			if out.end.Cause == agentturn.StopMaxOutputTokens && out.end.Incomplete != nil {
+				// The answer was cut at the model's output limit. It is
+				// still the agent's answer, so the task completes, and
+				// the status message says it was cut (#314).
+				if details, err := detailsMeta(out.end.Incomplete); err == nil {
+					msg.SetMeta(MetaIncomplete, details)
+				}
+			}
 		}
 		return e.finish(ctx, reqCtx, q, a2a.TaskStateCompleted, msg)
 	case agentturn.ReasonAborted:
@@ -956,6 +964,17 @@ func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, 
 	default:
 		return e.finish(ctx, reqCtx, q, a2a.TaskStateFailed, errorMessage(reqCtx, out.end.Err))
 	}
+}
+
+// detailsMeta is d as the JSON object a task store keeps: the types a
+// JSON decode yields, its extension members included.
+func detailsMeta(d *openresponses.IncompleteDetails) (map[string]any, error) {
+	raw, err := json.Marshal(d)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	return m, json.Unmarshal(raw, &m)
 }
 
 // checkDeclared refuses a tool a message declares that would stand in

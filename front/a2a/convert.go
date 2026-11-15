@@ -24,6 +24,12 @@ const (
 	// which is the form a JSON decode yields and the only one the SDK
 	// stores.
 	MetaPendingCalls = "agentturn.pending_calls"
+	// MetaIncomplete, on a completed status message, says the answer it
+	// carries was cut short: the model's response ended incomplete at
+	// its output limit (agentturn.StopMaxOutputTokens), and the value is
+	// that response's incomplete_details as a JSON object, members the
+	// spec does not define included.
+	MetaIncomplete = "agentturn.incomplete"
 )
 
 // ItemsFromMessage converts a caller's A2A message into Open Responses

@@ -1532,7 +1532,7 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 			if waiting := r.ending(); len(calls) > 0 || waiting {
 				return stopped(StopMaxTurns, nil)
 			}
-			return nil
+			return answered(resp)
 		}
 		var queued []TurnInput
 		if len(calls) > 0 {
@@ -1540,7 +1540,7 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 		} else {
 			queued = r.drainLast()
 			if len(queued) == 0 {
-				return nil
+				return answered(resp)
 			}
 		}
 		if err := r.appendArrived(queued); err != nil {
@@ -2010,6 +2010,24 @@ func (r *runner) closeCalls(items Transcript, text string) error {
 		outputs = append(outputs, &openresponses.FunctionCallOutput{CallID: call.CallID, Output: openresponses.FunctionCallOutputData{Text: text}})
 	}
 	return r.appendItems(outputs, InputTool)
+}
+
+// answered ends a run whose last response, resp, made no calls and
+// left nothing queued: done, or stopped with [StopMaxOutputTokens] and
+// the response's details when the response was cut at its output limit
+// or ended incomplete naming no reason, its text still the answer.
+func answered(resp *openresponses.Response) error {
+	if resp == nil || resp.Status != openresponses.ResponseStatusIncomplete {
+		return nil
+	}
+	details := resp.IncompleteDetails
+	if details == nil {
+		details = &openresponses.IncompleteDetails{Reason: openresponses.IncompleteReasonMaxOutputTokens}
+	}
+	if details.Reason != openresponses.IncompleteReasonMaxOutputTokens {
+		return nil
+	}
+	return &errStop{reason: ReasonStopped, cause: StopMaxOutputTokens, incomplete: cloneDetails(details)}
 }
 
 // filtered reports whether the provider ended resp incomplete with

@@ -71,8 +71,9 @@ func (m *cutShort) CreateStream(_ context.Context, req openresponses.Request, si
 
 // TestIncompleteLastResponseIsRecordedAborted pins #314's record: a run
 // whose last response ended incomplete is written aborted, as the
-// format's cascade reads its segment, with the loop's cause as ref, or
-// the response's incomplete reason when the loop ended it done. A call
+// format's cascade reads its segment, with the loop's cause as ref: a
+// content filter's stop, a final answer cut at the output limit, or
+// another stop after a response so cut. A call
 // a content-filtered response made is rejected by policy with the
 // loop's fixed output, and the response keeps the provider's extension
 // members. The record verifies, and the next prompt goes ahead.
@@ -93,7 +94,7 @@ func TestIncompleteLastResponseIsRecordedAborted(t *testing.T) {
 			agentturn.ReasonStopped, agentturn.StopContentFilter, "content_filter",
 			"run config item:user item:function_call* item:assistant* response decision item:function_call_output run"},
 		{"max_output_tokens, an answer", &cutShort{reason: openresponses.IncompleteReasonMaxOutputTokens}, 0,
-			agentturn.ReasonDone, "", "max_output_tokens",
+			agentturn.ReasonStopped, agentturn.StopMaxOutputTokens, "max_output_tokens",
 			"run config item:user item:assistant* response run"},
 		{"max_output_tokens, a call at the turn limit", &cutShort{call: true, reason: openresponses.IncompleteReasonMaxOutputTokens}, 1,
 			agentturn.ReasonStopped, agentturn.StopMaxTurns, "max_turns",
@@ -151,7 +152,7 @@ func TestIncompleteLastResponseIsRecordedAborted(t *testing.T) {
 // TestRecordedEndReadsAnIncompleteEnd pins how a run end #314 writes
 // aborted reads back for a call that runs again: a content filter
 // stop as that stop, no answer, and an answer cut at max_output_tokens
-// as the done run it was, its answer standing.
+// as that stop, its answer standing.
 func TestRecordedEndReadsAnIncompleteEnd(t *testing.T) {
 	items := openresponses.Items{openresponses.UserText("go"), openresponses.AssistantText("Once upon")}
 	for _, tc := range []struct {
@@ -161,7 +162,7 @@ func TestRecordedEndReadsAnIncompleteEnd(t *testing.T) {
 		answer bool
 	}{
 		{"content_filter", agentturn.ReasonStopped, agentturn.StopContentFilter, false},
-		{"max_output_tokens", agentturn.ReasonDone, "", true},
+		{"max_output_tokens", agentturn.ReasonStopped, agentturn.StopMaxOutputTokens, true},
 		// A guard's stop still reads as the failed run it read as
 		// before; Answer reads the items alone.
 		{"guard: rule", agentturn.ReasonError, "", true},

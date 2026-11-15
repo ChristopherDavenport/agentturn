@@ -1,6 +1,6 @@
 {
   "name": "content-filter-stop",
-  "description": "A response the server ended incomplete with content_filter ends the run stopped with cause content_filter and no turn_end: its function calls are never dispatched, each is answered with the fixed refused output before run_end, and the end carries the response's incomplete_details, extension members included, and its refusal text, so the next run goes ahead; a response ended at max_output_tokens is no such stop.",
+  "description": "A response the server ended incomplete with content_filter ends the run stopped with cause content_filter and no turn_end: its function calls are never dispatched, each is answered with the fixed refused output before run_end, and the end carries the response's incomplete_details, extension members included, and its refusal text, so the next run goes ahead; a final answer ended at max_output_tokens stops the run with cause max_output_tokens and its details, its text still the answer.",
   "rules": ["#the-turn", "#the-model-call", "#ending-a-run", "#order", "#invariants"],
   "config": {"model": "m"},
   "tools": [{"name": "probe", "result": {"output": "open ports: 22"}}],
@@ -80,7 +80,8 @@
           {"type": "item_end", "turn": 1, "item": {"type": "message", "role": "assistant"}, "response_id": "resp_3"},
           {"type": "response_end", "turn": 1, "response": {"id": "resp_3", "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}},
           {"type": "turn_end", "turn": 1, "tool_results": []},
-          {"type": "run_end", "reason": "done", "cause": "", "error": false, "pending": []}
+          {"type": "run_end", "reason": "stopped", "cause": "max_output_tokens", "error": false, "pending": [], "withheld": false,
+           "incomplete": {"reason": "max_output_tokens"}, "refusal": ""}
         ]
       }
     }

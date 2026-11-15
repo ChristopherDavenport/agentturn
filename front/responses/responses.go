@@ -74,6 +74,10 @@
 // agentturn.RefusedCallOutput. A single turn passes a response the
 // model ended incomplete through the same way, its details whole.
 //
+// A full run whose answer the model's output limit cut short
+// (agentturn.StopMaxOutputTokens) ends incomplete with reason
+// max_output_tokens, holding the cut text, as the model's response did.
+//
 // A full run that a terminating tool result stopped
 // (agentturn.StopTerminate or agentturn.StopPartialTerminate) is how a
 // handoff ends the sender's part. [WithHandoff] is asked for the
@@ -545,10 +549,12 @@ func (a *Adapter) fullRun(ctx context.Context, base agentturn.Config, req openre
 		}
 		return context.Canceled
 	case agentturn.ReasonStopped:
-		if end.Cause == agentturn.StopContentFilter {
-			// The provider's content filter ended the model's response:
-			// the caller's response ends as the model's did, with its
-			// details as given, its category among them (#314).
+		if end.Cause == agentturn.StopContentFilter || end.Cause == agentturn.StopMaxOutputTokens {
+			// The provider's content filter ended the model's response,
+			// or its output limit cut the answer short: the caller's
+			// response ends as the model's did, with what was relayed,
+			// the cut text included, and its details as given, a
+			// category among them (#314).
 			rl.em.Response().Usage = &usage
 			return rl.incomplete(end.Incomplete)
 		}

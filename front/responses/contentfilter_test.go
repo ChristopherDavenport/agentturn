@@ -113,3 +113,40 @@ func TestAContentFilterResponsePassesThrough(t *testing.T) {
 		})
 	}
 }
+
+// cutShort answers with a message cut at the output limit.
+type cutShort struct{}
+
+func (cutShort) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("Once upon"); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Incomplete(openresponses.IncompleteReasonMaxOutputTokens)
+}
+
+// TestACutAnswerEndsIncomplete pins #314's max_output_tokens decision
+// in a full run: the caller's response holds the cut text and ends
+// incomplete with reason max_output_tokens, as the model's did.
+func TestACutAnswerEndsIncomplete(t *testing.T) {
+	srv := httptest.NewServer(openresponses.NewHandler(New(agentturn.Config{Model: cutShort{}, ModelName: "m"})))
+	defer srv.Close()
+	status, body := post(t, srv.URL, request(openresponses.UserText("write at length")))
+	var resp openresponses.Response
+	if err := json.Unmarshal([]byte(body), &resp); err != nil || status != http.StatusOK {
+		t.Fatalf("collected: %d %s (%v)", status, body, err)
+	}
+	if resp.Status != openresponses.ResponseStatusIncomplete || resp.IncompleteDetails == nil || resp.IncompleteDetails.Reason != openresponses.IncompleteReasonMaxOutputTokens {
+		t.Errorf("collected = %s %+v, want incomplete max_output_tokens", resp.Status, resp.IncompleteDetails)
+	}
+	if resp.OutputText() != "Once upon" {
+		t.Errorf("output = %q", resp.OutputText())
+	}
+}

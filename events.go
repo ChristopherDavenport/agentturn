@@ -661,6 +661,14 @@ const (
 	// which is a refusal on resume, nor [StopGuard]: nothing is
 	// withheld and no error is set.
 	StopContentFilter StopCause = "content_filter"
+	// StopMaxOutputTokens: the model's last response, which made no
+	// calls and would have ended the run done, ended incomplete at its
+	// output limit (max_output_tokens), or incomplete naming no reason.
+	// Its text is still the answer, and Answer returns it; the cause
+	// and RunEnd.Incomplete, the response's incomplete_details, are how
+	// a caller tells that the answer was cut short. A response cut with
+	// calls is not this stop: its calls run and the run goes on.
+	StopMaxOutputTokens StopCause = "max_output_tokens"
 )
 
 // RunEnd closes a run. Exactly one is emitted per run and nothing

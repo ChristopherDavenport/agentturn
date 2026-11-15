@@ -147,3 +147,90 @@ func TestContentFilterStops(t *testing.T) {
 		})
 	}
 }
+
+// cutOff answers its first request with a call when call is set, then
+// a message cut at the output limit, its details dropped when bare;
+// every later request is answered with a message that completes.
+type cutOff struct {
+	call, bare bool
+	calls      int
+}
+
+func (m *cutOff) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	m.calls++
+	if m.bare {
+		next := sink
+		sink = openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+			if e, ok := ev.(*openresponses.ResponseIncompleteEvent); ok {
+				e.Response.IncompleteDetails = nil
+			}
+			return next.Send(ev)
+		})
+	}
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	if m.calls == 1 && m.call {
+		fc, err := em.FunctionCall("c1", "upper")
+		if err != nil {
+			return err
+		}
+		if err := fc.Arguments(`{"text":"x"}`); err != nil {
+			return err
+		}
+		if err := fc.Close(); err != nil {
+			return err
+		}
+	}
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text(fmt.Sprintf("Once upon %d", m.calls)); err != nil {
+		return err
+	}
+	if m.calls > 1 && m.call {
+		return em.Complete()
+	}
+	return em.Incomplete(openresponses.IncompleteReasonMaxOutputTokens)
+}
+
+// TestOutputLimitStops pins the decision on #314's max_output_tokens
+// case: a final answer cut at the output limit ends the run stopped
+// with StopMaxOutputTokens and the response's details, its text still
+// the answer; one whose details name no reason reads the same; a
+// response cut after a call runs the call and goes on.
+func TestOutputLimitStops(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		model  *cutOff
+		reason Reason
+		cause  StopCause
+		answer string
+	}{
+		{"an answer", &cutOff{}, ReasonStopped, StopMaxOutputTokens, "Once upon 1"},
+		{"an answer, no details", &cutOff{bare: true}, ReasonStopped, StopMaxOutputTokens, "Once upon 1"},
+		{"a call, then an answer", &cutOff{call: true}, ReasonDone, "", "Once upon 2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tool := agenttool.New("upper", "", func(context.Context, struct {
+				Text string `json:"text"`
+			}) (string, error) {
+				return "X", nil
+			})
+			a := New(Config{Model: tc.model, Tools: []agenttool.Tool{tool}})
+			end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if end.Reason != tc.reason || end.Cause != tc.cause || end.Err != nil {
+				t.Fatalf("end = %s %q %v", end.Reason, end.Cause, end.Err)
+			}
+			if text, ok := end.Answer(); !ok || text != tc.answer {
+				t.Errorf("answer = %q, %v, want %q", text, ok, tc.answer)
+			}
+			cut := tc.cause == StopMaxOutputTokens
+			if got := end.Incomplete != nil; got != cut || cut && end.Incomplete.Reason != openresponses.IncompleteReasonMaxOutputTokens {
+				t.Errorf("incomplete = %+v", end.Incomplete)
+			}
+		})
+	}
+}

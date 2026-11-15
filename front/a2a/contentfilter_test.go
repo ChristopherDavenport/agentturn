@@ -76,3 +76,36 @@ func TestContentFilterStopRejectsTask(t *testing.T) {
 		})
 	}
 }
+
+// cutShort answers with a message cut at the output limit.
+type cutShort struct{}
+
+func (cutShort) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
+	w, err := em.Message(openresponses.PhaseFinalAnswer)
+	if err != nil {
+		return err
+	}
+	if err := w.Text("Once upon"); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return em.Incomplete(openresponses.IncompleteReasonMaxOutputTokens)
+}
+
+// TestACutAnswerCompletesMarked pins #314's max_output_tokens decision
+// here: the task completes with the cut text, which is the agent's
+// answer, and its status message says it was cut under MetaIncomplete,
+// the response's incomplete_details.
+func TestACutAnswerCompletesMarked(t *testing.T) {
+	task := sendTask(t, a2asrv.NewHandler(New(agentturn.Config{Model: cutShort{}, ModelName: "m"})), userMessage("write at length"))
+	if task.Status.State != a2a.TaskStateCompleted || task.Status.Message == nil || partsText(task.Status.Message.Parts) != "Once upon" {
+		t.Fatalf("task = %s %q, want completed with the cut text", task.Status.State, taskText(task))
+	}
+	meta, ok := task.Status.Message.Metadata[MetaIncomplete].(map[string]any)
+	if !ok || meta["reason"] != "max_output_tokens" {
+		t.Errorf("status metadata = %v, want %s with the reason", task.Status.Message.Metadata, MetaIncomplete)
+	}
+}

@@ -17,10 +17,20 @@ versions may break the API.
   every `tool_use`. No `turn_end` follows its `response_end`, items
   steered in during the turn stay queued, and `RunEnd.Answer` reports
   none. v0.0.39 ran the calls and called the model again, or ended
-  `done` with the text beside the refusal as the answer. A response
-  ended at `max_output_tokens` is unchanged: its calls run, and with
-  none the run ends `done`. RFC 0001 draft 0.9, The turn, phase 7.
-  (#314)
+  `done` with the text beside the refusal as the answer. RFC 0001
+  draft 0.9, The turn, phase 7. (#314)
+- Changed (breaking for a host that reads only `ReasonDone` as an
+  answer): a final answer the provider ended `incomplete` at its output
+  limit (`max_output_tokens`), or incomplete naming no reason, ends the
+  run `ReasonStopped` with the new `StopMaxOutputTokens`, its details
+  on `RunEnd.Incomplete`. `RunEnd.Answer` still returns the cut text;
+  the cause and `Incomplete` say it was cut. v0.0.39 ended it `done`,
+  and nothing on the end said so. A response cut after calls runs them
+  as before. `front/responses` ends the caller's response incomplete
+  with reason `max_output_tokens` and the text; `front/a2a` completes
+  the task with the text and the details under the new
+  `MetaIncomplete` on its status message, A2A having no state for a
+  partial answer. RFC 0001 draft 0.9, The turn, phase 14. (#314)
 - Added: `RunEnd.Incomplete`, the refused response's
   `incomplete_details` as the provider gave them, `Extra` members such
   as `anthropic.refusal_category` included, and `RunEnd.Refusal`, the
@@ -38,15 +48,14 @@ versions may break the API.
 - Changed (breaking for a reader of the record): `session.Recorder`
   writes a run whose last response ended `incomplete` as `aborted`, as
   agentsession's cascade reads its segment: a content filter's stop,
-  or any other stop after such a response, with the cause as `ref`, and
-  a final answer cut at `max_output_tokens`, which the loop ends
-  `done`, with `max_output_tokens` as `ref`. v0.0.39 wrote `done` or
+  an answer cut at the output limit, or any other stop after a
+  response so cut, with the cause as `ref`. v0.0.39 wrote `done` or
   `stopped`, which `agentsession.Run.Verify` refuses. The outputs
   closing a refused response's calls are written as the policy's
   rejects, as a withheld response's are. A recorded child run read
   back for a call that runs again reads `aborted` `content_filter` as
   the content filter's stop and `aborted` `max_output_tokens` as the
-  `done` run it was. RFC 0001 draft 0.9, The record. (#314)
+  output limit's stop, its answer standing. RFC 0001 draft 0.9, The record. (#314)
 - Dependencies: every module requires openresponses v0.0.20, up from
   v0.0.19: its adapters refuse an input that would end on an assistant
   turn their provider continues as a prefix, and never send an input

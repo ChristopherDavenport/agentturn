@@ -4874,10 +4874,11 @@ func recordedEnd(run *agentsession.Run, items openresponses.Items) *agentturn.Ru
 		return end
 	}
 	switch {
-	case run.End.Reason == agentsession.ReasonAborted && run.End.Ref == string(openresponses.IncompleteReasonMaxOutputTokens):
-		// An answer cut at the output limit, which the loop ended done
-		// and the format reads as aborted (#314): the answer stands.
-		end.Reason = agentturn.ReasonDone
+	case run.End.Reason == agentsession.ReasonAborted && run.End.Ref == string(agentturn.StopMaxOutputTokens):
+		// An answer cut at the output limit, which the format reads as
+		// aborted (#314): the stop it was, and the answer stands.
+		end.Reason = agentturn.ReasonStopped
+		end.Cause = agentturn.StopMaxOutputTokens
 	case run.End.Reason == agentsession.ReasonAborted && run.End.Ref == string(agentturn.StopContentFilter):
 		// The provider's content filter stopped the run, which is no
 		// answer (#314).
@@ -7573,10 +7574,10 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 	switch e.Reason {
 	case agentturn.ReasonDone:
 		if w.incomplete != "" {
-			// The model's last word was cut short at its output limit:
-			// the loop ends the run done, and the format reads a run
-			// whose last response is incomplete as aborted, so the
-			// response's reason says why (#314).
+			// The last response ended incomplete for a reason the loop
+			// does not stop on, which the format reads as aborted, so
+			// the response's reason says why (#314). An answer cut at
+			// the output limit is a stop of its own, below.
 			return agentsession.ReasonAborted, string(w.incomplete)
 		}
 		return agentsession.ReasonDone, ""
