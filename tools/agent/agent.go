@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,6 +65,14 @@ type ChildInfo struct {
 	// host that wants to answer them appends their outputs to Items and
 	// continues the child with agentturn.Continue.
 	Pending []agentturn.PendingCall
+	// Incomplete and Refusal are the child's RunEnd.Incomplete and
+	// RunEnd.Refusal: the incomplete_details, extension members
+	// included, of the response a content filter
+	// (agentturn.StopContentFilter) or the output limit
+	// (agentturn.StopMaxOutputTokens) stopped the child on, and a
+	// content filter's refusal text.
+	Incomplete *openresponses.IncompleteDetails
+	Refusal    string
 }
 
 // InputRequiredError is returned when the child run stopped on calls
@@ -299,8 +308,17 @@ func WithToolName(name string) Option {
 // cause, so the model knows the child did not answer rather than
 // reading an empty output as one; a child stopped by a terminating
 // tool result is the exception, whose last output stands as the
-// answer, since the tool answered on the model's behalf. A child a
-// guard stopped (agentturn.StopGuard) without an answer is not asked
+// answer, since the tool answered on the model's behalf. A child the
+// model's provider refused with its content filter
+// (agentturn.StopContentFilter) is asked about here too, with
+// ChildInfo.Incomplete and ChildInfo.Refusal set; the default fails the
+// call with an error the parent's model reads as `agent "x" was refused
+// by its model's provider (content_filter, <each extension member of
+// the details, such as anthropic.refusal_category: cyber>): <the
+// refusal text>`. A child whose answer the output limit cut short
+// (agentturn.StopMaxOutputTokens) answered, and is not asked about:
+// its cut text is the call's output, and ChildInfo.Incomplete says it
+// was cut. A child a guard stopped (agentturn.StopGuard) without an answer is not asked
 // about here, whichever hook the guard is on, ShouldStopAfterTurn
 // included, nor one whose OutputGuard withheld a message after a
 // message of the same response it let through
@@ -989,7 +1007,8 @@ func restoredAnswers(rec *Record, ask bool) ([]agentturn.Answer, []agentturn.Pen
 // result is the call's result for the child's run end, items being
 // what the call's runs appended.
 func (a *agentTool) result(end *agentturn.RunEnd, items agentturn.Transcript) (agenttool.Result, error) {
-	info := ChildInfo{Agent: a.cfg.Name, RunID: end.RunID, Items: items, Reason: end.Reason, Cause: end.Cause, Pending: end.Pending}
+	info := ChildInfo{Agent: a.cfg.Name, RunID: end.RunID, Items: items, Reason: end.Reason, Cause: end.Cause, Pending: end.Pending,
+		Incomplete: end.Incomplete, Refusal: end.Refusal}
 	switch end.Reason {
 	case agentturn.ReasonInputRequired:
 		return agenttool.Result{Details: info}, &InputRequiredError{Agent: a.cfg.Name, RunID: end.RunID, Pending: end.Pending}
@@ -1135,10 +1154,38 @@ func defaultNoAnswer(info ChildInfo) (agenttool.Result, error) {
 	if info.Agent != "" {
 		name = fmt.Sprintf("agent %q", info.Agent)
 	}
+	if info.Reason == agentturn.ReasonStopped && info.Cause == agentturn.StopContentFilter {
+		return agenttool.Result{}, errors.New(refusedText(name, info))
+	}
 	if info.Cause != "" {
 		return agenttool.Result{}, fmt.Errorf("%s stopped (%s) without a final answer", name, info.Cause)
 	}
 	return agenttool.Result{}, errors.New(name + " finished without a final answer")
+}
+
+// refusedText is what the parent's model reads for a child the
+// provider's content filter stopped: who refused, the cause and the
+// members the provider added to its details, such as
+// anthropic.refusal_category, in name order, and the refusal text when
+// there is one (#314).
+func refusedText(name string, info ChildInfo) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s was refused by its model's provider (%s", name, info.Cause)
+	if info.Incomplete != nil {
+		keys := make([]string, 0, len(info.Incomplete.Extra))
+		for k := range info.Incomplete.Extra {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		for _, k := range keys {
+			fmt.Fprintf(&b, ", %s: %v", k, info.Incomplete.Extra[k])
+		}
+	}
+	b.WriteString(")")
+	if info.Refusal != "" {
+		b.WriteString(": " + info.Refusal)
+	}
+	return b.String()
 }
 
 // lastOutputText returns the text of the last function call output.

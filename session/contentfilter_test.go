@@ -222,3 +222,33 @@ func TestATerminateAfterACutReadsBackAsTheStop(t *testing.T) {
 		t.Fatalf("read back = %+v", back)
 	}
 }
+
+// TestRecordedEndKeepsTheRefusal pins #314 on the record: a content
+// filter's stop read back for a call that runs again carries the
+// response's details, the provider's category included, and the
+// refusal text, as the live end did.
+func TestRecordedEndKeepsTheRefusal(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: &cutShort{call: true, reason: openresponses.IncompleteReasonContentFilter, category: "cyber"}, ModelName: "m", Tools: []agenttool.Tool{upper}})
+	defer rec.Attach(a)()
+	live, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if err != nil || live.Cause != agentturn.StopContentFilter {
+		t.Fatalf("end = %+v err=%v", live, err)
+	}
+	runs := runsOf(t, s)
+	items, err := runItems(s, runs[0], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back := recordedEnd(runs[0], items)
+	if back == nil || back.Cause != agentturn.StopContentFilter || back.Refusal != live.Refusal || back.Refusal == "" {
+		t.Fatalf("read back = %+v, want refusal %q", back, live.Refusal)
+	}
+	if back.Incomplete == nil || back.Incomplete.Reason != openresponses.IncompleteReasonContentFilter || back.Incomplete.Extra["anthropic.refusal_category"] != "cyber" {
+		t.Errorf("read back incomplete = %+v", back.Incomplete)
+	}
+}

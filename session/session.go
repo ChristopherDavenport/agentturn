@@ -460,6 +460,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -4885,6 +4886,12 @@ func recordedEnd(run *agentsession.Run, items openresponses.Items) *agentturn.Ru
 		// with its error, stays the failure it reads as.
 		end.Reason = agentturn.ReasonStopped
 		end.Cause = stoppedCause(run.End.Ref)
+		if end.Cause == agentturn.StopContentFilter || end.Cause == agentturn.StopMaxOutputTokens {
+			end.Incomplete, end.Refusal = lastIncomplete(run)
+			if end.Cause != agentturn.StopContentFilter {
+				end.Refusal = ""
+			}
+		}
 	case run.End.Reason == agentsession.ReasonDone:
 		end.Reason = agentturn.ReasonDone
 	case run.End.Reason == agentsession.ReasonStopped:
@@ -4896,6 +4903,39 @@ func recordedEnd(run *agentsession.Run, items openresponses.Items) *agentturn.Ru
 		end.Err = fmt.Errorf("its run %s ended %s on the record: %s", run.RunID(), run.End.Reason, run.End.Ref)
 	}
 	return end
+}
+
+// lastIncomplete is what the end of run carried live, read from its
+// segment: the incomplete_details of its last response, extension
+// members included, and the text of the refusal parts of that
+// response's assistant messages, joined as the loop joins them.
+func lastIncomplete(run *agentsession.Run) (*openresponses.IncompleteDetails, string) {
+	var last *agentsession.ResponseEntry
+	for _, e := range run.Segment {
+		if r, ok := e.(*agentsession.ResponseEntry); ok {
+			last = r
+		}
+	}
+	if last == nil || last.Incomplete == nil {
+		return nil, ""
+	}
+	details := *last.Incomplete
+	details.Extra = maps.Clone(last.Incomplete.Extra)
+	var parts []string
+	for _, e := range run.Segment {
+		ie, ok := e.(*agentsession.ItemEntry)
+		if !ok || ie.ResponseID == "" || ie.ResponseID != last.ResponseID {
+			continue
+		}
+		if m, ok := ie.Item.(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant {
+			for _, part := range m.Content {
+				if p, ok := part.(*openresponses.Refusal); ok && p.Refusal != "" {
+					parts = append(parts, p.Refusal)
+				}
+			}
+		}
+	}
+	return &details, strings.Join(parts, "\n")
 }
 
 // stoppedCause is the stop a run end written aborted with ref names,
