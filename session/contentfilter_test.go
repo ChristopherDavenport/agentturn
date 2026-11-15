@@ -163,9 +163,19 @@ func TestRecordedEndReadsAnIncompleteEnd(t *testing.T) {
 	}{
 		{"content_filter", agentturn.ReasonStopped, agentturn.StopContentFilter, false},
 		{"max_output_tokens", agentturn.ReasonStopped, agentturn.StopMaxOutputTokens, true},
+		// Every other stop after a response cut at the output limit is
+		// written aborted with its cause, and reads back as that stop.
+		{"terminate", agentturn.ReasonStopped, agentturn.StopTerminate, true},
+		{"partial_terminate", agentturn.ReasonStopped, agentturn.StopPartialTerminate, true},
+		{"max_turns", agentturn.ReasonStopped, agentturn.StopMaxTurns, true},
+		{"hook", agentturn.ReasonStopped, agentturn.StopHook, true},
+		{"refused", agentturn.ReasonStopped, agentturn.StopRefused, true},
+		// The ref of a response ended incomplete naming no reason.
+		{"incomplete", agentturn.ReasonStopped, agentturn.StopMaxOutputTokens, true},
 		// A guard's stop still reads as the failed run it read as
 		// before; Answer reads the items alone.
 		{"guard: rule", agentturn.ReasonError, "", true},
+		{"no such cause", agentturn.ReasonError, "", true},
 	} {
 		t.Run(tc.ref, func(t *testing.T) {
 			run := &agentsession.Run{Start: agentsession.NewRunStart("run_1", "input", ""), End: agentsession.NewRunEnd("run_1", agentsession.ReasonAborted, tc.ref, nil)}
@@ -177,5 +187,38 @@ func TestRecordedEndReadsAnIncompleteEnd(t *testing.T) {
 				t.Errorf("answer = %v, want %v", ok, tc.answer)
 			}
 		})
+	}
+}
+
+// TestATerminateAfterACutReadsBackAsTheStop is the review's case for
+// #314: a child whose response called a terminating tool and was then
+// cut at the output limit stops with cause terminate, which is written
+// aborted; read back for a call that runs again, it is the terminate
+// stop it was, not an error, so the tool's output is still the child's
+// answer.
+func TestATerminateAfterACutReadsBackAsTheStop(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: &cutShort{call: true, reason: openresponses.IncompleteReasonMaxOutputTokens}, ModelName: "m",
+		Tools: []agenttool.Tool{terminatingTool{upper}}})
+	defer rec.Attach(a)()
+	end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if err != nil || end.Reason != agentturn.ReasonStopped || end.Cause != agentturn.StopTerminate {
+		t.Fatalf("end = %+v err=%v", end, err)
+	}
+	runs := runsOf(t, s)
+	if len(runs) != 1 || runs[0].End == nil || runs[0].End.Reason != agentsession.ReasonAborted || runs[0].End.Ref != "terminate" {
+		t.Fatalf("run end = %+v", runs[0].End)
+	}
+	items, err := runItems(s, runs[0], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back := recordedEnd(runs[0], items)
+	if back == nil || back.Reason != agentturn.ReasonStopped || back.Cause != agentturn.StopTerminate || back.Err != nil {
+		t.Fatalf("read back = %+v", back)
 	}
 }

@@ -53,9 +53,13 @@ versions may break the API.
   `stopped`, which `agentsession.Run.Verify` refuses. The outputs
   closing a refused response's calls are written as the policy's
   rejects, as a withheld response's are. A recorded child run read
-  back for a call that runs again reads `aborted` `content_filter` as
-  the content filter's stop and `aborted` `max_output_tokens` as the
-  output limit's stop, its answer standing. RFC 0001 draft 0.9, The record. (#314)
+  back for a call that runs again reads an `aborted` end whose ref
+  names a stop cause other than a guard's as that stop, so a
+  terminating tool's output after a cut response is still the child's
+  answer and a host's `WithNoAnswer` is still asked; ref `incomplete`
+  reads as `max_output_tokens`. This also reads such an end that an
+  earlier release wrote for a run with no response of its own as the
+  stop, where it read as a failure. RFC 0001 draft 0.9, The record. (#314)
 - Dependencies: every module requires openresponses v0.0.20, up from
   v0.0.19: its adapters refuse an input that would end on an assistant
   turn their provider continues as a prefix, and never send an input

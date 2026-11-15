@@ -4874,16 +4874,17 @@ func recordedEnd(run *agentsession.Run, items openresponses.Items) *agentturn.Ru
 		return end
 	}
 	switch {
-	case run.End.Reason == agentsession.ReasonAborted && run.End.Ref == string(agentturn.StopMaxOutputTokens):
-		// An answer cut at the output limit, which the format reads as
-		// aborted (#314): the stop it was, and the answer stands.
+	case run.End.Reason == agentsession.ReasonAborted && stoppedCause(run.End.Ref) != "":
+		// A stop after a last response that ended incomplete, which
+		// the format reads as aborted with the cause as ref (#314): a
+		// content filter's, an answer cut at the output limit, or a
+		// terminating result, the turn limit or the stop hook after a
+		// response so cut. It reads back as the stop it was, so a
+		// terminating tool's output is still the answer and a host's
+		// no-answer function is still asked. A guard's stop, written
+		// with its error, stays the failure it reads as.
 		end.Reason = agentturn.ReasonStopped
-		end.Cause = agentturn.StopMaxOutputTokens
-	case run.End.Reason == agentsession.ReasonAborted && run.End.Ref == string(agentturn.StopContentFilter):
-		// The provider's content filter stopped the run, which is no
-		// answer (#314).
-		end.Reason = agentturn.ReasonStopped
-		end.Cause = agentturn.StopContentFilter
+		end.Cause = stoppedCause(run.End.Ref)
 	case run.End.Reason == agentsession.ReasonDone:
 		end.Reason = agentturn.ReasonDone
 	case run.End.Reason == agentsession.ReasonStopped:
@@ -4895,6 +4896,22 @@ func recordedEnd(run *agentsession.Run, items openresponses.Items) *agentturn.Ru
 		end.Err = fmt.Errorf("its run %s ended %s on the record: %s", run.RunID(), run.End.Reason, run.End.Ref)
 	}
 	return end
+}
+
+// stoppedCause is the stop a run end written aborted with ref names,
+// the cause before any ":", for every cause but a guard's; ref
+// "incomplete", a response that ended incomplete naming no reason,
+// reads as the output limit's. It is empty for anything else.
+func stoppedCause(ref string) agentturn.StopCause {
+	cause, _, _ := strings.Cut(ref, ":")
+	switch c := agentturn.StopCause(cause); c {
+	case agentturn.StopMaxTurns, agentturn.StopHook, agentturn.StopTerminate, agentturn.StopPartialTerminate,
+		agentturn.StopRefused, agentturn.StopContentFilter, agentturn.StopMaxOutputTokens:
+		return c
+	case "incomplete":
+		return agentturn.StopMaxOutputTokens
+	}
+	return ""
 }
 
 // StartChild records a child agent the host starts itself, not
