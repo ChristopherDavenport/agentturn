@@ -5,6 +5,15 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Dependencies: every module requires openresponses v0.0.20, up from
+  v0.0.19: its adapters refuse an input that would end on an assistant
+  turn their provider continues as a prefix, and never send an input
+  their provider reads with another meaning (openresponses
+  docs/extensions.md section 1.8). Nothing here broke: the loop and its
+  tests use no provider adapter.
+
 ## v0.0.39 - 2026-11-06
 
 - Changed: an abort that arrives after a delivery, `Deliver` or
