@@ -2,6 +2,7 @@ package a2a
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/ChristopherDavenport/agenttool"
@@ -49,15 +50,19 @@ func (m filtered) CreateStream(_ context.Context, req openresponses.Request, sin
 // TestContentFilterStopRejectsTask pins #314: a run the provider's
 // content filter stopped rejects the task with FilteredText, as a
 // guard's stop does with RefusedText, rather than completing it with
-// the text before the refusal, and the agent runs none of the refused
-// response's calls.
+// the text before the refusal, the agent runs none of the refused
+// response's calls, and the refusal text is in the task's artifacts,
+// with or without an OutputGuard.
 func TestContentFilterStopRejectsTask(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		call bool
+		name  string
+		call  bool
+		guard bool
 	}{
-		{"a message", false},
-		{"a call and a message", true},
+		{"a message", false, false},
+		{"a call and a message", true, false},
+		// Under an OutputGuard a message's artifact is written whole.
+		{"a message, an output guard", false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ran := 0
@@ -66,12 +71,22 @@ func TestContentFilterStopRejectsTask(t *testing.T) {
 				return "open", nil
 			})
 			cfg := agentturn.Config{Model: filtered{call: tc.call}, ModelName: "m", Tools: []agenttool.Tool{probe}}
+			if tc.guard {
+				cfg.OutputGuard = func(context.Context, agentturn.OutputInfo) (*openresponses.Message, error) { return nil, nil }
+			}
 			task := sendTask(t, a2asrv.NewHandler(New(cfg)), userMessage("probe a"))
 			if task.Status.State != a2a.TaskStateRejected || task.Status.Message == nil || partsText(task.Status.Message.Parts) != FilteredText {
 				t.Errorf("task = %s %q, want rejected %q", task.Status.State, taskText(task), FilteredText)
 			}
 			if ran != 0 {
 				t.Errorf("the agent's tool ran %d times", ran)
+			}
+			var artifacts strings.Builder
+			for _, a := range task.Artifacts {
+				artifacts.WriteString(partsText(a.Parts))
+			}
+			if !strings.Contains(artifacts.String(), "I can't help with that.") {
+				t.Errorf("artifacts = %q, want the refusal text the caller reads", artifacts.String())
 			}
 		})
 	}

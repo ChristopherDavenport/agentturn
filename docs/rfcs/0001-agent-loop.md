@@ -390,7 +390,9 @@ it raises and the hooks it calls; the events are defined
    `incomplete_details` as the provider gave them, members this
    document does not define included, such as an adapter's
    `anthropic.refusal_category`, and the text of the refusal parts of
-   its assistant messages; it is no answer, whatever text the response
+   its assistant messages as the transcript kept them, an output
+   guard's replacement in place of the message it replaced; it is no
+   answer, whatever text the response
    spoke beside the refusal. No error is set and nothing is withheld:
    the response is the server's, carried by `response_end` as it
    arrived. Nothing below runs, so the turn has no `turn_end`, and the

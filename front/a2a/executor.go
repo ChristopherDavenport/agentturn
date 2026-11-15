@@ -70,9 +70,10 @@ const RefusedText = "the agent's guard refused this request"
 
 // FilteredText is the status message of a task whose run the model's
 // provider stopped with its content filter
-// (agentturn.StopContentFilter). It is fixed: the provider's refusal
-// text and category stay with the host, on the run's end and in the
-// record.
+// (agentturn.StopContentFilter). It is fixed. The refusal text the
+// model gave is in the task's artifacts, as any text of a message is,
+// so the caller reads why; the provider's category stays with the
+// host, on the run's end and in the record.
 const FilteredText = "the model's provider refused this request"
 
 var _ a2asrv.AgentExecutor = (*Executor)(nil)

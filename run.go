@@ -642,6 +642,10 @@ func (c Config) baseRequest(tools agenttool.Set) openresponses.Request {
 // error to abort the run; steer and followUp drain the queues when set,
 // each item with how it was queued and the trigger it was queued with.
 type runner struct {
+	// output is where the items the turn's response added start in the
+	// transcript, as kept: an OutputGuard's replacement in place of the
+	// message it replaced.
+	output     int
 	cfg        Config
 	transcript Transcript
 	send       func(Event) error
@@ -1489,7 +1493,7 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 			if err := r.closeCalls(made, RefusedCallOutput); err != nil {
 				return err
 			}
-			return &errStop{reason: ReasonStopped, cause: StopContentFilter, incomplete: cloneDetails(resp.IncompleteDetails), refusal: refusalText(resp)}
+			return &errStop{reason: ReasonStopped, cause: StopContentFilter, incomplete: cloneDetails(resp.IncompleteDetails), refusal: refusalText(r.transcript[r.output:])}
 		}
 		results, pending, err := r.toolBatch(ctx, tools, calls)
 		if err != nil {
@@ -1869,6 +1873,7 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 		return nil, err
 	}
 	start := len(r.transcript)
+	r.output = start
 	// call numbers the calls made, as model_retry reports them; attempt
 	// numbers the ones the retry policy counts, which a fold after a
 	// context-length refusal is not (#277). revised says the policy's
@@ -2048,11 +2053,13 @@ func cloneDetails(d *openresponses.IncompleteDetails) *openresponses.IncompleteD
 	return &c
 }
 
-// refusalText joins the refusal parts of resp's assistant messages, in
-// order, a line each.
-func refusalText(resp *openresponses.Response) string {
+// refusalText joins the refusal parts of the assistant messages among
+// items, the transcript's items of a response, in order, a line each:
+// what the transcript kept, so an OutputGuard's replacement stands in
+// for the message it replaced, as it does for the answer.
+func refusalText(items Transcript) string {
 	var parts []string
-	for _, item := range resp.Output {
+	for _, item := range items {
 		m, ok := item.(*openresponses.Message)
 		if !ok || m.Role != openresponses.RoleAssistant {
 			continue

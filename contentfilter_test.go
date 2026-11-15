@@ -234,3 +234,32 @@ func TestOutputLimitStops(t *testing.T) {
 		})
 	}
 }
+
+// TestContentFilterRefusalIsWhatWasKept pins #314's RunEnd.Refusal under
+// an OutputGuard: it is the refusal of the messages the transcript
+// kept, the guard's replacement where it made one, as Answer reads the
+// replacement, never the text the guard replaced.
+func TestContentFilterRefusalIsWhatWasKept(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		replacement *openresponses.Message
+		want        string
+	}{
+		{"kept", nil, "I can't help with that."},
+		{"replaced with text", openresponses.AssistantText("[withheld]"), ""},
+		{"replaced with a refusal", &openresponses.Message{Role: openresponses.RoleAssistant, Content: openresponses.Contents{&openresponses.Refusal{Refusal: "[redacted]"}}}, "[redacted]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New(Config{Model: &filtering{}, OutputGuard: func(context.Context, OutputInfo) (*openresponses.Message, error) {
+				return tc.replacement, nil
+			}})
+			end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+			if err != nil || end.Cause != StopContentFilter {
+				t.Fatalf("end = %+v err = %v", end, err)
+			}
+			if end.Refusal != tc.want {
+				t.Errorf("refusal = %q, want %q", end.Refusal, tc.want)
+			}
+		})
+	}
+}

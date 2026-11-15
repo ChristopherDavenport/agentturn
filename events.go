@@ -737,8 +737,11 @@ type RunEnd struct {
 	// other end.
 	Incomplete *openresponses.IncompleteDetails
 	// Refusal is the text of the refusal parts of that response's
-	// assistant messages, in order, joined by newlines, and empty when
-	// the provider sent none or the run ended otherwise.
+	// assistant messages as the transcript kept them, in order, joined
+	// by newlines: an OutputGuard's replacement stands in for the
+	// message it replaced, as it does for Answer. It is empty when the
+	// provider sent none, the guard replaced it with none, or the run
+	// ended otherwise.
 	Refusal string
 }
 

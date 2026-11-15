@@ -23,7 +23,9 @@
 // record. A run the model's provider stopped with its content filter
 // (agentturn.StopContentFilter) is refused the same way, with
 // [FilteredText] as the status message; the agent ran none of the
-// refused response's calls. A run whose answer the model's output limit
+// refused response's calls. Unlike a guard's error, the model's refusal
+// text is the caller's to read: it is in the task's artifacts with the
+// rest of the message, with or without an OutputGuard. A run whose answer the model's output limit
 // cut short (agentturn.StopMaxOutputTokens) completes the task with the
 // cut text, which is the agent's answer, and its status message carries
 // [MetaIncomplete], the response's incomplete_details: A2A has no state

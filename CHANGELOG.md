@@ -34,7 +34,8 @@ versions may break the API.
 - Added: `RunEnd.Incomplete`, the refused response's
   `incomplete_details` as the provider gave them, `Extra` members such
   as `anthropic.refusal_category` included, and `RunEnd.Refusal`, the
-  text of its refusal parts. `front/control` carries both on `run_end`
+  text of its refusal parts as the transcript kept them, an
+  OutputGuard's replacement in place of the message it replaced. `front/control` carries both on `run_end`
   as `incomplete` and `refusal`. (#314)
 - Changed: `front/responses` ends a full run's response incomplete with
   the refused response's details whole, extension members included, and
@@ -55,7 +56,9 @@ versions may break the API.
   it was cut. (#314)
 - Added: `front/a2a` rejects the task of a run a content filter
   stopped, with the new `FilteredText` as its status message, as it
-  rejects a guard's stop with `RefusedText`. (#314)
+  rejects a guard's stop with `RefusedText`. The model's refusal text
+  stays in the task's artifacts, with or without an OutputGuard, so
+  the caller reads why. (#314)
 - Changed (breaking for a reader of the record): `session.Recorder`
   writes a run whose last response ended `incomplete` as `aborted`, as
   agentsession's cascade reads its segment: a content filter's stop,
