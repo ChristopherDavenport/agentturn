@@ -30,7 +30,8 @@ versions may break the API.
   with reason `max_output_tokens` and the text; `front/a2a` completes
   the task with the text and the details under the new
   `MetaIncomplete` on its status message, A2A having no state for a
-  partial answer. RFC 0001 draft 0.9, The turn, phase 14. (#314)
+  partial answer; a status message with no text carries it when the
+  limit came before any. RFC 0001 draft 0.9, The turn, phase 14. (#314)
 - Added: `RunEnd.Incomplete`, the refused response's
   `incomplete_details` as the provider gave them, `Extra` members such
   as `anthropic.refusal_category` included, and `RunEnd.Refusal`, the

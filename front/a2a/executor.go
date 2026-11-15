@@ -947,13 +947,17 @@ func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, 
 		var msg *a2a.Message
 		if text != "" {
 			msg = a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: text})
-			if out.end.Cause == agentturn.StopMaxOutputTokens && out.end.Incomplete != nil {
-				// The answer was cut at the model's output limit. It is
-				// still the agent's answer, so the task completes, and
-				// the status message says it was cut (#314).
-				if details, err := detailsMeta(out.end.Incomplete); err == nil {
-					msg.SetMeta(MetaIncomplete, details)
+		}
+		if out.end.Cause == agentturn.StopMaxOutputTokens && out.end.Incomplete != nil {
+			// The answer was cut at the model's output limit. It is
+			// still the agent's answer, so the task completes, and the
+			// status message says it was cut, one with no text when the
+			// limit came before any (#314).
+			if details, err := detailsMeta(out.end.Incomplete); err == nil {
+				if msg == nil {
+					msg = a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx)
 				}
+				msg.SetMeta(MetaIncomplete, details)
 			}
 		}
 		return e.finish(ctx, reqCtx, q, a2a.TaskStateCompleted, msg)

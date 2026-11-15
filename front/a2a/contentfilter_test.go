@@ -92,14 +92,21 @@ func TestContentFilterStopRejectsTask(t *testing.T) {
 	}
 }
 
-// cutShort answers with a message cut at the output limit.
-type cutShort struct{}
+// cutShort answers with a message cut at the output limit, holding no
+// text when empty.
+type cutShort struct{ empty bool }
 
-func (cutShort) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
+func (m cutShort) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
 	em := openresponses.NewEmitter(sink, openresponses.NewResponse(req))
 	w, err := em.Message(openresponses.PhaseFinalAnswer)
 	if err != nil {
 		return err
+	}
+	if m.empty {
+		if err := w.Close(); err != nil {
+			return err
+		}
+		return em.Incomplete(openresponses.IncompleteReasonMaxOutputTokens)
 	}
 	if err := w.Text("Once upon"); err != nil {
 		return err
@@ -118,6 +125,20 @@ func TestACutAnswerCompletesMarked(t *testing.T) {
 	task := sendTask(t, a2asrv.NewHandler(New(agentturn.Config{Model: cutShort{}, ModelName: "m"})), userMessage("write at length"))
 	if task.Status.State != a2a.TaskStateCompleted || task.Status.Message == nil || partsText(task.Status.Message.Parts) != "Once upon" {
 		t.Fatalf("task = %s %q, want completed with the cut text", task.Status.State, taskText(task))
+	}
+	meta, ok := task.Status.Message.Metadata[MetaIncomplete].(map[string]any)
+	if !ok || meta["reason"] != "max_output_tokens" {
+		t.Errorf("status metadata = %v, want %s with the reason", task.Status.Message.Metadata, MetaIncomplete)
+	}
+}
+
+// TestACutAnswerWithNoTextIsMarked pins that a task whose answer the
+// output limit cut before any text still says it was cut: its status
+// message carries MetaIncomplete and no text.
+func TestACutAnswerWithNoTextIsMarked(t *testing.T) {
+	task := sendTask(t, a2asrv.NewHandler(New(agentturn.Config{Model: cutShort{empty: true}, ModelName: "m"})), userMessage("write at length"))
+	if task.Status.State != a2a.TaskStateCompleted || task.Status.Message == nil {
+		t.Fatalf("task = %s %+v, want completed with a status message", task.Status.State, task.Status.Message)
 	}
 	meta, ok := task.Status.Message.Metadata[MetaIncomplete].(map[string]any)
 	if !ok || meta["reason"] != "max_output_tokens" {

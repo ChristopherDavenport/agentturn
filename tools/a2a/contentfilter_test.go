@@ -15,6 +15,8 @@ import (
 // a refusal for content_filter, cut text for max_output_tokens.
 type endsIncomplete struct {
 	reason openresponses.IncompleteReason
+	// empty cuts the message before any text.
+	empty bool
 }
 
 func (m endsIncomplete) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
@@ -23,9 +25,11 @@ func (m endsIncomplete) CreateStream(_ context.Context, req openresponses.Reques
 	if err != nil {
 		return err
 	}
-	if m.reason == openresponses.IncompleteReasonContentFilter {
+	switch {
+	case m.empty:
+	case m.reason == openresponses.IncompleteReasonContentFilter:
 		err = w.Refusal("I can't help with that.")
-	} else {
+	default:
 		err = w.Text("Once upon")
 	}
 	if err != nil {
@@ -57,6 +61,14 @@ func TestARemoteIncompleteEndReachesTheParent(t *testing.T) {
 			const want = "Once upon\n\n[the agent's answer was cut short at its model's output limit (max_output_tokens)]"
 			if err != nil || res.Output.Text != want {
 				t.Errorf("cut: res = %q, err = %v, want %q", res.Output.Text, err, want)
+			}
+
+			empty := agentturn.Config{Model: endsIncomplete{reason: openresponses.IncompleteReasonMaxOutputTokens, empty: true}, ModelName: "remote"}
+			client, card = serve(t, fronta2a.New(empty), nil)
+			res, err = New(client, card, opts...).Execute(context.Background(), call)
+			const mark = "[the agent's answer was cut short at its model's output limit (max_output_tokens)]"
+			if err != nil || res.Output.Text != mark {
+				t.Errorf("cut before any text: res = %q, err = %v, want %q", res.Output.Text, err, mark)
 			}
 
 			filtered := agentturn.Config{Model: endsIncomplete{reason: openresponses.IncompleteReasonContentFilter}, ModelName: "remote"}
