@@ -52,8 +52,10 @@ versions may break the API.
   anthropic.refusal_category: cyber>): <refusal text>`, where v0.0.39's
   default said only that it stopped without a final answer; a host's
   `WithNoAnswer` gets both members. A child whose answer was cut at the
-  output limit answers with the cut text, `ChildInfo.Incomplete` saying
-  it was cut. (#314)
+  output limit answers with the cut text followed by the line
+  `[agent "x"'s answer was cut short at its model's output limit
+  (max_output_tokens)]`, live or answered from the record, and
+  `ChildInfo.Incomplete` says it was cut. (#314)
 - Added: `front/a2a` rejects the task of a run a content filter
   stopped, with the new `FilteredText` as its status message, as it
   rejects a guard's stop with `RefusedText`. The model's refusal text

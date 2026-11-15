@@ -68,11 +68,31 @@ func TestAChildsIncompleteEndReachesTheParent(t *testing.T) {
 
 	child = New(agentturn.Config{Name: "explore", Model: stoppedShort{reason: openresponses.IncompleteReasonMaxOutputTokens}})
 	res, err = child.Execute(context.Background(), call)
-	if err != nil || res.Output.Text != "Once upon" {
-		t.Errorf("output limit: res = %q, err = %v", res.Output.Text, err)
+	const cut = "Once upon\n\n[agent \"explore\"'s answer was cut short at its model's output limit (max_output_tokens)]"
+	if err != nil || res.Output.Text != cut {
+		t.Errorf("output limit: res = %q, err = %v, want %q", res.Output.Text, err, cut)
 	}
 	info, ok = res.Details.(ChildInfo)
 	if !ok || info.Cause != agentturn.StopMaxOutputTokens || info.Incomplete == nil || info.Incomplete.Reason != openresponses.IncompleteReasonMaxOutputTokens {
 		t.Errorf("output limit: details = %+v", res.Details)
+	}
+}
+
+// TestACutAnswerFromTheRecordIsMarked pins the same mark on a call
+// answered from the child's record after a restart: the recorded end
+// is an output limit's stop, and the parent's model reads that the
+// answer was cut, as it would have live.
+func TestACutAnswerFromTheRecordIsMarked(t *testing.T) {
+	end := &agentturn.RunEnd{RunID: "run_1", Reason: agentturn.ReasonStopped, Cause: agentturn.StopMaxOutputTokens,
+		Items:      agentturn.Transcript{openresponses.UserText("x"), openresponses.AssistantText("Once upon")},
+		Incomplete: &openresponses.IncompleteDetails{Reason: openresponses.IncompleteReasonMaxOutputTokens}}
+	child := New(agentturn.Config{Name: "explore", Model: stoppedShort{reason: openresponses.IncompleteReasonMaxOutputTokens}},
+		WithRecord(func(context.Context, agenttool.Call, agentturn.Config) (*Record, error) {
+			return &Record{End: end}, nil
+		}))
+	res, err := child.Execute(context.Background(), agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"x"}`), IdempotencyKey: "k"})
+	const cut = "Once upon\n\n[agent \"explore\"'s answer was cut short at its model's output limit (max_output_tokens)]"
+	if err != nil || res.Output.Text != cut {
+		t.Errorf("res = %q, err = %v, want %q", res.Output.Text, err, cut)
 	}
 }

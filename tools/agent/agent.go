@@ -317,8 +317,10 @@ func WithToolName(name string) Option {
 // the details, such as anthropic.refusal_category: cyber>): <the
 // refusal text>`. A child whose answer the output limit cut short
 // (agentturn.StopMaxOutputTokens) answered, and is not asked about:
-// its cut text is the call's output, and ChildInfo.Incomplete says it
-// was cut. A child a guard stopped (agentturn.StopGuard) without an answer is not asked
+// the call's output is its cut text followed by a line the parent's
+// model reads, `[agent "x"'s answer was cut short at its model's
+// output limit (max_output_tokens)]`, live or answered from the
+// record, and ChildInfo.Incomplete says it was cut. A child a guard stopped (agentturn.StopGuard) without an answer is not asked
 // about here, whichever hook the guard is on, ShouldStopAfterTurn
 // included, nor one whose OutputGuard withheld a message after a
 // message of the same response it let through
@@ -1033,6 +1035,11 @@ func (a *agentTool) result(end *agentturn.RunEnd, items agentturn.Transcript) (a
 		res.Details = info
 		return res, err
 	}
+	if end.Reason == agentturn.ReasonStopped && end.Cause == agentturn.StopMaxOutputTokens {
+		// The answer stands, cut short: the parent's model is told so,
+		// live or from the record (#314).
+		text += "\n\n" + cutNote(a.cfg.Name, end.Cause)
+	}
 	return agenttool.Result{
 		Output:  openresponses.FunctionCallOutputData{Text: text},
 		Details: info,
@@ -1161,6 +1168,16 @@ func defaultNoAnswer(info ChildInfo) (agenttool.Result, error) {
 		return agenttool.Result{}, fmt.Errorf("%s stopped (%s) without a final answer", name, info.Cause)
 	}
 	return agenttool.Result{}, errors.New(name + " finished without a final answer")
+}
+
+// cutNote is the line the parent's model reads after a child's answer
+// the output limit cut short, naming the cause as [refusedText] does.
+func cutNote(agent string, cause agentturn.StopCause) string {
+	name := "the agent"
+	if agent != "" {
+		name = fmt.Sprintf("agent %q", agent)
+	}
+	return fmt.Sprintf("[%s's answer was cut short at its model's output limit (%s)]", name, cause)
 }
 
 // refusedText is what the parent's model reads for a child the
