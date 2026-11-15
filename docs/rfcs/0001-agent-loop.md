@@ -988,7 +988,7 @@ carries none.
 
 | reason | meaning | error |
 | --- | --- | --- |
-| `done` | the model answered with no tool calls and no queued follow-up kept the run going | none |
+| `done` | the model answered with no tool calls, the response completed, and no queued follow-up kept the run going; an answer the server cut at `max_output_tokens` ends `stopped` with that cause instead | none |
 | `stopped` | the loop chose not to call the model again; `cause` says why | the guard's error when the cause is `guard`, otherwise none |
 | `input_required` | the decision hook deferred one or more calls to the caller; they are listed as pending | none |
 | `aborted` | the run's context was cancelled | the cancellation's cause, or the plain cancellation when it has none; joined with the error of a consumer or a hook that failed for a reason of its own while the run was being cancelled |
@@ -1007,8 +1007,9 @@ carries none.
 
 The reason is decided as follows. A phase that ends the run on its own
 terms — the turn limit, a deferred call, the stop hook, the terminate
-hint, a refusal on resume, a content filter, the cancellation check at the top of a turn
-or inside a retry delay — names its reason and cause, and that stands.
+hint, a refusal on resume, a content filter, a final answer the output
+limit cut, the cancellation check at the top of a turn or inside a
+retry delay — names its reason and cause, and that stands.
 Otherwise, if the run's context is cancelled when the run winds down,
 the reason is `aborted`, with the cancellation's cause as the error
 and, when the failure that ended the run was not that cancellation, the
