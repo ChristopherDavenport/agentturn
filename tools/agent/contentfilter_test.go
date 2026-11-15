@@ -96,3 +96,16 @@ func TestACutAnswerFromTheRecordIsMarked(t *testing.T) {
 		t.Errorf("res = %q, err = %v, want %q", res.Output.Text, err, cut)
 	}
 }
+
+// TestACutAnswerUnderTheStopHookIsMarked pins the cut line on a child's
+// answer the output limit cut and the stop hook then ended: the answer
+// stands, and the parent's model reads that it was cut.
+func TestACutAnswerUnderTheStopHookIsMarked(t *testing.T) {
+	child := New(agentturn.Config{Name: "explore", Model: stoppedShort{reason: openresponses.IncompleteReasonMaxOutputTokens},
+		ShouldStopAfterTurn: func(context.Context, agentturn.TurnInfo) (bool, error) { return true, nil }})
+	res, err := child.Execute(context.Background(), agenttool.Call{ID: "c1", Args: json.RawMessage(`{"input":"x"}`)})
+	const cut = "Once upon\n\n[agent \"explore\"'s answer was cut short at its model's output limit (max_output_tokens)]"
+	if err != nil || res.Output.Text != cut {
+		t.Errorf("res = %q, err = %v, want %q", res.Output.Text, err, cut)
+	}
+}

@@ -150,3 +150,20 @@ func TestACutAnswerEndsIncomplete(t *testing.T) {
 		t.Errorf("output = %q", resp.OutputText())
 	}
 }
+
+// TestACutAnswerUnderTheStopHookEndsIncomplete pins the same for a cut
+// answer the stop hook ended: the caller's response ends incomplete
+// with reason max_output_tokens.
+func TestACutAnswerUnderTheStopHookEndsIncomplete(t *testing.T) {
+	cfg := agentturn.Config{Model: cutShort{}, ModelName: "m", ShouldStopAfterTurn: func(context.Context, agentturn.TurnInfo) (bool, error) { return true, nil }}
+	srv := httptest.NewServer(openresponses.NewHandler(New(cfg)))
+	defer srv.Close()
+	status, body := post(t, srv.URL, request(openresponses.UserText("write at length")))
+	var resp openresponses.Response
+	if err := json.Unmarshal([]byte(body), &resp); err != nil || status != http.StatusOK {
+		t.Fatalf("collected: %d %s (%v)", status, body, err)
+	}
+	if resp.Status != openresponses.ResponseStatusIncomplete || resp.IncompleteDetails == nil || resp.IncompleteDetails.Reason != openresponses.IncompleteReasonMaxOutputTokens || resp.OutputText() != "Once upon" {
+		t.Errorf("collected = %s %+v %q, want incomplete max_output_tokens with the text", resp.Status, resp.IncompleteDetails, resp.OutputText())
+	}
+}

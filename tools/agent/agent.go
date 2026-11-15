@@ -1035,10 +1035,11 @@ func (a *agentTool) result(end *agentturn.RunEnd, items agentturn.Transcript) (a
 		res.Details = info
 		return res, err
 	}
-	if end.Reason == agentturn.ReasonStopped && end.Cause == agentturn.StopMaxOutputTokens {
-		// The answer stands, cut short: the parent's model is told so,
+	if end.Reason == agentturn.ReasonStopped && end.Incomplete != nil {
+		// The answer stands, cut short at the output limit, whatever
+		// stopped the run after it: the parent's model is told so,
 		// live or from the record (#314).
-		text += "\n\n" + cutNote(a.cfg.Name, end.Cause)
+		text += "\n\n" + cutNote(a.cfg.Name, agentturn.StopCause(end.Incomplete.Reason))
 	}
 	return agenttool.Result{
 		Output:  openresponses.FunctionCallOutputData{Text: text},

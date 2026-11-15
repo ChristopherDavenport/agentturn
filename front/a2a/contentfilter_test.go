@@ -145,3 +145,16 @@ func TestACutAnswerWithNoTextIsMarked(t *testing.T) {
 		t.Errorf("status metadata = %v, want %s with the reason", task.Status.Message.Metadata, MetaIncomplete)
 	}
 }
+
+// TestACutAnswerUnderTheStopHookIsMarked pins MetaIncomplete on a cut
+// answer the stop hook ended.
+func TestACutAnswerUnderTheStopHookIsMarked(t *testing.T) {
+	cfg := agentturn.Config{Model: cutShort{}, ModelName: "m", ShouldStopAfterTurn: func(context.Context, agentturn.TurnInfo) (bool, error) { return true, nil }}
+	task := sendTask(t, a2asrv.NewHandler(New(cfg)), userMessage("write at length"))
+	if task.Status.State != a2a.TaskStateCompleted || task.Status.Message == nil {
+		t.Fatalf("task = %s, want completed with a status message", task.Status.State)
+	}
+	if meta, ok := task.Status.Message.Metadata[MetaIncomplete].(map[string]any); !ok || meta["reason"] != "max_output_tokens" {
+		t.Errorf("status metadata = %v", task.Status.Message.Metadata)
+	}
+}

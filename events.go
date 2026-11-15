@@ -731,10 +731,12 @@ type RunEnd struct {
 	// answer, and Answer reports none.
 	Withheld bool
 	// Incomplete is the incomplete_details of the response that ended
-	// the run with Cause [StopContentFilter], as the provider gave them,
-	// members this package does not define, such as an adapter's
-	// anthropic.refusal_category, included in Extra. It is nil for every
-	// other end.
+	// the run with Cause [StopContentFilter] or [StopMaxOutputTokens],
+	// or of a response the output limit cut that another stop followed,
+	// the stop hook's, the turn limit's or a terminating result's, as
+	// the provider gave them, members this package does not define, such
+	// as an adapter's anthropic.refusal_category, included in Extra. It
+	// is nil for every other end, a guard's stop included.
 	Incomplete *openresponses.IncompleteDetails
 	// Refusal is the text of the refusal parts of that response's
 	// assistant messages as the transcript kept them, in order, joined

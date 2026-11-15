@@ -979,7 +979,12 @@ carries the items the run appended, a **reason**, a **cause** when the
 reason is `stopped`, an **error** when there is one, the **pending
 calls** with why each is pending, and, when the cause is
 `content_filter` or `max_output_tokens`, the response's **incomplete**
-details, and for `content_filter` its **refusal** text.
+details, and for `content_filter` its **refusal** text. A run another
+cause stopped after a response the server ended `incomplete` with
+`max_output_tokens`, the stop hook's, the turn limit's or a
+terminating result's, carries that response's details too, so the end
+says the answer was cut whatever stopped the run; a guard's stop
+carries none.
 
 | reason | meaning | error |
 | --- | --- | --- |
@@ -1294,7 +1299,7 @@ turn number. The catalogue, with the members beyond those two:
 | `tool_end` | `call_id`, `name`, `result`, `error`, `blocked`, `deferred`, `reason`, `parent`, `withdrawn`, `cut`, `replayed` | the call settled, in completion order; `reason` is the decision's for a blocked or deferred call; `withdrawn` when a consumer refused its `tool_dispatch`, so its tool never ran; `cut` when a cancellation or a failure cut it off before it had a result of its own, so its output is not appended and it stays pending; `replayed` when the result is the one a record held for a nested call that ended |
 | `turn_end` | `response`, `tool_results` | after the batch's outputs are appended |
 | `quarantine_added` | `items`, `quarantined` | the host quarantined while no run of the agent was active, or after its run's end was delivered; belongs to no run, and is delivered at once, or after the event being delivered |
-| `run_end` | `items`, `reason`, `cause`, `error`, `failure`, `pending`, `withheld`, `quarantined`, `incomplete`, `refusal` | last event of a run; `withheld` when the output guard's stop ended it; `incomplete` when a content filter or the output limit stopped it, and `refusal` for a content filter; `failure` when a consumer or a hook failed for a reason of its own while the run was being cancelled |
+| `run_end` | `items`, `reason`, `cause`, `error`, `failure`, `pending`, `withheld`, `quarantined`, `incomplete`, `refusal` | last event of a run; `withheld` when the output guard's stop ended it; `incomplete` when a content filter or the output limit stopped it, or another stop followed a response the output limit cut, and `refusal` for a content filter; `failure` when a consumer or a hook failed for a reason of its own while the run was being cancelled |
 | `queued` | `item`, `mode`, `input`, `hidden`, `copied`, `trigger`, `provenance` | an item accepted into a queue; belongs to no run; while a run is in flight, without waiting for its next phase (#302); `input` says how it arrived, `steer` or `follow_up` for an item queued and `deliver` for one delivered; `copied` when the caller marked the item as taken from another conversation; `trigger` is the item's provenance's source when it names one |
 
 An event's members are the facts as of the event. A loop MUST deliver

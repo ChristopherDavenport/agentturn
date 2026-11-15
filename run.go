@@ -642,6 +642,9 @@ func (c Config) baseRequest(tools agenttool.Set) openresponses.Request {
 // error to abort the run; steer and followUp drain the queues when set,
 // each item with how it was queued and the trigger it was queued with.
 type runner struct {
+	// response is the run's last response, which a stop after it reads
+	// whether the output limit cut.
+	response *openresponses.Response
 	// output is where the items the turn's response added start in the
 	// transcript, as kept: an OutputGuard's replacement in place of the
 	// message it replaced.
@@ -1223,6 +1226,12 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 		end.Withheld = stop.withheld
 		end.Incomplete = stop.incomplete
 		end.Refusal = stop.refusal
+		if end.Reason == ReasonStopped && end.Cause != StopGuard && end.Incomplete == nil {
+			// A stop after a response the output limit cut, the stop
+			// hook's, the turn limit's or a terminating result's, says
+			// so as StopMaxOutputTokens does (#314).
+			end.Incomplete = cutDetails(r.response)
+		}
 	case ctx.Err() != nil:
 		end.Reason = ReasonAborted
 		end.Err = context.Cause(ctx)
@@ -1478,6 +1487,7 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 		if err != nil {
 			return err
 		}
+		r.response = resp
 		calls := resp.FunctionCalls()
 		if filtered(resp) {
 			// The provider refused the response: the run stops before
@@ -2022,17 +2032,28 @@ func (r *runner) closeCalls(items Transcript, text string) error {
 // the response's details when the response was cut at its output limit
 // or ended incomplete naming no reason, its text still the answer.
 func answered(resp *openresponses.Response) error {
+	details := cutDetails(resp)
+	if details == nil {
+		return nil
+	}
+	return &errStop{reason: ReasonStopped, cause: StopMaxOutputTokens, incomplete: details}
+}
+
+// cutDetails returns a copy of the incomplete_details of resp when the
+// output limit cut it, reason max_output_tokens, or it ended incomplete
+// naming no reason, which reads the same; nil otherwise.
+func cutDetails(resp *openresponses.Response) *openresponses.IncompleteDetails {
 	if resp == nil || resp.Status != openresponses.ResponseStatusIncomplete {
 		return nil
 	}
 	details := resp.IncompleteDetails
 	if details == nil {
-		details = &openresponses.IncompleteDetails{Reason: openresponses.IncompleteReasonMaxOutputTokens}
+		return &openresponses.IncompleteDetails{Reason: openresponses.IncompleteReasonMaxOutputTokens}
 	}
 	if details.Reason != openresponses.IncompleteReasonMaxOutputTokens {
 		return nil
 	}
-	return &errStop{reason: ReasonStopped, cause: StopMaxOutputTokens, incomplete: cloneDetails(details)}
+	return cloneDetails(details)
 }
 
 // filtered reports whether the provider ended resp incomplete with

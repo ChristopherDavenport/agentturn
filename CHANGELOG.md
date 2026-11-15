@@ -31,7 +31,10 @@ versions may break the API.
   the task with the text and the details under the new
   `MetaIncomplete` on its status message, A2A having no state for a
   partial answer; a status message with no text carries it when the
-  limit came before any. RFC 0001 draft 0.9, The turn, phase 14. (#314)
+  limit came before any. A run the stop hook, the turn limit or a
+  terminating result stopped after a response so cut carries the
+  details on `RunEnd.Incomplete` too, read back from the record as
+  well, and the fronts and `tools/agent` mark its answer the same way. RFC 0001 draft 0.9, The turn, phase 14. (#314)
 - Added: `RunEnd.Incomplete`, the refused response's
   `incomplete_details` as the provider gave them, `Extra` members such
   as `anthropic.refusal_category` included, and `RunEnd.Refusal`, the

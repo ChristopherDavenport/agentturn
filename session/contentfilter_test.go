@@ -252,3 +252,29 @@ func TestRecordedEndKeepsTheRefusal(t *testing.T) {
 		t.Errorf("read back incomplete = %+v", back.Incomplete)
 	}
 }
+
+// TestRecordedEndKeepsACutUnderAnotherStop pins the read back of a cut
+// final answer the stop hook ended: the hook's stop, with the cut
+// response's details, as the live end had them.
+func TestRecordedEndKeepsACutUnderAnotherStop(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: &cutShort{reason: openresponses.IncompleteReasonMaxOutputTokens}, ModelName: "m",
+		ShouldStopAfterTurn: func(context.Context, agentturn.TurnInfo) (bool, error) { return true, nil }})
+	defer rec.Attach(a)()
+	if end, err := a.Prompt(context.Background(), openresponses.UserText("go")); err != nil || end.Cause != agentturn.StopHook {
+		t.Fatalf("end = %+v err=%v", end, err)
+	}
+	runs := runsOf(t, s)
+	items, err := runItems(s, runs[0], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back := recordedEnd(runs[0], items)
+	if back == nil || back.Cause != agentturn.StopHook || back.Incomplete == nil || back.Incomplete.Reason != openresponses.IncompleteReasonMaxOutputTokens {
+		t.Fatalf("read back = %+v", back)
+	}
+}

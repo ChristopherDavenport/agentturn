@@ -263,3 +263,41 @@ func TestContentFilterRefusalIsWhatWasKept(t *testing.T) {
 		})
 	}
 }
+
+// TestACutAnswerStoppedOtherwiseCarriesTheDetails pins that a final
+// answer cut at the output limit says so whatever stops the run after
+// it: the stop hook, or the turn limit with an item queued, end with
+// their own cause and RunEnd.Incomplete set, as StopMaxOutputTokens
+// does.
+func TestACutAnswerStoppedOtherwiseCarriesTheDetails(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		cfg   Config
+		queue bool
+		cause StopCause
+	}{
+		{"the stop hook", Config{ShouldStopAfterTurn: func(context.Context, TurnInfo) (bool, error) { return true, nil }}, false, StopHook},
+		{"the turn limit, a follow-up queued", Config{MaxTurns: 1}, true, StopMaxTurns},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			cfg.Model = &cutOff{}
+			a := New(cfg)
+			queued := false
+			a.Subscribe(func(_ context.Context, ev Event) error {
+				if _, ok := ev.(*ResponseEnd); ok && tc.queue && !queued {
+					queued = true
+					a.FollowUp(openresponses.UserText("and then"))
+				}
+				return nil
+			})
+			end, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+			if err != nil || end.Reason != ReasonStopped || end.Cause != tc.cause {
+				t.Fatalf("end = %+v err = %v", end, err)
+			}
+			if end.Incomplete == nil || end.Incomplete.Reason != openresponses.IncompleteReasonMaxOutputTokens {
+				t.Errorf("incomplete = %+v, want the cut response's details", end.Incomplete)
+			}
+		})
+	}
+}

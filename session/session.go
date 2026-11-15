@@ -4886,11 +4886,12 @@ func recordedEnd(run *agentsession.Run, items openresponses.Items) *agentturn.Ru
 		// with its error, stays the failure it reads as.
 		end.Reason = agentturn.ReasonStopped
 		end.Cause = stoppedCause(run.End.Ref)
-		if end.Cause == agentturn.StopContentFilter || end.Cause == agentturn.StopMaxOutputTokens {
-			end.Incomplete, end.Refusal = lastIncomplete(run)
-			if end.Cause != agentturn.StopContentFilter {
-				end.Refusal = ""
-			}
+		// What the live end carried: the last response's details,
+		// whatever stopped the run after it, and a content filter's
+		// refusal.
+		end.Incomplete, end.Refusal = lastIncomplete(run)
+		if end.Cause != agentturn.StopContentFilter {
+			end.Refusal = ""
 		}
 	case run.End.Reason == agentsession.ReasonDone:
 		end.Reason = agentturn.ReasonDone

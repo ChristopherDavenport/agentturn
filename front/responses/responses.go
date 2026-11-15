@@ -580,6 +580,13 @@ func (a *Adapter) fullRun(ctx context.Context, base agentturn.Config, req openre
 				}
 			}
 		}
+		if end.Incomplete != nil {
+			// Another stop after an answer the output limit cut, the
+			// stop hook's or the turn limit's: the response ends as the
+			// model's did (#314).
+			rl.em.Response().Usage = &usage
+			return rl.incomplete(end.Incomplete)
+		}
 	case agentturn.ReasonInputRequired:
 		// Open Responses has no interrupted state: a response whose
 		// output ends with function_call items is the caller's cue to
