@@ -68,6 +68,14 @@ var ErrConversationBusy = errors.New("conversation has a task in flight")
 // fixed, so a guard's reason never reaches the caller.
 const RefusedText = "the agent's guard refused this request"
 
+// FilteredText is the status message of a task whose run the model's
+// provider stopped with its content filter
+// (agentturn.StopContentFilter). It is fixed. The refusal text the
+// model gave is in the task's artifacts, as any text of a message is,
+// so the caller reads why; the provider's category stays with the
+// host, on the run's end and in the record.
+const FilteredText = "the model's provider refused this request"
+
 var _ a2asrv.AgentExecutor = (*Executor)(nil)
 
 // Option configures an [Executor].
@@ -913,6 +921,12 @@ func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, 
 		if out.bounded != nil {
 			return e.finish(ctx, reqCtx, q, a2a.TaskStateFailed, errorMessage(reqCtx, out.bounded))
 		}
+		if out.end.Cause == agentturn.StopContentFilter {
+			// The provider's content filter ended the model's response:
+			// the agent refused the task as a guard's stop does, and
+			// the text before the refusal is no answer (#314).
+			return e.finish(ctx, reqCtx, q, a2a.TaskStateRejected, a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: FilteredText}))
+		}
 		if _, ok := out.end.Answer(); out.end.Cause == agentturn.StopGuard && !ok {
 			// A guard stopped the run before the agent answered, at
 			// whichever hook: the agent refused the task, which neither
@@ -934,6 +948,18 @@ func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, 
 		if text != "" {
 			msg = a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: text})
 		}
+		if out.end.Reason == agentturn.ReasonStopped && out.end.Incomplete != nil {
+			// The answer was cut at the model's output limit. It is
+			// still the agent's answer, so the task completes, and the
+			// status message says it was cut, one with no text when the
+			// limit came before any (#314).
+			if details, err := detailsMeta(out.end.Incomplete); err == nil {
+				if msg == nil {
+					msg = a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx)
+				}
+				msg.SetMeta(MetaIncomplete, details)
+			}
+		}
 		return e.finish(ctx, reqCtx, q, a2a.TaskStateCompleted, msg)
 	case agentturn.ReasonAborted:
 		// The canceler usually wrote the canceled status already and the
@@ -943,6 +969,17 @@ func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, 
 	default:
 		return e.finish(ctx, reqCtx, q, a2a.TaskStateFailed, errorMessage(reqCtx, out.end.Err))
 	}
+}
+
+// detailsMeta is d as the JSON object a task store keeps: the types a
+// JSON decode yields, its extension members included.
+func detailsMeta(d *openresponses.IncompleteDetails) (map[string]any, error) {
+	raw, err := json.Marshal(d)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	return m, json.Unmarshal(raw, &m)
 }
 
 // checkDeclared refuses a tool a message declares that would stand in

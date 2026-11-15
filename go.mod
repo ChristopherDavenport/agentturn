@@ -4,5 +4,5 @@ go 1.25
 
 require (
 	github.com/ChristopherDavenport/agenttool v0.0.30
-	github.com/ChristopherDavenport/openresponses v0.0.19
+	github.com/ChristopherDavenport/openresponses v0.0.20
 )

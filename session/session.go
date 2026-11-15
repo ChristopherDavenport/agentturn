@@ -460,6 +460,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -1206,13 +1207,16 @@ type writer struct {
 	// answeredCall says the run wrote an output or a decision, which is
 	// how the format reads a run that answered a call an earlier one's
 	// model call made; withheld says an OutputGuard withheld the last
-	// response, written incomplete with content_filter.
+	// response, written incomplete with content_filter; incomplete is
+	// the reason the last response ended incomplete, a withheld one's
+	// included, and empty when it completed or failed.
 	run          string
 	open         []string
 	responses    int
 	lastCalls    bool
 	answeredCall bool
 	withheld     bool
+	incomplete   openresponses.IncompleteReason
 }
 
 // itemMeta is what a writer knows of an item's entry beyond the item.
@@ -4870,10 +4874,28 @@ func recordedEnd(run *agentsession.Run, items openresponses.Items) *agentturn.Ru
 		end.Reason = agentturn.ReasonDone
 		return end
 	}
-	switch run.End.Reason {
-	case agentsession.ReasonDone:
+	switch {
+	case run.End.Reason == agentsession.ReasonAborted && stoppedCause(run.End.Ref) != "":
+		// A stop after a last response that ended incomplete, which
+		// the format reads as aborted with the cause as ref (#314): a
+		// content filter's, an answer cut at the output limit, or a
+		// terminating result, the turn limit or the stop hook after a
+		// response so cut. It reads back as the stop it was, so a
+		// terminating tool's output is still the answer and a host's
+		// no-answer function is still asked. A guard's stop, written
+		// with its error, stays the failure it reads as.
+		end.Reason = agentturn.ReasonStopped
+		end.Cause = stoppedCause(run.End.Ref)
+		// What the live end carried: the last response's details,
+		// whatever stopped the run after it, and a content filter's
+		// refusal.
+		end.Incomplete, end.Refusal = lastIncomplete(run)
+		if end.Cause != agentturn.StopContentFilter {
+			end.Refusal = ""
+		}
+	case run.End.Reason == agentsession.ReasonDone:
 		end.Reason = agentturn.ReasonDone
-	case agentsession.ReasonStopped:
+	case run.End.Reason == agentsession.ReasonStopped:
 		end.Reason = agentturn.ReasonStopped
 		cause, _, _ := strings.Cut(run.End.Ref, ":")
 		end.Cause = agentturn.StopCause(cause)
@@ -4882,6 +4904,55 @@ func recordedEnd(run *agentsession.Run, items openresponses.Items) *agentturn.Ru
 		end.Err = fmt.Errorf("its run %s ended %s on the record: %s", run.RunID(), run.End.Reason, run.End.Ref)
 	}
 	return end
+}
+
+// lastIncomplete is what the end of run carried live, read from its
+// segment: the incomplete_details of its last response, extension
+// members included, and the text of the refusal parts of that
+// response's assistant messages, joined as the loop joins them.
+func lastIncomplete(run *agentsession.Run) (*openresponses.IncompleteDetails, string) {
+	var last *agentsession.ResponseEntry
+	for _, e := range run.Segment {
+		if r, ok := e.(*agentsession.ResponseEntry); ok {
+			last = r
+		}
+	}
+	if last == nil || last.Incomplete == nil {
+		return nil, ""
+	}
+	details := *last.Incomplete
+	details.Extra = maps.Clone(last.Incomplete.Extra)
+	var parts []string
+	for _, e := range run.Segment {
+		ie, ok := e.(*agentsession.ItemEntry)
+		if !ok || ie.ResponseID == "" || ie.ResponseID != last.ResponseID {
+			continue
+		}
+		if m, ok := ie.Item.(*openresponses.Message); ok && m.Role == openresponses.RoleAssistant {
+			for _, part := range m.Content {
+				if p, ok := part.(*openresponses.Refusal); ok && p.Refusal != "" {
+					parts = append(parts, p.Refusal)
+				}
+			}
+		}
+	}
+	return &details, strings.Join(parts, "\n")
+}
+
+// stoppedCause is the stop a run end written aborted with ref names,
+// the cause before any ":", for every cause but a guard's; ref
+// "incomplete", a response that ended incomplete naming no reason,
+// reads as the output limit's. It is empty for anything else.
+func stoppedCause(ref string) agentturn.StopCause {
+	cause, _, _ := strings.Cut(ref, ":")
+	switch c := agentturn.StopCause(cause); c {
+	case agentturn.StopMaxTurns, agentturn.StopHook, agentturn.StopTerminate, agentturn.StopPartialTerminate,
+		agentturn.StopRefused, agentturn.StopContentFilter, agentturn.StopMaxOutputTokens:
+		return c
+	case "incomplete":
+		return agentturn.StopMaxOutputTokens
+	}
+	return ""
 }
 
 // StartChild records a child agent the host starts itself, not
@@ -5967,6 +6038,7 @@ func (w *writer) runStart(ctx context.Context, e *agentturn.RunStart) error {
 	w.lastCalls = false
 	w.answeredCall = false
 	w.withheld = false
+	w.incomplete = ""
 	start := agentsession.NewRunStart(e.RunID, string(e.Source), e.Trigger.String())
 	start.Trigger = trigger
 	// The comparison below does not ask a tool provider, which may cost
@@ -6464,7 +6536,7 @@ func (w *writer) blocked(ctx context.Context, e *agentturn.ModelBlocked) error {
 		return w.recordQuarantine(ctx, e.Quarantined)
 	}
 	w.responses++
-	w.lastCalls = false
+	w.lastCalls, w.incomplete = false, ""
 	if _, err = w.append(ctx, &agentsession.ResponseEntry{
 		Status:      openresponses.ResponseStatusFailed,
 		Error:       errorPayload(e.Err),
@@ -6946,12 +7018,15 @@ func (w *writer) itemFrom(ctx context.Context, item openresponses.Item, response
 			// same shape with the loop as the decider: it refused the
 			// call before any tool, which is a policy's refusal.
 			by := agentturn.DeciderFromContext(ctx, out.CallID)
-			if c.settledRun != "" && c.settledRun == w.run || w.withheld {
+			if c.settledRun != "" && c.settledRun == w.run || w.withheld || w.incomplete == openresponses.IncompleteReasonContentFilter {
 				// The loop refused it, whoever approved it: a call
 				// the caller approved on resume and the loop then
 				// found no tool for is the loop's reject, and so is a
 				// call of a response an OutputGuard withheld, which
-				// the loop closes with agentturn.WithheldCallOutput.
+				// the loop closes with agentturn.WithheldCallOutput,
+				// and one of a response the provider's content
+				// filter ended, closed with
+				// agentturn.RefusedCallOutput (#314).
 				by = agentsession.ByPolicy
 			}
 			dec := agentsession.NewDecision(out.CallID, c.entry, agentsession.VerdictReject, by).WithReason(outputText(out))
@@ -7417,6 +7492,16 @@ func (w *writer) response(ctx context.Context, e *agentturn.ResponseEnd) error {
 	if e.Withheld {
 		w.lastCalls = false
 	}
+	// A response that ended incomplete, the provider's content filter
+	// or its output limit, or withheld, is what the format reads the
+	// run's end by, whatever ended the run after it (#314).
+	w.incomplete = ""
+	if resp.Status == openresponses.ResponseStatusIncomplete {
+		w.incomplete = "incomplete"
+		if resp.IncompleteDetails != nil && resp.IncompleteDetails.Reason != "" {
+			w.incomplete = resp.IncompleteDetails.Reason
+		}
+	}
 	_, err = w.append(ctx, entry)
 	return err
 }
@@ -7527,7 +7612,7 @@ func (w *writer) endInFlight(ctx context.Context, cause error) error {
 		return err
 	}
 	w.responses++
-	w.lastCalls = false
+	w.lastCalls, w.incomplete = false, ""
 	entry := &agentsession.ResponseEntry{
 		ResponseID:  responseID,
 		Status:      openresponses.ResponseStatusFailed,
@@ -7546,6 +7631,13 @@ func (w *writer) endInFlight(ctx context.Context, cause error) error {
 func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 	switch e.Reason {
 	case agentturn.ReasonDone:
+		if w.incomplete != "" {
+			// The last response ended incomplete for a reason the loop
+			// does not stop on, which the format reads as aborted, so
+			// the response's reason says why (#314). An answer cut at
+			// the output limit is a stop of its own, below.
+			return agentsession.ReasonAborted, string(w.incomplete)
+		}
 		return agentsession.ReasonDone, ""
 	case agentturn.ReasonInputRequired:
 		return agentsession.ReasonInputRequired, ""
@@ -7564,10 +7656,12 @@ func (w *writer) endReason(e *agentturn.RunEnd) (reason, ref string) {
 			cause += ": " + e.Err.Error()
 		}
 		switch {
-		case w.withheld:
+		case w.withheld || w.incomplete != "":
 			// OutputGuard withheld the last response, written
-			// incomplete, which the format reads as aborted whatever its
-			// calls: the run did not finish what the model began.
+			// incomplete, or the provider ended it incomplete, its
+			// content filter or its output limit, which the format
+			// reads as aborted whatever its calls: the run did not
+			// finish what the model began (#314).
 			return agentsession.ReasonAborted, cause
 		case w.responses == 0:
 			// A resume whose approved batch terminated, a refusal on

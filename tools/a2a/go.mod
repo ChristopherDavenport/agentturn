@@ -6,7 +6,7 @@ require (
 	github.com/ChristopherDavenport/agenttool v0.0.30
 	github.com/ChristopherDavenport/agentturn v0.0.39
 	github.com/ChristopherDavenport/agentturn/front/a2a v0.0.39
-	github.com/ChristopherDavenport/openresponses v0.0.19
+	github.com/ChristopherDavenport/openresponses v0.0.20
 	github.com/a2aproject/a2a-go v0.3.15
 )
 

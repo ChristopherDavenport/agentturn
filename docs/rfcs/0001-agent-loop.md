@@ -1,6 +1,6 @@
 # RFC 0001: Agent Loop
 
-Status: draft 0.8
+Status: draft 0.9
 Author: Christopher Davenport
 Discussion: to be opened against this repository, then proposed to the
 Open Responses community as a companion specification. The Go module at
@@ -62,7 +62,7 @@ executor, the session format begins where an entry is appended, and
 the loop is everything in between.
 
 Each draft describes the Go module as released with it; [Changes in
-draft 0.8](#changes-in-draft-08) lists what this draft added. Where the
+draft 0.9](#changes-in-draft-09) lists what this draft added. Where the
 module falls short of what is written here, or where a rule is
 contested, the shortfall is under open questions with the issue that
 tracks it.
@@ -378,47 +378,76 @@ it raises and the hooks it calls; the events are defined
    output guard error marked as a guard's stops the run with cause
    `guard` mid-stream: the turn's `response_end` is marked withheld,
    the withheld response's calls are closed, and nothing below runs.
-7. **The batch**, as the [batch section](#the-batch) says: the
+7. **Content filter.** A response the server ended `incomplete` with
+   reason `content_filter`, its provider's refusal, ends the run
+   `stopped` with cause `content_filter` (#314). Its function calls
+   MUST NOT be dispatched: the loop answers each, in the model's order,
+   with an output of fixed text, appended with its item events and no
+   tool events, before `run_end`, so the transcript holds no call
+   without an output, the next run may start, and a provider that
+   pairs every call with a result, as Anthropic's `tool_use` with
+   `tool_result`, is sent one. The end carries the response's
+   `incomplete_details` as the provider gave them, members this
+   document does not define included, such as an adapter's
+   `anthropic.refusal_category`, and the text of the refusal parts of
+   its assistant messages as the transcript kept them, an output
+   guard's replacement in place of the message it replaced; it is no
+   answer, whatever text the response
+   spoke beside the refusal. No error is set and nothing is withheld:
+   the response is the server's, carried by `response_end` as it
+   arrived. Nothing below runs, so the turn has no `turn_end`, and the
+   items steered in during the turn stay queued for the next run. This
+   is not `refused`, a refusal on resume, nor `guard`, a hook's or a
+   moderation layer's policy. A response the server ended `incomplete`
+   with `max_output_tokens` is no such stop: its completed calls run,
+   and with none it ends the run as phases 13 and 14 say.
+8. **The batch**, as the [batch section](#the-batch) says: the
    function calls of the response are decided one at a time in the
    model's order, then executed, then their outputs appended in the
    model's order.
-8. **`turn_end`** carries the folded response and the tool results in
+9. **`turn_end`** carries the folded response and the tool results in
    the model's order. It is raised whether or not the batch left calls
    pending; a deferred call's place holds an empty result, so the list
    is as long as the batch. A batch a cancellation or a failure cut off
    has no `turn_end`: it is settled as the
    [cancellation section](#cancellation) says, and the run ends.
-9. **Pending.** If any call of the batch was deferred, the run ends
+10. **Pending.** If any call of the batch was deferred, the run ends
    with reason `input_required` and the deferred calls listed. Nothing
    below runs: a deferred call is a question to the caller, and the
    stop hook and the terminate hint are answered after it.
-10. **The stop hook** sees the turn and MAY end the run with reason
+11. **The stop hook** sees the turn and MAY end the run with reason
     `stopped` and cause `hook`, or with cause `guard` and its error on
     the end event, or fail it with reason `error`.
-11. **Terminate.** If every result of the batch set the terminate hint,
+12. **Terminate.** If every result of the batch set the terminate hint,
     the run ends with reason `stopped` and cause `terminate`. If some
     did, it ends with cause `partial_terminate`: the other calls ran
     and their outputs are in the transcript, and the host acts on the
     call that asked to end the run. agenttool RFC 0001 requires a
     harness to report a partial batch as partial and leaves the policy
     to it; this loop's policy is to stop and say so.
-12. **Limits.** If the run has taken its turn limit's worth of turns,
+13. **Limits.** If the run has taken its turn limit's worth of turns,
     it ends with reason `stopped` and cause `max_turns` when the model
-    called tools or anything is queued, and with reason `done`
-    otherwise. What is queued is not drained: it stays queued for the
-    next run, which takes it after its prompt.
-13. **Queues.** Items steered in while the turn ran are appended, with
+    called tools or anything is queued, and otherwise as a final
+    answer ends, below. What is queued is not drained: it stays queued
+    for the next run, which takes it after its prompt.
+14. **Queues.** Items steered in while the turn ran are appended, with
     their item events. If the model called no tools, the follow-up
     queue is drained after them; if nothing was queued, the run ends
-    with reason `done`. Otherwise the next turn begins at phase 1.
+    with the final answer: with reason `done`, or, when the server ended
+    the response `incomplete` with `max_output_tokens`, or `incomplete`
+    naming no reason, with reason `stopped` and cause
+    `max_output_tokens` (#314). That end carries the response's
+    `incomplete_details`, and its text is still the answer: the cause
+    and the details are how a caller tells the answer was cut short.
+    Otherwise the next turn begins at phase 1.
 
-Phases 9 to 12 decide a stop before phase 13 drains anything, so an
+Phases 7 and 10 to 13 decide a stop before phase 14 drains anything, so an
 item steered during a turn that ends the run stays queued for the next
 run rather than being appended to a run that will not call the model
 again; the run is past its last drain from that decision on.
 
-A batch of zero calls runs phases 7 and 8 trivially: `turn_end` carries
-no results, and phase 9 finds nothing pending.
+A batch of zero calls runs phases 8 and 9 trivially: `turn_end` carries
+no results, and phase 10 finds nothing pending.
 
 ### The request
 
@@ -713,7 +742,9 @@ the transcript.
   run ends with the error, so a recorder can write it, and so is one
   the output guard withheld a message of, marked withheld, before the
   outputs that close its calls. A response the server itself ended
-  `incomplete` with `content_filter` is not marked withheld.
+  `incomplete` with `content_filter` is not marked withheld: it is
+  delivered as the server gave it, and stops the run as phase 7 of
+  [the turn](#the-turn) says.
 
 #### Retry
 
@@ -945,12 +976,19 @@ it from the conversation without the host threading anything through.
 
 Exactly one `run_end` is raised per run and nothing follows it. It
 carries the items the run appended, a **reason**, a **cause** when the
-reason is `stopped`, an **error** when there is one, and the **pending
-calls** with why each is pending.
+reason is `stopped`, an **error** when there is one, the **pending
+calls** with why each is pending, and, when the cause is
+`content_filter` or `max_output_tokens`, the response's **incomplete**
+details, and for `content_filter` its **refusal** text. A run another
+cause stopped after a response the server ended `incomplete` with
+`max_output_tokens`, the stop hook's, the turn limit's or a
+terminating result's, carries that response's details too, so the end
+says the answer was cut whatever stopped the run; a guard's stop
+carries none.
 
 | reason | meaning | error |
 | --- | --- | --- |
-| `done` | the model answered with no tool calls and no queued follow-up kept the run going | none |
+| `done` | the model answered with no tool calls, the response completed, and no queued follow-up kept the run going; an answer the server cut at `max_output_tokens` ends `stopped` with that cause instead | none |
 | `stopped` | the loop chose not to call the model again; `cause` says why | the guard's error when the cause is `guard`, otherwise none |
 | `input_required` | the decision hook deferred one or more calls to the caller; they are listed as pending | none |
 | `aborted` | the run's context was cancelled | the cancellation's cause, or the plain cancellation when it has none; joined with the error of a consumer or a hook that failed for a reason of its own while the run was being cancelled |
@@ -964,11 +1002,14 @@ calls** with why each is pending.
 | `terminate` | every result of the batch set the terminate hint |
 | `partial_terminate` | some results of the batch set it and others did not |
 | `refused` | an answer on resume asked the run to end without calling the model |
+| `max_output_tokens` | the server ended a final answer, a response with no calls and nothing queued after it, `incomplete` with `max_output_tokens` or naming no reason; the end carries the response's `incomplete_details`, and the cut text is the answer (#314) |
+| `content_filter` | the server ended the response `incomplete` with `content_filter`; its calls are answered with an output of fixed text and never dispatched, the turn has no `turn_end`, and the end carries the response's `incomplete_details` as given and its refusal text, and is no answer (#314) |
 
 The reason is decided as follows. A phase that ends the run on its own
 terms — the turn limit, a deferred call, the stop hook, the terminate
-hint, a refusal on resume, the cancellation check at the top of a turn
-or inside a retry delay — names its reason and cause, and that stands.
+hint, a refusal on resume, a content filter, a final answer the output
+limit cut, the cancellation check at the top of a turn or inside a
+retry delay — names its reason and cause, and that stands.
 Otherwise, if the run's context is cancelled when the run winds down,
 the reason is `aborted`, with the cancellation's cause as the error
 and, when the failure that ended the run was not that cancellation, the
@@ -1259,7 +1300,7 @@ turn number. The catalogue, with the members beyond those two:
 | `tool_end` | `call_id`, `name`, `result`, `error`, `blocked`, `deferred`, `reason`, `parent`, `withdrawn`, `cut`, `replayed` | the call settled, in completion order; `reason` is the decision's for a blocked or deferred call; `withdrawn` when a consumer refused its `tool_dispatch`, so its tool never ran; `cut` when a cancellation or a failure cut it off before it had a result of its own, so its output is not appended and it stays pending; `replayed` when the result is the one a record held for a nested call that ended |
 | `turn_end` | `response`, `tool_results` | after the batch's outputs are appended |
 | `quarantine_added` | `items`, `quarantined` | the host quarantined while no run of the agent was active, or after its run's end was delivered; belongs to no run, and is delivered at once, or after the event being delivered |
-| `run_end` | `items`, `reason`, `cause`, `error`, `failure`, `pending`, `withheld`, `quarantined` | last event of a run; `withheld` when the output guard's stop ended it; `failure` when a consumer or a hook failed for a reason of its own while the run was being cancelled |
+| `run_end` | `items`, `reason`, `cause`, `error`, `failure`, `pending`, `withheld`, `quarantined`, `incomplete`, `refusal` | last event of a run; `withheld` when the output guard's stop ended it; `incomplete` when a content filter or the output limit stopped it, or another stop followed a response the output limit cut, and `refusal` for a content filter; `failure` when a consumer or a hook failed for a reason of its own while the run was being cancelled |
 | `queued` | `item`, `mode`, `input`, `hidden`, `copied`, `trigger`, `provenance` | an item accepted into a queue; belongs to no run; while a run is in flight, without waiting for its next phase (#302); `input` says how it arrived, `steer` or `follow_up` for an item queued and `deliver` for one delivered; `copied` when the caller marked the item as taken from another conversation; `trigger` is the item's provenance's source when it names one |
 
 An event's members are the facts as of the event. A loop MUST deliver
@@ -1294,8 +1335,9 @@ turn*:
   turn_start | model_blocked            the latter ends the run
   ((item_start item_update*)* model_retry)*  attempts that failed before committing
   (item_start item_update* item_end)*   output items; item_end after the item is done
-  response_end | model_blocked          withheld: then the outputs closing its
-                                        calls, (item_start item_end)*, and run_end;
+  response_end | model_blocked          withheld, or ended by a content filter: then
+                                        the outputs closing its calls,
+                                        (item_start item_end)*, and run_end;
                                         model_blocked, a model guard's refusal
                                         before the attempt committed, ends the run
   batch
@@ -1628,7 +1670,7 @@ provide a way to chain each, with the fold rule the table gives.
 | output guard | as the stream completes an assistant message | the message | a replacement or none | fails the run unless marked as a guard's, which withholds the message and stops it with cause `guard` | in order, each seeing the last's replacement; the last stands; the first error stops |
 | decision (before tool call) | preflight, per call, model order; a nested call as a batch of one | the call, the tool, the arguments, the batch and index, and for a nested call its parent | a decision or none | fails the run; returned to the tool for a nested call | the strictest action wins, block over defer over allow; a block ends the chain, a defer does not; rewritten arguments pass to the hooks after; the first reason and decider of the standing action, the first note; the first decline text among the deferrals of the kind that stands, asking or held, so an asked call never takes a hold's (#304); terminate if any set it |
 | after tool call | as each call settles, blocked calls excepted | the call, the result, the error | an override or none | fails the run; returned to the tool for a nested call | — |
-| should stop after turn | turn phase 10 | the response, the results, whether the turn was final, the transcript | stop or not; a guard error stops with cause `guard` | fails the run unless marked as a guard's | in order until one stops; the first error stops |
+| should stop after turn | turn phase 11 | the response, the results, whether the turn was final, the transcript | stop or not; a guard error stops with cause `guard` | fails the run unless marked as a guard's | in order until one stops; the first error stops |
 | transform | request step 2 | a copy of the transcript | the input for this call | fails the run | — |
 | filter | request step 3 | the transformed list | what the model sees | — | — |
 
@@ -2053,13 +2095,13 @@ of the events.
 | `turn_start` | a `config` delta when the request's settings differ from the path's; the request hash is computed here and written on the response. When the host names the parts the request's instructions are composed of, for any session the recorder writes, a child run's included, and they join to the instructions sent, the entries carry `instructions_parts`, a delta naming the parts that moved and each run of unchanged parts as a `keep`, and `instructions_omitted` for what the host left out when it differs from the list in force, which stays in force until a `config` changes it: on a delta each run of parts unchanged in the list in force as a `keep`, `[]` when nothing is left out any more, and on a replace whole whenever it is non-empty. With the instructions recorded as parts, a recorder SHOULD write a configuration change as a delta whenever a delta can describe it, a switch to a configuration whose tools are disjoint included: a replace starts the path's parts afresh, after which a later hand-back can no longer name them by hash, so length alone is not a reason to replace; parts that do not join, or that the format refuses, a part with no ID, two sharing one, or one whose hash is not that of its text, are dropped and the string is written, since the record describes what was sent; a part carrying its text and also a keep or the hash of that text is written with both cleared, its source and trust kept, since the text says all they would. The quarantine in force, the event's `quarantined`, MUST be recorded as the format's `omit`, its outputs sent as the placeholder and every other item, a call with its outputs, left out, even when the recorder cannot describe how the request's input differs from the path and so writes no request hash, as for a run on a root of its own that sends the items of the run before it or an input a hook added to: otherwise a resume, an agent attached after one, or a child started from the record sends what the run withheld. The MUST covers a quarantine made after the run's last request, by a tool of its last batch, a hook after that request or the host during the run, which `run_end` carries, one a refused request's hook made, which `model_blocked` carries, and one the host made while no run was active, which `quarantine_added` carries, so the record holds every quarantine before the agent runs again: the recorder writes it after that event's other entries, as a `config` carrying only the `omit` it adds, so no response is hashed under it and the next request is (#294) |
 | `model_retry` | a record entry with the attempt, the error, the delay, the failed attempt's model and whether the retry policy revised the request, before the response of the attempt that answers; the revised request's settings are settled with that attempt, so only the attempt that answered is configured on the path. The record entry stays beside the count below, since it says what the count cannot |
 | `model_blocked` | for an error marked as a guard's, a custom entry in `agentturn:model_blocked` carrying the guard's error, the request hash, the model and the usage the event carries, when it carries any, since the run stopped rather than failed and a failed `response` would make its end read as a failure; for any other error, a failed `response` carrying the hook's error and the request hash. Either way the call that was refused is told from one that was made and failed |
-| `item_end` | an `item`, with the display flag off for a hidden item, and the run's trigger as `source` for an item the run was prompted with, an answer's output on a resume excepted, whose kind `human` is not written on an item that names instruction layers, is copied or is hidden, which keeps the trigger's other members (#303). An item carrying a provenance is recorded with it in agentsession RFC 0001's members: its layers as `instructions_part`, one object for one layer and a list for several, its trust as `trust`, on a copied item merged into the trust it was copied with, and its source as `source`, over the run's trigger. Items a run is prompted with that were taken from another conversation, marked `copied`, as a child prompted with its parent's conversation is, are recorded marked as copied, with agentsession RFC 0001's `copied_from` naming the session they came from, the session whose call spawned the run's, and the entry of it each repeats unchanged, none for an item made for the copy such as a placeholder output for a call in flight, and carrying that entry's `trust`, or, for an item that names no entry, the trust of the path it was copied from, as agentsession RFC 0001 has it; a recorder writes no decision, dispatch or result for a call so marked or its output, since the call is not this session's, and a reader treats such items as context, not as this session's model output or tool calls (#243). An input that arrived under a trigger of kind `callee`, a detached call's late result whether delivered, queued or handed back owed after a restart, carries agentsession RFC 0001's `from_link` naming the latest `peer` link on the path of the call the trigger's ref names, of the task its `task` member names when it names one, and none when the path holds no such link, a cancel notice never (#290). Before a caller-supplied output for a call that was neither dispatched nor rejected, a `reject` decision with the output's text as its reason and the decider the caller named, and `policy` as the decider when the loop refused the call itself in this run, for a name no tool has or arguments that are not an object, or closed it because the output guard withheld the response that made it; before one for a call that may have run, dispatched in an earlier run or on a path that does not promise dispatch records, an `answer` decision with the answer's decider and reason, since a `proceed` would say the call went on toward its tool and a `reject` that it never reached it, and no second `dispatch` says the tool did not run again; before one for a call the path already shows answered, nothing; one for a call that has its output is refused with agentsession's `ErrCallCompleted`, since the context would hold two. The answer's output for a call that completed off the path the run continues, which the caller marked with where it was taken from, is written with a `link` to the child session that produced the output it repeats, when the record holds one: the `subsession` link a branch of this session holding the original output has for the call, written again on this branch before the `answer`, since a link on a branch left says nothing of this one; a fork writes none, since a `subsession` link names a child of the session that writes it and the child is the origin's: an `answer` whose output repeats one that ran in the session a fork was made from MUST name that output's entry and session in the output's `copied_from`, carrying its `trust`, so a reader reaches the child session that produced it through the origin's link for the call, which the fork's prefix lacks when the fork was made at the call (#237). A call the loop renamed keeps the model's ID in an `agentturn:model_call_id` member beside the `item`. An output's `item` MUST be marked `failed` when the call's `tool_end` carried the tool's error for a hand-off of this run, or when the answer it is reports that the call failed, as an output saying a cut call's outcome is unknown does; a call refused, by a block, by the loop for a name no tool has or arguments that are not an object, or by an answer's output for a call that never started, is recorded by its `reject` and MUST NOT be marked |
+| `item_end` | an `item`, with the display flag off for a hidden item, and the run's trigger as `source` for an item the run was prompted with, an answer's output on a resume excepted, whose kind `human` is not written on an item that names instruction layers, is copied or is hidden, which keeps the trigger's other members (#303). An item carrying a provenance is recorded with it in agentsession RFC 0001's members: its layers as `instructions_part`, one object for one layer and a list for several, its trust as `trust`, on a copied item merged into the trust it was copied with, and its source as `source`, over the run's trigger. Items a run is prompted with that were taken from another conversation, marked `copied`, as a child prompted with its parent's conversation is, are recorded marked as copied, with agentsession RFC 0001's `copied_from` naming the session they came from, the session whose call spawned the run's, and the entry of it each repeats unchanged, none for an item made for the copy such as a placeholder output for a call in flight, and carrying that entry's `trust`, or, for an item that names no entry, the trust of the path it was copied from, as agentsession RFC 0001 has it; a recorder writes no decision, dispatch or result for a call so marked or its output, since the call is not this session's, and a reader treats such items as context, not as this session's model output or tool calls (#243). An input that arrived under a trigger of kind `callee`, a detached call's late result whether delivered, queued or handed back owed after a restart, carries agentsession RFC 0001's `from_link` naming the latest `peer` link on the path of the call the trigger's ref names, of the task its `task` member names when it names one, and none when the path holds no such link, a cancel notice never (#290). Before a caller-supplied output for a call that was neither dispatched nor rejected, a `reject` decision with the output's text as its reason and the decider the caller named, and `policy` as the decider when the loop refused the call itself in this run, for a name no tool has or arguments that are not an object, or closed it because the output guard withheld the response that made it or the server's content filter ended that response; before one for a call that may have run, dispatched in an earlier run or on a path that does not promise dispatch records, an `answer` decision with the answer's decider and reason, since a `proceed` would say the call went on toward its tool and a `reject` that it never reached it, and no second `dispatch` says the tool did not run again; before one for a call the path already shows answered, nothing; one for a call that has its output is refused with agentsession's `ErrCallCompleted`, since the context would hold two. The answer's output for a call that completed off the path the run continues, which the caller marked with where it was taken from, is written with a `link` to the child session that produced the output it repeats, when the record holds one: the `subsession` link a branch of this session holding the original output has for the call, written again on this branch before the `answer`, since a link on a branch left says nothing of this one; a fork writes none, since a `subsession` link names a child of the session that writes it and the child is the origin's: an `answer` whose output repeats one that ran in the session a fork was made from MUST name that output's entry and session in the output's `copied_from`, carrying its `trust`, so a reader reaches the child session that produced it through the origin's link for the call, which the fork's prefix lacks when the fork was made at the call (#237). A call the loop renamed keeps the model's ID in an `agentturn:model_call_id` member beside the `item`. An output's `item` MUST be marked `failed` when the call's `tool_end` carried the tool's error for a hand-off of this run, or when the answer it is reports that the call failed, as an output saying a cut call's outcome is unknown does; a call refused, by a block, by the loop for a name no tool has or arguments that are not an object, or by an answer's output for a call that never started, is recorded by its `reject` and MUST NOT be marked |
 | `response_end` | the `response`, with `request_hash` when the input the loop sent is the input the recorded path rebuilds, under the `omit` written before it when the input differs by edits the format describes, as the request procedure has it, and none otherwise, in which case a custom entry in `agentturn:unhashed` is written before the first response left without a hash for a cause, and again when the cause changes, saying why: the reason and the position where the input sent and the input the path rebuilds part, naming the item each holds there, so a reader tells a request a hook or a transform changed from one carrying items the recorder never wrote (#92); and `attempts`, the calls it took, when the retry policy tried it again; a `response_end` marked withheld is written `incomplete` with `content_filter` and no error, as the loop gives it, so the guard's text is not on it, before the outputs that close its calls; so is the failed `response` `run_end` writes for a call left in flight, where an abort during the retry's backoff counts the attempt that was due, since nothing tells it from an abort before that attempt streamed |
 | `tool_start` | a `decision`: `reject` with the reason for a block, `call blocked` when it gave none, and `answer` in its place for a call that may have run, since the format keeps `reject` for a call no `dispatch` reached; nothing for a call a `reject` or an `answer` already ended, which takes only its output, and a refusal, with `ErrCallCompleted`, for one that has its output, which the format reads as ended, so a loop that lost track of a call fails its run rather than the record hiding it; `hold` for a defer, with the reason when given, marked held, with its subject, for a call deferred only beside an asked call of its batch, as the prose after this table has it; `proceed` for a call that was held, whose arguments were rewritten, with the arguments, or whose decision gave a reason, with the reason, and for a call an earlier run dispatched that goes to its tool again, since running it again is a decision: when its decision gives no reason, the proceed is written before its second `dispatch` with `run again` as the reason, and not at all when the loop refuses the call before it. The decider is the decision's, and `policy` for a call nothing was holding and no earlier run dispatched whose decision names nobody. A nested call is a record entry instead, carrying the arguments it was invoked with when a decision rewrote them, and none for a nested call `replayed`, whose record is already on the path |
 | `tool_dispatch` | a `dispatch`, durable before the event returns, so the tool runs after it or not at all, carrying the call's idempotency key as `idempotency_key`; a second one for a call an earlier run dispatched and a resume runs again, carrying the key it runs under, that of the dispatch it repeats unless a decision made it a new operation, so the path holds one per hand-off; for a nested call, a record entry carrying its key, durable before the event returns, the same for one run again; and a refusal, with agentsession's `ErrCallCompleted`, for a call whose output is on the path, so its tool does not run again as the same call; a refusal, with agentsession's `ErrCallReturned`, for a call whose `result` is on the path, and so for a decision on one at its `tool_start`, since the format takes neither after a result and the call is owed that output; and a refusal for a call no `function_call` entry on the path names, other than one the filter keeps from the model, so no tool runs unrecorded. Every `decision` and `dispatch` names its call by `target`, the entry of its `function_call`, whichever writer wrote it: a live run's, one seeded by a resume or a rebase, a reopened child's. A function call the filter keeps from the model is a custom entry, which no `target` can name, and takes none. Subscribers are called in order, so one that vetoes a dispatch is registered before the recorder; one registered after it refuses a call whose dispatch is already durable, and the call's `tool_end` says the hand-off was withdrawn, for which the recorder MUST write agentsession RFC 0001's withdrawal, a `reject` carrying `withdrawn: true` with the refusal as its reason, directly after that `dispatch`, so the call reads as it was before it, never started when it has no other, and is not held to the replay rule (#119) |
 | `tool_end` | for a call the model made whose tool returned a result of its own, neither `cut` nor `withdrawn`, while another call of its batch has not settled, a `result` entry naming the call, carrying the output as the batch will append it and `failed` as its `item` will, durable before the event returns, since the batch appends the outputs only once every call has settled and a process that dies in between would otherwise leave a call that ran with nothing to show for it: a recorder MUST write it then, and MUST NOT write one for a call whose output joins as soon as it settles, the last of its batch; the output that later joins the path is that result's item, with no decision before it. Then a recordable details value as a record entry in its namespace, its `call_id` naming the call, or for a nested call the call whose tool made it; a nested call's record, carrying the result whole, its parts included, and whether the call was cut or its hand-off withdrawn, and none for a nested call `replayed`; for a child run that was not observed, its session written from the items it added and its `link`; an observed child's `link` and session are written by the observer from the child's own events, starting at its `run_start`, and the child's `queued` reports are among them: one that names a run MUST go to that run's session, and one that names no run, an input the child accepted while idle and reports before the start of the run that takes it, or accepted while its run's end was delivered and reported after it, MUST go to the session of that run, written before anything appends the item, so the item that drains it names it in `queued_from` with its trigger as `source`: when the call's child already has a session that its next run continues, the report is written there as it arrives, so it is on the record whether or not the child runs again |
 | `turn_end` | nothing of its own |
-| `run_end` | first, when a `turn_start` had neither a `response_end` nor a `model_blocked`, a failed `response` carrying the run's error; then `run` end, its `pending` list naming the run's calls left without an output, an earlier run's call the run wrote a decision or a `dispatch` for among them, with the reason mapped onto the format's cascade: `done`, `input_required` and `error` as themselves, the error's text as `ref`; `aborted` as `interrupted` with the error's text, since the host asked; `stopped` as `aborted` when the last `response_end` was marked withheld, since the format reads a run whose last response is incomplete so, as `stopped` when the last response made calls, as `done` when it made none, and for a run with no response of its own as `stopped` when it answered a pending call and left none, `aborted` otherwise, with the cause as `ref`, and for a guard's stop the cause followed by the guard's error |
+| `run_end` | first, when a `turn_start` had neither a `response_end` nor a `model_blocked`, a failed `response` carrying the run's error; then `run` end, its `pending` list naming the run's calls left without an output, an earlier run's call the run wrote a decision or a `dispatch` for among them, with the reason mapped onto the format's cascade: `done`, `input_required` and `error` as themselves, the error's text as `ref`, except that `done` is written `aborted` when the last `response_end` ended `incomplete` for a reason the loop does not stop on, with that reason as `ref`, for the reason `stopped` is below; `aborted` as `interrupted` with the error's text, since the host asked; `stopped` as `aborted` when the last `response_end` was marked withheld or ended `incomplete`, a content filter's stop and a final answer cut at `max_output_tokens` among them, since the format reads a run whose last response is incomplete so, as `stopped` when the last response made calls, as `done` when it made none, and for a run with no response of its own as `stopped` when it answered a pending call and left none, `aborted` otherwise, with the cause as `ref`, and for a guard's stop the cause followed by the guard's error |
 | a record a tool writes while it runs, a question it asks the user | a record entry at the leaf, its `call_id` naming the call on the tool's context when the session holds it, or the nearest call up a nested call's chain that it holds. A question is two record entries: the question, written before it is put to the user, and the answer, written after it is given and naming the question's entry and carrying the decider the answer names, `human` when it names none, as Nested calls has it, so a run cut while the user was deciding shows the open question under the call that was waiting on it; both name the call the question is about, its tool and its parent, when the asker put that call on the context as the Nested calls section has it, and the question's entry takes that call's `call_id` when the context carries none the session holds |
 | a fold the transform reports | a `compaction` naming what was kept and what was pinned, with agentsession RFC 0001 0.21's `requested` for a fold a host or a person asked for, and its `instructions` when they gave the summariser any; a recorder MUST NOT write `requested` for a fold the budget or the loop's retry after a context-length refusal forced, nor `instructions` without `requested` (#306); or a record entry for a fold that failed, carrying `requested` and `instructions` by the same rule, so a fold asked for that failed still says it was asked for, and, for one the transform backs off from, the split and the hash of the prefix it would have folded, so a transform seeded from the record in another process backs off from the same prefix |
 | `queued` | a `queued` entry with the item, the mode and the trigger, its richer facts included, without the kind `human` for an input that names instruction layers, is copied or is hidden, as the item that drains it has its `source` (#303), and agentsession RFC 0001's `deliver: true` for an input that arrived as a delivery, before anything appends the item; the item entry that drains it names it in `queued_from` with the trigger as `source`. A run end closes the entries of the inputs it did not append, and the recorder writes them again after it, since the agent still holds them, a delivery again as one; so does a rewind. The loop's follow-up mode is spelled `follow_up` and the format's `followup`; a writer maps the one onto the other |
@@ -2307,13 +2349,15 @@ maps onto it as follows:
 | events | `Event` with `EventType()`; `RunStart`, `TurnStart`, `ModelRetry`, `ModelBlocked`, `ItemStart`, `ItemUpdate`, `ItemEnd`, `ResponseEnd`, `ToolStart`, `ToolDispatch`, `ToolUpdate`, `ToolEnd`, `TurnEnd`, `RunEnd`, `Queued`; the `Event*` name constants |
 | tool recorder | `Config.ToolRecorder`, the executor's recorder for every batch; `session.Recorder.RecordFunc` is the value a session recorder offers |
 | tool elicitor | `Config.ToolElicitor`, installed on every tool call's context; `session.Recorder.Elicitor(by, fn)` wraps one so the question and the answer are recorded under the call |
-| reason, cause | `Reason` (`ReasonDone`, `ReasonStopped`, `ReasonInputRequired`, `ReasonAborted`, `ReasonError`); `StopCause` (`StopMaxTurns`, `StopHook`, `StopGuard`, `StopTerminate`, `StopPartialTerminate`, `StopRefused`) |
+| reason, cause | `Reason` (`ReasonDone`, `ReasonStopped`, `ReasonInputRequired`, `ReasonAborted`, `ReasonError`); `StopCause` (`StopMaxTurns`, `StopHook`, `StopGuard`, `StopTerminate`, `StopPartialTerminate`, `StopRefused`, `StopContentFilter`, `StopMaxOutputTokens`) |
 | idempotency key | `ToolDispatch.IdempotencyKey`, on `agenttool.Call` for the tool |
 | pending call | `PendingCall{Call, Reason, Tool, Dispatched, IdempotencyKey, Args, Nested}`, `PendingCall.MayHaveRun`; `PendingReason` (`PendingDeferred`, `PendingAborted`, `PendingUndispatched`, `PendingUnknown`, `PendingAnswered`, `PendingRejected`, `PendingReturned`); `PendingCalls` |
 | decision | `ToolDecision{Action, Reason, Terminate, Args, By, Note, Held, Subject, DeclineText}`; `ToolAction` (`Allow`, `Block`, `Defer`) |
 | answer | `Answer{CallID, Output, Args, Note, Terminate, By, Reason, Origin, Failed, IdempotencyKey, RunAgain}`; `Output`, `Approve`, `ApproveWith`, `Refuse`, `OutcomeUnknown`, `WithNote`, `WithBy`, `WithReason`, `WithOrigin`, `WithFailed`, `WithIdempotencyKey`, `WithRunAgain`, `RunAgainReason`, `OutcomeUnknownReason`; `Answer.Item` for an output opening a `Prompt`, carrying the answer's decider, reason, origin and failure; `ContextWithDeciders`/`DeciderFromContext`, `ContextWithReasons`/`ReasonFromContext`, `ContextWithOrigins`/`OriginFromContext` and `ContextWithFailures`/`FailedFromContext` for a host driving `Run` |
 | hooks | `Config.BeforeTurn`, `BeforeModelCall`, `OutputGuard`, `BeforeToolCall`, `AfterToolCall`, `ShouldStopAfterTurn` |
 | guard stop | an error wrapping `ErrGuard` from `ShouldStopAfterTurn`, `BeforeTurn`, `BeforeModelCall`, `OutputGuard` or the model; the output of a call a withheld response made is `WithheldCallOutput` |
+| content filter stop | `StopContentFilter`; `RunEnd.Incomplete`, the response's `openresponses.IncompleteDetails` with its `Extra` members, and `RunEnd.Refusal`; the output of a call the refused response made is `RefusedCallOutput`; `front/control` carries both members as `incomplete` and `refusal`, `front/responses` ends the caller's response incomplete with the details, and `front/a2a` rejects the task with `FilteredText` |
+| output limit stop | `StopMaxOutputTokens`; `RunEnd.Incomplete`, and `RunEnd.Answer` returns the cut text; `front/responses` ends the caller's response incomplete with reason `max_output_tokens`, and `front/a2a` completes the task with the text and the details under `MetaIncomplete` on its status message |
 | chains | `ChainBeforeTurn`, `ChainBeforeModelCall`, `ChainOutputGuard`, `ChainBeforeToolCall`, `ChainShouldStopAfterTurn`, `ChainTransform` |
 | nested call | `Invoke(ctx, name, args)`; `ErrNoInvoker`; `Parent` on the tool events, `ToolStart.Invoked`, `Replayed` on `ToolStart` and `ToolEnd`; `PendingCall.Nested` holding `NestedRecord{CallID, Parent, Name, Args, Dispatched, IdempotencyKey, DispatchArgs, Ended, Result, Err, Blocked, Reason}`, `RecordedDetails` for the details a replayed result gives back |
 | queue mode | `QueueMode`: `QueueSteer`, `QueueFollowUp`; `Queued.Input` (`InputSteer`, `InputFollowUp`, `InputDeliver`); `Agent.Redeliver` for a delivery a record owes |
@@ -2437,13 +2481,15 @@ Responses stream and completed; or a failure, `partial`, the items
 streamed before the failure, and `error`, a `message`, whether it is
 `retryable`, whether it is marked as a `guard`'s refusal, and the Open
 Responses error `code` it carries, `context_length_exceeded` say, with
-which the attempt fails. An answer's `no_done` lists the output indexes
+which the attempt fails. An answer's `incomplete` ends it with
+`response.incomplete` in place of `response.completed`, carrying those
+`incomplete_details`, members this document does not define included. An answer's `no_done` lists the output indexes
 whose `output_item.done` the stream leaves out, so only
 `response.completed` completes those items, and `at_index_zero` streams
 every item at output index 0, one after the other, as some servers
 do, while `response.completed` lists each at its own position. A stream opens each item
 with `output_item.added`, sends its text, arguments or summary as one
-delta and closes it with `output_item.done`, between
+delta, a message's refusal parts as refusal deltas, and closes it with `output_item.done`, between
 `response.created` and `response.completed`. The runner's retry
 policy waits no time between attempts and retries the errors the
 script marks retryable and nothing else. A model called more or fewer
@@ -2484,7 +2530,8 @@ value, and `terminate`; an item, a request and a response are their
 Open Responses JSON; a pending call is `call_id`, `name` and `reason`.
 `turn_start` carries `inputs` as items and `arrived` as a list of
 `item` and `mode`. The end is the `run_end` projection's `reason`,
-`cause`, `error`, `pending` and `withheld`.
+`cause`, `error`, `pending`, `withheld`, `incomplete`, the
+`incomplete_details` as Open Responses JSON or null, and `refusal`.
 
 The run's events other than `item_update` and `queued` are compared one
 to one, in order, with `expect.events`, and the two lists MUST be the
@@ -2533,6 +2580,7 @@ sequentially, gives it one call, orders it with a barrier, or holds a call with 
 | `model-blocked` | a model's guard refusal before the answer opened raises `model_blocked` in place of `response_end`, is not retried, and ends the run `stopped` with cause `guard` |
 | `call-completed-by-response` | a function call only `response.completed` completes joins the transcript under the ID it opened with before its batch runs, and its output is paired with it (#236) |
 | `fold-retry` | a request refused as longer than the window is folded through the transform and sent again as a retry, never unchanged |
+| `content-filter-stop` | a response the server ended `incomplete` with `content_filter` stops the run with cause `content_filter` and no `turn_end`, its call answered with the fixed output and never dispatched, the end carrying the details, an extension member included, and the refusal text; the next run goes ahead, with a response that makes no call, and a final answer ended at `max_output_tokens` stops the run with cause `max_output_tokens` and its details (#314) |
 | `calls-pair-by-item-id` | calls a stream opens at one output index pair with the response's by item ID, never by output index, one only the response completes among them (#236) |
 
 Four rules are not in the corpus, because a scenario cannot express
@@ -2557,6 +2605,40 @@ The scenario corpus is versioned with this document. A scenario is
 added when a rule is, and changes only when the rule it pins does, in
 the same draft; a scenario that a conforming loop fails is a defect in
 the scenario, fixed without a change of rule.
+
+## Changes in draft 0.9
+
+Draft 0.9 adds the rules below to draft 0.8, marked as Versioning has
+it.
+
+- **The turn.** A new phase 7, between the model call and the batch: a
+  response the server ended `incomplete` with `content_filter` ends the
+  run `stopped` with the new cause `content_filter`. Its calls are
+  never dispatched and are answered with an output of fixed text
+  before `run_end`, the turn has no `turn_end`, and the end carries the
+  response's `incomplete_details` as given and its refusal text and is
+  no answer. Phases 7 to 13 are now 8 to 14. Breaking for a loop that
+  ran such a response's calls, and for a host that read the end as
+  `done` with an answer (#314).
+- **Ending a run.** The causes `content_filter` and
+  `max_output_tokens`, and the `incomplete` and `refusal` members of
+  `run_end` (#314).
+- **The turn, Queues.** A final answer the server ended `incomplete`
+  with `max_output_tokens`, or `incomplete` naming no reason, ends the
+  run `stopped` with the new cause `max_output_tokens`, carrying the
+  response's `incomplete_details`; its text is still the answer.
+  Draft 0.8 ended it `done`, and a host could not tell the answer was
+  cut; breaking for a host that reads only `done` as an answer (#314).
+- **The record.** A run whose last response ended `incomplete` is
+  written `aborted`, as the format's cascade reads its segment, with
+  the cause as `ref`: a content filter's stop, an answer cut at the
+  output limit, or another stop after a response so cut. Draft 0.8
+  wrote `done` or `stopped`, which the format's verification refuses.
+  The outputs closing a content-filtered response's calls are written
+  as the policy's rejects (#314).
+- **The scenario corpus.** A scripted answer's `incomplete`, refusal
+  parts streamed as refusal deltas, `incomplete` and `refusal` in the
+  end's projection, and the scenario `content-filter-stop` (#314).
 
 ## Changes in draft 0.8
 

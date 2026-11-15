@@ -5,6 +5,93 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Changed (breaking for a host that read such a run as answered): a
+  response the model's provider ended `incomplete` with
+  `content_filter` stops the run, `ReasonStopped` with the new
+  `StopContentFilter`, before the batch. Its function calls are never
+  dispatched: each is answered with the new `RefusedCallOutput`, with
+  its item events and no tool events, so `RunEnd.Pending` is empty, the
+  next prompt goes ahead and Anthropic is sent a `tool_result` for
+  every `tool_use`. No `turn_end` follows its `response_end`, items
+  steered in during the turn stay queued, and `RunEnd.Answer` reports
+  none. v0.0.39 ran the calls and called the model again, or ended
+  `done` with the text beside the refusal as the answer. RFC 0001
+  draft 0.9, The turn, phase 7. (#314)
+- Changed (breaking for a host that reads only `ReasonDone` as an
+  answer): a final answer the provider ended `incomplete` at its output
+  limit (`max_output_tokens`), or incomplete naming no reason, ends the
+  run `ReasonStopped` with the new `StopMaxOutputTokens`, its details
+  on `RunEnd.Incomplete`. `RunEnd.Answer` still returns the cut text;
+  the cause and `Incomplete` say it was cut. v0.0.39 ended it `done`,
+  and nothing on the end said so. A response cut after calls runs them
+  as before. `front/responses` ends the caller's response incomplete
+  with reason `max_output_tokens` and the text; `front/a2a` completes
+  the task with the text and the details under the new
+  `MetaIncomplete` on its status message, A2A having no state for a
+  partial answer; a status message with no text carries it when the
+  limit came before any. A run the stop hook, the turn limit or a
+  terminating result stopped after a response so cut carries the
+  details on `RunEnd.Incomplete` too, read back from the record as
+  well, and the fronts and `tools/agent` mark its answer the same way. RFC 0001 draft 0.9, The turn, phase 14. (#314)
+- Added: `RunEnd.Incomplete`, the refused response's
+  `incomplete_details` as the provider gave them, `Extra` members such
+  as `anthropic.refusal_category` included, and `RunEnd.Refusal`, the
+  text of its refusal parts as the transcript kept them, an
+  OutputGuard's replacement in place of the message it replaced. `front/control` carries both on `run_end`
+  as `incomplete` and `refusal`. (#314)
+- Changed: `front/responses` ends a full run's response incomplete with
+  the refused response's details whole, extension members included, and
+  a single turn passes a model's incomplete details through whole where
+  it kept the reason alone. A full run counts a response's usage at its
+  `response_end`, so a refused response's tokens are in the total.
+  (#314)
+- Added: `tools/agent.ChildInfo.Incomplete` and `ChildInfo.Refusal`,
+  the child's `RunEnd.Incomplete` and `RunEnd.Refusal`, also read back
+  from the record for a call that runs again. A child the provider's
+  content filter stopped now fails the call with
+  `agent "x" was refused by its model's provider (content_filter,
+  <each extension member of the details, such as
+  anthropic.refusal_category: cyber>): <refusal text>`, where v0.0.39's
+  default said only that it stopped without a final answer; a host's
+  `WithNoAnswer` gets both members. A child whose answer was cut at the
+  output limit answers with the cut text followed by the line
+  `[agent "x"'s answer was cut short at its model's output limit
+  (max_output_tokens)]`, live or answered from the record, and
+  `ChildInfo.Incomplete` says it was cut. (#314)
+- Changed: `tools/a2a` marks a completed task's answer that front/a2a
+  says was cut (`MetaIncomplete`) with the line `[the agent's answer
+  was cut short at its model's output limit (max_output_tokens)]`, and
+  a task rejected with `FilteredText` fails the call with the refusal
+  text from the task's artifacts after it. (#314)
+- Added: `front/a2a` rejects the task of a run a content filter
+  stopped, with the new `FilteredText` as its status message, as it
+  rejects a guard's stop with `RefusedText`. The model's refusal text
+  stays in the task's artifacts, with or without an OutputGuard, so
+  the caller reads why. (#314)
+- Changed (breaking for a reader of the record): `session.Recorder`
+  writes a run whose last response ended `incomplete` as `aborted`, as
+  agentsession's cascade reads its segment: a content filter's stop,
+  an answer cut at the output limit, or any other stop after a
+  response so cut, with the cause as `ref`. v0.0.39 wrote `done` or
+  `stopped`, which `agentsession.Run.Verify` refuses. The outputs
+  closing a refused response's calls are written as the policy's
+  rejects, as a withheld response's are. A recorded child run read
+  back for a call that runs again reads an `aborted` end whose ref
+  names a stop cause other than a guard's as that stop, so a
+  terminating tool's output after a cut response is still the child's
+  answer and a host's `WithNoAnswer` is still asked; ref `incomplete`
+  reads as `max_output_tokens`. This also reads such an end that an
+  earlier release wrote for a run with no response of its own as the
+  stop, where it read as a failure. RFC 0001 draft 0.9, The record. (#314)
+- Dependencies: every module requires openresponses v0.0.20, up from
+  v0.0.19: its adapters refuse an input that would end on an assistant
+  turn their provider continues as a prefix, and never send an input
+  their provider reads with another meaning (openresponses
+  docs/extensions.md section 1.8). Nothing here broke: the loop and its
+  tests use no provider adapter.
+
 ## v0.0.39 - 2026-11-06
 
 - Changed: an abort that arrives after a delivery, `Deliver` or

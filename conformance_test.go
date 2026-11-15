@@ -117,6 +117,10 @@ type scriptedAttempt struct {
 	// AtIndexZero streams every item at output index 0, one after the
 	// other, while response.completed lists each at its own position.
 	AtIndexZero bool `json:"at_index_zero"`
+	// Incomplete ends the answer with response.incomplete carrying these
+	// details, extension members included, in place of
+	// response.completed.
+	Incomplete *openresponses.IncompleteDetails `json:"incomplete"`
 }
 
 type scriptedError struct {
@@ -711,12 +715,14 @@ func projectEnd(e *agentturn.RunEnd) map[string]any {
 		pending = append(pending, entry)
 	}
 	return map[string]any{
-		"reason":   string(e.Reason),
-		"cause":    string(e.Cause),
-		"error":    e.Err != nil,
-		"failure":  e.Failure != nil,
-		"pending":  pending,
-		"withheld": e.Withheld,
+		"reason":     string(e.Reason),
+		"cause":      string(e.Cause),
+		"error":      e.Err != nil,
+		"failure":    e.Failure != nil,
+		"pending":    pending,
+		"withheld":   e.Withheld,
+		"incomplete": e.Incomplete,
+		"refusal":    e.Refusal,
 	}
 }
 
@@ -798,6 +804,18 @@ func (m *scriptedModel) CreateStream(_ context.Context, req openresponses.Reques
 			return next.Send(ev)
 		})
 	}
+	if at.Incomplete != nil {
+		// The emitter writes the reason alone; the details go out as
+		// the script gives them.
+		next := sink
+		sink = openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+			if e, ok := ev.(*openresponses.ResponseIncompleteEvent); ok {
+				details := *at.Incomplete
+				e.Response.IncompleteDetails = &details
+			}
+			return next.Send(ev)
+		})
+	}
 	em := openresponses.NewEmitter(sink, resp)
 	if err := em.Start(); err != nil {
 		return err
@@ -813,6 +831,9 @@ func (m *scriptedModel) CreateStream(_ context.Context, req openresponses.Reques
 	}
 	if at.Error != nil {
 		return at.Error.err()
+	}
+	if at.Incomplete != nil {
+		return em.Incomplete(at.Incomplete.Reason)
 	}
 	return em.Complete()
 }
@@ -835,8 +856,16 @@ func stream(em *openresponses.Emitter, item openresponses.Item) error {
 		if err != nil {
 			return err
 		}
-		if err := w.Text(it.Text()); err != nil {
-			return err
+		for _, part := range it.Content {
+			switch p := part.(type) {
+			case *openresponses.OutputText:
+				err = w.Text(p.Text)
+			case *openresponses.Refusal:
+				err = w.Refusal(p.Refusal)
+			}
+			if err != nil {
+				return err
+			}
 		}
 		return w.Close()
 	case *openresponses.FunctionCall:

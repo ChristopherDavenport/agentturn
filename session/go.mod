@@ -6,7 +6,7 @@ require (
 	github.com/ChristopherDavenport/agentsession v0.0.38
 	github.com/ChristopherDavenport/agenttool v0.0.30
 	github.com/ChristopherDavenport/agentturn v0.0.39
-	github.com/ChristopherDavenport/openresponses v0.0.19
+	github.com/ChristopherDavenport/openresponses v0.0.20
 )
 
 // The require names the released root a consumer fetches; the replace
