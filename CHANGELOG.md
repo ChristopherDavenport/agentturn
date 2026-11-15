@@ -56,6 +56,11 @@ versions may break the API.
   `[agent "x"'s answer was cut short at its model's output limit
   (max_output_tokens)]`, live or answered from the record, and
   `ChildInfo.Incomplete` says it was cut. (#314)
+- Changed: `tools/a2a` marks a completed task's answer that front/a2a
+  says was cut (`MetaIncomplete`) with the line `[the agent's answer
+  was cut short at its model's output limit (max_output_tokens)]`, and
+  a task rejected with `FilteredText` fails the call with the refusal
+  text from the task's artifacts after it. (#314)
 - Added: `front/a2a` rejects the task of a run a content filter
   stopped, with the new `FilteredText` as its status message, as it
   rejects a guard's stop with `RefusedText`. The model's refusal text

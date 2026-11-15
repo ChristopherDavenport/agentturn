@@ -15,6 +15,14 @@
 // background task: it returns once the task runs, and the task's end
 // goes to a host function that delivers it to the parent.
 //
+// A completed task whose status message carries front/a2a's
+// MetaIncomplete, an answer cut at the remote model's output limit,
+// returns its text followed by a line saying so, as tools/agent marks a
+// local child's. A task rejected with front/a2a's FilteredText, the
+// remote model's provider refusing, fails the call with the refusal
+// text the task's artifacts hold after it, so the parent's model reads
+// why.
+//
 // The call records the callee it reaches as soon as it knows it, with
 // agenttool.WriteRecord: a [Callee] naming the URL it called, the task
 // and its context. The task is the call's own work, and the record names
@@ -1012,6 +1020,32 @@ func (o *outcome) text() string {
 	return b.String()
 }
 
+// artifactText is the text of the task's artifacts, joined.
+func (o *outcome) artifactText() string {
+	var b strings.Builder
+	for _, a := range o.artifacts {
+		b.WriteString(partsText(a.Parts))
+	}
+	return b.String()
+}
+
+// cut reports whether the status message says the answer was cut
+// short, front/a2a's MetaIncomplete, and the reason it names.
+func (o *outcome) cut() (string, bool) {
+	if o.status == nil {
+		return "", false
+	}
+	details, ok := o.status.Metadata[fronta2a.MetaIncomplete].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	reason, _ := details["reason"].(string)
+	if reason == "" {
+		reason = string(openresponses.IncompleteReasonMaxOutputTokens)
+	}
+	return reason, true
+}
+
 // info is the [TaskInfo] of the task as last seen.
 func (o *outcome) info() TaskInfo {
 	return TaskInfo{TaskID: o.taskID, ContextID: o.contextID, State: o.state, RecordErr: o.recordErr}
@@ -1041,14 +1075,32 @@ func (o *outcome) result() (agenttool.Result, error) {
 	}
 	switch o.state {
 	case a2a.TaskStateCompleted:
-		res.Output = output(o.text(), o.fileParts())
+		text := o.text()
+		if reason, ok := o.cut(); ok {
+			// The remote agent's answer was cut at its model's output
+			// limit: the parent's model is told, as tools/agent tells
+			// it of a local child's (#314).
+			if text != "" {
+				text += "\n\n"
+			}
+			text += fmt.Sprintf("[the agent's answer was cut short at its model's output limit (%s)]", reason)
+		}
+		res.Output = output(text, o.fileParts())
 		return res, nil
 	case a2a.TaskStateInputRequired, a2a.TaskStateAuthRequired:
 		return res, &InputRequiredError{TaskID: o.taskID, ContextID: o.contextID, Message: o.text(), waiting: waitingOn(o.taskID, o.status)}
 	case a2a.TaskStateCanceled:
 		return res, errors.New("the agent's task was canceled")
 	case a2a.TaskStateRejected:
-		return res, fmt.Errorf("the agent rejected the task: %s", o.text())
+		text := o.text()
+		if text == fronta2a.FilteredText {
+			// The remote model's provider refused: its refusal is in the
+			// task's artifacts, and the parent's model reads why (#314).
+			if refusal := o.artifactText(); refusal != "" {
+				text += ": " + refusal
+			}
+		}
+		return res, fmt.Errorf("the agent rejected the task: %s", text)
 	case a2a.TaskStateFailed:
 		return res, fmt.Errorf("the agent's task failed: %s", o.text())
 	}
