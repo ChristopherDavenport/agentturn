@@ -539,6 +539,11 @@ type wireRunEnd struct {
 	Pending  []wirePending   `json:"pending,omitempty"`
 	Notes    []wireNote      `json:"notes,omitempty"`
 	Withheld bool            `json:"withheld,omitempty"`
+	// Incomplete and Refusal are a content filter stop's: the
+	// response's incomplete_details as the provider gave them, and its
+	// refusal text (#314).
+	Incomplete *openresponses.IncompleteDetails `json:"incomplete,omitempty"`
+	Refusal    string                           `json:"refusal,omitempty"`
 }
 
 type wireQueued struct {
@@ -1084,11 +1089,13 @@ func runEndOut(e *agentturn.RunEnd) (wireRunEnd, error) {
 		return wireRunEnd{}, err
 	}
 	return wireRunEnd{Type: e.EventType(), RunID: e.RunID, Items: items, Reason: string(e.Reason), Cause: string(e.Cause),
-		Err: errorOut(e.Err), Failure: errorOut(e.Failure), Pending: pending, Notes: notes, Withheld: e.Withheld}, nil
+		Err: errorOut(e.Err), Failure: errorOut(e.Failure), Pending: pending, Notes: notes, Withheld: e.Withheld,
+		Incomplete: e.Incomplete, Refusal: e.Refusal}, nil
 }
 
 func runEndIn(w wireRunEnd) (*agentturn.RunEnd, error) {
-	e := &agentturn.RunEnd{RunID: w.RunID, Reason: agentturn.Reason(w.Reason), Cause: agentturn.StopCause(w.Cause), Err: errorIn(w.Err), Failure: errorIn(w.Failure), Withheld: w.Withheld}
+	e := &agentturn.RunEnd{RunID: w.RunID, Reason: agentturn.Reason(w.Reason), Cause: agentturn.StopCause(w.Cause), Err: errorIn(w.Err), Failure: errorIn(w.Failure), Withheld: w.Withheld,
+		Incomplete: w.Incomplete, Refusal: w.Refusal}
 	var err error
 	if e.Items, err = itemsIn(w.Items); err != nil {
 		return nil, err

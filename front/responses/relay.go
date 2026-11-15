@@ -1,6 +1,7 @@
 package responses
 
 import (
+	"maps"
 	"strings"
 
 	"github.com/ChristopherDavenport/openresponses"
@@ -30,10 +31,35 @@ type relay struct {
 	// another item started or ended, or the run ended, which the loop
 	// never leaves a message it keeps, and it was closed emptied.
 	withheld bool
+
+	// details are the incomplete_details the response.incomplete event
+	// carries in place of the emitter's, which hold the reason alone.
+	details *openresponses.IncompleteDetails
 }
 
 func newRelay(sink openresponses.EventSink, resp *openresponses.Response) *relay {
-	return &relay{em: openresponses.NewEmitter(sink, resp)}
+	r := &relay{}
+	r.em = openresponses.NewEmitter(openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
+		if e, ok := ev.(*openresponses.ResponseIncompleteEvent); ok && r.details != nil && e.Response != nil {
+			details := *r.details
+			details.Extra = maps.Clone(r.details.Extra)
+			e.Response.IncompleteDetails = &details
+		}
+		return sink.Send(ev)
+	}), resp)
+	return r
+}
+
+// incomplete ends the response incomplete with the details as the
+// model gave them, members the spec does not define included, such as
+// an adapter's anthropic.refusal_category (#314); with none, for the
+// output limit, as a response that names no reason has been read.
+func (r *relay) incomplete(details *openresponses.IncompleteDetails) error {
+	if details == nil {
+		return r.em.Incomplete(openresponses.IncompleteReasonMaxOutputTokens)
+	}
+	r.details = details
+	return r.em.Incomplete(details.Reason)
 }
 
 // start opens a writer for a streamed item. Items that are never

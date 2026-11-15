@@ -54,7 +54,8 @@ func sampleEvents(t *testing.T) map[string]agentturn.Event {
 		"ToolEnd":      &agentturn.ToolEnd{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Result: result, Err: errors.New("boom"), Blocked: true, Deferred: true, Reason: "r", Parent: "call_0", Withdrawn: true, Cut: true, Replayed: true},
 		"TurnEnd":      &agentturn.TurnEnd{RunID: "run_1", Turn: 1, Response: resp, ToolResults: []agenttool.Result{result}},
 		"RunEnd": &agentturn.RunEnd{RunID: "run_1", Items: openresponses.Items{openresponses.UserText("hi"), call, out}, Reason: agentturn.ReasonInputRequired,
-			Cause: agentturn.StopGuard, Err: agentturn.ErrRunning, Failure: errors.New("disk full"), Withheld: true, Pending: []agentturn.PendingCall{{
+			Cause: agentturn.StopGuard, Err: agentturn.ErrRunning, Failure: errors.New("disk full"), Withheld: true, Refusal: "no",
+			Incomplete: &openresponses.IncompleteDetails{Reason: openresponses.IncompleteReasonContentFilter, Extra: map[string]any{"anthropic.refusal_category": "cyber"}}, Pending: []agentturn.PendingCall{{
 				Call: call, Reason: agentturn.PendingDeferred, Tool: remoteUpper(), Dispatched: true, IdempotencyKey: "k", Args: json.RawMessage(`{"text":"b"}`),
 				Ran: out, RanWhere: "branch", Refused: "no", Decision: decision,
 				Notes:    []agentturn.Note{{Item: openresponses.UserText("only the unit tests"), Mode: agentturn.InputResume, Trigger: trigger, CallID: "call_1"}},
@@ -283,6 +284,35 @@ func TestAnswersCarryEveryField(t *testing.T) {
 	got.Output, in.Output = nil, nil
 	if !reflect.DeepEqual(got, in) || !bytes.Equal(gotOut, wantOut) {
 		t.Errorf("answer after the wire = %+v %s, want %+v %s", got, gotOut, in, wantOut)
+	}
+}
+
+// TestAContentFilterEndCrossesTheWire pins #314: a remote view of a run
+// the provider's content filter stopped gets the response's incomplete
+// details, extension members included, and the refusal text, and reads
+// the end as no answer.
+func TestAContentFilterEndCrossesTheWire(t *testing.T) {
+	in := &agentturn.RunEnd{RunID: "run_1", Reason: agentturn.ReasonStopped, Cause: agentturn.StopContentFilter,
+		Items:      openresponses.Items{openresponses.UserText("probe a"), openresponses.AssistantText("Sure, ")},
+		Incomplete: &openresponses.IncompleteDetails{Reason: openresponses.IncompleteReasonContentFilter, Extra: map[string]any{"anthropic.refusal_category": "cyber"}},
+		Refusal:    "I can't help with that."}
+	data, err := MarshalEvent(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev, err := UnmarshalEvent(data)
+	if err != nil {
+		t.Fatalf("%v\n%s", err, data)
+	}
+	got := ev.(*agentturn.RunEnd)
+	if got.Cause != agentturn.StopContentFilter || got.Refusal != in.Refusal {
+		t.Errorf("end = %+v", got)
+	}
+	if got.Incomplete == nil || got.Incomplete.Reason != openresponses.IncompleteReasonContentFilter || got.Incomplete.Extra["anthropic.refusal_category"] != "cyber" {
+		t.Errorf("incomplete = %+v\n%s", got.Incomplete, data)
+	}
+	if text, ok := got.Answer(); ok {
+		t.Errorf("answer = %q", text)
 	}
 }
 

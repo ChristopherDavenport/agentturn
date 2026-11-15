@@ -46,6 +46,15 @@ var (
 // the guard's error, which may say what the guard kept from the model.
 const WithheldCallOutput = "Error: not run: the response that made this call was withheld"
 
+// RefusedCallOutput is the text of the output the loop appends for a
+// function call of a response the provider ended incomplete with
+// content_filter, which stops the run with [StopContentFilter]: the
+// loop never dispatches the call and closes it, so the transcript holds
+// no call without an output, the next prompt goes ahead, and a provider
+// that pairs every call with a result, as Anthropic's tool_use with
+// tool_result, is sent one.
+const RefusedCallOutput = "Error: not run: the provider refused the response that made this call"
+
 // EventBuffer is how many events the loop can run ahead of the consumer
 // of [Run] or [Continue] before it blocks; [Agent] delivers every event
 // synchronously and has no buffer.
@@ -848,6 +857,10 @@ type errStop struct {
 	// withheld says OutputGuard withheld a message of the response in
 	// flight, which is what stopped the run.
 	withheld bool
+	// incomplete and refusal are the details and the refusal text of
+	// the response a content filter stop ended the run on.
+	incomplete *openresponses.IncompleteDetails
+	refusal    string
 }
 
 func (e *errStop) Error() string {
@@ -1204,6 +1217,8 @@ func (r *runner) run(ctx context.Context, prompts openresponses.Items, approved 
 		end.Cause = stop.cause
 		end.Err = stop.err
 		end.Withheld = stop.withheld
+		end.Incomplete = stop.incomplete
+		end.Refusal = stop.refusal
 	case ctx.Err() != nil:
 		end.Reason = ReasonAborted
 		end.Err = context.Cause(ctx)
@@ -1460,6 +1475,22 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 			return err
 		}
 		calls := resp.FunctionCalls()
+		if filtered(resp) {
+			// The provider refused the response: the run stops before
+			// the batch, past its last drain, so what was steered in
+			// stays queued. Its calls never run; each is closed with
+			// the fixed text, so the transcript holds no call without
+			// an output and the next run may start (#314).
+			r.ending()
+			made := make(Transcript, 0, len(calls))
+			for _, call := range calls {
+				made = append(made, call)
+			}
+			if err := r.closeCalls(made, RefusedCallOutput); err != nil {
+				return err
+			}
+			return &errStop{reason: ReasonStopped, cause: StopContentFilter, incomplete: cloneDetails(resp.IncompleteDetails), refusal: refusalText(resp)}
+		}
 		results, pending, err := r.toolBatch(ctx, tools, calls)
 		if err != nil {
 			return err
@@ -1866,7 +1897,7 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 					return nil, err
 				}
 			}
-			if err := r.closeWithheld(r.transcript[start:]); err != nil {
+			if err := r.closeCalls(r.transcript[start:], WithheldCallOutput); err != nil {
 				return nil, err
 			}
 			return nil, err
@@ -1903,7 +1934,7 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 					return nil, err
 				}
 			}
-			if err := r.closeWithheld(r.transcript[start:]); err != nil {
+			if err := r.closeCalls(r.transcript[start:], WithheldCallOutput); err != nil {
 				return nil, err
 			}
 			return nil, halt
@@ -1968,15 +1999,53 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 	}
 }
 
-// closeWithheld appends a [WithheldCallOutput] for each function call
-// among items, the part of the transcript a withheld response added.
-// Those calls were never dispatched; nothing else answers them.
-func (r *runner) closeWithheld(items Transcript) error {
+// closeCalls appends an output of the fixed text for each function
+// call among items without one: [WithheldCallOutput] for the part of
+// the transcript a withheld response added, [RefusedCallOutput] for the
+// calls of a response the provider's content filter ended. Those calls
+// were never dispatched; nothing else answers them.
+func (r *runner) closeCalls(items Transcript, text string) error {
 	var outputs openresponses.Items
 	for _, call := range unansweredCalls(items) {
-		outputs = append(outputs, &openresponses.FunctionCallOutput{CallID: call.CallID, Output: openresponses.FunctionCallOutputData{Text: WithheldCallOutput}})
+		outputs = append(outputs, &openresponses.FunctionCallOutput{CallID: call.CallID, Output: openresponses.FunctionCallOutputData{Text: text}})
 	}
 	return r.appendItems(outputs, InputTool)
+}
+
+// filtered reports whether the provider ended resp incomplete with
+// content_filter.
+func filtered(resp *openresponses.Response) bool {
+	return resp != nil && resp.Status == openresponses.ResponseStatusIncomplete &&
+		resp.IncompleteDetails != nil && resp.IncompleteDetails.Reason == openresponses.IncompleteReasonContentFilter
+}
+
+// cloneDetails copies d and its extension members, so the end does not
+// share them with the response the transcript's subscribers hold.
+func cloneDetails(d *openresponses.IncompleteDetails) *openresponses.IncompleteDetails {
+	if d == nil {
+		return nil
+	}
+	c := *d
+	c.Extra = maps.Clone(d.Extra)
+	return &c
+}
+
+// refusalText joins the refusal parts of resp's assistant messages, in
+// order, a line each.
+func refusalText(resp *openresponses.Response) string {
+	var parts []string
+	for _, item := range resp.Output {
+		m, ok := item.(*openresponses.Message)
+		if !ok || m.Role != openresponses.RoleAssistant {
+			continue
+		}
+		for _, part := range m.Content {
+			if p, ok := part.(*openresponses.Refusal); ok && p.Refusal != "" {
+				parts = append(parts, p.Refusal)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 // sleep waits for d or until ctx is done.

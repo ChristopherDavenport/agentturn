@@ -68,6 +68,13 @@ var ErrConversationBusy = errors.New("conversation has a task in flight")
 // fixed, so a guard's reason never reaches the caller.
 const RefusedText = "the agent's guard refused this request"
 
+// FilteredText is the status message of a task whose run the model's
+// provider stopped with its content filter
+// (agentturn.StopContentFilter). It is fixed: the provider's refusal
+// text and category stay with the host, on the run's end and in the
+// record.
+const FilteredText = "the model's provider refused this request"
+
 var _ a2asrv.AgentExecutor = (*Executor)(nil)
 
 // Option configures an [Executor].
@@ -912,6 +919,12 @@ func (e *Executor) conclude(ctx context.Context, reqCtx *a2asrv.RequestContext, 
 	case agentturn.ReasonDone, agentturn.ReasonStopped:
 		if out.bounded != nil {
 			return e.finish(ctx, reqCtx, q, a2a.TaskStateFailed, errorMessage(reqCtx, out.bounded))
+		}
+		if out.end.Cause == agentturn.StopContentFilter {
+			// The provider's content filter ended the model's response:
+			// the agent refused the task as a guard's stop does, and
+			// the text before the refusal is no answer (#314).
+			return e.finish(ctx, reqCtx, q, a2a.TaskStateRejected, a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: FilteredText}))
 		}
 		if _, ok := out.end.Answer(); out.end.Cause == agentturn.StopGuard && !ok {
 			// A guard stopped the run before the agent answered, at

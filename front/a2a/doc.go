@@ -20,7 +20,10 @@
 // is no answer (agentturn.RunEnd.Withheld). The
 // guard's error is not sent, since its text may carry the rule a
 // caller could phrase around; the host has it on RunEnd.Err and in the
-// record.
+// record. A run the model's provider stopped with its content filter
+// (agentturn.StopContentFilter) is refused the same way, with
+// [FilteredText] as the status message; the agent ran none of the
+// refused response's calls.
 //
 // A task keeps its artifacts, so under a configuration with an
 // OutputGuard the executor does not stream a message's text: it writes

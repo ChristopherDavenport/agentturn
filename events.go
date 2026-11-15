@@ -455,7 +455,8 @@ type ResponseEnd struct {
 	// as output the items the transcript took from it, without the
 	// withheld message or anything after it. No turn_end follows; the
 	// outputs closing its calls and the run_end do. A server's own
-	// content_filter response is not withheld.
+	// content_filter response is not withheld: it is carried as it
+	// arrived, and stops the run with [StopContentFilter].
 	Withheld bool
 }
 
@@ -648,6 +649,18 @@ const (
 	// StopRefused: an answer built with [Refuse] ended the run instead
 	// of calling the model.
 	StopRefused StopCause = "refused"
+	// StopContentFilter: the model's response ended incomplete with
+	// reason content_filter, the provider's refusal. Its function calls
+	// are never dispatched: each is answered with a [RefusedCallOutput]
+	// output, with its item_end and no tool events, before the run ends,
+	// so RunEnd.Pending is empty and the next prompt goes ahead. No
+	// turn_end follows the response_end, and the items steered in during
+	// the turn stay queued. RunEnd.Incomplete carries the response's
+	// incomplete_details as the provider gave them and RunEnd.Refusal
+	// its refusal text; the end is no answer. It is not [StopRefused],
+	// which is a refusal on resume, nor [StopGuard]: nothing is
+	// withheld and no error is set.
+	StopContentFilter StopCause = "content_filter"
 )
 
 // RunEnd closes a run. Exactly one is emitted per run and nothing
@@ -709,6 +722,16 @@ type RunEnd struct {
 	// so whatever message Items end with was said before it and is no
 	// answer, and Answer reports none.
 	Withheld bool
+	// Incomplete is the incomplete_details of the response that ended
+	// the run with Cause [StopContentFilter], as the provider gave them,
+	// members this package does not define, such as an adapter's
+	// anthropic.refusal_category, included in Extra. It is nil for every
+	// other end.
+	Incomplete *openresponses.IncompleteDetails
+	// Refusal is the text of the refusal parts of that response's
+	// assistant messages, in order, joined by newlines, and empty when
+	// the provider sent none or the run ended otherwise.
+	Refusal string
 }
 
 // EventType returns "run_end".
@@ -724,9 +747,11 @@ func (*RunEnd) EventType() string { return EventRunEnd }
 // messages but not last among the items. A message that OutputGuard
 // replaced is the replacement, and an empty one is no answer. A run
 // whose message OutputGuard withheld (Withheld) did not answer either,
-// though a message the same response spoke before it may end Items.
+// though a message the same response spoke before it may end Items, and
+// nor did one the provider's content filter stopped
+// ([StopContentFilter]), whatever text its refused message holds.
 func (e *RunEnd) Answer() (string, bool) {
-	if e.Withheld {
+	if e.Withheld || e.Cause == StopContentFilter {
 		return "", false
 	}
 	last := len(e.Items) - 1

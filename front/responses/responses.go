@@ -64,6 +64,16 @@
 // record. A run a guard stopped after an answer completes with that
 // answer, the OutputGuard's replacement when it made one.
 //
+// A response the model's provider ended incomplete with content_filter
+// stops a full run (agentturn.StopContentFilter), and the caller's
+// response ends incomplete as the model's did, with the provider's
+// incomplete_details as given, members the spec does not define, such
+// as anthropic.refusal_category, included, and the refused response's
+// usage. The agent runs none of that response's calls; under
+// [WithToolItems] they come with the outputs the loop closed them with,
+// agentturn.RefusedCallOutput. A single turn passes a response the
+// model ended incomplete through the same way, its details whole.
+//
 // A full run that a terminating tool result stopped
 // (agentturn.StopTerminate or agentturn.StopPartialTerminate) is how a
 // handoff ends the sender's part. [WithHandoff] is asked for the
@@ -535,6 +545,13 @@ func (a *Adapter) fullRun(ctx context.Context, base agentturn.Config, req openre
 		}
 		return context.Canceled
 	case agentturn.ReasonStopped:
+		if end.Cause == agentturn.StopContentFilter {
+			// The provider's content filter ended the model's response:
+			// the caller's response ends as the model's did, with its
+			// details as given, its category among them (#314).
+			rl.em.Response().Usage = &usage
+			return rl.incomplete(end.Incomplete)
+		}
 		// A guard that stopped the run before the model answered
 		// refused the request, at whichever hook it stopped it: before
 		// the first call, on a tool's output before the next, or after
@@ -624,12 +641,9 @@ func (a *Adapter) relayRun(ctx context.Context, transcript agentturn.Transcript,
 				return nil, nil, err
 			}
 		case *agentturn.ResponseEnd:
-			// A withheld response has no turn_end, and its tokens were
-			// spent all the same.
-			if e.Withheld && e.Response != nil && e.Response.Usage != nil {
-				addUsage(usage, *e.Response.Usage)
-			}
-		case *agentturn.TurnEnd:
+			// Counted here rather than on turn_end, which a withheld
+			// response and one the provider's content filter ended do
+			// not have: their tokens were spent all the same.
 			if e.Response != nil && e.Response.Usage != nil {
 				addUsage(usage, *e.Response.Usage)
 			}
@@ -895,11 +909,7 @@ func (a *Adapter) oneTurn(ctx context.Context, cfg agentturn.Config, req openres
 		return errors.New("responses: model response failed")
 	case openresponses.ResponseStatusIncomplete:
 		rl.em.Response().Usage = final.Usage
-		reason := openresponses.IncompleteReasonMaxOutputTokens
-		if final.IncompleteDetails != nil {
-			reason = final.IncompleteDetails.Reason
-		}
-		return rl.em.Incomplete(reason)
+		return rl.incomplete(final.IncompleteDetails)
 	}
 	rl.em.Response().Usage = final.Usage
 	return rl.em.Complete()

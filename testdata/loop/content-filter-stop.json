@@ -1,0 +1,88 @@
+{
+  "name": "content-filter-stop",
+  "description": "A response the server ended incomplete with content_filter ends the run stopped with cause content_filter and no turn_end: its function calls are never dispatched, each is answered with the fixed refused output before run_end, and the end carries the response's incomplete_details, extension members included, and its refusal text, so the next run goes ahead; a response ended at max_output_tokens is no such stop.",
+  "rules": ["#the-turn", "#the-model-call", "#ending-a-run", "#order", "#invariants"],
+  "config": {"model": "m"},
+  "tools": [{"name": "probe", "result": {"output": "open ports: 22"}}],
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "probe", "arguments": "{\"host\":\"a\"}"},
+      {"type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": "I can't help with that."}]}
+    ], "incomplete": {"reason": "content_filter", "anthropic.refusal_category": "cyber"}},
+    {"id": "resp_2", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": "No."}]}
+    ], "incomplete": {"reason": "content_filter"}},
+    {"id": "resp_3", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Once upon"}]}
+    ], "incomplete": {"reason": "max_output_tokens"}}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "probe a"}]}],
+      "expect": {
+        "events": [
+          {"type": "run_start", "source": "input"},
+          {"type": "item_start", "turn": 0, "item": {"type": "message", "role": "user"}},
+          {"type": "item_end", "turn": 0, "item": {"type": "message", "role": "user"}},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start", "turn": 1, "item": {"type": "function_call", "call_id": "call_1"}, "response_id": "resp_1"},
+          {"type": "item_end", "turn": 1, "item": {"type": "function_call", "call_id": "call_1", "name": "probe"}, "response_id": "resp_1"},
+          {"type": "item_start", "turn": 1, "item": {"type": "message", "role": "assistant"}, "response_id": "resp_1"},
+          {"type": "item_end", "turn": 1, "item": {"type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": "I can't help with that."}]}, "response_id": "resp_1"},
+          {"type": "response_end", "turn": 1, "withheld": false,
+           "response": {"id": "resp_1", "status": "incomplete", "incomplete_details": {"reason": "content_filter", "anthropic.refusal_category": "cyber"}}},
+          {"type": "item_start", "turn": 1, "item": {"type": "function_call_output", "call_id": "call_1"}, "response_id": ""},
+          {"type": "item_end", "turn": 1, "item": {"type": "function_call_output", "call_id": "call_1", "output": "Error: not run: the provider refused the response that made this call"}, "response_id": ""},
+          {"type": "run_end", "reason": "stopped", "cause": "content_filter", "error": false, "pending": [], "withheld": false,
+           "incomplete": {"reason": "content_filter", "anthropic.refusal_category": "cyber"},
+           "refusal": "I can't help with that."}
+        ],
+        "transcript": [
+          {"type": "message", "role": "user"},
+          {"type": "function_call", "call_id": "call_1"},
+          {"type": "message", "role": "assistant"},
+          {"type": "function_call_output", "call_id": "call_1", "output": "Error: not run: the provider refused the response that made this call"}
+        ]
+      }
+    },
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "then say hi"}]}],
+      "expect": {
+        "events": [
+          {"type": "run_start", "source": "input"},
+          {"type": "item_start", "turn": 0, "item": {"type": "message", "role": "user"}},
+          {"type": "item_end", "turn": 0, "item": {"type": "message", "role": "user"}},
+          {"type": "turn_start", "turn": 1,
+           "request": {"input": [
+             {"type": "message", "role": "user"},
+             {"type": "function_call", "call_id": "call_1"},
+             {"type": "message", "role": "assistant"},
+             {"type": "function_call_output", "call_id": "call_1"},
+             {"type": "message", "role": "user"}
+           ]}},
+          {"type": "item_start", "turn": 1, "item": {"type": "message", "role": "assistant"}, "response_id": "resp_2"},
+          {"type": "item_end", "turn": 1, "item": {"type": "message", "role": "assistant"}, "response_id": "resp_2"},
+          {"type": "response_end", "turn": 1, "response": {"id": "resp_2", "status": "incomplete"}},
+          {"type": "run_end", "reason": "stopped", "cause": "content_filter", "error": false, "pending": [], "withheld": false,
+           "incomplete": {"reason": "content_filter"}, "refusal": "No."}
+        ]
+      }
+    },
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "write at length"}]}],
+      "expect": {
+        "events": [
+          {"type": "run_start", "source": "input"},
+          {"type": "item_start", "turn": 0, "item": {"type": "message", "role": "user"}},
+          {"type": "item_end", "turn": 0, "item": {"type": "message", "role": "user"}},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start", "turn": 1, "item": {"type": "message", "role": "assistant"}, "response_id": "resp_3"},
+          {"type": "item_end", "turn": 1, "item": {"type": "message", "role": "assistant"}, "response_id": "resp_3"},
+          {"type": "response_end", "turn": 1, "response": {"id": "resp_3", "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}},
+          {"type": "turn_end", "turn": 1, "tool_results": []},
+          {"type": "run_end", "reason": "done", "cause": "", "error": false, "pending": []}
+        ]
+      }
+    }
+  ]
+}

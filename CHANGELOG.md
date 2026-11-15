@@ -7,6 +7,46 @@ versions may break the API.
 
 ## Unreleased
 
+- Changed (breaking for a host that read such a run as answered): a
+  response the model's provider ended `incomplete` with
+  `content_filter` stops the run, `ReasonStopped` with the new
+  `StopContentFilter`, before the batch. Its function calls are never
+  dispatched: each is answered with the new `RefusedCallOutput`, with
+  its item events and no tool events, so `RunEnd.Pending` is empty, the
+  next prompt goes ahead and Anthropic is sent a `tool_result` for
+  every `tool_use`. No `turn_end` follows its `response_end`, items
+  steered in during the turn stay queued, and `RunEnd.Answer` reports
+  none. v0.0.39 ran the calls and called the model again, or ended
+  `done` with the text beside the refusal as the answer. A response
+  ended at `max_output_tokens` is unchanged: its calls run, and with
+  none the run ends `done`. RFC 0001 draft 0.9, The turn, phase 7.
+  (#314)
+- Added: `RunEnd.Incomplete`, the refused response's
+  `incomplete_details` as the provider gave them, `Extra` members such
+  as `anthropic.refusal_category` included, and `RunEnd.Refusal`, the
+  text of its refusal parts. `front/control` carries both on `run_end`
+  as `incomplete` and `refusal`. (#314)
+- Changed: `front/responses` ends a full run's response incomplete with
+  the refused response's details whole, extension members included, and
+  a single turn passes a model's incomplete details through whole where
+  it kept the reason alone. A full run counts a response's usage at its
+  `response_end`, so a refused response's tokens are in the total.
+  (#314)
+- Added: `front/a2a` rejects the task of a run a content filter
+  stopped, with the new `FilteredText` as its status message, as it
+  rejects a guard's stop with `RefusedText`. (#314)
+- Changed (breaking for a reader of the record): `session.Recorder`
+  writes a run whose last response ended `incomplete` as `aborted`, as
+  agentsession's cascade reads its segment: a content filter's stop,
+  or any other stop after such a response, with the cause as `ref`, and
+  a final answer cut at `max_output_tokens`, which the loop ends
+  `done`, with `max_output_tokens` as `ref`. v0.0.39 wrote `done` or
+  `stopped`, which `agentsession.Run.Verify` refuses. The outputs
+  closing a refused response's calls are written as the policy's
+  rejects, as a withheld response's are. A recorded child run read
+  back for a call that runs again reads `aborted` `content_filter` as
+  the content filter's stop and `aborted` `max_output_tokens` as the
+  `done` run it was. RFC 0001 draft 0.9, The record. (#314)
 - Dependencies: every module requires openresponses v0.0.20, up from
   v0.0.19: its adapters refuse an input that would end on an assistant
   turn their provider continues as a prefix, and never send an input
