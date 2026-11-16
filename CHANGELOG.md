@@ -5,6 +5,53 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Changed (breaking for a host that built with `compact.WithBudget(0)`):
+  a budget of 0 is no budget: the transform folds nothing for the
+  transcript's size, and only a fold asked for, by `FoldNext` or by the
+  loop's retry after a context-length refusal, is made. v0.0.40 folded
+  on every call under a budget of 0. Under no budget the summary
+  request's `max_output_tokens` is `DefaultSummaryMaxOutputTokens`, and
+  the person's kept messages are held to `WithPersonTotal`, as given,
+  or to the default under `DefaultBudget`: a quarter of it, at most half
+  of what the request's settings leave of it. (#318)
+- Changed (breaking for a host that read such a run as answered): a
+  final answer the provider ended `incomplete` with
+  `incomplete_details` whose `reason` is empty ends the run
+  `ReasonStopped` with `StopMaxOutputTokens`, as one with no details
+  does and as RFC 0001 already had it; v0.0.40 ended it `done`, while
+  the record wrote `aborted` and read it back as the output limit's
+  stop. `RunEnd.Incomplete` names `max_output_tokens` for both forms,
+  live and read back from the record. Part of #317.
+- Added: `ChainAfterToolCall` joins several `Config.AfterToolCall`
+  hooks: in order, each seeing the result as the hooks before it left
+  it; a hook returning no override passes the result on unchanged; the
+  first error stops the chain and is returned. RFC 0001 draft 0.10,
+  Hooks, which also states the transform's chain rule that
+  `ChainTransform` already follows. (#319)
+- Added: `(*compact.Transform).SetBudget` changes the budget while the
+  conversation goes on, from the next call, under the lock `FoldNext`
+  takes; the transform keeps its fold memory and its back-off, a fold
+  in flight keeps the budget it began with, `NewLocal`'s default
+  `WithMinFold` follows the new budget, and 0 is no budget, as above.
+  A host can build the transform before it knows the model's context
+  window. RFC 0001 draft 0.10, The request, step 2. (#318)
+- Added: `compact.WithModelOfRequest` asks each fold of the model the
+  request being folded for names (`agentturn.RequestFromContext`), and,
+  for `NewLocal`, under that request's reasoning, so a model switched
+  mid-session writes the next summary. `WithModel` wins over it, in
+  either order, the reasoning not taken either; `WithRequest` still
+  edits the summary request last. (#318)
+- Added: `compact.Fold.Budget` and `compact.Fold.Model`, the budget a
+  fold, failed or not, was made under and the model its request named,
+  `New`'s compaction request included. `session` writes both on every
+  compaction's `fold` member (`FoldCall.Budget`, a pointer, nil in a
+  record written before this; `FoldCall.Model`, now set for `New` too)
+  and on failed and unplaced fold entries; the `fold` member is written
+  on every compaction. agentturn writes no entry for the setting change
+  itself, which is the host's. RFC 0001 draft 0.10, The record. (#318)
+
 ## v0.0.40 - 2026-11-15
 
 - Changed (breaking for a host that read such a run as answered): a

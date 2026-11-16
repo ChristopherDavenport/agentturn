@@ -484,7 +484,7 @@ const FailedFoldNS = "agentturn:compaction_failed"
 // fold's model calls did, as far as they got: how many there were, the
 // usage of them all summed, and for the last one the members a
 // compaction entry's [FoldMember] carries (request_hash, response_id,
-// model) and the types of the items it answered, so a reader can tell
+// model, budget) and the types of the items it answered, so a reader can tell
 // a model that answered with no text, or with too much, from a call
 // that never completed. For a fold the transform backs off from, it
 // carries the split and the prefix hash the transform remembers, which
@@ -524,11 +524,14 @@ type UnplacedFold struct {
 	Reason       string `json:"reason"`
 	TokensBefore int    `json:"tokens_before,omitempty"`
 	ResponseID   string `json:"response_id,omitempty"`
+	// Model and Budget are the fold's, as [FoldCall] has them (#318).
+	Model  string `json:"model,omitempty"`
+	Budget *int   `json:"budget,omitempty"`
 }
 
 // FoldMember is the member a compaction entry carries, beyond those the
-// format defines, naming the fold's own model call. Its value is a
-// [FoldCall]. Readers of the format preserve members they do not
+// format defines, naming the fold's own model call and the budget it
+// was made under. Its value is a [FoldCall]. Readers of the format preserve members they do not
 // define, and Session.Verify never reads it: the request it hashes is
 // the fold's, which no path rebuilds.
 const FoldMember = "fold"
@@ -552,8 +555,14 @@ type FoldCall struct {
 	RequestHash string `json:"request_hash,omitempty"`
 	// ResponseID is the ID of the response the call produced.
 	ResponseID string `json:"response_id,omitempty"`
-	// Model is the model the request named.
+	// Model is the model the fold's request named, compact.Fold.Model:
+	// the summary request's, or the compaction request's, which has
+	// no hash; empty when it named none.
 	Model string `json:"model,omitempty"`
+	// Budget is the budget the fold was made under, compact.Fold.Budget,
+	// 0 for no budget. It is nil in a record written before v0.0.41,
+	// which did not say (RFC 0001 The record; #318).
+	Budget *int `json:"budget,omitempty"`
 }
 
 // NestedCallNS is the namespace of the custom entries written for a
@@ -4909,7 +4918,10 @@ func recordedEnd(run *agentsession.Run, items openresponses.Items) *agentturn.Ru
 // lastIncomplete is what the end of run carried live, read from its
 // segment: the incomplete_details of its last response, extension
 // members included, and the text of the refusal parts of that
-// response's assistant messages, joined as the loop joins them.
+// response's assistant messages, joined as the loop joins them. A last
+// response that ended incomplete naming no reason, with no details or
+// details whose reason is empty, reads as the loop read it live: cut
+// at the output limit, max_output_tokens (#317).
 func lastIncomplete(run *agentsession.Run) (*openresponses.IncompleteDetails, string) {
 	var last *agentsession.ResponseEntry
 	for _, e := range run.Segment {
@@ -4917,11 +4929,17 @@ func lastIncomplete(run *agentsession.Run) (*openresponses.IncompleteDetails, st
 			last = r
 		}
 	}
-	if last == nil || last.Incomplete == nil {
+	if last == nil || last.Incomplete == nil && last.Status != openresponses.ResponseStatusIncomplete {
 		return nil, ""
 	}
-	details := *last.Incomplete
-	details.Extra = maps.Clone(last.Incomplete.Extra)
+	var details openresponses.IncompleteDetails
+	if last.Incomplete != nil {
+		details = *last.Incomplete
+		details.Extra = maps.Clone(last.Incomplete.Extra)
+	}
+	if details.Reason == "" {
+		details.Reason = openresponses.IncompleteReasonMaxOutputTokens
+	}
 	var parts []string
 	for _, e := range run.Segment {
 		ie, ok := e.(*agentsession.ItemEntry)
@@ -7778,7 +7796,8 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 		// items on a resume. The record says a fold happened and the
 		// requests after it, which the path cannot rebuild, carry no
 		// hash; the run goes on.
-		raw, err := json.Marshal(UnplacedFold{Reason: "the fold's first kept item is not one entry of the path", TokensBefore: f.TokensBefore, ResponseID: f.ResponseID})
+		call, _ := foldCall(f)
+		raw, err := json.Marshal(UnplacedFold{Reason: "the fold's first kept item is not one entry of the path", TokensBefore: f.TokensBefore, ResponseID: f.ResponseID, Model: call.Model, Budget: call.Budget})
 		if err != nil {
 			return fmt.Errorf("session: encode unplaced fold: %w", err)
 		}
@@ -7817,17 +7836,18 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 	if f.Requested {
 		entry.Instructions = f.Instructions
 	}
-	if f.Request != nil || f.ResponseID != "" {
-		call, err := foldCall(f)
-		if err != nil {
-			return err
-		}
-		raw, err := json.Marshal(call)
-		if err != nil {
-			return fmt.Errorf("session: encode fold call: %w", err)
-		}
-		entry.Unknown = map[string]json.RawMessage{FoldMember: raw}
+	// The fold's call, and what it was made under, on every fold: each
+	// has a budget, and a model, the server's default one included
+	// (#318).
+	call, err := foldCall(f)
+	if err != nil {
+		return err
 	}
+	raw, err := json.Marshal(call)
+	if err != nil {
+		return fmt.Errorf("session: encode fold call: %w", err)
+	}
+	entry.Unknown = map[string]json.RawMessage{FoldMember: raw}
 	id, err := w.append(ctx, entry)
 	if err != nil {
 		return err
@@ -7849,15 +7869,18 @@ func (w *writer) fold(ctx context.Context, f compact.Fold) error {
 	return nil
 }
 
-// foldCall names the model call a fold made: the hash and model of its
-// request, when it has one, and its response ID. The request itself is
-// not kept, as it holds the whole folded prefix. When the request
-// cannot be hashed the call is returned without the hash, with the
-// error.
+// foldCall names the model call a fold made: the model it was asked
+// of and the budget it was made under, the hash of its request, when it
+// has one, and its response ID. The request itself is not kept, as it
+// holds the whole folded prefix. When the request cannot be hashed the
+// call is returned without the hash, with the error.
 func foldCall(f compact.Fold) (FoldCall, error) {
-	call := FoldCall{ResponseID: f.ResponseID}
+	budget := f.Budget
+	call := FoldCall{ResponseID: f.ResponseID, Model: f.Model, Budget: &budget}
 	if f.Request != nil {
-		call.Model = f.Request.Model
+		if call.Model == "" {
+			call.Model = f.Request.Model
+		}
 		hash, err := RequestHash(Canonical(*f.Request))
 		if err != nil {
 			return call, err

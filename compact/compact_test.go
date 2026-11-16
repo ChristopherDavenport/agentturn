@@ -183,9 +183,10 @@ func TestSplitKeepsCallsWithOutputs(t *testing.T) {
 			}
 		})
 	}
-	// Nothing older than the kept tail: no compaction, no call.
+	// Nothing older than the kept tail: no compaction, no call, though
+	// the transcript is over budget.
 	c := &counting{Compactor: &echo.Adapter{}}
-	out, err := New(c, WithKeepLast(10), WithBudget(0), WithEstimator(count)).Transform(context.Background(), transcript)
+	out, err := New(c, WithKeepLast(10), WithBudget(1), WithEstimator(count)).Transform(context.Background(), transcript)
 	if err != nil || len(out) != len(transcript) || c.calls.Load() != 0 {
 		t.Errorf("out = %d err = %v calls = %d", len(out), err, c.calls.Load())
 	}
@@ -767,9 +768,9 @@ func TestLocalSummaryOutputLimit(t *testing.T) {
 			if tc.edit != nil {
 				opts = append(opts, WithRequest(tc.edit))
 			}
-			// The fold itself, so the budget shapes the request whatever
-			// the transcript's size.
-			if _, err := NewLocal(s, opts...).fold(context.Background(), openresponses.Items(items(4)), ""); err != nil {
+			// The fold itself, under the budget the call would give it, so the
+			// budget shapes the request whatever the transcript's size.
+			if _, err := NewLocal(s, opts...).fold(context.Background(), openresponses.Items(items(4)), foldArgs{budget: tc.budget}); err != nil {
 				t.Fatal(err)
 			}
 			got := 0

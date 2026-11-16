@@ -370,3 +370,97 @@ func TestChainedDeferralsAreHeldOnlyIfEveryHookHeld(t *testing.T) {
 		})
 	}
 }
+
+// TestChainAfterToolCall pins #319: the hooks run in order, each seeing
+// the result as the hooks before it left it; a hook returning no
+// override passes the result on unchanged; the first error stops the
+// chain and is returned, the hooks after it not run.
+func TestChainAfterToolCall(t *testing.T) {
+	boom := errors.New("boom")
+	type hook = func(context.Context, ToolResultInfo) (*ToolOverride, error)
+	var ran []string
+	var saw []string
+	text := func(info ToolResultInfo) string {
+		if info.Err != nil {
+			return "err:" + info.Err.Error()
+		}
+		return info.Result.Output.Text
+	}
+	suffix := func(name string) hook {
+		return func(_ context.Context, info ToolResultInfo) (*ToolOverride, error) {
+			ran = append(ran, name)
+			saw = append(saw, text(info))
+			return &ToolOverride{Result: agenttool.Text(text(info) + " " + name)}, nil
+		}
+	}
+	keep := func(name string) hook {
+		return func(_ context.Context, info ToolResultInfo) (*ToolOverride, error) {
+			ran = append(ran, name)
+			saw = append(saw, text(info))
+			return nil, nil
+		}
+	}
+	fail := func(_ context.Context, info ToolResultInfo) (*ToolOverride, error) {
+		ran = append(ran, "fail")
+		return nil, boom
+	}
+	failed := func(name string) hook {
+		return func(_ context.Context, info ToolResultInfo) (*ToolOverride, error) {
+			ran = append(ran, name)
+			saw = append(saw, text(info))
+			return &ToolOverride{Err: errors.New("no")}, nil
+		}
+	}
+	for _, tc := range []struct {
+		name    string
+		fns     []hook
+		isNil   bool
+		want    string // the override's text, "" for none
+		ran     string
+		saw     string
+		wantErr error
+	}{
+		{name: "none", isNil: true},
+		{name: "only nil", fns: []hook{nil, nil}, isNil: true},
+		{name: "in order, each seeing the last's override", fns: []hook{suffix("a"), nil, suffix("b")}, want: "out a b", ran: "a b", saw: "out|out a"},
+		{name: "no override passes the result on", fns: []hook{keep("k"), suffix("a"), keep("j")}, want: "out a", ran: "k a j", saw: "out|out|out a"},
+		{name: "no override from any is none", fns: []hook{keep("k"), keep("j")}, ran: "k j", saw: "out|out"},
+		{name: "an error override is what the next sees", fns: []hook{failed("x"), keep("k")}, want: "err:no", ran: "x k", saw: "out|err:no"},
+		{name: "the first error stops it", fns: []hook{suffix("a"), fail, suffix("b")}, ran: "a fail", saw: "out", wantErr: boom},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ran, saw = nil, nil
+			fn := ChainAfterToolCall(tc.fns...)
+			if tc.isNil {
+				if fn != nil {
+					t.Error("a chain of nothing is not nil")
+				}
+				return
+			}
+			out, err := fn(context.Background(), ToolResultInfo{Result: agenttool.Text("out")})
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tc.wantErr)
+			}
+			if got := strings.Join(ran, " "); got != tc.ran {
+				t.Errorf("ran %q, want %q", got, tc.ran)
+			}
+			if got := strings.Join(saw, "|"); got != tc.saw {
+				t.Errorf("saw %q, want %q", got, tc.saw)
+			}
+			if tc.wantErr != nil {
+				if out != nil {
+					t.Errorf("an error returned an override %+v", out)
+				}
+				return
+			}
+			switch {
+			case tc.want == "" && out != nil:
+				t.Errorf("override = %+v, want none", out)
+			case tc.want != "" && out == nil:
+				t.Errorf("no override, want %q", tc.want)
+			case tc.want != "" && text(ToolResultInfo{Result: out.Result, Err: out.Err}) != tc.want:
+				t.Errorf("override = %q, want %q", text(ToolResultInfo{Result: out.Result, Err: out.Err}), tc.want)
+			}
+		})
+	}
+}

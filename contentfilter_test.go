@@ -149,20 +149,24 @@ func TestContentFilterStops(t *testing.T) {
 }
 
 // cutOff answers its first request with a call when call is set, then
-// a message cut at the output limit, its details dropped when bare;
-// every later request is answered with a message that completes.
+// a message cut at the output limit, its details dropped when bare
+// and naming no reason when empty; every later request is answered
+// with a message that completes.
 type cutOff struct {
-	call, bare bool
-	calls      int
+	call, bare, empty bool
+	calls             int
 }
 
 func (m *cutOff) CreateStream(_ context.Context, req openresponses.Request, sink openresponses.EventSink) error {
 	m.calls++
-	if m.bare {
+	if m.bare || m.empty {
 		next := sink
 		sink = openresponses.EventSinkFunc(func(ev openresponses.StreamEvent) error {
 			if e, ok := ev.(*openresponses.ResponseIncompleteEvent); ok {
 				e.Response.IncompleteDetails = nil
+				if m.empty {
+					e.Response.IncompleteDetails = &openresponses.IncompleteDetails{}
+				}
 			}
 			return next.Send(ev)
 		})
@@ -196,8 +200,9 @@ func (m *cutOff) CreateStream(_ context.Context, req openresponses.Request, sink
 // TestOutputLimitStops pins the decision on #314's max_output_tokens
 // case: a final answer cut at the output limit ends the run stopped
 // with StopMaxOutputTokens and the response's details, its text still
-// the answer; one whose details name no reason reads the same; a
-// response cut after a call runs the call and goes on.
+// the answer; one with no details, or whose details name no reason
+// (#317), reads the same; a response cut after a call runs the call and
+// goes on.
 func TestOutputLimitStops(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -208,6 +213,7 @@ func TestOutputLimitStops(t *testing.T) {
 	}{
 		{"an answer", &cutOff{}, ReasonStopped, StopMaxOutputTokens, "Once upon 1"},
 		{"an answer, no details", &cutOff{bare: true}, ReasonStopped, StopMaxOutputTokens, "Once upon 1"},
+		{"an answer, details naming no reason", &cutOff{empty: true}, ReasonStopped, StopMaxOutputTokens, "Once upon 1"},
 		{"a call, then an answer", &cutOff{call: true}, ReasonDone, "", "Once upon 2"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

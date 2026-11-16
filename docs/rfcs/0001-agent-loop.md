@@ -1,6 +1,6 @@
 # RFC 0001: Agent Loop
 
-Status: draft 0.9
+Status: draft 0.10
 Author: Christopher Davenport
 Discussion: to be opened against this repository, then proposed to the
 Open Responses community as a companion specification. The Go module at
@@ -62,7 +62,7 @@ executor, the session format begins where an entry is appended, and
 the loop is everything in between.
 
 Each draft describes the Go module as released with it; [Changes in
-draft 0.9](#changes-in-draft-09) lists what this draft added. Where the
+draft 0.10](#changes-in-draft-010) lists what this draft added. Where the
 module falls short of what is written here, or where a rule is
 contested, the shortfall is under open questions with the issue that
 tracks it.
@@ -469,7 +469,16 @@ that a recorder holding the transcript and the settings rebuilds it:
    and recorded as any other. The loop asks the same, with no
    instructions, when it rebuilds a request the server refused as too
    long, as [Retry](#retry) says, by a mark on the transform's
-   context (#277). The transform MAY read the settings the request
+   context (#277). A host MAY change a folding transform's budget
+   while the conversation goes on. The change applies from the next
+   request, and the transform keeps what it remembers of earlier
+   folds; a transform with no budget folds only when asked. A summary
+   that follows the agent is asked of the model, and under the
+   reasoning, that the request being folded for names. A recorder MUST
+   record, with each fold and each failed fold, the budget it was made
+   under and the model its summary was asked of; the change of setting
+   itself is the host's to record, as agentsession RFC 0001 records a
+   mid-session setting change, so it is not recorded twice (#318). The transform MAY read the settings the request
    will carry, the instructions and the tool definitions of the
    moment, as step 4 builds them before the hook; the loop MUST make
    them available to it, read-only. A transform that folds against a
@@ -1669,9 +1678,9 @@ provide a way to chain each, with the fold rule the table gives.
 | before model call | turn phase 4, last | the finished request | edits it in place | `model_blocked`, then the run fails; marked as a guard's, the run stops with cause `guard` | in order, each seeing what the last left; the first error stops |
 | output guard | as the stream completes an assistant message | the message | a replacement or none | fails the run unless marked as a guard's, which withholds the message and stops it with cause `guard` | in order, each seeing the last's replacement; the last stands; the first error stops |
 | decision (before tool call) | preflight, per call, model order; a nested call as a batch of one | the call, the tool, the arguments, the batch and index, and for a nested call its parent | a decision or none | fails the run; returned to the tool for a nested call | the strictest action wins, block over defer over allow; a block ends the chain, a defer does not; rewritten arguments pass to the hooks after; the first reason and decider of the standing action, the first note; the first decline text among the deferrals of the kind that stands, asking or held, so an asked call never takes a hold's (#304); terminate if any set it |
-| after tool call | as each call settles, blocked calls excepted | the call, the result, the error | an override or none | fails the run; returned to the tool for a nested call | — |
+| after tool call | as each call settles, blocked calls excepted | the call, the result, the error | an override or none | fails the run; returned to the tool for a nested call | in order, each seeing the result as the hooks before it left it; a hook returning no override passes the result on unchanged; the first error stops (#319) |
 | should stop after turn | turn phase 11 | the response, the results, whether the turn was final, the transcript | stop or not; a guard error stops with cause `guard` | fails the run unless marked as a guard's | in order until one stops; the first error stops |
-| transform | request step 2 | a copy of the transcript | the input for this call | fails the run | — |
+| transform | request step 2 | a copy of the transcript | the input for this call | fails the run | in order, each seeing the last's output; the first error stops (#319) |
 | filter | request step 3 | the transformed list | what the model sees | — | — |
 
 The before-turn hook is where a layer acts on what arrived for the
@@ -2103,7 +2112,7 @@ of the events.
 | `turn_end` | nothing of its own |
 | `run_end` | first, when a `turn_start` had neither a `response_end` nor a `model_blocked`, a failed `response` carrying the run's error; then `run` end, its `pending` list naming the run's calls left without an output, an earlier run's call the run wrote a decision or a `dispatch` for among them, with the reason mapped onto the format's cascade: `done`, `input_required` and `error` as themselves, the error's text as `ref`, except that `done` is written `aborted` when the last `response_end` ended `incomplete` for a reason the loop does not stop on, with that reason as `ref`, for the reason `stopped` is below; `aborted` as `interrupted` with the error's text, since the host asked; `stopped` as `aborted` when the last `response_end` was marked withheld or ended `incomplete`, a content filter's stop and a final answer cut at `max_output_tokens` among them, since the format reads a run whose last response is incomplete so, as `stopped` when the last response made calls, as `done` when it made none, and for a run with no response of its own as `stopped` when it answered a pending call and left none, `aborted` otherwise, with the cause as `ref`, and for a guard's stop the cause followed by the guard's error |
 | a record a tool writes while it runs, a question it asks the user | a record entry at the leaf, its `call_id` naming the call on the tool's context when the session holds it, or the nearest call up a nested call's chain that it holds. A question is two record entries: the question, written before it is put to the user, and the answer, written after it is given and naming the question's entry and carrying the decider the answer names, `human` when it names none, as Nested calls has it, so a run cut while the user was deciding shows the open question under the call that was waiting on it; both name the call the question is about, its tool and its parent, when the asker put that call on the context as the Nested calls section has it, and the question's entry takes that call's `call_id` when the context carries none the session holds |
-| a fold the transform reports | a `compaction` naming what was kept and what was pinned, with agentsession RFC 0001 0.21's `requested` for a fold a host or a person asked for, and its `instructions` when they gave the summariser any; a recorder MUST NOT write `requested` for a fold the budget or the loop's retry after a context-length refusal forced, nor `instructions` without `requested` (#306); or a record entry for a fold that failed, carrying `requested` and `instructions` by the same rule, so a fold asked for that failed still says it was asked for, and, for one the transform backs off from, the split and the hash of the prefix it would have folded, so a transform seeded from the record in another process backs off from the same prefix |
+| a fold the transform reports | a `compaction` naming what was kept and what was pinned, with agentsession RFC 0001 0.21's `requested` for a fold a host or a person asked for, and its `instructions` when they gave the summariser any; a recorder MUST NOT write `requested` for a fold the budget or the loop's retry after a context-length refusal forced, nor `instructions` without `requested` (#306); or a record entry for a fold that failed, carrying `requested` and `instructions` by the same rule, so a fold asked for that failed still says it was asked for, and, for one the transform backs off from, the split and the hash of the prefix it would have folded, so a transform seeded from the record in another process backs off from the same prefix; either carries the budget the fold was made under and the model its summary was asked of (#318) |
 | `queued` | a `queued` entry with the item, the mode and the trigger, its richer facts included, without the kind `human` for an input that names instruction layers, is copied or is hidden, as the item that drains it has its `source` (#303), and agentsession RFC 0001's `deliver: true` for an input that arrived as a delivery, before anything appends the item; the item entry that drains it names it in `queued_from` with the trigger as `source`. A run end closes the entries of the inputs it did not append, and the recorder writes them again after it, since the agent still holds them, a delivery again as one; so does a rewind. The loop's follow-up mode is spelled `follow_up` and the format's `followup`; a writer maps the one onto the other |
 
 Three rules follow from the writing discipline of that format and are
@@ -2332,7 +2341,7 @@ maps onto it as follows:
 | copied item | `Copied(item)`, which `tools/agent`'s `WithCallConfig` sets on the items it takes from the parent; `Copied` on the item events |
 | filter | `Config.Filter`; `DefaultFilter`, `VisibleFilter(types…)` |
 | reasoning another model produced | `ReasoningModels` (`Attribute`, `For`); `WithReasoningModels` for an agent, `ContextWithReasoningModels` for `Run` and `Continue`, and on every hook's and tool's context |
-| transform | `Config.Transform`; `compact.New`, `compact.NewLocal` as the reference; `compact.MarkFold`/`compact.IsFold` for a fold's own model call; the person's own messages, `PersonMessages` (`Has`), `PersonMessagesFromContext` for a transform, `WithPersonMessages`/`Agent.SetPersonMessages` for an agent and `ContextWithPersonMessages` for `Run` and `Continue`, kept by `compact` under `compact.WithPersonBound` (`compact.DefaultPersonBound`) and the newest within `compact.WithPersonTotal` (a quarter of the budget by default, at most half of what the settings leave) beside `compact.WithPin`, and read from a record by `session.TranscriptMarks`, which `session.AgentOptions` and `MoveTo` use; `(*compact.Transform).FoldNext(instructions)` for a fold on request, `ContextWithFoldRequest`/`FoldRequested` for the loop's after an overflow, `compact.Fold.Forced`, and `Requested`/`Instructions` for a fold asked for through `FoldNext` alone; the settings a transform reads, `ContextWithRequest`/`RequestFromContext`, weighed by `compact.EstimateSettings`, and images by `compact.ImageTokens` in `compact.Estimate` |
+| transform | `Config.Transform`; `compact.New`, `compact.NewLocal` as the reference; `compact.MarkFold`/`compact.IsFold` for a fold's own model call; the person's own messages, `PersonMessages` (`Has`), `PersonMessagesFromContext` for a transform, `WithPersonMessages`/`Agent.SetPersonMessages` for an agent and `ContextWithPersonMessages` for `Run` and `Continue`, kept by `compact` under `compact.WithPersonBound` (`compact.DefaultPersonBound`) and the newest within `compact.WithPersonTotal` (a quarter of the budget by default, at most half of what the settings leave, and the same of `compact.DefaultBudget` under no budget, where a host's total stands as given) beside `compact.WithPin`, and read from a record by `session.TranscriptMarks`, which `session.AgentOptions` and `MoveTo` use; `(*compact.Transform).FoldNext(instructions)` for a fold on request, `(*compact.Transform).SetBudget` for a budget changed mid-conversation (0, as for `compact.WithBudget`, is no budget) and `compact.WithModelOfRequest` for a summary that follows the agent, each fold reporting `compact.Fold.Budget` and `compact.Fold.Model`, which `session.FoldCall` records, `ContextWithFoldRequest`/`FoldRequested` for the loop's after an overflow, `compact.Fold.Forced`, and `Requested`/`Instructions` for a fold asked for through `FoldNext` alone; the settings a transform reads, `ContextWithRequest`/`RequestFromContext`, weighed by `compact.EstimateSettings`, and images by `compact.ImageTokens` in `compact.Estimate` |
 | configuration | `Config`; `Config.BaseRequest`, `Config.ResolveTools` |
 | tools of the moment | `Config.Tools`, `Config.ToolProvider` |
 | execution mode, bound | `Config.ToolExecution` (`ExecParallel`, `ExecSequential`), `Config.MaxParallelTools` |
@@ -2358,7 +2367,7 @@ maps onto it as follows:
 | guard stop | an error wrapping `ErrGuard` from `ShouldStopAfterTurn`, `BeforeTurn`, `BeforeModelCall`, `OutputGuard` or the model; the output of a call a withheld response made is `WithheldCallOutput` |
 | content filter stop | `StopContentFilter`; `RunEnd.Incomplete`, the response's `openresponses.IncompleteDetails` with its `Extra` members, and `RunEnd.Refusal`; the output of a call the refused response made is `RefusedCallOutput`; `front/control` carries both members as `incomplete` and `refusal`, `front/responses` ends the caller's response incomplete with the details, and `front/a2a` rejects the task with `FilteredText` |
 | output limit stop | `StopMaxOutputTokens`; `RunEnd.Incomplete`, and `RunEnd.Answer` returns the cut text; `front/responses` ends the caller's response incomplete with reason `max_output_tokens`, and `front/a2a` completes the task with the text and the details under `MetaIncomplete` on its status message |
-| chains | `ChainBeforeTurn`, `ChainBeforeModelCall`, `ChainOutputGuard`, `ChainBeforeToolCall`, `ChainShouldStopAfterTurn`, `ChainTransform` |
+| chains | `ChainBeforeTurn`, `ChainBeforeModelCall`, `ChainOutputGuard`, `ChainBeforeToolCall`, `ChainAfterToolCall`, `ChainShouldStopAfterTurn`, `ChainTransform` |
 | nested call | `Invoke(ctx, name, args)`; `ErrNoInvoker`; `Parent` on the tool events, `ToolStart.Invoked`, `Replayed` on `ToolStart` and `ToolEnd`; `PendingCall.Nested` holding `NestedRecord{CallID, Parent, Name, Args, Dispatched, IdempotencyKey, DispatchArgs, Ended, Result, Err, Blocked, Reason}`, `RecordedDetails` for the details a replayed result gives back |
 | queue mode | `QueueMode`: `QueueSteer`, `QueueFollowUp`; `Queued.Input` (`InputSteer`, `InputFollowUp`, `InputDeliver`); `Agent.Redeliver` for a delivery a record owes |
 | the loop as a model | `front/responses.New(cfg)` → `openresponses.Adapter` |
@@ -2605,6 +2614,27 @@ The scenario corpus is versioned with this document. A scenario is
 added when a rule is, and changes only when the rule it pins does, in
 the same draft; a scenario that a conforming loop fails is a defect in
 the scenario, fixed without a change of rule.
+
+## Changes in draft 0.10
+
+Draft 0.10 adds the rules below to draft 0.9, marked as Versioning has
+it.
+
+- **Hooks.** The after-tool-call hook and the transform have a chain
+  rule: after tool call in order, each seeing the result as the hooks
+  before it left it, a hook returning no override passing the result
+  on unchanged; transform in order, each seeing the last's output; for
+  both the first error stops. The Go binding adds `ChainAfterToolCall`
+  (#319).
+- **The request.** A host may change a folding transform's budget
+  while the conversation goes on, from the next request, the
+  transform keeping what it remembers of earlier folds; a transform
+  with no budget folds only when asked; a summary that follows the
+  agent is asked of the model and under the reasoning the request
+  being folded for names (#318).
+- **The record.** Each fold and each failed fold carries the budget it
+  was made under and the model its summary was asked of; the setting
+  change itself is the host's entry (#318).
 
 ## Changes in draft 0.9
 
