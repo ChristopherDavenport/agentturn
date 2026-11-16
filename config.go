@@ -300,6 +300,10 @@ type Config struct {
 	// or captures, a checkpoint or a recorded move of the workspace,
 	// falls between the two. A call in another chain may run alongside
 	// it.
+	//
+	// Two layers that each want this field are joined with
+	// [ChainAfterToolCall], which runs them in the order given, each
+	// seeing the result as the ones before it left it.
 	AfterToolCall func(context.Context, ToolResultInfo) (*ToolOverride, error)
 	// ShouldStopAfterTurn ends the run after a turn even when the model
 	// requested tools: true ends it with ReasonStopped and StopHook. An

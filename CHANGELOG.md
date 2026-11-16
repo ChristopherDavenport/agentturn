@@ -14,6 +14,12 @@ versions may break the API.
   the record wrote `aborted` and read it back as the output limit's
   stop. `RunEnd.Incomplete` names `max_output_tokens` for both forms,
   live and read back from the record. Part of #317.
+- Added: `ChainAfterToolCall` joins several `Config.AfterToolCall`
+  hooks: in order, each seeing the result as the hooks before it left
+  it; a hook returning no override passes the result on unchanged; the
+  first error stops the chain and is returned. RFC 0001 draft 0.10,
+  Hooks, which also states the transform's chain rule that
+  `ChainTransform` already follows. (#319)
 
 ## v0.0.40 - 2026-11-15
 

@@ -278,8 +278,10 @@ cfg.ShouldStopAfterTurn = agentturn.ChainShouldStopAfterTurn(
 ```
 
 `ChainBeforeTurn` concatenates what each layer returns,
-`ChainBeforeToolCall` folds the decisions deny over ask over allow, and
-`ChainOutputGuard` hands each guard's replacement to the next.
+`ChainBeforeToolCall` folds the decisions deny over ask over allow,
+`ChainOutputGuard` hands each guard's replacement to the next, and
+`ChainAfterToolCall` hands each hook's override of a call's result to
+the next.
 
 `Config.Retry` retries a model call that failed before the model began
 its answer: a 429 or 5xx, a dropped stream, a refused connection. The

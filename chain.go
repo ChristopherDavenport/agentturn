@@ -285,3 +285,37 @@ func ChainOutputGuard(fns ...func(context.Context, OutputInfo) (*openresponses.M
 		return replaced, nil
 	}
 }
+
+// ChainAfterToolCall runs each hook on a call's result in order, each
+// seeing the result as the hooks before it left it: an override one
+// returns, its result and its error, is the ToolResultInfo.Result and
+// Err the next is given, and a hook that returns no override passes the
+// result on unchanged. The chain's override is the last one returned,
+// and none when no hook overrode, so the tool's own result stands. The
+// first error stops the chain and is returned, the hooks after it not
+// run, which fails the turn as a single hook's error does.
+func ChainAfterToolCall(fns ...func(context.Context, ToolResultInfo) (*ToolOverride, error)) func(context.Context, ToolResultInfo) (*ToolOverride, error) {
+	var kept []func(context.Context, ToolResultInfo) (*ToolOverride, error)
+	for _, fn := range fns {
+		if fn != nil {
+			kept = append(kept, fn)
+		}
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return func(ctx context.Context, info ToolResultInfo) (*ToolOverride, error) {
+		var out *ToolOverride
+		for _, fn := range kept {
+			o, err := fn(ctx, info)
+			if err != nil {
+				return nil, err
+			}
+			if o != nil {
+				out = o
+				info.Result, info.Err = o.Result, o.Err
+			}
+		}
+		return out, nil
+	}
+}
