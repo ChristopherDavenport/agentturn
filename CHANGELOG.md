@@ -7,7 +7,16 @@ versions may break the API.
 
 ## Unreleased
 
-- Fixed: a final answer the provider ended `incomplete` with
+- Changed (breaking for a host that built with `compact.WithBudget(0)`):
+  a budget of 0 is no budget: the transform folds nothing for the
+  transcript's size, and only a fold asked for, by `FoldNext` or by the
+  loop's retry after a context-length refusal, is made. v0.0.40 folded
+  on every call under a budget of 0. Under no budget the summary
+  request's `max_output_tokens` is `DefaultSummaryMaxOutputTokens`, and
+  the person's kept messages are held to `WithPersonTotal`, or a quarter
+  of `DefaultBudget`. (#318)
+- Changed (breaking for a host that read such a run as answered): a
+  final answer the provider ended `incomplete` with
   `incomplete_details` whose `reason` is empty ends the run
   `ReasonStopped` with `StopMaxOutputTokens`, as one with no details
   does and as RFC 0001 already had it; v0.0.40 ended it `done`, while
@@ -20,13 +29,6 @@ versions may break the API.
   first error stops the chain and is returned. RFC 0001 draft 0.10,
   Hooks, which also states the transform's chain rule that
   `ChainTransform` already follows. (#319)
-- Behaviour change: `compact.WithBudget(0)` is no budget: the
-  transform folds nothing for the transcript's size, and only a fold
-  asked for, by `FoldNext` or by the loop's retry after a context-length
-  refusal, is made. v0.0.40 folded on every call under a budget of 0.
-  Under no budget the summary request's `max_output_tokens` is
-  `DefaultSummaryMaxOutputTokens`, and the person's kept messages are
-  held to `WithPersonTotal`, or a quarter of `DefaultBudget`. (#318)
 - Added: `(*compact.Transform).SetBudget` changes the budget while the
   conversation goes on, from the next call, under the lock `FoldNext`
   takes; the transform keeps its fold memory and its back-off, a fold
