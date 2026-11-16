@@ -20,6 +20,34 @@ versions may break the API.
   first error stops the chain and is returned. RFC 0001 draft 0.10,
   Hooks, which also states the transform's chain rule that
   `ChainTransform` already follows. (#319)
+- Behaviour change: `compact.WithBudget(0)` is no budget: the
+  transform folds nothing for the transcript's size, and only a fold
+  asked for, by `FoldNext` or by the loop's retry after a context-length
+  refusal, is made. v0.0.40 folded on every call under a budget of 0.
+  Under no budget the summary request's `max_output_tokens` is
+  `DefaultSummaryMaxOutputTokens`, and the person's kept messages are
+  held to `WithPersonTotal`, or a quarter of `DefaultBudget`. (#318)
+- Added: `(*compact.Transform).SetBudget` changes the budget while the
+  conversation goes on, from the next call, under the lock `FoldNext`
+  takes; the transform keeps its fold memory and its back-off, a fold
+  in flight keeps the budget it began with, `NewLocal`'s default
+  `WithMinFold` follows the new budget, and 0 is no budget, as above.
+  A host can build the transform before it knows the model's context
+  window. RFC 0001 draft 0.10, The request, step 2. (#318)
+- Added: `compact.WithModelOfRequest` asks each fold of the model the
+  request being folded for names (`agentturn.RequestFromContext`), and,
+  for `NewLocal`, under that request's reasoning, so a model switched
+  mid-session writes the next summary. `WithModel` wins over it, in
+  either order, the reasoning not taken either; `WithRequest` still
+  edits the summary request last. (#318)
+- Added: `compact.Fold.Budget` and `compact.Fold.Model`, the budget a
+  fold, failed or not, was made under and the model its request named,
+  `New`'s compaction request included. `session` writes both on every
+  compaction's `fold` member (`FoldCall.Budget`, a pointer, nil in a
+  record written before this; `FoldCall.Model`, now set for `New` too)
+  and on failed and unplaced fold entries; the `fold` member is written
+  on every compaction. agentturn writes no entry for the setting change
+  itself, which is the host's. RFC 0001 draft 0.10, The record. (#318)
 
 ## v0.0.40 - 2026-11-15
 

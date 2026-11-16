@@ -412,7 +412,15 @@ cfg.Transform = l.Transform
 ```
 
 `WithRequest(fn)` edits the summary request `NewLocal` sends, so it
-can carry the reasoning setting the agent's own requests do. A summary
+can carry the reasoning setting the agent's own requests do;
+`WithModelOfRequest()` asks the summary of the model, and under the
+reasoning, of the request being folded for, so a model switched
+mid-session writes the next summary (`WithModel` wins over it).
+`SetBudget(n)` changes the budget while the conversation goes on,
+keeping what the transform remembers of earlier folds; a budget of 0
+is none, and folds only on `FoldNext`, so a host can build the
+transform before it knows the model's context window. Each fold
+reports the budget and the model it was made with. A summary
 that comes back with no text, cut short or no smaller than what it
 folds is asked once more; a second such answer leaves the transcript
 unfolded for that call, and the transform does not ask about the same

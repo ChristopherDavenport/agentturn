@@ -767,9 +767,9 @@ func TestLocalSummaryOutputLimit(t *testing.T) {
 			if tc.edit != nil {
 				opts = append(opts, WithRequest(tc.edit))
 			}
-			// The fold itself, so the budget shapes the request whatever
-			// the transcript's size.
-			if _, err := NewLocal(s, opts...).fold(context.Background(), openresponses.Items(items(4)), ""); err != nil {
+			// The fold itself, under the budget the call would give it, so the
+			// budget shapes the request whatever the transcript's size.
+			if _, err := NewLocal(s, opts...).fold(context.Background(), openresponses.Items(items(4)), foldArgs{budget: tc.budget}); err != nil {
 				t.Fatal(err)
 			}
 			got := 0

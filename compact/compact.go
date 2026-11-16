@@ -33,7 +33,10 @@
 // items so, for context a harness injected that must not become
 // whatever the summary made of it. [WithRequest] edits the summary
 // request [NewLocal] sends, so it can carry the reasoning setting the
-// agent's own requests do.
+// agent's own requests do, and [WithModelOfRequest] asks the summary of
+// the model, and under the reasoning, of the request being folded for.
+// [Transform.SetBudget] changes the budget while the conversation goes
+// on, keeping what the transform remembers.
 package compact
 
 import (
@@ -49,6 +52,7 @@ import (
 	_ "image/gif"  // GIF headers, for an image's visual cost
 	_ "image/jpeg" // JPEG headers
 	_ "image/png"  // PNG headers
+	"maps"
 	"math"
 	"strings"
 	"sync"
@@ -104,6 +108,13 @@ type Option func(*Transform)
 // context window is a share of what the window holds. A transform
 // called with no settings on its context, or given [WithEstimator]
 // without [WithSettingsEstimator], weighs the items alone.
+//
+// A budget of 0 or less is no budget: nothing is folded for its size,
+// and only a fold asked for, by [Transform.FoldNext] or by the loop's
+// retry after a context-length refusal, is made. A host that does not
+// yet know the model's context window builds the transform so and
+// gives the budget later with [Transform.SetBudget]. Before v0.0.41 a
+// budget of 0 folded on every call. The default is [DefaultBudget].
 func WithBudget(tokens int) Option { return func(t *Transform) { t.budget = tokens } }
 
 // WithEstimator replaces the token estimator for items. The default is
@@ -130,7 +141,24 @@ func WithSettingsEstimator(fn func(openresponses.Request) int) Option {
 }
 
 // WithModel sets the model named on compaction or summary requests.
+// It pins that model: given with [WithModelOfRequest], in either order,
+// it wins, and the summary takes neither the request's model nor its
+// reasoning.
 func WithModel(name string) Option { return func(t *Transform) { t.model = name } }
+
+// WithModelOfRequest asks each fold of the model the request being
+// folded for names, the one the loop puts on the transform's context
+// (agentturn.RequestFromContext), as the call is made: a summary that
+// follows the agent, so a host that switches the agent's model
+// mid-session has the next summary written by the new one. [NewLocal]
+// asks under that request's reasoning too, a copy of it; [New]'s
+// compaction request names the model alone. A call with no request on
+// its context names no model and the server picks its default, as
+// without this option. [WithModel] wins over it, and [WithRequest]
+// still edits the summary request after both. The model asked is
+// reported in [Fold.Model] (agentturn RFC 0001 The request, step 2;
+// #318).
+func WithModelOfRequest() Option { return func(t *Transform) { t.modelOfRequest = true } }
 
 // WithKeepLast sets how many recent items are always kept verbatim. The
 // cut never separates a function call from its output.
@@ -238,8 +266,10 @@ func WithPersonBound(bytes int) Option { return func(t *Transform) { t.personBou
 // request's settings leave of the budget, as [WithSettingsEstimator]
 // weighs them, counts as that half: kept messages that filled the
 // request alone would leave no room for the summary and the kept tail,
-// and every call would fold again. Zero or less keeps none of them. [WithPin]'s items are the host's choice and do
-// not count against it.
+// and every call would fold again. Under no budget ([WithBudget] 0),
+// the default is a quarter of [DefaultBudget] and a total given here
+// stands as given. Zero or less keeps none of them. [WithPin]'s items
+// are the host's choice and do not count against it.
 func WithPersonTotal(tokens int) Option {
 	return func(t *Transform) { t.personTotal, t.personTotalSet = tokens, true }
 }
@@ -362,6 +392,17 @@ type Fold struct {
 	// did: Usage, ResponseID, OutputTypes, Attempts and Request, as far
 	// as the calls got.
 	Err error
+	// Budget is the budget the fold was made under, as [WithBudget] or
+	// [Transform.SetBudget] last set it when the call began: 0 for no
+	// budget, under which only a fold asked for is made. A recorder
+	// writes it with the fold, failed or not, so a reader knows what a
+	// fold was made against after the host changed it (#318).
+	Budget int
+	// Model is the model the fold's request named: the summary
+	// request's, as [WithRequest] left it, for [NewLocal], and the
+	// compaction request's for [New]; empty when it named none and the
+	// server chose. See [WithModel] and [WithModelOfRequest].
+	Model string
 }
 
 // WithOnFold adds a function called after every fold attempt, from the
@@ -402,11 +443,9 @@ func WithSummaryItem(fn func(summary string) openresponses.Item) Option {
 // fold or skips a fold because the other's failed; it only folds more
 // often than one per conversation would, as each forgets the other's.
 type Transform struct {
-	fold        func(ctx context.Context, input openresponses.Items, instructions string) (folded, error)
+	fold        func(ctx context.Context, input openresponses.Items, args foldArgs) (folded, error)
 	onFold      []func(context.Context, Fold) error
-	budget      int
 	keepLast    int
-	minFold     int
 	model       string
 	estimate    func(openresponses.Items) int
 	settings    func(openresponses.Request) int
@@ -421,8 +460,18 @@ type Transform struct {
 	personTotal    int
 	personTotalSet bool
 	request        func(*openresponses.Request)
+	// modelOfRequest is WithModelOfRequest's.
+	modelOfRequest bool
+	// minFoldOf is NewLocal's default minimum fold for a budget, kept
+	// when the caller set none so SetBudget recomputes it; nil when the
+	// caller set one or the default does not depend on the budget.
+	minFoldOf func(budget int) int
 
 	mu sync.Mutex
+	// budget and minFold are read and changed under mu, since SetBudget
+	// changes them while the conversation goes on.
+	budget  int
+	minFold int
 	// next says FoldNext asked the next call to fold whatever its
 	// budget, with nextInstructions for that fold alone.
 	next             bool
@@ -456,19 +505,19 @@ func New(c Compactor, opts ...Option) *Transform {
 	if t.minFold < 0 {
 		t.minFold = 0
 	}
-	t.fold = func(ctx context.Context, input openresponses.Items, _ string) (folded, error) {
-		resp, err := c.Compact(MarkFold(ctx), openresponses.CompactRequest{Model: t.model, Input: input})
+	t.fold = func(ctx context.Context, input openresponses.Items, args foldArgs) (folded, error) {
+		resp, err := c.Compact(MarkFold(ctx), openresponses.CompactRequest{Model: args.model, Input: input})
 		if err != nil {
-			return folded{attempts: 1}, fmt.Errorf("compact: %w", err)
+			return folded{attempts: 1, model: args.model}, fmt.Errorf("compact: %w", err)
 		}
 		if resp == nil || len(resp.Output) == 0 {
-			f := folded{attempts: 1}
+			f := folded{attempts: 1, model: args.model}
 			if resp != nil {
 				f.usage, f.responseID = resp.Usage, resp.ID
 			}
 			return f, errors.New("compact: empty compaction response")
 		}
-		f := folded{output: append(openresponses.Items(nil), resp.Output...), usage: resp.Usage, responseID: resp.ID, outputTypes: itemTypes(resp.Output), attempts: 1}
+		f := folded{output: append(openresponses.Items(nil), resp.Output...), usage: resp.Usage, responseID: resp.ID, outputTypes: itemTypes(resp.Output), attempts: 1, model: args.model}
 		for _, item := range f.output {
 			if c, ok := item.(*openresponses.Compaction); ok {
 				f.summary = c
@@ -493,6 +542,18 @@ type folded struct {
 	request     *openresponses.Request
 	outputTypes []string
 	attempts    int
+	// model is the model the fold's request named.
+	model string
+}
+
+// foldArgs are what one fold is made with, read under the lock when
+// the call that folds began: FoldNext's instructions, the budget, and
+// the model and reasoning to ask the summary of.
+type foldArgs struct {
+	instructions string
+	budget       int
+	model        string
+	reasoning    *openresponses.ReasoningConfig
 }
 
 // itemTypes returns the type of each item, in order.
@@ -539,14 +600,17 @@ func itemTypes(items openresponses.Items) []string {
 func NewLocal(model openresponses.Streamer, opts ...Option) *Transform {
 	t := newTransform(opts)
 	if t.minFold < 0 {
-		t.minFold = max(2*t.estimate(openresponses.Items{t.summaryItem("")}), t.budget/8)
+		// The default follows the budget, so SetBudget recomputes it.
+		floor := 2 * t.estimate(openresponses.Items{t.summaryItem("")})
+		t.minFoldOf = func(budget int) int { return max(floor, budget/8) }
+		t.minFold = t.minFoldOf(t.budget)
 	}
-	t.fold = func(ctx context.Context, input openresponses.Items, instructions string) (folded, error) {
-		f, err := t.summarize(ctx, model, input, instructions)
+	t.fold = func(ctx context.Context, input openresponses.Items, args foldArgs) (folded, error) {
+		f, err := t.summarize(ctx, model, input, args)
 		f.attempts = 1
 		if unfolded(err) {
 			first := f.usage
-			f, err = t.summarize(ctx, model, input, instructions)
+			f, err = t.summarize(ctx, model, input, args)
 			f.attempts = 2
 			f.usage = addUsage(first, f.usage)
 		}
@@ -590,7 +654,8 @@ var ErrSummaryNoText = errors.New("compact: summary response has no text")
 var ErrSummaryIncomplete = errors.New("compact: summary response is incomplete")
 
 // DefaultSummaryMaxOutputTokens caps the MaxOutputTokens [NewLocal]
-// sets on a summary request: half the budget, and no more than this.
+// sets on a summary request: half the budget, and no more than this;
+// this alone under no budget.
 const DefaultSummaryMaxOutputTokens = 8192
 
 // ErrSummaryTooLarge is the error of a [NewLocal] fold whose summary,
@@ -612,28 +677,37 @@ func unfolded(err error) bool {
 	return errors.Is(err, ErrSummaryNoText) || errors.Is(err, ErrSummaryIncomplete) || errors.Is(err, ErrSummaryTooLarge)
 }
 
-// summarize asks model once for a summary of input, with instructions,
-// when there are any, after the summary prompt.
-func (t *Transform) summarize(ctx context.Context, model openresponses.Streamer, input openresponses.Items, instructions string) (folded, error) {
+// summarize asks model once for a summary of input, with the fold's
+// instructions, when there are any, after the summary prompt, of the
+// fold's model under its reasoning, the output capped by its budget.
+func (t *Transform) summarize(ctx context.Context, model openresponses.Streamer, input openresponses.Items, args foldArgs) (folded, error) {
 	// The summary is the fold's own call, and says so to the model.
 	ctx = MarkFold(ctx)
 	store := false
 	prompt := t.prompt
-	if instructions != "" {
-		prompt += "\n\n" + instructions
+	if args.instructions != "" {
+		prompt += "\n\n" + args.instructions
 	}
 	req := openresponses.Request{
-		Model: t.model,
+		Model: args.model,
 		Input: append(withoutReasoning(input), openresponses.UserText(prompt)),
 		Store: &store,
 	}
-	if limit := min(t.budget/2, DefaultSummaryMaxOutputTokens); limit > 0 {
+	if args.reasoning != nil {
+		req.Reasoning = *args.reasoning
+		req.Reasoning.Extra = maps.Clone(args.reasoning.Extra)
+	}
+	limit := DefaultSummaryMaxOutputTokens
+	if args.budget > 0 {
+		limit = min(args.budget/2, limit)
+	}
+	if limit > 0 {
 		req.MaxOutputTokens = &limit
 	}
 	if t.request != nil {
 		t.request(&req)
 	}
-	f := folded{request: &req}
+	f := folded{request: &req, model: req.Model}
 	resp, err := openresponses.CollectStream(ctx, model, req)
 	if resp != nil {
 		f.usage, f.responseID, f.outputTypes = resp.Usage, resp.ID, itemTypes(resp.Output)
@@ -853,6 +927,28 @@ func (t *Transform) FoldNext(instructions string) {
 	t.next, t.nextInstructions = true, instructions
 }
 
+// SetBudget changes the budget [WithBudget] set while the conversation
+// goes on, such as when a host switches the agent to a model with
+// another context window. It applies from the next call to
+// [Transform.Transform]; a fold in flight keeps the budget it began
+// with and reports it in [Fold.Budget]. The transform keeps what it
+// remembers: the fold it made, which a later call still sends while
+// the transcript begins with its prefix, and the failed fold it backs
+// off from. A budget cut below what the remembered fold leaves folds
+// on the next call, the earlier summary folded with the rest. 0 or
+// less is no budget, as for WithBudget. [NewLocal]'s default
+// [WithMinFold] follows the new budget; one the caller set stays. A
+// recorder writes the change itself where the host's settings go: the
+// transform reports only the folds made under it (#318).
+func (t *Transform) SetBudget(tokens int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.budget = tokens
+	if t.minFoldOf != nil {
+		t.minFold = t.minFoldOf(tokens)
+	}
+}
+
 // Transform returns the transcript to send for this call: unchanged
 // when it fits the budget or when its older part is smaller than
 // [WithMinFold], otherwise the fold of its older part followed by the
@@ -876,9 +972,16 @@ func (t *Transform) FoldNext(instructions string) {
 // [WithBackOff] turns the back-off off.
 func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (agentturn.Transcript, error) {
 	settings := 0
-	if req, ok := agentturn.RequestFromContext(ctx); ok && t.settings != nil {
+	req, hasReq := agentturn.RequestFromContext(ctx)
+	if hasReq && t.settings != nil {
 		// The instructions and tools share the window with the items.
 		settings = t.settings(req)
+	}
+	args := foldArgs{model: t.model}
+	if t.model == "" && t.modelOfRequest && hasReq {
+		// The summary follows the agent: the model and the reasoning
+		// of the request this call folds for (#318).
+		args.model, args.reasoning = req.Model, &req.Reasoning
 	}
 	quarantined := agentturn.QuarantineFromContext(ctx)
 	// The person's own messages, which a fold keeps verbatim (#298).
@@ -889,9 +992,12 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	requested, instructions := t.next, t.nextInstructions
 	forced := requested || agentturn.FoldRequested(ctx)
 	t.next, t.nextInstructions = false, ""
+	// The budget this call folds under, whatever SetBudget does while
+	// the fold is in flight.
+	args.instructions, args.budget = instructions, t.budget
 	view, base := t.view(items, quarantined)
 	tokens := t.estimate(view) + settings
-	if tokens <= t.budget && !forced {
+	if (args.budget <= 0 || tokens <= args.budget) && !forced {
 		t.mu.Unlock()
 		return view, nil
 	}
@@ -916,9 +1022,9 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 
 	// The model call runs unlocked so concurrent callers do not
 	// serialise on the network.
-	f, err := t.fold(ctx, input, instructions)
+	f, err := t.fold(ctx, input, args)
 	if err != nil {
-		failed := Fold{Split: split, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Forced: forced, Requested: requested, Instructions: instructions, Err: err}
+		failed := Fold{Split: split, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Forced: forced, Requested: requested, Instructions: instructions, Budget: args.budget, Model: f.model, Err: err}
 		if unfolded(err) {
 			failed.PrefixHash = PrefixHash(items[:split])
 		}
@@ -947,7 +1053,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 		t.mu.Unlock()
 		return view, nil
 	}
-	pinned := t.pinned(items[:split], persons, settings)
+	pinned := t.pinned(items[:split], persons, args.budget, settings)
 	var first openresponses.Item
 	if split < len(items) {
 		first = items[split]
@@ -963,7 +1069,7 @@ func (t *Transform) Transform(ctx context.Context, items agentturn.Transcript) (
 	t.mu.Unlock()
 	// The fold's own output and the pinned items, as locals: the memory
 	// they were written to belongs to the lock that was just released.
-	if err := t.report(ctx, Fold{Split: split, First: first, Output: f.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Forced: forced, Requested: requested, Instructions: instructions}); err != nil {
+	if err := t.report(ctx, Fold{Split: split, First: first, Output: f.output, Summary: f.summary, Pinned: pinned, TokensBefore: tokens, Usage: f.usage, ResponseID: f.responseID, OutputTypes: f.outputTypes, Attempts: f.attempts, Request: f.request, Forced: forced, Requested: requested, Instructions: instructions, Budget: args.budget, Model: f.model}); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -997,8 +1103,8 @@ func (t *Transform) backOff(items agentturn.Transcript, split, tokens int) bool 
 // the person's own messages among them within the bound and the
 // newest of those within the total, in their order, filtered as the
 // request is so an app-only item never reaches the server.
-func (t *Transform) pinned(prefix agentturn.Transcript, persons agentturn.PersonMessages, settings int) openresponses.Items {
-	total := t.personTotalOf(settings)
+func (t *Transform) pinned(prefix agentturn.Transcript, persons agentturn.PersonMessages, budget, settings int) openresponses.Items {
+	total := t.personTotalOf(budget, settings)
 	if t.pin == nil && (len(persons) == 0 || t.personBound <= 0 || total <= 0) {
 		return nil
 	}
@@ -1031,13 +1137,22 @@ func (t *Transform) pinned(prefix agentturn.Transcript, persons agentturn.Person
 // budget by default, and never more than half of what the request's
 // settings, weighing settings, leave of the budget, so the kept
 // messages stay below it with room for the summary and the kept tail,
-// as RFC 0001 The request, step 2, requires.
-func (t *Transform) personTotalOf(settings int) int {
-	total := t.budget / 4
+// as RFC 0001 The request, step 2, requires. Under no budget, where
+// only a fold asked for is made, it is WithPersonTotal's when set and
+// otherwise the default under [DefaultBudget], so the kept messages
+// still stay bounded from one asked-for fold to the next.
+func (t *Transform) personTotalOf(budget, settings int) int {
+	if budget <= 0 {
+		if t.personTotalSet {
+			return t.personTotal
+		}
+		return DefaultBudget / 4
+	}
+	total := budget / 4
 	if t.personTotalSet {
 		total = t.personTotal
 	}
-	return min(total, max(t.budget-settings, 0)/2)
+	return min(total, max(budget-settings, 0)/2)
 }
 
 // keepsPerson reports whether item is one of the person's own messages
