@@ -109,13 +109,14 @@ type Option func(*Transform)
 // called with no settings on its context, or given [WithEstimator]
 // without [WithSettingsEstimator], weighs the items alone.
 //
-// A budget of 0 or less is no budget: nothing is folded for its size,
+// A budget of 0 or less is no budget, kept and reported as 0: nothing
+// is folded for its size,
 // and only a fold asked for, by [Transform.FoldNext] or by the loop's
 // retry after a context-length refusal, is made. A host that does not
 // yet know the model's context window builds the transform so and
 // gives the budget later with [Transform.SetBudget]. Before v0.0.41 a
 // budget of 0 folded on every call. The default is [DefaultBudget].
-func WithBudget(tokens int) Option { return func(t *Transform) { t.budget = tokens } }
+func WithBudget(tokens int) Option { return func(t *Transform) { t.budget = max(tokens, 0) } }
 
 // WithEstimator replaces the token estimator for items. The default is
 // [Estimate]. An estimator of its own counts in its own units, so the
@@ -943,9 +944,9 @@ func (t *Transform) FoldNext(instructions string) {
 func (t *Transform) SetBudget(tokens int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.budget = tokens
+	t.budget = max(tokens, 0)
 	if t.minFoldOf != nil {
-		t.minFold = t.minFoldOf(tokens)
+		t.minFold = t.minFoldOf(t.budget)
 	}
 }
 

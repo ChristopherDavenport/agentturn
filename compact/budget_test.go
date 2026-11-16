@@ -268,3 +268,38 @@ func TestNewRecordsItsModel(t *testing.T) {
 		})
 	}
 }
+
+// TestANegativeBudgetIsNone pins that a budget below 0, from WithBudget
+// or SetBudget, is no budget and is reported as 0, as the docs of
+// Fold.Budget and the record's budget say: nothing folds by size, and a
+// fold asked for carries budget 0.
+func TestANegativeBudgetIsNone(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []Option
+		set  bool
+	}{
+		{"WithBudget(-5)", []Option{WithBudget(-5)}, false},
+		{"SetBudget(-5)", []Option{WithBudget(3)}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &summarizer{reply: "gist"}
+			var folds []Fold
+			tr := NewLocal(s, append(tc.opts, WithKeepLast(1), WithEstimator(count), WithMinFold(0),
+				WithOnFold(func(_ context.Context, f Fold) error { folds = append(folds, f); return nil }))...)
+			if tc.set {
+				tr.SetBudget(-5)
+			}
+			if out, err := tr.Transform(context.Background(), items(10)); err != nil || len(out) != 10 || len(s.reqs) != 0 {
+				t.Fatalf("by size: out = %d, err = %v, summaries = %d", len(out), err, len(s.reqs))
+			}
+			tr.FoldNext("")
+			if _, err := tr.Transform(context.Background(), items(10)); err != nil {
+				t.Fatal(err)
+			}
+			if len(folds) != 1 || folds[0].Budget != 0 {
+				t.Errorf("folds = %+v, want one with budget 0", folds)
+			}
+		})
+	}
+}
