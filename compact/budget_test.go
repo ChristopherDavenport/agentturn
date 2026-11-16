@@ -2,6 +2,7 @@ package compact
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -299,6 +300,49 @@ func TestANegativeBudgetIsNone(t *testing.T) {
 			}
 			if len(folds) != 1 || folds[0].Budget != 0 {
 				t.Errorf("folds = %+v, want one with budget 0", folds)
+			}
+		})
+	}
+}
+
+// TestNoBudgetCapsThePersonTotalBySettings pins the person total under
+// no budget: with no total of the host's, it is the default under
+// DefaultBudget, a quarter of it and at most half of what the request's
+// settings leave of it, as on the budgeted path; a host's
+// WithPersonTotal stands as given.
+func TestNoBudgetCapsThePersonTotalBySettings(t *testing.T) {
+	var asks openresponses.Items
+	persons := agentturn.PersonMessages{}
+	for i := range 10 {
+		m := openresponses.UserText(fmt.Sprintf("ask %d", i))
+		asks = append(asks, m)
+		persons[m] = true
+	}
+	for _, tc := range []struct {
+		name     string
+		settings int
+		opts     []Option
+		pinned   int
+	}{
+		{"no settings: a quarter of DefaultBudget keeps all nine", 0, nil, 9},
+		{"settings leave six: half of that", DefaultBudget - 6, nil, 3},
+		{"a host's total stands", DefaultBudget - 6, []Option{WithPersonTotal(5)}, 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var folds []Fold
+			tr := NewLocal(&summarizer{reply: "gist"}, append([]Option{WithBudget(0), WithKeepLast(1), WithEstimator(count), WithMinFold(0),
+				WithSettingsEstimator(func(openresponses.Request) int { return tc.settings }),
+				WithOnFold(func(_ context.Context, f Fold) error { folds = append(folds, f); return nil })}, tc.opts...)...)
+			ctx := agentturn.ContextWithPersonMessages(agentturn.ContextWithRequest(context.Background(), openresponses.Request{Model: "m"}), persons)
+			tr.FoldNext("")
+			if _, err := tr.Transform(ctx, agentturn.Transcript(asks)); err != nil {
+				t.Fatal(err)
+			}
+			if len(folds) != 1 {
+				t.Fatalf("folds = %d, want 1", len(folds))
+			}
+			if got := len(folds[0].Pinned); got != tc.pinned {
+				t.Errorf("pinned = %d, want %d", got, tc.pinned)
 			}
 		})
 	}

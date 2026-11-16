@@ -13,8 +13,9 @@ versions may break the API.
   loop's retry after a context-length refusal, is made. v0.0.40 folded
   on every call under a budget of 0. Under no budget the summary
   request's `max_output_tokens` is `DefaultSummaryMaxOutputTokens`, and
-  the person's kept messages are held to `WithPersonTotal`, or a quarter
-  of `DefaultBudget`. (#318)
+  the person's kept messages are held to `WithPersonTotal`, as given,
+  or to the default under `DefaultBudget`: a quarter of it, at most half
+  of what the request's settings leave of it. (#318)
 - Changed (breaking for a host that read such a run as answered): a
   final answer the provider ended `incomplete` with
   `incomplete_details` whose `reason` is empty ends the run

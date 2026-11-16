@@ -268,7 +268,8 @@ func WithPersonBound(bytes int) Option { return func(t *Transform) { t.personBou
 // weighs them, counts as that half: kept messages that filled the
 // request alone would leave no room for the summary and the kept tail,
 // and every call would fold again. Under no budget ([WithBudget] 0),
-// the default is a quarter of [DefaultBudget] and a total given here
+// the default is the one under [DefaultBudget], a quarter of it and at
+// most half of what the settings leave of it, and a total given here
 // stands as given. Zero or less keeps none of them. [WithPin]'s items
 // are the host's choice and do not count against it.
 func WithPersonTotal(tokens int) Option {
@@ -1139,15 +1140,16 @@ func (t *Transform) pinned(prefix agentturn.Transcript, persons agentturn.Person
 // settings, weighing settings, leave of the budget, so the kept
 // messages stay below it with room for the summary and the kept tail,
 // as RFC 0001 The request, step 2, requires. Under no budget, where
-// only a fold asked for is made, it is WithPersonTotal's when set and
-// otherwise the default under [DefaultBudget], so the kept messages
-// still stay bounded from one asked-for fold to the next.
+// only a fold asked for is made, it is WithPersonTotal's when set, as
+// given, and otherwise the default under [DefaultBudget], capped by
+// the settings as there, so the kept messages still stay bounded from
+// one asked-for fold to the next.
 func (t *Transform) personTotalOf(budget, settings int) int {
 	if budget <= 0 {
 		if t.personTotalSet {
 			return t.personTotal
 		}
-		return DefaultBudget / 4
+		budget = DefaultBudget
 	}
 	total := budget / 4
 	if t.personTotalSet {
