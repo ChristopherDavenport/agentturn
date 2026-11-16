@@ -183,9 +183,10 @@ func TestSplitKeepsCallsWithOutputs(t *testing.T) {
 			}
 		})
 	}
-	// Nothing older than the kept tail: no compaction, no call.
+	// Nothing older than the kept tail: no compaction, no call, though
+	// the transcript is over budget.
 	c := &counting{Compactor: &echo.Adapter{}}
-	out, err := New(c, WithKeepLast(10), WithBudget(0), WithEstimator(count)).Transform(context.Background(), transcript)
+	out, err := New(c, WithKeepLast(10), WithBudget(1), WithEstimator(count)).Transform(context.Background(), transcript)
 	if err != nil || len(out) != len(transcript) || c.calls.Load() != 0 {
 		t.Errorf("out = %d err = %v calls = %d", len(out), err, c.calls.Load())
 	}
