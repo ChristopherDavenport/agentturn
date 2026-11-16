@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.41 - 2026-11-15
 
 - Changed (breaking for a host that built with `compact.WithBudget(0)`):
   a budget of 0 is no budget: the transform folds nothing for the
