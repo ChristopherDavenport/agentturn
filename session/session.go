@@ -4909,7 +4909,10 @@ func recordedEnd(run *agentsession.Run, items openresponses.Items) *agentturn.Ru
 // lastIncomplete is what the end of run carried live, read from its
 // segment: the incomplete_details of its last response, extension
 // members included, and the text of the refusal parts of that
-// response's assistant messages, joined as the loop joins them.
+// response's assistant messages, joined as the loop joins them. A last
+// response that ended incomplete naming no reason, with no details or
+// details whose reason is empty, reads as the loop read it live: cut
+// at the output limit, max_output_tokens (#317).
 func lastIncomplete(run *agentsession.Run) (*openresponses.IncompleteDetails, string) {
 	var last *agentsession.ResponseEntry
 	for _, e := range run.Segment {
@@ -4917,11 +4920,17 @@ func lastIncomplete(run *agentsession.Run) (*openresponses.IncompleteDetails, st
 			last = r
 		}
 	}
-	if last == nil || last.Incomplete == nil {
+	if last == nil || last.Incomplete == nil && last.Status != openresponses.ResponseStatusIncomplete {
 		return nil, ""
 	}
-	details := *last.Incomplete
-	details.Extra = maps.Clone(last.Incomplete.Extra)
+	var details openresponses.IncompleteDetails
+	if last.Incomplete != nil {
+		details = *last.Incomplete
+		details.Extra = maps.Clone(last.Incomplete.Extra)
+	}
+	if details.Reason == "" {
+		details.Reason = openresponses.IncompleteReasonMaxOutputTokens
+	}
 	var parts []string
 	for _, e := range run.Segment {
 		ie, ok := e.(*agentsession.ItemEntry)

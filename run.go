@@ -2041,19 +2041,26 @@ func answered(resp *openresponses.Response) error {
 
 // cutDetails returns a copy of the incomplete_details of resp when the
 // output limit cut it, reason max_output_tokens, or it ended incomplete
-// naming no reason, which reads the same; nil otherwise.
+// naming no reason, which reads the same: with no details, or details
+// whose reason is empty (#317), the copy names max_output_tokens, any
+// extension members kept. It is nil otherwise.
 func cutDetails(resp *openresponses.Response) *openresponses.IncompleteDetails {
 	if resp == nil || resp.Status != openresponses.ResponseStatusIncomplete {
 		return nil
 	}
-	details := resp.IncompleteDetails
-	if details == nil {
+	d := resp.IncompleteDetails
+	if d == nil {
 		return &openresponses.IncompleteDetails{Reason: openresponses.IncompleteReasonMaxOutputTokens}
 	}
-	if details.Reason != openresponses.IncompleteReasonMaxOutputTokens {
-		return nil
+	switch d.Reason {
+	case openresponses.IncompleteReasonMaxOutputTokens:
+		return cloneDetails(d)
+	case "":
+		c := cloneDetails(d)
+		c.Reason = openresponses.IncompleteReasonMaxOutputTokens
+		return c
 	}
-	return cloneDetails(details)
+	return nil
 }
 
 // filtered reports whether the provider ended resp incomplete with

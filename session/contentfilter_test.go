@@ -278,3 +278,44 @@ func TestRecordedEndKeepsACutUnderAnotherStop(t *testing.T) {
 		t.Fatalf("read back = %+v", back)
 	}
 }
+
+// TestAnEmptyIncompleteReasonReadsAsTheOutputLimit pins #317's empty
+// reason: a final answer whose incomplete_details name no reason, as
+// one with no details, ends stopped with StopMaxOutputTokens live, is
+// written aborted with that cause, and reads back as the same stop
+// with the same details.
+func TestAnEmptyIncompleteReasonReadsAsTheOutputLimit(t *testing.T) {
+	store := agentsession.NewMemoryStore()
+	rec, s, err := Start(context.Background(), store, agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := agentturn.New(agentturn.Config{Model: &cutShort{reason: ""}, ModelName: "m"})
+	defer rec.Attach(a)()
+	live, err := a.Prompt(context.Background(), openresponses.UserText("go"))
+	if err != nil || live.Reason != agentturn.ReasonStopped || live.Cause != agentturn.StopMaxOutputTokens {
+		t.Fatalf("live end = %+v err=%v", live, err)
+	}
+	if live.Incomplete == nil || live.Incomplete.Reason != openresponses.IncompleteReasonMaxOutputTokens {
+		t.Errorf("live incomplete = %+v", live.Incomplete)
+	}
+	runs := runsOf(t, s)
+	if len(runs) != 1 || runs[0].End == nil || runs[0].End.Reason != agentsession.ReasonAborted || runs[0].End.Ref != string(agentturn.StopMaxOutputTokens) {
+		t.Fatalf("run end = %+v", runs[0].End)
+	}
+	items, err := runItems(s, runs[0], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back := recordedEnd(runs[0], items)
+	if back == nil || back.Reason != live.Reason || back.Cause != live.Cause {
+		t.Fatalf("read back = %+v, want %s %q", back, live.Reason, live.Cause)
+	}
+	if back.Incomplete == nil || live.Incomplete == nil || back.Incomplete.Reason != live.Incomplete.Reason {
+		t.Errorf("read back incomplete = %+v, live %+v", back.Incomplete, live.Incomplete)
+	}
+	if text, ok := back.Answer(); !ok || text != "Once upon" {
+		t.Errorf("read back answer = %q, %v", text, ok)
+	}
+	verifyAll(t, s)
+}

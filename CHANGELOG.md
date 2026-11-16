@@ -5,6 +5,16 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Fixed: a final answer the provider ended `incomplete` with
+  `incomplete_details` whose `reason` is empty ends the run
+  `ReasonStopped` with `StopMaxOutputTokens`, as one with no details
+  does and as RFC 0001 already had it; v0.0.40 ended it `done`, while
+  the record wrote `aborted` and read it back as the output limit's
+  stop. `RunEnd.Incomplete` names `max_output_tokens` for both forms,
+  live and read back from the record. Part of #317.
+
 ## v0.0.40 - 2026-11-15
 
 - Changed (breaking for a host that read such a run as answered): a
