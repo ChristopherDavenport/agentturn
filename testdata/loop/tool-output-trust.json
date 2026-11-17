@@ -1,0 +1,66 @@
+{
+  "name": "tool-output-trust",
+  "description": "A tool's output carries the trust its stated flow gives it, on its item events and its tool_end: a flow's labels, an empty list for a flow that reads neither, none for a tool that states no flow and none for a call blocked before its tool, whose output is the loop's refusal (#321).",
+  "rules": ["#the-transcript", "#the-batch"],
+  "config": {"model": "m", "tool_execution": "sequential"},
+  "tools": [
+    {"name": "web", "flow": {"reads": ["untrusted", "private"], "sends": true}, "result": {"output": "a page"}},
+    {"name": "pure", "flow": {"reads": []}, "result": {"output": "4"}},
+    {"name": "plain", "result": {"output": "a file"}},
+    {"name": "refused", "flow": {"reads": ["untrusted"]}}
+  ],
+  "decisions": {"call_4": {"action": "block", "reason": "not now"}},
+  "model": [
+    {"id": "resp_1", "output": [
+      {"type": "function_call", "call_id": "call_1", "name": "web", "arguments": "{}"},
+      {"type": "function_call", "call_id": "call_2", "name": "pure", "arguments": "{}"},
+      {"type": "function_call", "call_id": "call_3", "name": "plain", "arguments": "{}"},
+      {"type": "function_call", "call_id": "call_4", "name": "refused", "arguments": "{}"}
+    ]},
+    {"id": "resp_2", "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}
+    ]}
+  ],
+  "runs": [
+    {
+      "prompt": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "look"}]}],
+      "expect": {
+        "events": [
+          {"type": "run_start"},
+          {"type": "item_start", "provenance": null}, {"type": "item_end", "provenance": null},
+          {"type": "turn_start", "turn": 1},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "item_start"}, {"type": "item_end"},
+          {"type": "response_end", "turn": 1},
+          {"type": "tool_start", "call_id": "call_1"},
+          {"type": "tool_start", "call_id": "call_2"},
+          {"type": "tool_start", "call_id": "call_3"},
+          {"type": "tool_start", "call_id": "call_4", "decision": {"action": "block", "reason": "not now"}},
+          {"type": "tool_end", "call_id": "call_4", "blocked": true, "trust": null},
+          {"type": "tool_dispatch", "call_id": "call_1"},
+          {"type": "tool_end", "call_id": "call_1", "result": {"output": "a page"}, "trust": {"reads": ["untrusted", "private"]}},
+          {"type": "tool_dispatch", "call_id": "call_2"},
+          {"type": "tool_end", "call_id": "call_2", "result": {"output": "4"}, "trust": {"reads": []}},
+          {"type": "tool_dispatch", "call_id": "call_3"},
+          {"type": "tool_end", "call_id": "call_3", "result": {"output": "a file"}, "trust": null},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_1"}, "provenance": {"trust": {"reads": ["untrusted", "private"]}}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_1", "output": "a page"}, "provenance": {"trust": {"reads": ["untrusted", "private"]}}},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_2"}, "provenance": {"trust": {"reads": []}}},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_2", "output": "4"}, "provenance": {"trust": {"reads": []}}},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_3"}, "provenance": null},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_3", "output": "a file"}, "provenance": null},
+          {"type": "item_start", "item": {"type": "function_call_output", "call_id": "call_4"}, "provenance": null},
+          {"type": "item_end", "item": {"type": "function_call_output", "call_id": "call_4", "output": "Error: not now"}, "provenance": null},
+          {"type": "turn_end", "turn": 1},
+          {"type": "turn_start", "turn": 2},
+          {"type": "item_start", "provenance": null}, {"type": "item_end", "provenance": null},
+          {"type": "response_end", "turn": 2},
+          {"type": "turn_end", "turn": 2},
+          {"type": "run_end", "reason": "done", "error": false, "pending": []}
+        ]
+      }
+    }
+  ]
+}

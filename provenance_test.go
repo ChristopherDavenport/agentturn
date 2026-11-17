@@ -184,3 +184,152 @@ func TestWithProvenanceRefusesWhatTheFormatCannotHold(t *testing.T) {
 		t.Error("a plain item has provenance")
 	}
 }
+
+// TestToolOutputCarriesItsFlowTrust pins that the output of a tool
+// that states its flow carries the trust that flow gives it, as
+// agentsession RFC 0001 asks of a writer (item, trust: "on the output
+// of a tool whose declaration labels what it reads"), so a recorder
+// writes it on the output's entry (#321): a tool reading untrusted and
+// private content labels its output with both, one stating it reads
+// neither with an empty trust, which says the content was judged, and
+// one stating no flow with none, which says nothing. A call the tool
+// never ran, refused before it, carries none: its output is the
+// refusal, not what the tool read.
+func TestToolOutputCarriesItsFlowTrust(t *testing.T) {
+	text := func(name string) func(context.Context, echoArgs) (string, error) {
+		return func(context.Context, echoArgs) (string, error) { return name, nil }
+	}
+	web := agenttool.New("web", "", text("web"), agenttool.WithFlow(agenttool.Flow{Reads: []agenttool.Label{agenttool.LabelUntrusted, agenttool.LabelPrivate}, Sends: true}))
+	pure := agenttool.New("pure", "", text("pure"), agenttool.WithFlow(agenttool.Flow{}))
+	plain := agenttool.New("plain", "", text("plain"))
+	refused := agenttool.New("refused", "", text("refused"), agenttool.WithFlow(agenttool.Flow{Reads: []agenttool.Label{agenttool.LabelUntrusted}}))
+	cfg := Config{Model: twoCalls{}, Tools: []agenttool.Tool{web, pure, plain, refused}, MaxTurns: 1,
+		BeforeToolCall: func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
+			if info.Call.Name == "refused" {
+				return &ToolDecision{Action: Block, Reason: "no"}, nil
+			}
+			return nil, nil
+		}}
+	events, _, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]string{}
+	outputs := map[string]*ItemEnd{}
+	ends := map[string]*ToolEnd{}
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case *ToolStart:
+			names[e.CallID] = e.Name
+		case *ToolEnd:
+			ends[e.Name] = e
+		case *ItemEnd:
+			if out, ok := e.Item.(*openresponses.FunctionCallOutput); ok {
+				outputs[names[out.CallID]] = e
+			}
+		}
+	}
+	for name, want := range map[string][]agenttool.Label{
+		"web":     {agenttool.LabelUntrusted, agenttool.LabelPrivate},
+		"pure":    {},
+		"plain":   nil,
+		"refused": nil,
+	} {
+		e := outputs[name]
+		if e == nil {
+			t.Errorf("%s: no output item_end", name)
+			continue
+		}
+		var got *Trust
+		if e.Provenance != nil {
+			got = e.Provenance.Trust
+		}
+		switch {
+		case want == nil && got != nil:
+			t.Errorf("%s: output trust = %v, want none", name, got.Reads)
+		case want != nil && (got == nil || !slices.Equal(got.Reads, want)):
+			t.Errorf("%s: output trust = %+v, want %v", name, got, want)
+		}
+		if e.Provenance != nil && (len(e.Provenance.Layers) > 0 || !e.Provenance.Source.IsZero()) {
+			t.Errorf("%s: output provenance = %+v, want trust alone", name, e.Provenance)
+		}
+		// The call's tool_end carries the same, for a recorder's
+		// result entry, which carries the output's trust.
+		end := ends[name]
+		switch {
+		case end == nil:
+			t.Errorf("%s: no tool_end", name)
+		case want == nil && end.Trust != nil:
+			t.Errorf("%s: tool_end trust = %v, want none", name, end.Trust.Reads)
+		case want != nil && (end.Trust == nil || !slices.Equal(end.Trust.Reads, want)):
+			t.Errorf("%s: tool_end trust = %+v, want %v", name, end.Trust, want)
+		}
+	}
+}
+
+// TestToolOutputTrustSurvivesAnOverrideAndSkipsADeferral pins two rows
+// of RFC 0001's tool output trust (#321): an output the after-call hook
+// replaced carries the tool's labels all the same, since a label only
+// narrows what a reader may do with the text, and a call the decision
+// hook deferred, never handed to its tool, carries none on its
+// tool_end.
+func TestToolOutputTrustSurvivesAnOverrideAndSkipsADeferral(t *testing.T) {
+	untrusted := agenttool.Flow{Reads: []agenttool.Label{agenttool.LabelUntrusted, agenttool.LabelPrivate}}
+	web := agenttool.New("web", "", func(context.Context, echoArgs) (string, error) { return "page", nil }, agenttool.WithFlow(untrusted))
+	held := agenttool.New("held", "", func(context.Context, echoArgs) (string, error) { return "held", nil }, agenttool.WithFlow(untrusted))
+	cfg := Config{Model: twoCalls{}, Tools: []agenttool.Tool{web, held}, MaxTurns: 1,
+		BeforeToolCall: func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
+			if info.Call.Name == "held" {
+				return &ToolDecision{Action: Defer, Reason: "ask"}, nil
+			}
+			return nil, nil
+		},
+		AfterToolCall: func(_ context.Context, info ToolResultInfo) (*ToolOverride, error) {
+			if info.Call.Name == "web" {
+				return &ToolOverride{Result: agenttool.Text("summarised page")}, nil
+			}
+			return nil, nil
+		}}
+	events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if end.Reason != ReasonInputRequired {
+		t.Fatalf("run ended %s, want input_required for the deferred call", end.Reason)
+	}
+	want := []agenttool.Label{agenttool.LabelUntrusted, agenttool.LabelPrivate}
+	var sawOutput, sawWeb, sawHeld bool
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case *ToolEnd:
+			switch e.Name {
+			case "web":
+				sawWeb = true
+				if e.Trust == nil || !slices.Equal(e.Trust.Reads, want) {
+					t.Errorf("overridden web tool_end trust = %+v, want %v", e.Trust, want)
+				}
+			case "held":
+				sawHeld = true
+				if !e.Deferred || e.Trust != nil {
+					t.Errorf("deferred held tool_end deferred=%v trust=%+v, want deferred with none", e.Deferred, e.Trust)
+				}
+			}
+		case *ItemEnd:
+			out, ok := e.Item.(*openresponses.FunctionCallOutput)
+			if !ok {
+				continue
+			}
+			if out.Output.Text != "summarised page" {
+				t.Errorf("an output %q was appended, want only the override", out.Output.Text)
+				continue
+			}
+			sawOutput = true
+			if e.Provenance == nil || e.Provenance.Trust == nil || !slices.Equal(e.Provenance.Trust.Reads, want) {
+				t.Errorf("overridden output provenance = %+v, want trust %v", e.Provenance, want)
+			}
+		}
+	}
+	if !sawOutput || !sawWeb || !sawHeld {
+		t.Errorf("saw output=%v web=%v held=%v, want all", sawOutput, sawWeb, sawHeld)
+	}
+}

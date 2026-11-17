@@ -2889,6 +2889,10 @@ type callState struct {
 	// read by the loop after the executor has drained.
 	key        string
 	dispatched bool
+	// trust is what the flow its tool states gives the call's output,
+	// set by finish for a call its tool ran, nil for one whose tool
+	// states no flow or never ran.
+	trust *Trust
 	// after is the calls before this one that its dispatch waits for
 	// the settling of: the one before it in its chain, or, around an
 	// agenttool.Barrier, every call of the segment before it. done is
@@ -3078,7 +3082,7 @@ func (r *runner) appendFinished(ctx context.Context, batch []*callState) error {
 			continue
 		}
 		p.appended = true
-		outputs = append(outputs, &openresponses.FunctionCallOutput{CallID: p.call.CallID, Output: p.result.Output})
+		outputs = append(outputs, p.output())
 	}
 	// The notes of every call of the batch wait with the batch, a cut
 	// one's included: what was said about it still holds when the run
@@ -3327,7 +3331,7 @@ func (r *runner) collect(batch []*callState) ([]agenttool.Result, []*openrespons
 		results[i] = p.result
 		if !p.deferred {
 			p.appended = true
-			outputs = append(outputs, &openresponses.FunctionCallOutput{CallID: p.call.CallID, Output: p.result.Output})
+			outputs = append(outputs, p.output())
 		} else {
 			deferred = append(deferred, p.call)
 		}
@@ -3584,7 +3588,45 @@ func (r *runner) finish(p *callState) error {
 	// delivery that fails is the consumer's failure, and the call is
 	// not ended a second time for it.
 	p.ended = true
-	return r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Reason: p.reason, Parent: p.parent, Withdrawn: p.dispatchErr != nil, Cut: p.cut})
+	if p.dispatched {
+		// The tool ran, so its output, an error it returned and what
+		// the after-call hook made of either included, holds what the
+		// tool read (agentsession RFC 0001, item, trust; #321). A hook
+		// that replaced the output gets the tool's labels all the same:
+		// a label only narrows what a reader may do with the text. A
+		// call refused before its tool, or one no tool has the name of,
+		// carries the refusal and none.
+		p.trust = flowTrust(p.tool)
+	}
+	return r.emit(&ToolEnd{RunID: r.runID, Turn: p.turn, CallID: p.call.CallID, Name: p.call.Name, Result: p.result, Err: p.err, Blocked: p.blocked, Reason: p.reason, Parent: p.parent, Withdrawn: p.dispatchErr != nil, Cut: p.cut, Trust: p.trust.clone()})
+}
+
+// flowTrust is the trust the flow t states gives its output, nil when
+// t states none: [agenttool.FlowOf]'s labels, an empty list for a tool
+// that states it reads neither untrusted nor private content, which
+// says the content was judged and found neither.
+func flowTrust(t agenttool.Tool) *Trust {
+	if t == nil {
+		return nil
+	}
+	flow, ok := agenttool.FlowOf(t)
+	if !ok {
+		return nil
+	}
+	return &Trust{Reads: append([]agenttool.Label{}, flow.Reads...)}
+}
+
+// output is the call's output as the batch appends it, marked with the
+// trust its tool's flow gives it, which its item events carry and a
+// recorder writes on its entry.
+func (p *callState) output() openresponses.Item {
+	out := &openresponses.FunctionCallOutput{CallID: p.call.CallID, Output: p.result.Output}
+	if p.trust == nil {
+		return out
+	}
+	// Marked as WithProvenance marks an item, with nothing to check:
+	// FlowOf returns its labels non-empty and without repeats.
+	return markedItem{item: out, prov: &Provenance{Trust: p.trust.clone()}}
 }
 
 func validObject(raw json.RawMessage) bool {

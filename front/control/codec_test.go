@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -51,7 +52,7 @@ func sampleEvents(t *testing.T) map[string]agentturn.Event {
 		"ToolStart":    &agentturn.ToolStart{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Args: json.RawMessage(`{"text":"a"}`), Decision: decision, Parent: "call_0", Invoked: json.RawMessage(`{"text":"A"}`), Replayed: true},
 		"ToolDispatch": &agentturn.ToolDispatch{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Parent: "call_0", IdempotencyKey: "k"},
 		"ToolUpdate":   &agentturn.ToolUpdate{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Partial: result},
-		"ToolEnd":      &agentturn.ToolEnd{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Result: result, Err: errors.New("boom"), Blocked: true, Deferred: true, Reason: "r", Parent: "call_0", Withdrawn: true, Cut: true, Replayed: true},
+		"ToolEnd":      &agentturn.ToolEnd{RunID: "run_1", Turn: 1, CallID: "call_1", Name: "upper", Result: result, Err: errors.New("boom"), Blocked: true, Deferred: true, Reason: "r", Parent: "call_0", Withdrawn: true, Cut: true, Replayed: true, Trust: &agentturn.Trust{Reads: []agenttool.Label{agenttool.LabelUntrusted}}},
 		"TurnEnd":      &agentturn.TurnEnd{RunID: "run_1", Turn: 1, Response: resp, ToolResults: []agenttool.Result{result}},
 		"RunEnd": &agentturn.RunEnd{RunID: "run_1", Items: openresponses.Items{openresponses.UserText("hi"), call, out}, Reason: agentturn.ReasonInputRequired,
 			Cause: agentturn.StopGuard, Err: agentturn.ErrRunning, Failure: errors.New("disk full"), Withheld: true, Refusal: "no",
@@ -207,6 +208,9 @@ func TestWhatTravelsAsADescription(t *testing.T) {
 	te := decode(samples["ToolEnd"]).(*agentturn.ToolEnd)
 	if d, ok := te.Result.Details.(json.RawMessage); !ok || string(d) != `{"k":"v"}` {
 		t.Errorf("details = %#v", te.Result.Details)
+	}
+	if te.Trust == nil || !slices.Equal(te.Trust.Reads, []agenttool.Label{agenttool.LabelUntrusted}) {
+		t.Errorf("tool_end trust = %+v, want untrusted", te.Trust)
 	}
 	closed := decode(samples["QuestionClosed"]).(*agentturn.QuestionClosed)
 	if closed.Answer == nil || closed.Answer.Note != "not now" || closed.Answer.Action != agenttool.ActionDecline || closed.By.Ref != "alice" {

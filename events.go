@@ -347,7 +347,8 @@ type ItemStart struct {
 	Copied bool
 	// Provenance is what the caller marked the item with through
 	// [WithProvenance], nil for none: where text the person did not
-	// write came from and whether it is trusted.
+	// write came from and whether it is trusted. A tool's output
+	// carries the trust its tool's flow gives it ([ToolEnd.Trust]).
 	Provenance *Provenance
 }
 
@@ -405,9 +406,11 @@ type ItemEnd struct {
 	Copied bool
 	// Provenance is what the caller marked the item with through
 	// [WithProvenance], nil for none: where text the person did not
-	// write came from and whether it is trusted. A session recorder
-	// writes its layers as instructions_part, its trust as trust and
-	// its source as the item's source, over Trigger.
+	// write came from and whether it is trusted. A tool's output
+	// carries the trust its tool's flow gives it ([ToolEnd.Trust]). A
+	// session recorder writes its layers as instructions_part, its
+	// trust as trust and its source as the item's source, over
+	// Trigger.
 	Provenance *Provenance
 	// Trigger, for an item the run was prompted with, is the run's
 	// [Trigger], so a recorder can write how the input arrived; it is
@@ -592,6 +595,15 @@ type ToolEnd struct {
 	// Replayed says the result is the one a record held for a nested
 	// call that had ended, given again without running its tool.
 	Replayed bool
+	// Trust is what the flow the call's tool states gives its output
+	// ([agenttool.FlowOf]): its labels, an empty Reads for a tool that
+	// states it reads neither untrusted nor private content, nil for a
+	// tool that states no flow, a call its tool never ran and a
+	// replayed one. The output's item events carry the same as their
+	// [Provenance.Trust], and a recorder writes it as agentsession RFC
+	// 0001's trust on the call's result entry, which carries the trust
+	// of the output's entry (#321).
+	Trust *Trust
 }
 
 // EventType returns "tool_end".

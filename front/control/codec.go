@@ -143,7 +143,7 @@ func wireOf(ev agentturn.Event) (any, error) {
 			return nil, err
 		}
 		return wireToolEnd{Type: e.EventType(), RunID: e.RunID, Turn: e.Turn, CallID: e.CallID, Name: e.Name, Result: result, Err: errorOut(e.Err),
-			Blocked: e.Blocked, Deferred: e.Deferred, Reason: e.Reason, Parent: e.Parent, Withdrawn: e.Withdrawn, Cut: e.Cut, Replayed: e.Replayed}, nil
+			Blocked: e.Blocked, Deferred: e.Deferred, Reason: e.Reason, Parent: e.Parent, Withdrawn: e.Withdrawn, Cut: e.Cut, Replayed: e.Replayed, Trust: trustOut(e.Trust)}, nil
 	case *agentturn.TurnEnd:
 		resp, err := responseOut(e.Response)
 		if err != nil {
@@ -320,7 +320,7 @@ var decoders = map[string]func([]byte) (agentturn.Event, error){
 			return nil, err
 		}
 		return &agentturn.ToolEnd{RunID: w.RunID, Turn: w.Turn, CallID: w.CallID, Name: w.Name, Result: resultIn(w.Result), Err: errorIn(w.Err),
-			Blocked: w.Blocked, Deferred: w.Deferred, Reason: w.Reason, Parent: w.Parent, Withdrawn: w.Withdrawn, Cut: w.Cut, Replayed: w.Replayed}, nil
+			Blocked: w.Blocked, Deferred: w.Deferred, Reason: w.Reason, Parent: w.Parent, Withdrawn: w.Withdrawn, Cut: w.Cut, Replayed: w.Replayed, Trust: trustIn(w.Trust)}, nil
 	},
 	agentturn.EventTurnEnd: func(data []byte) (agentturn.Event, error) {
 		var w wireTurnEnd
@@ -518,6 +518,7 @@ type wireToolEnd struct {
 	Withdrawn bool       `json:"withdrawn,omitempty"`
 	Cut       bool       `json:"cut,omitempty"`
 	Replayed  bool       `json:"replayed,omitempty"`
+	Trust     *wireTrust `json:"trust,omitempty"`
 }
 
 type wireTurnEnd struct {
@@ -682,13 +683,32 @@ func provenanceOut(p *agentturn.Provenance) *wireProvenance {
 	for _, l := range p.Layers {
 		w.Layers = append(w.Layers, wireLayer{ID: l.ID, Source: l.Source})
 	}
-	if p.Trust != nil {
-		w.Trust = &wireTrust{Reads: p.Trust.Reads}
-		if w.Trust.Reads == nil {
-			w.Trust.Reads = []agenttool.Label{}
-		}
+	w.Trust = trustOut(p.Trust)
+	return w
+}
+
+// trustOut is t on the wire: absent for nil, and reads an empty list,
+// never null, for a trust that judged the content and found neither.
+func trustOut(t *agentturn.Trust) *wireTrust {
+	if t == nil {
+		return nil
+	}
+	w := &wireTrust{Reads: t.Reads}
+	if w.Reads == nil {
+		w.Reads = []agenttool.Label{}
 	}
 	return w
+}
+
+func trustIn(w *wireTrust) *agentturn.Trust {
+	if w == nil {
+		return nil
+	}
+	t := &agentturn.Trust{Reads: w.Reads}
+	if t.Reads == nil {
+		t.Reads = []agenttool.Label{}
+	}
+	return t
 }
 
 func provenanceIn(w *wireProvenance) *agentturn.Provenance {
@@ -699,12 +719,7 @@ func provenanceIn(w *wireProvenance) *agentturn.Provenance {
 	for _, l := range w.Layers {
 		p.Layers = append(p.Layers, agentturn.Layer{ID: l.ID, Source: l.Source})
 	}
-	if w.Trust != nil {
-		p.Trust = &agentturn.Trust{Reads: w.Trust.Reads}
-		if p.Trust.Reads == nil {
-			p.Trust.Reads = []agenttool.Label{}
-		}
-	}
+	p.Trust = trustIn(w.Trust)
 	return p
 }
 
