@@ -208,3 +208,105 @@ func TestTheRecorderRefusesToRunAReturnedCall(t *testing.T) {
 		t.Errorf("verify: %v", err)
 	}
 }
+
+// TestAResultCarriesItsOutputsTrust pins agentsession RFC 0001's result
+// trust as agentturn records it (#321): the result of a call whose tool
+// states a flow carries the trust that flow gives the output, as the
+// output's entry does, whether the output joins in the same run or a
+// resume answers the returned call with it after a crash.
+func TestAResultCarriesItsOutputsTrust(t *testing.T) {
+	for _, crash := range []bool{false, true} {
+		name := "live"
+		if crash {
+			name = "after a crash"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := &cutStore{Store: agentsession.NewMemoryStore()}
+			rec, s, err := Start(ctx, store, agentsession.Header{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var sends atomic.Int32
+			fetched := make(chan struct{})
+			tools := []agenttool.Tool{
+				agenttool.New("fetch_page", "", func(context.Context, echoArgs) (string, error) {
+					return "page", nil
+				}, agenttool.WithFlow(agenttool.Flow{Reads: []agenttool.Label{agenttool.LabelUntrusted}})),
+				agenttool.New("send_email", "", func(context.Context, echoArgs) (string, error) {
+					if sends.Add(1) == 1 {
+						<-fetched
+						store.cut.Store(crash)
+					}
+					return "sent", nil
+				}),
+			}
+			cfg := agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools}
+			a := agentturn.New(cfg)
+			unsub := rec.Attach(a)
+			a.Subscribe(func(_ context.Context, ev agentturn.Event) error {
+				if e, ok := ev.(*agentturn.ToolEnd); ok && e.Name == "fetch_page" {
+					close(fetched)
+				}
+				return nil
+			})
+			_, err = a.Prompt(ctx, openresponses.UserText("go"))
+			unsub()
+			if crash {
+				if err == nil {
+					t.Fatal("the run survived the crash")
+				}
+				store.cut.Store(false)
+				if rec, s, err = Resume(ctx, store, s.ID()); err != nil {
+					t.Fatal(err)
+				}
+				pending, err := Pending(s)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var sendID string
+				for _, p := range pending {
+					if p.Call.Name == "send_email" {
+						sendID = p.Call.CallID
+					}
+				}
+				answers, err := ReplayAnswers(ctx, s, tools)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for i, ans := range answers {
+					if ans.CallID == sendID {
+						answers[i] = agentturn.OutcomeUnknown(sendID)
+					}
+				}
+				opts, err := AgentOptions(s)
+				if err != nil {
+					t.Fatal(err)
+				}
+				b := agentturn.New(cfg, opts...)
+				defer rec.Attach(b)()
+				if _, err := b.Resume(ctx, answers...); err != nil {
+					t.Fatal(err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			c := callsOf(t, s)["fetch_page"]
+			if c == nil || c.Result == nil || c.Output == nil {
+				t.Fatalf("fetch_page = %+v, want its result and its output", c)
+			}
+			if got := c.Result.Trust; got == nil || strings.Join(got.Reads, ",") != "untrusted" {
+				t.Errorf("fetch_page's result trust = %+v, want untrusted", got)
+			}
+			if got := c.Output.Trust; got == nil || strings.Join(got.Reads, ",") != "untrusted" {
+				t.Errorf("fetch_page's output trust = %+v, want untrusted, as its result's", got)
+			}
+			if c := callsOf(t, s)["send_email"]; c == nil || c.Output == nil || c.Output.Trust != nil {
+				t.Errorf("send_email = %+v, want its output with no trust", c)
+			}
+			if err := s.VerifyRecords(s.Leaf()); err != nil {
+				t.Errorf("verify: %v", err)
+			}
+		})
+	}
+}

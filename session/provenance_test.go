@@ -1230,3 +1230,41 @@ func TestProviderIsNotAskedAtEveryRunStart(t *testing.T) {
 	}
 	verifyAll(t, s)
 }
+
+// TestAToolOutputsEntryCarriesItsFlowTrust pins agentsession RFC 0001's
+// item trust as agentturn records it (#321): the entry of the output of
+// a tool whose flow labels what it reads carries those labels, and the
+// output of a tool that states no flow carries no trust.
+func TestAToolOutputsEntryCarriesItsFlowTrust(t *testing.T) {
+	ctx := context.Background()
+	rec, s, err := Start(ctx, agentsession.NewMemoryStore(), agentsession.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := func(out string) func(context.Context, echoArgs) (string, error) {
+		return func(context.Context, echoArgs) (string, error) { return out, nil }
+	}
+	tools := []agenttool.Tool{
+		agenttool.New("read_email", "", text("mail"), agenttool.WithFlow(agenttool.Flow{Reads: []agenttool.Label{agenttool.LabelUntrusted, agenttool.LabelPrivate}})),
+		agenttool.New("read_file", "", text("file")),
+	}
+	a := agentturn.New(agentturn.Config{Model: allCalls{}, ModelName: "m", MaxTurns: 1, Tools: tools})
+	defer rec.Attach(a)()
+	if _, err := a.Prompt(ctx, openresponses.UserText("go")); err != nil {
+		t.Fatal(err)
+	}
+	calls := callsOf(t, s)
+	mail, file := calls["read_email"], calls["read_file"]
+	if mail == nil || mail.Output == nil || file == nil || file.Output == nil {
+		t.Fatalf("calls = %+v, want both answered", calls)
+	}
+	if got := mail.Output.Trust; got == nil || strings.Join(got.Reads, ",") != "untrusted,private" {
+		t.Errorf("read_email's output trust = %+v, want untrusted, private", got)
+	}
+	if got := file.Output.Trust; got != nil {
+		t.Errorf("read_file's output trust = %+v, want none", got)
+	}
+	if err := s.VerifyRecords(s.Leaf()); err != nil {
+		t.Errorf("verify: %v", err)
+	}
+}

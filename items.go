@@ -129,7 +129,8 @@ func IsCopied(item openresponses.Item) bool {
 // [Queued.Provenance]), and a session recorder writes it on the item's
 // entry in agentsession RFC 0001's members: Layers as
 // instructions_part, Source as source and Trust as trust (RFC 0001 The
-// record).
+// record). The loop gives a tool's output one itself, holding only the
+// trust its tool's flow gives it ([ToolEnd.Trust]).
 type Provenance struct {
 	// Layers names the instruction layers a message was composed from,
 	// in the order their texts appear in it: an instruction file wrapped
@@ -275,11 +276,20 @@ func (p *Provenance) clone() *Provenance {
 			out.Source.Extra[k] = v
 		}
 	}
-	if p.Trust != nil {
-		out.Trust = &Trust{Reads: slices.Clone(p.Trust.Reads)}
-		if out.Trust.Reads == nil {
-			out.Trust.Reads = []agenttool.Label{}
-		}
+	out.Trust = p.Trust.clone()
+	return out
+}
+
+// clone returns a copy of t holding a list of its own, an empty one
+// for none, so an empty trust stays one that says the content was
+// judged.
+func (t *Trust) clone() *Trust {
+	if t == nil {
+		return nil
+	}
+	out := &Trust{Reads: slices.Clone(t.Reads)}
+	if out.Reads == nil {
+		out.Reads = []agenttool.Label{}
 	}
 	return out
 }

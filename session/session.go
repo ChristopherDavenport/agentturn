@@ -5936,6 +5936,10 @@ func (w *writer) toolEnd(ctx context.Context, e *agentturn.ToolEnd) error {
 			}
 			r := agentsession.NewResult(e.CallID, c.entry, out.(*openresponses.FunctionCallOutput))
 			r.Failed = c.failed
+			// The output's entry carries the trust its tool's flow
+			// gives it, and agentsession RFC 0001 has the result carry
+			// the same (#321).
+			r.Trust = sessionTrust(e.Trust)
 			if _, err := w.append(ctx, r); err != nil {
 				return err
 			}
@@ -6740,14 +6744,11 @@ func recordProvenance(e *agentsession.ItemEntry, prov *agentturn.Provenance) err
 	if prov.Trust == nil {
 		return nil
 	}
-	reads := make([]string, len(prov.Trust.Reads))
-	for i, l := range prov.Trust.Reads {
-		reads[i] = string(l)
-	}
 	if e.CopiedFrom == nil {
-		e.Trust = &agentsession.Trust{Reads: reads}
+		e.Trust = sessionTrust(prov.Trust)
 		return nil
 	}
+	reads := sessionTrust(prov.Trust).Reads
 	// A copy carries the trust of what it copies, and format 0.21 lets
 	// it hold more labels, never fewer (agentsession#279): the host's
 	// labels are merged into it. An empty trust adds none, and leaves a
@@ -6767,6 +6768,39 @@ func recordProvenance(e *agentsession.ItemEntry, prov *agentturn.Provenance) err
 		e.Trust = &agentsession.Trust{Reads: merged}
 	}
 	return nil
+}
+
+// sessionTrust is t in the format's terms, nil for nil and an empty
+// list, never null, for a trust that found neither label.
+func sessionTrust(t *agentturn.Trust) *agentsession.Trust {
+	if t == nil {
+		return nil
+	}
+	reads := make([]string, len(t.Reads))
+	for i, l := range t.Reads {
+		reads[i] = string(l)
+	}
+	return &agentsession.Trust{Reads: reads}
+}
+
+// mergeTrust is the union of a's labels and b's, a's first; either nil
+// is the other's copy.
+func mergeTrust(a, b *agentsession.Trust) *agentsession.Trust {
+	if a == nil && b == nil {
+		return nil
+	}
+	out := &agentsession.Trust{Reads: []string{}}
+	for _, t := range []*agentsession.Trust{a, b} {
+		if t == nil {
+			continue
+		}
+		for _, l := range t.Reads {
+			if !slices.Contains(out.Reads, l) {
+				out.Reads = append(out.Reads, l)
+			}
+		}
+	}
+	return out
 }
 
 // itemTrigger is the trigger item is queued under: the source of its
@@ -6940,6 +6974,9 @@ func (w *writer) itemFrom(ctx context.Context, item openresponses.Item, response
 	// as one whose outcome is unknown. A refusal, written as a reject,
 	// is not a failure.
 	failed := false
+	// resultTrust is the trust of the result an output appends, which
+	// its entry carries too.
+	var resultTrust *agentsession.Trust
 	if out, ok := item.(*openresponses.FunctionCallOutput); ok && !w.replay && !w.copied[out.CallID] {
 		c := w.calls[out.CallID]
 		switch {
@@ -6960,6 +6997,7 @@ func (w *writer) itemFrom(ctx context.Context, item openresponses.Item, response
 			// what it returned: the result is the record, and the
 			// output appends it.
 			failed = c.result.Failed
+			resultTrust = c.result.Trust
 		case c.dispatched && c.dispatchRun != "" && c.dispatchRun == w.run:
 			// The tool's own output: the dispatch is the record.
 			failed = c.failed
@@ -7086,6 +7124,13 @@ func (w *writer) itemFrom(ctx context.Context, item openresponses.Item, response
 		}
 		if err := recordProvenance(e, prov); err != nil {
 			return err
+		}
+		if resultTrust != nil {
+			// The output's entry carries its result's trust (RFC 0001,
+			// result), which a resume's answer, handed the result's
+			// output alone, does not mark; labels the item's own
+			// provenance adds stay, since a label only narrows (#321).
+			e.Trust = mergeTrust(e.Trust, resultTrust)
 		}
 		if hidden {
 			visible := false

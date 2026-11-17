@@ -5,6 +5,21 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Added: a tool's output carries the trust its tool's flow gives it
+  (agentsession RFC 0001, `item`, `trust`). When `agenttool.FlowOf`
+  reports a flow for the tool a call was handed to, the output's item
+  events carry `Provenance.Trust` with the flow's labels, an empty
+  list for a flow that reads neither, and `ToolEnd.Trust` carries the
+  same; a tool that states no flow, and a call blocked, deferred or
+  never run, carry none. agentturn/session writes it as `trust` on the
+  output's `item` entry and on the call's `result` entry, and an output
+  a resume appends from a result carries the result's, so a resumed
+  session or an evaluator tells a web page's output from a file
+  read's. The control front carries
+  `ToolEnd.Trust` as `trust`. RFC 0001 draft 0.11. Closes #321.
+
 ## v0.0.41 - 2026-11-15
 
 - Changed (breaking for a host that built with `compact.WithBudget(0)`):
