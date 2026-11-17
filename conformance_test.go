@@ -60,6 +60,15 @@ type scenarioTool struct {
 	Barrier    bool            `json:"barrier"`
 	Replay     string          `json:"replay"`
 	Result     *scriptedResult `json:"result"`
+	// Flow is the flow the tool states; absent, it states none.
+	Flow *scriptedFlow `json:"flow"`
+}
+
+// scriptedFlow is a tool's flow as agenttool RFC 0001 has it: the
+// labels its output reads and whether a call sends.
+type scriptedFlow struct {
+	Reads []agenttool.Label `json:"reads"`
+	Sends bool              `json:"sends"`
 }
 
 // scriptedPending is what a record says of a call of the transcript the
@@ -639,11 +648,13 @@ func project(t *testing.T, ev agentturn.Event) map[string]any {
 		m["item"] = toJSON(t, e.Item)
 		m["response_id"] = e.ResponseID
 		m["hidden"] = e.Hidden
+		m["provenance"] = projectProvenance(e.Provenance)
 	case *agentturn.ItemEnd:
 		m["turn"] = e.Turn
 		m["item"] = toJSON(t, e.Item)
 		m["response_id"] = e.ResponseID
 		m["hidden"] = e.Hidden
+		m["provenance"] = projectProvenance(e.Provenance)
 	case *agentturn.ResponseEnd:
 		m["turn"] = e.Turn
 		m["response"] = toJSON(t, e.Response)
@@ -685,6 +696,7 @@ func project(t *testing.T, ev agentturn.Event) map[string]any {
 		m["withdrawn"] = e.Withdrawn
 		m["cut"] = e.Cut
 		m["replayed"] = e.Replayed
+		m["trust"] = projectTrust(e.Trust)
 	case *agentturn.TurnEnd:
 		m["turn"] = e.Turn
 		m["response"] = toJSON(t, e.Response)
@@ -702,6 +714,28 @@ func project(t *testing.T, ev agentturn.Event) map[string]any {
 		t.Errorf("unprojected event %s", ev.EventType())
 	}
 	return toJSON(t, m).(map[string]any)
+}
+
+// projectProvenance is a provenance as the corpus compares it: its
+// trust, null for none.
+func projectProvenance(p *agentturn.Provenance) any {
+	if p == nil {
+		return nil
+	}
+	return map[string]any{"trust": projectTrust(p.Trust)}
+}
+
+// projectTrust is a trust as the corpus compares it, reads as a list,
+// empty for a trust that found neither label, and null for none.
+func projectTrust(tr *agentturn.Trust) any {
+	if tr == nil {
+		return nil
+	}
+	reads := []any{}
+	for _, l := range tr.Reads {
+		reads = append(reads, string(l))
+	}
+	return map[string]any{"reads": reads}
 }
 
 func projectEnd(e *agentturn.RunEnd) map[string]any {
@@ -910,6 +944,14 @@ func (s *scriptedTool) Description() string         { return "" }
 func (s *scriptedTool) Parameters() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
 func (s *scriptedTool) Sequential() bool            { return s.spec.Sequential }
 func (s *scriptedTool) Barrier() bool               { return s.spec.Barrier }
+
+// Flow states the scenario's flow, and none when it gives none.
+func (s *scriptedTool) Flow() (agenttool.Flow, bool) {
+	if s.spec.Flow == nil {
+		return agenttool.Flow{}, false
+	}
+	return agenttool.Flow{Reads: s.spec.Flow.Reads, Sends: s.spec.Flow.Sends}, true
+}
 
 // scriptedReplayTool is a scripted tool that says how a call of it may
 // run again.

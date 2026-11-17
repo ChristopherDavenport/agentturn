@@ -266,3 +266,70 @@ func TestToolOutputCarriesItsFlowTrust(t *testing.T) {
 		}
 	}
 }
+
+// TestToolOutputTrustSurvivesAnOverrideAndSkipsADeferral pins two rows
+// of RFC 0001's tool output trust (#321): an output the after-call hook
+// replaced carries the tool's labels all the same, since a label only
+// narrows what a reader may do with the text, and a call the decision
+// hook deferred, never handed to its tool, carries none on its
+// tool_end.
+func TestToolOutputTrustSurvivesAnOverrideAndSkipsADeferral(t *testing.T) {
+	untrusted := agenttool.Flow{Reads: []agenttool.Label{agenttool.LabelUntrusted, agenttool.LabelPrivate}}
+	web := agenttool.New("web", "", func(context.Context, echoArgs) (string, error) { return "page", nil }, agenttool.WithFlow(untrusted))
+	held := agenttool.New("held", "", func(context.Context, echoArgs) (string, error) { return "held", nil }, agenttool.WithFlow(untrusted))
+	cfg := Config{Model: twoCalls{}, Tools: []agenttool.Tool{web, held}, MaxTurns: 1,
+		BeforeToolCall: func(_ context.Context, info ToolCallInfo) (*ToolDecision, error) {
+			if info.Call.Name == "held" {
+				return &ToolDecision{Action: Defer, Reason: "ask"}, nil
+			}
+			return nil, nil
+		},
+		AfterToolCall: func(_ context.Context, info ToolResultInfo) (*ToolOverride, error) {
+			if info.Call.Name == "web" {
+				return &ToolOverride{Result: agenttool.Text("summarised page")}, nil
+			}
+			return nil, nil
+		}}
+	events, end, err := collect(t, Run(context.Background(), nil, openresponses.Items{openresponses.UserText("x")}, cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if end.Reason != ReasonInputRequired {
+		t.Fatalf("run ended %s, want input_required for the deferred call", end.Reason)
+	}
+	want := []agenttool.Label{agenttool.LabelUntrusted, agenttool.LabelPrivate}
+	var sawOutput, sawWeb, sawHeld bool
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case *ToolEnd:
+			switch e.Name {
+			case "web":
+				sawWeb = true
+				if e.Trust == nil || !slices.Equal(e.Trust.Reads, want) {
+					t.Errorf("overridden web tool_end trust = %+v, want %v", e.Trust, want)
+				}
+			case "held":
+				sawHeld = true
+				if !e.Deferred || e.Trust != nil {
+					t.Errorf("deferred held tool_end deferred=%v trust=%+v, want deferred with none", e.Deferred, e.Trust)
+				}
+			}
+		case *ItemEnd:
+			out, ok := e.Item.(*openresponses.FunctionCallOutput)
+			if !ok {
+				continue
+			}
+			if out.Output.Text != "summarised page" {
+				t.Errorf("an output %q was appended, want only the override", out.Output.Text)
+				continue
+			}
+			sawOutput = true
+			if e.Provenance == nil || e.Provenance.Trust == nil || !slices.Equal(e.Provenance.Trust.Reads, want) {
+				t.Errorf("overridden output provenance = %+v, want trust %v", e.Provenance, want)
+			}
+		}
+	}
+	if !sawOutput || !sawWeb || !sawHeld {
+		t.Errorf("saw output=%v web=%v held=%v, want all", sawOutput, sawWeb, sawHeld)
+	}
+}

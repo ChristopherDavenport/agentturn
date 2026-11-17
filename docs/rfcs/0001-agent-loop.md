@@ -62,7 +62,7 @@ executor, the session format begins where an entry is appended, and
 the loop is everything in between.
 
 Each draft describes the Go module as released with it; [Changes in
-draft 0.10](#changes-in-draft-010) lists what this draft added. Where the
+draft 0.11](#changes-in-draft-011) lists what this draft added. Where the
 module falls short of what is written here, or where a rule is
 contested, the shortfall is under open questions with the issue that
 tracks it.
@@ -203,15 +203,16 @@ from it; a session recorder writes it.
   carries the provenance unread on its events; the item's own source
   stands over the trigger it was handed in under, for that item alone.
 - A tool's output carries the **trust** its tool's flow gives it
-  (agenttool RFC 0001, flow): when the tool states a flow and its call
-  was handed to it, the loop marks the output with a provenance whose
-  trust is the flow's `reads`, an empty list for a flow that reads
-  neither label, and its `tool_end` carries the same. A tool that
-  states no flow gives none, and so does a call never handed to its
-  tool, blocked, deferred, unknown or with arguments that are not an
-  object, whose output is the loop's refusal, not what a tool read. An
-  after-call hook's override is marked as the tool's output would be:
-  a label only narrows what a reader may do with the text (#321).
+  (agenttool RFC 0001, flow). When the tool states a flow and the call
+  was handed to it, the loop MUST mark the output with a provenance
+  whose trust is the flow's `reads`, an empty list for a flow that
+  reads neither label, and the call's `tool_end` MUST carry the same.
+  The loop MUST NOT give trust to the output of a tool that states no
+  flow, or of a call never handed to its tool, blocked, deferred,
+  unknown or with arguments that are not an object, whose output is
+  the loop's refusal, not what a tool read. An output the after-call
+  hook replaced MUST carry the tool's trust all the same: a label only
+  narrows what a reader may do with the text (#321).
 - The **filter** removes the items the model must not see before every
   call. The default drops every item whose type carries a slug prefix
   and every null; a configuration MAY keep listed extension types. An
@@ -2473,7 +2474,7 @@ repository, and it uses the module's exported API alone.
 | `description` | the rule the scenario pins, in a sentence |
 | `rules` | the anchors of the sections of this document it exercises, each of which MUST name a heading here |
 | `config` | the configuration: `model`, the model name; `instructions`; `max_turns`; `tool_execution`, `parallel` or `sequential`; `max_parallel_tools`; `retry.max_attempts`; `fold`, the items a transform folds the transcript to when the loop asks it for a fold, leaving it as it is otherwise, and no transform when absent. Zero or absent is the member's default |
-| `tools` | the tools of the moment, in order: each a `name`, its `sequential` and `barrier` properties, its `replay`, `safe`, `keyed` or `unknown`, and the `result` it answers a call with when `results` names none for the call |
+| `tools` | the tools of the moment, in order: each a `name`, its `sequential` and `barrier` properties, its `replay`, `safe`, `keyed` or `unknown`, its `flow`, the `reads` labels and `sends` of agenttool RFC 0001's flow, a tool without the member stating none, and the `result` it answers a call with when `results` names none for the call |
 | `results` | a scripted result per call ID |
 | `decisions` | the decision hook's decision per call ID: `action`, one of `allow`, `block` and `defer`, with a `reason` and a `terminate` hint. A call the map does not name, and every nested call, is decided none. A scenario without the member has no decision hook |
 | `transcript` | the items the agent starts from |
@@ -2548,7 +2549,9 @@ when there is none; a result is `output`, as the Open Responses output
 value, and `terminate`; an item, a request and a response are their
 Open Responses JSON; a pending call is `call_id`, `name` and `reason`.
 `turn_start` carries `inputs` as items and `arrived` as a list of
-`item` and `mode`. The end is the `run_end` projection's `reason`,
+`item` and `mode`. A provenance is its `trust`, and a trust, on a
+provenance or on `tool_end`, is `reads`, a list, empty for a trust
+that found neither label; either is null when there is none. The end is the `run_end` projection's `reason`,
 `cause`, `error`, `pending`, `withheld`, `incomplete`, the
 `incomplete_details` as Open Responses JSON or null, and `refusal`.
 
@@ -2598,6 +2601,7 @@ sequentially, gives it one call, orders it with a barrier, or holds a call with 
 | `pending-returned` | a call pending as `returned` takes no approval, the resume refused before it starts, and is answered by an output |
 | `model-blocked` | a model's guard refusal before the answer opened raises `model_blocked` in place of `response_end`, is not retried, and ends the run `stopped` with cause `guard` |
 | `call-completed-by-response` | a function call only `response.completed` completes joins the transcript under the ID it opened with before its batch runs, and its output is paired with it (#236) |
+| `tool-output-trust` | a tool's output carries its stated flow's labels on its item events and `tool_end`, an empty list for a flow that reads neither, and none for a tool that states no flow or a call blocked before its tool (#321) |
 | `fold-retry` | a request refused as longer than the window is folded through the transform and sent again as a retry, never unchanged |
 | `content-filter-stop` | a response the server ended `incomplete` with `content_filter` stops the run with cause `content_filter` and no `turn_end`, its call answered with the fixed output and never dispatched, the end carrying the details, an extension member included, and the refusal text; the next run goes ahead, with a response that makes no call, and a final answer ended at `max_output_tokens` stops the run with cause `max_output_tokens` and its details (#314) |
 | `calls-pair-by-item-id` | calls a stream opens at one output index pair with the response's by item ID, never by output index, one only the response completes among them (#236) |
@@ -2633,6 +2637,9 @@ it.
 - **The transcript.** A tool's output carries the trust its tool's
   stated flow gives it, on its item events and its `tool_end`; a tool
   that states no flow, and a call never handed to its tool, give none.
+- **Conformance.** A scenario's tool MAY state a `flow`; item events
+  project their provenance's trust and `tool_end` its trust; the
+  `tool-output-trust` scenario pins the rule.
 - **The record.** The output's `item` entry carries that trust, as any
   provenance's, and a `result` entry carries the `tool_end`'s, as
   agentsession RFC 0001 has a result carry its output's; the output
