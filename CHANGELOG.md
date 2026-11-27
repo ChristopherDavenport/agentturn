@@ -5,6 +5,27 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Added: agentturn/session starts a child the host runs as a fork of
+  its parent's session. `Recorder.ForkChild(ctx, spawnID, at)` writes
+  the spawn's link, as `StartChild` does, and creates the child's
+  session with the parent's entry `at` as its base, so the child's
+  path opens with the parent's path to there. An agent seeded from the
+  child's session with `AgentOptions` holds the parent's conversation,
+  and its requests are recorded with hashes that verify; a child of
+  `StartChild` seeded with those items is still recorded with none.
+  `ContinueChild` continues a forked child as any other and makes a
+  fork a stop cut off after its link, from the base the link names
+  under `agentturn:fork_base` (`ForkBaseMember`). `EntryBefore(s,
+  callID)` is the base that forks before a call, and `OwnPath(s)` the
+  path without the prefix: what the child itself wrote, whatever was
+  folded since. `Recorder.ForkChildBefore(ctx, spawnID, callID)` is
+  `ForkChild` at that base, for a host forking for a call the parent's
+  model holds, and refuses a call the path does not hold with
+  `ErrNoCall`. `PrefixPath(s)` is the other part of the path, what the
+  fork inherited. `StartChild` is unchanged.
+
 ## v0.0.42 - 2026-11-16
 
 - Added: a tool's output carries the trust its tool's flow gives it
