@@ -493,6 +493,33 @@ defer child.Subscribe(func(ctx context.Context, ev agentturn.Event) error {
 _, err = child.Prompt(agent.ContextWithConfig(ctx, cfg), input)
 ```
 
+A child that should start from the parent's conversation is forked
+rather than seeded. `ForkChild` writes the link and creates the child's
+session with an entry of the parent's path as its base, the leaf when
+none is named, so the child's session opens with the parent's path to
+there. The agent is seeded from the child's own session, and its
+requests carry hashes that verify, which a child of `StartChild` handed
+the parent's items does not get. `EntryBefore` gives the base that
+leaves a call out, and `ForkChildBefore` forks there given the call's
+ID. `OwnPath` is what the child itself wrote and `PrefixPath` what it
+inherited.
+
+```go
+ctx, err := rec.ForkChild(ctx, agentsession.NewSpawnID(), at)
+if err != nil {
+	return err
+}
+cs, err := store.Open(ctx, session.SessionIDFromContext(ctx))
+if err != nil {
+	return err
+}
+opts, err := session.AgentOptions(cs, rec.ReadOptions()...)
+if err != nil {
+	return err
+}
+child := agentturn.New(cfg, opts...)
+```
+
 ## Design
 
 The contract is `docs/rfcs/0001-agent-loop.md`, the plan behind it

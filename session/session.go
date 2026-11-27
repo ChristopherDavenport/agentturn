@@ -371,7 +371,11 @@
 // subsession too, linked by a spawn ID in place of a call's:
 // [Recorder.StartChild] writes the link and returns the context to
 // prompt the child with, and Observe writes the run it starts to the
-// session the link names.
+// session the link names. [Recorder.ForkChild] starts such a child as a
+// fork of the parent's session at an entry of its path: the child's
+// session opens with the parent's path to there, so an agent seeded
+// from it holds the parent's conversation and its requests carry
+// hashes, and [OwnPath] is what the child itself wrote.
 //
 // # Request hashes and compaction
 //
@@ -382,7 +386,8 @@
 // it wrote, the fold it last recorded and the filter in force. A
 // request whose input a Transform or a BeforeModelCall changed in a way
 // the record does not describe, or that carries items the recorder
-// never wrote, such as a child's seed transcript, is recorded without
+// never wrote, such as a seed transcript given a child of StartChild
+// rather than forked with ForkChild, is recorded without
 // a hash, and Session.Verify reports it with agentsession.ErrNoHash
 // rather than as a mismatch. A host that gates on the record therefore
 // tells "nothing was checked" from "checked and correct" with
@@ -817,6 +822,12 @@ const (
 // says as a developer message when an approval releases the call.
 // [Pending] reads it back onto the call's Decision.
 const NoteMember = "agentturn:note"
+
+// ForkBaseMember is the member of a subsession link [Recorder.ForkChild]
+// wrote that names the entry of the parent the child forks at: the base
+// of the child's header. [Recorder.ContinueChild] reads it to make a
+// fork a stop cut off between the link and the child's header.
+const ForkBaseMember = "agentturn:fork_base"
 
 // UnhashedNS is the namespace of the custom entry written when the
 // recorder declines to hash a request because its input is not what
@@ -5060,13 +5071,244 @@ func (r *Recorder) StartChild(ctx context.Context, spawnID string) (context.Cont
 	return r.spawnContext(ctx, w, spawnRef{parent: w.id, spawnID: spawnID, child: id, call: callOnContext(ctx)}), nil
 }
 
+// ForkChild starts a child the host runs itself, as [Recorder.StartChild]
+// does, whose session is a fork of the parent's: its header names the
+// parent, the spawn and, as its base, the entry at of the parent's path,
+// so the child's path opens with the parent's path to at, the prefix,
+// and its own entries hang from there. An empty at is the parent's leaf
+// before the link. The child's context is the parent's at the base, so
+// its requests carry the parent's conversation and are recorded with
+// hashes that verify, where a child of StartChild seeded with those
+// items is recorded with none.
+//
+// Unlike StartChild's, the child's session exists when ForkChild
+// returns: the host seeds the child's agent from it, as it would a
+// session it resumes, and prompts it under the context returned:
+//
+//	cctx, err := rec.ForkChild(ctx, spawnID, at)
+//	cs, err := store.Open(ctx, session.SessionIDFromContext(cctx))
+//	opts, err := session.AgentOptions(cs, rec.ReadOptions()...)
+//	child := agentturn.New(cfg, opts...)
+//
+// A later agent for the child is made the same way under
+// [Recorder.ContinueChild]'s context, which needs no base: the header
+// holds it. The context returned reserves every call ID of the prefix,
+// as ContinueChild's does. The child's session is named after its
+// configuration at its first run, as any child is.
+//
+// The base is the host's to choose and is usually not the leaf. A base
+// inside a run leaves that run open on the fork, and ForkChild closes
+// it there, interrupted, with a ref naming the fork, as [Start] does
+// on a based header. A call the prefix holds without its output is
+// pending in the child, which [AgentOptions] hands its agent: a host
+// forking for a call its own model made forks before the call, at
+// [EntryBefore] of it. The prefix must stand alone and be in a form the
+// child's header can hold, as agentsession.Fork says; what it refuses
+// is refused here and the link is not written.
+//
+// [agentsession.Session.Prefix] tells an entry the child inherited
+// from one it wrote, whatever was folded since, and [OwnPath] is the
+// child's path without the prefix. A fold in the child that covers
+// inherited items is a compaction entry of the child's own: the prefix
+// stays on its path and out of its context, as a fold in the parent
+// would leave it.
+//
+// A spawn ID the session carries is refused as StartChild refuses it,
+// and an at the parent's path at its leaf does not hold with
+// agentsession.ErrNoEntry.
+func (r *Recorder) ForkChild(ctx context.Context, spawnID, at string) (context.Context, error) {
+	return r.fork(ctx, spawnID, func(s *agentsession.Session) (string, error) {
+		if at == "" {
+			return s.Leaf(), nil
+		}
+		return at, nil
+	})
+}
+
+// ErrNoCall is the error of [Recorder.ForkChildBefore] for a call ID
+// the parent's path at its leaf holds no function call of.
+var ErrNoCall = errors.New("session: no function call on the path carries the call ID")
+
+// ForkChildBefore is [Recorder.ForkChild] at the entry before the
+// function call callID in the parent's session, [EntryBefore] of it:
+// the fork a host makes for a call the parent's model made and still
+// holds, whose child should open with what the model had seen when it
+// made the call and not with the call itself. The parent is the session
+// ForkChild would fork for ctx, so the host opens nothing and names no
+// entry:
+//
+//	cctx, err := rec.ForkChildBefore(ctx, spawnID, call.CallID)
+//
+// A call ID the parent's path at its leaf holds no call of, or holds
+// as the session's first entry, with nothing before it to fork at,
+// does not hold with [ErrNoCall], and nothing is written.
+func (r *Recorder) ForkChildBefore(ctx context.Context, spawnID, callID string) (context.Context, error) {
+	return r.fork(ctx, spawnID, func(s *agentsession.Session) (string, error) {
+		at, ok := EntryBefore(s, callID)
+		if !ok {
+			return "", fmt.Errorf("session: fork %s before call %q: %w", s.ID(), callID, ErrNoCall)
+		}
+		return at, nil
+	})
+}
+
+// fork is [Recorder.ForkChild] at the entry base names in the parent's
+// session.
+func (r *Recorder) fork(ctx context.Context, spawnID string, base func(*agentsession.Session) (string, error)) (context.Context, error) {
+	if !validSpawnID(spawnID) {
+		return ctx, fmt.Errorf("session: spawn ID %q is not a non-empty string of ASCII letters, digits, '_' and '-'", spawnID)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.children {
+		return ctx, errNoChildSessions
+	}
+	w, err := r.spawnWriter(ctx)
+	if err != nil {
+		return ctx, err
+	}
+	bg := context.WithoutCancel(ctx)
+	s, err := r.store.Open(bg, w.id)
+	if err != nil {
+		return ctx, fmt.Errorf("session: open %s to fork it: %w", w.id, err)
+	}
+	at, err := base(s)
+	if err != nil {
+		return ctx, err
+	}
+	on := false
+	for _, e := range s.Path(s.Leaf()) {
+		on = on || e.Base().ID == at
+	}
+	if at == "" || !on {
+		return ctx, fmt.Errorf("session: fork %s at %q: %w", w.id, at, agentsession.ErrNoEntry)
+	}
+	id := agentsession.SpawnedSessionID(w.id, spawnID)
+	// What the store would refuse of the fork is refused before the
+	// link says there is a child.
+	if _, err := agentsession.Fork(s, at, r.forkHeader(w, id, spawnID, at)); err != nil {
+		return ctx, fmt.Errorf("session: fork %s at %s: %w", w.id, at, err)
+	}
+	link := agentsession.NewSpawnLink(id, spawnID)
+	raw, err := json.Marshal(at)
+	if err != nil {
+		return ctx, err
+	}
+	setMember(&link.EntryBase, ForkBaseMember, raw)
+	if _, err := w.append(bg, link); err != nil {
+		return ctx, err
+	}
+	cs, err := r.forkChild(bg, w, id, spawnID, at)
+	if err != nil {
+		return ctx, err
+	}
+	return r.forkContext(ctx, w, spawnRef{parent: w.id, spawnID: spawnID, child: id, call: callOnContext(ctx)}, cs), nil
+}
+
+// forkHeader is the header of the child session id that forks w's at
+// the entry at, for the spawn.
+func (r *Recorder) forkHeader(w *writer, id, spawnID, at string) agentsession.Header {
+	return agentsession.Header{
+		ID: id, ParentSession: w.id, Base: at, SpawnedBy: spawnID, Harness: r.harness, CWD: w.cwd, Media: w.media,
+		Records: append(append([]string(nil), agentsession.AllRecords...), agentsession.TypeQueued, agentsession.TypeResult),
+	}
+}
+
+// forkChild creates the child session id as a fork of w's at the entry
+// at and closes the run the base left open on it, or opens the one a
+// stop left already made. The caller holds r.mu.
+func (r *Recorder) forkChild(ctx context.Context, w *writer, id, spawnID, at string) (*agentsession.Session, error) {
+	cs, err := r.store.Create(ctx, r.forkHeader(w, id, spawnID, at))
+	if errors.Is(err, agentsession.ErrSessionExists) {
+		if cs, err = r.store.Open(ctx, id); err != nil {
+			return nil, fmt.Errorf("session: open forked child %s: %w", id, err)
+		}
+		r.addChild(cs.ID())
+		return cs, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("session: create forked child session: %w", err)
+	}
+	r.addChild(cs.ID())
+	cw := newWriter(r, cs.ID())
+	cw.cwd, cw.media = w.cwd, cs.Header().Media
+	cw.parent, cw.parentID = w, w.id
+	if err := cw.closeOpenRun(ctx, cs, agentsession.ReasonInterrupted, "fork at "+at, false); err != nil {
+		return nil, err
+	}
+	if cs, err = r.store.Open(ctx, id); err != nil {
+		return nil, fmt.Errorf("session: open forked child %s: %w", id, err)
+	}
+	return cs, nil
+}
+
+// forkContext is [Recorder.spawnContext] for a forked child, whose
+// session cs exists: it reserves the call IDs cs holds, the prefix's
+// among them. The caller holds r.mu.
+func (r *Recorder) forkContext(ctx context.Context, w *writer, ref spawnRef, cs *agentsession.Session) context.Context {
+	ctx = r.spawnContext(ctx, w, ref)
+	if ids, err := CallIDs(cs); err == nil {
+		ctx = agentturn.ContextWithReservedCallIDs(ctx, ids...)
+	}
+	return ctx
+}
+
+// EntryBefore returns the entry the item entry of the function call
+// callID hangs from, on the path at the session's leaf: the base that
+// forks a session before that call, with whatever its response put out
+// ahead of it. It reports false when the path holds no such call.
+func EntryBefore(s *agentsession.Session, callID string) (string, bool) {
+	for _, e := range s.Path(s.Leaf()) {
+		it, ok := e.(*agentsession.ItemEntry)
+		if !ok {
+			continue
+		}
+		if c, ok := it.Item.(*openresponses.FunctionCall); ok && c.CallID == callID {
+			return it.Parent, it.Parent != ""
+		}
+	}
+	return "", false
+}
+
+// OwnPath returns the path at the session's leaf without the prefix a
+// fork opens with: the entries the session wrote itself, which for a
+// session with no base is the whole path. It is what a reader of a
+// child [Recorder.ForkChild] made takes for the child's own record.
+func OwnPath(s *agentsession.Session) []agentsession.Entry {
+	var own []agentsession.Entry
+	for _, e := range s.Path(s.Leaf()) {
+		if !s.Prefix(e.Base().ID) {
+			own = append(own, e)
+		}
+	}
+	return own
+}
+
+// PrefixPath returns the part of the path at the session's leaf a fork
+// opens with: the entries it inherited from the session it forked, in
+// order, and none for a session with no base. It is the counterpart of
+// [OwnPath], and the two together are the path. A fork of a fork
+// inherits the first fork's prefix and what that fork wrote before the
+// base.
+func PrefixPath(s *agentsession.Session) []agentsession.Entry {
+	var prefix []agentsession.Entry
+	for _, e := range s.Path(s.Leaf()) {
+		if s.Prefix(e.Base().ID) {
+			prefix = append(prefix, e)
+		}
+	}
+	return prefix
+}
+
 // ErrNoSpawn is the error of [Recorder.ContinueChild] for a spawn ID
 // no subsession link on the parent's path carries.
 var ErrNoSpawn = errors.New("session: no subsession link on the path carries the spawn ID")
 
 // ContinueChild returns a context for a child the host started with
 // [Recorder.StartChild], whose link the parent's path holds, as
-// StartChild returned one, and writes nothing: a host that did not keep
+// StartChild returned one, and writes nothing, but for a child of
+// [Recorder.ForkChild] whose session a stop cut off before it was made,
+// which is made now from the base its link names: a host that did not keep
 // that context, a recorder resumed in another process for one,
 // continues the child under it, and a run prompted with it and
 // observed by [Recorder.Observe] continues the child's session at its
@@ -5102,6 +5344,18 @@ func (r *Recorder) ContinueChild(ctx context.Context, spawnID string) (context.C
 	}
 	if spawnID == "" || link == nil || link.URL != "" {
 		return ctx, fmt.Errorf("%w: %q in %s", ErrNoSpawn, spawnID, w.id)
+	}
+	if raw, ok := link.Unknown[ForkBaseMember]; ok {
+		// A forked child has its session from ForkChild; one a stop
+		// cut off before the header is made now, so no agent runs it
+		// without the prefix.
+		var at string
+		if err := json.Unmarshal(raw, &at); err != nil || at == "" {
+			return ctx, fmt.Errorf("session: the link of spawn %q names no fork base: %s", spawnID, raw)
+		}
+		if _, err := r.forkChild(context.WithoutCancel(ctx), w, link.Session, spawnID, at); err != nil {
+			return ctx, err
+		}
 	}
 	ctx = r.spawnContext(ctx, w, spawnRef{parent: w.id, spawnID: spawnID, child: link.Session, call: callOnContext(ctx)})
 	if cs, err := r.store.Open(context.WithoutCancel(ctx), link.Session); err == nil {
@@ -5677,6 +5931,13 @@ func (r *Recorder) newChild(ctx context.Context, parent *writer, by childKey, li
 			if err := w.seed(ctx, s, false); err != nil {
 				return nil, err
 			}
+			if name != "" && s.Header().Base != "" && !named(OwnPath(s)) {
+				// A forked child's session was made before its first
+				// run, which names it as a child made here is named.
+				if _, err := w.append(ctx, &agentsession.InfoEntry{Name: name}); err != nil {
+					return nil, err
+				}
+			}
 			return w, nil
 		}
 		// The store cannot reopen it; a fresh session still records
@@ -5697,6 +5958,16 @@ func (r *Recorder) newChild(ctx context.Context, parent *writer, by childKey, li
 		}
 	}
 	return w, nil
+}
+
+// named reports whether path holds an info entry that names its session.
+func named(path []agentsession.Entry) bool {
+	for _, e := range path {
+		if info, ok := e.(*agentsession.InfoEntry); ok && info.Name != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // addChild notes id as a child session the recorder writes.
