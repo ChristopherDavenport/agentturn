@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.43 - 2026-11-26
 
 - Added: agentturn/session starts a child the host runs as a fork of
   its parent's session. `Recorder.ForkChild(ctx, spawnID, at)` writes
