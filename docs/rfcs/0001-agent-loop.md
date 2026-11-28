@@ -326,7 +326,8 @@ it raises and the hooks it calls; the events are defined
    reason `aborted`.
 2. **Before the turn.** The before-turn hook sees the working
    transcript and the turn's inputs so far, each item with its
-   **input mode**, how it arrived, as described under phase 5, and MAY
+   **input mode**, how it arrived, as described under phase 5, and the
+   **provenance** it was supplied with, if any, and MAY
    return items, which
    the loop appends to the transcript with their item events as it
    appends any input. They are then facts about the transcript: a
@@ -351,7 +352,8 @@ it raises and the hooks it calls; the events are defined
    turn's response, or since the run started for the first turn. They
    are what this turn's response answers. Beside them it carries the
    same items as **arrived**, each with its **input mode**, which says
-   how the item came, and on a run's first turn also the items the
+   how the item came, and the provenance it was supplied with, if
+   any, and on a run's first turn also the items the
    transcript already ended with when the run started that the model
    did not produce, after its last output: a run that continues from
    a transcript answers them first, and the inputs, which name only

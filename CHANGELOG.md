@@ -5,6 +5,17 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
+## Unreleased
+
+- Added: `TurnInput.Provenance`, the provenance an input was handed in
+  with (`WithProvenance`): its instruction layers, what sent it and
+  what its content holds. A `BeforeTurn` hook and `TurnStart.Arrived`
+  carry it, a copy for each reader, for a prompt, a steer and a
+  follow-up alike, so a hook can tell a message composed from a layer
+  from the person's words. agentturn/front/control carries it on
+  `turn_start`'s arrived inputs (`provenance`, absent when there is
+  none). (#325)
+
 ## v0.0.43 - 2026-11-26
 
 - Added: agentturn/session starts a child the host runs as a fork of

@@ -643,6 +643,14 @@ type TurnInput struct {
 	// item; zero otherwise. An item whose [Provenance] names a Source
 	// arrives under that source instead, wherever it came in.
 	Trigger Trigger
+	// Provenance is the provenance the item was handed in with
+	// ([WithProvenance]): the instruction layers a message was composed
+	// from, what sent it and what its content holds. The item itself no
+	// longer carries the mark, so this is where a hook learns that a
+	// message is a template's or a skill's and not the person's words.
+	// A copy; nil for an item handed in with none, and for one that was
+	// already in the transcript ([InputContinued]).
+	Provenance *Provenance
 }
 
 // OutputInfo describes an assistant message the stream has completed,
