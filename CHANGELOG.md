@@ -5,7 +5,7 @@ All user-visible changes to this library. The format follows
 uses [Semantic Versioning](https://semver.org/); before v1.0.0 minor
 versions may break the API.
 
-## Unreleased
+## v0.0.44 - 2026-11-27
 
 - Added: `TurnInput.Provenance`, the provenance an input was handed in
   with (`WithProvenance`): its instruction layers, what sent it and
