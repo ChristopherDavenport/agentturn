@@ -1464,7 +1464,7 @@ func (r *runner) loop(ctx context.Context, prompts openresponses.Items, approved
 		ctx := ContextWithTurn(ctx, r.turn)
 		r.ctx = ctx
 		if r.cfg.BeforeTurn != nil {
-			items, err := r.cfg.BeforeTurn(r.attributed(ctx), TurnStartInfo{RunID: r.runID, Turn: r.turn, Transcript: r.transcript, Inputs: append([]TurnInput(nil), r.arrived...)})
+			items, err := r.cfg.BeforeTurn(r.attributed(ctx), TurnStartInfo{RunID: r.runID, Turn: r.turn, Transcript: r.transcript, Inputs: copyInputs(r.arrived)})
 			if err != nil {
 				if errors.Is(err, ErrGuard) {
 					return stopped(StopGuard, err)
@@ -1681,6 +1681,21 @@ func (r *runner) appendArrived(inputs []TurnInput) error {
 	return nil
 }
 
+// copyInputs returns inputs for one reader, a hook or a subscriber: a
+// list of its own, each provenance a copy, so a change one makes does
+// not reach the next.
+func copyInputs(inputs []TurnInput) []TurnInput {
+	if inputs == nil {
+		return nil
+	}
+	out := make([]TurnInput, len(inputs))
+	for i, in := range inputs {
+		in.Provenance = in.Provenance.clone()
+		out[i] = in
+	}
+	return out
+}
+
 // appendOne appends one item the loop did not stream with its item
 // events, and remembers how it arrived for the next turn's inputs.
 func (r *runner) appendOne(item openresponses.Item, mode InputMode, trigger, endTrigger Trigger) error {
@@ -1699,7 +1714,7 @@ func (r *runner) appendOne(item openresponses.Item, mode InputMode, trigger, end
 	}
 	r.transcript = append(r.transcript, item)
 	r.added = append(r.added, item)
-	r.arrived = append(r.arrived, TurnInput{Item: item, Mode: mode, Trigger: trigger})
+	r.arrived = append(r.arrived, TurnInput{Item: item, Mode: mode, Trigger: trigger, Provenance: prov.clone()})
 	// The trigger the item's record names: the one it arrived under,
 	// its own source over it, or, for a prompt a resume carries and a
 	// note, the one its item_end carries.
@@ -1879,7 +1894,7 @@ func (r *runner) modelTurn(ctx context.Context, tools agenttool.Set) (*openrespo
 		return nil, err
 	}
 	inputs := append(openresponses.Items(nil), r.transcript[min(r.mark, len(r.transcript)):]...)
-	if err := r.emit(&TurnStart{RunID: r.runID, Turn: r.turn, Request: req, Inputs: inputs, Arrived: append([]TurnInput(nil), r.arrived...), Quarantined: r.quarantined()}); err != nil {
+	if err := r.emit(&TurnStart{RunID: r.runID, Turn: r.turn, Request: req, Inputs: inputs, Arrived: copyInputs(r.arrived), Quarantined: r.quarantined()}); err != nil {
 		return nil, err
 	}
 	start := len(r.transcript)

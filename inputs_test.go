@@ -2,6 +2,7 @@ package agentturn
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -313,5 +314,73 @@ func TestTurnInputsSayHowEachArrived(t *testing.T) {
 				t.Errorf("turn_start inputs %q, want %q", log.inputs, tc.inputs)
 			}
 		})
+	}
+}
+
+// TestTurnInputsCarryTheirProvenance pins #325: an input handed in with
+// a provenance arrives with it, as a prompt, a steer and a follow-up
+// alike, so a BeforeTurn hook can tell a message composed from a layer
+// from the person's words. It is a copy, and an input handed in with
+// none has none.
+func TestTurnInputsCarryTheirProvenance(t *testing.T) {
+	composed := func(text, id string) openresponses.Item {
+		t.Helper()
+		item, err := WithProvenance(openresponses.UserText(text), Provenance{
+			Layers: []Layer{{ID: id, Source: "agentskill"}},
+			Trust:  &Trust{Reads: []agenttool.Label{agenttool.LabelUntrusted}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return item
+	}
+	var got []string
+	cfg := Config{
+		Model: &echo.Adapter{},
+		BeforeTurn: func(_ context.Context, info TurnStartInfo) (openresponses.Items, error) {
+			for _, in := range info.Inputs {
+				word := string(in.Mode) + ":"
+				if p := in.Provenance; p != nil {
+					if p.Trust == nil || len(p.Trust.Reads) != 1 {
+						t.Errorf("%s input's trust = %+v", in.Mode, p.Trust)
+					}
+					for i := range p.Layers {
+						word += p.Layers[i].ID
+						// A hook's change must not reach the next reader.
+						p.Layers[i].ID = "changed"
+					}
+				}
+				got = append(got, word)
+			}
+			return nil, nil
+		},
+	}
+	a := New(cfg)
+	var arrived []string
+	a.Subscribe(func(_ context.Context, ev Event) error {
+		if ts, ok := ev.(*TurnStart); ok {
+			for _, in := range ts.Arrived {
+				word := string(in.Mode) + ":"
+				if in.Provenance != nil {
+					for _, l := range in.Provenance.Layers {
+						word += l.ID
+					}
+				}
+				arrived = append(arrived, word)
+			}
+		}
+		return nil
+	})
+	a.Steer(composed("steered", "steer.md"))
+	a.FollowUp(composed("followed", "follow.md"))
+	if _, err := a.Prompt(context.Background(), composed("prompted", "prompt.md"), openresponses.UserText("plain")); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"prompt:prompt.md", "prompt:", "steer:steer.md", "follow_up:follow.md"}
+	if !slices.Equal(got, want) {
+		t.Errorf("BeforeTurn saw %q, want %q", got, want)
+	}
+	if !slices.Equal(arrived, want) {
+		t.Errorf("turn_start carried %q, want %q", arrived, want)
 	}
 }

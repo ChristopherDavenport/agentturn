@@ -734,6 +734,9 @@ type wireTurnInput struct {
 	Item    json.RawMessage `json:"item"`
 	Mode    string          `json:"mode"`
 	Trigger *wireTrigger    `json:"trigger,omitempty"`
+	// Provenance is the input's provenance, absent from a host that
+	// does not send it and for an item handed in with none.
+	Provenance *wireProvenance `json:"provenance,omitempty"`
 }
 
 func turnInputsOut(in []agentturn.TurnInput) ([]wireTurnInput, error) {
@@ -743,7 +746,7 @@ func turnInputsOut(in []agentturn.TurnInput) ([]wireTurnInput, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, wireTurnInput{Item: item, Mode: string(t.Mode), Trigger: triggerOut(t.Trigger)})
+		out = append(out, wireTurnInput{Item: item, Mode: string(t.Mode), Trigger: triggerOut(t.Trigger), Provenance: provenanceOut(t.Provenance)})
 	}
 	return out, nil
 }
@@ -755,7 +758,7 @@ func turnInputsIn(in []wireTurnInput) ([]agentturn.TurnInput, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, agentturn.TurnInput{Item: item, Mode: agentturn.InputMode(w.Mode), Trigger: triggerIn(w.Trigger)})
+		out = append(out, agentturn.TurnInput{Item: item, Mode: agentturn.InputMode(w.Mode), Trigger: triggerIn(w.Trigger), Provenance: provenanceIn(w.Provenance)})
 	}
 	return out, nil
 }
